@@ -1,0 +1,67 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+
+fn project_hash(root: &Path) -> Result<String> {
+    let canonical = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    Ok(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+fn projects_root() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("could not resolve home directory")?;
+    Ok(home.join(".g-mesh").join("projects"))
+}
+
+/// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
+pub fn project_dir(root: &Path) -> Result<PathBuf> {
+    Ok(projects_root()?.join(project_hash(root)?))
+}
+
+/// Opens (creating if absent) the project's SQLite index in WAL mode.
+pub fn open(root: &Path) -> Result<Connection> {
+    let dir = project_dir(root)?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create project directory {}", dir.display()))?;
+
+    let db_path = dir.join("index.db");
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("failed to enable WAL mode")?;
+    Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_root_hashes_to_same_directory() {
+        let root = std::env::current_dir().unwrap();
+        let first = project_dir(&root).unwrap();
+        let second = project_dir(&root).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn opens_database_in_wal_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        let expected_db = project_dir(tmp.path()).unwrap().join("index.db");
+        assert!(expected_db.exists());
+    }
+}
