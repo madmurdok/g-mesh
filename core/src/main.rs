@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use g_mesh::{daemon, shim};
 
@@ -14,13 +16,24 @@ enum Command {
     McpShim,
     /// Internal daemon entry point, bootstrapped by mcp-shim - not invoked directly by users.
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Project root this daemon serves; passed explicitly by the shim
+        /// rather than inferred from cwd, which a detached process must not
+        /// depend on.
+        #[arg(long)]
+        project_root: PathBuf,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::McpShim => shim::run(),
-        Command::Daemon => daemon::run(),
+        Command::Daemon { project_root } => daemon::run(&project_root),
+    };
+
+    if let Err(err) = result {
+        eprintln!("g-mesh: {err:#}");
+        std::process::exit(1);
     }
 }
