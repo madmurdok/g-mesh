@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 
-fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
+pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
     Ok(NodeRecord {
         id: row.get("id")?,
         kind: row.get("kind")?,
