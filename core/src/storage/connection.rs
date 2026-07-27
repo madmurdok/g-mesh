@@ -3,17 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
 
-fn project_hash(root: &Path) -> Result<String> {
-    let canonical = root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    Ok(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
-}
+use crate::daemon::identity::project_hash;
 
 fn projects_root() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
@@ -21,6 +12,8 @@ fn projects_root() -> Result<PathBuf> {
 }
 
 /// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
+/// Uses the same hash as the daemon's own socket/pid file location
+/// (`daemon::identity::project_hash`) so the two can never disagree.
 pub fn project_dir(root: &Path) -> Result<PathBuf> {
     Ok(projects_root()?.join(project_hash(root)?))
 }
