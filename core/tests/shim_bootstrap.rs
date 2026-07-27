@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::protocol::jsonrpc::{read_frame, write_frame};
 use g_mesh::storage::connection::project_dir;
+use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-const REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+const REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"status"}"#;
 
 /// Temp project root plus teardown of the `~/.g-mesh/projects/<hash>/`
 /// directory the daemon creates outside it.
@@ -149,6 +150,14 @@ fn round_trip_over_socket(socket: &Path) -> Vec<u8> {
     read_one_frame(stream)
 }
 
+/// Asserts the frame is a real `status` response naming the given daemon pid
+/// (not a byte-for-byte echo of the request).
+fn assert_status_response(frame: &[u8], expected_pid: u32) {
+    let response: Value = serde_json::from_slice(frame).expect("response is not valid JSON");
+    assert_eq!(response["result"]["status"], "ok");
+    assert_eq!(response["result"]["pid"].as_u64(), Some(expected_pid as u64));
+}
+
 #[test]
 fn shim_proxies_through_an_already_running_daemon() {
     let project = Project::new();
@@ -165,7 +174,7 @@ fn shim_proxies_through_an_already_running_daemon() {
     let mut shim = spawn_shim(project.root());
     let response = round_trip_through_shim(&mut shim);
 
-    assert_eq!(response, REQUEST, "the frame must come back through the daemon unchanged");
+    assert_status_response(&response, pid_before);
     assert!(socket.exists(), "the daemon socket must survive the shim");
     assert_eq!(
         project.daemon_pid(),
@@ -185,15 +194,15 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
     let mut shim = spawn_shim(project.root());
     let response = round_trip_through_shim(&mut shim);
 
-    assert_eq!(response, REQUEST, "the bootstrapped daemon must have echoed the frame back");
     assert!(socket.exists(), "the bootstrapped daemon must have bound its socket");
+    let pid = project.daemon_pid();
+    assert_status_response(&response, pid);
 
     // The shim has already exited; a second round trip over the same socket
     // proves the daemon it spawned is genuinely detached rather than a child
     // that died with its parent.
-    assert_eq!(round_trip_over_socket(&socket), REQUEST);
+    assert_status_response(&round_trip_over_socket(&socket), pid);
 
-    let pid = project.daemon_pid();
     let alive = Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
