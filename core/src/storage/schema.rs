@@ -1,5 +1,11 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+/// Bumped whenever the DDL below changes in a way that isn't backward
+/// compatible. No migration framework in v1 - a mismatch means a full
+/// wipe-and-reindex, since the index is a reproducible cache, not source
+/// of truth.
+pub const CURRENT_SCHEMA_VERSION: &str = "1";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md). `vectors` is deliberately not created
@@ -49,6 +55,50 @@ CREATE TABLE IF NOT EXISTS meta (
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
 pub fn apply(conn: &Connection) -> Result<()> {
     conn.execute_batch(DDL).context("failed to apply schema DDL")
+}
+
+/// Ensures the DB's schema matches [`CURRENT_SCHEMA_VERSION`], wiping and
+/// recreating it on mismatch - no migration framework, full reindex is the
+/// only upgrade path. Returns `true` if a full reindex is now required
+/// (fresh DB or version mismatch), `false` if the existing schema and data
+/// were already current and were left untouched.
+pub fn ensure_current(conn: &Connection) -> Result<bool> {
+    apply(conn)?;
+
+    let existing: Option<String> = conn
+        .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read schema_version")?;
+
+    match existing {
+        Some(version) if version == CURRENT_SCHEMA_VERSION => Ok(false),
+        Some(_) => {
+            wipe(conn)?;
+            apply(conn)?;
+            record_version(conn)?;
+            Ok(true)
+        }
+        None => {
+            record_version(conn)?;
+            Ok(true)
+        }
+    }
+}
+
+fn wipe(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta;",
+    )
+    .context("failed to wipe schema")
+}
+
+fn record_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, lastUsed) VALUES (1, ?1, CURRENT_TIMESTAMP)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION],
+    )
+    .context("failed to record schema_version")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,6 +193,54 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "CALLS");
         assert!(!resolved);
+    }
+
+    #[test]
+    fn wipes_and_reindexes_on_version_mismatch() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (id, schema_version, lastUsed) VALUES (1, '0', CURRENT_TIMESTAMP)",
+            [],
+        )
+        .unwrap();
+
+        let reindex_needed = ensure_current(&conn).unwrap();
+        assert!(reindex_needed);
+
+        let version: String = conn
+            .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+        assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
+    }
+
+    #[test]
+    fn leaves_current_version_untouched() {
+        let conn = setup();
+        // First call on a fresh DB: no meta row yet, so a reindex is (correctly) signaled.
+        assert!(ensure_current(&conn).unwrap());
+
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        // Second call at the same (current) version must not wipe existing data.
+        let reindex_needed = ensure_current(&conn).unwrap();
+        assert!(!reindex_needed);
+
+        let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+        assert_eq!(node_count, 1, "data at the current schema version must survive");
     }
 
     #[test]
