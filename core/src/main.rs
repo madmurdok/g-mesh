@@ -1,12 +1,5 @@
-mod daemon;
-mod graph;
-mod mcp;
-mod protocol;
-mod shim;
-mod storage;
-mod watcher;
-
 use clap::{Parser, Subcommand};
+use g_mesh::{daemon, shim};
 
 #[derive(Parser)]
 #[command(name = "g-mesh", version, about = "Local source code indexer for AI agents")]

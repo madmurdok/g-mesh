@@ -3,6 +3,10 @@ name = "g-mesh"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "g_mesh"
+path = "src/lib.rs"
+
 [[bin]]
 name = "g-mesh"
 path = "src/main.rs"

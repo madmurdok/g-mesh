@@ -1,0 +1,3 @@
+{"id":"n1","kind":"File","name":"lib.rs","qualifiedName":"lib.rs","filePath":"src/lib.rs","range":{"start":{"line":0,"col":0},"end":{"line":10,"col":0}},"exported":false,"language":"rust","hasSyntaxErrors":false}
+{"id":"n2","kind":"Function","name":"foo","qualifiedName":"m::foo","filePath":"src/lib.rs","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"exported":true,"language":"rust"}
+{"id":"e1","fromId":"n1","toId":"n2","kind":"DEFINES","source":"tree-sitter","resolved":false}

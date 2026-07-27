@@ -99,7 +99,12 @@ pub enum RequestId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "camelCase")]
 pub enum ControlMessage {
+    // Enum-level rename_all only renames the tag ("method") value, not a
+    // struct variant's own fields - each variant needs its own rename_all
+    // to get filePath instead of file_path in "params".
+    #[serde(rename_all = "camelCase")]
     Reindex { file_path: String },
+    #[serde(rename_all = "camelCase")]
     FileChanged { file_path: String },
     Status,
 }

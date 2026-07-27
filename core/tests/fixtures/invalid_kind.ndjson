@@ -1,0 +1,2 @@
+{"id":"n1","kind":"Function","name":"foo","qualifiedName":"m::foo","filePath":"src/lib.rs","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"exported":true,"language":"rust"}
+{"id":"e1","fromId":"n1","toId":"n2","kind":"NOT_A_REAL_KIND","source":"tree-sitter","resolved":false}
