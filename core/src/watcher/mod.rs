@@ -1,3 +1,4 @@
+pub mod burst;
 pub mod debounce;
 
 use std::path::{Path, PathBuf};
