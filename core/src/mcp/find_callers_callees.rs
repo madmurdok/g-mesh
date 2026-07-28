@@ -49,7 +49,7 @@ fn list_calls(
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<CallSite>> {
-    let page = pagination::paginate_edges(conn, anchor_id, direction, Some("CALLS"), anchor_file_path, page_size, cursor)
+    let page = pagination::paginate_edges(conn, anchor_id, direction, &["CALLS"], anchor_file_path, page_size, cursor)
         .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());

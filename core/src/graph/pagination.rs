@@ -47,12 +47,18 @@ pub enum Direction {
 /// (an edge whose other endpoint shares `anchor_file_path` sorts first),
 /// then `id` as a stable tiebreaker. Backs find_references/find_callers/
 /// find_callees/find_implementations, which all differ only in `direction`
-/// and `edge_kind`.
+/// and `edge_kinds`.
+///
+/// `edge_kinds` is a set, not a single kind: the extractor records one usage
+/// under exactly one kind (a call is a `CALLS` edge *instead of* a
+/// `REFERENCES` one - see `addUsage` in plugins/js-ts/src/extract.ts), so a
+/// tool whose question spans several of those kinds has to ask for all of
+/// them at once. An empty slice means "every kind".
 pub fn paginate_edges(
     conn: &Connection,
     anchor_node_id: &str,
     direction: Direction,
-    edge_kind: Option<&str>,
+    edge_kinds: &[&str],
     anchor_file_path: &str,
     page_size: usize,
     cursor: Option<&str>,
@@ -64,23 +70,30 @@ pub fn paginate_edges(
         Direction::Incoming => ("fromId", "toId"),
     };
 
-    // Fixed placeholder count/order regardless of whether edge_kind/cursor
-    // are present - `?3 IS NULL` and `?4 = 0` make the extra predicates
-    // vacuously true instead of needing dynamically-numbered SQL text.
+    // The seven leading placeholders are fixed regardless of whether a cursor
+    // is present (`?3 = 0` makes the keyset predicate vacuously true); only
+    // the kind filter varies in width, so its placeholders continue after
+    // them.
+    let kind_filter = if edge_kinds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 8)).collect();
+        format!("e.kind IN ({})", placeholders.join(", "))
+    };
     let sql = format!(
         "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.resolved AS resolved, \
          CASE WHEN n.filePath = ?1 THEN 0 ELSE 1 END AS locality \
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?2 \
-           AND (?3 IS NULL OR e.kind = ?3) \
+           AND {kind_filter} \
            AND ( \
-             ?4 = 0 \
-             OR e.resolved < ?5 \
-             OR (e.resolved = ?5 AND locality > ?6) \
-             OR (e.resolved = ?5 AND locality = ?6 AND e.id > ?7) \
+             ?3 = 0 \
+             OR e.resolved < ?4 \
+             OR (e.resolved = ?4 AND locality > ?5) \
+             OR (e.resolved = ?4 AND locality = ?5 AND e.id > ?6) \
            ) \
          ORDER BY e.resolved DESC, locality ASC, e.id ASC \
-         LIMIT ?8"
+         LIMIT ?7"
     );
 
     let (has_cursor, cursor_resolved, cursor_locality, cursor_id): (i64, i64, i64, String) = match &decoded {
@@ -89,19 +102,21 @@ pub fn paginate_edges(
     };
     let limit = (page_size + 1) as i64;
 
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![
+        &anchor_file_path,
+        &anchor_node_id,
+        &has_cursor,
+        &cursor_resolved,
+        &cursor_locality,
+        &cursor_id,
+        &limit,
+    ];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+
     let mut stmt = conn.prepare(&sql)?;
     let mut rows: Vec<(EdgeRecord, i64)> = stmt
         .query_map(
-            params![
-                anchor_file_path,
-                anchor_node_id,
-                edge_kind,
-                has_cursor,
-                cursor_resolved,
-                cursor_locality,
-                cursor_id,
-                limit
-            ],
+            sql_params.as_slice(),
             |row| {
                 let locality: i64 = row.get("locality")?;
                 Ok((
@@ -299,7 +314,7 @@ mod tests {
         make_edge(&conn, "e_unresolved", "root", "n1", false);
         make_edge(&conn, "e_resolved", "root", "n2", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, None, "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 10, None).unwrap();
         assert_eq!(page.results.len(), 2);
         assert!(page.results[0].resolved, "resolved edge must sort first at equal locality");
         assert!(!page.results[1].resolved);
@@ -315,7 +330,7 @@ mod tests {
         make_edge(&conn, "e_far", "root", "far", true);
         make_edge(&conn, "e_near", "root", "near", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, None, "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 10, None).unwrap();
         assert_eq!(page.results[0].id, "e_near", "same-file target must sort before a distant one");
         assert_eq!(page.results[1].id, "e_far");
     }
@@ -329,7 +344,7 @@ mod tests {
         make_edge(&conn, "e1", "caller1", "root", true);
         make_edge(&conn, "e2", "caller2", "root", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Incoming, None, "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Incoming, &[], "a.rs", 10, None).unwrap();
         let ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2"], "same-file caller must sort before the distant one");
     }
@@ -347,7 +362,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = paginate_edges(&conn, "root", Direction::Outgoing, None, "a.rs", 2, cursor.as_deref()).unwrap();
+            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 2, cursor.as_deref()).unwrap();
             seen.extend(page.results.iter().map(|e| e.id.clone()));
 
             // Simulate a background reindex inserting a new low-priority edge

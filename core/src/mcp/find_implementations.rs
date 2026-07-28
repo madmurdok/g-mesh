@@ -69,7 +69,7 @@ fn list_implementations(
         conn,
         anchor_id,
         Direction::Incoming,
-        Some("SUPERTYPE_OF"),
+        &["SUPERTYPE_OF"],
         anchor_file_path,
         page_size,
         cursor,

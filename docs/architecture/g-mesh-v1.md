@@ -289,7 +289,7 @@ schema + language-specific detail split out.
 | Tool | Input | Returns |
 |---|---|---|
 | `find_definition` | symbol name, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count) |
-| `find_references` | `symbolId` | usage sites (`REFERENCES` edges) |
+| `find_references` | `symbolId` | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
 | `find_callers` | `symbolId` | inbound `CALLS` |
 | `find_callees` | `symbolId` | outbound `CALLS` |
 | `find_implementations` | `symbolId` | inbound `SUPERTYPE_OF` |
