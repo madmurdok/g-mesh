@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod burst;
 pub mod debounce;
+pub mod staleness;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};

@@ -5,7 +5,11 @@ use rusqlite::{Connection, OptionalExtension};
 /// compatible. No migration framework in v1 - a mismatch means a full
 /// wipe-and-reindex, since the index is a reproducible cache, not source
 /// of truth.
-pub const CURRENT_SCHEMA_VERSION: &str = "1";
+///
+/// Bumped to "2" when `indexed_files` was added (query-time staleness
+/// checking - see `watcher::staleness`): it records the on-disk mtime/hash
+/// a file's index was last built from, which didn't exist in "1".
+pub const CURRENT_SCHEMA_VERSION: &str = "2";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md). `vectors` is deliberately not created
@@ -50,6 +54,17 @@ CREATE TABLE IF NOT EXISTS meta (
     embedding_model TEXT,
     lastUsed        TEXT NOT NULL
 );
+
+-- Baseline on-disk state (mtime + content hash) a file's index was last
+-- built from - see watcher::staleness. mtime is a cheap fast-path check
+-- (no file read); contentHash is the authoritative fallback used only when
+-- mtime disagrees, so a query touching many files doesn't have to hash all
+-- of them every time.
+CREATE TABLE IF NOT EXISTS indexed_files (
+    filePath    TEXT PRIMARY KEY,
+    mtimeMillis INTEGER NOT NULL,
+    contentHash TEXT NOT NULL
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -87,7 +102,7 @@ pub fn ensure_current(conn: &Connection) -> Result<bool> {
 
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta;",
+        "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
     )
     .context("failed to wipe schema")
 }
@@ -122,7 +137,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables.sort();
-        assert_eq!(tables, vec!["edges", "meta", "nodes"]);
+        assert_eq!(tables, vec!["edges", "indexed_files", "meta", "nodes"]);
 
         let indexes: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
