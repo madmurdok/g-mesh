@@ -1,3 +1,4 @@
+pub mod bulk_index;
 pub mod identity;
 pub mod plugin;
 
@@ -48,7 +49,8 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
-/// version), registers the file watcher, and serves an MCP session per
+/// version), builds the initial index if the project has never been walked
+/// (`bulk_index`), registers the file watcher, and serves an MCP session per
 /// connection on the project's AF_UNIX socket. Simplified MVP lifecycle -
 /// runs until killed; the two-tier idle-timeout model and `g-mesh stop` are
 /// backlog.
@@ -81,6 +83,12 @@ pub fn run(root: &Path) -> Result<()> {
     if schema::ensure_current(&conn).context("failed to check schema version")? {
         eprintln!("g-mesh daemon: schema (re)initialized - a full reindex is needed");
     }
+    // Asked before anything can answer it, and answered by a recorded fact
+    // rather than by the schema being fresh: a walk killed half way through
+    // leaves a current schema behind a partial graph, and that project is
+    // still owed its index.
+    let needs_bulk_index = !schema::bulk_index_completed(&conn)
+        .context("failed to check whether the project has been indexed")?;
     let conn = Arc::new(Mutex::new(conn));
 
     // ProjectWatcher reports canonicalized absolute paths (see its own doc
@@ -97,6 +105,31 @@ pub fn run(root: &Path) -> Result<()> {
     let plugin = Arc::new(
         PluginProcess::spawn(&canonical_root).context("failed to start the JS/TS plugin")?,
     );
+
+    // Cold start only, and before the watcher: a bulk walk racing incremental
+    // updates could commit its own (older) parse of a file over one the
+    // watcher had just refreshed. Nothing is accepted on the socket until
+    // this returns, so a client's first query is never answered off a half-
+    // built graph. A failure here is fatal for the same reason a failed
+    // plugin handshake is - an empty index that looks like a working one is
+    // worse than a daemon that says why it didn't start - and is recoverable:
+    // the completion marker stays unset, so the next start walks again.
+    if needs_bulk_index {
+        let summary = bulk_index::run(&canonical_root, &conn)
+            .context("failed to build the project's initial index")?;
+        schema::record_bulk_index(&conn.lock().unwrap())
+            .context("failed to record that the project was indexed")?;
+        eprintln!(
+            "g-mesh daemon: initial index built - {} nodes, {} edges",
+            summary.nodes, summary.edges
+        );
+        if summary.skipped_lines > 0 {
+            eprintln!(
+                "g-mesh daemon: {} unreadable lines were skipped - the index may be incomplete",
+                summary.skipped_lines
+            );
+        }
+    }
 
     let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
     {

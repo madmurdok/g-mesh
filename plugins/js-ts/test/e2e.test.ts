@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import { FrameReader, encodeFrame } from "../src/jsonrpc";
 import { PROTOCOL_VERSION } from "../src/protocol";
@@ -115,6 +117,58 @@ test("plugin handles a fileChanged notification without crashing and without res
     );
   } finally {
     child.kill();
+  }
+});
+
+/**
+ * The one-shot mode core spawns for a cold start (`daemon::bulk_index`). What
+ * matters to core is the *stream contract*, not the extraction: the whole of
+ * stdout is NDJSON with no handshake in front of it, and the process ends by
+ * itself once everything has been written - that end is core's only
+ * end-of-index signal.
+ */
+test("--bulk-index streams the project as NDJSON on stdout and then exits", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-e2e-bulk-"));
+  await fs.mkdir(path.join(root, "src"));
+  await fs.writeFile(
+    path.join(root, "src", "a.ts"),
+    "export function alpha(): number {\n  return 1;\n}\n",
+    "utf8",
+  );
+
+  try {
+    const child = spawn(process.execPath, [ENTRY, "--bulk-index", root], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const stdout: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code) => resolve(code));
+    });
+
+    assert.equal(exitCode, 0, "a completed bulk index must exit cleanly");
+
+    const text = Buffer.concat(stdout).toString("utf8");
+    const lines = text.split("\n").filter((line) => line.length > 0);
+    assert.ok(lines.length > 0, "expected NDJSON output for a non-empty project");
+
+    const parsed = lines.map((line) => JSON.parse(line));
+    // A Content-Length header ahead of the payload would mean the control
+    // plane's framing leaked into a stream that must be plain NDJSON.
+    assert.ok(!text.includes("Content-Length"), "bulk output must not be framed");
+    assert.ok(
+      parsed.some((p) => p.kind === "File" && p.filePath === "src/a.ts"),
+      "expected the walked file's File node",
+    );
+    assert.ok(
+      parsed.some((p) => p.kind === "Function" && p.name === "alpha"),
+      "expected the walked file's symbols",
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 

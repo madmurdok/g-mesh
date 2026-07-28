@@ -2,8 +2,9 @@
 // existing tree-sitter extraction (extract.ts) on each one, and streams the
 // resulting nodes/edges out as NDJSON (one compact JSON object per line)
 // matching core's wire contract (core/src/protocol/types.rs - `WireNode` /
-// `WireEdge`). Deliberately standalone: nothing here wires into index.ts's
-// control-plane handler, per this ticket's scope.
+// `WireEdge`). Driven by index.ts's one-shot `--bulk-index` mode, whose whole
+// stdout is this stream - never by the long-lived control plane, which speaks
+// framed request/response instead.
 
 import * as fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
@@ -22,13 +23,40 @@ const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist"]);
  */
 export type NdjsonSink = NodeJS.WritableStream | ((line: string) => void);
 
-function emitLine(sink: NdjsonSink, value: unknown): void {
+/** Returns false when a stream sink is already over its high-water mark,
+ * i.e. the consumer is behind and the caller should let it catch up. */
+function emitLine(sink: NdjsonSink, value: unknown): boolean {
   const line = JSON.stringify(value);
   if (typeof sink === "function") {
     sink(line);
-  } else {
-    sink.write(line + "\n");
+    return true;
   }
+  return sink.write(line + "\n");
+}
+
+/**
+ * Parks until a stream sink has flushed enough to accept more, so a project
+ * bigger than the pipe buffer queues in the *consumer's* pace rather than in
+ * this process's memory. Core reads this stream while committing each batch
+ * to SQLite (`daemon::bulk_index`), so it is routinely slower than the walk;
+ * without this, `bulkIndexProject`'s bounded-memory promise would hold for
+ * extraction but not for output.
+ */
+function waitForDrain(sink: NdjsonSink): Promise<void> {
+  if (typeof sink === "function") return Promise.resolve();
+  return new Promise((resolve) => {
+    const settle = (): void => {
+      sink.removeListener("drain", settle);
+      sink.removeListener("close", settle);
+      sink.removeListener("error", settle);
+      resolve();
+    };
+    sink.once("drain", settle);
+    // A consumer that died never drains: resuming on close/error lets the
+    // next write fail loudly instead of parking here forever.
+    sink.once("close", settle);
+    sink.once("error", settle);
+  });
 }
 
 // --- wire shape (core/src/protocol/types.rs) -----------------------------
@@ -185,7 +213,9 @@ export interface BulkIndexSummary {
  * per node/edge, emitted as soon as that file's extraction completes. Files
  * are processed one at a time; nothing from a later file is read before an
  * earlier file's output has been written, so memory use stays bounded by a
- * single file's extraction result, never the whole project's.
+ * single file's extraction result, never the whole project's - and a stream
+ * sink that falls behind pauses the walk at the next file boundary
+ * (`waitForDrain`) rather than letting the backlog accumulate here.
  *
  * A file with syntax errors still contributes whatever nodes/edges
  * tree-sitter's error-tolerant parse produced (see `ExtractedNode.hasSyntaxErrors`) -
@@ -217,14 +247,20 @@ export async function bulkIndexProject(
     }
     filesProcessed += 1;
 
+    let sinkReady = true;
     for (const node of result.nodes) {
-      emitLine(sink, toWireNode(node));
+      sinkReady = emitLine(sink, toWireNode(node));
       nodesEmitted += 1;
     }
     for (const edge of result.edges) {
-      emitLine(sink, edge);
+      sinkReady = emitLine(sink, edge);
       edgesEmitted += 1;
     }
+    // Only at a file boundary: a file's nodes and edges belong together (an
+    // edge is only ever emitted between nodes of the file it came from), and
+    // keeping them in one uninterrupted run is what lets a consumer commit
+    // whatever it has at any point without ever holding a dangling edge.
+    if (!sinkReady) await waitForDrain(sink);
   }
 
   return { filesProcessed, nodesEmitted, edgesEmitted };

@@ -1,9 +1,13 @@
 import { FrameReader, writeMessage } from "./jsonrpc";
 import { parseControlEnvelope, ControlEnvelope, PROTOCOL_VERSION, JSONRPC_VERSION } from "./protocol";
 import { reparseChangedFile, type FileDiff } from "./incremental";
-import { toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
+import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
 
 const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
+
+/** Selects one-shot bulk-index mode instead of the control-plane loop; must
+ * stay in sync with core's `daemon::bulk_index::BULK_INDEX_FLAG`. */
+const BULK_INDEX_FLAG = "--bulk-index";
 
 function log(message: string): void {
   process.stderr.write(`[g-mesh-js-ts] ${message}\n`);
@@ -77,11 +81,12 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
 async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): Promise<void> {
   switch (envelope.method) {
     case "reindex":
-      // No NDJSON bulk-index wiring yet - that would mean streaming
-      // bulkIndex.ts's output back over this same control-plane connection,
-      // which is a different transport shape than the request/response
-      // FileChanged uses and not required by this ticket's acceptance
-      // criteria. Left for a later ticket.
+      // Still a no-op: a whole-project rebuild is not something this
+      // connection can carry - its output is an unbounded stream, not one
+      // response frame - so core runs it as a separate `--bulk-index`
+      // process instead (see `runBulkIndex` below). What is left for a
+      // later ticket is the per-file meaning this message's `filePath`
+      // implies, which `fileChanged` already covers in practice.
       log(`reindex requested: ${envelope.params?.filePath}`);
       break;
     case "fileChanged":
@@ -127,14 +132,47 @@ function handleFrame(frame: Buffer, projectRoot: string): void {
   });
 }
 
+/**
+ * One-shot cold-start index: walks the whole project and streams it to
+ * stdout as NDJSON (bulkIndex.ts), then lets the process end.
+ *
+ * Its own process rather than a control-plane method, because the two have
+ * incompatible shapes: a whole-project walk is an open-ended stream, while
+ * the control plane is framed request/response. Running it standalone makes
+ * this stdout a self-contained NDJSON stream that simply ends at EOF - which
+ * is exactly what core's `NdjsonReader` consumes - with no handshake ahead
+ * of it and no framing or termination marker to agree on.
+ */
+async function runBulkIndex(projectRoot: string): Promise<void> {
+  const summary = await bulkIndexProject(projectRoot, process.stdout);
+  log(
+    `bulk index complete: ${summary.filesProcessed} files, ` +
+      `${summary.nodesEmitted} nodes, ${summary.edgesEmitted} edges`,
+  );
+}
+
 function main(): void {
+  const args = process.argv.slice(2);
+
+  if (args[0] === BULK_INDEX_FLAG) {
+    // No process.exit() on success on purpose: stdout is a pipe, so its last
+    // writes can still be in flight, and exiting explicitly would truncate
+    // the stream core is reading. Letting the event loop run dry exits only
+    // once everything has actually been handed over.
+    runBulkIndex(args[1] ?? process.cwd()).catch((err) => {
+      log(`bulk index failed: ${(err as Error).message}`);
+      process.exitCode = 1;
+    });
+    return;
+  }
+
   // Nothing else passes core's control messages a project root (they carry
   // only a file path), so the plugin has to learn it some other way at
   // startup. A CLI arg is the simplest option here since core already spawns
   // this process itself (daemon::plugin::PluginProcess::spawn) and can pass
   // it directly; falling back to cwd keeps a bare `node dist/src/index.js`
   // (as used by the plugin's own e2e tests) working without an argument.
-  const projectRoot = process.argv[2] ?? process.cwd();
+  const projectRoot = args[0] ?? process.cwd();
 
   sendHandshake();
 

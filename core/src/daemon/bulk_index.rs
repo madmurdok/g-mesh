@@ -1,0 +1,283 @@
+//! Cold-start bulk index: the one full walk of a project that gives a
+//! never-indexed codebase a populated graph before its daemon answers
+//! anything.
+//!
+//! The file watcher can only report changes that happen while it is running -
+//! `notify` synthesizes nothing for a tree that already exists - so without
+//! this, a freshly cloned project stays invisible to every tool until each of
+//! its files happens to be edited.
+//!
+//! The plugin is spawned a *second* time for this, in its one-shot
+//! `--bulk-index` mode, rather than asked over the long-lived control-plane
+//! pipe (`daemon::plugin::PluginProcess`). A whole-project walk is an
+//! open-ended stream of nodes and edges, not one request/response frame:
+//! given a process of its own, its stdout is precisely the self-contained,
+//! EOF-terminated NDJSON stream `protocol::ndjson::NdjsonReader` was written
+//! to consume - nothing interleaved with `FileChanged` traffic, and no
+//! end-of-bulk marker to invent.
+
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+use anyhow::{bail, Context, Result};
+use rusqlite::Connection;
+
+use crate::daemon::plugin::plugin_entry_path;
+use crate::protocol::ndjson::{BulkItem, NdjsonReader};
+use crate::storage::write::{apply_diff, Diff};
+use crate::watcher::apply::{to_edge_record, to_node_record};
+
+/// Puts the plugin in one-shot bulk-index mode; must stay in sync with
+/// `BULK_INDEX_FLAG` in plugins/js-ts/src/index.ts.
+const BULK_INDEX_FLAG: &str = "--bulk-index";
+
+/// Nodes plus edges accumulated before a batch is committed. One `Diff` for
+/// the whole project would mean holding a large repo's entire graph in memory
+/// before a single row is written; one per item would mean a transaction per
+/// row. A few thousand keeps both bounded without tuning.
+const BATCH_ITEMS: usize = 2_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BulkIndexSummary {
+    pub nodes: usize,
+    pub edges: usize,
+    /// Lines that parsed as neither a node nor an edge. Skipped rather than
+    /// fatal, matching `NdjsonReader`'s contract: one unreadable line costs
+    /// one symbol, while refusing the whole walk over it costs the project
+    /// its entire index.
+    pub skipped_lines: usize,
+}
+
+/// Walks `project_root` through the plugin and commits everything it emits,
+/// returning only once the child has exited and the last batch is durable -
+/// callers rely on that to serve their first query off a complete graph.
+///
+/// Batching is safe to cut anywhere in the stream even though edges are
+/// foreign keys onto nodes: the plugin emits a file's nodes before that same
+/// file's edges, and never an edge between files (see the dangling-edge guard
+/// in extract.ts), so an edge's endpoints are always committed by an earlier
+/// batch or its own.
+pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
+    let entry = plugin_entry_path();
+    let mut child = Command::new("node")
+        .arg(&entry)
+        .arg(BULK_INDEX_FLAG)
+        .arg(project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Same reasoning as PluginProcess::spawn: plugin logs are diagnostic
+        // only, so they go wherever the daemon's own stderr goes.
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn the JS/TS plugin's bulk index at {}", entry.display()))?;
+
+    let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
+
+    let mut summary = BulkIndexSummary::default();
+    if let Err(err) = ingest(BufReader::new(stdout), conn, &mut summary) {
+        // Nobody is going to read the rest of this walk: a plugin left
+        // writing into a pipe no one drains would otherwise outlive a failure
+        // it knows nothing about.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+
+    let status = child.wait().context("failed to wait for the bulk-index plugin process")?;
+    if !status.success() {
+        bail!("the JS/TS plugin's bulk index exited with {status}");
+    }
+
+    Ok(summary)
+}
+
+/// Reads a whole NDJSON bulk stream to EOF, committing it in batches. Split
+/// out from [`run`] so every way of failing part way through has one place to
+/// clean up after the child process - and so the ingestion rules can be
+/// tested without a plugin on the other end.
+fn ingest<R: BufRead>(
+    reader: R,
+    conn: &Mutex<Connection>,
+    summary: &mut BulkIndexSummary,
+) -> Result<()> {
+    let mut batch = Diff::default();
+    let mut batched = 0usize;
+
+    for item in NdjsonReader::new(reader) {
+        match item {
+            Ok(BulkItem::Node(node)) => {
+                batch.upsert_nodes.push(to_node_record(node));
+                summary.nodes += 1;
+            }
+            Ok(BulkItem::Edge(edge)) => {
+                batch.upsert_edges.push(to_edge_record(edge));
+                summary.edges += 1;
+            }
+            Err(err) => {
+                // A read failure (a broken pipe, say) would be reported again
+                // on the very next iteration, so shrugging it off the way a
+                // malformed line is shrugged off would spin forever - the
+                // stream is over, whatever the line count says.
+                if err.downcast_ref::<std::io::Error>().is_some() {
+                    return Err(err).context("failed to read the plugin's bulk-index stream");
+                }
+                eprintln!("g-mesh daemon: skipping malformed bulk-index line: {err:#}");
+                summary.skipped_lines += 1;
+                continue;
+            }
+        }
+
+        batched += 1;
+        if batched >= BATCH_ITEMS {
+            commit(conn, &mut batch)?;
+            batched = 0;
+        }
+    }
+
+    commit(conn, &mut batch)
+}
+
+/// Commits one batch and empties it, holding the connection only for as long
+/// as the transaction takes - the walk itself must not keep other readers out.
+fn commit(conn: &Mutex<Connection>, batch: &mut Diff) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut conn = conn.lock().unwrap();
+    apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
+    *batch = Diff::default();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range, WireEdge, WireNode};
+    use crate::storage::schema;
+    use std::io::Cursor;
+
+    fn setup_conn() -> Mutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        // Foreign keys on, unlike the daemon's own connection: the point of
+        // several of these tests is that batching never presents SQLite with
+        // an edge whose endpoints aren't in yet, and that only bites when the
+        // constraint is actually enforced.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        schema::apply(&conn).unwrap();
+        Mutex::new(conn)
+    }
+
+    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+        conn.lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn node_line(id: &str) -> String {
+        serde_json::to_string(&WireNode {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: "src/a.ts".to_string(),
+            range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 2, col: 0 } },
+            signature: None,
+            exported: true,
+            doc_comment: None,
+            language: "typescript".to_string(),
+            native_kind: None,
+            has_syntax_errors: false,
+        })
+        .unwrap()
+    }
+
+    fn edge_line(id: &str, from: &str, to: &str) -> String {
+        serde_json::to_string(&WireEdge {
+            id: id.to_string(),
+            from_id: from.to_string(),
+            to_id: to.to_string(),
+            kind: EdgeKind::Calls,
+            source: EdgeSource::TreeSitter,
+            resolved: false,
+        })
+        .unwrap()
+    }
+
+    fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
+        let mut summary = BulkIndexSummary::default();
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary)?;
+        Ok(summary)
+    }
+
+    #[test]
+    fn a_whole_stream_lands_in_sqlite() {
+        let conn = setup_conn();
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            node_line("n1"),
+            node_line("n2"),
+            edge_line("e1", "n1", "n2")
+        );
+
+        let summary = ingest_str(&stream, &conn).unwrap();
+
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0 });
+        assert_eq!(count(&conn, "nodes"), 2);
+        assert_eq!(count(&conn, "edges"), 1);
+        let name: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "n1");
+    }
+
+    /// One unreadable line costs one symbol; refusing the whole walk over it
+    /// would cost the project its entire index.
+    #[test]
+    fn a_malformed_line_is_counted_and_skipped_without_losing_the_rest() {
+        let conn = setup_conn();
+        let stream = format!("{}\nnot json at all\n{}\n", node_line("n1"), node_line("n2"));
+
+        let summary = ingest_str(&stream, &conn).unwrap();
+
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1 });
+        assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
+    }
+
+    /// The batching contract: a stream longer than one batch commits every
+    /// item exactly once, and a batch boundary landing between a node and an
+    /// edge that points at it must not produce a dangling edge.
+    #[test]
+    fn a_stream_longer_than_one_batch_commits_all_of_it() {
+        let conn = setup_conn();
+        let total = BATCH_ITEMS + 5;
+        let mut stream = String::new();
+        for i in 0..total {
+            stream.push_str(&node_line(&format!("n{i}")));
+            stream.push('\n');
+        }
+        // Deliberately last, i.e. in the trailing partial batch, while its
+        // endpoints were committed by the full batch before it.
+        stream.push_str(&edge_line("e1", "n0", &format!("n{}", total - 1)));
+        stream.push('\n');
+
+        let summary = ingest_str(&stream, &conn).unwrap();
+
+        assert_eq!(summary.nodes, total);
+        assert_eq!(summary.edges, 1);
+        assert_eq!(count(&conn, "nodes"), total as i64);
+        assert_eq!(count(&conn, "edges"), 1);
+    }
+
+    #[test]
+    fn an_empty_stream_is_a_no_op() {
+        let conn = setup_conn();
+        let summary = ingest_str("", &conn).unwrap();
+        assert_eq!(summary, BulkIndexSummary::default());
+        assert_eq!(count(&conn, "nodes"), 0);
+    }
+}
