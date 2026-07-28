@@ -12,9 +12,11 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Watches a project root for filesystem changes, filtering out anything
-/// `.gitignore` (plus `.git` itself, which `.gitignore` files don't
-/// normally list - it's special-cased the way git and `ignore`-crate
-/// directory walkers already do).
+/// `.gitignore` (plus `.git` and `.claude`, which `.gitignore` files don't
+/// normally list - they're special-cased the same way the JS/TS plugin's
+/// bulk-index walk hard-excludes them regardless of `.gitignore` contents).
+/// `.claude` holds Claude Code's own session/worktree artifacts (e.g. full
+/// project copies under `.claude/worktrees/`), never real project source.
 pub struct ProjectWatcher {
     // Held only to keep the OS watch alive - dropping it stops watching.
     _watcher: RecommendedWatcher,
@@ -37,6 +39,7 @@ impl ProjectWatcher {
 
         let mut builder = GitignoreBuilder::new(root);
         builder.add_line(None, ".git/").context("failed to add built-in .git exclusion")?;
+        builder.add_line(None, ".claude/").context("failed to add built-in .claude exclusion")?;
         // A missing .gitignore is the common case (no ignore rules yet),
         // not an error - only propagate genuine parse failures.
         if let Some(err) = builder.add(root.join(".gitignore")) {
@@ -154,6 +157,24 @@ mod tests {
         assert!(
             watcher.next_change(NO_EVENT_TIMEOUT).is_none(),
             ".git is always excluded even when not explicitly listed in .gitignore"
+        );
+
+        fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();
+        assert!(watcher.next_change(EVENT_TIMEOUT).is_some());
+    }
+
+    #[test]
+    fn write_under_dot_claude_produces_no_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".claude/worktrees/agent-abc123")).unwrap();
+
+        let watcher = ProjectWatcher::new(tmp.path()).unwrap();
+        drain_startup_noise(&watcher);
+
+        fs::write(tmp.path().join(".claude/worktrees/agent-abc123/index.ts"), b"stale copy").unwrap();
+        assert!(
+            watcher.next_change(NO_EVENT_TIMEOUT).is_none(),
+            ".claude is always excluded even when not explicitly listed in .gitignore"
         );
 
         fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();

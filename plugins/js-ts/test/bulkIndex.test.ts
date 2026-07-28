@@ -140,12 +140,15 @@ test("toWireNode nests flat range fields", () => {
   assert.equal(wire.nativeKind, null);
 });
 
-test("always skips node_modules, dist, and .git regardless of .gitignore", async () => {
+test("always skips node_modules, dist, .git, and .claude regardless of .gitignore", async () => {
   const root = await makeProject({
     "src/index.ts": `export const x = 1;\n`,
     "node_modules/dep/index.ts": `export const shouldNotAppear = 1;\n`,
     "dist/index.ts": `export const alsoShouldNotAppear = 1;\n`,
     ".git/objects/index.ts": `export const definitelyNot = 1;\n`,
+    // A stale full-project copy under a Claude Code worktree - real source
+    // never lives here, and nobody's own .gitignore anticipates it.
+    ".claude/worktrees/agent-abc123/src/index.ts": `export const staleDuplicate = 1;\n`,
     // A .gitignore that does NOT mention these dirs at all - hard exclusion
     // must not depend on it.
     ".gitignore": "*.log\n",
@@ -157,6 +160,7 @@ test("always skips node_modules, dist, and .git regardless of .gitignore", async
     assert.ok(filePaths.every((p: string) => !p.includes("node_modules")));
     assert.ok(filePaths.every((p: string) => !p.includes("dist")));
     assert.ok(filePaths.every((p: string) => !p.includes(".git")));
+    assert.ok(filePaths.every((p: string) => !p.includes(".claude")));
     assert.ok(filePaths.includes("src/index.ts"));
   } finally {
     await cleanup(root);

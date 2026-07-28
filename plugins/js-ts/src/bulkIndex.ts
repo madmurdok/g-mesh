@@ -13,8 +13,15 @@ import ignore, { type Ignore } from "ignore";
 
 import { extractFile, isSupportedFile, type ExtractedEdge, type ExtractedNode } from "./extract";
 
-/** Directories skipped unconditionally, regardless of .gitignore contents. */
-const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist"]);
+/**
+ * Directories skipped unconditionally, regardless of .gitignore contents.
+ * `.claude` holds Claude Code's own session/worktree artifacts (e.g.
+ * `.claude/worktrees/agent-<hash>/`, full copies of the project made for
+ * parallel agent sessions) - real project source is never there, and a
+ * project's own .gitignore has no reason to list it, so it needs the same
+ * hard exclusion as `.git`.
+ */
+const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", ".claude"]);
 
 /**
  * Where bulk-indexed NDJSON lines go. A callback mirrors the simplest test
@@ -154,9 +161,9 @@ function isIgnoredByLayers(layers: readonly GitignoreLayer[], absPath: string): 
 /**
  * Walks `projectRoot` depth-first, yielding project-relative POSIX paths of
  * every JS/TS/JSX/TSX file that is not gitignored. `.git`, `node_modules`,
- * and `dist` are never descended into, regardless of `.gitignore` contents.
- * Entries within a directory are visited in sorted order for deterministic
- * output.
+ * `dist`, and `.claude` are never descended into, regardless of `.gitignore`
+ * contents. Entries within a directory are visited in sorted order for
+ * deterministic output.
  */
 export async function* walkProjectFiles(projectRoot: string): AsyncGenerator<string> {
   yield* walkDir(projectRoot, projectRoot, []);

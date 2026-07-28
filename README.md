@@ -102,7 +102,7 @@ claude mcp add g-mesh -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
 ## First run: the initial index
 
 The first time a daemon starts for a project it walks the whole tree once
-(gitignore-aware, skipping `.git`, `node_modules` and `dist`), parses every
+(gitignore-aware, skipping `.git`, `node_modules`, `dist`, and `.claude`), parses every
 `.ts`/`.tsx`/`.js`/`.jsx` file, and commits the result **before** it accepts
 any MCP connection — so a client's first tool call already sees a complete
 graph, with nothing to touch or warm up first. Expect that first start to
