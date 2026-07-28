@@ -27,7 +27,9 @@ use crate::watcher::apply::apply_file_change as apply_file_change_diff;
 /// depending on the daemon binary's own install location.
 pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
 
-fn plugin_entry_path() -> PathBuf {
+/// Shared with `daemon::bulk_index`, which spawns the same entry point in
+/// its one-shot mode - both must honor the same override.
+pub(crate) fn plugin_entry_path() -> PathBuf {
     if let Ok(over) = std::env::var(PLUGIN_PATH_ENV) {
         return PathBuf::from(over);
     }

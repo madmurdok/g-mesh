@@ -17,7 +17,8 @@ use rusqlite::Connection;
 
 use crate::protocol::jsonrpc::{read_message, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
+    JSONRPC_VERSION,
 };
 use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
 
@@ -67,44 +68,47 @@ pub fn apply_file_change<R: BufRead, W: Write>(
 /// both sides already agree on `Vec<String>`.
 fn to_storage_diff(wire: FileChangeDiff) -> Diff {
     Diff {
-        upsert_nodes: wire
-            .upsert_nodes
-            .into_iter()
-            .map(|node| NodeRecord {
-                id: node.id,
-                kind: format!("{:?}", node.kind),
-                name: node.name,
-                qualified_name: node.qualified_name,
-                file_path: node.file_path,
-                start_line: node.range.start.line as i64,
-                start_col: node.range.start.col as i64,
-                end_line: node.range.end.line as i64,
-                end_col: node.range.end.col as i64,
-                signature: node.signature,
-                exported: node.exported,
-                doc_comment: node.doc_comment,
-                language: node.language,
-                native_kind: node.native_kind,
-                has_syntax_errors: node.has_syntax_errors,
-            })
-            .collect(),
+        upsert_nodes: wire.upsert_nodes.into_iter().map(to_node_record).collect(),
         delete_node_ids: wire.delete_node_ids,
-        upsert_edges: wire
-            .upsert_edges
-            .into_iter()
-            .map(|edge| {
-                EdgeRecord::new(
-                    edge.id,
-                    edge.from_id,
-                    edge.to_id,
-                    edge_kind_wire_value(&edge.kind),
-                    edge_source_wire_value(&edge.source),
-                    edge.resolved,
-                )
-            })
-            .collect(),
+        upsert_edges: wire.upsert_edges.into_iter().map(to_edge_record).collect(),
         delete_edge_ids: wire.delete_edge_ids,
     }
+}
+
+/// Wire node -> storage record. Shared with the cold-start bulk index
+/// (`daemon::bulk_index`), which ingests the very same `WireNode` shape off
+/// an NDJSON stream instead of out of a diff response - the two paths must
+/// never disagree about how a wire node becomes a row.
+pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
+    NodeRecord {
+        id: node.id,
+        kind: format!("{:?}", node.kind),
+        name: node.name,
+        qualified_name: node.qualified_name,
+        file_path: node.file_path,
+        start_line: node.range.start.line as i64,
+        start_col: node.range.start.col as i64,
+        end_line: node.range.end.line as i64,
+        end_col: node.range.end.col as i64,
+        signature: node.signature,
+        exported: node.exported,
+        doc_comment: node.doc_comment,
+        language: node.language,
+        native_kind: node.native_kind,
+        has_syntax_errors: node.has_syntax_errors,
+    }
+}
+
+/// Wire edge -> storage record; see [`to_node_record`] on why this is shared.
+pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
+    EdgeRecord::new(
+        edge.id,
+        edge.from_id,
+        edge.to_id,
+        edge_kind_wire_value(&edge.kind),
+        edge_source_wire_value(&edge.source),
+        edge.resolved,
+    )
 }
 
 /// `nodes.kind` in the schema is a plain string matching `NodeKind`'s Rust

@@ -9,7 +9,11 @@ use rusqlite::{Connection, OptionalExtension};
 /// Bumped to "2" when `indexed_files` was added (query-time staleness
 /// checking - see `watcher::staleness`): it records the on-disk mtime/hash
 /// a file's index was last built from, which didn't exist in "1".
-pub const CURRENT_SCHEMA_VERSION: &str = "2";
+///
+/// Bumped to "3" when `meta.bulkIndexedAt` was added (cold-start bulk index -
+/// see `daemon::bulk_index`): the daemon needs to know whether a full walk of
+/// the project has ever *finished*, which nothing in "2" recorded.
+pub const CURRENT_SCHEMA_VERSION: &str = "3";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md). `vectors` is deliberately not created
@@ -48,11 +52,17 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_fromId ON edges(fromId);
 CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
 
+-- bulkIndexedAt is NULL until a full project walk has completed at least
+-- once (see daemon::bulk_index). Deliberately not derived from "are there
+-- any nodes?": a walk interrupted half way also leaves nodes behind, and
+-- resuming from a partial index as if it were complete is the exact failure
+-- this column exists to rule out.
 CREATE TABLE IF NOT EXISTS meta (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version  TEXT NOT NULL,
     embedding_model TEXT,
-    lastUsed        TEXT NOT NULL
+    lastUsed        TEXT NOT NULL,
+    bulkIndexedAt   TEXT
 );
 
 -- Baseline on-disk state (mtime + content hash) a file's index was last
@@ -98,6 +108,28 @@ pub fn ensure_current(conn: &Connection) -> Result<bool> {
             Ok(true)
         }
     }
+}
+
+/// Whether a full project walk has ever finished for this index. `false`
+/// means the daemon owes the project a cold-start bulk index - on a fresh or
+/// wiped DB, but equally after a walk that was killed part way through, which
+/// is why this is its own recorded fact rather than "was the schema just
+/// created?".
+pub fn bulk_index_completed(conn: &Connection) -> Result<bool> {
+    let recorded: Option<Option<String>> = conn
+        .query_row("SELECT bulkIndexedAt FROM meta WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read bulkIndexedAt")?;
+    Ok(matches!(recorded, Some(Some(_))))
+}
+
+/// Marks the project as fully walked. Written only after the last batch of a
+/// bulk index has been committed, so a crash mid-walk leaves it unset and the
+/// next daemon start redoes the walk (idempotent - every batch is an upsert).
+pub fn record_bulk_index(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+        .context("failed to record bulkIndexedAt")?;
+    Ok(())
 }
 
 fn wipe(conn: &Connection) -> Result<()> {
@@ -256,6 +288,35 @@ mod tests {
 
         let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
         assert_eq!(node_count, 1, "data at the current schema version must survive");
+    }
+
+    #[test]
+    fn a_fresh_index_owes_a_bulk_index_until_one_is_recorded() {
+        let conn = setup();
+        assert!(ensure_current(&conn).unwrap());
+        assert!(!bulk_index_completed(&conn).unwrap(), "a fresh index has never been walked");
+
+        record_bulk_index(&conn).unwrap();
+        assert!(bulk_index_completed(&conn).unwrap());
+
+        // The whole point of the flag: reopening an unchanged, already-walked
+        // index must not ask for the walk again.
+        assert!(!ensure_current(&conn).unwrap());
+        assert!(bulk_index_completed(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_version_mismatch_wipe_makes_a_bulk_index_owed_again() {
+        let conn = setup();
+        ensure_current(&conn).unwrap();
+        record_bulk_index(&conn).unwrap();
+
+        conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
+        assert!(ensure_current(&conn).unwrap());
+        assert!(
+            !bulk_index_completed(&conn).unwrap(),
+            "data wiped by a version mismatch has to be walked again"
+        );
     }
 
     #[test]

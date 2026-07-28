@@ -47,6 +47,18 @@ impl Project {
     fn root(&self) -> &Path {
         self.dir.path()
     }
+
+    /// Writes a source file *before* any daemon exists. Nothing but the
+    /// cold-start bulk index can ever put such a file in the graph: the
+    /// watcher is only told about changes made while it is running, and a
+    /// file that was already there never makes one.
+    fn seed(&self, relative_path: &str, contents: &str) {
+        let path = self.root().join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("failed to create a fixture directory");
+        }
+        std::fs::write(&path, contents).expect("failed to seed a fixture file");
+    }
 }
 
 impl Drop for Project {
@@ -147,6 +159,34 @@ fn tools_list_request(id: u32) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {} })
 }
 
+fn outline_request(id: u32, file_path: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": "get_file_outline", "arguments": { "file_path": file_path } },
+    })
+}
+
+/// The tool's own JSON payload, which travels as *text* inside the MCP
+/// content block rather than as a nested object.
+fn tool_payload(response: &Value) -> Value {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool call returned no text content: {response}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("tool payload is not JSON ({e}): {text}"))
+}
+
+fn symbol_names(response: &Value) -> Vec<String> {
+    tool_payload(response)["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("outline has no results array: {response}"))
+        .iter()
+        .map(|symbol| symbol["name"].as_str().expect("a symbol name must be a string").to_string())
+        .collect()
+}
+
 fn tool_names(response: &Value) -> Vec<String> {
     let tools = response["result"]["tools"]
         .as_array()
@@ -198,6 +238,95 @@ fn daemon_opens_sqlite_watches_files_and_serves_the_mcp_tool_surface() {
 
     let _ = daemon.kill();
     let _ = daemon.wait();
+}
+
+/// The cold-start guarantee: a project that already had source files when
+/// its daemon started answers the very first query out of a real index -
+/// no edit, no `touch`, nothing that could have reached the watcher.
+#[test]
+fn a_pre_existing_project_is_indexed_before_the_daemon_answers_anything() {
+    let project = Project::new();
+    project.seed(
+        "src/greeter.ts",
+        "export function greet(name: string): string {\n  \
+           return `hello ${name}`;\n\
+         }\n\n\
+         export class Greeter {\n  \
+           run(): string {\n    \
+             return greet(\"world\");\n  \
+           }\n\
+         }\n",
+    );
+    project.seed("src/util.ts", "export const VERSION = \"1\";\n");
+
+    let mut daemon = spawn_daemon(project.root());
+    let pid_file = daemon::pid_path(project.root()).unwrap();
+    // The pid file is written only after the initial index has been
+    // committed, so waiting for it is also what makes the query below
+    // impossible to race - there is no sleep here, and there must not be.
+    wait_for("the daemon to start listening", || pid_file.exists());
+
+    let socket = daemon::socket_path(project.root()).unwrap();
+    let responses = mcp_session(&socket, vec![outline_request(1, "src/greeter.ts")]);
+
+    assert_eq!(
+        responses[0]["result"]["isError"], false,
+        "a file that existed before the daemon must be in the index: {}",
+        responses[0]
+    );
+    let names = symbol_names(&responses[0]);
+    assert!(names.contains(&"greet".to_string()), "outline is missing `greet`: {names:?}");
+    assert!(names.contains(&"Greeter".to_string()), "outline is missing `Greeter`: {names:?}");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+/// The other half of that guarantee: the walk is a *cold start*, not a
+/// startup routine. A file added while no daemon was running stays unindexed
+/// until something tells the daemon about it - which is exactly what proves
+/// the second start did not walk the project again.
+#[test]
+fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
+    let project = Project::new();
+    project.seed("src/first.ts", "export function first(): number {\n  return 1;\n}\n");
+
+    let mut first_daemon = spawn_daemon(project.root());
+    let pid_file = daemon::pid_path(project.root()).unwrap();
+    wait_for("the first daemon to start listening", || pid_file.exists());
+    let _ = first_daemon.kill();
+    let _ = first_daemon.wait();
+    // Otherwise the wait for the *second* daemon would be satisfied by the
+    // dead one's file, and the session below could race the real startup.
+    std::fs::remove_file(&pid_file).expect("failed to clear the stale pid file");
+
+    // Written with nothing watching and nothing serving: only a second full
+    // walk could get it into the index.
+    project.seed("src/second.ts", "export function second(): number {\n  return 2;\n}\n");
+
+    let mut second_daemon = spawn_daemon(project.root());
+    wait_for("the second daemon to start listening", || pid_file.exists());
+
+    let socket = daemon::socket_path(project.root()).unwrap();
+    let responses = mcp_session(
+        &socket,
+        vec![outline_request(1, "src/first.ts"), outline_request(2, "src/second.ts")],
+    );
+
+    assert_eq!(
+        responses[0]["result"]["isError"], false,
+        "the first walk's index must survive the restart: {}",
+        responses[0]
+    );
+    assert_eq!(symbol_names(&responses[0]), vec!["first".to_string()]);
+    assert_eq!(
+        responses[1]["result"]["isError"], true,
+        "an already-indexed project must not be walked again on restart: {}",
+        responses[1]
+    );
+
+    let _ = second_daemon.kill();
+    let _ = second_daemon.wait();
 }
 
 #[test]
