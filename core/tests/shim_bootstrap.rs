@@ -104,6 +104,21 @@ fn spawn_shim(root: &Path) -> Child {
         .expect("failed to spawn the shim")
 }
 
+/// Spawned with `cwd` and `CLAUDE_PROJECT_DIR` deliberately pointed at two
+/// different directories, so a round trip through it can prove which one it
+/// actually treated as the project root.
+fn spawn_shim_with_project_dir_env(cwd: &Path, project_dir_env: &Path) -> Child {
+    Command::new(BIN)
+        .arg("mcp-shim")
+        .current_dir(cwd)
+        .env("CLAUDE_PROJECT_DIR", project_dir_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the shim")
+}
+
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -274,6 +289,28 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
         .status()
         .expect("failed to signal the daemon");
     assert!(alive.success(), "daemon pid {pid} is no longer alive");
+}
+
+#[test]
+fn shim_prefers_claude_project_dir_env_over_cwd() {
+    // Two distinct roots: `cwd` is where the shim process happens to run,
+    // `env_project` is what CLAUDE_PROJECT_DIR names - the real project, per
+    // Claude Code's contract that cwd is not reliable for this. Only the
+    // latter's daemon/socket may ever come up.
+    let cwd_decoy = Project::new();
+    let env_project = Project::new();
+
+    let mut shim = spawn_shim_with_project_dir_env(cwd_decoy.root(), env_project.root());
+    assert_tool_surface(&round_trip_through_shim(&mut shim));
+
+    assert!(
+        env_project.socket().exists(),
+        "the daemon must have bootstrapped for CLAUDE_PROJECT_DIR, not cwd"
+    );
+    assert!(
+        !cwd_decoy.socket().exists(),
+        "cwd must be ignored once CLAUDE_PROJECT_DIR is set"
+    );
 }
 
 #[test]

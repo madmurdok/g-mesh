@@ -59,10 +59,19 @@ export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/js-ts/dist/src/index.js
 
 ## How it finds a project
 
-`g-mesh mcp-shim` takes no arguments — it uses its **current working
-directory** as the project identity (hashed to derive the daemon's socket,
-lock and SQLite paths under `~/.g-mesh/projects/<hash>/`). Whatever spawns
-the shim must set its `cwd` to the target project's root.
+`g-mesh mcp-shim` takes no arguments. It resolves the project root — the
+only project identity it needs, hashed to derive the daemon's socket, lock
+and SQLite paths under `~/.g-mesh/projects/<hash>/` — like this:
+
+1. **`CLAUDE_PROJECT_DIR`**, if set. Claude Code sets this in every stdio
+   MCP server it spawns, in every registration scope (local/project/user) —
+   unlike the process's own `cwd`, which Claude Code's docs call unreliable
+   for this. This is what lets `g-mesh` be registered *once, globally* and
+   still get the right project per session.
+2. Otherwise, the shim's own **current working directory** — the only
+   option for an MCP client that isn't Claude Code, and how earlier versions
+   of this doc had you register it (once per project, cwd pinned at
+   registration time).
 
 The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
@@ -73,16 +82,22 @@ shim and is reused by later connections for the same project.
 
 ## Register with an MCP client
 
-Run from inside the target project's directory (so the client's own `cwd` —
-and therefore the shim's — is the project root), e.g. with Claude Code:
+**Recommended (Claude Code): register once, globally.** Since the shim reads
+`CLAUDE_PROJECT_DIR`, a single user-scoped registration works for every
+project you open Claude Code in — no per-project setup:
+
+```bash
+claude mcp add g-mesh -s user -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
+```
+
+**Fallback (any other stdio MCP client): register per project.** Run from
+inside the target project's directory, so the client's own `cwd` — and
+therefore the shim's, absent `CLAUDE_PROJECT_DIR` — is the project root:
 
 ```bash
 cd /path/to/target-project
 claude mcp add g-mesh -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
 ```
-
-Any MCP client that speaks stdio + newline-delimited JSON works the same
-way — the shim doesn't do anything Claude Code-specific.
 
 ## First run: the initial index
 

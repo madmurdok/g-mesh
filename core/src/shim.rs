@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,15 +19,31 @@ use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Stateless stdio<->AF_UNIX proxy. The MCP client spawns this with the
-/// project directory as cwd, which is the only project identity the shim
-/// needs: it hashes that path, connects to the project's daemon socket
-/// (bootstrapping a detached daemon if nothing is listening) and then moves
-/// JSON-RPC frames between the two sides without interpreting them.
+/// Set by Claude Code on every stdio MCP server it spawns, in every
+/// registration scope (local/project/user) - unlike the process's cwd, which
+/// Claude Code's own docs call unreliable for learning the session's project
+/// root. Preferring it over cwd is what lets g-mesh be registered once,
+/// globally, instead of once per project.
+const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+
+/// Stateless stdio<->AF_UNIX proxy. Project identity - the only thing the
+/// shim needs - comes from `CLAUDE_PROJECT_DIR` when the client set it, or
+/// the shim's own cwd otherwise (the only option for an MCP client that
+/// isn't Claude Code, and the historical behavior this falls back to). Once
+/// resolved, the shim hashes that path, connects to the project's daemon
+/// socket (bootstrapping a detached daemon if nothing is listening) and then
+/// moves JSON-RPC frames between the two sides without interpreting them.
 pub fn run() -> Result<()> {
-    let root = std::env::current_dir().context("failed to resolve the current directory")?;
+    let root = resolve_project_root()?;
     let stream = connect_or_bootstrap(&root)?;
     proxy(stream)
+}
+
+fn resolve_project_root() -> Result<PathBuf> {
+    match std::env::var_os(PROJECT_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        _ => std::env::current_dir().context("failed to resolve the current directory"),
+    }
 }
 
 fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
