@@ -30,6 +30,7 @@ struct StructuralCursor {
     id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     /// Edges going out of the anchor node (`fromId = anchor`).
     Outgoing,

@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, ToSql};
 
 use crate::graph::pagination::Direction;
 use crate::graph::queries::map_node_row;
+use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::storage::write::{EdgeRecord, NodeRecord};
 
 /// Response-level limits: how deep the walk goes and how many children a
@@ -18,8 +19,11 @@ pub const DEFAULT_MAX_FANOUT: u32 = 50;
 pub const DEFAULT_EXPLORATION_BUDGET: u32 = 5000;
 
 /// Why a traversal stopped short of the full transitive closure. Continuation
-/// differs per cause (single-hop pagination / re-rooting on frontier nodes /
-/// resume token) - see the architecture doc; none of it is built here.
+/// differs per cause: `MaxFanout` needs no new mechanism (the caller
+/// paginates the cut node's edges with `pagination::paginate_edges`),
+/// `MaxDepth` hands back `frontier_nodes` to re-root from, `ExplorationBudget`
+/// hands back a `resume_token` because the budget is spent across the whole
+/// walk rather than at one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncatedBy {
     MaxDepth,
@@ -68,20 +72,32 @@ pub struct TraversalResult {
     pub visited_rows: u32,
     pub truncated: bool,
     pub truncated_by: Option<TruncatedBy>,
+    /// Ids of the nodes on the depth boundary (`depth == max_depth`) - the
+    /// last level the walk expanded, which the caller re-roots on to go one
+    /// hop further. Populated only for `TruncatedBy::MaxDepth`.
+    pub frontier_nodes: Vec<String>,
+    /// Opaque continuation state for `resume`. Populated only for
+    /// `TruncatedBy::ExplorationBudget`.
+    pub resume_token: Option<String>,
 }
 
-/// Builds the bounded walk CTE. Three independent bounds:
+fn endpoints(direction: &Direction) -> (&'static str, &'static str) {
+    match direction {
+        Direction::Outgoing => ("fromId", "toId"),
+        Direction::Incoming => ("toId", "fromId"),
+    }
+}
+
+/// One expansion step, shared verbatim by the plain walk and the resumed one.
+/// `extra_filter` appends resume-only predicates; it is empty for `walk_cte`,
+/// which must keep producing exactly the query plan below.
 ///
-/// - `maxFanout` (?3): the child-selection subquery is the *driver* of the
-///   join (`e.id IN (...)`, no usable index constraint on the edge endpoint),
-///   so SQLite evaluates it once per expanded node and then seeks each of at
-///   most `maxFanout` children by primary key. Capping expansion this way,
-///   rather than filtering an already-scanned adjacency list, is what keeps a
-///   hub node's step bounded inside the engine.
-/// - `maxDepth` (?4): plain depth cap in the recursive term.
-/// - exploration budget (?5): `LIMIT` on the CTE itself - SQLite stops the
-///   recursion once initial + recursive rows reach it, regardless of how much
-///   frontier is left.
+/// `maxFanout` (?3): the child-selection subquery is the *driver* of the join
+/// (`e.id IN (...)`, no usable index constraint on the edge endpoint), so
+/// SQLite evaluates it once per expanded node and then seeks each of at most
+/// `maxFanout` children by primary key. Capping expansion this way, rather
+/// than filtering an already-scanned adjacency list, is what keeps a hub
+/// node's step bounded inside the engine. `maxDepth` (?4) is a plain depth cap.
 ///
 /// Cycle safety: each row carries the delimited id path it was reached by and
 /// refuses to re-enter a node already on that path. SQLite forbids a second
@@ -89,27 +105,76 @@ pub struct TraversalResult {
 /// expressible; per-path is the correct-and-expressible option, at the cost
 /// of re-visiting diamond-shaped nodes once per path (bounded by the budget,
 /// deduplicated in `TraversalResult`).
-fn walk_cte(direction: &Direction) -> String {
-    let (this_endpoint, other_endpoint) = match direction {
-        Direction::Outgoing => ("fromId", "toId"),
-        Direction::Incoming => ("toId", "fromId"),
-    };
+fn recursive_term(direction: &Direction, extra_filter: &str) -> String {
+    let (this_endpoint, other_endpoint) = endpoints(direction);
 
+    format!(
+        "SELECT e.{other_endpoint}, e.id, w.depth + 1, w.path || e.{other_endpoint} || '|' \
+         FROM walk w \
+         JOIN edges e ON e.id IN ( \
+             SELECT c.id FROM edges c \
+             WHERE c.{this_endpoint} = w.node_id \
+               AND (?2 IS NULL OR c.kind = ?2) \
+             ORDER BY c.resolved DESC, c.id ASC \
+             LIMIT ?3 \
+         ) \
+         WHERE w.depth < ?4 \
+           AND instr(w.path, '|' || e.{other_endpoint} || '|') = 0 \
+           {extra_filter}"
+    )
+}
+
+/// The bounded walk from a single root (?1). The exploration budget (?5) is a
+/// `LIMIT` on the CTE itself - SQLite stops the recursion once initial +
+/// recursive rows reach it, regardless of how much frontier is left.
+fn walk_cte(direction: &Direction) -> String {
+    let term = recursive_term(direction, "");
     format!(
         "WITH RECURSIVE walk(node_id, edge_id, depth, path) AS ( \
              SELECT ?1, NULL, 0, '|' || ?1 || '|' \
-             UNION ALL \
-             SELECT e.{other_endpoint}, e.id, w.depth + 1, w.path || e.{other_endpoint} || '|' \
-             FROM walk w \
-             JOIN edges e ON e.id IN ( \
-                 SELECT c.id FROM edges c \
-                 WHERE c.{this_endpoint} = w.node_id \
-                   AND (?2 IS NULL OR c.kind = ?2) \
-                 ORDER BY c.resolved DESC, c.id ASC \
-                 LIMIT ?3 \
-             ) \
-             WHERE w.depth < ?4 \
-               AND instr(w.path, '|' || e.{other_endpoint} || '|') = 0 \
+             UNION ALL {term} \
+             LIMIT ?5 \
+         )"
+    )
+}
+
+/// The same walk seeded from a token's visited set (?1, JSON) instead of one
+/// root, with the edges the chain has already reported in ?6. Seed rows are
+/// the only ones with a NULL `edge_id`, which is what the two extra predicates
+/// key off:
+///
+/// - a row landing back on an already-visited node is never expanded again
+///   (only the seeds themselves are), so the fresh budget buys new ground;
+/// - a seed does not re-emit a hop the chain already reported - but it is the
+///   *edge* that decides that, not the child node. A seed is re-expanded from
+///   scratch, so it re-offers every one of its edges, and the earlier call may
+///   well have reported only some of them: it can have been cut mid-expansion
+///   by the budget, or have reached the child by a different edge entirely
+///   (a diamond, or two parallel edges between the same pair). Gating on the
+///   child node instead would drop those still-unreported hops for good, since
+///   no later call ever offers them again. A node first discovered by *this*
+///   call needs no gate at all - nothing has walked its edges yet, and none of
+///   them can be in ?6.
+///
+/// Gating on the edge alone is not just narrower, it is exactly equivalent on
+/// the case the old node gate got right: every reported edge's endpoint is a
+/// reported node, so `e.id IN walked` already implies the child is visited.
+fn resume_cte(direction: &Direction) -> String {
+    let term = recursive_term(
+        direction,
+        "AND (w.edge_id IS NULL OR w.node_id NOT IN (SELECT id FROM visited)) \
+         AND (w.edge_id IS NOT NULL OR e.id NOT IN (SELECT id FROM walked))",
+    );
+
+    format!(
+        "WITH RECURSIVE \
+         visited(id) AS (SELECT json_extract(value, '$.id') FROM json_each(?1)), \
+         walked(id) AS (SELECT value FROM json_each(?6)), \
+         walk(node_id, edge_id, depth, path) AS ( \
+             SELECT json_extract(value, '$.id'), NULL, json_extract(value, '$.depth'), \
+                    '|' || json_extract(value, '$.id') || '|' \
+             FROM json_each(?1) \
+             UNION ALL {term} \
              LIMIT ?5 \
          )"
     )
@@ -120,46 +185,14 @@ fn walk_cte(direction: &Direction) -> String {
 /// caller never reads an exhausted budget as "there is nothing more".
 pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<TraversalResult> {
     let cte = walk_cte(&options.direction);
-    let sql = format!(
-        "{cte} \
-         SELECT n.*, w.depth AS depth, \
-                e.id AS walkedEdgeId, e.fromId AS walkedFromId, e.toId AS walkedToId, \
-                e.kind AS walkedKind, e.source AS walkedSource, e.resolved AS walkedResolved \
-         FROM walk w \
-         JOIN nodes n ON n.id = w.node_id \
-         LEFT JOIN edges e ON e.id = w.edge_id \
-         ORDER BY w.depth ASC, w.node_id ASC"
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(
-            params![
-                options.start_node_id,
-                options.edge_kind,
-                options.max_fanout,
-                options.max_depth,
-                options.exploration_budget
-            ],
-            |row| {
-                let node = map_node_row(row)?;
-                let depth: u32 = row.get("depth")?;
-                let edge = match row.get::<_, Option<String>>("walkedEdgeId")? {
-                    Some(id) => Some(EdgeRecord {
-                        id,
-                        from_id: row.get("walkedFromId")?,
-                        to_id: row.get("walkedToId")?,
-                        kind: row.get("walkedKind")?,
-                        source: row.get("walkedSource")?,
-                        resolved: row.get("walkedResolved")?,
-                    }),
-                    None => None,
-                };
-                Ok((node, depth, edge))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to run bounded traversal")?;
+    let params: [&dyn ToSql; 5] = [
+        &options.start_node_id,
+        &options.edge_kind,
+        &options.max_fanout,
+        &options.max_depth,
+        &options.exploration_budget,
+    ];
+    let rows = run_walk(conn, &cte, &params)?;
 
     let mut nodes: Vec<ReachedNode> = Vec::new();
     let mut edges: Vec<EdgeRecord> = Vec::new();
@@ -187,7 +220,7 @@ pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<Traversa
     let truncated_by = if visited_rows >= options.exploration_budget {
         Some(TruncatedBy::ExplorationBudget)
     } else {
-        let (fanout_cut, depth_cut) = analyze_cuts(conn, &cte, &options)?;
+        let (fanout_cut, depth_cut) = analyze_cuts(conn, &cte, &options.direction, &params)?;
         match (fanout_cut, depth_cut) {
             (true, _) => Some(TruncatedBy::MaxFanout),
             (false, true) => Some(TruncatedBy::MaxDepth),
@@ -195,7 +228,27 @@ pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<Traversa
         }
     };
 
+    let reached: Vec<VisitedNode> = nodes
+        .iter()
+        .map(|r| VisitedNode { id: r.node.id.clone(), depth: r.depth })
+        .collect();
+    // Every row this call produced was reported, so the edges it walked are
+    // exactly the hops a resumed call must not offer a second time.
+    let walked: Vec<String> = edges.iter().map(|e| e.id.clone()).collect();
+
     Ok(TraversalResult {
+        frontier_nodes: frontier_nodes(truncated_by, &reached, options.max_depth),
+        resume_token: continuation(
+            truncated_by,
+            ResumeState {
+                direction: options.direction,
+                edge_kind: options.edge_kind.clone(),
+                max_depth: options.max_depth,
+                max_fanout: options.max_fanout,
+                visited: reached,
+                walked,
+            },
+        ),
         nodes,
         edges,
         visited_rows,
@@ -204,15 +257,175 @@ pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<Traversa
     })
 }
 
+/// Continues a walk that the exploration budget cut short, with a budget of
+/// its own. The token carries the walk's shape as well as its state, so a
+/// resumed call cannot silently drift into a different traversal; only the
+/// budget is the caller's to choose again.
+///
+/// The returned result holds *only* what this call added: nodes the earlier
+/// calls never returned, and the edges walked to reach them. Combining the
+/// results of a call chain is a plain union - nothing is reported twice.
+pub fn resume(conn: &Connection, token: &str, exploration_budget: u32) -> Result<TraversalResult> {
+    let state = resume_token::decode(token)?;
+    let seeds =
+        serde_json::to_string(&state.visited).expect("resume state is always serializable");
+    let walked = serde_json::to_string(&state.walked).expect("resume state is always serializable");
+    let already_returned: HashSet<&str> = state.visited.iter().map(|v| v.id.as_str()).collect();
+
+    // Replaying the seeds costs rows the budget must not be billed for: they
+    // carry no new information, they only put the queue back where it was.
+    let limit = state.visited.len() as i64 + exploration_budget as i64;
+    let cte = resume_cte(&state.direction);
+    let params: [&dyn ToSql; 6] =
+        [&seeds, &state.edge_kind, &state.max_fanout, &state.max_depth, &limit, &walked];
+    let rows = run_walk(conn, &cte, &params)?;
+
+    let mut nodes: Vec<ReachedNode> = Vec::new();
+    let mut edges: Vec<EdgeRecord> = Vec::new();
+    let mut seen_nodes: HashSet<String> = HashSet::new();
+    let mut seen_edges: HashSet<String> = HashSet::new();
+    let mut visited_rows = 0;
+
+    for (node, depth, edge) in rows {
+        // Seed rows are the replay, not exploration; a row with an edge but an
+        // already-returned node is an edge the earlier call never walked.
+        let Some(edge) = edge else { continue };
+        visited_rows += 1;
+        if !already_returned.contains(node.id.as_str()) && seen_nodes.insert(node.id.clone()) {
+            nodes.push(ReachedNode { node, depth });
+        }
+        if seen_edges.insert(edge.id.clone()) {
+            edges.push(edge);
+        }
+    }
+
+    let truncated_by = if visited_rows >= exploration_budget {
+        Some(TruncatedBy::ExplorationBudget)
+    } else {
+        let (fanout_cut, depth_cut) = analyze_cuts(conn, &cte, &state.direction, &params)?;
+        match (fanout_cut, depth_cut) {
+            (true, _) => Some(TruncatedBy::MaxFanout),
+            (false, true) => Some(TruncatedBy::MaxDepth),
+            (false, false) => None,
+        }
+    };
+
+    // The chain's state is cumulative: the next token has to seed from every
+    // node the whole chain has returned, not just this call's share. Ordered
+    // by (depth, id) so the resumed queue stays breadth-first.
+    let mut reached = state.visited;
+    reached.extend(nodes.iter().map(|r| VisitedNode { id: r.node.id.clone(), depth: r.depth }));
+    reached.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.id.cmp(&b.id)));
+
+    // The edge side of the same accumulation, and for the same reason: the
+    // seed gate only holds if it knows every hop the *chain* reported, not
+    // just this call's share. Sorted so the token is a function of the walk
+    // rather than of row order.
+    let mut walked_edges = state.walked;
+    walked_edges.extend(edges.iter().map(|e| e.id.clone()));
+    walked_edges.sort_unstable();
+
+    Ok(TraversalResult {
+        frontier_nodes: frontier_nodes(truncated_by, &reached, state.max_depth),
+        resume_token: continuation(
+            truncated_by,
+            ResumeState {
+                direction: state.direction,
+                edge_kind: state.edge_kind,
+                max_depth: state.max_depth,
+                max_fanout: state.max_fanout,
+                visited: reached,
+                walked: walked_edges,
+            },
+        ),
+        nodes,
+        edges,
+        visited_rows,
+        truncated: truncated_by.is_some(),
+        truncated_by,
+    })
+}
+
+fn run_walk(
+    conn: &Connection,
+    cte: &str,
+    params: &[&dyn ToSql],
+) -> Result<Vec<(NodeRecord, u32, Option<EdgeRecord>)>> {
+    let sql = format!(
+        "{cte} \
+         SELECT n.*, w.depth AS depth, \
+                e.id AS walkedEdgeId, e.fromId AS walkedFromId, e.toId AS walkedToId, \
+                e.kind AS walkedKind, e.source AS walkedSource, e.resolved AS walkedResolved \
+         FROM walk w \
+         JOIN nodes n ON n.id = w.node_id \
+         LEFT JOIN edges e ON e.id = w.edge_id \
+         ORDER BY w.depth ASC, w.node_id ASC"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params, |row| {
+            let node = map_node_row(row)?;
+            let depth: u32 = row.get("depth")?;
+            let edge = match row.get::<_, Option<String>>("walkedEdgeId")? {
+                Some(id) => Some(EdgeRecord {
+                    id,
+                    from_id: row.get("walkedFromId")?,
+                    to_id: row.get("walkedToId")?,
+                    kind: row.get("walkedKind")?,
+                    source: row.get("walkedSource")?,
+                    resolved: row.get("walkedResolved")?,
+                }),
+                None => None,
+            };
+            Ok((node, depth, edge))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to run bounded traversal")?;
+
+    Ok(rows)
+}
+
+/// The deepest level the walk expanded - what a `maxDepth` caller re-roots on.
+/// Empty for every other cause: a frontier is only meaningful when depth, not
+/// something else, is what stopped the walk.
+fn frontier_nodes(
+    truncated_by: Option<TruncatedBy>,
+    reached: &[VisitedNode],
+    max_depth: u32,
+) -> Vec<String> {
+    match truncated_by {
+        Some(TruncatedBy::MaxDepth) => reached
+            .iter()
+            .filter(|v| v.depth == max_depth)
+            .map(|v| v.id.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A resume token only for the one cause that cannot be re-queried around:
+/// `maxFanout` is paginated per node, `maxDepth` is re-rooted per frontier
+/// node, but the budget is spent across the whole walk.
+fn continuation(truncated_by: Option<TruncatedBy>, state: ResumeState) -> Option<String> {
+    match truncated_by {
+        Some(TruncatedBy::ExplorationBudget) => Some(resume_token::encode(&state)),
+        _ => None,
+    }
+}
+
 /// Re-runs the walk to ask whether either response-level limit actually
 /// dropped something: `fanout_cut` - some expanded node had more matching
 /// edges than `maxFanout`; `depth_cut` - some node at the depth boundary
-/// leads to a node the walk never reached.
-fn analyze_cuts(conn: &Connection, cte: &str, options: &TraversalOptions) -> Result<(bool, bool)> {
-    let (this_endpoint, other_endpoint) = match options.direction {
-        Direction::Outgoing => ("fromId", "toId"),
-        Direction::Incoming => ("toId", "fromId"),
-    };
+/// leads to a node the walk never reached. `params` are the walk's own five,
+/// so this works against either CTE shape.
+fn analyze_cuts(
+    conn: &Connection,
+    cte: &str,
+    direction: &Direction,
+    params: &[&dyn ToSql],
+) -> Result<(bool, bool)> {
+    let (this_endpoint, other_endpoint) = endpoints(direction);
 
     let sql = format!(
         "{cte} \
@@ -229,24 +442,15 @@ fn analyze_cuts(conn: &Connection, cte: &str, options: &TraversalOptions) -> Res
              ) AS depthCut"
     );
 
-    conn.query_row(
-        &sql,
-        params![
-            options.start_node_id,
-            options.edge_kind,
-            options.max_fanout,
-            options.max_depth,
-            options.exploration_budget
-        ],
-        |row| Ok((row.get("fanoutCut")?, row.get("depthCut")?)),
-    )
-    .context("failed to analyse traversal truncation")
+    conn.query_row(&sql, params, |row| Ok((row.get("fanoutCut")?, row.get("depthCut")?)))
+        .context("failed to analyse traversal truncation")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::schema;
+    use rusqlite::params;
     use std::time::Instant;
 
     fn setup() -> Connection {
@@ -508,5 +712,184 @@ mod tests {
             Some(TruncatedBy::ExplorationBudget),
             "all three limits bind here; the budget is the one the caller cannot re-query around"
         );
+    }
+
+    /// The contract itself: which continuation field each cause hands back.
+    /// A caller reads the presence of the field, not just the enum, so an
+    /// extra one is as wrong as a missing one.
+    #[test]
+    fn each_truncation_cause_carries_only_its_own_continuation_field() {
+        let conn = setup();
+        let chain = ["a", "b", "c", "d", "e"];
+        for id in chain {
+            make_node(&conn, id);
+        }
+        for pair in chain.windows(2) {
+            make_edge(&conn, &format!("e_{}{}", pair[0], pair[1]), pair[0], pair[1], "CALLS");
+        }
+
+        let mut options = TraversalOptions::new("a", Direction::Outgoing);
+        options.max_depth = 2;
+        options.max_fanout = 10_000;
+        let by_depth = traverse(&conn, options).unwrap();
+
+        assert!(by_depth.truncated);
+        assert_eq!(by_depth.truncated_by, Some(TruncatedBy::MaxDepth));
+        assert_eq!(by_depth.frontier_nodes, vec!["c"], "the last fully expanded level, to re-root on");
+        assert_eq!(by_depth.resume_token, None, "a depth cut is re-rooted, not resumed");
+
+        let fanout_conn = setup();
+        make_wide_graph(&fanout_conn, 10, 10);
+        let mut options = TraversalOptions::new("root", Direction::Outgoing);
+        options.max_fanout = 3;
+        options.max_depth = 5;
+        let by_fanout = traverse(&fanout_conn, options).unwrap();
+
+        assert!(by_fanout.truncated);
+        assert_eq!(by_fanout.truncated_by, Some(TruncatedBy::MaxFanout));
+        assert!(by_fanout.frontier_nodes.is_empty(), "a fanout cut is paginated per node, not re-rooted");
+        assert_eq!(by_fanout.resume_token, None);
+
+        let mut options = TraversalOptions::new("root", Direction::Outgoing);
+        options.max_fanout = 1_000_000;
+        options.max_depth = 5;
+        options.exploration_budget = 4;
+        let by_budget = traverse(&fanout_conn, options).unwrap();
+
+        assert!(by_budget.truncated);
+        assert_eq!(by_budget.truncated_by, Some(TruncatedBy::ExplorationBudget));
+        assert!(by_budget.frontier_nodes.is_empty(), "a budget cut has no meaningful depth boundary");
+        assert!(by_budget.resume_token.is_some(), "only the budget needs opaque state to continue");
+
+        let complete = traverse(&conn, TraversalOptions::new("a", Direction::Outgoing)).unwrap();
+        assert!(!complete.truncated);
+        assert_eq!(complete.truncated_by, None);
+        assert!(complete.frontier_nodes.is_empty());
+        assert_eq!(complete.resume_token, None);
+    }
+
+    #[test]
+    fn a_resume_chain_covers_the_whole_walk_exactly_once() {
+        let conn = setup();
+        let chain = ["a", "b", "c", "d", "e", "f", "g"];
+        for id in chain {
+            make_node(&conn, id);
+        }
+        for pair in chain.windows(2) {
+            make_edge(&conn, &format!("e_{}{}", pair[0], pair[1]), pair[0], pair[1], "CALLS");
+        }
+
+        let mut options = TraversalOptions::new("a", Direction::Outgoing);
+        options.max_depth = 10;
+        options.exploration_budget = 3;
+        let first = traverse(&conn, options).unwrap();
+
+        assert_eq!(node_ids(&first), vec!["a", "b", "c"]);
+        assert_eq!(first.truncated_by, Some(TruncatedBy::ExplorationBudget));
+
+        let mut all_nodes: Vec<String> = first.nodes.iter().map(|r| r.node.id.clone()).collect();
+        let mut all_edges: Vec<String> = first.edges.iter().map(|e| e.id.clone()).collect();
+        let mut token = first.resume_token.clone().expect("a budget cut hands back a token");
+        let mut calls = 1;
+
+        let last = loop {
+            // A fresh budget per call is the caller's to choose; the walk's
+            // shape rides along in the token and is not re-negotiable.
+            let next = resume(&conn, &token, 3).unwrap();
+            calls += 1;
+            all_nodes.extend(next.nodes.iter().map(|r| r.node.id.clone()));
+            all_edges.extend(next.edges.iter().map(|e| e.id.clone()));
+
+            match next.resume_token.clone() {
+                Some(t) => token = t,
+                None => break next,
+            }
+            assert!(calls < 10, "the chain must converge, not re-explore itself forever");
+        };
+
+        assert!(calls > 2, "the budget really did split this walk across calls, {calls} of them");
+        assert!(!last.truncated, "the final call ran out of graph, not of budget");
+        assert_eq!(last.truncated_by, None);
+        assert_eq!(last.resume_token, None);
+
+        let mut deduped = all_nodes.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), all_nodes.len(), "no node may be returned by two calls: {all_nodes:?}");
+        assert_eq!(deduped, chain.to_vec(), "the chain's union is the full closure");
+
+        let mut deduped_edges = all_edges.clone();
+        deduped_edges.sort();
+        deduped_edges.dedup();
+        assert_eq!(deduped_edges.len(), all_edges.len(), "no edge may be returned twice: {all_edges:?}");
+        assert_eq!(deduped_edges.len(), chain.len() - 1, "every hop of the chain is reported once");
+    }
+
+    /// A re-expanded seed re-offers all of its edges, and the first call may
+    /// have reported only some of them. Gating on the child *node* dropped
+    /// the rest for good; the gate is on the edge id.
+    #[test]
+    fn a_resumed_seed_reports_the_hop_the_first_call_never_walked() {
+        let conn = setup();
+        for id in ["a", "b", "c", "d"] {
+            make_node(&conn, id);
+        }
+        // b -> c closes a diamond: the first call reaches c via a -> c and
+        // stops, so b -> c is a real edge nobody has walked yet.
+        make_edge(&conn, "e_ab", "a", "b", "CALLS");
+        make_edge(&conn, "e_ac", "a", "c", "CALLS");
+        make_edge(&conn, "e_bc", "b", "c", "CALLS");
+        make_edge(&conn, "e_cd", "c", "d", "CALLS");
+
+        let mut options = TraversalOptions::new("a", Direction::Outgoing);
+        options.max_depth = 10;
+        options.exploration_budget = 3;
+        let first = traverse(&conn, options).unwrap();
+
+        assert_eq!(node_ids(&first), vec!["a", "b", "c"]);
+        assert_eq!(first.edges.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["e_ab", "e_ac"]);
+        assert_eq!(first.truncated_by, Some(TruncatedBy::ExplorationBudget));
+
+        let second = resume(&conn, &first.resume_token.unwrap(), 10).unwrap();
+
+        let mut edge_ids: Vec<&str> = second.edges.iter().map(|e| e.id.as_str()).collect();
+        edge_ids.sort_unstable();
+        assert_eq!(
+            edge_ids,
+            vec!["e_bc", "e_cd"],
+            "b -> c lands on an already-visited node but was never reported, so it is still owed"
+        );
+        assert_eq!(node_ids(&second), vec!["d"], "c was already returned and must not be returned again");
+    }
+
+    /// The same gap at its sharpest: two distinct edges between the same pair
+    /// (the schema keys edges by their own id, so parallel call sites are a
+    /// real shape). Node-level filtering cannot tell the unreported one from
+    /// the reported one.
+    #[test]
+    fn parallel_edges_between_the_same_pair_are_not_lost_across_a_resume() {
+        let conn = setup();
+        for id in ["a", "b", "c"] {
+            make_node(&conn, id);
+        }
+        make_edge(&conn, "e1", "a", "b", "CALLS");
+        make_edge(&conn, "e2", "a", "b", "CALLS");
+        make_edge(&conn, "e3", "a", "c", "CALLS");
+
+        let mut options = TraversalOptions::new("a", Direction::Outgoing);
+        options.exploration_budget = 2;
+        let first = traverse(&conn, options).unwrap();
+
+        assert_eq!(node_ids(&first), vec!["a", "b"]);
+        assert_eq!(first.edges.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["e1"]);
+        assert_eq!(first.truncated_by, Some(TruncatedBy::ExplorationBudget));
+
+        let second = resume(&conn, &first.resume_token.unwrap(), 10).unwrap();
+
+        let mut edge_ids: Vec<&str> = second.edges.iter().map(|e| e.id.as_str()).collect();
+        edge_ids.sort_unstable();
+        assert_eq!(edge_ids, vec!["e2", "e3"], "e2 is a second, unreported edge to an already-visited node");
+        assert_eq!(node_ids(&second), vec!["c"], "b is not a new node just because a new edge reaches it");
+        assert!(!second.truncated);
     }
 }
