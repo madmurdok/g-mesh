@@ -161,6 +161,9 @@ async function* walkDir(
     }
 
     if (!entry.isFile()) continue; // symlinks, sockets, etc. - not source files
+    // Anything with an unsupported extension - including tsconfig.json - is
+    // never opened here, which is what keeps a malicious tsconfig
+    // `compilerOptions.plugins` entry inert (see security.test.ts).
     if (!isSupportedFile(abs)) continue;
     if (isIgnoredByLayers(nextLayers, abs)) continue;
     yield toPosixPath(path.relative(projectRoot, abs));
