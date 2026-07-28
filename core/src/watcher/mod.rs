@@ -1,3 +1,5 @@
+pub mod debounce;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::Duration;
