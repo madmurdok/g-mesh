@@ -1,6 +1,7 @@
 pub mod identity;
+pub mod plugin;
 
-use std::fs;
+use std::fs::{self, File, TryLockError};
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
+use crate::daemon::plugin::PluginProcess;
 use crate::protocol::jsonrpc::{read_frame, write_frame};
 use crate::storage::connection::{self, project_dir};
 use crate::storage::schema;
@@ -19,6 +21,14 @@ use crate::watcher::ProjectWatcher;
 
 const SOCKET_FILE: &str = "daemon.sock";
 const PID_FILE: &str = "daemon.pid";
+/// Held by a shim while it decides whether to bootstrap a daemon and while
+/// it waits for the one it spawned to come up (see `shim::connect_or_bootstrap`).
+const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
+/// Held by a running daemon for its whole lifetime: whoever owns it owns the
+/// project's socket. Deliberately a different file from the bootstrap lock -
+/// the shim holds that one *while* spawning the daemon, so a daemon waiting
+/// on it would deadlock against the shim waiting for the daemon.
+const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
 /// The AF_UNIX socket a project's daemon listens on. The shim derives the
 /// same path from its own cwd, which is how the two find each other without
@@ -33,6 +43,12 @@ pub fn pid_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(PID_FILE))
 }
 
+/// The file shims serialize their bootstrap on, derived exactly like the
+/// socket and pid paths so every process agrees on it without configuration.
+pub fn lock_path(root: &Path) -> Result<PathBuf> {
+    Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
+}
+
 /// Per-project daemon core: opens the SQLite index (checking schema
 /// version), registers the file watcher, and serves shim connections on
 /// the project's AF_UNIX socket. Simplified MVP lifecycle - runs until
@@ -45,25 +61,77 @@ pub fn run(root: &Path) -> Result<()> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create project directory {}", dir.display()))?;
 
+    // Singleton guard, taken before anything else touches the project's
+    // files: whoever holds it owns the socket. A second daemon for the same
+    // project - spawned by a shim that raced ahead of this one's bind, or by
+    // hand - exits here instead of going on to clear and rebind a socket its
+    // predecessor is already serving. Losing this race is the expected,
+    // healthy outcome, not an error: the caller connects to the incumbent.
+    let _singleton = match acquire_singleton_lock(&dir)? {
+        Some(lock) => lock,
+        None => {
+            eprintln!(
+                "g-mesh daemon: another daemon already serves {} - exiting",
+                root.display()
+            );
+            return Ok(());
+        }
+    };
+
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     if schema::ensure_current(&conn).context("failed to check schema version")? {
         eprintln!("g-mesh daemon: schema (re)initialized - a full reindex is needed");
     }
     let conn = Arc::new(Mutex::new(conn));
 
+    // ProjectWatcher reports canonicalized absolute paths (see its own doc
+    // comment on FSEvents' /var -> /private/var behavior); canonicalizing
+    // here too is what lets `relative_wire_path` turn those back into the
+    // project-relative paths the wire protocol and storage layer use.
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
+
+    // A protocol mismatch (or the plugin failing to start at all) is a hard
+    // daemon-startup failure, matching handshake::verify's philosophy - there
+    // is nothing useful this daemon can do without its plugin.
+    let plugin = Arc::new(
+        PluginProcess::spawn(&canonical_root).context("failed to start the JS/TS plugin")?,
+    );
+
     let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-    // Wiring watcher events into plugin notifications + reindex diffs is a
-    // separate ticket; for now the watcher just needs to stay registered
-    // (dropping it would stop watching) without its queue growing forever.
-    thread::spawn(move || loop {
-        watcher.next_change(Duration::from_secs(3600));
-    });
+    {
+        let conn = Arc::clone(&conn);
+        let plugin = Arc::clone(&plugin);
+        let root = canonical_root.clone();
+        // Debouncer/BurstBatcher (watcher::debounce, watcher::burst) would
+        // coalesce a burst of saves into fewer plugin round trips, but
+        // wiring them in is nice-to-have, not required by this ticket's
+        // acceptance criteria - left for a later pass rather than scope-
+        // creeping into a batching rewrite here.
+        thread::spawn(move || loop {
+            match watcher.next_change(Duration::from_secs(3600)) {
+                None => continue, // nothing arrived within the idle timeout; keep waiting
+                Some(path) => {
+                    let Some(file_path) = relative_wire_path(&root, &path) else {
+                        // Outside the project root - shouldn't happen given how
+                        // ProjectWatcher is scoped, but there is nothing to
+                        // route a plugin request for if it does.
+                        continue;
+                    };
+                    if let Err(err) = plugin.apply_file_change(&conn, file_path) {
+                        eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+                    }
+                }
+            }
+        });
+    }
 
     let socket = dir.join(SOCKET_FILE);
     // A socket file left behind by a crashed daemon makes bind() fail with
-    // AddrInUse forever, so it is cleared first. Two daemons racing to bind
-    // the same project is the concurrent-first-start race that the pid/socket
-    // file lock covers - that guard is a separate ticket.
+    // AddrInUse forever, so it is cleared first. That is only safe because
+    // the singleton lock above guarantees no other daemon is serving this
+    // project: any socket file still here belongs to a dead one.
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
@@ -82,6 +150,43 @@ pub fn run(root: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Converts an absolute, canonicalized path (as `ProjectWatcher` reports
+/// them) into the project-relative, forward-slash path string the wire
+/// protocol and storage layer use - the same convention the plugin's own
+/// `toPosixPath` follows in bulkIndex.ts. `None` for a path outside `root`,
+/// which is not this function's job to treat as an error.
+fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
+    let rel = absolute.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        parts.push(component.as_os_str().to_str()?.to_string());
+    }
+    Some(parts.join("/"))
+}
+
+/// Takes the project's daemon lock, or reports that someone else holds it.
+///
+/// The returned `File` must stay alive for as long as the daemon runs: the
+/// lock is advisory and tied to the open file, so dropping it (or exiting,
+/// or being killed) releases it - which is exactly what lets the next daemon
+/// take over from a crashed one without any stale-lock cleanup.
+fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
+    let path = dir.join(DAEMON_LOCK_FILE);
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open daemon lock file {}", path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(err)
+            .with_context(|| format!("failed to lock {}", path.display())),
+    }
 }
 
 /// The shim<->daemon socket carries whatever JSON-RPC the MCP client sends;
