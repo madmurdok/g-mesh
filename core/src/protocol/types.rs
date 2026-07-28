@@ -130,6 +130,35 @@ pub struct Handshake {
     pub plugin_version: String,
 }
 
+/// The wire-level shape of a plugin's answer to a `FileChanged` request:
+/// which nodes/edges to upsert or delete. Mirrors
+/// `storage::write::Diff` field-for-field (same `upsert`/`delete`
+/// vocabulary, not a separate "added/removed" one) but using the
+/// `WireNode`/`WireEdge` bulk-transfer shapes instead of storage records.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeDiff {
+    #[serde(default)]
+    pub upsert_nodes: Vec<WireNode>,
+    #[serde(default)]
+    pub delete_node_ids: Vec<String>,
+    #[serde(default)]
+    pub upsert_edges: Vec<WireEdge>,
+    #[serde(default)]
+    pub delete_edge_ids: Vec<String>,
+}
+
+/// Minimal JSON-RPC 2.0 response envelope carrying a `FileChangeDiff` -
+/// the counterpart to `ControlEnvelope` (which is the request/notification
+/// side only). Kept as one concrete response type rather than a generic
+/// `ControlResponse<T>` since this ticket only needs this one shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileChangeResponse {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub result: FileChangeDiff,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +236,72 @@ mod tests {
         assert!(!json.contains("\"id\""), "notifications must omit id per JSON-RPC 2.0");
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
+    }
+
+    #[test]
+    fn file_change_diff_round_trips_with_camel_case_keys() {
+        let diff = FileChangeDiff {
+            upsert_nodes: vec![WireNode {
+                id: "n1".to_string(),
+                kind: NodeKind::Function,
+                name: "foo".to_string(),
+                qualified_name: "mod::foo".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                range: Range {
+                    start: Position { line: 1, col: 0 },
+                    end: Position { line: 3, col: 1 },
+                },
+                signature: None,
+                exported: true,
+                doc_comment: None,
+                language: "rust".to_string(),
+                native_kind: None,
+                has_syntax_errors: false,
+            }],
+            delete_node_ids: vec!["n2".to_string()],
+            upsert_edges: vec![WireEdge {
+                id: "e1".to_string(),
+                from_id: "n1".to_string(),
+                to_id: "n3".to_string(),
+                kind: EdgeKind::Calls,
+                source: EdgeSource::TreeSitter,
+                resolved: false,
+            }],
+            delete_edge_ids: vec!["e2".to_string()],
+        };
+
+        let json = serde_json::to_string(&diff).unwrap();
+        assert!(json.contains("\"upsertNodes\""));
+        assert!(json.contains("\"deleteNodeIds\""));
+        assert!(json.contains("\"upsertEdges\""));
+        assert!(json.contains("\"deleteEdgeIds\""));
+
+        let round_tripped: FileChangeDiff = serde_json::from_str(&json).unwrap();
+        assert_eq!(diff, round_tripped);
+    }
+
+    #[test]
+    fn file_change_diff_round_trips_when_empty() {
+        let diff = FileChangeDiff::default();
+        let json = serde_json::to_string(&diff).unwrap();
+        let round_tripped: FileChangeDiff = serde_json::from_str(&json).unwrap();
+        assert_eq!(diff, round_tripped);
+    }
+
+    #[test]
+    fn file_change_response_round_trips_with_matching_id() {
+        let response = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::Number(42),
+            result: FileChangeDiff::default(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"result\""));
+        assert!(!json.contains("\"method\""), "a response has no method field, unlike ControlEnvelope");
+
+        let round_tripped: FileChangeResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, round_tripped);
     }
 
     #[test]

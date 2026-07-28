@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod burst;
 pub mod debounce;
 
