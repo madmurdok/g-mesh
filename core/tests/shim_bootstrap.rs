@@ -2,8 +2,13 @@
 //! running daemon, and bootstraps a detached one when none is running.
 //! Everything here drives the real binary as a subprocess - the point is to
 //! exercise actual process spawning, sockets and framing, not a mock.
+//!
+//! The wire probe is a real MCP `initialize` + `tools/list`, hand-framed as
+//! newline-delimited JSON, because that is the only traffic the shim carries;
+//! what each test is actually about, though, is which daemon ends up serving
+//! it.
 
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,14 +17,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
-use g_mesh::protocol::jsonrpc::{read_frame, write_frame};
+use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
+const PROTOCOL_VERSION: &str = "2025-06-18";
 
-const REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"status"}"#;
+/// Every tool the MVP promises, whatever order the router lists them in.
+const EXPECTED_TOOLS: [&str; 7] = [
+    "find_callees",
+    "find_callers",
+    "find_definition",
+    "find_implementations",
+    "find_references",
+    "get_dependencies",
+    "get_file_outline",
+];
 
 /// Temp project root plus teardown of the `~/.g-mesh/projects/<hash>/`
 /// directory the daemon creates outside it.
@@ -100,32 +115,86 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// Reads one frame off a stream on a helper thread so a shim that never
-/// answers fails the test instead of hanging it forever.
-fn read_one_frame<R: Read + Send + 'static>(reader: R) -> Vec<u8> {
+/// Runs `initialize` + `tools/list` over one duplex channel and returns the
+/// tool names, sorted.
+///
+/// The conversation runs on a helper thread so a peer that never answers
+/// fails the test instead of hanging it forever; when that thread finishes it
+/// drops `writer`, which is what closes the shim's stdin and lets it exit.
+fn mcp_tool_names<W, R>(writer: W, reader: R) -> Vec<String>
+where
+    W: Write + Send + 'static,
+    R: Read + Send + 'static,
+{
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let _ = tx.send(read_frame(&mut reader).expect("failed to read a frame"));
+        let _ = tx.send(list_tools(writer, reader));
     });
-    rx.recv_timeout(TIMEOUT)
-        .expect("timed out waiting for a response frame")
-        .expect("stream closed before a response frame arrived")
+
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(Ok(names)) => names,
+        Ok(Err(err)) => panic!("MCP session failed: {err}"),
+        Err(err) => panic!("MCP session did not finish within {TIMEOUT:?}: {err}"),
+    }
 }
 
-/// Sends one request through the shim's stdio and returns what came back,
-/// then closes stdin so the shim shuts down and waits for it to exit.
-fn round_trip_through_shim(shim: &mut Child) -> Vec<u8> {
-    let mut stdin = shim.stdin.take().expect("shim stdin was not piped");
-    write_frame(&mut stdin, REQUEST).expect("failed to write a request to the shim");
+fn list_tools<W: Write, R: Read>(mut writer: W, reader: R) -> Result<Vec<String>, String> {
+    let mut reader = BufReader::new(reader);
 
+    send(&mut writer, &json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "g-mesh-shim-tests", "version": "0" },
+        },
+    }))?;
+    let initialized = receive(&mut reader)?;
+    if initialized["result"]["serverInfo"]["name"] != "g-mesh" {
+        return Err(format!("unexpected initialize response: {initialized}"));
+    }
+    send(&mut writer, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
+
+    send(&mut writer, &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }))?;
+    let listed = receive(&mut reader)?;
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| format!("tools/list did not return a tool array: {listed}"))?;
+
+    let mut names: Vec<String> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+fn send<W: Write>(writer: &mut W, message: &Value) -> Result<(), String> {
+    let body = serde_json::to_vec(message).expect("request is always serializable");
+    write_ndjson_frame(writer, &body).map_err(|e| format!("cannot send {message}: {e:#}"))
+}
+
+fn receive<R: Read>(reader: &mut BufReader<R>) -> Result<Value, String> {
+    let frame = read_ndjson_frame(reader)
+        .map_err(|e| format!("cannot read a response: {e:#}"))?
+        .ok_or("the peer closed the connection instead of answering")?;
+    serde_json::from_slice(&frame).map_err(|e| {
+        format!("response is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame))
+    })
+}
+
+/// One MCP probe through the shim's stdio, then waits for it to exit - the
+/// helper thread closing stdin is what tells it to.
+fn round_trip_through_shim(shim: &mut Child) -> Vec<String> {
+    let stdin = shim.stdin.take().expect("shim stdin was not piped");
     let stdout = shim.stdout.take().expect("shim stdout was not piped");
-    let response = read_one_frame(stdout);
+    let names = mcp_tool_names(stdin, stdout);
 
-    drop(stdin);
     let status = wait_with_timeout(shim);
     assert!(status.success(), "shim exited with {status}");
-    response
+    names
 }
 
 fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
@@ -142,20 +211,18 @@ fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// One request/response over the daemon socket directly, bypassing the shim.
-fn round_trip_over_socket(socket: &Path) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket)
+/// One MCP probe over the daemon socket directly, bypassing the shim.
+fn round_trip_over_socket(socket: &Path) -> Vec<String> {
+    let stream = UnixStream::connect(socket)
         .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", socket.display()));
-    write_frame(&mut stream, REQUEST).expect("failed to write a request to the daemon");
-    read_one_frame(stream)
+    let writer = stream.try_clone().expect("failed to clone the daemon socket");
+    mcp_tool_names(writer, stream)
 }
 
-/// Asserts the frame is a real `status` response naming the given daemon pid
-/// (not a byte-for-byte echo of the request).
-fn assert_status_response(frame: &[u8], expected_pid: u32) {
-    let response: Value = serde_json::from_slice(frame).expect("response is not valid JSON");
-    assert_eq!(response["result"]["status"], "ok");
-    assert_eq!(response["result"]["pid"].as_u64(), Some(expected_pid as u64));
+/// Asserts a live daemon answered with the real tool surface (rather than,
+/// say, the shim echoing the request back).
+fn assert_tool_surface(names: &[String]) {
+    assert_eq!(names, EXPECTED_TOOLS);
 }
 
 #[test]
@@ -172,9 +239,8 @@ fn shim_proxies_through_an_already_running_daemon() {
     assert_eq!(pid_before, daemon.id(), "pid file must name the daemon we started");
 
     let mut shim = spawn_shim(project.root());
-    let response = round_trip_through_shim(&mut shim);
+    assert_tool_surface(&round_trip_through_shim(&mut shim));
 
-    assert_status_response(&response, pid_before);
     assert!(socket.exists(), "the daemon socket must survive the shim");
     assert_eq!(
         project.daemon_pid(),
@@ -192,16 +258,15 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
     assert!(!socket.exists(), "no daemon may be running for a fresh project root");
 
     let mut shim = spawn_shim(project.root());
-    let response = round_trip_through_shim(&mut shim);
+    assert_tool_surface(&round_trip_through_shim(&mut shim));
 
     assert!(socket.exists(), "the bootstrapped daemon must have bound its socket");
     let pid = project.daemon_pid();
-    assert_status_response(&response, pid);
 
     // The shim has already exited; a second round trip over the same socket
     // proves the daemon it spawned is genuinely detached rather than a child
     // that died with its parent.
-    assert_status_response(&round_trip_over_socket(&socket), pid);
+    assert_tool_surface(&round_trip_over_socket(&socket));
 
     let alive = Command::new("kill")
         .arg("-0")
@@ -225,18 +290,17 @@ fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
     let mut shim_a = spawn_shim(project.root());
     let mut shim_b = spawn_shim(project.root());
 
-    let response_a = round_trip_through_shim(&mut shim_a);
-    let response_b = round_trip_through_shim(&mut shim_b);
+    assert_tool_surface(&round_trip_through_shim(&mut shim_a));
+    assert_tool_surface(&round_trip_through_shim(&mut shim_b));
 
     let pid = project.daemon_pid();
-    assert_status_response(&response_a, pid);
-    assert_status_response(&response_b, pid);
 
     // If a second daemon had ever won a later bind race, it would have
     // overwritten the pid file with its own pid; a third round trip straight
-    // over the socket still reporting the same pid proves the daemon both
-    // shims talked to is still the only one alive for this project.
-    assert_status_response(&round_trip_over_socket(&socket), pid);
+    // over the socket still being served, with the pid file unchanged, proves
+    // the daemon both shims talked to is still the only one alive.
+    assert_tool_surface(&round_trip_over_socket(&socket));
+    assert_eq!(project.daemon_pid(), pid, "a second daemon must never have taken over");
 
     let alive = Command::new("kill")
         .arg("-0")

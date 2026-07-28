@@ -3,7 +3,7 @@ use base64::prelude::*;
 use rusqlite::{params, Connection, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::storage::write::EdgeRecord;
+use crate::storage::write::{EdgeRecord, NodeRecord};
 
 /// Opaque cursor-paginated batch, shared shape for every list-shaped MCP
 /// tool response. Cursor instead of offset: background reindexing can
@@ -30,7 +30,11 @@ struct StructuralCursor {
     id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Which way to follow edges out of an anchor node.
+// Doc comments here are user-facing: `JsonSchema` is derived so
+// `get_dependencies`' MCP tool schema can name this exact enum rather than
+// restating its variants, and schemars publishes the prose verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Direction {
     /// Edges going out of the anchor node (`fromId = anchor`).
     Outgoing,
@@ -133,6 +137,63 @@ pub fn paginate_edges(
         has_more,
         next_cursor,
     })
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourceOrderCursor {
+    start_line: i64,
+    start_col: i64,
+    id: String,
+}
+
+/// Paginates the symbols a `File` node's `DEFINES` edges reach, ordered by
+/// source position (`startLine` then `startCol` ascending, `id` as a stable
+/// tiebreaker for same-position nodes) rather than `paginate_edges`'
+/// resolved/locality rule - `get_file_outline`'s whole point is to read back
+/// "as the file reads", not ranked by confidence. Joins straight to `nodes`
+/// instead of returning `EdgeRecord`s to resolve one at a time, since every
+/// caller wants the full node here and there's no ambiguity about which end
+/// of the edge that is.
+pub fn paginate_defines(
+    conn: &Connection,
+    file_node_id: &str,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Page<NodeRecord>> {
+    let decoded: Option<SourceOrderCursor> = cursor.map(decode_cursor).transpose()?;
+
+    let sql = "SELECT n.* FROM edges e JOIN nodes n ON n.id = e.toId \
+               WHERE e.fromId = ?1 AND e.kind = 'DEFINES' \
+                 AND ( \
+                   ?2 = 0 \
+                   OR n.startLine > ?3 \
+                   OR (n.startLine = ?3 AND n.startCol > ?4) \
+                   OR (n.startLine = ?3 AND n.startCol = ?4 AND n.id > ?5) \
+                 ) \
+               ORDER BY n.startLine ASC, n.startCol ASC, n.id ASC \
+               LIMIT ?6";
+
+    let (has_cursor, cursor_line, cursor_col, cursor_id): (i64, i64, i64, String) = match &decoded {
+        Some(c) => (1, c.start_line, c.start_col, c.id.clone()),
+        None => (0, 0, 0, String::new()),
+    };
+    let limit = (page_size + 1) as i64;
+
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows: Vec<NodeRecord> = stmt
+        .query_map(params![file_node_id, has_cursor, cursor_line, cursor_col, cursor_id, limit], crate::graph::queries::map_node_row)?
+        .collect::<rusqlite::Result<_>>()
+        .context("failed to paginate DEFINES edges")?;
+
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+
+    let next_cursor = has_more.then(|| {
+        let last = rows.last().expect("has_more implies at least one row");
+        encode_cursor(&SourceOrderCursor { start_line: last.start_line, start_col: last.start_col, id: last.id.clone() })
+    });
+
+    Ok(Page { results: rows, has_more, next_cursor })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -310,6 +371,64 @@ mod tests {
         }
         assert!(seen.contains(&"e_intruder".to_string()), "the new lowest-priority row lands on the final page");
         assert_eq!(seen.len(), 6);
+    }
+
+    fn make_node_at(conn: &Connection, id: &str, file_path: &str, start_line: i64, start_col: i64) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, 'Function', ?1, ?1, ?2, ?3, ?4, ?3, ?4, 'rust')",
+            params![id, file_path, start_line, start_col],
+        )
+        .unwrap();
+    }
+
+    fn make_defines_edge(conn: &Connection, id: &str, file_id: &str, symbol_id: &str) {
+        conn.execute(
+            "INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, 'DEFINES', 'tree-sitter', false)",
+            params![id, file_id, symbol_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn paginate_defines_orders_by_source_position_not_insertion_order() {
+        let conn = setup();
+        make_node(&conn, "file", "a.rs");
+        make_node_at(&conn, "third", "a.rs", 30, 0);
+        make_node_at(&conn, "first", "a.rs", 5, 0);
+        make_node_at(&conn, "second", "a.rs", 5, 4);
+        make_defines_edge(&conn, "e_third", "file", "third");
+        make_defines_edge(&conn, "e_first", "file", "first");
+        make_defines_edge(&conn, "e_second", "file", "second");
+
+        let page = paginate_defines(&conn, "file", 10, None).unwrap();
+        let ids: Vec<&str> = page.results.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second", "third"], "must come back in source order, not insertion order");
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn paginate_defines_paginates_across_cursor_continuation() {
+        let conn = setup();
+        make_node(&conn, "file", "a.rs");
+        for i in 0..5 {
+            let id = format!("n{i}");
+            make_node_at(&conn, &id, "a.rs", i, 0);
+            make_defines_edge(&conn, &format!("e{i}"), "file", &id);
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = paginate_defines(&conn, "file", 2, cursor.as_deref()).unwrap();
+            seen.extend(page.results.into_iter().map(|n| n.id));
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"], "must return every symbol exactly once, in source order");
     }
 
     #[test]

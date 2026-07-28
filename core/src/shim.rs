@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::daemon;
-use crate::protocol::jsonrpc::{read_frame, write_frame};
+use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 
 /// How long to keep retrying the first connect after bootstrapping a daemon,
 /// and how long to wait between attempts. The daemon needs a few milliseconds
@@ -154,9 +154,13 @@ fn proxy(stream: UnixStream) -> Result<()> {
     pump(&mut inbound, &mut stdout)
 }
 
+/// Moves whole MCP messages across, one at a time. Both legs are newline-
+/// delimited JSON - that is what the MCP stdio transport mandates on the
+/// client side, and the daemon speaks the same framing on the socket, so the
+/// shim can stay a repacking proxy that never parses a payload.
 fn pump<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
-    while let Some(frame) = read_frame(reader)? {
-        write_frame(writer, &frame)?;
+    while let Some(frame) = read_ndjson_frame(reader)? {
+        write_ndjson_frame(writer, &frame)?;
     }
     Ok(())
 }

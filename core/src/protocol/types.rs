@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking change to this wire contract. A mismatch between
@@ -6,7 +7,12 @@ pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A point in a source file, as a line and a column.
+// Doc comments on this type and its fields are user-facing: `JsonSchema` is
+// derived so the MCP tool schemas can describe positions with the very type
+// the plugin protocol and storage layer already use, and schemars copies the
+// prose straight into the published schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Position {
     pub line: u32,
     pub col: u32,

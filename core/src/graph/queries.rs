@@ -97,6 +97,41 @@ pub fn find_by_qualified_name(
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by qualifiedName")
 }
 
+/// Finds the `File` node for a project-relative path, e.g. resolving
+/// `get_file_outline`'s anchor. `File` nodes' own `filePath` is the path
+/// itself (see the js-ts plugin's extractor), so this is a plain lookup, not
+/// a join.
+pub fn find_file_node(conn: &Connection, file_path: &str) -> Result<Option<NodeRecord>> {
+    conn.query_row(
+        "SELECT * FROM nodes WHERE kind = 'File' AND filePath = ?1",
+        params![file_path],
+        map_node_row,
+    )
+    .optional()
+    .context("failed to look up file node")
+}
+
+/// Finds the innermost node enclosing a cursor position, e.g. resolving
+/// `find_definition`'s file+position input. Multiple nodes can contain a
+/// position (a `File` spans the whole file, a `Function` inside it spans
+/// just itself) - ordering by span size ascending picks the smallest one
+/// first, which is always the most specific.
+pub fn find_by_position(conn: &Connection, file_path: &str, line: u32, col: u32) -> Result<Option<NodeRecord>> {
+    let (line, col) = (line as i64, col as i64);
+    conn.query_row(
+        "SELECT * FROM nodes \
+         WHERE filePath = ?1 \
+           AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
+           AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
+         ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
+         LIMIT 1",
+        params![file_path, line, col],
+        map_node_row,
+    )
+    .optional()
+    .context("failed to look up node by position")
+}
+
 pub fn upsert_edge(conn: &mut Connection, edge: EdgeRecord) -> Result<()> {
     write::apply_diff(
         conn,
@@ -181,6 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn find_file_node_looks_up_by_file_path_not_name() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file1", "File", "lib.rs", "src/lib.rs", "src/lib.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("fn1", "Function", "run", "pkg::run", "src/lib.rs", "rust")).unwrap();
+
+        let found = find_file_node(&conn, "src/lib.rs").unwrap().unwrap();
+        assert_eq!(found.id, "file1", "must return the File node, not the unrelated symbol sharing its filePath");
+
+        assert!(find_file_node(&conn, "missing.rs").unwrap().is_none());
+    }
+
+    #[test]
     fn delete_edge_removes_only_that_edge() {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")).unwrap();
@@ -212,5 +259,33 @@ mod tests {
         let by_qualified = find_by_qualified_name(&conn, "pkg_a::run", None).unwrap();
         assert_eq!(by_qualified.len(), 1);
         assert_eq!(by_qualified[0].id, "n1");
+    }
+
+    fn node_with_span(id: &str, kind: &str, file_path: &str, start: (i64, i64), end: (i64, i64)) -> NodeRecord {
+        let mut node = NodeRecord::new(id, kind, id, id, file_path, "rust");
+        node.start_line = start.0;
+        node.start_col = start.1;
+        node.end_line = end.0;
+        node.end_col = end.1;
+        node
+    }
+
+    #[test]
+    fn find_by_position_picks_the_innermost_enclosing_node() {
+        let mut conn = setup();
+        upsert_node(&mut conn, node_with_span("file1", "File", "a/lib.rs", (0, 0), (20, 0))).unwrap();
+        upsert_node(&mut conn, node_with_span("fn1", "Function", "a/lib.rs", (5, 0), (10, 1))).unwrap();
+
+        let found = find_by_position(&conn, "a/lib.rs", 7, 2).unwrap().unwrap();
+        assert_eq!(found.id, "fn1", "the nested function must win over the enclosing file");
+    }
+
+    #[test]
+    fn find_by_position_returns_none_outside_every_node() {
+        let mut conn = setup();
+        upsert_node(&mut conn, node_with_span("file1", "File", "a/lib.rs", (0, 0), (20, 0))).unwrap();
+        upsert_node(&mut conn, node_with_span("fn1", "Function", "a/lib.rs", (5, 0), (10, 1))).unwrap();
+
+        assert!(find_by_position(&conn, "a/lib.rs", 50, 0).unwrap().is_none());
     }
 }

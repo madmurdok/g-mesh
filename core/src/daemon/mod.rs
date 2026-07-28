@@ -2,8 +2,7 @@ pub mod identity;
 pub mod plugin;
 
 use std::fs::{self, File, TryLockError};
-use std::io::BufReader;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,10 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use serde_json::{json, Value};
 
 use crate::daemon::plugin::PluginProcess;
-use crate::protocol::jsonrpc::{read_frame, write_frame};
+use crate::mcp;
 use crate::storage::connection::{self, project_dir};
 use crate::storage::schema;
 use crate::watcher::ProjectWatcher;
@@ -50,9 +48,10 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
-/// version), registers the file watcher, and serves shim connections on
-/// the project's AF_UNIX socket. Simplified MVP lifecycle - runs until
-/// killed; the two-tier idle-timeout model and `g-mesh stop` are backlog.
+/// version), registers the file watcher, and serves an MCP session per
+/// connection on the project's AF_UNIX socket. Simplified MVP lifecycle -
+/// runs until killed; the two-tier idle-timeout model and `g-mesh stop` are
+/// backlog.
 ///
 /// Unix-only for now: AF_UNIX is available on Windows 10+ but is not wired
 /// up here (see the architecture doc's shim/daemon section).
@@ -140,16 +139,53 @@ pub fn run(root: &Path) -> Result<()> {
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
 
-    for stream in listener.incoming() {
-        let stream = stream.context("failed to accept a daemon connection")?;
-        let conn = Arc::clone(&conn);
-        thread::spawn(move || {
-            if let Err(err) = serve(stream, &conn) {
-                eprintln!("g-mesh daemon: connection ended: {err:#}");
-            }
-        });
-    }
-    Ok(())
+    serve_forever(listener, conn, plugin)
+}
+
+/// Runs the MCP accept loop until the process is killed.
+///
+/// This is the only async part of the daemon, and deliberately the last thing
+/// that happens: `rmcp` requires tokio, but SQLite, the plugin bridge and the
+/// watcher above have no use for it, so the runtime is entered here rather
+/// than wrapped around a daemon that would otherwise gain nothing from it.
+/// The listener is bound synchronously (above) and only then handed to tokio,
+/// which keeps every bind/pid-file ordering guarantee the bootstrap race
+/// depends on exactly where it was.
+fn serve_forever(
+    listener: UnixListener,
+    conn: Arc<Mutex<Connection>>,
+    plugin: Arc<PluginProcess>,
+) -> Result<()> {
+    // Two workers: connections are few (one per MCP client) and their work is
+    // dominated by a mutex-guarded SQLite handle, so more threads would only
+    // queue on the same lock.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("failed to build the daemon's async runtime")?;
+
+    runtime.block_on(async move {
+        listener
+            .set_nonblocking(true)
+            .context("failed to put the daemon socket in non-blocking mode")?;
+        let listener = tokio::net::UnixListener::from_std(listener)
+            .context("failed to register the daemon socket with the async runtime")?;
+
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .context("failed to accept a daemon connection")?;
+            let conn = Arc::clone(&conn);
+            let plugin = Arc::clone(&plugin);
+            tokio::spawn(async move {
+                if let Err(err) = mcp::serve_connection(stream, conn, plugin).await {
+                    eprintln!("g-mesh daemon: connection ended: {err:#}");
+                }
+            });
+        }
+    })
 }
 
 /// Converts an absolute, canonicalized path (as `ProjectWatcher` reports
@@ -189,52 +225,3 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     }
 }
 
-/// The shim<->daemon socket carries whatever JSON-RPC the MCP client sends;
-/// real tool dispatch is later tickets (MCP server scaffolding, find_*).
-/// For now only `status` is handled for real, so a manual client has
-/// something genuine to check the daemon is alive and its DB is open -
-/// anything else gets a proper JSON-RPC "method not found" rather than a
-/// placeholder echo.
-fn serve(stream: UnixStream, conn: &Arc<Mutex<Connection>>) -> Result<()> {
-    let mut writer = stream.try_clone().context("failed to clone daemon socket")?;
-    let mut reader = BufReader::new(stream);
-    while let Some(frame) = read_frame(&mut reader)? {
-        if let Some(response) = handle_request(&frame, conn) {
-            write_frame(&mut writer, &response)?;
-        }
-    }
-    Ok(())
-}
-
-fn handle_request(frame: &[u8], conn: &Arc<Mutex<Connection>>) -> Option<Vec<u8>> {
-    let request: Value = match serde_json::from_slice(frame) {
-        Ok(v) => v,
-        Err(_) => return Some(error_response(Value::Null, -32700, "parse error")),
-    };
-    // No `id` means a notification (JSON-RPC 2.0): no response is sent.
-    let id = request.get("id")?.clone();
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-
-    let response = match method {
-        "status" => {
-            let node_count: i64 = conn
-                .lock()
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
-                .unwrap_or(0);
-            success_response(id, json!({ "status": "ok", "pid": std::process::id(), "nodeCount": node_count }))
-        }
-        other => error_response(id, -32601, &format!("method not found: {other}")),
-    };
-    Some(response)
-}
-
-fn success_response(id: Value, result: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-        .expect("response is always serializable")
-}
-
-fn error_response(id: Value, code: i32, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
-        .expect("response is always serializable")
-}
