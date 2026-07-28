@@ -210,3 +210,38 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
         .expect("failed to signal the daemon");
     assert!(alive.success(), "daemon pid {pid} is no longer alive");
 }
+
+#[test]
+fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
+    let project = Project::new();
+    let socket = project.socket();
+    assert!(!socket.exists(), "no daemon may be running for a fresh project root");
+
+    // Spawned back-to-back with no synchronization in between: both are
+    // independent OS processes that start racing to bootstrap this
+    // project's daemon the instant they're spawned, well before either of
+    // them appears in this test's own control flow below. That's the real
+    // concurrency the bootstrap lock has to serialize.
+    let mut shim_a = spawn_shim(project.root());
+    let mut shim_b = spawn_shim(project.root());
+
+    let response_a = round_trip_through_shim(&mut shim_a);
+    let response_b = round_trip_through_shim(&mut shim_b);
+
+    let pid = project.daemon_pid();
+    assert_status_response(&response_a, pid);
+    assert_status_response(&response_b, pid);
+
+    // If a second daemon had ever won a later bind race, it would have
+    // overwritten the pid file with its own pid; a third round trip straight
+    // over the socket still reporting the same pid proves the daemon both
+    // shims talked to is still the only one alive for this project.
+    assert_status_response(&round_trip_over_socket(&socket), pid);
+
+    let alive = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .expect("failed to signal the daemon");
+    assert!(alive.success(), "daemon pid {pid} is no longer alive");
+}

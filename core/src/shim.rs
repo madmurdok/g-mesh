@@ -1,3 +1,4 @@
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -37,14 +38,62 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
         return Ok(stream);
     }
 
-    // TOCTOU: two shims starting concurrently on the same project can both
-    // get here and both spawn a daemon. The file lock that closes this gap is
-    // a separate ticket - deliberately not guarded here.
-    spawn_detached_daemon(root)?;
+    // Nothing is listening, so this shim may have to bootstrap a daemon -
+    // a decision that has to be serialized across processes, because two
+    // shims started at the same moment for the same project would otherwise
+    // both spawn one. The lock is held across the spawn *and* the wait
+    // below, so by the time it is handed on the daemon is already up.
+    let lock = acquire_bootstrap_lock(root)?;
 
+    // The re-check under the lock is what makes the lock worth taking: a
+    // shim that queued behind another one finds the socket connectable here
+    // and connects instead of spawning a second daemon. Returning drops the
+    // lock, handing it to whoever is waiting next.
+    if let Ok(stream) = UnixStream::connect(&socket) {
+        return Ok(stream);
+    }
+
+    spawn_detached_daemon(root)?;
+    let stream = wait_until_listening(&socket);
+    // Released the moment the daemon is reachable - or, just as importantly,
+    // the moment bootstrapping it failed, so one bad start does not wedge
+    // every other shim on this project behind a lock nobody will release.
+    drop(lock);
+    stream
+}
+
+/// Opens (creating if absent) the project's bootstrap lock file and blocks
+/// until this process holds it exclusively.
+///
+/// Blocking rather than try-locking is the point: a shim that loses the race
+/// has to wait for the winner's daemon rather than start a competing one.
+/// The lock is an advisory `flock()` tied to the open file, so the kernel
+/// drops it if the holder exits or is killed mid-bootstrap - a dead shim
+/// cannot leave the project locked.
+fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
+    let path = daemon::lock_path(root)?;
+    // First shim for a project gets here before anything has created the
+    // per-project state directory (the daemon is what usually creates it).
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create project directory {}", dir.display()))?;
+    }
+
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open bootstrap lock file {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to take the bootstrap lock on {}", path.display()))?;
+    Ok(file)
+}
+
+fn wait_until_listening(socket: &Path) -> Result<UnixStream> {
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
-        match UnixStream::connect(&socket) {
+        match UnixStream::connect(socket) {
             Ok(stream) => return Ok(stream),
             Err(err) if Instant::now() >= deadline => {
                 bail!(
