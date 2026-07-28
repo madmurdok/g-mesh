@@ -3,10 +3,10 @@
 //! connection to one `rmcp` session.
 //!
 //! Every tool is registered with its real name, description and parameter
-//! schema but answers "not implemented yet" - the schemas are the contract
-//! five follow-up tickets fill in one handler at a time, and registering them
-//! up front means a client can discover and be wired against the finished
-//! surface today rather than watching tools appear one by one.
+//! schema, and each one's answer lives in a module of its own next to this
+//! one - the schemas were registered up front, before the handlers existed,
+//! so a client could be wired against the finished surface rather than watch
+//! tools appear one by one; this file has stayed pure router wiring since.
 //!
 //! Why `rmcp` (and therefore tokio) only here: the rest of the daemon - SQLite,
 //! the plugin bridge, the watcher - is plainly synchronous and has no reason
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use rusqlite::Connection;
 use schemars::JsonSchema;
@@ -34,6 +34,7 @@ mod find_callers_callees;
 mod find_definition;
 mod find_implementations;
 mod find_references;
+mod get_dependencies;
 mod get_file_outline;
 mod tool_result;
 
@@ -56,25 +57,15 @@ pub async fn serve_connection(
 /// The structural query surface, backed by the project's index and the
 /// language plugin.
 ///
-/// `conn` and `plugin` are held (not yet read) because the follow-up tool
-/// handlers are what turn them into answers; wiring them once here keeps that
-/// work to editing a single tool body each.
+/// Every handler answers out of `conn` alone; `plugin` is held but not read
+/// yet, because the tool that needs it - a query the index cannot answer
+/// without asking the language server - is still ahead of the MVP surface.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
     conn: Arc<Mutex<Connection>>,
     #[allow(dead_code)]
     plugin: Arc<PluginProcess>,
     tool_router: ToolRouter<Self>,
-}
-
-/// One wording, one place. Reported as a tool-level error rather than a
-/// JSON-RPC one so the text actually reaches the caller: MCP clients render
-/// protocol errors opaquely, and "this tool isn't built yet" is precisely the
-/// kind of thing an agent needs to read.
-fn not_implemented(tool: &str) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-        "g-mesh: `{tool}` is registered but not implemented yet"
-    ))]))
 }
 
 #[tool_router]
@@ -143,9 +134,9 @@ impl GMeshMcpServer {
     )]
     async fn get_dependencies(
         &self,
-        _params: Parameters<GetDependenciesParams>,
+        params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        not_implemented("get_dependencies")
+        get_dependencies::handle(&self.conn, params.0)
     }
 }
 

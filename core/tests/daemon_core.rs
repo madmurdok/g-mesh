@@ -226,8 +226,13 @@ fn unknown_method_gets_a_json_rpc_error_not_a_crash() {
     let _ = daemon.wait();
 }
 
+/// A tool call the server refuses (here: `get_dependencies` with no anchor to
+/// start from) has to come back as a tool-level error *result* and leave the
+/// session usable - the framing this pins is what every handler's error paths
+/// rely on, and it used to be pinned against the last not-yet-implemented
+/// tool, back when there was one.
 #[test]
-fn calling_an_unimplemented_tool_reports_an_error_result_rather_than_failing_the_session() {
+fn a_rejected_tool_call_reports_an_error_result_rather_than_failing_the_session() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
     let pid_file = daemon::pid_path(project.root()).unwrap();
@@ -248,13 +253,13 @@ fn calling_an_unimplemented_tool_reports_an_error_result_rather_than_failing_the
     );
 
     // Tool-level error, not a JSON-RPC one: MCP clients render protocol
-    // errors opaquely, so "not implemented yet" has to travel as content.
+    // errors opaquely, so what went wrong has to travel as content.
     assert_eq!(responses[0]["result"]["isError"], true);
     assert!(
         responses[0]["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("not implemented")),
-        "unhelpful stub response: {}",
+            .is_some_and(|text| text.contains("file_path")),
+        "the error must name what the call was missing: {}",
         responses[0]
     );
     assert_eq!(tool_names(&responses[1]), EXPECTED_TOOLS);
