@@ -14,8 +14,8 @@ use serde::Serialize;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 
-use super::tool_result::{error, internal_error, success};
-use super::SymbolQueryParams;
+use super::tool_result::{internal_error, success};
+use super::{anchor, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
 /// source". The extractor files each usage under exactly one of these and
@@ -114,15 +114,13 @@ fn list_references(
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = queries::get_node(&conn, &params.symbol_id)
-        .map_err(|e| internal_error("failed to look up anchor node", e))?;
-    let anchor = match anchor {
-        Some(node) => node,
-        None => return error(format!("g-mesh: no symbol with id '{}' found", params.symbol_id)),
+    let anchor = match anchor::resolve(&conn, &params)? {
+        Ok(node) => node,
+        Err(finished) => return Ok(finished),
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_references(&conn, &params.symbol_id, &anchor.file_path, page_size, params.cursor.as_deref())
+    let page = list_references(&conn, &anchor.id, &anchor.file_path, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find references", e))?;
 
     success(&ReferencePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -212,7 +210,7 @@ mod tests {
 
         let callers = json_body(&super::super::find_callers_callees::handle_callers(
             &conn,
-            SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None },
+            SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
         )
         .unwrap());
         let mut caller_ids: Vec<&str> =
@@ -221,7 +219,7 @@ mod tests {
         assert_eq!(caller_ids, vec!["caller_a", "caller_b"], "precondition: find_callers sees both in-file callers");
 
         let references =
-            json_body(&handle(&conn, SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None }).unwrap());
+            json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
             .unwrap()
@@ -307,7 +305,7 @@ mod tests {
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: Some(25) };
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
         let body = json_body(&handle(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -318,17 +316,46 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
 
-        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
     }
 
+    /// The whole point of `symbol_name`: an unambiguous name lands on the
+    /// same anchor a `find_definition`-then-`find_references` pair would
+    /// have, in one call instead of two.
+    #[test]
+    fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let by_id = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+        );
+        let by_name = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(by_name, by_id, "a name that resolves to one node must answer exactly as its id does");
+        assert_eq!(by_name["results"][0]["referencingSymbolId"], "caller_a");
+    }
+
+    #[test]
+    fn unknown_symbol_name_is_a_tool_level_error() {
+        let conn = setup();
+        let params = SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        assert!(error_text(&result).contains("does_not_exist"));
+    }
+
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -348,7 +375,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone(), limit: None };
+            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
             let result = handle(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

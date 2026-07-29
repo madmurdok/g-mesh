@@ -60,11 +60,19 @@ impl From<NodeRecord> for DefinitionNode {
 }
 
 /// One entry in a ranked candidate list for an ambiguous bare name - a
-/// preview, not the full node, since the caller is expected to re-query by
-/// `qualifiedName` once it picks one.
+/// preview, not the full node, since the caller is expected to re-query once
+/// it picks one.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DefinitionCandidate {
+    /// The handle to re-query with, and the only one guaranteed to resolve:
+    /// `qualifiedName` is not unique either. Excalidraw has two distinct
+    /// `getNonDeletedElements` functions - `packages/element/src/index.ts`
+    /// and `packages/element/src/Scene.ts` - whose qualifiedName is bare
+    /// `getNonDeletedElements` in both, so picking one and asking again by
+    /// name returns this very page a second time. Anchoring on `id` always
+    /// terminates.
+    id: String,
     qualified_name: String,
     file_path: String,
     kind: String,
@@ -79,6 +87,13 @@ struct DefinitionCandidate {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CandidatePage {
+    /// Always `true`, and the reason this field exists at all: the four
+    /// symbol-anchored tools return this page *in place of* their own result
+    /// shape when a `symbol_name` turns out ambiguous, and both shapes are
+    /// `{results, hasMore, nextCursor}`. Without a marker a caller would have
+    /// to sniff item fields to tell "here are your callers" from "say which
+    /// symbol you meant".
+    ambiguous: bool,
     results: Vec<DefinitionCandidate>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -104,6 +119,7 @@ fn find_candidates_by_name(
         let id: String = row.get("id")?;
         let score: f64 = row.get("score")?;
         let candidate = DefinitionCandidate {
+            id: id.clone(),
             qualified_name: row.get("qualifiedName")?,
             file_path: row.get("filePath")?,
             kind: row.get("kind")?,
@@ -136,33 +152,55 @@ fn by_position(conn: &Connection, file_path: &str, line: u32, col: u32) -> Resul
     }
 }
 
-/// Resolves `find_definition`'s symbol-name input: an exact qualifiedName
-/// match is tried first as a fast path (this is how a caller re-queries a
-/// candidate it picked off a previous ambiguous page), then falls back to a
-/// bare-name lookup that is either a single direct node or a ranked
-/// candidate page.
-fn by_name(conn: &Connection, name: &str, cursor: Option<&str>) -> Result<CallToolResult, ErrorData> {
+/// Resolves a symbol name to the single node it names: an exact
+/// qualifiedName match is tried first as a fast path (this is how a caller
+/// re-queries a candidate it picked off a previous ambiguous page), then
+/// falls back to a bare-name lookup.
+///
+/// `Ok(Ok(node))` is that node. `Ok(Err(result))` is a finished response the
+/// caller must return unchanged - the ranked candidate page when the name is
+/// ambiguous, or the not-found tool error - which is what lets the four
+/// symbol-anchored tools accept a `symbol_name` (see `mcp::anchor`) and mean
+/// exactly what `find_definition` means by it, down to the error text.
+/// Shaped like `find_callers_callees`' old `resolve_anchor` rather than a
+/// bespoke enum so every call site is the same two-line `match`.
+pub(super) fn resolve_symbol_name(
+    conn: &Connection,
+    name: &str,
+    cursor: Option<&str>,
+) -> Result<Result<NodeRecord, CallToolResult>, ErrorData> {
     let mut exact = queries::find_by_qualified_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
     if exact.len() == 1 {
-        return success(&DefinitionNode::from(exact.remove(0)));
+        return Ok(Ok(exact.remove(0)));
     }
 
     let matches =
         queries::find_by_name(conn, name, None).map_err(|e| internal_error("failed to look up node by name", e))?;
 
     match matches.len() {
-        0 => error(format!("g-mesh: no symbol named '{name}' found")),
-        1 => success(&DefinitionNode::from(matches.into_iter().next().expect("len checked above"))),
+        0 => error(format!("g-mesh: no symbol named '{name}' found")).map(Err),
+        1 => Ok(Ok(matches.into_iter().next().expect("len checked above"))),
         _ => {
             let page = find_candidates_by_name(conn, name, cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
             success(&CandidatePage {
+                ambiguous: true,
                 results: page.results,
                 has_more: page.has_more,
                 next_cursor: page.next_cursor,
             })
+            .map(Err)
         }
+    }
+}
+
+/// `find_definition`'s own symbol-name input: the shared resolution above,
+/// with the resolved case formatted as the full node this tool promises.
+fn by_name(conn: &Connection, name: &str, cursor: Option<&str>) -> Result<CallToolResult, ErrorData> {
+    match resolve_symbol_name(conn, name, cursor)? {
+        Ok(node) => success(&DefinitionNode::from(node)),
+        Err(finished) => Ok(finished),
     }
 }
 

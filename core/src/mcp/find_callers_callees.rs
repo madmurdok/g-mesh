@@ -18,8 +18,8 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
 
-use super::tool_result::{error, internal_error, success};
-use super::SymbolQueryParams;
+use super::tool_result::{internal_error, success};
+use super::{anchor, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
 /// `resolved`. Direction-agnostic on purpose: `list_calls` doesn't know
@@ -140,29 +140,16 @@ struct CalleePage {
     next_cursor: Option<String>,
 }
 
-/// Shared anchor lookup: both tools fail the same way on an unknown
-/// `symbol_id`, matching `find_references::handle`'s convention exactly.
-fn resolve_anchor(conn: &Connection, symbol_id: &str) -> Result<Result<NodeRecord, CallToolResult>, ErrorData> {
-    let anchor = queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
-    match anchor {
-        Some(node) => Ok(Ok(node)),
-        None => match error(format!("g-mesh: no symbol with id '{symbol_id}' found")) {
-            Ok(result) => Ok(Err(result)),
-            Err(e) => Err(e),
-        },
-    }
-}
-
 pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match resolve_anchor(&conn, &params.symbol_id)? {
+    let anchor = match anchor::resolve(&conn, &params)? {
         Ok(node) => node,
-        Err(early_return) => return Ok(early_return),
+        Err(finished) => return Ok(finished),
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Incoming, page_size, params.cursor.as_deref())
+    let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Incoming, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callers", e))?;
 
     success(&CallerPage {
@@ -175,13 +162,13 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
 pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match resolve_anchor(&conn, &params.symbol_id)? {
+    let anchor = match anchor::resolve(&conn, &params)? {
         Ok(node) => node,
-        Err(early_return) => return Ok(early_return),
+        Err(finished) => return Ok(finished),
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Outgoing, page_size, params.cursor.as_deref())
+    let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Outgoing, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callees", e))?;
 
     success(&CalleePage {
@@ -235,7 +222,7 @@ mod tests {
     #[test]
     fn find_callers_of_b_returns_exactly_a_not_c_not_itself() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -246,7 +233,7 @@ mod tests {
     #[test]
     fn find_callees_of_b_returns_exactly_c_not_a() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -257,7 +244,7 @@ mod tests {
     #[test]
     fn callers_of_a_root_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "a".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("a".to_string()), ..Default::default() };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -267,17 +254,117 @@ mod tests {
     #[test]
     fn callees_of_a_leaf_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "c".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("c".to_string()), ..Default::default() };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
     }
 
+    /// Both directions must accept the name form: the anchor lookup is
+    /// shared, but the two handlers call it separately.
+    #[test]
+    fn an_unambiguous_symbol_name_anchors_both_directions_without_a_symbol_id() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let callers = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+        assert_eq!(callers["results"].as_array().unwrap().len(), 1);
+        assert_eq!(callers["results"][0]["callerSymbolId"], "a");
+
+        let callees = json_body(
+            &handle_callees(&conn, SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+        assert_eq!(callees["results"].as_array().unwrap().len(), 1);
+        assert_eq!(callees["results"][0]["calleeSymbolId"], "c");
+    }
+
+    /// Two same-named functions with disjoint callers - the shape of
+    /// `getNonDeletedElements` in the excalidraw corpus, which has three
+    /// declarations. The tool must hand back the choice, never make it: no
+    /// guessed winner, and no union of both candidates' callers either.
+    /// Picking one and re-asking with its `id` still costs two calls total,
+    /// exactly what the old mandatory `find_definition` step cost.
+    #[test]
+    fn an_ambiguous_symbol_name_returns_candidates_instead_of_walking_either() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("run_a", "Function", "run", "pkg_a::run", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run_b", "Function", "run", "pkg_b::run", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "ca", "pkg::ca", "ca.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "run_a", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let ambiguous = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+        assert_eq!(ambiguous["ambiguous"], true, "the candidate page must be distinguishable from a results page");
+        let candidates = ambiguous["results"].as_array().unwrap();
+        let mut names: Vec<&str> = candidates.iter().map(|c| c["qualifiedName"].as_str().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, vec!["pkg_a::run", "pkg_b::run"], "both declarations must be offered");
+        assert!(
+            candidates.iter().all(|c| c.get("callerSymbolId").is_none()),
+            "no walk may have run: these are candidates to choose from, not callers"
+        );
+
+        // The follow-up the caller is expected to make - and it must answer
+        // for the one symbol it picked, not for both.
+        let picked = candidates.iter().find(|c| c["qualifiedName"] == "pkg_b::run").expect("candidate pkg_b::run");
+        let params = SymbolQueryParams {
+            symbol_id: Some(picked["id"].as_str().expect("a candidate carries its id").to_string()),
+            ..Default::default()
+        };
+        let body = json_body(&handle_callers(&conn, params).unwrap());
+        assert!(body.get("ambiguous").is_none(), "an id is never ambiguous");
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "only the chosen candidate's callers, never a union across candidates");
+        assert_eq!(results[0]["callerSymbolId"], "caller_b");
+    }
+
+    /// Why candidates carry an `id` at all. Excalidraw's two distinct
+    /// `getNonDeletedElements` functions (`packages/element/src/index.ts` and
+    /// `packages/element/src/Scene.ts`) share the bare qualifiedName
+    /// `getNonDeletedElements`, so a caller that picked one and re-asked by
+    /// name would be handed the same candidate page forever. The `id` is the
+    /// handle that ends the loop.
+    #[test]
+    fn candidates_stay_distinguishable_when_even_the_qualified_name_repeats() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("run_a", "Function", "run", "run", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run_b", "Function", "run", "run", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
+        let ambiguous = json_body(&handle_callers(&conn, by_name).unwrap());
+        assert_eq!(ambiguous["ambiguous"], true);
+
+        // Re-asking by qualifiedName here is the loop: it is the same query.
+        let requalified =
+            SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
+        assert_eq!(json_body(&handle_callers(&conn, requalified).unwrap())["ambiguous"], true);
+
+        let mut ids: Vec<&str> =
+            ambiguous["results"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["run_a", "run_b"], "the ids must survive even when nothing else tells them apart");
+
+        let params = SymbolQueryParams { symbol_id: Some("run_b".to_string()), ..Default::default() };
+        let body = json_body(&handle_callers(&conn, params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap()[0]["callerSymbolId"], "caller_b");
+    }
+
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callers() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -285,7 +372,7 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callees() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -336,7 +423,7 @@ mod tests {
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: Some(25) };
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
         let body = json_body(&handle_callers(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -357,7 +444,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone(), limit: None };
+            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
             let result = handle_callees(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

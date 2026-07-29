@@ -20,8 +20,8 @@ use serde::Serialize;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 
-use super::tool_result::{error, internal_error, success};
-use super::SymbolQueryParams;
+use super::tool_result::{internal_error, success};
+use super::{anchor, SymbolQueryParams};
 
 /// One implementing/extending type on the other end of an inbound
 /// `SUPERTYPE_OF` edge.
@@ -94,15 +94,13 @@ fn list_implementations(
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = queries::get_node(&conn, &params.symbol_id)
-        .map_err(|e| internal_error("failed to look up anchor node", e))?;
-    let anchor = match anchor {
-        Some(node) => node,
-        None => return error(format!("g-mesh: no symbol with id '{}' found", params.symbol_id)),
+    let anchor = match anchor::resolve(&conn, &params)? {
+        Ok(node) => node,
+        Err(finished) => return Ok(finished),
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_implementations(&conn, &params.symbol_id, &anchor.file_path, page_size, params.cursor.as_deref())
+    let page = list_implementations(&conn, &anchor.id, &anchor.file_path, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find implementations", e))?;
 
     success(&ImplementationPage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -154,7 +152,7 @@ mod tests {
     #[test]
     fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "interface".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -167,17 +165,34 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
 
-        let params = SymbolQueryParams { symbol_id: "interface".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
     }
 
+    /// Anchoring by name must reach the same node the id does - here the
+    /// interface, whose one direct implementor is `class_a`.
+    #[test]
+    fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let by_id = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+        let by_name = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(by_name, by_id, "a name that resolves to one node must answer exactly as its id does");
+        assert_eq!(by_name["results"][0]["implementingSymbolId"], "class_a");
+    }
+
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
+        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -222,7 +237,7 @@ mod tests {
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: Some(25) };
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
         let body = json_body(&handle(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -243,7 +258,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone(), limit: None };
+            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
             let result = handle(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

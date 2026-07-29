@@ -377,10 +377,10 @@ model works that way, and the query layer accounts for it.
 | Tool | Input | Returns |
 |---|---|---|
 | `find_definition` | symbol name, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count) |
-| `find_references` | `symbolId` + `limit`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
-| `find_callers` | `symbolId` + `limit`? | inbound `CALLS` |
-| `find_callees` | `symbolId` + `limit`? | outbound `CALLS` |
-| `find_implementations` | `symbolId` + `limit`? | inbound `SUPERTYPE_OF` |
+| `find_references` | `symbolId` or `symbolName` + `limit`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
+| `find_callers` | `symbolId` or `symbolName` + `limit`? | inbound `CALLS` |
+| `find_callees` | `symbolId` or `symbolName` + `limit`? | outbound `CALLS` |
+| `find_implementations` | `symbolId` or `symbolName` + `limit`? | inbound `SUPERTYPE_OF` |
 | `search_code` | free-text query | semantic matches via embeddings, ranked by similarity |
 | `get_file_outline` | `filePath` | symbols defined in the file |
 | `get_dependencies` | `filePath`/`moduleId` + direction | impact analysis before a change: a bounded transitive `IMPORTS` walk over the files linked as described in [Import resolution](#import-resolution) |
@@ -399,6 +399,22 @@ size for a single call instead of paging through `cursor` — added after
 g-mesh-bench measured that, in a stateless CLI-agent conversation, every
 extra pagination round-trip re-pays the whole resent-conversation cost, so a
 fixed small page forced more of exactly that on high-fan-out lookups.
+
+The same four tools take their anchor as *either* a `symbolId` or a
+`symbolName`, exactly one per call — measured against the same
+resent-conversation cost, since a mandatory `symbolId` made every lookup a
+two-call sequence even when the name was unambiguous. A `symbolName` is
+resolved by the same code path `find_definition` uses for its own
+`symbol_name` (fully qualified name first, then the bare name), so the two
+tools cannot disagree about what a name means. Ambiguity is never guessed
+at and never unioned across candidates: the tool answers with
+`find_definition`'s ranked candidate list, marked `ambiguous: true` to
+separate it from a normal results page, and the caller re-asks with the
+`id` of the candidate it picks — still two calls, the same as the pair this
+replaces. Candidates carry that `id` precisely because `qualifiedName` is
+not a unique handle either (excalidraw has two distinct
+`getNonDeletedElements` functions sharing one), so a name-based re-ask
+could return the same candidate page forever.
 
 Traversal responses that hit a limit carry `truncated: true` and
 `truncatedBy: 'maxDepth' | 'maxFanout' | 'explorationBudget'` — never a

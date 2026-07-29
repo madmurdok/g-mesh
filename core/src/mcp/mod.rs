@@ -30,6 +30,7 @@ use crate::daemon::plugin::PluginProcess;
 use crate::graph::pagination::Direction;
 use crate::protocol::types::Position;
 
+mod anchor;
 mod find_callers_callees;
 mod find_definition;
 mod find_implementations;
@@ -87,7 +88,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_references",
-        description = "List every place a symbol is referenced, across the whole project."
+        description = "List every place a symbol is referenced, across the whole project. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
     )]
     async fn find_references(
         &self,
@@ -96,19 +97,25 @@ impl GMeshMcpServer {
         find_references::handle(&self.conn, params.0)
     }
 
-    #[tool(name = "find_callers", description = "List the functions that call the given function.")]
+    #[tool(
+        name = "find_callers",
+        description = "List the functions that call the given function. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
+    )]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
         find_callers_callees::handle_callers(&self.conn, params.0)
     }
 
-    #[tool(name = "find_callees", description = "List the functions the given function calls.")]
+    #[tool(
+        name = "find_callees",
+        description = "List the functions the given function calls. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
+    )]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
         find_callers_callees::handle_callees(&self.conn, params.0)
     }
 
     #[tool(
         name = "find_implementations",
-        description = "List the types that implement or extend the given interface, base class or abstract type."
+        description = "List the types that implement or extend the given interface, base class or abstract type. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
     )]
     async fn find_implementations(
         &self,
@@ -172,10 +179,22 @@ pub struct FindDefinitionParams {
 /// find_references/find_callers/find_callees/find_implementations differ only
 /// in which edges they walk, never in what the caller has to supply - so they
 /// share one parameter shape instead of four identical ones.
-#[derive(Debug, Deserialize, JsonSchema)]
+///
+/// `Default` is for the tests that construct this by hand: with two
+/// alternative addressing fields plus two paging ones, spelling all four out
+/// at every call site is noise that hides which one the test is about.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
-    /// Id of the anchor symbol, as returned by `find_definition`.
-    pub symbol_id: String,
+    /// Id of the anchor symbol, as returned by `find_definition`. Give this
+    /// or `symbol_name`, never both.
+    pub symbol_id: Option<String>,
+    /// Name of the anchor symbol, as an alternative to `symbol_id` that saves
+    /// the `find_definition` call: resolved exactly as `find_definition`
+    /// resolves it (a fully qualified name first, then the bare name). If the
+    /// name is ambiguous the answer is that tool's ranked candidate list
+    /// (`ambiguous: true`) instead of this tool's results - re-call with the
+    /// `id` of the candidate you pick as `symbol_id`.
+    pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page of results.
     pub cursor: Option<String>,
     /// Maximum results to return in this call (default 20, capped at 200).
