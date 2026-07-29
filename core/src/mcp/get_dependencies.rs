@@ -25,6 +25,11 @@ use super::GetDependenciesParams;
 /// `CALLS`/`REFERENCES` side of the graph belongs to the single-hop tools.
 const IMPORT_EDGE: &str = "IMPORTS";
 
+/// The kind an import that resolved to nothing comes back as: a placeholder
+/// standing in for a file this index does not have. See
+/// [`DependencyNode::file_path`] for why it needs a case of its own.
+const MODULE_KIND: &str = "Module";
+
 /// One reached dependency, with how many import hops away it is. No
 /// `resolved` flag, unlike the single-hop tools: a node several hops out is
 /// reached over a *path* of edges, and one flag can only describe one of
@@ -39,7 +44,16 @@ struct DependencyNode {
     kind: String,
     name: String,
     qualified_name: String,
-    file_path: String,
+    /// The file this dependency *is*, and null when it is not one. An import
+    /// `graph::imports` could not link - a package, or a relative path with
+    /// nothing indexed behind it - stays a `Module` placeholder whose stored
+    /// `filePath` is the *importing* file, because that is where the
+    /// specifier is written. Echoing that column here would name the wrong
+    /// file twice over: it reads as "the dependency lives there", and it
+    /// collides with the importer's own row in the same walk. `qualifiedName`
+    /// still carries the specifier, which is all there is to act on for
+    /// something with no file to open.
+    file_path: Option<String>,
     /// Import hops from the anchor. Always >= 1: the anchor itself is the
     /// walk's depth-0 node and is not reported back to the caller who named it.
     depth: u32,
@@ -47,12 +61,13 @@ struct DependencyNode {
 
 impl From<ReachedNode> for DependencyNode {
     fn from(r: ReachedNode) -> Self {
+        let file_path = (r.node.kind != MODULE_KIND).then_some(r.node.file_path);
         Self {
             id: r.node.id,
             kind: r.node.kind,
             name: r.node.name,
             qualified_name: r.node.qualified_name,
-            file_path: r.node.file_path,
+            file_path,
             depth: r.depth,
         }
     }
@@ -226,6 +241,13 @@ mod tests {
         conn
     }
 
+    /// An import nothing could be linked to, stored the way the js-ts
+    /// extractor stores it: a `Module` node whose `filePath` is the
+    /// *importing* file, because that is where the specifier is written.
+    fn unresolved_import(importer: &str, specifier: &str) -> NodeRecord {
+        NodeRecord::new(format!("mod_{specifier}"), MODULE_KIND, specifier, specifier, importer, "typescript")
+    }
+
     fn anchored_at(file_path: &str, direction: Direction) -> GetDependenciesParams {
         GetDependenciesParams {
             file_path: Some(file_path.to_string()),
@@ -286,6 +308,27 @@ mod tests {
 
         let ids: Vec<&str> = body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert!(!ids.contains(&"a.rs"), "the depth-0 anchor must not appear among its own dependencies: {ids:?}");
+    }
+
+    /// A placeholder must not borrow the importing file's path on the way
+    /// out: "zod lives in a.rs" is both untrue and indistinguishable from
+    /// a.rs's own row in the same walk.
+    #[test]
+    fn an_unresolved_import_is_reported_without_a_file_path_of_its_own() {
+        let mut conn = import_chain();
+        upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
+        imports(&mut conn, "a.rs", "mod_zod");
+
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let rows = body["results"].as_array().unwrap();
+
+        let module = rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
+        assert!(module["filePath"].is_null(), "a module placeholder has no file of its own: {module}");
+        assert_eq!(module["qualifiedName"], "zod", "the specifier is all there is left to act on");
+
+        let files: Vec<&str> =
+            rows.iter().filter(|r| r["kind"] == "File").map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(files, vec!["b.rs", "c.rs"], "real files are still addressed by their own path");
     }
 
     #[test]
