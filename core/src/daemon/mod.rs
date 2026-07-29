@@ -120,8 +120,8 @@ pub fn run(root: &Path) -> Result<()> {
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
         eprintln!(
-            "g-mesh daemon: initial index built - {} nodes, {} edges",
-            summary.nodes, summary.edges
+            "g-mesh daemon: initial index built - {} nodes, {} edges ({} imports linked to their target file)",
+            summary.nodes, summary.edges, summary.linked_imports
         );
         if summary.skipped_lines > 0 {
             eprintln!(

@@ -15,6 +15,7 @@ use std::io::{BufRead, Write};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::graph::imports;
 use crate::protocol::jsonrpc::{read_message, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
@@ -59,6 +60,9 @@ pub fn apply_file_change<R: BufRead, W: Write>(
 
     let diff = to_storage_diff(response.result);
     apply_diff(conn, &diff).context("failed to apply file-change diff")?;
+    // After the commit, never before: linking points edges at `File` nodes,
+    // and the ones this diff brought with it have to be in the index first.
+    imports::link_diff(conn, &diff).context("failed to link the file's resolved imports")?;
     Ok(())
 }
 

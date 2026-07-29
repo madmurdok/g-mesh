@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::plugin::plugin_entry_path;
+use crate::graph::imports;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
@@ -48,6 +49,9 @@ pub struct BulkIndexSummary {
     /// one symbol, while refusing the whole walk over it costs the project
     /// its entire index.
     pub skipped_lines: usize,
+    /// `IMPORTS` edges the post-walk linking pass repointed from a module
+    /// placeholder onto the real file it names (`graph::imports`).
+    pub linked_imports: usize,
 }
 
 /// Walks `project_root` through the plugin and commits everything it emits,
@@ -58,7 +62,10 @@ pub struct BulkIndexSummary {
 /// foreign keys onto nodes: the plugin emits a file's nodes before that same
 /// file's edges, and never an edge between files (see the dangling-edge guard
 /// in extract.ts), so an edge's endpoints are always committed by an earlier
-/// batch or its own.
+/// batch or its own. Cross-file `IMPORTS` edges appear only afterwards, when
+/// `graph::imports` links the walk's resolved module placeholders - by then
+/// every node either exists or never will, which is precisely why that step
+/// cannot be folded into the stream.
 pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
     let entry = plugin_entry_path();
     let mut child = Command::new("node")
@@ -136,7 +143,17 @@ fn ingest<R: BufRead>(
         }
     }
 
-    commit(conn, &mut batch)
+    commit(conn, &mut batch)?;
+
+    // Only now, with the stream over: an import can only be linked to a file
+    // that is already a node, and until the last batch is in there is no
+    // telling whether a still-unresolved specifier names a file the walk had
+    // simply not reached yet (see `graph::imports`).
+    let mut conn = conn.lock().unwrap();
+    summary.linked_imports = imports::link_all(&mut conn)
+        .context("failed to link the walk's resolved imports")?
+        .linked_edges;
+    Ok(())
 }
 
 /// Commits one batch and empties it, holding the connection only for as long
@@ -224,7 +241,7 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0 });
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0 });
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
         let name: String = conn
@@ -244,7 +261,7 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1 });
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0 });
         assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
     }
 
