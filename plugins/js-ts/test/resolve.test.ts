@@ -155,6 +155,38 @@ test("the fs-backed predicate answers about real files under the project root", 
   }
 });
 
+test("the fs-backed predicate treats a hard-excluded directory as non-existent even when the file is there", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-resolve-"));
+  try {
+    await fs.mkdir(path.join(root, "packages", "math", "dist", "prod"), { recursive: true });
+    await fs.writeFile(path.join(root, "packages", "math", "dist", "prod", "index.js"), "module.exports = {};\n");
+    await fs.mkdir(path.join(root, "packages", "math", "src"), { recursive: true });
+    await fs.writeFile(path.join(root, "packages", "math", "src", "index.ts"), "export const x = 1;\n");
+
+    const exists = createProjectFileExists(root);
+    assert.equal(exists("packages/math/dist/prod/index.js"), false, "dist is hard-excluded regardless of gitignore");
+    assert.equal(exists("packages/math/src/index.ts"), true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the fs-backed predicate treats a gitignored file as non-existent", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-resolve-"));
+  try {
+    await fs.writeFile(path.join(root, ".gitignore"), "src/generated.ts\n");
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    await fs.writeFile(path.join(root, "src", "generated.ts"), "export const x = 1;\n");
+    await fs.writeFile(path.join(root, "src", "kept.ts"), "export const y = 1;\n");
+
+    const exists = createProjectFileExists(root);
+    assert.equal(exists("src/generated.ts"), false);
+    assert.equal(exists("src/kept.ts"), true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- workspace package specifiers ----------------------------------------
 
 /** The excalidraw shape: an unbuilt monorepo whose manifests only mention

@@ -32,6 +32,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { isSupportedFile, type SpecifierResolver } from "./extract";
+import { createIndexabilityChecker } from "./ignorePolicy";
 import {
   NO_WORKSPACE_PACKAGES,
   packageEntryTargets,
@@ -175,10 +176,17 @@ export function createSpecifierResolver(
 }
 
 /**
- * A [`FileExists`] backed by the real filesystem under `projectRoot`, with a
- * memo of what it has already looked up: one module is typically imported by
- * many files, and each miss costs several stat calls' worth of extension
- * guessing.
+ * A [`FileExists`] backed by the real filesystem under `projectRoot`, answering
+ * the fuller question the index actually cares about: the path is a regular
+ * file *and* it is something the walk would index - not under a hard-excluded
+ * directory (`dist`, `node_modules`, ...), not gitignored (see
+ * ignorePolicy.ts, shared with `walkProjectFiles` so the two answers cannot
+ * drift apart). A build output that happens to be on disk is therefore not
+ * allowed to shadow the source file it was compiled from.
+ *
+ * The memo caches that combined answer, not raw filesystem existence: one
+ * module is typically imported by many files, and each miss costs several stat
+ * calls' worth of extension guessing.
  *
  * The memo is the reason this is a factory rather than a module-level
  * function: it must not outlive the assumption that the tree is not changing
@@ -188,6 +196,7 @@ export function createSpecifierResolver(
  */
 export function createProjectFileExists(projectRoot: string): FileExists {
   const memo = new Map<string, boolean>();
+  const isIndexable = createIndexabilityChecker(projectRoot);
   return (projectRelativePath: string): boolean => {
     const cached = memo.get(projectRelativePath);
     if (cached !== undefined) return cached;
@@ -197,7 +206,11 @@ export function createProjectFileExists(projectRoot: string): FileExists {
       // Path segments are re-joined with the platform separator; the caller's
       // path is normalized and cannot start with "..", so this stays inside
       // `projectRoot`.
-      exists = fs.statSync(path.join(projectRoot, ...projectRelativePath.split("/"))).isFile();
+      // The stat comes first deliberately: most candidate probes are misses
+      // that fail it, and those never pay for the gitignore-aware check.
+      exists =
+        fs.statSync(path.join(projectRoot, ...projectRelativePath.split("/"))).isFile() &&
+        isIndexable(projectRelativePath);
     } catch {
       exists = false; // missing, unreadable, or a broken symlink - all "no"
     }
