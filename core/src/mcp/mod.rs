@@ -157,7 +157,15 @@ impl ServerHandler for GMeshMcpServer {
             .with_server_info(Implementation::new("g-mesh", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Structural code-graph queries over this project's index. Prefer these over \
-                 grepping when you need definitions, references, call edges or imports.",
+                 grepping when you need definitions, references, call edges or imports.\n\n\
+                 Efficient usage: find_references/find_callers/find_callees/find_implementations \
+                 accept `symbol_name` directly - use it instead of calling find_definition first \
+                 when the name is likely unambiguous, to save a round-trip. If a symbol_name turns \
+                 out ambiguous, re-query using the `id` of the candidate you pick, not its \
+                 `qualifiedName` - the same qualifiedName can name more than one declaration. For a \
+                 symbol you expect to have many references/callers/implementations (a widely-used \
+                 utility, a base interface), pass a higher `limit` up front instead of paging \
+                 through the default 20 - one larger call is cheaper than several small ones.",
             )
     }
 }
