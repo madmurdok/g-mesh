@@ -4,8 +4,9 @@
 // carries them to the core is a separate ticket, as is any TS-compiler-API
 // semantic layer - everything produced here is name-based and therefore
 // `resolved: false` / `source: 'tree-sitter'`. The one exception is module
-// specifiers, which are literals rather than names: relative ones are
-// resolved to a real path here (see `recordImport`) and core turns that into
+// specifiers, which are literals rather than names: the ones naming a file of
+// this project - relative, or a package of its own workspace - are resolved to
+// a real path here (see `recordImport`) and core turns that into
 // a `resolved: true` edge once it has confirmed the target is in the index.
 // Symbols reached *through* such a specifier ride on the same handshake: a
 // call or reference to an imported name gets a pending-symbol placeholder
@@ -616,9 +617,9 @@ class Extractor {
   /**
    * The local names this import statement binds, and the name each one stands
    * for in the target file. Only a specifier that resolved to a project file
-   * is worth recording: a package's symbols are not in this index, so a
-   * placeholder for one could never be linked to anything (bare-specifier
-   * resolution is its own, separate problem - see resolve.ts).
+   * is worth recording: an off-workspace package's symbols are not in this
+   * index, so a placeholder for one could never be linked to anything (which
+   * specifiers resolve at all is resolve.ts's call).
    *
    * `import * as NS from "./x"` is deliberately not recorded. The binding
    * names a whole module rather than one symbol, so `NS.f()` would have to

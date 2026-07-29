@@ -1,0 +1,444 @@
+// The one class of bare specifier a syntax-only pass can resolve exactly:
+// a package that lives *in this project*, linked by a workspace manifest
+// rather than fetched from a registry. `@excalidraw/math` is a directory in
+// the same tree as its importer, so the specifier still names a file this
+// index holds - the only thing missing is the manifest lookup that turns the
+// package name into that directory.
+//
+// Packages outside the workspace (`react`, `node:crypto`, anything only
+// present under `node_modules`) stay out of scope: no file of theirs is
+// indexed, so resolving them would point an edge at nothing.
+//
+// This module answers "which directory is package X, and which paths could
+// its entry be?" - manifest facts only. Turning those paths into a file is
+// resolve.ts's job, so both specifier kinds go through one filesystem policy.
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+/** The package.json fields this resolution reads; everything else is ignored. */
+interface PackageManifest {
+  readonly name?: unknown;
+  readonly exports?: unknown;
+  readonly source?: unknown;
+  readonly main?: unknown;
+  readonly module?: unknown;
+  readonly types?: unknown;
+  readonly typings?: unknown;
+}
+
+export interface WorkspacePackage {
+  /** Project-relative POSIX directory holding the package's package.json. */
+  readonly dir: string;
+  readonly manifest: PackageManifest;
+}
+
+/** In-workspace packages by the name their package.json declares. */
+export type WorkspacePackages = ReadonlyMap<string, WorkspacePackage>;
+
+export const NO_WORKSPACE_PACKAGES: WorkspacePackages = new Map();
+
+/**
+ * Conditions in the order a *source* index wants them, not the order Node
+ * would pick: `source` and the runtime conditions name the package's own
+ * code, while `types` names a `.d.ts` describing code that is very often
+ * already in this index under its real path. Existence still decides - this
+ * only settles which of several existing files wins.
+ */
+const CONDITION_PRIORITY = [
+  "source",
+  "import",
+  "module",
+  "require",
+  "default",
+  "node",
+  "browser",
+  "development",
+  "production",
+  "types",
+  "typings",
+];
+
+/** How deep a `**` pattern segment may descend before it is treated as noise. */
+const MAX_GLOB_DEPTH = 6;
+
+const IGNORED_DIRECTORIES = new Set(["node_modules", ".git"]);
+
+/**
+ * `@scope/pkg/sub` split into the package name and the subpath it addresses
+ * (`"."` when it addresses the package itself), or `null` when the specifier
+ * is not a package name at all - relative, absolute, a `node:`/`data:` URL,
+ * or a `#private` imports-map key.
+ */
+export function parseBareSpecifier(
+  specifier: string,
+): { readonly name: string; readonly subpath: string } | null {
+  if (specifier === "" || specifier.startsWith(".") || specifier.startsWith("/")) return null;
+  if (specifier.startsWith("#") || /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(specifier)) return null;
+
+  const segments = specifier.split("/");
+  if (segments.some((segment) => segment === "")) return null;
+
+  const nameLength = specifier.startsWith("@") ? 2 : 1;
+  if (segments.length < nameLength) return null;
+
+  const rest = segments.slice(nameLength);
+  return {
+    name: segments.slice(0, nameLength).join("/"),
+    subpath: rest.length === 0 ? "." : `./${rest.join("/")}`,
+  };
+}
+
+/**
+ * Every project-relative path `subpath` of `pkg` could name, most specific
+ * first: what the manifest declares, then the source-tree conventions.
+ *
+ * The conventional `src/index`/`index` fallback is not a nicety - a
+ * workspace package's declared entry almost always points into build output
+ * (`dist/...`) that an unbuilt checkout does not have, and that a built one
+ * gitignores, so for most monorepos it is the *only* candidate backed by a
+ * file this index holds.
+ */
+export function packageEntryTargets(pkg: WorkspacePackage, subpath: string): string[] {
+  const targets = exportsTargets(pkg.manifest.exports, subpath);
+
+  if (subpath === ".") {
+    const { source, main, module: moduleField, types, typings } = pkg.manifest;
+    for (const field of [source, main, moduleField, types, typings]) {
+      if (typeof field === "string") targets.push(field);
+    }
+    targets.push("src/index", "index");
+  } else {
+    const relative = subpath.slice(2);
+    targets.push(relative, `src/${relative}`);
+  }
+
+  const resolved: string[] = [];
+  for (const target of targets) {
+    const inside = insidePackage(pkg.dir, target);
+    if (inside !== null && !resolved.includes(inside)) resolved.push(inside);
+  }
+  return resolved;
+}
+
+/**
+ * The workspace's packages, read from disk once. Callers cache the result for
+ * as long as they cache their other filesystem answers (see resolve.ts): a
+ * workspace manifest changes far more rarely than the sources it lists.
+ */
+export function readWorkspacePackages(projectRoot: string): WorkspacePackages {
+  const patterns = workspacePatterns(projectRoot);
+  if (patterns.length === 0) return NO_WORKSPACE_PACKAGES;
+
+  const excluded = patterns
+    .filter((pattern) => pattern.startsWith("!"))
+    .map((pattern) => globToRegExp(pattern.slice(1)));
+  const listSubdirectories = subdirectoryLister(projectRoot);
+
+  const packages = new Map<string, WorkspacePackage>();
+  for (const pattern of patterns) {
+    if (pattern.startsWith("!")) continue;
+    for (const dir of expandPattern(pattern, projectRoot, listSubdirectories)) {
+      if (excluded.some((regex) => regex.test(dir))) continue;
+      const manifest = readJson(path.join(projectRoot, ...dir.split("/"), "package.json"));
+      if (manifest === null || typeof manifest.name !== "string") continue;
+      // First declaration wins, like a re-declared symbol elsewhere in this plugin.
+      if (!packages.has(manifest.name)) packages.set(manifest.name, { dir, manifest });
+    }
+  }
+  return packages;
+}
+
+// --- manifests ------------------------------------------------------------
+
+function workspacePatterns(projectRoot: string): string[] {
+  const patterns = pnpmWorkspacePatterns(projectRoot);
+
+  // npm/yarn/bun keep the same list in the root package.json; a repo can
+  // carry both (pnpm workspaces with a package.json kept for tooling), and
+  // the union is what either package manager would see.
+  const rootManifest = readJson(path.join(projectRoot, "package.json"));
+  const workspaces = rootManifest?.workspaces;
+  const list = Array.isArray(workspaces)
+    ? workspaces
+    : isRecord(workspaces) && Array.isArray(workspaces.packages)
+      ? workspaces.packages
+      : [];
+  for (const entry of list) {
+    if (typeof entry === "string" && entry.trim() !== "") patterns.push(entry.trim());
+  }
+  return patterns;
+}
+
+/**
+ * The `packages:` list of a pnpm-workspace.yaml, read without a YAML parser:
+ * this plugin ships no dependency that could do it, and the shape in question
+ * is a flat list of strings under one top-level key - the one corner of YAML
+ * that is unambiguous enough to read line by line.
+ */
+function pnpmWorkspacePatterns(projectRoot: string): string[] {
+  const text =
+    readText(path.join(projectRoot, "pnpm-workspace.yaml")) ??
+    readText(path.join(projectRoot, "pnpm-workspace.yml"));
+  if (text === null) return [];
+
+  const patterns: string[] = [];
+  let inPackages = false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/\t/g, "  ");
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+
+    if (!/^\s/.test(line)) {
+      const key = /^packages\s*:\s*(.*)$/.exec(line);
+      inPackages = key !== null;
+      if (key && key[1].trim() !== "") {
+        patterns.push(...flowSequenceItems(key[1]));
+        inPackages = false;
+      }
+      continue;
+    }
+
+    if (!inPackages) continue;
+    const item = /^\s*-\s*(.+?)\s*$/.exec(line);
+    if (item) {
+      const value = scalarValue(item[1]);
+      if (value !== "") patterns.push(value);
+    }
+  }
+  return patterns;
+}
+
+function flowSequenceItems(text: string): string[] {
+  const inner = /^\[(.*)\]$/.exec(text.trim());
+  if (!inner) return [];
+  return inner[1]
+    .split(",")
+    .map((item) => scalarValue(item.trim()))
+    .filter((item) => item !== "");
+}
+
+function scalarValue(raw: string): string {
+  const quoted = /^(["'])(.*)\1$/.exec(raw);
+  if (quoted) return quoted[2];
+  const commented = raw.indexOf(" #");
+  return (commented === -1 ? raw : raw.slice(0, commented)).trim();
+}
+
+// --- exports maps ---------------------------------------------------------
+
+function exportsTargets(exports: unknown, subpath: string): string[] {
+  if (exports === undefined || exports === null) return [];
+
+  const targets: string[] = [];
+  if (typeof exports === "string" || Array.isArray(exports)) {
+    if (subpath === ".") collectConditionTargets(exports, targets);
+    return targets;
+  }
+  if (!isRecord(exports)) return [];
+
+  // `{ ".": ... }` is a subpath map, `{ "import": ... }` a bare condition map
+  // that applies to the package root - the two are told apart by their keys,
+  // which is what the spec itself does.
+  const keys = Object.keys(exports);
+  if (!keys.some((key) => key === "." || key.startsWith("./"))) {
+    if (subpath === ".") collectConditionTargets(exports, targets);
+    return targets;
+  }
+
+  const exact = exports[subpath];
+  if (exact !== undefined) {
+    collectConditionTargets(exact, targets);
+    return targets;
+  }
+
+  for (const key of keys) {
+    const match = matchWildcard(key, subpath);
+    if (match === null) continue;
+    const patterns: string[] = [];
+    collectConditionTargets(exports[key], patterns);
+    for (const pattern of patterns) targets.push(pattern.split("*").join(match));
+  }
+  return targets;
+}
+
+function collectConditionTargets(value: unknown, out: string[]): void {
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectConditionTargets(item, out);
+    return;
+  }
+  if (!isRecord(value)) return;
+
+  const keys = Object.keys(value).sort((a, b) => conditionRank(a) - conditionRank(b));
+  for (const key of keys) collectConditionTargets(value[key], out);
+}
+
+function conditionRank(condition: string): number {
+  const index = CONDITION_PRIORITY.indexOf(condition);
+  return index === -1 ? CONDITION_PRIORITY.length : index;
+}
+
+/** What `*` stands for when `subpath` matches `pattern`, or `null`. */
+function matchWildcard(pattern: string, subpath: string): string | null {
+  const star = pattern.indexOf("*");
+  if (star === -1) return null;
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  if (subpath.length < prefix.length + suffix.length) return null;
+  if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) return null;
+  return subpath.slice(prefix.length, subpath.length - suffix.length);
+}
+
+// --- patterns and the filesystem ------------------------------------------
+
+/**
+ * Project-relative directories `pattern` names. Only `*` and `**` are
+ * understood; both stop at `node_modules` and dot-directories, which no
+ * package manager treats as workspace members and which are the one way this
+ * walk could get expensive.
+ */
+function expandPattern(
+  pattern: string,
+  projectRoot: string,
+  listSubdirectories: (dir: string) => string[],
+): string[] {
+  const segments = pattern.split("/").filter((segment) => segment !== "" && segment !== ".");
+  if (segments.length === 0 || segments.includes("..")) return [];
+
+  let dirs = [""];
+  for (const segment of segments) {
+    const next: string[] = [];
+    for (const dir of dirs) {
+      if (segment === "**") {
+        next.push(dir, ...descendants(dir, listSubdirectories, MAX_GLOB_DEPTH));
+        continue;
+      }
+      if (segment.includes("*") || segment.includes("?")) {
+        const regex = globToRegExp(segment);
+        for (const child of listSubdirectories(dir)) {
+          if (regex.test(child)) next.push(join(dir, child));
+        }
+        continue;
+      }
+      const candidate = join(dir, segment);
+      if (isDirectory(path.join(projectRoot, ...candidate.split("/")))) next.push(candidate);
+    }
+    dirs = [...new Set(next)];
+  }
+  return dirs.filter((dir) => dir !== "");
+}
+
+function descendants(
+  dir: string,
+  listSubdirectories: (dir: string) => string[],
+  depth: number,
+): string[] {
+  if (depth === 0) return [];
+  const found: string[] = [];
+  for (const child of listSubdirectories(dir)) {
+    const childDir = join(dir, child);
+    found.push(childDir, ...descendants(childDir, listSubdirectories, depth - 1));
+  }
+  return found;
+}
+
+function subdirectoryLister(projectRoot: string): (dir: string) => string[] {
+  const memo = new Map<string, string[]>();
+  return (dir: string): string[] => {
+    const cached = memo.get(dir);
+    if (cached !== undefined) return cached;
+
+    let names: string[] = [];
+    try {
+      names = fs
+        .readdirSync(path.join(projectRoot, ...dir.split("/").filter(Boolean)), {
+          withFileTypes: true,
+        })
+        .filter((entry) => entry.isDirectory() && !isIgnoredDirectory(entry.name))
+        .map((entry) => entry.name);
+    } catch {
+      names = []; // missing or unreadable - nothing to expand into
+    }
+    memo.set(dir, names);
+    return names;
+  };
+}
+
+function isIgnoredDirectory(name: string): boolean {
+  return name.startsWith(".") || IGNORED_DIRECTORIES.has(name);
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const glob = pattern.replace(/^\.\//, "");
+  let source = "";
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index];
+    if (char === "*" && glob[index + 1] === "*") {
+      index += 1;
+      if (glob[index + 1] === "/") {
+        index += 1;
+        source += "(?:.*/)?";
+        continue;
+      }
+      source += ".*";
+      continue;
+    }
+    if (char === "*") {
+      source += "[^/]*";
+      continue;
+    }
+    source += char === "?" ? "[^/]" : char.replace(/[.+^${}()|[\]\\]/, "\\$&");
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/**
+ * `target` as a project-relative path, or `null` when it leaves the package -
+ * an absolute path or one climbing past the project root names a file this
+ * index cannot hold, and is also the only way this could address the
+ * filesystem outside the project.
+ */
+function insidePackage(packageDir: string, target: string): string | null {
+  if (target === "" || path.posix.isAbsolute(target) || /^[a-zA-Z]:/.test(target)) return null;
+  const joined = path.posix.normalize(path.posix.join(packageDir, target)).replace(/\/+$/, "");
+  if (joined === "" || joined === "." || joined === ".." || joined.startsWith("../")) return null;
+  return joined;
+}
+
+function join(dir: string, name: string): string {
+  return dir === "" ? name : `${dir}/${name}`;
+}
+
+function isDirectory(absolutePath: string): boolean {
+  try {
+    return fs.statSync(absolutePath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function readText(absolutePath: string): string | null {
+  try {
+    return fs.readFileSync(absolutePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function readJson(absolutePath: string): (PackageManifest & Record<string, unknown>) | null {
+  const text = readText(absolutePath);
+  if (text === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null; // a malformed manifest is a package this resolution skips, not a crash
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

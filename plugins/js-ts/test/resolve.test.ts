@@ -6,10 +6,13 @@ import * as path from "node:path";
 
 import {
   createProjectFileExists,
+  createProjectResolver,
   isRelativeSpecifier,
   resolveRelativeSpecifier,
+  resolveWorkspaceSpecifier,
   type FileExists,
 } from "../src/resolve";
+import type { WorkspacePackages } from "../src/workspace";
 
 /** The resolution policy is a pure function of "which paths exist", so a set
  * is a complete stand-in for a filesystem - and one that can describe cases
@@ -84,7 +87,7 @@ test("`..` segments are resolved against the importing file's directory", () => 
   assert.equal(resolve("./log", "src/shared/index.ts", exists), "src/shared/log.ts");
 });
 
-test("a bare or package specifier is never resolved", () => {
+test("relative resolution never claims a bare or package specifier", () => {
   // Even if a path-shaped file happens to exist, these do not address it.
   const exists = existing("node:crypto", "react.ts", "@scope/pkg.ts", "src/react.ts");
   for (const specifier of ["react", "node:crypto", "@modelcontextprotocol/sdk/server/stdio.js", "@scope/pkg"]) {
@@ -147,6 +150,113 @@ test("the fs-backed predicate answers about real files under the project root", 
       "src/db/connection.ts",
       "the emitted-extension rule must work against a real tree too",
     );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- workspace package specifiers ----------------------------------------
+
+/** The excalidraw shape: an unbuilt monorepo whose manifests only mention
+ * `dist`, so the entry that exists is the source one. */
+const WORKSPACE: WorkspacePackages = new Map([
+  [
+    "@excalidraw/math",
+    { dir: "packages/math", manifest: { name: "@excalidraw/math", main: "./dist/prod/index.js" } },
+  ],
+  [
+    "@excalidraw/element",
+    {
+      dir: "packages/element",
+      manifest: {
+        name: "@excalidraw/element",
+        exports: { ".": "./src/index.ts", "./types": "./src/types.ts" },
+      },
+    },
+  ],
+]);
+
+function resolveBare(specifier: string, exists: FileExists): string | null {
+  return resolveWorkspaceSpecifier(specifier, WORKSPACE, exists);
+}
+
+test("a workspace package resolves to the entry file it actually has", () => {
+  const exists = existing("packages/math/src/index.ts");
+  assert.equal(resolveBare("@excalidraw/math", exists), "packages/math/src/index.ts");
+});
+
+test("a declared entry wins when the build output is really there", () => {
+  const exists = existing("packages/math/dist/prod/index.js", "packages/math/src/index.ts");
+  assert.equal(resolveBare("@excalidraw/math", exists), "packages/math/dist/prod/index.js");
+});
+
+test("an exports map decides the entry, for the package root and its subpaths", () => {
+  const exists = existing("packages/element/src/index.ts", "packages/element/src/types.ts");
+  assert.equal(resolveBare("@excalidraw/element", exists), "packages/element/src/index.ts");
+  assert.equal(resolveBare("@excalidraw/element/types", exists), "packages/element/src/types.ts");
+});
+
+test("a subpath with no exports entry falls back onto the package's source tree", () => {
+  const exists = existing("packages/math/src/point.ts");
+  assert.equal(resolveBare("@excalidraw/math/point", exists), "packages/math/src/point.ts");
+});
+
+test("a package outside the workspace stays unresolved", () => {
+  // The one thing this must not start doing: claiming registry packages. Each
+  // of these has a plausible-looking file in the tree and still resolves to
+  // nothing, because no package.json in the workspace declares that name.
+  const exists = existing(
+    "node_modules/react/index.js",
+    "packages/math/src/index.ts",
+    "src/react.ts",
+    "react.ts",
+  );
+  for (const specifier of ["react", "node:crypto", "lodash/fp", "@types/node"]) {
+    assert.equal(resolveBare(specifier, exists), null, specifier);
+  }
+});
+
+test("a workspace package whose entry is missing is not invented", () => {
+  assert.equal(resolveBare("@excalidraw/math", existing("packages/math/package.json")), null);
+});
+
+test("a workspace with no packages resolves nothing", () => {
+  const exists: FileExists = () => true;
+  assert.equal(resolveWorkspaceSpecifier("@excalidraw/math", new Map(), exists), null);
+});
+
+// --- the whole resolver, against a real workspace on disk ----------------
+
+test("the project resolver resolves workspace imports and leaves real packages alone", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-monorepo-"));
+  const write = async (rel: string, contents: string): Promise<void> => {
+    await fs.mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+    await fs.writeFile(path.join(root, rel), contents, "utf8");
+  };
+  try {
+    await write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    await write(
+      "packages/math/package.json",
+      JSON.stringify({ name: "@excalidraw/math", main: "./dist/prod/index.js" }),
+    );
+    await write("packages/math/src/index.ts", "export const pointFrom = () => {};\n");
+    await write("packages/math/src/point.ts", "export const p = 1;\n");
+    await write("packages/element/package.json", JSON.stringify({ name: "@excalidraw/element" }));
+    await write("packages/element/src/index.ts", "export const mutateElement = () => {};\n");
+    await write("packages/element/src/shape.ts", "export const shape = 1;\n");
+    await write("node_modules/react/package.json", JSON.stringify({ name: "react" }));
+    await write("node_modules/react/index.js", "module.exports = {};\n");
+
+    const resolve = createProjectResolver(root);
+    const from = "packages/element/src/shape.ts";
+
+    assert.equal(resolve("@excalidraw/math", from), "packages/math/src/index.ts");
+    assert.equal(resolve("@excalidraw/math/point", from), "packages/math/src/point.ts");
+    assert.equal(resolve("@excalidraw/element", from), "packages/element/src/index.ts");
+    assert.equal(resolve("react", from), null);
+    assert.equal(resolve("node:crypto", from), null);
+    assert.equal(resolve("@excalidraw/nope", from), null);
+    assert.equal(resolve("./index", from), "packages/element/src/index.ts");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

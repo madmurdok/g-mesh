@@ -204,10 +204,23 @@ Node-style path arithmetic: try the literal path, then each source extension
 this plugin parses, then `index.*` inside a directory — plus TypeScript's
 extension substitution, without which `import "./x.js"` in an ESM TypeScript
 project would resolve to nothing, since `./x.js` does not exist on disk until
-the project is built. Everything else — bare/package specifiers, and anything
-needing `exports`/`imports` maps, `paths` aliases or workspace links — is
-left to the backlog semantic layer, which has the type information and the
-module-resolution machinery to answer it properly.
+the project is built.
+
+A *bare* specifier is answered the same way when — and only when — it names a
+package of the project's own workspace. The manifest
+(`pnpm-workspace.yaml`, or `workspaces` in the root package.json) says which
+directories are packages, each package.json says what that package is called
+and where its entry is (`exports` conditions, then `source`/`main`/`module`/
+`types`, then the `src/index.*` convention that an unbuilt monorepo is
+actually resolvable by), and from there it is the same path arithmetic
+producing the same project-relative path. This is the normal way cross-package
+code is imported in a monorepo — `import { pointFrom } from "@excalidraw/math"`,
+not a `../../math/src` path — so without it a monorepo's cross-package edges
+are simply absent. Everything else — packages that live only in
+`node_modules`, `node:` builtins, `paths` aliases, `#private` imports maps —
+is left to the backlog semantic layer, which has the type information and the
+module-resolution machinery to answer it properly. Nothing of theirs is in the
+index anyway.
 
 The work is split across the process boundary, because neither side has both
 halves of the answer:
@@ -226,8 +239,8 @@ halves of the answer:
 
 An import that survives both steps unlinked stays what it was before any of
 this: a placeholder `Module` node carrying the raw specifier, with an
-unresolved `IMPORTS` edge into it. That covers packages (`"zod"`,
-`"node:crypto"`) and dangling relative imports alike — a specifier pointing
+unresolved `IMPORTS` edge into it. That covers off-workspace packages
+(`"zod"`, `"node:crypto"`) and dangling relative imports alike — a specifier pointing
 at nothing is reported as pointing at nothing, never quietly dropped and
 never invented.
 
@@ -253,7 +266,8 @@ resolved. Anything else is left alone, on the same rule the extractor's own
 name lookup follows: a missing edge beats a wrong one. In practice that
 leaves `import * as ns`, `default` imports of a *named* default export, and
 re-exported (`export { x } from "./y"`) names to the semantic layer, along
-with everything reached through a bare specifier.
+with everything reached through a specifier that did not resolve — a package
+outside the workspace, in practice.
 
 Unlike an import placeholder, a linked-away symbol placeholder is kept rather
 than deleted: it carries one edge per usage, so a later edit to the same file

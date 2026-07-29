@@ -367,7 +367,7 @@ async function modulesOf(root: string): Promise<WireNode[]> {
     );
 }
 
-test("relative imports are resolved against the real tree, bare ones are not", async () => {
+test("relative imports are resolved against the real tree, off-workspace packages are not", async () => {
   const root = await makeProject({
     // The ESM-TypeScript spelling: the specifier names a `.js` file that does
     // not exist on disk at all, only the `.ts` it is compiled from.
@@ -428,6 +428,52 @@ test("an import of a gitignored file resolves to nothing rather than to a node t
       "resolved_module",
       "resolution answers about the filesystem; whether the target is indexed is core's question",
     );
+  } finally {
+    await cleanup(root);
+  }
+});
+
+/**
+ * The monorepo case this resolution exists for: cross-package usage is
+ * written as a package name, not a relative path, so without workspace
+ * resolution neither the IMPORTS edge nor the imported *symbol* behind it has
+ * anything to point at - which is exactly what made find_callers blind to
+ * `pointFrom`'s real call sites in the excalidraw corpus.
+ */
+test("a workspace package import resolves to the package's source, symbols included", async () => {
+  const root = await makeProject({
+    "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+    "packages/math/package.json": JSON.stringify({
+      name: "@excalidraw/math",
+      main: "./dist/prod/index.js", // build output, absent from an unbuilt checkout
+    }),
+    "packages/math/src/index.ts": `export const pointFrom = (x: number) => x;\n`,
+    "packages/element/package.json": JSON.stringify({ name: "@excalidraw/element" }),
+    "packages/element/src/shape.ts": `import { pointFrom } from "@excalidraw/math";
+import { useState } from "react";
+export const shape = () => pointFrom(1) + useState();
+`,
+  });
+  try {
+    const lines: string[] = [];
+    await bulkIndexProject(root, (line) => lines.push(line));
+    const nodes = lines.map((line) => JSON.parse(line)).filter((parsed) => "range" in parsed) as WireNode[];
+    const byName = new Map(nodes.map((node) => [`${node.name}:${node.nativeKind}`, node]));
+
+    const target = byName.get("@excalidraw/math:resolved_module");
+    assert.ok(target, "the workspace package must resolve to a file");
+    assert.equal(target.qualifiedName, "packages/math/src/index.ts");
+
+    const external = byName.get("react:external_module");
+    assert.ok(external, "a registry package must stay an unresolved placeholder");
+    assert.equal(external.qualifiedName, "react");
+
+    // The payoff: the imported name now has a placeholder core can link to
+    // the real declaration, because the specifier resolved.
+    const pending = byName.get("pointFrom:pending_symbol");
+    assert.ok(pending, "the symbol imported across packages must get a placeholder");
+    assert.equal(pending.qualifiedName, "packages/math/src/index.ts#pointFrom");
+    assert.equal(byName.has("useState:pending_symbol"), false, "nothing to link a package symbol to");
   } finally {
     await cleanup(root);
   }

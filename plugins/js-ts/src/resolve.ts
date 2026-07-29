@@ -1,4 +1,4 @@
-// Relative module-specifier resolution for the structural (tree-sitter) pass.
+// Module-specifier resolution for the structural (tree-sitter) pass.
 //
 // A specifier is the one thing a syntax-only extractor can resolve exactly:
 // it is a string literal, not an identifier, so no type information is
@@ -9,12 +9,20 @@
 // extension-substitution rule, which is what makes `import "./db/connection.js"`
 // in an ESM TypeScript file point at `db/connection.ts` on disk.
 //
-// Bare/package specifiers ("react", "@scope/pkg/sub.js", "node:crypto") are
-// deliberately out of scope: resolving them means walking `node_modules`,
-// honouring `exports`/`imports` maps, `paths` aliases and workspace links -
-// all of which need real project configuration, and none of which points at a
-// file this index contains anyway. They stay unresolved placeholders (see
-// `recordImport` in extract.ts).
+// A *bare* specifier is resolved only when it names a package of this
+// project's own workspace ("@excalidraw/math" -> packages/math): the manifest
+// says which directory that is (workspace.ts), and from there it is the same
+// path arithmetic, against the same filesystem, producing the same kind of
+// project-relative path - so nothing downstream can tell the two apart.
+// That case matters because in a monorepo most cross-package imports are
+// written this way, not relatively.
+//
+// Everything else - "react", "node:crypto", any package that exists only
+// under `node_modules` - stays an unresolved placeholder (see `recordImport`
+// in extract.ts): no file of theirs is indexed, so there is no node an edge
+// could honestly point at. `paths` aliases and `imports` (#private) maps need
+// project configuration this pass does not read, and are left to the semantic
+// layer as well.
 
 // Depends on extract.ts, never the other way round: the extractor takes a
 // `SpecifierResolver` from its caller and knows nothing about how one is
@@ -24,6 +32,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { isSupportedFile, type SpecifierResolver } from "./extract";
+import {
+  NO_WORKSPACE_PACKAGES,
+  packageEntryTargets,
+  parseBareSpecifier,
+  readWorkspacePackages,
+  type WorkspacePackages,
+} from "./workspace";
 
 /**
  * "Is there a regular file at this project-relative POSIX path?" - the one
@@ -119,9 +134,44 @@ export function resolveRelativeSpecifier(
   return null;
 }
 
-/** [`resolveRelativeSpecifier`] in the shape the extractor consumes. */
-export function createSpecifierResolver(fileExists: FileExists): SpecifierResolver {
-  return (specifier, fromFilePath) => resolveRelativeSpecifier(specifier, fromFilePath, fileExists);
+/**
+ * Project-relative POSIX path a bare specifier names, or `null` when it names
+ * nothing in this project - the overwhelmingly common case, since only a
+ * package `workspacePackages` lists is in the tree at all.
+ *
+ * Unlike relative resolution this does not depend on the importing file: a
+ * package name means the same thing everywhere in the workspace.
+ */
+export function resolveWorkspaceSpecifier(
+  specifier: string,
+  workspacePackages: WorkspacePackages,
+  fileExists: FileExists,
+): string | null {
+  if (workspacePackages.size === 0) return null;
+
+  const parsed = parseBareSpecifier(specifier);
+  if (parsed === null) return null;
+
+  const target = workspacePackages.get(parsed.name);
+  if (target === undefined) return null;
+
+  for (const base of packageEntryTargets(target, parsed.subpath)) {
+    for (const candidate of candidatePaths(base)) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/** Both resolutions in the single shape the extractor consumes. */
+export function createSpecifierResolver(
+  fileExists: FileExists,
+  workspacePackages: WorkspacePackages = NO_WORKSPACE_PACKAGES,
+): SpecifierResolver {
+  return (specifier, fromFilePath) =>
+    isRelativeSpecifier(specifier)
+      ? resolveRelativeSpecifier(specifier, fromFilePath, fileExists)
+      : resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists);
 }
 
 /**
@@ -156,7 +206,19 @@ export function createProjectFileExists(projectRoot: string): FileExists {
   };
 }
 
-/** The resolver the real indexing paths use: filesystem-backed, rooted at `projectRoot`. */
+/**
+ * The resolver the real indexing paths use: filesystem-backed, rooted at
+ * `projectRoot`.
+ *
+ * The workspace is read once here, and so has the same lifetime as the
+ * existence memo above - once per bulk-index walk, once per reparsed file. It
+ * is the cheaper of the two answers to refresh (a handful of manifests, well
+ * under a millisecond) and by far the less volatile, so nothing is gained by
+ * holding it any longer than the memo it travels with.
+ */
 export function createProjectResolver(projectRoot: string): SpecifierResolver {
-  return createSpecifierResolver(createProjectFileExists(projectRoot));
+  return createSpecifierResolver(
+    createProjectFileExists(projectRoot),
+    readWorkspacePackages(projectRoot),
+  );
 }
