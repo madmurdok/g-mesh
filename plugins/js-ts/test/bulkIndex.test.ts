@@ -410,24 +410,36 @@ export const start = () => connect(pool, fmt(z));
   }
 });
 
-test("an import of a gitignored file resolves to nothing rather than to a node that is not there", async () => {
+test("an import of a gitignored file stays an unresolved placeholder, matching the walk's own exclusion policy", async () => {
   const root = await makeProject({
     "src/index.ts": `import { secret } from "./generated";\nexport const x = secret;\n`,
     "src/generated.ts": `export const secret = 1;\n`,
     ".gitignore": "src/generated.ts\n",
   });
   try {
-    // The walk skips the target, so nothing would ever create its `File`
-    // node - core would find no target and leave the placeholder alone, but
-    // the honest answer is available one step earlier than that.
     const modules = await modulesOf(root);
     assert.equal(modules.length, 1);
-    assert.equal(modules[0].qualifiedName, "src/generated.ts");
+    assert.equal(modules[0].qualifiedName, "./generated", "unresolved - the raw specifier, not a path");
     assert.equal(
       modules[0].nativeKind,
-      "resolved_module",
-      "resolution answers about the filesystem; whether the target is indexed is core's question",
+      "external_module",
+      "resolution now agrees with the walk: a gitignored target is never indexed, so it is never claimed as resolved either",
     );
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a relative import into a hard-excluded directory is also treated as unresolved", async () => {
+  const root = await makeProject({
+    "src/index.ts": `import { secret } from "./dist/generated";\nexport const x = secret;\n`,
+    "src/dist/generated.ts": `export const secret = 1;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].qualifiedName, "./dist/generated");
+    assert.equal(modules[0].nativeKind, "external_module");
   } finally {
     await cleanup(root);
   }
@@ -474,6 +486,53 @@ export const shape = () => pointFrom(1) + useState();
     assert.ok(pending, "the symbol imported across packages must get a placeholder");
     assert.equal(pending.qualifiedName, "packages/math/src/index.ts#pointFrom");
     assert.equal(byName.has("useState:pending_symbol"), false, "nothing to link a package symbol to");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+/** Same package, now *built*: the declared entry is physically on disk, and it
+ * is the one file of the pair the walk would never index. */
+test("a workspace package's declared entry under dist/ does not shadow its source, even though dist physically exists", async () => {
+  const root = await makeProject({
+    "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+    "packages/math/package.json": JSON.stringify({ name: "@excalidraw/math", main: "./dist/prod/index.js" }),
+    "packages/math/dist/prod/index.js": `export const pointFrom = () => 0; // must not win\n`,
+    "packages/math/src/index.ts": `export const pointFrom = (x: number) => x;\n`,
+    "packages/element/package.json": JSON.stringify({ name: "@excalidraw/element" }),
+    "packages/element/src/shape.ts": `import { pointFrom } from "@excalidraw/math";\nexport const shape = () => pointFrom(1);\n`,
+  });
+  try {
+    const lines: string[] = [];
+    await bulkIndexProject(root, (line) => lines.push(line));
+    const nodes = lines.map((line) => JSON.parse(line)).filter((p) => "range" in p) as WireNode[];
+    const byName = new Map(nodes.map((n) => [`${n.name}:${n.nativeKind}`, n]));
+    const target = byName.get("@excalidraw/math:resolved_module");
+    assert.ok(target, "the workspace package must still resolve");
+    assert.equal(target.qualifiedName, "packages/math/src/index.ts");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a workspace package's declared entry under a gitignored (not hard-excluded-named) directory does not shadow its source", async () => {
+  const root = await makeProject({
+    "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+    "packages/math/package.json": JSON.stringify({ name: "@excalidraw/math", main: "./build-output/index.js" }),
+    "packages/math/.gitignore": "build-output/\n",
+    "packages/math/build-output/index.js": `export const pointFrom = () => 0; // must not win\n`,
+    "packages/math/src/index.ts": `export const pointFrom = (x: number) => x;\n`,
+    "packages/element/package.json": JSON.stringify({ name: "@excalidraw/element" }),
+    "packages/element/src/shape.ts": `import { pointFrom } from "@excalidraw/math";\nexport const shape = () => pointFrom(1);\n`,
+  });
+  try {
+    const lines: string[] = [];
+    await bulkIndexProject(root, (line) => lines.push(line));
+    const nodes = lines.map((line) => JSON.parse(line)).filter((p) => "range" in p) as WireNode[];
+    const byName = new Map(nodes.map((n) => [`${n.name}:${n.nativeKind}`, n]));
+    const target = byName.get("@excalidraw/math:resolved_module");
+    assert.ok(target);
+    assert.equal(target.qualifiedName, "packages/math/src/index.ts");
   } finally {
     await cleanup(root);
   }

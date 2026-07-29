@@ -9,20 +9,16 @@
 import * as fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import * as path from "node:path";
-import ignore, { type Ignore } from "ignore";
 
 import { extractFile, isSupportedFile, type ExtractedEdge, type ExtractedNode } from "./extract";
+import {
+  HARD_EXCLUDED_DIRS,
+  isIgnoredByLayers,
+  loadGitignoreLayer,
+  toPosixPath,
+  type GitignoreLayer,
+} from "./ignorePolicy";
 import { createProjectResolver } from "./resolve";
-
-/**
- * Directories skipped unconditionally, regardless of .gitignore contents.
- * `.claude` holds Claude Code's own session/worktree artifacts (e.g.
- * `.claude/worktrees/agent-<hash>/`, full copies of the project made for
- * parallel agent sessions) - real project source is never there, and a
- * project's own .gitignore has no reason to list it, so it needs the same
- * hard exclusion as `.git`.
- */
-const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", ".claude"]);
 
 /**
  * Where bulk-indexed NDJSON lines go. A callback mirrors the simplest test
@@ -120,44 +116,8 @@ export function toWireNode(node: ExtractedNode): WireNode {
 }
 
 // --- gitignore-aware walk -------------------------------------------------
-
-/** One directory's own `.gitignore`, plus the (absolute) directory it applies to. */
-interface GitignoreLayer {
-  readonly baseDir: string;
-  readonly matcher: Ignore;
-}
-
-function toPosixPath(p: string): string {
-  return p.split(path.sep).join("/");
-}
-
-async function loadGitignoreLayer(dir: string): Promise<GitignoreLayer | null> {
-  let contents: string;
-  try {
-    contents = await fs.readFile(path.join(dir, ".gitignore"), "utf8");
-  } catch {
-    return null; // no .gitignore here - not an error
-  }
-  return { baseDir: dir, matcher: ignore().add(contents) };
-}
-
-/**
- * Combines every ancestor `.gitignore` layer the same way git does: each
- * layer's patterns apply to paths relative to that layer's own directory,
- * and a later (deeper, or later-declared) match - including a negation -
- * overrides an earlier one.
- */
-function isIgnoredByLayers(layers: readonly GitignoreLayer[], absPath: string): boolean {
-  let ignored = false;
-  for (const layer of layers) {
-    const rel = path.relative(layer.baseDir, absPath);
-    if (rel === "" || rel.startsWith("..")) continue; // not under this layer
-    const result = layer.matcher.test(toPosixPath(rel));
-    if (result.ignored) ignored = true;
-    else if (result.unignored) ignored = false;
-  }
-  return ignored;
-}
+// The exclusion policy itself lives in ignorePolicy.ts, shared with
+// resolve.ts so the two cannot disagree about what gets indexed.
 
 /**
  * Walks `projectRoot` depth-first, yielding project-relative POSIX paths of

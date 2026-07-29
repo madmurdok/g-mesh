@@ -228,14 +228,19 @@ halves of the answer:
 - **The plugin** decides *which path* a specifier names. Extension guessing
   and `index.*` directory imports are language rules, and core is
   deliberately language-agnostic; the stat calls they cost land on the side
-  that is walking the tree anyway.
+  that is walking the tree anyway. Existence alone is not enough to claim a
+  path, so the same side also applies its own walk's exclusion policy — hard-excluded
+  directories, `.gitignore` — to every candidate: a target the walk would
+  never turn into a `File` node is never reported as resolved either. Without
+  that, a built checkout resolves `@excalidraw/math` to the `dist/` output
+  its manifest declares and loses the edge into the source the walk did index.
 - **The core** decides *whether that path is a node*, in a linking pass
   (`core/src/graph/imports.rs`) that repoints the edge — once the cold-start
-  stream is over, and scoped to each diff afterwards. A file can exist on
-  disk and still have no node — gitignored, excluded, or another language —
-  and mid-walk it may simply not have been reached yet. Since edges are
-  foreign keys onto nodes, only the side that knows what the index holds can
-  point one at a real node.
+  stream is over, and scoped to each diff afterwards. What is left for it is
+  timing, not policy: a path can be a perfectly indexable target that simply
+  has not reached a `File` node yet mid-walk, or belong to another language's
+  plugin. Since edges are foreign keys onto nodes, only the side that knows
+  what the index holds can point one at a real node.
 
 An import that survives both steps unlinked stays what it was before any of
 this: a placeholder `Module` node carrying the raw specifier, with an
