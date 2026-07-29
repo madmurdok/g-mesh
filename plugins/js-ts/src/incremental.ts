@@ -19,9 +19,11 @@ import {
   extractIncremental,
   type ExtractedEdge,
   type ExtractedNode,
+  type ExtractOptions,
   type ExtractResult,
   type ParsedTree,
 } from "./extract";
+import { createProjectResolver } from "./resolve";
 
 // --- edit description ----------------------------------------------------
 
@@ -316,11 +318,15 @@ export function resetIncrementalState(): void {
  *
  * @throws {UnsupportedFileError} for extensions this plugin does not own.
  */
-export function reparseFile(filePath: string, sourceText: string): FileDiff {
+export function reparseFile(
+  filePath: string,
+  sourceText: string,
+  options?: ExtractOptions,
+): FileDiff {
   const cached = fileStates.get(filePath);
 
   if (cached === undefined) {
-    const { tree, result } = extractIncremental(filePath, sourceText);
+    const { tree, result } = extractIncremental(filePath, sourceText, undefined, options);
     fileStates.set(filePath, { sourceText, tree, result });
     return diffResults(filePath, EMPTY_RESULT, result, true);
   }
@@ -334,7 +340,7 @@ export function reparseFile(filePath: string, sourceText: string): FileDiff {
   // text's layout with the edited ranges marked stale, which is exactly what
   // `parse` needs as its `oldTree`.
   cached.tree.edit(edit);
-  const { tree, result } = extractIncremental(filePath, sourceText, cached.tree);
+  const { tree, result } = extractIncremental(filePath, sourceText, cached.tree, options);
 
   fileStates.set(filePath, { sourceText, tree, result });
   return diffResults(filePath, cached.result, result, false);
@@ -345,11 +351,24 @@ export function reparseFile(filePath: string, sourceText: string): FileDiff {
  * project-relative path, with the new contents read from disk.
  * `projectRoot` only locates the file; ids keep using `filePath` verbatim,
  * the same convention bulkIndex.ts follows.
+ *
+ * A fresh resolver per call, unlike the bulk index's one-per-walk: this
+ * process is long-lived, so a memo shared across calls would keep answering
+ * "that file does not exist" about a file created since the last edit.
+ *
+ * Resolution is still only ever as fresh as the *importer's* last reparse:
+ * creating `b.ts` does not by itself re-resolve `a.ts`'s dangling
+ * `import "./b"`, it stays a placeholder until `a.ts` is reindexed. Core
+ * closes exactly that gap from the other side - a diff that adds a `File`
+ * node relinks the placeholders already pointing at its path (see
+ * `graph::imports::link_diff`) - so the two together leave only "the importer
+ * has not been touched and the target was never added" unresolved, which the
+ * next reparse of the importer fixes.
  */
 export async function reparseChangedFile(
   projectRoot: string,
   filePath: string,
 ): Promise<FileDiff> {
   const sourceText = await fs.readFile(path.join(projectRoot, filePath), "utf8");
-  return reparseFile(filePath, sourceText);
+  return reparseFile(filePath, sourceText, { resolveSpecifier: createProjectResolver(projectRoot) });
 }

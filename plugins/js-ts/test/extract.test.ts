@@ -4,6 +4,7 @@ import {
   extractFile,
   isSupportedFile,
   nodeIdFor,
+  RESOLVED_MODULE_NATIVE_KIND,
   UnsupportedFileError,
   type EdgeKind,
   type ExtractResult,
@@ -284,6 +285,95 @@ test("rejects files this plugin does not own", () => {
   assert.equal(isSupportedFile("src/lib.rs"), false);
   assert.equal(isSupportedFile("src/lib.mts"), true);
   assert.throws(() => extractFile("src/lib.rs", "fn main() {}"), UnsupportedFileError);
+});
+
+// --- import placeholders and their resolution ----------------------------
+
+const IMPORTER_TS = `import { connect } from "./db/connection.js";
+import { z } from "zod";
+import { helper } from "./missing/helper.js";
+export { pool } from "./db/pool";
+const legacy = require("./legacy");
+`;
+
+/** A `SpecifierResolver` over a fixed set of project files, i.e. the shape
+ * resolve.ts produces - kept local so this file tests what the *extractor*
+ * does with a resolution, not how one is arrived at. */
+function resolverOver(files: Record<string, string>) {
+  return (specifier: string, fromFilePath: string): string | null => {
+    assert.equal(fromFilePath, "src/index.ts", "the importer's own path is what specifiers are relative to");
+    return files[specifier] ?? null;
+  };
+}
+
+test("without a resolver every import target stays a raw-specifier placeholder", () => {
+  const result = extractFile("src/index.ts", IMPORTER_TS);
+
+  for (const specifier of ["./db/connection.js", "zod", "./missing/helper.js", "./db/pool", "./legacy"]) {
+    const placeholder = node(result, "Module", specifier);
+    assert.equal(placeholder.name, specifier);
+    assert.equal(placeholder.nativeKind, "external_module");
+    assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", specifier), `IMPORTS ${specifier}`);
+  }
+});
+
+test("a resolved specifier becomes a placeholder addressed by the path it names", () => {
+  const result = extractFile("src/index.ts", IMPORTER_TS, {
+    resolveSpecifier: resolverOver({
+      "./db/connection.js": "src/db/connection.ts",
+      "./db/pool": "src/db/pool.ts",
+      "./legacy": "src/legacy.js",
+    }),
+  });
+
+  const connection = node(result, "Module", "src/db/connection.ts");
+  assert.equal(connection.nativeKind, RESOLVED_MODULE_NATIVE_KIND);
+  assert.equal(connection.name, "./db/connection.js", "the raw specifier is still what the source says");
+  assert.equal(connection.filePath, "src/index.ts", "the placeholder lives where the import statement is");
+  assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", "src/db/connection.ts"));
+
+  // `export ... from` and `require()` are imports too, and resolve alike.
+  assert.equal(node(result, "Module", "src/db/pool.ts").nativeKind, RESOLVED_MODULE_NATIVE_KIND);
+  assert.equal(node(result, "Module", "src/legacy.js").nativeKind, RESOLVED_MODULE_NATIVE_KIND);
+});
+
+test("a bare specifier and a dangling relative one keep the old placeholder behaviour", () => {
+  const result = extractFile("src/index.ts", IMPORTER_TS, {
+    resolveSpecifier: resolverOver({ "./db/connection.js": "src/db/connection.ts" }),
+  });
+
+  // Nothing local to point at: a package, and a relative import of a file
+  // that is not there (deleted, or a typo).
+  for (const specifier of ["zod", "./missing/helper.js"]) {
+    assert.equal(node(result, "Module", specifier).nativeKind, "external_module");
+    assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", specifier));
+  }
+});
+
+test("resolution never claims an edge is resolved - that is core's call", () => {
+  const result = extractFile("src/index.ts", IMPORTER_TS, {
+    resolveSpecifier: resolverOver({ "./db/connection.js": "src/db/connection.ts" }),
+  });
+
+  for (const edge of result.edges) {
+    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.resolved, false, "the target node is still a placeholder until core links it");
+  }
+});
+
+test("two specifiers naming the same file collapse into one placeholder", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `import { a } from "./db/connection.js";\nimport type { B } from "./db/connection";\n`,
+    { resolveSpecifier: () => "src/db/connection.ts" },
+  );
+
+  assert.equal(
+    result.nodes.filter((n) => n.kind === "Module").length,
+    1,
+    "identity is the resolved path, so the two spellings are one target",
+  );
+  assert.equal(result.edges.filter((e) => e.kind === "IMPORTS").length, 1);
 });
 
 test("parses files larger than the native parser's default read buffer", () => {

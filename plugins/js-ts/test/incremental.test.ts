@@ -398,6 +398,44 @@ test("reparseChangedFile reads the project-relative path and keys state by it", 
   }
 });
 
+test("reparseChangedFile resolves relative imports against the project on disk", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-incr-"));
+  try {
+    resetIncrementalState();
+    const write = async (rel: string, text: string): Promise<void> => {
+      const abs = path.join(root, rel);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, text, "utf8");
+    };
+    await write("src/index.ts", `import { format } from "./format.js";\nexport const x = format;\n`);
+
+    // The target does not exist yet, so the import is honestly unresolved.
+    const before = await reparseChangedFile(root, "src/index.ts");
+    const dangling = before.addedNodes.find((n) => n.kind === "Module");
+    assert.equal(dangling?.qualifiedName, "./format.js");
+    assert.equal(dangling?.nativeKind, "external_module");
+
+    // Creating the target does not by itself re-resolve the importer - the
+    // plugin only ever re-answers about a file it is asked to reparse (core
+    // closes this gap from its side, see graph::imports::link_diff).
+    await write("src/format.ts", `export const format = (x: unknown) => String(x);\n`);
+    assert.ok(isEmptyDiff(await reparseChangedFile(root, "src/index.ts")), "unchanged text, unchanged diff");
+
+    // Editing the importer re-runs resolution, which now finds it.
+    await write("src/index.ts", `import { format } from "./format.js";\nexport const y = format;\n`);
+    const after = await reparseChangedFile(root, "src/index.ts");
+    const resolved = after.addedNodes.find((n) => n.kind === "Module");
+    assert.equal(resolved?.qualifiedName, "src/format.ts");
+    assert.equal(resolved?.nativeKind, "resolved_module");
+    assert.ok(
+      after.removedNodes.some((n) => n.qualifiedName === "./format.js"),
+      "the old placeholder must be reported removed, or core would keep both",
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- the edit description itself -------------------------------------------
 
 test("computeSourceEdit returns null for identical text", () => {

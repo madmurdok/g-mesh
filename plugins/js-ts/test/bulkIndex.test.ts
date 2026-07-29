@@ -345,3 +345,80 @@ test("accepts a real NodeJS.WritableStream sink, one write() call per line", asy
     await cleanup(root);
   }
 });
+
+// --- import resolution over a real tree -----------------------------------
+
+/** Every `Module` node the walk emitted, keyed by the file that imported it. */
+async function modulesOf(root: string): Promise<WireNode[]> {
+  const lines: string[] = [];
+  await bulkIndexProject(root, (line) => lines.push(line));
+  return lines
+    .map((line) => JSON.parse(line))
+    .filter((parsed): parsed is WireNode => "range" in parsed && parsed.kind === "Module");
+}
+
+test("relative imports are resolved against the real tree, bare ones are not", async () => {
+  const root = await makeProject({
+    // The ESM-TypeScript spelling: the specifier names a `.js` file that does
+    // not exist on disk at all, only the `.ts` it is compiled from.
+    "src/index.ts": `import { connect } from "./db/connection.js";
+import { z } from "zod";
+import { pool } from "./db";
+import { fmt } from "./util";
+import { gone } from "./deleted.js";
+export const start = () => connect(pool, fmt(z));
+`,
+    "src/db/connection.ts": `export const connect = () => 1;\n`,
+    "src/db/index.ts": `export const pool = 1;\n`,
+    "src/util.tsx": `export const fmt = (x: unknown) => String(x);\n`,
+  });
+  try {
+    const targets = new Map((await modulesOf(root)).map((m) => [m.name, m]));
+
+    for (const [specifier, expected] of [
+      ["./db/connection.js", "src/db/connection.ts"],
+      ["./db", "src/db/index.ts"],
+      ["./util", "src/util.tsx"],
+    ] as const) {
+      const target = targets.get(specifier);
+      assert.ok(target, `no placeholder for ${specifier}`);
+      assert.equal(target.qualifiedName, expected, `${specifier} must resolve to ${expected}`);
+      assert.equal(target.nativeKind, "resolved_module");
+      assert.equal(target.filePath, "src/index.ts", "the placeholder still belongs to the importing file");
+    }
+
+    // A package, and a relative import of a file that is not there: both stay
+    // exactly what they were before resolution existed.
+    for (const specifier of ["zod", "./deleted.js"]) {
+      const target = targets.get(specifier);
+      assert.ok(target, `no placeholder for ${specifier}`);
+      assert.equal(target.qualifiedName, specifier);
+      assert.equal(target.nativeKind, "external_module");
+    }
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("an import of a gitignored file resolves to nothing rather than to a node that is not there", async () => {
+  const root = await makeProject({
+    "src/index.ts": `import { secret } from "./generated";\nexport const x = secret;\n`,
+    "src/generated.ts": `export const secret = 1;\n`,
+    ".gitignore": "src/generated.ts\n",
+  });
+  try {
+    // The walk skips the target, so nothing would ever create its `File`
+    // node - core would find no target and leave the placeholder alone, but
+    // the honest answer is available one step earlier than that.
+    const modules = await modulesOf(root);
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].qualifiedName, "src/generated.ts");
+    assert.equal(
+      modules[0].nativeKind,
+      "resolved_module",
+      "resolution answers about the filesystem; whether the target is indexed is core's question",
+    );
+  } finally {
+    await cleanup(root);
+  }
+});

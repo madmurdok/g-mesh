@@ -12,6 +12,7 @@ import * as path from "node:path";
 import ignore, { type Ignore } from "ignore";
 
 import { extractFile, isSupportedFile, type ExtractedEdge, type ExtractedNode } from "./extract";
+import { createProjectResolver } from "./resolve";
 
 /**
  * Directories skipped unconditionally, regardless of .gitignore contents.
@@ -236,6 +237,12 @@ export async function bulkIndexProject(
   let nodesEmitted = 0;
   let edgesEmitted = 0;
 
+  // One resolver (and therefore one existence memo) for the whole walk: this
+  // process is one-shot, so nothing can create or delete a file behind its
+  // back while it runs, and the same handful of shared modules is otherwise
+  // re-stat-ed once per importing file.
+  const resolveSpecifier = createProjectResolver(projectRoot);
+
   for await (const relPath of walkProjectFiles(projectRoot)) {
     const absPath = path.join(projectRoot, relPath);
     let sourceText: string;
@@ -247,7 +254,7 @@ export async function bulkIndexProject(
 
     let result;
     try {
-      result = extractFile(relPath, sourceText);
+      result = extractFile(relPath, sourceText, { resolveSpecifier });
     } catch {
       continue; // e.g. UnsupportedFileError should not happen post-walk-filter,
       // but a corrupt/oversized file must not abort the whole bulk index
