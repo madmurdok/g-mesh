@@ -9,13 +9,14 @@ import {
   createProjectResolver,
   createSpecifierResolver,
   isRelativeSpecifier,
+  resolvePackageImportsSpecifier,
   resolveRelativeSpecifier,
   resolveTsconfigPathsSpecifier,
   resolveWorkspaceSpecifier,
   type FileExists,
 } from "../src/resolve";
 import type { TsconfigPathsConfig, TsconfigPathsIndex } from "../src/tsconfigPaths";
-import type { WorkspacePackages } from "../src/workspace";
+import type { PackageImportsConfig, PackageImportsIndex, WorkspacePackages } from "../src/workspace";
 
 /** The resolution policy is a pure function of "which paths exist", so a set
  * is a complete stand-in for a filesystem - and one that can describe cases
@@ -406,5 +407,70 @@ test("an alias is refused when its target is outside the project or unparseable"
     assert.equal(resolve("@/kept", "src/kept.ts"), "src/kept.ts");
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+// --- `#private` package-imports specifiers --------------------------------
+
+/** The importing file's own package's `imports` map, as the index would hand
+ * it over - so this stays a test of the resolution policy, not of the
+ * package.json walk itself (see workspace.test.ts for that half). */
+const PACKAGE_IMPORTS: PackageImportsConfig = {
+  dir: "packages/math",
+  imports: { "#util": "./src/util.ts", "#lib/*": "./src/lib/*.ts" },
+};
+
+const PACKAGE_IMPORTS_INDEX: PackageImportsIndex = () => PACKAGE_IMPORTS;
+
+test("a `#` specifier resolves through the importing file's own package imports map", () => {
+  const exists = existing("packages/math/src/util.ts", "packages/math/src/lib/point.ts");
+  const resolve = (specifier: string): string | null =>
+    resolvePackageImportsSpecifier(specifier, "packages/math/src/index.ts", PACKAGE_IMPORTS_INDEX, exists);
+
+  assert.equal(resolve("#util"), "packages/math/src/util.ts");
+  assert.equal(resolve("#lib/point"), "packages/math/src/lib/point.ts");
+  assert.equal(resolve("#nowhere"), null, "no key matches, so this is not an imports specifier at all");
+  assert.equal(resolve("react"), null, "a non-`#` specifier is the other functions' job");
+});
+
+test("a `#` specifier is refused when the importing file has no enclosing imports map", () => {
+  const noIndex: PackageImportsIndex = () => null;
+  const exists: FileExists = () => true;
+  assert.equal(resolvePackageImportsSpecifier("#util", "src/index.ts", noIndex, exists), null);
+});
+
+test("the project resolver resolves a `#private` import to the real file it names", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-package-imports-"));
+  const write = async (rel: string, contents: string): Promise<void> => {
+    await fs.mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+    await fs.writeFile(path.join(root, rel), contents, "utf8");
+  };
+  try {
+    await write("package.json", JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }));
+    await write("src/util.ts", "export const util = 1;\n");
+    await write("src/index.ts", 'import { util } from "#util";\n');
+
+    const resolve = createProjectResolver(root);
+    assert.equal(resolve("#util", "src/index.ts"), "src/util.ts");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the project resolver leaves an unmatched `#private` import unresolved", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-package-imports-"));
+  const write = async (rel: string, contents: string): Promise<void> => {
+    await fs.mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+    await fs.writeFile(path.join(root, rel), contents, "utf8");
+  };
+  try {
+    await write("package.json", JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }));
+    await write("src/util.ts", "export const util = 1;\n");
+    await write("src/index.ts", 'import { gone } from "#gone";\n');
+
+    const resolve = createProjectResolver(root);
+    assert.equal(resolve("#gone", "src/index.ts"), null);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });

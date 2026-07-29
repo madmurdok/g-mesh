@@ -44,6 +44,17 @@ export const NO_WORKSPACE_PACKAGES: WorkspacePackages = new Map();
  * code, while `types` names a `.d.ts` describing code that is very often
  * already in this index under its real path. Existence still decides - this
  * only settles which of several existing files wins.
+ *
+ * Task 84 (see ignorePolicy.ts) already makes `FileExists` refuse a
+ * gitignored or hard-excluded candidate regardless of where it ranks, so the
+ * only case this ordering still has to arbitrate is a package that ships
+ * *both* an ESM and a CJS build actually committed in-tree. Ranking
+ * source/import/module ahead of require/default, and types last, means such a
+ * package deterministically resolves to its ESM/source-facing copy every
+ * time - a defensible, source-oriented-index choice, and importantly a
+ * *stable* one: the same input always resolves to the same file, which rules
+ * out the flakiness that would be the real cost of getting this wrong. This is
+ * a deliberate, documented choice, not an open gap.
  */
 const CONDITION_PRIORITY = [
   "source",
@@ -147,6 +158,133 @@ export function readWorkspacePackages(projectRoot: string): WorkspacePackages {
     }
   }
   return packages;
+}
+
+// --- package imports (#private) --------------------------------------------
+
+/**
+ * A package.json's `imports` map, plus the directory (project-relative POSIX)
+ * that map's targets resolve against - the same "config facts, not yet a
+ * file" shape `TsconfigPathsConfig` uses for `paths`.
+ */
+export interface PackageImportsConfig {
+  /** Project-relative POSIX dir of the package.json that declared `imports`. */
+  readonly dir: string;
+  readonly imports: Record<string, unknown>;
+}
+
+/**
+ * "Which `#private` imports map applies to this file?" - the `imports` analog
+ * of `TsconfigPathsIndex`, a function rather than a map because the answer
+ * depends on where the importing file sits: `#specifier` resolution is
+ * strictly scoped to the *nearest enclosing package*, not inherited from a
+ * parent package the way a workspace-wide manifest lookup would be.
+ */
+export type PackageImportsIndex = (fromFilePath: string) => PackageImportsConfig | null;
+
+/** For callers with no project on disk - tests, and resolution built from a
+ * bare `FileExists`. Every file gets "no `#imports` map". */
+export const NO_PACKAGE_IMPORTS: PackageImportsIndex = () => null;
+
+/**
+ * The `#imports` map in force for `fromFilePath`, or `null` when the nearest
+ * enclosing package.json declares none.
+ *
+ * Walks upward from `fromFilePath`'s own directory, exactly like
+ * `createTsconfigPathsIndex` walks for the nearest tsconfig/jsconfig: the
+ * first directory holding a package.json wins outright, whether or not that
+ * package.json declares `imports` - a `#specifier` in a package with no
+ * `imports` map is simply unresolved, matching Node's real behaviour, where
+ * `#imports` never fall through to a grandparent package. The walk never
+ * looks above `projectRoot`, and every directory it passes through is
+ * memoized with the same answer, so a later lookup starting deeper in the
+ * same package costs nothing.
+ */
+export function createPackageImportsIndex(projectRoot: string): PackageImportsIndex {
+  const projectRootAbs = path.resolve(projectRoot);
+  const nearestCache = new Map<string, PackageImportsConfig | null>();
+
+  return (fromFilePath: string): PackageImportsConfig | null => {
+    const startDir = path.join(projectRootAbs, ...path.posix.dirname(fromFilePath).split("/"));
+    // A caller is expected to pass a project-relative path, but one that
+    // climbs out would start the walk outside the project - the one way this
+    // could read a package.json that is none of its business.
+    if (projectRelativeDir(startDir, projectRootAbs) === null) return null;
+
+    // Every directory walked past shares the answer: none of them held a
+    // package.json, so their nearest one is whatever this walk ends up finding.
+    const visited: string[] = [];
+    let current = startDir;
+    let found: PackageImportsConfig | null = null;
+
+    while (true) {
+      const cached = nearestCache.get(current);
+      if (cached !== undefined) {
+        found = cached;
+        break;
+      }
+      visited.push(current);
+
+      const manifestPath = path.join(current, "package.json");
+      if (isFile(manifestPath)) {
+        found = readPackageImports(manifestPath, current, projectRootAbs);
+        break;
+      }
+
+      if (current === projectRootAbs) break; // never look above the project root
+      const parent = path.dirname(current);
+      if (parent === current) break; // walked past the root - stop rather than loop
+      current = parent;
+    }
+
+    for (const dir of visited) nearestCache.set(dir, found);
+    return found;
+  };
+}
+
+/** One package.json's `imports` field, or `null` when it has none worth
+ * reporting - missing, malformed (handled by `readJson`), or not a plain
+ * object. */
+function readPackageImports(
+  manifestAbsPath: string,
+  dirAbs: string,
+  projectRootAbs: string,
+): PackageImportsConfig | null {
+  const manifest = readJson(manifestAbsPath);
+  const imports = manifest?.imports;
+  if (!isRecord(imports)) return null;
+  const dir = projectRelativeDir(dirAbs, projectRootAbs);
+  return dir === null ? null : { dir, imports };
+}
+
+/**
+ * Every project-relative path `specifier` (always `#`-prefixed) could name
+ * under `config`, most specific first - the `imports` analog of
+ * `exportsTargets`.
+ *
+ * All matching keys contribute, not just the most specific one, the same
+ * "let existence decide" policy `exportsTargets` and `expandPathsCandidates`
+ * already use.
+ */
+export function importsTargets(config: PackageImportsConfig, specifier: string): string[] {
+  const targets: string[] = [];
+  for (const [key, value] of Object.entries(config.imports)) {
+    let capture: string | null = null;
+    if (key.includes("*")) {
+      capture = matchWildcard(key, specifier);
+      if (capture === null) continue;
+    } else if (key !== specifier) {
+      continue;
+    }
+    targets.push(...keyTargets(value, capture));
+  }
+
+  const resolved: string[] = [];
+  for (const target of targets) {
+    const inside = insidePackage(config.dir, target);
+    if (inside !== null && !resolved.includes(inside)) resolved.push(inside);
+  }
+  return resolved;
 }
 
 // --- manifests ------------------------------------------------------------
@@ -254,11 +392,25 @@ function exportsTargets(exports: unknown, subpath: string): string[] {
   for (const key of keys) {
     const match = matchWildcard(key, subpath);
     if (match === null) continue;
-    const patterns: string[] = [];
-    collectConditionTargets(exports[key], patterns);
-    for (const pattern of patterns) targets.push(pattern.split("*").join(match));
+    targets.push(...keyTargets(exports[key], match));
   }
   return targets;
+}
+
+/**
+ * One key's declared value - a string, an array, or a nested condition object
+ * - turned into ranked target strings, with a wildcard capture substituted in
+ * when the key that matched had one (`null` for an exact-match key, which
+ * substitutes nothing). Shared between `exportsTargets` and `importsTargets`:
+ * an `exports` subpath key and an `imports` `#name` key declare their value in
+ * exactly the same shape, so the "condition object -> candidate strings" step
+ * is one piece of logic for both.
+ */
+function keyTargets(value: unknown, capture: string | null): string[] {
+  const patterns: string[] = [];
+  collectConditionTargets(value, patterns);
+  if (capture === null) return patterns;
+  return patterns.map((pattern) => pattern.split("*").join(capture));
 }
 
 function collectConditionTargets(value: unknown, out: string[]): void {
@@ -422,6 +574,26 @@ function isDirectory(absolutePath: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isFile(absolutePath: string): boolean {
+  try {
+    return fs.statSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** `absPath` as a project-relative POSIX path (`""` for the root itself), or
+ * `null` when it is not under the project root at all. Mirrors
+ * tsconfigPaths.ts's helper of the same name and purpose. */
+function projectRelativeDir(absPath: string, projectRootAbs: string): string | null {
+  const relative = path.relative(projectRootAbs, absPath);
+  if (relative === "") return "";
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    return null;
+  }
+  return relative.split(path.sep).join("/");
 }
 
 function readText(absolutePath: string): string | null {
