@@ -179,8 +179,10 @@ sequenceDiagram
     Shim->>Core: bootstrap detached daemon
     Core->>Plugin: spawn language plugin
     Plugin->>Plugin: tree-sitter parse (parallel, per core)
+    Plugin->>Plugin: resolve relative specifiers against the filesystem
     Plugin-->>Core: NDJSON stream: nodes/edges (structural)
     Core->>DB: batched transaction(s)
+    Core->>DB: link resolved imports onto their File nodes
     Core-->>Shim: index available (tree-sitter layer)
     par async, non-blocking
         Plugin->>Plugin: TS compiler API semantic pass
@@ -192,6 +194,42 @@ sequenceDiagram
 Structural graph is available almost immediately; semantic resolution
 (`source: 'ts-compiler'`, `resolved: true`) fills in asynchronously without
 blocking tool availability.
+
+#### Import resolution
+
+`IMPORTS` is the one edge kind the structural layer can resolve on its own,
+and it does — without waiting for the semantic pass. A module specifier is a
+literal, not a name, so a *relative* one (`./x`, `../x`) is answered by plain
+Node-style path arithmetic: try the literal path, then each source extension
+this plugin parses, then `index.*` inside a directory — plus TypeScript's
+extension substitution, without which `import "./x.js"` in an ESM TypeScript
+project would resolve to nothing, since `./x.js` does not exist on disk until
+the project is built. Everything else — bare/package specifiers, and anything
+needing `exports`/`imports` maps, `paths` aliases or workspace links — is
+left to the backlog semantic layer, which has the type information and the
+module-resolution machinery to answer it properly.
+
+The work is split across the process boundary, because neither side has both
+halves of the answer:
+
+- **The plugin** decides *which path* a specifier names. Extension guessing
+  and `index.*` directory imports are language rules, and core is
+  deliberately language-agnostic; the stat calls they cost land on the side
+  that is walking the tree anyway.
+- **The core** decides *whether that path is a node*, in a linking pass
+  (`core/src/graph/imports.rs`) that repoints the edge — once the cold-start
+  stream is over, and scoped to each diff afterwards. A file can exist on
+  disk and still have no node — gitignored, excluded, or another language —
+  and mid-walk it may simply not have been reached yet. Since edges are
+  foreign keys onto nodes, only the side that knows what the index holds can
+  point one at a real node.
+
+An import that survives both steps unlinked stays what it was before any of
+this: a placeholder `Module` node carrying the raw specifier, with an
+unresolved `IMPORTS` edge into it. That covers packages (`"zod"`,
+`"node:crypto"`) and dangling relative imports alike — a specifier pointing
+at nothing is reported as pointing at nothing, never quietly dropped and
+never invented.
 
 ### 2. Incremental edit
 
@@ -213,6 +251,12 @@ sequenceDiagram
 
 A burst of watcher events (e.g. `git checkout`/`pull`) is detected and
 folded into one SQLite transaction rather than one per file.
+
+The same import linking runs on each applied diff, scoped to what that diff
+could have changed rather than to the whole index: the reindexed file's own
+imports, plus any placeholder elsewhere that was waiting for a `File` node
+the diff has just added — which is what keeps a newly created file from
+staying invisible to its importers until they happen to be edited too.
 
 ### 3. MCP query with staleness check
 
@@ -282,6 +326,13 @@ deliberately language-agnostic: instead of JS/TS-shaped `Class`/`Interface`
 `nativeKind` rather than the core enum. Reference: SCIP's minimal universal
 schema + language-specific detail split out.
 
+`Module` carries one language-agnostic special case: an import specifier that
+resolves to nothing this index holds is stored as a `Module` node standing in
+for it, so the `IMPORTS` edge has somewhere to point (see
+[Import resolution](#import-resolution)). Such a node's `filePath` is the
+file the specifier is *written in*, not a file it names — nothing else in the
+model works that way, and the query layer accounts for it.
+
 ## Interfaces
 
 ### MCP tools
@@ -295,7 +346,7 @@ schema + language-specific detail split out.
 | `find_implementations` | `symbolId` | inbound `SUPERTYPE_OF` |
 | `search_code` | free-text query | semantic matches via embeddings, ranked by similarity |
 | `get_file_outline` | `filePath` | symbols defined in the file |
-| `get_dependencies` | `filePath`/`moduleId` + direction | impact analysis before a change |
+| `get_dependencies` | `filePath`/`moduleId` + direction | impact analysis before a change: a bounded transitive `IMPORTS` walk over the files linked as described in [Import resolution](#import-resolution) |
 
 All list-shaped responses are cursor-paginated: `results`, `hasMore`,
 `nextCursor` (opaque token — chosen over `offset` because background
@@ -313,6 +364,14 @@ cut; `maxDepth` → response includes `frontierNodes` to re-root the same
 traversal call one level further; `explorationBudget` → response includes
 an opaque `resumeToken` encoding visited-set + frontier queue, since budget
 is spent across the whole traversal rather than per-node.
+
+An import that resolved to nothing is still reported as a dependency —
+`get_dependencies` answers what a file depends on, and "on a package we do
+not index" is part of that answer — but as the `Module` placeholder it is,
+carrying the specifier in `qualifiedName` and **no `filePath`**. The only
+path such a node stores is the importing file's, which as a dependency row
+would both name the wrong file and collide with the importer's own row in
+the same walk.
 
 Defaults (unvalidated, confirm on a prototype): `maxDepth = 5`,
 `maxFanout = 50`, internal exploration budget = 5000 visited nodes per
