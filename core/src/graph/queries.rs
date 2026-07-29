@@ -1,7 +1,17 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
+
+// Every "which symbol is this?" lookup below carries an
+// `AND nativeKind IS NOT <PENDING_SYMBOL_NATIVE_KIND>` clause. A pending
+// symbol placeholder (`graph::symbol_links`) carries an imported symbol's
+// *name* while standing for a definition that lives in another file
+// entirely, so answering a name, qualifiedName or position query with one
+// would point the caller at a usage site instead of at the definition it
+// asked for. `IS NOT` rather than `<>`, so an ordinary node's NULL
+// `nativeKind` still passes.
 
 pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
     Ok(NodeRecord {
@@ -71,12 +81,14 @@ pub fn delete_node(conn: &mut Connection, id: &str) -> Result<()> {
 
 pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> Result<Vec<NodeRecord>> {
     let mut stmt = match file_path {
-        Some(_) => conn.prepare("SELECT * FROM nodes WHERE name = ?1 AND filePath = ?2")?,
-        None => conn.prepare("SELECT * FROM nodes WHERE name = ?1")?,
+        Some(_) => {
+            conn.prepare("SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND filePath = ?3")?
+        }
+        None => conn.prepare("SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2")?,
     };
     let rows = match file_path {
-        Some(fp) => stmt.query_map(params![name, fp], map_node_row)?,
-        None => stmt.query_map(params![name], map_node_row)?,
+        Some(fp) => stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, fp], map_node_row)?,
+        None => stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND], map_node_row)?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
@@ -87,12 +99,14 @@ pub fn find_by_qualified_name(
     file_path: Option<&str>,
 ) -> Result<Vec<NodeRecord>> {
     let mut stmt = match file_path {
-        Some(_) => conn.prepare("SELECT * FROM nodes WHERE qualifiedName = ?1 AND filePath = ?2")?,
-        None => conn.prepare("SELECT * FROM nodes WHERE qualifiedName = ?1")?,
+        Some(_) => conn.prepare(
+            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND filePath = ?3",
+        )?,
+        None => conn.prepare("SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2")?,
     };
     let rows = match file_path {
-        Some(fp) => stmt.query_map(params![qualified_name, fp], map_node_row)?,
-        None => stmt.query_map(params![qualified_name], map_node_row)?,
+        Some(fp) => stmt.query_map(params![qualified_name, PENDING_SYMBOL_NATIVE_KIND, fp], map_node_row)?,
+        None => stmt.query_map(params![qualified_name, PENDING_SYMBOL_NATIVE_KIND], map_node_row)?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by qualifiedName")
 }
@@ -121,11 +135,12 @@ pub fn find_by_position(conn: &Connection, file_path: &str, line: u32, col: u32)
     conn.query_row(
         "SELECT * FROM nodes \
          WHERE filePath = ?1 \
+           AND nativeKind IS NOT ?4 \
            AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
            AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
          ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
          LIMIT 1",
-        params![file_path, line, col],
+        params![file_path, line, col, PENDING_SYMBOL_NATIVE_KIND],
         map_node_row,
     )
     .optional()

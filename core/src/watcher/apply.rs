@@ -15,7 +15,7 @@ use std::io::{BufRead, Write};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
-use crate::graph::imports;
+use crate::graph::{imports, symbol_links};
 use crate::protocol::jsonrpc::{read_message, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
@@ -63,6 +63,10 @@ pub fn apply_file_change<R: BufRead, W: Write>(
     // After the commit, never before: linking points edges at `File` nodes,
     // and the ones this diff brought with it have to be in the index first.
     imports::link_diff(conn, &diff).context("failed to link the file's resolved imports")?;
+    // Symbols second, and for the same reason: a usage edge can only be
+    // repointed at an export that is already committed - including the ones
+    // this very diff added, which other files may have been waiting for.
+    symbol_links::link_diff(conn, &diff).context("failed to link the file's cross-file symbol usages")?;
     Ok(())
 }
 

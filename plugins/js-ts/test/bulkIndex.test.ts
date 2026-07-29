@@ -348,13 +348,23 @@ test("accepts a real NodeJS.WritableStream sink, one write() call per line", asy
 
 // --- import resolution over a real tree -----------------------------------
 
-/** Every `Module` node the walk emitted, keyed by the file that imported it. */
+/**
+ * Every import placeholder the walk emitted. `Module` is also the kind of a
+ * pending *symbol* placeholder (extract.ts's `PENDING_SYMBOL_NATIVE_KIND`),
+ * which stands for one imported name rather than for the module itself - a
+ * different handshake, and not what these two tests are about.
+ */
 async function modulesOf(root: string): Promise<WireNode[]> {
   const lines: string[] = [];
   await bulkIndexProject(root, (line) => lines.push(line));
   return lines
     .map((line) => JSON.parse(line))
-    .filter((parsed): parsed is WireNode => "range" in parsed && parsed.kind === "Module");
+    .filter(
+      (parsed): parsed is WireNode =>
+        "range" in parsed &&
+        parsed.kind === "Module" &&
+        (parsed.nativeKind === "resolved_module" || parsed.nativeKind === "external_module"),
+    );
 }
 
 test("relative imports are resolved against the real tree, bare ones are not", async () => {

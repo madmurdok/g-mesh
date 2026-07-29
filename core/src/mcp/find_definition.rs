@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
@@ -91,10 +92,13 @@ fn find_candidates_by_name(
     name: &str,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
+    // The `nativeKind` filter matches `graph::queries`': a pending-symbol
+    // placeholder is named after the symbol it is waiting for, so without it
+    // every file importing `foo` would offer itself as a candidate `foo`.
     let base_sql = "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
                     n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
                     CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-                    FROM nodes n WHERE n.name = ?1";
+                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2";
 
     fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
         let id: String = row.get("id")?;
@@ -110,7 +114,14 @@ fn find_candidates_by_name(
         Ok((candidate, score, id))
     }
 
-    pagination::paginate_by_score(conn, base_sql, &[&name], CANDIDATE_PAGE_SIZE, cursor, map_row)
+    pagination::paginate_by_score(
+        conn,
+        base_sql,
+        &[&name, &PENDING_SYMBOL_NATIVE_KIND],
+        CANDIDATE_PAGE_SIZE,
+        cursor,
+        map_row,
+    )
 }
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by

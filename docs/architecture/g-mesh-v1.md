@@ -231,6 +231,37 @@ unresolved `IMPORTS` edge into it. That covers packages (`"zod"`,
 at nothing is reported as pointing at nothing, never quietly dropped and
 never invented.
 
+#### Cross-file symbol resolution
+
+A resolved import is also what makes the *symbols* behind it resolvable. The
+extractor sees one file at a time, so `foo()` after
+`import { foo } from "./x"` has no local declaration to point a `CALLS` edge
+at — and dropping that edge, which is what the structural pass used to do,
+made `find_callers`/`find_references`/`find_implementations` answer "nothing"
+for any symbol used outside the file declaring it, i.e. the normal case.
+
+So the same handshake runs one level finer. Where the specifier resolved to a
+project file, the plugin records which local names that import binds and what
+each one is called in the target file, and a usage of such a name gets a
+placeholder node addressed by `<target file>#<imported name>`, with the
+`CALLS`/`REFERENCES`/`SUPERTYPE_OF` edge hung on it. Core
+(`core/src/graph/symbol_links.rs`) then looks for a symbol of that name
+**exported** by that file and, when exactly one fits the edge — a `CALLS`
+edge only ever lands on a `Function`, a `SUPERTYPE_OF` edge only on a `Type`,
+`REFERENCES` on whatever is unambiguous — repoints the edge and marks it
+resolved. Anything else is left alone, on the same rule the extractor's own
+name lookup follows: a missing edge beats a wrong one. In practice that
+leaves `import * as ns`, `default` imports of a *named* default export, and
+re-exported (`export { x } from "./y"`) names to the semantic layer, along
+with everything reached through a bare specifier.
+
+Unlike an import placeholder, a linked-away symbol placeholder is kept rather
+than deleted: it carries one edge per usage, so a later edit to the same file
+can add another one to it, and the plugin sends that new edge without
+re-sending the unchanged placeholder. The rows are excluded from every
+"which symbol is this?" lookup (`core/src/graph/queries.rs`), so they never
+surface as a definition.
+
 ### 2. Incremental edit
 
 ```mermaid
@@ -257,6 +288,12 @@ could have changed rather than to the whole index: the reindexed file's own
 imports, plus any placeholder elsewhere that was waiting for a `File` node
 the diff has just added — which is what keeps a newly created file from
 staying invisible to its importers until they happen to be edited too.
+
+Symbol linking follows on the same diff and by the same rule, with one extra
+trigger: the reindexed file's own pending symbols, any placeholder elsewhere
+waiting for an *export* the diff has just added, and any new usage edge onto
+a placeholder that is already in the index — the last one because that
+placeholder did not change, so nothing else in the diff would point at it.
 
 ### 3. MCP query with staleness check
 

@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::plugin::plugin_entry_path;
-use crate::graph::imports;
+use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
@@ -52,6 +52,10 @@ pub struct BulkIndexSummary {
     /// `IMPORTS` edges the post-walk linking pass repointed from a module
     /// placeholder onto the real file it names (`graph::imports`).
     pub linked_imports: usize,
+    /// `CALLS`/`REFERENCES`/`SUPERTYPE_OF` edges the post-walk linking pass
+    /// repointed from a pending-symbol placeholder onto the symbol another
+    /// file exports (`graph::symbol_links`).
+    pub linked_symbols: usize,
 }
 
 /// Walks `project_root` through the plugin and commits everything it emits,
@@ -62,10 +66,11 @@ pub struct BulkIndexSummary {
 /// foreign keys onto nodes: the plugin emits a file's nodes before that same
 /// file's edges, and never an edge between files (see the dangling-edge guard
 /// in extract.ts), so an edge's endpoints are always committed by an earlier
-/// batch or its own. Cross-file `IMPORTS` edges appear only afterwards, when
-/// `graph::imports` links the walk's resolved module placeholders - by then
-/// every node either exists or never will, which is precisely why that step
-/// cannot be folded into the stream.
+/// batch or its own. Every cross-file edge appears only afterwards, when
+/// `graph::imports` links the walk's resolved module placeholders and
+/// `graph::symbol_links` its pending-symbol ones - by then every node either
+/// exists or never will, which is precisely why those steps cannot be folded
+/// into the stream.
 pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
     let entry = plugin_entry_path();
     let mut child = Command::new("node")
@@ -152,6 +157,12 @@ fn ingest<R: BufRead>(
     let mut conn = conn.lock().unwrap();
     summary.linked_imports = imports::link_all(&mut conn)
         .context("failed to link the walk's resolved imports")?
+        .linked_edges;
+    // Same argument one level finer: until the walk is over there is no
+    // telling whether the file a usage is waiting on simply had not been
+    // reached yet (see `graph::symbol_links`).
+    summary.linked_symbols = symbol_links::link_all(&mut conn)
+        .context("failed to link the walk's cross-file symbol usages")?
         .linked_edges;
     Ok(())
 }
@@ -241,7 +252,7 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0 });
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 });
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
         let name: String = conn
@@ -261,7 +272,7 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0 });
+        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 });
         assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
     }
 

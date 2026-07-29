@@ -4,9 +4,12 @@ import {
   extractFile,
   isSupportedFile,
   nodeIdFor,
+  PENDING_SYMBOL_NATIVE_KIND,
+  pendingSymbolQualifiedName,
   RESOLVED_MODULE_NATIVE_KIND,
   UnsupportedFileError,
   type EdgeKind,
+  type ExtractOptions,
   type ExtractResult,
   type ExtractedNode,
   type NodeKind,
@@ -374,6 +377,174 @@ test("two specifiers naming the same file collapse into one placeholder", () => 
     "identity is the resolved path, so the two spellings are one target",
   );
   assert.equal(result.edges.filter((e) => e.kind === "IMPORTS").length, 1);
+});
+
+// --- cross-file symbol usages --------------------------------------------
+
+/** Every specifier resolves to one and the same project file, which is all
+ * these tests need: what is under test is what the extractor does with the
+ * *names* such an import binds, not how a path is arrived at. */
+const RESOLVES_TO_LIB: ExtractOptions = { resolveSpecifier: () => "src/lib.ts" };
+
+/** The pending-symbol placeholder for `name`, asserted to be the only one. */
+function pending(result: ExtractResult, targetPath: string, name: string): ExtractedNode {
+  const matches = result.nodes.filter(
+    (n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND && n.name === name,
+  );
+  assert.equal(matches.length, 1, `expected exactly one pending symbol ${name}`);
+  assert.equal(matches[0].qualifiedName, pendingSymbolQualifiedName(targetPath, name));
+  return matches[0];
+}
+
+test("a call to an imported function becomes a CALLS edge onto a pending symbol", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { mutate } from "./lib";
+
+export function run(): void {
+  mutate(1);
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  const placeholder = pending(result, "src/lib.ts", "mutate");
+  assert.equal(placeholder.kind, "Module");
+  assert.equal(placeholder.filePath, "src/app.ts", "the placeholder lives where the usage is");
+  assert.ok(hasEdge(result, "CALLS", "run", "src/lib.ts#mutate"));
+  assert.equal(
+    result.edges.find((e) => e.kind === "CALLS")?.resolved,
+    false,
+    "whether that file really exports it is core's call, not the extractor's",
+  );
+});
+
+test("an aliased import is addressed by the name the target file exports", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { mutate as change } from "./lib";
+
+export function run(): void {
+  change(1);
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  const placeholder = pending(result, "src/lib.ts", "mutate");
+  assert.ok(hasEdge(result, "CALLS", "run", placeholder.qualifiedName));
+});
+
+test("a default import is addressed as `default`", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import cache from "./lib";
+
+export function run(): void {
+  cache.clear();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "REFERENCES", "run", pending(result, "src/lib.ts", "default").qualifiedName));
+});
+
+test("an imported type used as a supertype becomes a SUPERTYPE_OF edge", () => {
+  const result = extractFile(
+    "src/laser.ts",
+    `import { Trail } from "./lib";
+import type { Drawable } from "./lib";
+
+export class LaserTrails implements Trail {}
+
+export interface Sketch extends Drawable {}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "LaserTrails", "src/lib.ts#Trail"));
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "Sketch", "src/lib.ts#Drawable"));
+});
+
+test("imported names in type positions and JSX become REFERENCES edges", () => {
+  const result = extractFile(
+    "src/app.tsx",
+    `import { Widget } from "./lib";
+import type { Options } from "./lib";
+
+export function render(options: Options) {
+  return <Widget />;
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "REFERENCES", "render", "src/lib.ts#Options"));
+  assert.ok(hasEdge(result, "REFERENCES", "render", "src/lib.ts#Widget"));
+});
+
+test("a local declaration shadows an import of the same name", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { mutate } from "./lib";
+
+function mutate(): void {}
+
+export function run(): void {
+  mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "CALLS", "run", "mutate"), "the file's own declaration wins");
+  assert.deepEqual(
+    result.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND),
+    [],
+    "nothing is pending when the name resolves locally",
+  );
+});
+
+test("an unused import and an unresolvable specifier produce no pending symbol", () => {
+  const unused = extractFile("src/app.ts", `import { mutate } from "./lib";\n`, RESOLVES_TO_LIB);
+  assert.deepEqual(unused.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND), []);
+
+  // A package: its symbols are not in this index, so a placeholder for one
+  // could never be linked to anything.
+  const bare = extractFile(
+    "src/app.ts",
+    `import { z } from "zod";\n\nexport function run(): void {\n  z();\n}\n`,
+    { resolveSpecifier: () => null },
+  );
+  assert.deepEqual(bare.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND), []);
+});
+
+test("every usage of one imported symbol shares a single placeholder", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { mutate } from "./lib";
+
+export function a(): void { mutate(); }
+export function b(): void { mutate(); }
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  pending(result, "src/lib.ts", "mutate"); // asserts there is exactly one
+  assert.equal(result.edges.filter((e) => e.kind === "CALLS").length, 2);
+});
+
+test("a call to an import at module top level degrades to a usage edge", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { create } from "./lib";\n\nexport const instance = create();\n`,
+    RESOLVES_TO_LIB,
+  );
+
+  // CALLS is Function -> Function, and a `const` initializer is neither.
+  assert.equal(result.edges.filter((e) => e.kind === "CALLS").length, 0);
+  assert.ok(hasEdge(result, "REFERENCES", "instance", "src/lib.ts#create"));
 });
 
 test("parses files larger than the native parser's default read buffer", () => {
