@@ -282,7 +282,7 @@ function conditionRank(condition: string): number {
 }
 
 /** What `*` stands for when `subpath` matches `pattern`, or `null`. */
-function matchWildcard(pattern: string, subpath: string): string | null {
+export function matchWildcard(pattern: string, subpath: string): string | null {
   const star = pattern.indexOf("*");
   if (star === -1) return null;
   const prefix = pattern.slice(0, star);
@@ -400,8 +400,12 @@ function globToRegExp(pattern: string): RegExp {
  * an absolute path or one climbing past the project root names a file this
  * index cannot hold, and is also the only way this could address the
  * filesystem outside the project.
+ *
+ * Shared with tsconfigPaths.ts, where the "package directory" role is played
+ * by a tsconfig's `resolveDir`: an alias target escaping it has to be refused
+ * on exactly the same grounds.
  */
-function insidePackage(packageDir: string, target: string): string | null {
+export function insidePackage(packageDir: string, target: string): string | null {
   if (target === "" || path.posix.isAbsolute(target) || /^[a-zA-Z]:/.test(target)) return null;
   const joined = path.posix.normalize(path.posix.join(packageDir, target)).replace(/\/+$/, "");
   if (joined === "" || joined === "." || joined === ".." || joined.startsWith("../")) return null;

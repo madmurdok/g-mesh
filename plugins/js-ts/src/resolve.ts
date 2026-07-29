@@ -17,12 +17,20 @@
 // That case matters because in a monorepo most cross-package imports are
 // written this way, not relatively.
 //
+// A bare specifier that is neither of those may still be an alias the project
+// declared for one of its own directories - `@/utils` -> `src/utils.ts`, the
+// house style of most app packages. That rewrite lives in a tsconfig/jsconfig
+// `paths` map (tsconfigPaths.ts), and once the alias is expanded it is again
+// the same path arithmetic against the same filesystem, so it too produces an
+// ordinary project-relative path.
+//
 // Everything else - "react", "node:crypto", any package that exists only
 // under `node_modules` - stays an unresolved placeholder (see `recordImport`
 // in extract.ts): no file of theirs is indexed, so there is no node an edge
-// could honestly point at. `paths` aliases and `imports` (#private) maps need
-// project configuration this pass does not read, and are left to the semantic
-// layer as well.
+// could honestly point at. `imports` (#private) maps are the one project-local
+// rewrite still missing here: they need a different manifest field and their
+// own scoping rules, so they stay out of scope and are left to the semantic
+// layer.
 
 // Depends on extract.ts, never the other way round: the extractor takes a
 // `SpecifierResolver` from its caller and knows nothing about how one is
@@ -33,6 +41,12 @@ import * as path from "node:path";
 
 import { isSupportedFile, type SpecifierResolver } from "./extract";
 import { createIndexabilityChecker } from "./ignorePolicy";
+import {
+  createTsconfigPathsIndex,
+  expandPathsCandidates,
+  NO_TSCONFIG_PATHS,
+  type TsconfigPathsIndex,
+} from "./tsconfigPaths";
 import {
   NO_WORKSPACE_PACKAGES,
   packageEntryTargets,
@@ -164,15 +178,63 @@ export function resolveWorkspaceSpecifier(
   return null;
 }
 
-/** Both resolutions in the single shape the extractor consumes. */
+/**
+ * The tsconfig-paths analog of `resolveWorkspaceSpecifier`: the alias rules in
+ * force for `fromFilePath` (see tsconfigPaths.ts - which config that is
+ * depends on where the file sits) expand the specifier into the paths it could
+ * name, and those go through the same `candidatePaths` pipeline as every other
+ * specifier kind, so the result is indistinguishable from a relative import's.
+ *
+ * Unlike workspace resolution this does depend on the importing file: a
+ * monorepo has one config per package, and the same `@/x` means a different
+ * directory in each of them.
+ */
+export function resolveTsconfigPathsSpecifier(
+  specifier: string,
+  fromFilePath: string,
+  tsconfigPaths: TsconfigPathsIndex,
+  fileExists: FileExists,
+): string | null {
+  if (isRelativeSpecifier(specifier)) return null;
+
+  const config = tsconfigPaths(fromFilePath);
+  if (config === null) return null;
+
+  for (const base of expandPathsCandidates(config, specifier)) {
+    for (const candidate of candidatePaths(base)) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * All three resolutions in the single shape the extractor consumes.
+ *
+ * A bare specifier is offered to the workspace first and only falls through to
+ * the alias map when the workspace has no answer for it. The two do overlap in
+ * practice - excalidraw maps `@excalidraw/element/*` both in its manifests and
+ * in a `paths` entry - and the workspace answer is the authoritative one there:
+ * it is what the package manager's own resolution would produce, while a
+ * `paths` entry is a compile-time hint that is free to be stale. So the
+ * precedence is not "the two must agree", it is "workspace wins wherever it
+ * applies": a specifier the workspace resolves never reaches the alias map at
+ * all, whatever that map would have said about it.
+ */
 export function createSpecifierResolver(
   fileExists: FileExists,
   workspacePackages: WorkspacePackages = NO_WORKSPACE_PACKAGES,
+  tsconfigPaths: TsconfigPathsIndex = NO_TSCONFIG_PATHS,
 ): SpecifierResolver {
-  return (specifier, fromFilePath) =>
-    isRelativeSpecifier(specifier)
-      ? resolveRelativeSpecifier(specifier, fromFilePath, fileExists)
-      : resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists);
+  return (specifier, fromFilePath) => {
+    if (isRelativeSpecifier(specifier)) {
+      return resolveRelativeSpecifier(specifier, fromFilePath, fileExists);
+    }
+    return (
+      resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists) ??
+      resolveTsconfigPathsSpecifier(specifier, fromFilePath, tsconfigPaths, fileExists)
+    );
+  };
 }
 
 /**
@@ -227,11 +289,14 @@ export function createProjectFileExists(projectRoot: string): FileExists {
  * existence memo above - once per bulk-index walk, once per reparsed file. It
  * is the cheaper of the two answers to refresh (a handful of manifests, well
  * under a millisecond) and by far the less volatile, so nothing is gained by
- * holding it any longer than the memo it travels with.
+ * holding it any longer than the memo it travels with. The tsconfig index
+ * travels with them for the same reason, reading each config it is actually
+ * asked about at most once (see `createTsconfigPathsIndex`).
  */
 export function createProjectResolver(projectRoot: string): SpecifierResolver {
   return createSpecifierResolver(
     createProjectFileExists(projectRoot),
     readWorkspacePackages(projectRoot),
+    createTsconfigPathsIndex(projectRoot),
   );
 }

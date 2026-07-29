@@ -7,11 +7,14 @@ import * as path from "node:path";
 import {
   createProjectFileExists,
   createProjectResolver,
+  createSpecifierResolver,
   isRelativeSpecifier,
   resolveRelativeSpecifier,
+  resolveTsconfigPathsSpecifier,
   resolveWorkspaceSpecifier,
   type FileExists,
 } from "../src/resolve";
+import type { TsconfigPathsConfig, TsconfigPathsIndex } from "../src/tsconfigPaths";
 import type { WorkspacePackages } from "../src/workspace";
 
 /** The resolution policy is a pure function of "which paths exist", so a set
@@ -291,5 +294,117 @@ test("the project resolver resolves workspace imports and leaves real packages a
     assert.equal(resolve("./index", from), "packages/element/src/index.ts");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- tsconfig `paths` aliases ---------------------------------------------
+
+/** The alias map of a plain `@/*` app, as the config reader would hand it
+ * over - so this stays a test of the resolution policy, not of tsconfig
+ * parsing (see tsconfigPaths.test.ts for that half). */
+const ALIASES: TsconfigPathsConfig = {
+  resolveDir: "",
+  paths: [
+    { pattern: "@/*", targets: ["./src/*"] },
+    { pattern: "config", targets: ["./src/config/index.ts"] },
+  ],
+};
+
+const ALIAS_INDEX: TsconfigPathsIndex = () => ALIASES;
+
+test("a paths alias resolves through the same extension guessing as a relative import", () => {
+  const exists = existing("src/utils.ts", "src/config/index.ts", "src/db/index.tsx");
+  const alias = (specifier: string): string | null =>
+    resolveTsconfigPathsSpecifier(specifier, "src/app/page.tsx", ALIAS_INDEX, exists);
+
+  assert.equal(alias("@/utils"), "src/utils.ts");
+  assert.equal(alias("@/db"), "src/db/index.tsx");
+  assert.equal(alias("config"), "src/config/index.ts");
+  assert.equal(alias("@/nowhere"), null);
+  assert.equal(alias("react"), null, "no key matches, so this is not an alias at all");
+  assert.equal(alias("./utils"), null, "a relative specifier is the other function's job");
+});
+
+/** The excalidraw case: a specifier that is *both* a workspace package and an
+ * alias key. Here the alias even points at a file that exists, and the
+ * workspace answer still wins - the alias map is never consulted for it. */
+test("the workspace answer wins over an alias for the same specifier", () => {
+  const exists = existing("packages/math/src/index.ts", "src/shims/math.ts");
+  const shadowing: TsconfigPathsIndex = () => ({
+    resolveDir: "",
+    paths: [
+      { pattern: "@excalidraw/math", targets: ["./src/shims/math.ts"] },
+      { pattern: "@/*", targets: ["./src/*"] },
+    ],
+  });
+  const resolve = createSpecifierResolver(exists, WORKSPACE, shadowing);
+
+  assert.equal(resolve("@excalidraw/math", "src/app.ts"), "packages/math/src/index.ts");
+  // ...while a specifier no workspace package claims does fall through.
+  assert.equal(resolve("@/shims/math", "src/app.ts"), "src/shims/math.ts");
+});
+
+test("the project resolver resolves aliases and workspace packages side by side", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-aliases-"));
+  const write = async (rel: string, contents: string): Promise<void> => {
+    await fs.mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+    await fs.writeFile(path.join(root, rel), contents, "utf8");
+  };
+  try {
+    await write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    await write(
+      "tsconfig.json",
+      JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@/*": ["./apps/web/src/*"] } } }),
+    );
+    await write("packages/math/package.json", JSON.stringify({ name: "@excalidraw/math" }));
+    await write("packages/math/src/index.ts", "export const pointFrom = () => {};\n");
+    await write("apps/web/src/util.ts", "export const util = 1;\n");
+    await write("apps/web/src/page.tsx", 'import { util } from "@/util";\n');
+
+    const resolve = createProjectResolver(root);
+
+    assert.equal(
+      resolve("@excalidraw/math", "apps/web/src/page.tsx"),
+      "packages/math/src/index.ts",
+    );
+    assert.equal(resolve("@/util", "apps/web/src/page.tsx"), "apps/web/src/util.ts");
+    // Same resolver instance, a file in another package: the alias is rooted
+    // in the config, not in the importer's directory.
+    assert.equal(resolve("@/util", "packages/math/src/index.ts"), "apps/web/src/util.ts");
+    assert.equal(resolve("react", "apps/web/src/page.tsx"), null);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an alias is refused when its target is outside the project or unparseable", async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-alias-escape-"));
+  const root = path.join(parent, "project");
+  const write = async (abs: string, contents: string): Promise<void> => {
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, contents, "utf8");
+  };
+  try {
+    // A real file, really outside the project root - so refusing it is a
+    // decision, not an accident of the file being missing.
+    await write(path.join(parent, "outside.ts"), "export const secret = 1;\n");
+    await write(
+      path.join(root, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { outside: ["../outside.ts"], styles: ["./src/app.css"], "@/*": ["./src/*"] },
+        },
+      }),
+    );
+    await write(path.join(root, "src", "app.css"), ".a { color: red }\n");
+    await write(path.join(root, "src", "kept.ts"), "export const kept = 1;\n");
+
+    const resolve = createProjectResolver(root);
+    assert.equal(resolve("outside", "src/kept.ts"), null);
+    assert.equal(resolve("styles", "src/kept.ts"), null, "no File node could ever back a .css");
+    assert.equal(resolve("@/kept", "src/kept.ts"), "src/kept.ts");
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
   }
 });
