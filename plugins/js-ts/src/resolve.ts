@@ -24,13 +24,16 @@
 // the same path arithmetic against the same filesystem, so it too produces an
 // ordinary project-relative path.
 //
+// A `#`-prefixed specifier is a fourth, disjoint case: package.json's own
+// `imports` map, scoped to the importing file's nearest enclosing package
+// (workspace.ts's `createPackageImportsIndex`), not to the workspace as a
+// whole - a `#` name means something different in each package, the way an
+// `@/` alias means something different in each tsconfig.
+//
 // Everything else - "react", "node:crypto", any package that exists only
 // under `node_modules` - stays an unresolved placeholder (see `recordImport`
 // in extract.ts): no file of theirs is indexed, so there is no node an edge
-// could honestly point at. `imports` (#private) maps are the one project-local
-// rewrite still missing here: they need a different manifest field and their
-// own scoping rules, so they stay out of scope and are left to the semantic
-// layer.
+// could honestly point at.
 
 // Depends on extract.ts, never the other way round: the extractor takes a
 // `SpecifierResolver` from its caller and knows nothing about how one is
@@ -48,10 +51,14 @@ import {
   type TsconfigPathsIndex,
 } from "./tsconfigPaths";
 import {
+  createPackageImportsIndex,
+  importsTargets,
+  NO_PACKAGE_IMPORTS,
   NO_WORKSPACE_PACKAGES,
   packageEntryTargets,
   parseBareSpecifier,
   readWorkspacePackages,
+  type PackageImportsIndex,
   type WorkspacePackages,
 } from "./workspace";
 
@@ -209,7 +216,34 @@ export function resolveTsconfigPathsSpecifier(
 }
 
 /**
- * All three resolutions in the single shape the extractor consumes.
+ * The `#private` imports analog of `resolveWorkspaceSpecifier`: a `#`
+ * specifier is resolved against the `imports` map of the importing file's own
+ * nearest enclosing package (see workspace.ts's `createPackageImportsIndex`),
+ * never the whole project's workspace map - Node scopes `#imports` to a
+ * package boundary, not to a package name, so unlike workspace resolution
+ * this does depend on where `fromFilePath` sits.
+ */
+export function resolvePackageImportsSpecifier(
+  specifier: string,
+  fromFilePath: string,
+  packageImports: PackageImportsIndex,
+  fileExists: FileExists,
+): string | null {
+  if (!specifier.startsWith("#")) return null;
+
+  const config = packageImports(fromFilePath);
+  if (config === null) return null;
+
+  for (const base of importsTargets(config, specifier)) {
+    for (const candidate of candidatePaths(base)) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * All four resolutions in the single shape the extractor consumes.
  *
  * A bare specifier is offered to the workspace first and only falls through to
  * the alias map when the workspace has no answer for it. The two do overlap in
@@ -220,15 +254,25 @@ export function resolveTsconfigPathsSpecifier(
  * precedence is not "the two must agree", it is "workspace wins wherever it
  * applies": a specifier the workspace resolves never reaches the alias map at
  * all, whatever that map would have said about it.
+ *
+ * A `#`-prefixed specifier is its own branch, not a fallback after the other
+ * two: `#` names are syntactically disjoint from bare package names and from
+ * tsconfig `paths` keys (which are never written with a leading `#`), so
+ * there is no overlap to arbitrate - it either resolves through the importing
+ * file's own package `imports` map, or it does not resolve at all.
  */
 export function createSpecifierResolver(
   fileExists: FileExists,
   workspacePackages: WorkspacePackages = NO_WORKSPACE_PACKAGES,
   tsconfigPaths: TsconfigPathsIndex = NO_TSCONFIG_PATHS,
+  packageImports: PackageImportsIndex = NO_PACKAGE_IMPORTS,
 ): SpecifierResolver {
   return (specifier, fromFilePath) => {
     if (isRelativeSpecifier(specifier)) {
       return resolveRelativeSpecifier(specifier, fromFilePath, fileExists);
+    }
+    if (specifier.startsWith("#")) {
+      return resolvePackageImportsSpecifier(specifier, fromFilePath, packageImports, fileExists);
     }
     return (
       resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists) ??
@@ -291,12 +335,15 @@ export function createProjectFileExists(projectRoot: string): FileExists {
  * under a millisecond) and by far the less volatile, so nothing is gained by
  * holding it any longer than the memo it travels with. The tsconfig index
  * travels with them for the same reason, reading each config it is actually
- * asked about at most once (see `createTsconfigPathsIndex`).
+ * asked about at most once (see `createTsconfigPathsIndex`), and so does the
+ * package-imports index, reading each package.json it is actually asked
+ * about at most once (see `createPackageImportsIndex`).
  */
 export function createProjectResolver(projectRoot: string): SpecifierResolver {
   return createSpecifierResolver(
     createProjectFileExists(projectRoot),
     readWorkspacePackages(projectRoot),
     createTsconfigPathsIndex(projectRoot),
+    createPackageImportsIndex(projectRoot),
   );
 }

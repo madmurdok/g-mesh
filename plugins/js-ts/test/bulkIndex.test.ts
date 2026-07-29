@@ -537,3 +537,38 @@ test("a workspace package's declared entry under a gitignored (not hard-excluded
     await cleanup(root);
   }
 });
+
+// --- `#private` package-imports specifiers, over a real tree --------------
+
+test("a `#private` import resolves to the real file its package.json `imports` map names", async () => {
+  const root = await makeProject({
+    "package.json": JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }),
+    "src/util.ts": `export const util = 1;\n`,
+    "src/index.ts": `import { util } from "#util";\nexport const start = () => util;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    const target = modules.find((m) => m.name === "#util");
+    assert.ok(target, "no placeholder for #util");
+    assert.equal(target.nativeKind, "resolved_module");
+    assert.equal(target.qualifiedName, "src/util.ts");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a `#private` import with no matching `imports` key stays an unresolved placeholder, not a crash", async () => {
+  const root = await makeProject({
+    "package.json": JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }),
+    "src/util.ts": `export const util = 1;\n`,
+    "src/index.ts": `import { gone } from "#gone";\nexport const start = () => gone;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].qualifiedName, "#gone", "unresolved - the raw specifier, not a path");
+    assert.equal(modules[0].nativeKind, "external_module");
+  } finally {
+    await cleanup(root);
+  }
+});
