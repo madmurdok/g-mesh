@@ -17,11 +17,6 @@ use crate::graph::queries;
 use super::tool_result::{error, internal_error, success};
 use super::SymbolQueryParams;
 
-/// Nothing in the ticket specifies a page size for the reference list, so 20
-/// mirrors `find_definition`'s `CANDIDATE_PAGE_SIZE` - there's no existing
-/// convention to reuse instead.
-const REFERENCE_PAGE_SIZE: usize = 20;
-
 /// Every edge kind that means "this node uses the anchor somewhere in its own
 /// source". The extractor files each usage under exactly one of these and
 /// never duplicates it: a resolved call becomes a `CALLS` edge and `addUsage`
@@ -126,7 +121,8 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         None => return error(format!("g-mesh: no symbol with id '{}' found", params.symbol_id)),
     };
 
-    let page = list_references(&conn, &params.symbol_id, &anchor.file_path, REFERENCE_PAGE_SIZE, params.cursor.as_deref())
+    let page_size = pagination::resolve_page_size(params.limit);
+    let page = list_references(&conn, &params.symbol_id, &anchor.file_path, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find references", e))?;
 
     success(&ReferencePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -216,7 +212,7 @@ mod tests {
 
         let callers = json_body(&super::super::find_callers_callees::handle_callers(
             &conn,
-            SymbolQueryParams { symbol_id: "target".to_string(), cursor: None },
+            SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None },
         )
         .unwrap());
         let mut caller_ids: Vec<&str> =
@@ -225,7 +221,7 @@ mod tests {
         assert_eq!(caller_ids, vec!["caller_a", "caller_b"], "precondition: find_callers sees both in-file callers");
 
         let references =
-            json_body(&handle(&conn, SymbolQueryParams { symbol_id: "target".to_string(), cursor: None }).unwrap());
+            json_body(&handle(&conn, SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None }).unwrap());
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
             .unwrap()
@@ -298,12 +294,31 @@ mod tests {
         assert_eq!(seen, vec!["caller", "sub", "user"], "every usage kind comes back exactly once across pages");
     }
 
+    /// A caller-supplied `limit` above the default page size must actually
+    /// reach `paginate_edges`, not just be accepted and ignored.
+    #[test]
+    fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        for i in 0..25 {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: Some(25) };
+        let body = json_body(&handle(&conn, params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
+        assert_eq!(body["hasMore"], false);
+    }
+
     #[test]
     fn zero_references_is_an_empty_page_not_an_error() {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
 
-        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: None };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -313,7 +328,7 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -333,7 +348,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone() };
+            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone(), limit: None };
             let result = handle(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

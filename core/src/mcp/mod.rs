@@ -178,6 +178,10 @@ pub struct SymbolQueryParams {
     pub symbol_id: String,
     /// Opaque cursor from a previous page of results.
     pub cursor: Option<String>,
+    /// Maximum results to return in this call (default 20, capped at 200).
+    /// Raise this to fetch a larger result set in one call instead of
+    /// paging through it with `cursor`.
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

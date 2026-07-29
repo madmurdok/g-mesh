@@ -377,10 +377,10 @@ model works that way, and the query layer accounts for it.
 | Tool | Input | Returns |
 |---|---|---|
 | `find_definition` | symbol name, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count) |
-| `find_references` | `symbolId` | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
-| `find_callers` | `symbolId` | inbound `CALLS` |
-| `find_callees` | `symbolId` | outbound `CALLS` |
-| `find_implementations` | `symbolId` | inbound `SUPERTYPE_OF` |
+| `find_references` | `symbolId` + `limit`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
+| `find_callers` | `symbolId` + `limit`? | inbound `CALLS` |
+| `find_callees` | `symbolId` + `limit`? | outbound `CALLS` |
+| `find_implementations` | `symbolId` + `limit`? | inbound `SUPERTYPE_OF` |
 | `search_code` | free-text query | semantic matches via embeddings, ranked by similarity |
 | `get_file_outline` | `filePath` | symbols defined in the file |
 | `get_dependencies` | `filePath`/`moduleId` + direction | impact analysis before a change: a bounded transitive `IMPORTS` walk over the files linked as described in [Import resolution](#import-resolution) |
@@ -392,6 +392,13 @@ results are ordered `resolved: true` before `resolved: false`, then by
 locality; `search_code` is ordered by similarity score. Every edge-derived
 result carries `resolved`/`source` so the agent knows how much to trust a
 given relationship.
+
+`find_references`/`find_callers`/`find_callees`/`find_implementations` also
+accept an optional `limit` (default 20, capped at 200) to raise the page
+size for a single call instead of paging through `cursor` — added after
+g-mesh-bench measured that, in a stateless CLI-agent conversation, every
+extra pagination round-trip re-pays the whole resent-conversation cost, so a
+fixed small page forced more of exactly that on high-fan-out lookups.
 
 Traversal responses that hit a limit carry `truncated: true` and
 `truncatedBy: 'maxDepth' | 'maxFanout' | 'explorationBudget'` — never a

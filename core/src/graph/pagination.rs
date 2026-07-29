@@ -5,6 +5,24 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::storage::write::{EdgeRecord, NodeRecord};
 
+/// Page size `find_references`/`find_callers`/`find_callees`/
+/// `find_implementations` use when the caller doesn't supply `limit`.
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+
+/// Ceiling on a caller-supplied `limit` - comfortably above every fan-out
+/// case seen in practice (g-mesh-bench's benchmark corpus tops out around
+/// 60), while still bounding worst-case single-response size.
+pub const MAX_PAGE_SIZE: usize = 200;
+
+/// Resolves a tool's optional `limit` param to an actual page size: the
+/// default when the caller didn't ask for anything specific, otherwise
+/// clamped into `[1, MAX_PAGE_SIZE]` rather than erroring on an
+/// out-of-range value - a caller-supplied limit isn't a mistake worth
+/// failing loudly over, just a suggestion to bound.
+pub fn resolve_page_size(limit: Option<u32>) -> usize {
+    limit.map(|l| l as usize).unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)
+}
+
 /// Opaque cursor-paginated batch, shared shape for every list-shaped MCP
 /// tool response. Cursor instead of offset: background reindexing can
 /// shift/duplicate rows mid-pagination if positions are counted by offset.
@@ -303,6 +321,26 @@ mod tests {
             params![id, from, to, resolved],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn resolve_page_size_defaults_when_no_limit_given() {
+        assert_eq!(resolve_page_size(None), DEFAULT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn resolve_page_size_clamps_an_oversized_limit_down_to_the_ceiling() {
+        assert_eq!(resolve_page_size(Some(10_000)), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn resolve_page_size_clamps_a_zero_limit_up_to_one() {
+        assert_eq!(resolve_page_size(Some(0)), 1);
+    }
+
+    #[test]
+    fn resolve_page_size_passes_an_in_range_limit_through_unchanged() {
+        assert_eq!(resolve_page_size(Some(50)), 50);
     }
 
     #[test]

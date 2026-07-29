@@ -21,11 +21,6 @@ use crate::storage::write::NodeRecord;
 use super::tool_result::{error, internal_error, success};
 use super::SymbolQueryParams;
 
-/// Mirrors `find_references::REFERENCE_PAGE_SIZE` - no page-size convention
-/// exists beyond "20" yet, so this reuses it rather than inventing a second
-/// arbitrary number.
-const CALL_PAGE_SIZE: usize = 20;
-
 /// One "other end of a CALLS edge" record, plus whether that edge is
 /// `resolved`. Direction-agnostic on purpose: `list_calls` doesn't know
 /// whether it's resolving a caller or a callee, only which node id sits at
@@ -166,7 +161,8 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(early_return) => return Ok(early_return),
     };
 
-    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Incoming, CALL_PAGE_SIZE, params.cursor.as_deref())
+    let page_size = pagination::resolve_page_size(params.limit);
+    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Incoming, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callers", e))?;
 
     success(&CallerPage {
@@ -184,7 +180,8 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(early_return) => return Ok(early_return),
     };
 
-    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Outgoing, CALL_PAGE_SIZE, params.cursor.as_deref())
+    let page_size = pagination::resolve_page_size(params.limit);
+    let page = list_calls(&conn, &params.symbol_id, &anchor.file_path, Direction::Outgoing, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callees", e))?;
 
     success(&CalleePage {
@@ -238,7 +235,7 @@ mod tests {
     #[test]
     fn find_callers_of_b_returns_exactly_a_not_c_not_itself() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None, limit: None };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -249,7 +246,7 @@ mod tests {
     #[test]
     fn find_callees_of_b_returns_exactly_c_not_a() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "b".to_string(), cursor: None, limit: None };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -260,7 +257,7 @@ mod tests {
     #[test]
     fn callers_of_a_root_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "a".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "a".to_string(), cursor: None, limit: None };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -270,7 +267,7 @@ mod tests {
     #[test]
     fn callees_of_a_leaf_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
-        let params = SymbolQueryParams { symbol_id: "c".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "c".to_string(), cursor: None, limit: None };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -280,7 +277,7 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callers() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -288,7 +285,7 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callees() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None };
+        let params = SymbolQueryParams { symbol_id: "does_not_exist".to_string(), cursor: None, limit: None };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -325,6 +322,26 @@ mod tests {
         assert_eq!(seen, vec!["caller_a", "caller_b", "caller_c"], "all three callers must come back, once each");
     }
 
+    /// A caller-supplied `limit` above the default page size must actually
+    /// reach `paginate_edges`, not just be accepted and ignored. Proven for
+    /// callers only, same reasoning as the small-page-size test above.
+    #[test]
+    fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        for i in 0..25 {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: None, limit: Some(25) };
+        let body = json_body(&handle_callers(&conn, params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
+        assert_eq!(body["hasMore"], false);
+    }
+
     #[test]
     fn handle_callees_paginates_across_cursor_continuation() {
         let mut conn = setup();
@@ -340,7 +357,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone() };
+            let params = SymbolQueryParams { symbol_id: "target".to_string(), cursor: cursor.clone(), limit: None };
             let result = handle_callees(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

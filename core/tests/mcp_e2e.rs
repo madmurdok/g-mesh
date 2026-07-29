@@ -26,11 +26,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Name plus the parameters a caller must supply - the half of each schema a
 /// follow-up ticket is not allowed to quietly change.
 const EXPECTED_TOOLS: [(&str, &[&str]); 7] = [
-    ("find_callees", &["symbol_id", "cursor"]),
-    ("find_callers", &["symbol_id", "cursor"]),
+    ("find_callees", &["symbol_id", "cursor", "limit"]),
+    ("find_callers", &["symbol_id", "cursor", "limit"]),
     ("find_definition", &["symbol_name", "file_path", "position", "cursor"]),
-    ("find_implementations", &["symbol_id", "cursor"]),
-    ("find_references", &["symbol_id", "cursor"]),
+    ("find_implementations", &["symbol_id", "cursor", "limit"]),
+    ("find_references", &["symbol_id", "cursor", "limit"]),
     (
         "get_dependencies",
         &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"],
