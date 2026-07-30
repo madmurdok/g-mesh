@@ -45,13 +45,25 @@ pub fn socket_path(root: &Path) -> Result<PathBuf> {
 /// Records the live daemon's pid next to its socket, so tooling can tell a
 /// stale socket file from a running daemon.
 pub fn pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(PID_FILE))
+    Ok(pid_path_in(&project_dir(root)?))
 }
 
 /// Records the pid of the language plugin the live daemon spawned, next to
 /// the daemon's own.
 pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(PLUGIN_PID_FILE))
+    Ok(plugin_pid_path_in(&project_dir(root)?))
+}
+
+/// The same two paths resolved from an already-known state directory rather
+/// than from a project root - the form a scan over `~/.g-mesh/projects/*`
+/// has, where the root a directory was named after may not even exist any
+/// more (`cli::clean`).
+pub fn pid_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(PID_FILE)
+}
+
+pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(PLUGIN_PID_FILE)
 }
 
 /// The file shims serialize their bootstrap on, derived exactly like the

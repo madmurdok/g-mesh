@@ -19,6 +19,7 @@
 //! schemas were, so `--help` describes the finished CLI rather than growing a
 //! command at a time.
 
+pub mod clean;
 pub mod status;
 pub mod stop;
 
@@ -118,7 +119,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Plugins { command } => match command {
             PluginsCommand::List => not_implemented("plugins list"),
         },
-        Command::Clean(_) => not_implemented("clean"),
+        Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),

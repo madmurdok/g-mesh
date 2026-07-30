@@ -170,6 +170,12 @@ how much of the project the index covers, and which files failed to parse.
 `g-mesh stop` shuts the daemon core and its plugin down; running it when
 nothing is up is a no-op, not an error.
 
+`g-mesh clean` deletes a cached index: the current project's by default, a
+named one with `g-mesh clean <project-id>`, everything unused for 90+ days
+with `g-mesh clean expired`, or the lot with `g-mesh clean all --force`
+(without `--force` it only reports how many it would delete). Stop a
+project's daemon before cleaning it.
+
 ## Run tests
 
 ```bash
