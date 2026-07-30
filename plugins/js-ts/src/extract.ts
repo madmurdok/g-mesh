@@ -11,7 +11,11 @@
 // Symbols reached *through* such a specifier ride on the same handshake: a
 // call or reference to an imported name gets a pending-symbol placeholder
 // (see `PENDING_SYMBOL_NATIVE_KIND`) naming the file and the export it is
-// waiting for, which core links the same way.
+// waiting for, which core links the same way. Where that file only passes the
+// name through - a barrel doing `export * from`/`export { x } from`, which is
+// what a workspace specifier usually lands on - a re-export placeholder (see
+// `REEXPORT_NATIVE_KIND`) records the next hop, so core can follow the chain
+// to wherever the declaration really is.
 
 import { createHash } from "node:crypto";
 import * as path from "node:path";
@@ -57,6 +61,36 @@ export const RESOLVED_MODULE_NATIVE_KIND = "resolved_module";
  * mirrored there, so the two must be changed together).
  */
 export const PENDING_SYMBOL_NATIVE_KIND = "pending_symbol";
+
+/**
+ * `nativeKind` of a placeholder recording that this file *publishes* a name it
+ * does not declare - `export { a } from "./y"`, `export { a as b } from "./y"`,
+ * `export * from "./y"`. A barrel/index file is made of nothing else, and in a
+ * monorepo it is what a workspace specifier resolves to, so without this a
+ * usage reached through `@scope/pkg` addresses a file where the name is only
+ * passed through and core's linking finds nothing declared there.
+ *
+ * The placeholder is addressed exactly like a pending symbol - its
+ * `qualifiedName` is [`pendingSymbolQualifiedName`]`(target file, name in that
+ * file)` - while its `name` is the name *this* file publishes, which the two
+ * differ on whenever an alias renamed it. That pair is the whole fact core
+ * needs to follow the chain one hop further (`core/src/graph/symbol_links.rs` -
+ * the constant is mirrored there, so the two must be changed together).
+ *
+ * Which file the target really is, and whether the chain ends in a declaration
+ * at all, stays core's call for the usual reason: the target may not be
+ * indexed yet, or ever.
+ */
+export const REEXPORT_NATIVE_KIND = "reexport";
+
+/**
+ * The name a whole-module re-export (`export * from "./y"`) is recorded under,
+ * at both ends of its address: it publishes every name the target exports
+ * rather than one, so neither end can be spelled out until core knows what
+ * that file exports. `*` cannot collide with a real symbol - no identifier is
+ * spelled that way.
+ */
+export const REEXPORT_ALL_NAME = "*";
 
 /**
  * How a pending-symbol placeholder is addressed: the target file's
@@ -732,7 +766,9 @@ class Extractor {
 
   private handleExport(node: SyntaxNode, scope: Scope): void {
     const source = node.childForFieldName("source");
-    if (source) this.recordImport(source); // `export ... from "x"` also imports x
+    // `export ... from "x"` also imports x, and the path that resolved to is
+    // the far end of every re-export this statement records.
+    const targetPath = source === null ? null : this.recordImport(source);
 
     const declaration = node.childForFieldName("declaration");
     if (declaration) {
@@ -748,13 +784,26 @@ class Extractor {
 
     const clause = node.children.find((child) => child.type === "export_clause");
     if (clause) {
-      // Names re-exported from another module are not local symbols, so only
-      // a clause without `from` can mark anything exported here.
-      if (!source) {
-        for (const spec of clause.namedChildren) {
-          const name = spec.childForFieldName("name");
-          if (name) this.pendingExports.push(name.text);
+      for (const spec of clause.namedChildren) {
+        if (spec.type !== "export_specifier") continue;
+        const name = spec.childForFieldName("name");
+        if (!name) continue;
+        const alias = spec.childForFieldName("alias");
+        // Names re-exported from another module are not local symbols, so
+        // only a clause without `from` can mark anything exported here; with
+        // one, the pair (published name, name over there) is recorded instead.
+        if (source === null) {
+          this.pendingExports.push(name.text);
+        } else if (targetPath !== null) {
+          this.recordReexport(alias ?? name, alias?.text ?? name.text, targetPath, name.text);
         }
+      }
+      return;
+    }
+
+    if (isWholeModuleReexport(node)) {
+      if (targetPath !== null) {
+        this.recordReexport(node, REEXPORT_ALL_NAME, targetPath, REEXPORT_ALL_NAME);
       }
       return;
     }
@@ -762,6 +811,34 @@ class Extractor {
     // `export = foo` (TS export assignment).
     const identifier = node.namedChildren.find((child) => child.type === "identifier");
     if (identifier) this.pendingExports.push(identifier.text);
+  }
+
+  /**
+   * Records that this file publishes `publishedName` without declaring it -
+   * see [`REEXPORT_NATIVE_KIND`]. Nothing is added to the file's own name
+   * lookup (`declareSymbol`'s job): a re-exported name is not a declaration
+   * here, so it must not shadow one, and a usage of it in this file is an
+   * ordinary import that already has its own placeholder.
+   *
+   * Two aliases of the same target symbol in one file (`export { a as b, a as
+   * c } from "./y"`) collapse into one placeholder, since a node's identity is
+   * its `qualifiedName` and both spell the same address. First one wins, as
+   * everywhere else here; the loser degrades to an unlinked usage, never to a
+   * wrong link.
+   */
+  private recordReexport(
+    at: SyntaxNode,
+    publishedName: string,
+    targetPath: string,
+    exportedName: string,
+  ): void {
+    this.addNode({
+      kind: "Module",
+      name: publishedName,
+      qualifiedName: pendingSymbolQualifiedName(targetPath, exportedName),
+      at,
+      nativeKind: REEXPORT_NATIVE_KIND,
+    });
   }
 
   private handleDefaultExportValue(value: SyntaxNode, scope: Scope, outer: SyntaxNode): void {
@@ -1401,6 +1478,20 @@ class Extractor {
 }
 
 // --- syntax helpers -----------------------------------------------------
+
+/**
+ * `export * from "./y"`, which republishes every name `./y` exports.
+ *
+ * Told apart from `export * as NS from "./y"` by where the `*` sits: a
+ * namespace re-export tucks it inside a `namespace_export` child and publishes
+ * a single name bound to the whole module, which is the same thing
+ * `import * as NS` binds and is left alone for the same reason (see
+ * `recordImportBindings`) - resolving `NS.f` needs to tell a module's export
+ * from an ordinary property access, which this pass cannot do.
+ */
+function isWholeModuleReexport(statement: SyntaxNode): boolean {
+  return statement.children.some((child) => child.type === "*");
+}
 
 /** Identifiers introducing a binding are declarations, not usages. */
 function isBindingPosition(node: SyntaxNode): boolean {

@@ -287,10 +287,26 @@ edge only ever lands on a `Function`, a `SUPERTYPE_OF` edge only on a `Type`,
 `REFERENCES` on whatever is unambiguous — repoints the edge and marks it
 resolved. Anything else is left alone, on the same rule the extractor's own
 name lookup follows: a missing edge beats a wrong one. In practice that
-leaves `import * as ns`, `default` imports of a *named* default export, and
-re-exported (`export { x } from "./y"`) names to the semantic layer, along
-with everything reached through a specifier that did not resolve — a package
-outside the workspace, in practice.
+leaves `import * as ns` and `default` imports of a *named* default export to
+the semantic layer, along with everything reached through a specifier that did
+not resolve — a package outside the workspace, in practice.
+
+The file a placeholder addresses is very often not the one declaring the
+symbol. A bare workspace specifier resolves to a package's entry point, and in
+a monorepo that entry point is typically a barrel that declares nothing and
+only re-exports — six of excalidraw's seven packages are entered that way — so
+looking for the name *in* that file finds nothing, and every usage written as
+`import { mutateElement } from "@excalidraw/element"` silently loses its edge
+while the same import written relatively keeps it. So the split runs one level
+further: the plugin, which is the side that parses the syntax and resolves the
+specifier, records each `export * from "./y"` / `export { x as y } from "./z"`
+as a placeholder saying "this file publishes *this* name, which is *that* name
+over there"; core, which is the side that knows what the index holds, follows
+those hops breadth-first until it reaches a declaration, up to a bounded number
+of them. Shallowest wins, so a file that declares a name shadows what it
+re-exports under the same one, as it does in the language; a cycle terminates
+on the walk's visited set rather than hanging the index; and a chain that ends
+nowhere leaves the edge exactly as unresolved as before, never guessed at.
 
 Unlike an import placeholder, a linked-away symbol placeholder is kept rather
 than deleted: it carries one edge per usage, so a later edit to the same file
@@ -330,7 +346,12 @@ Symbol linking follows on the same diff and by the same rule, with one extra
 trigger: the reindexed file's own pending symbols, any placeholder elsewhere
 waiting for an *export* the diff has just added, and any new usage edge onto
 a placeholder that is already in the index — the last one because that
-placeholder did not change, so nothing else in the diff would point at it.
+placeholder did not change, so nothing else in the diff would point at it. A
+new export is not only waited on under its own address: the same walk that
+follows re-exports down from an importer is run back up from what changed, so
+a declaration added behind a barrel reaches the placeholders addressed at the
+barrel, and a barrel that newly re-exports something reaches the placeholders
+that were waiting on it.
 
 ### 3. MCP query with staleness check
 
