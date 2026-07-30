@@ -21,6 +21,11 @@ use crate::watcher::ProjectWatcher;
 
 const SOCKET_FILE: &str = "daemon.sock";
 const PID_FILE: &str = "daemon.pid";
+/// The plugin is a child of the daemon and normally dies with it, but its pid
+/// is recorded anyway so tooling outside the daemon can tell "the plugin is
+/// running" from "the plugin is running with no core left to serve" - see
+/// `cli::status` and `cli::stop`.
+const PLUGIN_PID_FILE: &str = "plugin.pid";
 /// Held by a shim while it decides whether to bootstrap a daemon and while
 /// it waits for the one it spawned to come up (see `shim::connect_or_bootstrap`).
 const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
@@ -43,10 +48,52 @@ pub fn pid_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(PID_FILE))
 }
 
+/// Records the pid of the language plugin the live daemon spawned, next to
+/// the daemon's own.
+pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
+    Ok(project_dir(root)?.join(PLUGIN_PID_FILE))
+}
+
 /// The file shims serialize their bootstrap on, derived exactly like the
 /// socket and pid paths so every process agrees on it without configuration.
 pub fn lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
+}
+
+/// Reads a pid out of one of the files above. `None` for a file that isn't
+/// there or doesn't hold a pid - both mean "nothing recorded", which is what
+/// every caller does with them anyway.
+pub fn read_pid_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether a process with this pid currently exists.
+///
+/// `kill(pid, 0)` performs the usual permission and existence checks without
+/// delivering anything. `EPERM` counts as alive: the process is there, this
+/// user just may not signal it - reporting it as gone would be the more
+/// misleading of the two answers.
+///
+/// Inherently a snapshot, and pids are reused, so a caller that cares
+/// (`cli::status`) corroborates it with the socket rather than trusting a
+/// recorded pid on its own.
+pub fn is_process_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 only inspects; it cannot affect this
+    // process, and no pointers are involved.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether something is accepting connections on this project's socket right
+/// now - the liveness check that cannot be fooled by a recycled pid, since it
+/// is answered by the daemon itself.
+///
+/// The connection is opened and immediately dropped; the daemon treats that
+/// as a client that hung up before saying anything.
+pub fn is_listening(root: &Path) -> Result<bool> {
+    Ok(std::os::unix::net::UnixStream::connect(socket_path(root)?).is_ok())
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
@@ -111,6 +158,13 @@ pub fn run(root: &Path) -> Result<()> {
     let plugin = Arc::new(
         PluginProcess::spawn(&canonical_root).context("failed to start the JS/TS plugin")?,
     );
+    // Recorded as soon as it exists, not at the end of startup: a daemon that
+    // dies during its bulk walk would otherwise leave a running plugin behind
+    // that nothing outside this process could name (see `cli::stop`).
+    let plugin_pid_file = dir.join(PLUGIN_PID_FILE);
+    fs::write(&plugin_pid_file, plugin.pid().to_string()).with_context(|| {
+        format!("failed to write plugin pid file {}", plugin_pid_file.display())
+    })?;
 
     // Cold start only, and before the watcher: a bulk walk racing incremental
     // updates could commit its own (older) parse of a file over one the

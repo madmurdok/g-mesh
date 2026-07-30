@@ -19,6 +19,8 @@
 //! schemas were, so `--help` describes the finished CLI rather than growing a
 //! command at a time.
 
+pub mod status;
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -110,7 +112,7 @@ fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Init => not_implemented("init"),
         Command::Config { .. } => not_implemented("config"),
-        Command::Status => not_implemented("status"),
+        Command::Status => status::run(),
         Command::Reindex => not_implemented("reindex"),
         Command::Plugins { command } => match command {
             PluginsCommand::List => not_implemented("plugins list"),

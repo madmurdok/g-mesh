@@ -50,13 +50,13 @@ struct PluginIo {
 /// thread the same way `daemon::run` already shares its `Connection` - a
 /// full actor/async rewrite is more than this ticket needs.
 pub struct PluginProcess {
-    // Kept alive only so the child is not dropped (and its pipes closed)
-    // while still in use; nothing reads its exit status today. Killing it
-    // explicitly on daemon shutdown is unnecessary: the OS closes the
-    // daemon's end of the child's stdin when the daemon process exits,
+    // Kept alive so the child is not dropped (and its pipes closed) while
+    // still in use; only its pid is ever read, never its exit status.
+    // Killing it explicitly on daemon shutdown is unnecessary: the OS closes
+    // the daemon's end of the child's stdin when the daemon process exits,
     // which the plugin already treats as its cue to exit (see index.ts's
     // stdin "end" handler).
-    _child: Child,
+    child: Child,
     io: Mutex<PluginIo>,
     next_id: AtomicI64,
 }
@@ -93,10 +93,16 @@ impl PluginProcess {
         handshake::perform(&mut reader).context("JS/TS plugin handshake failed")?;
 
         Ok(Self {
-            _child: child,
+            child,
             io: Mutex::new(PluginIo { reader, writer: stdin }),
             next_id: AtomicI64::new(1),
         })
+    }
+
+    /// The plugin process's pid, so the daemon can record it for tooling that
+    /// has to reason about the plugin from outside this process.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Sends a `FileChanged` request for `file_path` to the plugin and

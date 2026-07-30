@@ -1,0 +1,195 @@
+//! `g-mesh status` against a real daemon, in a project whose state the test
+//! arranged on purpose: one file with a deliberate syntax error, and later a
+//! file the index has never seen.
+//!
+//! The command is driven as a subprocess with the project as its cwd - the
+//! same way a person runs it - so what is asserted is the text a human reads,
+//! not an internal struct.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use g_mesh::daemon;
+use g_mesh::storage::connection::project_dir;
+
+const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A project with a known, deliberately mixed index state.
+struct Project {
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create a temp project root");
+        std::fs::write(dir.path().join("good.ts"), b"export function good() { return 1; }\n")
+            .expect("failed to write good.ts");
+        // Deliberately unparseable: the plugin still emits a File node for it,
+        // flagged, which is exactly the state `status` has to surface.
+        std::fs::write(dir.path().join("broken.ts"), b"export function broken( {\n")
+            .expect("failed to write broken.ts");
+        Self { dir }
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        project_dir(self.root()).expect("failed to resolve the project state directory")
+    }
+
+    fn pid_file(&self) -> PathBuf {
+        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+    }
+
+    fn plugin_pid_file(&self) -> PathBuf {
+        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+    }
+
+    fn recorded_pid(&self, path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+            .trim()
+            .parse()
+            .expect("pid file does not contain a pid")
+    }
+
+    fn status(&self) -> String {
+        let output = Command::new(BIN)
+            .arg("status")
+            .current_dir(self.root())
+            .output()
+            .expect("failed to run `g-mesh status`");
+        assert!(
+            output.status.success(),
+            "`g-mesh status` failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("status output is not valid UTF-8")
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        for path in [self.pid_file(), self.plugin_pid_file()] {
+            if let Ok(pid) = std::fs::read_to_string(&path) {
+                let _ =
+                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
+            }
+        }
+        let _ = std::fs::remove_dir_all(self.state_dir());
+    }
+}
+
+fn spawn_daemon(root: &Path) -> Child {
+    Command::new(BIN)
+        .arg("daemon")
+        .arg("--project-root")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon")
+}
+
+fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn assert_contains(haystack: &str, needle: &str) {
+    assert!(haystack.contains(needle), "expected `{needle}` in status output:\n{haystack}");
+}
+
+#[test]
+fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project() {
+    let project = Project::new();
+    let mut daemon_process = spawn_daemon(project.root());
+    // The pid file is written after the cold-start bulk walk and the socket
+    // bind, so by the time it exists the index is complete.
+    wait_for("the daemon to start listening", || project.pid_file().exists());
+
+    let core_pid = project.recorded_pid(&project.pid_file());
+    let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
+    assert_eq!(core_pid, daemon_process.id(), "the pid file must name the daemon we started");
+    assert_ne!(plugin_pid, core_pid, "the plugin runs in a process of its own");
+
+    let status = project.status();
+
+    assert_contains(&status, &format!("daemon core:     running (pid {core_pid})"));
+    assert_contains(&status, &format!("plugin:          active (pid {plugin_pid})"));
+    // Both files were walked, and neither has been edited since.
+    assert_contains(&status, "index coverage:  100.0% (2/2 source files)");
+    assert_contains(&status, "dirty files:     0 awaiting reindex");
+    assert_contains(&status, "syntax errors:   1 file(s)");
+    assert_contains(&status, "broken.ts");
+    assert!(
+        !status.contains("never fully walked"),
+        "the project has been fully walked:\n{status}"
+    );
+    // The stamp the daemon wrote at startup, read back off disk by the
+    // command rather than asked of the daemon.
+    assert_contains(&status, "just now");
+
+    assert!(daemon_process.try_wait().unwrap().is_none(), "the daemon must still be running");
+}
+
+#[test]
+fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
+    let project = Project::new();
+    let mut daemon_process = spawn_daemon(project.root());
+    wait_for("the daemon to start listening", || project.pid_file().exists());
+    let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
+
+    // Killed, not stopped, so the pid files are deliberately left behind:
+    // status has to see through them rather than trust them.
+    daemon_process.kill().expect("failed to kill the daemon");
+    daemon_process.wait().expect("failed to reap the daemon");
+    // The plugin exits when the daemon's end of its stdin closes, which is
+    // what makes "plugin: not running" the correct report a moment later.
+    wait_for("the plugin to exit with its core", || !daemon::is_process_alive(plugin_pid));
+
+    // A file added while nothing was watching: the index has never seen it.
+    std::fs::write(project.root().join("late.ts"), b"export const late = 1;\n")
+        .expect("failed to write late.ts");
+
+    let status = project.status();
+
+    assert_contains(&status, "daemon core:     not running");
+    assert_contains(&status, "plugin:          not running");
+    assert_contains(&status, "index coverage:  66.7% (2/3 source files)");
+    assert_contains(&status, "dirty files:     1 awaiting reindex");
+    // Still true of the index, and still reported with no daemon to ask.
+    assert_contains(&status, "syntax errors:   1 file(s)");
+    assert_contains(&status, "broken.ts");
+}
+
+/// Running it somewhere g-mesh has never indexed must report an empty state,
+/// not fail - `status` is the command someone reaches for precisely when they
+/// are not sure whether anything is set up.
+#[test]
+fn status_on_a_project_that_was_never_indexed_reports_an_empty_state() {
+    let project = Project::new();
+
+    let status = project.status();
+
+    assert_contains(&status, "daemon core:     not running");
+    assert_contains(&status, "plugin:          not running");
+    assert_contains(&status, "last used:       never recorded");
+    assert_contains(&status, "never fully walked");
+    assert_contains(&status, "index coverage:  0.0% (0/2 source files)");
+    assert_contains(&status, "dirty files:     2 awaiting reindex");
+    assert_contains(&status, "syntax errors:   none");
+}
