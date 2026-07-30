@@ -547,6 +547,151 @@ test("a call to an import at module top level degrades to a usage edge", () => {
   assert.ok(hasEdge(result, "REFERENCES", "instance", "src/lib.ts#create"));
 });
 
+// --- calls made from functions that are not declarations -----------------
+
+/**
+ * Both shapes are lifted from excalidraw, where `find_callers` used to miss
+ * them: an arrow function as an object-literal property value handed to a
+ * call (`register({ perform: ... })`, and every `React.memo(props => ...)` /
+ * `forwardRef` component), and an arrow function as a callback argument
+ * (`.map`, `setTimeout`, `.then`). Neither position gets a Function node -
+ * there is no name to hang one on - so the calls inside them used to be
+ * attributed to nothing and dropped.
+ */
+const NESTED_CALLBACKS_TS = `import { mutate } from "./lib";
+
+function helper(): void {}
+
+export const action = register({
+  name: "wrap",
+  perform: (element) => {
+    helper();
+    mutate(element);
+  },
+});
+
+export const copies = elements.map((element) => {
+  helper();
+  return mutate(element);
+});
+`;
+
+test("a call inside a callback is attributed to the symbol the callback was written into", () => {
+  const result = extractFile("src/app.ts", NESTED_CALLBACKS_TS, RESOLVES_TO_LIB);
+
+  // The object-literal property value handed to `register(...)`.
+  assert.ok(hasEdge(result, "CALLS", "action", "helper"));
+  assert.ok(hasEdge(result, "CALLS", "action", "src/lib.ts#mutate"));
+  // The `.map` callback argument.
+  assert.ok(hasEdge(result, "CALLS", "copies", "helper"));
+  assert.ok(hasEdge(result, "CALLS", "copies", "src/lib.ts#mutate"));
+
+  // The caller is the `const` itself: an anonymous function has no name to
+  // build a qualifiedName from, and a positional one would break the rule
+  // that node ids survive edits elsewhere in the file.
+  assert.equal(node(result, "Variable", "action").kind, "Variable");
+  assert.deepEqual(
+    result.nodes.filter((n) => n.kind === "Function").map((n) => n.qualifiedName),
+    ["helper"],
+    "no synthetic node is invented for the callbacks themselves",
+  );
+});
+
+test("a callback inside a function still attributes its calls to that function", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `function helper(): void {}
+
+export function run(items: string[]): void {
+  items.forEach((item) => {
+    helper();
+  });
+}
+`,
+  );
+
+  assert.ok(hasEdge(result, "CALLS", "run", "helper"));
+  assert.equal(result.edges.filter((e) => e.kind === "CALLS").length, 1, "not doubled, not moved");
+});
+
+test("every way of writing a function as a value carries its calls, not just arrows", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `function first(): void {}
+function second(): void {}
+function third(): void {}
+function fourth(): void {}
+
+export const api = wrap({
+  reset() { first(); },
+  gen: function* () { second(); },
+  legacy: function () { third(); },
+  deferred: () => setTimeout(() => fourth(), 0),
+});
+`,
+  );
+
+  // An object-literal method, a generator, a function expression, and an
+  // arrow nested two callbacks deep - the gap was never specific to arrows.
+  for (const callee of ["first", "second", "third", "fourth"]) {
+    assert.ok(hasEdge(result, "CALLS", "api", callee), `CALLS api -> ${callee}`);
+  }
+});
+
+test("a callback in a class field attributes its calls to the class", () => {
+  const result = extractFile(
+    "src/collab.ts",
+    `export class Collab {
+  queue = throttle(() => {
+    this.save();
+  });
+
+  save(): void {}
+}
+`,
+  );
+
+  // The field's value is a call, not a function, so the field is below symbol
+  // granularity and the class is the nearest thing that can own the call.
+  assert.ok(hasEdge(result, "CALLS", "Collab", "Collab#save"));
+});
+
+test("a callback at module top level still degrades to a usage edge", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { create } from "./lib";
+
+setTimeout(() => create(), 0);
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // Nothing declared encloses it, and the File is not a caller: a call made
+  // at module load time is made by nothing.
+  assert.equal(result.edges.filter((e) => e.kind === "CALLS").length, 0);
+  assert.ok(hasEdge(result, "REFERENCES", "src/app.ts", "src/lib.ts#create"));
+});
+
+test("locals declared inside a callback stay out of the graph", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `export const total = values.reduce((sum, value) => {
+  const doubled = value * 2;
+  function inner(): void {}
+  return sum + doubled;
+}, 0);
+`,
+  );
+
+  // A callback body is a function body, so what it declares is a local -
+  // these used to surface as module-level symbols of the enclosing file.
+  assert.equal(node(result, "Variable", "total").kind, "Variable");
+  assert.deepEqual(
+    result.nodes.filter((n) => n.name === "doubled" || n.name === "inner"),
+    [],
+  );
+});
+
 test("parses files larger than the native parser's default read buffer", () => {
   // node-tree-sitter hands the whole source over in one slice, so anything
   // past ~16k characters throws unless bufferSize is sized to the input.
