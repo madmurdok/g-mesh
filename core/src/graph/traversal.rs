@@ -509,6 +509,76 @@ mod tests {
         result.nodes.iter().map(|r| r.node.id.as_str()).collect()
     }
 
+    /// splitmix64 - good dispersion for a benchmark id, no need for a
+    /// cryptographic hash. Only the *length and entropy class* need to match
+    /// a real sha256-derived id (`plugins/js-ts/src/extract.ts::hash`, 32 hex
+    /// chars, effectively uniform): `make_wide_graph`'s zero-padded counter
+    /// ids compress far better than a real id would and would understate
+    /// resume-token size.
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn realistic_id(n: u64) -> String {
+        let a = splitmix64(n);
+        let b = splitmix64(n ^ 0xDEAD_BEEF_CAFE_BABE);
+        format!("{a:016x}{b:016x}")
+    }
+
+    /// Same shape as `make_wide_graph`, but with 32-hex-char, high-entropy
+    /// ids (see `realistic_id`) instead of short zero-padded counters, so a
+    /// resume-token-size measurement isn't skewed by unrealistically
+    /// compressible ids. Ids are pre-generated in Rust and inserted through a
+    /// prepared statement reused across the loop, not re-prepared per row,
+    /// so tens of thousands of rows stay fast without needing SQL-side hash
+    /// arithmetic (which, for small sequential inputs, leaves the high bits
+    /// zero and is no more realistic than a padded counter).
+    fn make_wide_graph_with_realistic_ids(conn: &Connection, parents: usize, children: usize) -> String {
+        let root_id = realistic_id(0);
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, 'Function', 'root', 'root', 'src/lib.rs', 0, 0, 0, 0, 'rust')",
+            params![root_id],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut insert_node = tx
+                .prepare(
+                    "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+                     VALUES (?1, 'Function', 'n', 'n', 'src/lib.rs', 0, 0, 0, 0, 'rust')",
+                )
+                .unwrap();
+            let mut insert_edge = tx
+                .prepare("INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'tree-sitter', 1)")
+                .unwrap();
+
+            for p in 0..parents {
+                // Offset ids so parent/child/edge namespaces never collide.
+                let pid = realistic_id(1_000_000 + p as u64);
+                insert_node.execute(params![pid]).unwrap();
+                let eid = realistic_id(2_000_000 + p as u64);
+                insert_edge.execute(params![eid, root_id, pid]).unwrap();
+
+                for c in 0..children {
+                    let idx = (p * children + c) as u64;
+                    let cid = realistic_id(3_000_000 + idx);
+                    insert_node.execute(params![cid]).unwrap();
+                    let geid = realistic_id(4_000_000 + idx);
+                    insert_edge.execute(params![geid, pid, cid]).unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+
+        root_id
+    }
+
     #[test]
     fn small_graph_under_every_limit_returns_the_full_transitive_closure() {
         let conn = setup();
@@ -823,6 +893,58 @@ mod tests {
         deduped_edges.dedup();
         assert_eq!(deduped_edges.len(), all_edges.len(), "no edge may be returned twice: {all_edges:?}");
         assert_eq!(deduped_edges.len(), chain.len() - 1, "every hop of the chain is reported once");
+    }
+
+    /// Task #68 (resume token size): `ResumeState.visited`/`walked` are
+    /// cumulative across a whole resume chain (see the doc comment on
+    /// `ResumeState`), so the encoded token grows every call. On a graph
+    /// with realistic (32-hex-char, high-entropy) ids - short test ids like
+    /// "a" or zero-padded counters compress far better than a real id and
+    /// would hide the problem - a single `DEFAULT_EXPLORATION_BUDGET` (5000)
+    /// cutoff alone produces a token in the hundreds of KB. `resume_token`'s
+    /// `encode`/`decode` now gzip the JSON before/after base64 for exactly
+    /// this reason, measured at ~2.3x smaller on this kind of payload. This
+    /// does not make growth O(1) - it rescales the constant - so the
+    /// assertion below is a concrete ceiling for this test's own graph size,
+    /// not a claim that no larger graph could ever exceed it.
+    #[test]
+    fn resume_token_stays_a_fraction_of_its_uncompressed_size_across_a_long_chain_on_a_large_graph() {
+        let conn = setup();
+        // 100 * 140 + 100 + 1 = 14,101 nodes - enough to force several
+        // exploration-budget cutoffs (5000 each) with realistic ids.
+        let root_id = make_wide_graph_with_realistic_ids(&conn, 100, 140);
+
+        let mut options = TraversalOptions::new(root_id, Direction::Outgoing);
+        options.max_fanout = 1_000_000;
+        options.max_depth = 10;
+        options.exploration_budget = DEFAULT_EXPLORATION_BUDGET;
+        let first = traverse(&conn, options).unwrap();
+        assert_eq!(first.truncated_by, Some(TruncatedBy::ExplorationBudget));
+
+        let mut token = first.resume_token.clone();
+        let mut calls = 1;
+        let mut nodes_seen = first.nodes.len();
+        let mut max_token_len = token.as_ref().map(|t| t.len()).unwrap_or(0);
+
+        while let Some(t) = token {
+            let next = resume(&conn, &t, DEFAULT_EXPLORATION_BUDGET).unwrap();
+            calls += 1;
+            nodes_seen += next.nodes.len();
+            max_token_len = max_token_len.max(next.resume_token.as_ref().map(|t| t.len()).unwrap_or(0));
+            token = next.resume_token;
+            assert!(calls < 100, "the chain must converge, not re-explore itself forever");
+        }
+
+        assert!(calls >= 3, "this graph must force several resumes, not just one: {calls}");
+        assert_eq!(nodes_seen, 14_101, "the chain's union must be the full closure");
+        // Measured: ~523 KB compressed vs. ~1.08 MB the equivalent
+        // uncompressed token reached at the same point in the chain - the
+        // ceiling below sits between the two, so a regression that dropped
+        // compression would fail this test.
+        assert!(
+            max_token_len < 700_000,
+            "resume token grew to {max_token_len} bytes - compression regression?"
+        );
     }
 
     /// A re-expanded seed re-offers all of its edges, and the first call may
