@@ -1,0 +1,1255 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>g-mesh: как это устроено</title>
+<style>
+  :root {
+    --bg: #eef1ee;
+    --bg-2: #e4e9e3;
+    --surface: #e3e7e1;
+    --surface-2: #d8ded5;
+    --ink: #1b2420;
+    --ink-muted: #4b5c55;
+    --ink-faint: #74857e;
+    --accent: #a85f26;
+    --accent-ink: #ffffff;
+    --edge: #3f7d75;
+    --edge-soft: #cfe0dc;
+    --rule: #c5cdc2;
+    --code-bg: #dde3da;
+    --warn-bg: #f4e3d1;
+    --warn-ink: #6b4318;
+    --shadow: 0 1px 2px rgba(20, 30, 25, 0.06), 0 6px 20px rgba(20, 30, 25, 0.05);
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", "Roboto Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161c;
+      --bg-2: #141b21;
+      --surface: #182029;
+      --surface-2: #1d2630;
+      --ink: #dfe6e2;
+      --ink-muted: #8fa39c;
+      --ink-faint: #5f716b;
+      --accent: #d99456;
+      --accent-ink: #16110a;
+      --edge: #5fa89e;
+      --edge-soft: #223832;
+      --rule: #2a333b;
+      --code-bg: #141c23;
+      --warn-bg: #2a2114;
+      --warn-ink: #e8c294;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161c; --bg-2: #141b21; --surface: #182029; --surface-2: #1d2630;
+    --ink: #dfe6e2; --ink-muted: #8fa39c; --ink-faint: #5f716b; --accent: #d99456;
+    --accent-ink: #16110a; --edge: #5fa89e; --edge-soft: #223832; --rule: #2a333b;
+    --code-bg: #141c23; --warn-bg: #2a2114; --warn-ink: #e8c294;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+  }
+  :root[data-theme="light"] {
+    --bg: #eef1ee; --bg-2: #e4e9e3; --surface: #e3e7e1; --surface-2: #d8ded5;
+    --ink: #1b2420; --ink-muted: #4b5c55; --ink-faint: #74857e; --accent: #a85f26;
+    --accent-ink: #ffffff; --edge: #3f7d75; --edge-soft: #cfe0dc; --rule: #c5cdc2;
+    --code-bg: #dde3da; --warn-bg: #f4e3d1; --warn-ink: #6b4318;
+    --shadow: 0 1px 2px rgba(20,30,25,.06), 0 6px 20px rgba(20,30,25,.05);
+  }
+
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--edge-soft); }
+
+  .page {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 4rem 1.75rem 8rem;
+    position: relative;
+  }
+
+  /* ---- masthead ---- */
+  .masthead {
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 2rem;
+    margin-bottom: 2.5rem;
+  }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--edge);
+    display: flex;
+    align-items: center;
+    gap: 0.6em;
+    margin-bottom: 1rem;
+  }
+  .kicker::before {
+    content: "";
+    width: 1.6em;
+    height: 1px;
+    background: var(--edge);
+    display: inline-block;
+  }
+  h1.title {
+    font-size: clamp(2rem, 5vw, 2.7rem);
+    line-height: 1.15;
+    margin: 0 0 0.6rem;
+    text-wrap: balance;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    color: var(--ink-muted);
+    font-size: 1.08rem;
+    max-width: 56ch;
+    margin: 0;
+  }
+  .meta-row {
+    margin-top: 1.4rem;
+    display: flex;
+    gap: 1.6rem;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .meta-row b { color: var(--ink-muted); font-weight: 600; }
+
+  /* ---- contents ---- */
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 1.5rem 1.75rem;
+    margin-bottom: 3rem;
+    box-shadow: var(--shadow);
+  }
+  .toc-title {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 0.9rem;
+  }
+  .toc ol {
+    columns: 2;
+    column-gap: 2rem;
+    margin: 0;
+    padding: 0 0 0 1.2rem;
+    font-size: 0.92rem;
+  }
+  .toc li { margin-bottom: 0.5rem; break-inside: avoid; }
+  .toc a { color: var(--ink); text-decoration: none; border-bottom: 1px solid transparent; }
+  .toc a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
+  /* ---- sections ---- */
+  section { margin-bottom: 3.4rem; scroll-margin-top: 1.5rem; }
+  .sec-num {
+    font-family: var(--mono);
+    color: var(--accent);
+    font-size: 0.82rem;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-size: 1.55rem;
+    margin: 0 0 1.1rem;
+    text-wrap: balance;
+    display: flex;
+    align-items: baseline;
+    gap: 0.6em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.6rem;
+  }
+  h3 {
+    font-size: 1.15rem;
+    margin: 1.8rem 0 0.7rem;
+    color: var(--ink);
+  }
+  h3 .mono-tag {
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--edge);
+    font-weight: 400;
+  }
+  p { margin: 0 0 1rem; max-width: 68ch; }
+  ul, ol.plain { margin: 0 0 1.1rem; padding-left: 1.3rem; max-width: 68ch; }
+  li { margin-bottom: 0.4rem; }
+  strong { font-weight: 650; }
+  a { color: var(--edge); }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+  pre.codeblock {
+    font-family: var(--mono);
+    font-size: 0.83rem;
+    line-height: 1.55;
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    margin: 0 0 1.2rem;
+  }
+  pre.codeblock code { background: none; padding: 0; }
+
+  /* mermaid container: allow horizontal scroll, never the page */
+  .diagram {
+    margin: 1.4rem 0 1.8rem;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1.1rem;
+    overflow-x: auto;
+  }
+  .diagram pre.mermaid {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    white-space: pre;
+  }
+  .diagram figcaption {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-top: 0.8rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--rule);
+  }
+
+  /* callouts */
+  .note {
+    border-left: 3px solid var(--edge);
+    background: var(--edge-soft);
+    padding: 0.9rem 1.2rem;
+    border-radius: 0 4px 4px 0;
+    margin: 1.2rem 0;
+    max-width: 68ch;
+  }
+  .note p:last-child { margin-bottom: 0; }
+  .gap {
+    border-left: 3px solid var(--accent);
+    background: var(--warn-bg);
+    color: var(--warn-ink);
+    padding: 0.9rem 1.2rem;
+    border-radius: 0 4px 4px 0;
+    margin: 1.2rem 0;
+    max-width: 68ch;
+    font-size: 0.95rem;
+  }
+  .gap p { margin-bottom: 0; color: inherit; }
+  .gap b { color: inherit; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.9rem;
+  }
+  .table-wrap { overflow-x: auto; margin: 0 0 1.3rem; }
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.8rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+  }
+  td code { white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    padding: 0.12em 0.55em;
+    border-radius: 999px;
+    text-transform: uppercase;
+  }
+  .pill.done { background: var(--edge-soft); color: var(--edge); }
+  .pill.gap { background: var(--warn-bg); color: var(--warn-ink); }
+
+  .cols2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.4rem;
+  }
+  @media (max-width: 640px) {
+    .cols2 { grid-template-columns: 1fr; }
+    .toc ol { columns: 1; }
+  }
+  .cols2 .box {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 1.1rem 1.3rem;
+  }
+  .cols2 .box h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.95rem;
+    font-family: var(--mono);
+    color: var(--edge);
+    text-transform: none;
+  }
+  .cols2 .box p { font-size: 0.92rem; margin-bottom: 0.4rem; }
+
+  hr.rule {
+    border: none;
+    border-top: 1px dashed var(--rule);
+    margin: 2.5rem 0;
+  }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.6rem;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.02em;
+  }
+
+  .glossary dt {
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--edge);
+    margin-top: 0.9rem;
+  }
+  .glossary dd { margin: 0.2rem 0 0; color: var(--ink-muted); max-width: 64ch; }
+
+  /* theme toggle (this standalone copy has no host UI, so it ships its own) */
+  .theme-toggle {
+    position: fixed;
+    top: 1.2rem;
+    right: 1.2rem;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    color: var(--ink-muted);
+    padding: 0.4em 0.8em;
+    border-radius: 999px;
+    cursor: pointer;
+    box-shadow: var(--shadow);
+  }
+  .theme-toggle:hover { color: var(--accent); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<button class="theme-toggle" id="themeToggle" type="button" aria-label="Переключить тему">тема</button>
+
+<div class="page">
+
+  <div class="masthead">
+    <div class="kicker">Техническая записка · Устройство системы</div>
+    <h1 class="title">g-mesh: как устроен движок структурного графа кода</h1>
+    <p class="subtitle">
+      Разбор механизма работы — от разбора файлов до ответа на вопрос ИИ-агента.
+      Основано на архитектурном документе проекта и на текущем состоянии кода
+      (Rust-ядро <code>core/</code> + плагин <code>plugins/js-ts/</code>),
+      включая места, где реализация ещё отстаёт от задуманного.
+    </p>
+    <div class="meta-row">
+      <span><b>Релиз</b> 0.3.0</span>
+      <span><b>Версия ядра</b> 0.1.0 · протокол v1 · схема БД v3</span>
+      <span><b>Язык-плагин</b> JS/TS (единственный на сегодня)</span>
+      <span><b>Хранилище</b> SQLite (WAL), один файл на проект</span>
+    </div>
+  </div>
+
+  <nav class="toc">
+    <p class="toc-title">Содержание</p>
+    <ol>
+      <li><a href="#problem">Зачем это нужно</a></li>
+      <li><a href="#components">Из чего состоит система</a></li>
+      <li><a href="#lifecycle">Как поднимается процесс</a></li>
+      <li><a href="#storage">Хранилище: таблицы и файл на диске</a></li>
+      <li><a href="#protocol">Протокол ядро ↔ плагин</a></li>
+      <li><a href="#coldstart">Первый запуск: холодная индексация</a></li>
+      <li><a href="#resolve">Как определяется, куда ведёт импорт</a></li>
+      <li><a href="#linking">Склейка графа: от заглушки к настоящему узлу</a></li>
+      <li><a href="#incremental">Инкрементальное обновление на лету</a></li>
+      <li><a href="#traversal">Обход графа и постраничные ответы</a></li>
+      <li><a href="#resume">Долгие обходы: resume-токен</a></li>
+      <li><a href="#tools">Инструменты, которые видит агент</a></li>
+      <li><a href="#security">Модель доверия и безопасность</a></li>
+      <li><a href="#gaps">Что задумано, а что пока не построено</a></li>
+      <li><a href="#glossary">Краткий словарь терминов</a></li>
+    </ol>
+  </nav>
+
+  <section id="problem">
+    <h2><span class="sec-num">01</span> Зачем это нужно</h2>
+    <p>
+      Когда ИИ-агент работает с кодом, ему регулярно нужно отвечать на вопросы вроде
+      «кто вызывает эту функцию» или «что реализует этот интерфейс». Без специального
+      инструмента агент решает это грепом и чтением файлов — работает, но медленно и
+      ненадёжно: текстовый поиск не отличает вызов функции от комментария с тем же именем,
+      не проходит через реэкспорты и алиасы импортов, не умеет сказать «а вот тут я не уверен».
+    </p>
+    <p>
+      <b>g-mesh</b> — локальный индексатор кода. Он один раз проходит по проекту, строит
+      граф: файлы, функции, типы, переменные — и связи между ними (кто кого вызывает, что
+      от чего наследует, кто что импортирует). Дальше граф отдаётся агенту через протокол
+      <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">MCP</a> —
+      набором точных инструментов вида «найди определение», «найди всех вызывающих»,
+      «покажи зависимости файла». Поверх графа планируется слой семантического поиска
+      по смыслу (эмбеддинги) — для случаев, когда агент не знает точное имя символа.
+    </p>
+    <p>
+      Ключевая идея: <b>граф — это источник истины</b>, эмбеддинги — это надстройка
+      для поиска. Так система остаётся точной там, где точность возможна (структура
+      кода — это факт, а не догадка), и подключает более мягкий, вероятностный поиск
+      только там, где без него не обойтись.
+    </p>
+  </section>
+
+  <section id="components">
+    <h2><span class="sec-num">02</span> Из чего состоит система</h2>
+    <p>
+      Система — это четыре независимых процесса, которые запускаются и живут по-разному.
+      Ниже — карта того, кто с кем разговаривает и по какому каналу.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+graph TD
+    Agent["ИИ-агент<br/>(MCP-клиент)"] -->|stdio, новый процесс на сессию| Shim["g-mesh mcp-shim<br/>тонкий прокси, без своего состояния"]
+    Shim -->|Unix-сокет<br/>поднимает демон, если его нет| Core["Демон-ядро (Rust)<br/>один процесс на проект"]
+
+    subgraph inner [" "]
+        Watcher["Наблюдатель за файлами"]
+        Tools["Логика MCP-инструментов"]
+        Sock["Слушатель Unix-сокета"]
+    end
+    Core --- Watcher
+    Core --- Tools
+    Core --- Sock
+
+    Core -->|JSON-RPC control-plane<br/>+ NDJSON bulk-поток| Plugin["Процесс языкового плагина<br/>JS/TS: tree-sitter"]
+    Core -->|rusqlite, режим WAL| DB[("index.db<br/>~/.g-mesh/projects/&lt;hash&gt;/")]
+</pre>
+      <figcaption>Четыре живых процесса: шим на сессию, демон-ядро и плагин — на проект, SQLite-файл — на диске</figcaption>
+    </div>
+    <div class="cols2">
+      <div class="box">
+        <h4>Шим (mcp-shim)</h4>
+        <p>Без памяти между вызовами. MCP-клиент запускает его как обычный
+        stdio-сервер — так же, как любой другой MCP-инструмент. Шим считает
+        хэш пути проекта, ищет живой сокет демона, при необходимости поднимает
+        демон в фоне и дальше просто перекладывает байты между stdin/stdout
+        и Unix-сокетом, не заглядывая внутрь сообщений.</p>
+      </div>
+      <div class="box">
+        <h4>Демон-ядро</h4>
+        <p>Один процесс на проект (хотя бы теоретически — про фактические
+        таймауты см. раздел «Что задумано»). Держит открытым SQLite,
+        слушает файловую систему, отвечает на MCP-запросы, управляет
+        жизненным циклом процесса языкового плагина.</p>
+      </div>
+      <div class="box">
+        <h4>Языковой плагин</h4>
+        <p>Отдельный процесс на язык. Для JS/TS — это tree-sitter (быстрый
+        синтаксический разбор) плюс в перспективе TypeScript compiler API
+        для более точного семантического разрешения. Только читает
+        исходники проекта, в базу данных не пишет напрямую — только
+        отправляет ядру список изменений.</p>
+      </div>
+      <div class="box">
+        <h4>SQLite-файл</h4>
+        <p>Один файл на проект, в режиме WAL (Write-Ahead Log — запись
+        сначала в отдельный лог, потом слияние с основным файлом; так
+        чтение не блокирует запись). Хранит и граф (таблицы узлов/рёбер),
+        и в будущем — векторы для семантического поиска.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="lifecycle">
+    <h2><span class="sec-num">03</span> Как поднимается процесс</h2>
+    <p>
+      Важная деталь дизайна: пользователю не нужно ничего «запускать» руками.
+      Идентичность проекта — это просто хэш от канонического пути каталога.
+      Переключил агента на другой проект — шим сам поймёт, к какому демону
+      подключаться (или что нужно поднять новый).
+    </p>
+    <p>Последовательность при первом обращении к новому проекту:</p>
+    <ol class="plain">
+      <li>Шим пытается подключиться к Unix-сокету по пути, зависящему от хэша проекта.</li>
+      <li>Сокета нет — шим берёт файловую блокировку (<code>bootstrap.lock</code>) и <i>ждёт</i>
+        её получения, а не гонится наперегонки с другими шимами: если два агента открылись
+        в одном проекте одновременно, второй просто подождёт первого, а не запустит второй демон.</li>
+      <li>Под блокировкой шим ещё раз проверяет сокет (вдруг кто-то уже поднял демон, пока
+        мы ждали) и, если так и не появился — запускает демон как полностью отсоединённый
+        процесс (свой process group, нулевые дескрипторы ввода-вывода) и опрашивает сокет
+        каждые 20&nbsp;мс до 10&nbsp;секунд.</li>
+      <li>Демон, в свою очередь, берёт <i>отдельную</i> блокировку (<code>daemon.lock</code>,
+        не ту же, что у шима — иначе был бы взаимный тупик), открывает SQLite, проверяет
+        версию схемы, поднимает процесс плагина.</li>
+      <li>Если проект ещё не индексировался (или схема пересобралась с нуля) — демон
+        запускает разовый, отдельный процесс плагина в режиме полного обхода (<code>--bulk-index</code>)
+        и <i>не открывает сокет для запросов</i>, пока обход не завершится целиком. Это
+        осознанный выбор: агент никогда не получит ответ по наполовину построенному графу.</li>
+      <li>Только после этого стартует наблюдатель за файлами, открывается сокет — и демон
+        готов принимать MCP-запросы.</li>
+    </ol>
+    <div class="note">
+      <p>
+        Зачем два разных lock-файла у шима и демона? Шим держит свою блокировку,
+        <i>пока ждёт</i>, что запущенный им демон станет доступен. Если бы демон
+        пытался взять ту же блокировку — оба процесса заблокировали бы друг друга
+        навсегда.
+      </p>
+    </div>
+  </section>
+
+  <section id="storage">
+    <h2><span class="sec-num">04</span> Хранилище: таблицы и файл на диске</h2>
+    <p>
+      Весь граф живёт в одном SQLite-файле — выбор в пользу простоты (один движок
+      вместо графовой БД плюс отдельного векторного хранилища) ценой того, что
+      рекурсивные запросы (обход графа) на SQLite медленнее, чем на специализированном
+      графовом движке — это осознанный компромисс с чётко описанным порогом,
+      после которого решение стоит пересмотреть (раздел 14).
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+erDiagram
+    NODES {
+        text id PK "стабилен между правками"
+        text kind "File, Module, Type, Function, Variable"
+        text name
+        text qualifiedName
+        text filePath
+        int startLine
+        int startCol
+        int endLine
+        int endCol
+        text signature "только для функций"
+        bool exported
+        text docComment "текст для будущих эмбеддингов"
+        text language
+        text nativeKind "деталь языка + маркеры заглушек"
+        bool hasSyntaxErrors
+    }
+    EDGES {
+        text id PK
+        text fromId FK
+        text toId FK
+        text kind "DEFINES, IMPORTS, CALLS, SUPERTYPE_OF, REFERENCES, EXPORTS"
+        text source "tree-sitter | ts-compiler"
+        bool resolved
+    }
+    META {
+        int id PK "всегда 1, одна строка"
+        text schema_version
+        text embedding_model
+        text lastUsed
+        text bulkIndexedAt "NULL, пока обход не завершён целиком"
+    }
+    INDEXED_FILES {
+        text filePath PK
+        int mtimeMillis
+        text contentHash
+    }
+    NODES ||--o{ EDGES : "fromId"
+    NODES ||--o{ EDGES : "toId"
+</pre>
+      <figcaption>Фактическая схема на сегодня — без таблицы векторов: она пока не построена, см. раздел 14</figcaption>
+    </div>
+    <p>
+      Гранулярность — на уровне символа, а не строки: <code>File</code>, <code>Module</code>
+      (пространство имён/пакет), <code>Type</code> (класс/интерфейс/структура),
+      <code>Function</code>, <code>Variable</code> (только модульного уровня — локальные
+      переменные внутри функций не индексируются, это был бы слишком большой объём
+      данных без практической пользы для агента).
+    </p>
+    <p>
+      Схема специально языконезависима: вместо JS-шного «класс/интерфейс» и
+      «extends/implements» — общий <code>Type</code> и одно ребро <code>SUPERTYPE_OF</code>
+      для любого «наследует/реализует» отношения в любом языке. Особенности конкретного
+      языка уходят в поле <code>nativeKind</code>, не размножая перечисление видов узлов.
+    </p>
+    <h3>Версия схемы — без миграций</h3>
+    <p>
+      Если версия схемы в файле не совпадает с ожидаемой (обновили ядро) — база просто
+      <b>стирается и строится заново</b>. Никакого фреймворка миграций нет и не планируется:
+      индекс — это воспроизводимый кэш, а не источник правды. Пересобрать дешевле, чем
+      поддерживать миграции для данных, которые всегда можно восстановить из исходников.
+    </p>
+    <p>
+      Отдельная деталь: <code>bulkIndexedAt</code> в таблице <code>meta</code> — это не
+      «версия схемы свежая», а именно факт «полный обход когда-то <i>дошёл до конца</i>».
+      Если демон упал посреди обхода, при следующем запуске он честно увидит, что обход
+      не завершён, и начнёт заново — а не решит, что раз схема на месте, то и данные полные.
+    </p>
+  </section>
+
+  <section id="protocol">
+    <h2><span class="sec-num">05</span> Протокол ядро ↔ плагин</h2>
+    <p>
+      Ядро и языковой плагин общаются <b>двумя разными каналами</b> одновременно —
+      сознательное разделение, потому что у этих каналов разная природа сообщений.
+    </p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Канал</th><th>Формат</th><th>Зачем</th></tr>
+      <tr>
+        <td><b>Control-plane</b></td>
+        <td>JSON-RPC 2.0 в LSP-стиле: заголовок <code>Content-Length</code>, затем тело</td>
+        <td>Короткие команды запрос-ответ: «файл изменился», «статус», рукопожатие
+          версии протокола. Такой же формат framing, что у <code>tsserver</code> —
+          адаптер почти не нужен.</td>
+      </tr>
+      <tr>
+        <td><b>Bulk-поток</b></td>
+        <td>NDJSON — один компактный JSON-объект на строку</td>
+        <td>Первичный полный обход проекта: плагин может отдать сотни тысяч узлов и рёбер,
+          не дожидаясь, пока всё поместится в памяти как один документ.</td>
+      </tr>
+    </table>
+    </div>
+    <p>
+      Оба канала защищены потолком размера в <b>64 мегабайта</b> на одно сообщение
+      (<code>MAX_BODY_BYTES</code> / <code>MAX_LINE_BYTES</code>) — так «сломанный»
+      или недобросовестный плагин не сможет заставить ядро выделить неограниченную
+      память под один пришедший кусок данных.
+    </p>
+    <h3>Рукопожатие и версия протокола</h3>
+    <p>
+      Перед началом работы плагин присылает своё имя, версию и версию протокола.
+      Несовпадение версии протокола — это <b>жёсткий отказ</b>, а не попытка работать
+      «как получится»: протокол — это код, а не данные, договориться о полусовместимости
+      тут не с чем. (Для сравнения: несовпадение версии <i>схемы БД</i> — это просто
+      сигнал переиндексировать всё с нуля, не ошибка.)
+    </p>
+  </section>
+
+  <section id="coldstart">
+    <h2><span class="sec-num">06</span> Первый запуск: холодная индексация</h2>
+    <p>
+      Когда демон впервые видит проект, он гонит один сплошной поток разбора —
+      без ожидания «а что там с типами» — и делает граф доступным как можно раньше.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant Agent as Агент
+    participant Shim as Шим
+    participant Core as Ядро
+    participant Plugin as Плагин
+    participant DB as SQLite
+
+    Agent->>Shim: запуск (stdio), рабочий каталог = проект
+    Shim->>Shim: хэш(каталог), проверка сокета
+    Shim->>Core: поднять демон
+    Core->>Plugin: запустить языковой плагин (bulk-режим)
+    Plugin->>Plugin: разбор tree-sitter (параллельно, по ядрам CPU)
+    Plugin->>Plugin: резолвинг относительных путей импорта
+    Plugin-->>Core: NDJSON-поток: узлы и рёбра
+    Core->>DB: пакетные транзакции (~2000 элементов)
+    Core->>DB: склейка резолвленных импортов с реальными файлами
+    Core-->>Shim: индекс доступен
+</pre>
+      <figcaption>К агенту не летит ничего, пока весь поток от плагина не дойдёт до конца — это гарантирует «полный или никакой»</figcaption>
+    </div>
+    <p>
+      Внутри плагина tree-sitter — это <i>синтаксический</i>, а не семантический разбор:
+      он строит дерево кода, не зная, что означает конкретное имя (нет проверки типов,
+      нет понимания перегрузок). Именно поэтому «кто вызывает эту функцию» изначально
+      решается неточно, а точные ответы там, где это возможно, получаются за счёт
+      отдельного механизма — «склейки» графа, о которой ниже.
+    </p>
+    <p>
+      Разбор файла с синтаксической ошибкой (например, файл сохранён на середине
+      правки) не проваливается целиком: tree-sitter — «терпимый к ошибкам» парсер,
+      он выдаёт частичное дерево с узлом-«раной» на месте проблемного участка,
+      а остальной файл разбирает как обычно. Стратегия обновления —
+      <b>«оставить последнее хорошее состояние»</b>, а не «стереть всё»: символы вне
+      сломанного участка обновляются как обычно, а символы внутри или ниже него по
+      файлу сохраняют предыдущее известное состояние, пока чистый разбор не
+      подтвердит, что они правда удалены. Логика простая: ложное «символ, возможно,
+      ещё существует» безопаснее для агента, чем ложное «символа точно больше нет» —
+      второе может подтолкнуть к разрушительной правке на основе артефакта момента
+      сохранения файла, а не реального состояния кода.
+    </p>
+  </section>
+
+  <section id="resolve">
+    <h2><span class="sec-num">07</span> Как определяется, куда ведёт импорт</h2>
+    <p>
+      Это самая проработанная часть системы на сегодня (пять задач последнего релиза
+      были посвящены именно ей). Задача: увидев в коде <code>import x from "..."</code>,
+      понять — какой реальный файл проекта имеется в виду, если вообще имеется.
+      Строка-специфайер проверяется по цепочке из четырёх механизмов, <b>по порядку</b>,
+      первый сработавший побеждает:
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart TD
+    Start(["Специфайер импорта,<br/>например «@/utils» или «./x»"]) --> IsRel{Начинается<br/>с «./» или «../»?}
+    IsRel -->|Да| Rel["Относительный путь:<br/>арифметика путей + подстановка расширений<br/>+ index.* внутри каталога"]
+    IsRel -->|Нет| IsPriv{Начинается с «#»?}
+    IsPriv -->|Да| Priv["package.json → imports<br/>ближайшего package.json<br/>к файлу-импортёру"]
+    IsPriv -->|Нет| Workspace["Пакет своего workspace?<br/>(pnpm-workspace.yaml / package.json)"]
+    Workspace -->|Нашли| WsOk["Путь из exports/main/module<br/>или src/index.* по договорённости"]
+    Workspace -->|Нет| Tsconfig["Алиас из tsconfig/jsconfig<br/>paths? («@/foo» → «./src/foo»)"]
+    Tsconfig -->|Нашли| TsOk["Путь по ближайшему<br/>tsconfig.json/jsconfig.json"]
+    Tsconfig -->|Нет| Unresolved["Нерезолвленная заглушка Module:<br/>node_modules, node:builtin,<br/>несуществующий путь"]
+
+    Rel --> Exists{Файл реально<br/>существует<br/>и не игнорируется?}
+    WsOk --> Exists
+    TsOk --> Exists
+    Exists -->|Да| Resolved(["resolved_module —<br/>реальный узел графа"])
+    Exists -->|Нет| Unresolved
+</pre>
+      <figcaption>Порядок важен: воркспейс-пакет побеждает алиас tsconfig, даже если оба указывают на один и тот же специфайер — потому что ответ пакетного менеджера точнее подсказки из конфига компилятора</figcaption>
+    </div>
+    <h3>Почему именно такой порядок</h3>
+    <p>
+      Реальный пример из кода Excalidraw, на который ориентировался проект: пакет
+      <code>@excalidraw/element/*</code> одновременно объявлен как воркспейс-пакет
+      <i>и</i> замаплен через <code>tsconfig</code> paths на тот же каталог. Если бы
+      оба механизма проверялись независимо и «побеждал последний ответивший», результат
+      был бы недетерминированным. Вместо этого — жёсткий приоритет: путь от
+      пакетного менеджера (воркспейс) побеждает <i>всегда</i>, а alias из
+      tsconfig — это запасной вариант только тогда, когда воркспейс вообще ничего
+      не нашёл. Резонно: воркспейс-манифест описывает, что реально загрузит
+      Node/пакетный менеджер, а запись в <code>paths</code> — это подсказка для
+      компилятора, которая может устареть и никак не проверяется при импорте.
+    </p>
+    <h3>«Существует» — это не просто <code>stat()</code></h3>
+    <p>
+      На каждом шаге, прежде чем засчитать путь как найденный, система проверяет
+      не только «файл физически есть на диске», но и «этот файл вообще попадёт в
+      индекс при полном обходе». Иначе возникает конкретный баг, который был
+      исправлен в последнем релизе: у собранного (не «сырого») монорепозитория
+      объявленная точка входа пакета может указывать на <code>dist/prod/index.js</code> —
+      файл, который физически существует, но который обход <i>никогда бы не</i>
+      проиндексировал (он либо в <code>.gitignore</code>, либо в жёстко исключённом
+      каталоге вроде <code>dist/</code>/<code>node_modules/</code>). Раньше резолвер
+      наивно говорил «да, файл есть» и указывал импорт именно туда — в файл без узла
+      графа. Теперь резолвинг и обход файловой системы используют <b>одну и ту же</b>
+      политику исключений, поэтому такой путь честно считается несуществующим, и
+      перебор кандидатов проваливается дальше — к исходнику <code>src/index.ts</code>,
+      который реально попадёт в граф.
+    </p>
+    <h3>Симлинки: теперь учитываются, с защитой от циклов</h3>
+    <p>
+      Ранее символические ссылки на каталоги были невидимы для обхода — из-за
+      особенности API файловой системы Node.js ссылка не отвечает «я директория»
+      и не отвечает «я файл», поэтому просто пропускалась. Это делало невидимыми
+      целые пакеты в некоторых типичных для yarn/lerna раскладках монорепозиториев
+      или в случаях, когда общий код подключён через симлинк. Решение — намеренно
+      выбранная политика «следовать за ссылками», но только с защитой:
+    </p>
+    <ul>
+      <li><b>Идентичность — это реальный путь</b>, полученный через разрешение
+        ссылки (<code>realpath</code>), а не сама ссылка. Так система понимает,
+        что два разных пути на самом деле указывают на одно и то же место.</li>
+      <li><b>Цикл</b> (ссылка указывает на своего же «предка» по дереву) —
+        отклоняется тем же способом, что и дубликат: реальный путь уже «занят».</li>
+      <li><b>Два пути на одно и то же</b> (обычный каталог плюс ссылка-алиас на него) —
+        индексируются <i>один раз</i>, под тем путём, который обход достиг первым
+        по своему обычному отсортированному порядку обхода. Второй путь просто
+        отбрасывается — не переименовывается, не сливается: идентичность узла
+        здесь <i>есть</i> путь, которым до него дошли, и любое «канонизирование»
+        сломало бы все специфайеры, которые на него ссылаются под старым именем.</li>
+      <li>Ссылка, ведущая <b>за пределы</b> корня проекта — отклоняется всегда;
+        <b>битая</b> ссылка (указывает в никуда) — тихо пропускается, не роняя обход.</li>
+    </ul>
+    <div class="note">
+      <p>
+        Забавная деталь, всплывшая при разработке: на macOS системный временный
+        каталог <code>/tmp</code> сам является символической ссылкой на
+        <code>/private/tmp</code>. Если не «канонизировать» корень проекта перед
+        сравнением путей, вся защита от циклов и дублей тихо ломается именно
+        на macOS — ссылка снаружи выглядит так, будто указывает «за пределы»
+        корня, хотя на самом деле указывает внутрь него, просто записанного
+        другим путём. Это было проверено вживую намеренной поломкой кода —
+        без канонизации 3 из 4 вариантов записи одного и того же пути ломались.
+      </p>
+    </div>
+  </section>
+
+  <section id="linking">
+    <h2><span class="sec-num">08</span> Склейка графа: от заглушки к настоящему узлу</h2>
+    <p>
+      Плагин видит только один файл за раз. Когда он встречает
+      <code>import { foo } from "./x"</code>, он ещё не знает, существует ли файл
+      <code>./x</code> в индексе и правда ли там есть экспорт с именем <code>foo</code>.
+      Поэтому вместо того, чтобы промолчать (и потерять связь навсегда) или гадать
+      (и получить неверную связь), он честно создаёт <b>узел-заглушку</b> —
+      временный <code>Module</code>-узел, на который вешается ребро — и отправляет
+      это ядру. Ядро — единственная сторона, которая видит <i>весь</i> индекс сразу,
+      и именно оно потом «дошивает» заглушку до настоящего узла.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Плагин["Файл видит только себя"]
+        A["import { foo } from './x'"] --> B["Module-заглушка<br/>nativeKind: resolved_module<br/>qualifiedName: путь к x"]
+        B -->|IMPORTS| A
+        A -->|CALLS на заглушку<br/>x#foo| C["pending_symbol-заглушка<br/>name: foo"]
+    end
+    subgraph Ядро["Видит весь индекс"]
+        D["Появился File-узел<br/>с путём x?"] -->|Да| E["Перецепить IMPORTS<br/>на настоящий File,<br/>удалить заглушку"]
+        F["В x есть<br/>экспортированный foo?"] -->|Ровно один подходящий| G["Перецепить CALLS<br/>на настоящий Function,<br/>заглушку НЕ удалять"]
+    end
+    B -.-> D
+    C -.-> F
+</pre>
+      <figcaption>Два прохода склейки — imports.rs и symbol_links.rs — работают по одной и той же логике на разном уровне: файл, потом символ внутри файла</figcaption>
+    </div>
+    <h3>Проход 1 — файлы (<span class="mono-tag">graph::imports</span>)</h3>
+    <p>
+      Как только в графе появляется настоящий <code>File</code>-узел с нужным путём,
+      все рёбра <code>IMPORTS</code>, ведущие на заглушку с этим же путём, перецепляются
+      на него, а заглушка удаляется — если на неё больше ничего не ссылается
+      (заглушка импорта может нести только одно такое ребро, так что удалять её
+      после привязки безопасно).
+    </p>
+    <h3>Проход 2 — символы внутри файла (<span class="mono-tag">graph::symbol_links</span>)</h3>
+    <p>
+      Тот же приём на уровень тоньше: заглушка адресуется как
+      <code>«путь-к-файлу#имя»</code>, и ядро ищет в этом файле <i>ровно один</i>
+      подходящий по виду экспортированный символ (вызов — только на функцию,
+      «наследует» — только на тип). Если подходит ровно один — ребро перецепляется
+      и помечается разрешённым. Если ноль или больше одного — ребро остаётся
+      как есть: правило простое и намеренное — <b>лучше отсутствующая связь, чем
+      неверная</b>. На этом уровне не разрешаются: <code>import * as ns</code>
+      (обращение к пространству имён — это уже семантика, кто есть <code>ns.foo</code>,
+      structural-разбор не может достоверно сказать), default-импорт по умолчанию
+      экспортированного <i>именованного</i> значения и реэкспорты вида
+      <code>export { x } from "./y"</code> — эти случаи оставлены будущему семантическому
+      слою (TypeScript compiler API).
+    </p>
+    <p>
+      Важная асимметрия: заглушка-файл удаляется после склейки, а заглушка-символ —
+      <b>нет</b>, даже уже привязанная. Причина: на одну и ту же импортированную функцию
+      в файле может быть несколько мест использования, и они добавляются со временем
+      по мере правок; плагин при инкрементальном обновлении присылает только
+      <i>изменившиеся</i> узлы, поэтому неизменная заглушка не будет переслана заново —
+      удалить её значило бы оставить будущее новое ребро висящим в пустоте.
+    </p>
+    <h3>Когда это запускается</h3>
+    <p>
+      Оба прохода — и «весь индекс» (<code>link_all</code>), и «только этот
+      диф» (<code>link_diff</code>) — идемпотентны, то есть безопасны для повторного
+      запуска. Полный проход по всему индексу выполняется <b>один раз</b>, строго
+      после того, как поток холодной индексации дошёл до конца (не раньше — иначе
+      «ещё не дошли до этого файла» не отличить от «этого файла тут никогда не будет»).
+      Диф-проход выполняется после <b>каждого</b> инкрементального изменения файла.
+    </p>
+  </section>
+
+  <section id="incremental">
+    <h2><span class="sec-num">09</span> Инкрементальное обновление на лету</h2>
+    <p>
+      Индекс не пересобирается заново на каждое сохранение файла — наблюдатель за
+      файловой системой (<code>notify</code>) ловит события изменения, плагин
+      делает <i>частичный</i> tree-sitter-репарс (перестраивает только затронутое
+      поддерево, а не весь файл целиком), и в базу летит только разница —
+      добавленные/удалённые узлы и рёбра.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant FS as Файловая система
+    participant W as Наблюдатель
+    participant Core as Ядро
+    participant Plugin as Плагин
+    participant DB as SQLite
+
+    FS-->>W: событие записи (файл сохранён)
+    Core->>Plugin: файл изменился: X
+    Plugin->>Plugin: инкрементальный tree-sitter-репарс
+    Plugin-->>Core: диф (добавленные/удалённые узлы и рёбра)
+    Core->>DB: одна транзакция
+    Core->>Core: склейка импортов и символов, ограниченная этим дифом
+</pre>
+      <figcaption>Склейка после дифа смотрит не на весь индекс, а только на то, что этот конкретный диф мог затронуть</figcaption>
+    </div>
+    <p>
+      Склейка на инкрементальном шаге умнее, чем «перепроверить только этот файл»:
+      она также ловит заглушки <i>в других файлах</i>, которые ждали именно этого
+      файла (если только что созданный файл — это цель чужого импорта), и новые
+      использования символа, повешенные на уже существующую заглушку, которая
+      сама не изменилась (и потому не попала в диф явно).
+    </p>
+    <div class="gap">
+      <p>
+        <b>Расхождение с архитектурным планом.</b> В плане описано «пачка изменений
+        (например, <code>git checkout</code>) сливается в одну транзакцию» и
+        «повторные сохранения одного файла гасятся» (debounce). Механизмы для
+        этого — <code>Debouncer</code> и <code>BurstBatcher</code> — уже написаны
+        и покрыты тестами, но <b>ещё не подключены</b> к реальному циклу демона:
+        сегодня каждое отфильтрованное событие файловой системы вызывает
+        обработку немедленно, одна транзакция на файл. Для обычной
+        работы это не проблема (SQLite и так справляется), но при массовом
+        переключении веток разница будет заметна как несколько сотен транзакций
+        подряд вместо одной.
+      </p>
+    </div>
+  </section>
+
+  <section id="traversal">
+    <h2><span class="sec-num">10</span> Обход графа и постраничные ответы</h2>
+    <p>
+      Большинство инструментов агента — однохопный вопрос («кто вызывает X»,
+      «что определено в этом файле») и отвечают обычной постраничной выборкой
+      по курсору: «дай мне следующую страницу после этой отсортированной
+      позиции». Один инструмент — <code>get_dependencies</code> — устроен
+      сложнее: это транзитивный обход графа импортов на несколько шагов вглубь,
+      и он реализован через рекурсивный SQL-запрос прямо внутри SQLite.
+    </p>
+    <h3>Три независимых предохранителя</h3>
+    <p>
+      Обход графа теоретически может «взорваться» — узел с тысячами исходящих
+      связей (хаб) или очень глубокая цепочка. Против этого — три разных
+      ограничения, каждое работает на своём уровне:
+    </p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Ограничение</th><th>Что делает</th><th>Как реализовано</th></tr>
+      <tr>
+        <td><code>maxDepth</code></td>
+        <td>Не уходить глубже N шагов от стартового узла</td>
+        <td>Простое условие <code>WHERE глубина &lt; maxDepth</code> в рекурсивном запросе</td>
+      </tr>
+      <tr>
+        <td><code>maxFanout</code></td>
+        <td>С одного узла брать не больше N исходящих связей за раз</td>
+        <td><code>LIMIT</code> прямо внутри подзапроса, который выбирает детей
+          узла — так СУБД физически не читает больше нужного даже для узла
+          с 20&nbsp;000 связей</td>
+      </tr>
+      <tr>
+        <td><code>explorationBudget</code></td>
+        <td>Общий бюджет «сколько строк движок вообще посмотрит» за весь запрос,
+          независимо от того, что попадёт в итоговый ответ</td>
+        <td><code>LIMIT</code> на весь рекурсивный запрос целиком — «внутренний»
+          предохранитель, отдельный от того, что видит вызывающая сторона</td>
+      </tr>
+    </table>
+    </div>
+    <p>
+      Ответ, который на что-то из этого наткнулся, никогда не отвечает молчаливым
+      «всё, данных больше нет» — он честно помечен <code>truncated: true</code> и
+      называет причину (<code>truncatedBy</code>). Продолжение разное для разной
+      причины: срез по <code>maxFanout</code> — агент просто делает обычный
+      постраничный запрос с того узла, где обрезало; срез по <code>maxDepth</code> —
+      в ответе приходит список «узлов на границе», с которых можно перезапустить
+      обход на следующую глубину; срез по бюджету — это отдельный механизм,
+      описанный в следующем разделе.
+    </p>
+    <p>
+      Циклы в самом графе (A импортирует B, B импортирует A) не приводят к
+      бесконечному обходу: каждая «нить» обхода помнит свой собственный путь
+      от старта и не заходит на узел, который на этом пути уже был. Так как
+      SQL не позволяет держать единый общий «список посещённого» внутри одного
+      рекурсивного запроса, дедупликация «одного и того же узла, до которого
+      дошли двумя разными путями» происходит уже в Rust-коде после запроса.
+    </p>
+  </section>
+
+  <section id="resume">
+    <h2><span class="sec-num">11</span> Долгие обходы: resume-токен</h2>
+    <p>
+      Если обрезка произошла из-за общего бюджета исследования (не глубины и не
+      ветвистости одного узла — а просто «мы уже посмотрели достаточно строк
+      за один вызов»), продолжить обычной постраничной выборкой нельзя: бюджет
+      тратится сразу на весь обход, а не на один узел. Для этого случая ответ
+      несёт непрозрачный <code>resumeToken</code> — закодированное «состояние
+      обхода», которое агент присылает обратно на следующем вызове.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant Agent as Агент
+    participant Core as Ядро
+
+    Agent->>Core: get_dependencies(файл, depth=10)
+    Core->>Core: обход упёрся в бюджет (5000 строк)
+    Core-->>Agent: результаты + resumeToken (что уже видели)
+    Note over Agent,Core: агент решает продолжить
+    Agent->>Core: get_dependencies(resumeToken=...)
+    Core->>Core: пересеять запрос всем «уже видели»,<br/>продолжить с новым бюджетом
+    Core-->>Agent: новые результаты + новый resumeToken (или конец)
+</pre>
+      <figcaption>Каждый следующий вызов приносит с собой всю накопленную историю обхода — иначе корректность продолжения не гарантирована</figcaption>
+    </div>
+    <h3>Почему нельзя запомнить только «последнюю страницу»</h3>
+    <p>
+      Здесь и была настоящая инженерная тонкость. Когда обход возобновляется,
+      нужно «пересеять» с той же границы (frontier), с которой остановились —
+      но граничный узел на возобновлении снова предлагает <i>все</i> свои
+      исходящие связи, а в первый раз система могла успеть отдать только часть
+      из них. Если бы фильтр отсеивания дублей проверялся по <i>узлу</i>
+      («мы уже были в этом узле — пропускаем всё, что из него ведёт»), часть
+      связей терялась бы навсегда и без предупреждения. Поэтому фильтр стоит
+      на уровне <b>конкретного ребра</b>: узел-граница разрешено переоткрыть,
+      но конкретное ребро, которое уже было отдано, — нет. Это и есть причина,
+      по которой состояние обхода накапливается <i>целиком</i> с самого начала
+      цепочки, а не только за последний шаг: чтобы корректно решить «эту связь
+      уже отдавали или ещё нет», нужно помнить полный список того, что уже
+      отдано, а не только последнюю порцию.
+    </p>
+    <h3>Побочный эффект — токен растёт, и что с этим сделали</h3>
+    <p>
+      Раз состояние накопительное, закодированный токен растёт с каждым вызовом
+      цепочки — это не ошибка, а прямое следствие только что описанной гарантии
+      корректности. На реальных идентификаторах узлов (32-символьные
+      hex-хэши) один-единственный срез по стандартному бюджету (5000 узлов) уже
+      даёт токен в сотни килобайт; на длинной цепочке возобновлений — до нескольких
+      мегабайт. Это разбиралось отдельной задачей: реальный жёсткий предел
+      передачи (64&nbsp;МБ на сообщение) тут ни при чём — токен даже в худшем
+      измеренном случае в разы меньше. Настоящая цена другая: этот токен обязан
+      <i>вернуть обратно</i> вызывающая сторона — а вызывающая сторона в этой
+      системе, как правило, ИИ-агент, который платит за каждый лишний байт из
+      своего собственного контекстного окна. Поэтому токен сейчас дополнительно
+      сжимается (gzip) перед кодированием в base64 — измеренное ускорение около
+      2,3 раза на реалистичных данных, без единого изменения в логике самого
+      обхода.
+    </p>
+    <div class="note">
+      <p>
+        Рассматривался и вариант «хранить не весь список, а что-то покомпактнее,
+        из чего список можно восстановить» — и был сознательно отклонён:
+        корректность пересева (описанная выше защита от потери рёбер) требует
+        именно полной истории, урезание рискует вернуть тот самый баг с
+        потерянными связями, ради исправления которого эта конструкция и была
+        придумана.
+      </p>
+    </div>
+  </section>
+
+  <section id="tools">
+    <h2><span class="sec-num">12</span> Инструменты, которые видит агент</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Инструмент</th><th>Спрашивает</th><th>Отвечает</th></tr>
+      <tr><td><code>find_definition</code></td><td>имя символа, или файл+позиция</td>
+        <td>узел: вид, сигнатура, докстрока, расположение (список кандидатов,
+        если имя неоднозначно, отсортированный по числу входящих ссылок)</td></tr>
+      <tr><td><code>find_references</code></td><td><code>symbolId</code> или <code>symbolName</code></td>
+        <td>все места использования — объединение вызовов, наследований и прочих
+        ссылок (надмножество find_callers/find_implementations)</td></tr>
+      <tr><td><code>find_callers</code></td><td>то же</td><td>кто вызывает этот символ</td></tr>
+      <tr><td><code>find_callees</code></td><td>то же</td><td>кого вызывает этот символ</td></tr>
+      <tr><td><code>find_implementations</code></td><td>то же</td><td>кто наследует/реализует этот тип</td></tr>
+      <tr><td><code>get_file_outline</code></td><td>путь к файлу</td><td>какие символы в нём определены</td></tr>
+      <tr><td><code>get_dependencies</code></td><td>файл/модуль + направление</td>
+        <td>транзитивный обход импортов — «что затронет правка этого файла»</td></tr>
+      <tr><td><code>search_code</code></td><td>текстовый запрос</td>
+        <td>поиск по смыслу через эмбеддинги — <span class="pill gap">пока не подключено</span>,
+        см. раздел 14</td></tr>
+    </table>
+    </div>
+    <h3>Один якорь на четыре инструмента</h3>
+    <p>
+      Чтобы спросить «кто вызывает эту функцию», формально сначала нужно узнать
+      <i>id</i> этой функции — иначе на что ссылаться. Раньше это означало
+      обязательную пару вызовов: сперва <code>find_definition</code>, потом
+      сам вопрос. Замер реального использования показал: если имя однозначно,
+      это лишний круг общения, который не даёт ничего, кроме траты «хода».
+      Поэтому четыре инструмента (<code>find_references/callers/callees/implementations</code>)
+      теперь принимают <b>либо</b> <code>symbolId</code>, <b>либо</b>
+      <code>symbolName</code> напрямую — по общему внутреннему механизму
+      («якорь», <code>anchor.rs</code>), тому же самому, которым пользуется
+      сам <code>find_definition</code>. Если имя неоднозначно (в реальном коде
+      Excalidraw нашлось два разных <code>getNonDeletedElements</code> с
+      одинаковым квалифицированным именем!) — инструмент не гадает и не
+      объединяет кандидатов молча, а честно возвращает список кандидатов
+      с пометкой <code>ambiguous: true</code> и настоящим <code>id</code>
+      каждого — именно <code>id</code>, а не имя, потому что одинаковое имя
+      само по себе не гарантирует уникальность повторного запроса.
+    </p>
+    <h3>Постраничность и уровень доверия к ответу</h3>
+    <p>
+      Все списочные ответы разбиты на страницы непрозрачным курсором
+      (не числовым смещением — потому что фоновая переиндексация может
+      сдвинуть или задвоить строки прямо во время постраничного чтения).
+      Любой ответ, построенный на ребре графа, несёт два поля: <code>resolved</code>
+      (прошло ли ребро окончательную склейку) и <code>source</code>
+      (<code>tree-sitter</code> или в будущем <code>ts-compiler</code>) —
+      так агент видит не только факт связи, но и насколько ей можно доверять.
+    </p>
+  </section>
+
+  <section id="security">
+    <h2><span class="sec-num">13</span> Модель доверия и безопасность</h2>
+    <p>
+      Явное решение проекта — не строить песочницу уровня ОС для языковых
+      плагинов (пространства имён, seccomp, App Sandbox — всё это оценено как
+      несоразмерное усилие против модели угроз, которая и так эквивалентна
+      «языковому серверу редактора, у которого открыт ваш проект»). Вместо
+      этого — точечные, дешёвые меры:
+    </p>
+    <ul>
+      <li>Плагины никогда не подгружают точки расширения вида
+        <code>tsconfig.json → compilerOptions.plugins</code>, которые исполняют
+        код при старте языкового сервера — известный вектор атаки через
+        вредоносный конфиг. Для индексации это и не нужно, так что вектор
+        просто не появляется.</li>
+      <li>Плагины не имеют прямого доступа на запись в индекс — пишет только
+        ядро, плагин лишь присылает разницу по протоколу.</li>
+      <li>Доступ плагина к исходникам проекта — только на чтение.</li>
+    </ul>
+  </section>
+
+  <section id="gaps">
+    <h2><span class="sec-num">14</span> Что задумано, а что пока не построено</h2>
+    <p>
+      Архитектурный документ описывает целевую систему; часть механизмов уже
+      реализована и работает, часть — написана и покрыта тестами, но ещё не
+      подключена к рабочему циклу, часть — пока только заложена в схему.
+      Ниже — честная сверка, чтобы не создавать иллюзию, будто всё из плана
+      уже работает.
+    </p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Механизм</th><th>Статус</th><th>Пояснение</th></tr>
+      <tr>
+        <td>Резолвинг импортов (4 механизма + gitignore/симлинки)</td>
+        <td><span class="pill done">готово</span></td>
+        <td>Полностью реализовано и протестировано — основной предмет последнего релиза.</td>
+      </tr>
+      <tr>
+        <td>Обход графа, лимиты, resume-токены</td>
+        <td><span class="pill done">готово</span></td>
+        <td>Работает, включая сжатие токена.</td>
+      </tr>
+      <tr>
+        <td>Слияние пачки изменений в одну транзакцию (debounce/burst)</td>
+        <td><span class="pill gap">не подключено</span></td>
+        <td><code>Debouncer</code> и <code>BurstBatcher</code> написаны и
+          протестированы отдельно, но реальный цикл наблюдателя вызывает
+          обработку немедленно на каждое событие — одна транзакция на файл,
+          не на пачку.</td>
+      </tr>
+      <tr>
+        <td>Два независимых таймера простоя (ядро / плагин)</td>
+        <td><span class="pill gap">не реализовано</span></td>
+        <td>Собственный комментарий в коде демона прямо называет текущий
+          жизненный цикл «упрощённым MVP: работает, пока не убьют вручную» —
+          ни таймера простоя для плагина, ни для самого демона пока нет.</td>
+      </tr>
+      <tr>
+        <td>Таблица векторов и семантический поиск (<code>search_code</code>)</td>
+        <td><span class="pill gap">не построено</span></td>
+        <td>Таблицы векторов в схеме БД ещё нет — отложено в отдельный
+          будущий этап работы («Embeddings epic»).</td>
+      </tr>
+      <tr>
+        <td>Загрузка плагинов сторонних языков по манифесту</td>
+        <td><span class="pill gap">не построено</span></td>
+        <td>Демон пока жёстко запускает единственный встроенный JS/TS-плагин
+          по вычисляемому пути, а не по общему механизму обнаружения плагинов.</td>
+      </tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="glossary">
+    <h2><span class="sec-num">15</span> Краткий словарь терминов</h2>
+    <dl class="glossary">
+      <dt>Узел / ребро (node / edge)</dt>
+      <dd>Узел — это символ (файл, функция, тип...). Ребро — связь между
+        двумя узлами (вызывает, наследует, импортирует).</dd>
+      <dt>Заглушка (placeholder)</dt>
+      <dd>Временный узел на месте того, что плагин ещё не смог однозначно
+        определить — например, куда ведёт импорт. Позже либо «дошивается»
+        до настоящего узла, либо остаётся заглушкой навсегда, если цели
+        действительно нет в индексе.</dd>
+      <dt>Резолвинг (resolve)</dt>
+      <dd>Процесс превращения строки-специфайера импорта («./utils», «@/lib»)
+        в конкретный путь к файлу.</dd>
+      <dt>Склейка (linking)</dt>
+      <dd>Отдельный проход ядра, который перецепляет ребро с заглушки на
+        настоящий узел, когда тот появляется в индексе.</dd>
+      <dt>Курсор / resume-токен</dt>
+      <dd>Оба — непрозрачные строки для продолжения большого ответа.
+        Курсор — для простой постраничной выборки; resume-токен — для
+        продолжения обхода графа, несёт с собой состояние самого обхода.</dd>
+      <dt>WAL (Write-Ahead Log)</dt>
+      <dd>Режим SQLite, где изменения сначала пишутся в отдельный журнал,
+        а потом сливаются с основным файлом — так чтение не блокируется
+        параллельной записью.</dd>
+    </dl>
+  </section>
+
+  <footer>
+    Составлено по докам архитектуры (<code>docs/architecture/g-mesh-v1.md</code>)
+    и коду репозитория g-mesh по состоянию на релиз 0.3.0 (Rust-ядро
+    <code>core/</code> + плагин <code>plugins/js-ts/</code>).
+  </footer>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  (function () {
+    function currentTheme() {
+      var stored = document.documentElement.getAttribute("data-theme");
+      if (stored) return stored;
+      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    function applyMermaidTheme() {
+      if (typeof mermaid === "undefined") return;
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: currentTheme() === "dark" ? "dark" : "neutral",
+        securityLevel: "loose",
+        fontFamily: "ui-monospace, SF Mono, Consolas, monospace"
+      });
+      document.querySelectorAll("pre.mermaid").forEach(function (el) {
+        if (!el.dataset.raw) el.dataset.raw = el.textContent;
+        el.removeAttribute("data-processed");
+        el.textContent = el.dataset.raw;
+      });
+      mermaid.run({ querySelector: "pre.mermaid" });
+    }
+    var toggle = document.getElementById("themeToggle");
+    toggle.addEventListener("click", function () {
+      var next = currentTheme() === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      applyMermaidTheme();
+    });
+    window.addEventListener("load", applyMermaidTheme);
+  })();
+</script>
+</body>
+</html>
