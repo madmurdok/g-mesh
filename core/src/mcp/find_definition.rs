@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
-use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
+use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
@@ -108,12 +108,13 @@ fn find_candidates_by_name(
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
     // The `nativeKind` filter matches `graph::queries`': a pending-symbol
-    // placeholder is named after the symbol it is waiting for, so without it
-    // every file importing `foo` would offer itself as a candidate `foo`.
+    // placeholder is named after the symbol it is waiting for and a re-export
+    // one after the symbol it passes through, so without it every file
+    // importing or republishing `foo` would offer itself as a candidate `foo`.
     let base_sql = "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
                     n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
                     CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2";
+                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3";
 
     fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
         let id: String = row.get("id")?;
@@ -133,7 +134,7 @@ fn find_candidates_by_name(
     pagination::paginate_by_score(
         conn,
         base_sql,
-        &[&name, &PENDING_SYMBOL_NATIVE_KIND],
+        &[&name, &PENDING_SYMBOL_NATIVE_KIND, &REEXPORT_NATIVE_KIND],
         CANDIDATE_PAGE_SIZE,
         cursor,
         map_row,
@@ -281,6 +282,37 @@ mod tests {
         assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
         assert_eq!(results[0]["qualifiedName"], "pkg_b::run", "the higher inbound-edge count must rank first");
         assert_eq!(results[1]["qualifiedName"], "pkg_a::run");
+    }
+
+    /// Neither placeholder kind is a definition: one is named after a symbol
+    /// this file imports, the other after one it only republishes, and a
+    /// monorepo has a barrel republishing almost everything - so without the
+    /// filter a plain name lookup would turn ambiguous project-wide.
+    #[test]
+    fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
+        let mut conn = setup();
+        upsert_node(&mut conn, node_with_span("n1", "mutate", "mutate", "target.ts", (5, 0))).unwrap();
+
+        for (id, native_kind, file) in [
+            ("pending", "pending_symbol", "caller.ts"),
+            ("reexported", "reexport", "index.ts"),
+        ] {
+            let mut placeholder =
+                NodeRecord::new(id, "Module", "mutate", "target.ts#mutate", file, "typescript");
+            placeholder.native_kind = Some(native_kind.to_string());
+            placeholder.end_line = 5;
+            upsert_node(&mut conn, placeholder).unwrap();
+        }
+
+        let params = FindDefinitionParams {
+            symbol_name: Some("mutate".to_string()),
+            file_path: None,
+            position: None,
+            cursor: None,
+        };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
+        assert_eq!(body["filePath"], "target.ts");
     }
 
     #[test]

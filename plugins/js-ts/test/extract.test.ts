@@ -6,6 +6,8 @@ import {
   nodeIdFor,
   PENDING_SYMBOL_NATIVE_KIND,
   pendingSymbolQualifiedName,
+  REEXPORT_ALL_NAME,
+  REEXPORT_NATIVE_KIND,
   RESOLVED_MODULE_NATIVE_KIND,
   UnsupportedFileError,
   type EdgeKind,
@@ -690,6 +692,108 @@ test("locals declared inside a callback stay out of the graph", () => {
     result.nodes.filter((n) => n.name === "doubled" || n.name === "inner"),
     [],
   );
+});
+
+// --- re-exports ----------------------------------------------------------
+
+/** Every re-export placeholder the extraction produced, as
+ * `[published name, address]` pairs, sorted for a stable comparison. */
+function reexports(result: ExtractResult): [string, string][] {
+  return result.nodes
+    .filter((n) => n.nativeKind === REEXPORT_NATIVE_KIND)
+    .map((n): [string, string] => [n.name, n.qualifiedName])
+    .sort();
+}
+
+/** Resolution for the barrel fixtures below: one specifier per target file. */
+const BARREL_RESOLVER: ExtractOptions = {
+  resolveSpecifier: (specifier) =>
+    specifier.startsWith("./") ? `src/${specifier.slice(2)}.ts` : null,
+};
+
+test("a barrel records what it publishes and where each name really lives", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export * from "./mutateElement";
+export { bindText } from "./textBinding";
+export { newElement as create } from "./factory";
+export type { Bounds } from "./bounds";
+`,
+    BARREL_RESOLVER,
+  );
+
+  assert.deepEqual(reexports(result), [
+    ["*", "src/mutateElement.ts#*"],
+    ["Bounds", "src/bounds.ts#Bounds"],
+    // The published name is the alias; the address is the name over there.
+    ["create", "src/factory.ts#newElement"],
+    ["bindText", "src/textBinding.ts#bindText"],
+  ].sort());
+
+  const placeholder = node(result, "Module", "src/factory.ts#newElement");
+  assert.equal(placeholder.kind, "Module");
+  assert.equal(placeholder.filePath, "src/index.ts", "the placeholder lives where the statement is");
+  assert.equal(placeholder.exported, false, "a placeholder is not a symbol this file exports");
+  // `export ... from` is still an import, and still resolves as one.
+  assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", "src/factory.ts"));
+});
+
+test("a whole-module re-export is addressed by the name no symbol can have", () => {
+  const result = extractFile("src/index.ts", `export * from "./lib";\n`, BARREL_RESOLVER);
+
+  const placeholder = node(result, "Module", `src/lib.ts#${REEXPORT_ALL_NAME}`);
+  assert.equal(placeholder.name, REEXPORT_ALL_NAME, "it publishes every name, so it names none");
+  assert.equal(placeholder.qualifiedName, pendingSymbolQualifiedName("src/lib.ts", REEXPORT_ALL_NAME));
+});
+
+test("`export * as NS from` binds a namespace, so it is not a re-export of names", () => {
+  const result = extractFile("src/index.ts", `export * as shapes from "./lib";\n`, BARREL_RESOLVER);
+
+  // Same reason `import * as NS` binds nothing: resolving `shapes.f` needs to
+  // tell a module's export from an ordinary property access.
+  assert.deepEqual(reexports(result), []);
+  assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", "src/lib.ts"));
+});
+
+test("a re-export of a specifier that resolves to nothing records no placeholder", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export * from "react";\nexport { z } from "zod";\n`,
+    { resolveSpecifier: () => null },
+  );
+
+  // No file of theirs is in this index, so there is no chain to follow.
+  assert.deepEqual(reexports(result), []);
+});
+
+test("a local `export { name }` still marks the declaration, not a re-export", () => {
+  const result = extractFile(
+    "src/lib.ts",
+    `function boot(): void {}\nexport { boot as started };\n`,
+    BARREL_RESOLVER,
+  );
+
+  assert.equal(node(result, "Function", "boot").exported, true);
+  assert.deepEqual(reexports(result), [], "nothing is forwarded anywhere - the symbol is right here");
+});
+
+test("a re-export binds nothing locally, so it cannot be mistaken for a declaration", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export { mutate } from "./lib";
+
+export function run(): void {
+  mutate();
+}
+`,
+    BARREL_RESOLVER,
+  );
+
+  // The re-export placeholder is not a binding: `mutate` here is unbound (the
+  // re-export never imported it into this scope), so nothing is claimed about
+  // the call at all.
+  assert.deepEqual(reexports(result), [["mutate", "src/lib.ts#mutate"]]);
+  assert.equal(result.edges.filter((e) => e.kind === "CALLS").length, 0);
 });
 
 test("parses files larger than the native parser's default read buffer", () => {
