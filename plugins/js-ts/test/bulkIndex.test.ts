@@ -36,6 +36,21 @@ async function cleanup(root: string): Promise<void> {
   await fs.rm(root, { recursive: true, force: true });
 }
 
+/** A symlink inside a fixture. `makeProject` only knows about regular files, and
+ * deliberately stays that way (every other test here wants a plain tree), so the
+ * symlink cases add the one link they are about on top of the tree it built. */
+async function symlink(root: string, linkRelPath: string, target: string): Promise<void> {
+  const linkAbs = path.join(root, linkRelPath);
+  await fs.mkdir(path.dirname(linkAbs), { recursive: true });
+  await fs.symlink(target, linkAbs);
+}
+
+async function walkedPaths(root: string): Promise<string[]> {
+  const files: string[] = [];
+  for await (const rel of walkProjectFiles(root)) files.push(rel);
+  return files;
+}
+
 /** Every field the wire contract (core/src/protocol/types.rs) requires,
  * checked without invoking any Rust code - see the ticket report for why
  * this structural check was chosen over a cross-process Rust conformance
@@ -346,6 +361,111 @@ test("accepts a real NodeJS.WritableStream sink, one write() call per line", asy
   }
 });
 
+// --- symlink policy (task 87) ---------------------------------------------
+
+test("a symlinked package directory is walked, and indexed under its own apparent path", async () => {
+  const root = await makeProject({
+    "vendor/real-lib/index.ts": `export const shared = 1;\n`,
+  });
+  try {
+    // Nothing else lives at packages/aliased: the only way "index.ts" is
+    // reachable there is by following the link.
+    await symlink(root, "packages/aliased", "../vendor/real-lib");
+    assert.deepEqual(await walkedPaths(root), ["packages/aliased/index.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+/**
+ * The maybe-surprising half of "index a real location exactly once": the winner
+ * is whichever path the sorted, depth-first walk reaches first, and that can be
+ * the *symlink*. Here `packages/` sorts before `vendor/`, so the alias is
+ * reached first and claims the directory, and the real path is dropped outright
+ * rather than being preferred for being real or merged onto the alias.
+ *
+ * This is correct, not a bug to "fix" later: a file's identity in this index is
+ * the project-relative path it was reached by, so there is no canonical path to
+ * prefer - only a deterministic rule for picking one of two, which is what the
+ * sort makes it.
+ */
+test("two paths onto the same real directory index it exactly once, sorted-first path winning even when that is the symlink", async () => {
+  const root = await makeProject({
+    "vendor/shared/thing.ts": `export const thing = 1;\n`,
+  });
+  try {
+    await symlink(root, "packages/dup", "../vendor/shared");
+    assert.deepEqual(await walkedPaths(root), ["packages/dup/thing.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlinked file aliasing an already-walked real file is skipped, not indexed twice", async () => {
+  const root = await makeProject({
+    "src/index.ts": `export const x = 1;\n`,
+  });
+  try {
+    // Named to sort *after* index.ts on purpose: the real file is reached first
+    // and claims the location, so the alias is the one dropped. Named
+    // "alias.ts" instead, the same rule would flip the winner - which is the
+    // point of the test above, and why this one pins the ordering explicitly
+    // rather than implying links always lose.
+    await symlink(root, "src/zalias.ts", "./index.ts");
+    const files = await walkedPaths(root);
+    assert.ok(files.includes("src/index.ts"), "the real file must still be indexed");
+    assert.ok(!files.includes("src/zalias.ts"), "the alias must not be indexed a second time");
+    assert.deepEqual(files, ["src/index.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlink pointing back at its own containing directory does not loop forever", async () => {
+  const root = await makeProject({
+    "cycle/a.ts": `export const a = 1;\n`,
+  });
+  try {
+    // A genuine cycle: cycle/loop resolves to cycle itself, which the walk has
+    // already claimed by the time it looks at this entry. If the guard were
+    // missing, this test would hang rather than fail - the runner's own timeout
+    // is the assertion.
+    await symlink(root, "cycle/loop", ".");
+    assert.deepEqual(await walkedPaths(root), ["cycle/a.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlink resolving outside the project root is refused", async () => {
+  const root = await makeProject({ "src/index.ts": `export const x = 1;\n` });
+  const outsideRoot = await makeProject({ "outside/secret.ts": `export const secret = 1;\n` });
+  try {
+    await symlink(root, "packages/escape", path.join(outsideRoot, "outside"));
+    const files = await walkedPaths(root);
+    assert.ok(
+      files.every((rel) => !rel.startsWith("packages/escape")),
+      `nothing outside the project may be indexed, got ${JSON.stringify(files)}`,
+    );
+    assert.deepEqual(files, ["src/index.ts"]);
+  } finally {
+    await cleanup(root);
+    await cleanup(outsideRoot);
+  }
+});
+
+test("a dangling symlink is skipped rather than throwing", async () => {
+  const root = await makeProject({ "src/index.ts": `export const x = 1;\n` });
+  try {
+    await symlink(root, "packages/broken", "./does-not-exist");
+    const files = await walkedPaths(root);
+    assert.ok(files.every((rel) => !rel.startsWith("packages/broken")));
+    assert.deepEqual(files, ["src/index.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
 // --- import resolution over a real tree -----------------------------------
 
 /**
@@ -410,24 +530,36 @@ export const start = () => connect(pool, fmt(z));
   }
 });
 
-test("an import of a gitignored file resolves to nothing rather than to a node that is not there", async () => {
+test("an import of a gitignored file stays an unresolved placeholder, matching the walk's own exclusion policy", async () => {
   const root = await makeProject({
     "src/index.ts": `import { secret } from "./generated";\nexport const x = secret;\n`,
     "src/generated.ts": `export const secret = 1;\n`,
     ".gitignore": "src/generated.ts\n",
   });
   try {
-    // The walk skips the target, so nothing would ever create its `File`
-    // node - core would find no target and leave the placeholder alone, but
-    // the honest answer is available one step earlier than that.
     const modules = await modulesOf(root);
     assert.equal(modules.length, 1);
-    assert.equal(modules[0].qualifiedName, "src/generated.ts");
+    assert.equal(modules[0].qualifiedName, "./generated", "unresolved - the raw specifier, not a path");
     assert.equal(
       modules[0].nativeKind,
-      "resolved_module",
-      "resolution answers about the filesystem; whether the target is indexed is core's question",
+      "external_module",
+      "resolution now agrees with the walk: a gitignored target is never indexed, so it is never claimed as resolved either",
     );
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a relative import into a hard-excluded directory is also treated as unresolved", async () => {
+  const root = await makeProject({
+    "src/index.ts": `import { secret } from "./dist/generated";\nexport const x = secret;\n`,
+    "src/dist/generated.ts": `export const secret = 1;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].qualifiedName, "./dist/generated");
+    assert.equal(modules[0].nativeKind, "external_module");
   } finally {
     await cleanup(root);
   }
@@ -474,6 +606,88 @@ export const shape = () => pointFrom(1) + useState();
     assert.ok(pending, "the symbol imported across packages must get a placeholder");
     assert.equal(pending.qualifiedName, "packages/math/src/index.ts#pointFrom");
     assert.equal(byName.has("useState:pending_symbol"), false, "nothing to link a package symbol to");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+/** Same package, now *built*: the declared entry is physically on disk, and it
+ * is the one file of the pair the walk would never index. */
+test("a workspace package's declared entry under dist/ does not shadow its source, even though dist physically exists", async () => {
+  const root = await makeProject({
+    "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+    "packages/math/package.json": JSON.stringify({ name: "@excalidraw/math", main: "./dist/prod/index.js" }),
+    "packages/math/dist/prod/index.js": `export const pointFrom = () => 0; // must not win\n`,
+    "packages/math/src/index.ts": `export const pointFrom = (x: number) => x;\n`,
+    "packages/element/package.json": JSON.stringify({ name: "@excalidraw/element" }),
+    "packages/element/src/shape.ts": `import { pointFrom } from "@excalidraw/math";\nexport const shape = () => pointFrom(1);\n`,
+  });
+  try {
+    const lines: string[] = [];
+    await bulkIndexProject(root, (line) => lines.push(line));
+    const nodes = lines.map((line) => JSON.parse(line)).filter((p) => "range" in p) as WireNode[];
+    const byName = new Map(nodes.map((n) => [`${n.name}:${n.nativeKind}`, n]));
+    const target = byName.get("@excalidraw/math:resolved_module");
+    assert.ok(target, "the workspace package must still resolve");
+    assert.equal(target.qualifiedName, "packages/math/src/index.ts");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a workspace package's declared entry under a gitignored (not hard-excluded-named) directory does not shadow its source", async () => {
+  const root = await makeProject({
+    "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+    "packages/math/package.json": JSON.stringify({ name: "@excalidraw/math", main: "./build-output/index.js" }),
+    "packages/math/.gitignore": "build-output/\n",
+    "packages/math/build-output/index.js": `export const pointFrom = () => 0; // must not win\n`,
+    "packages/math/src/index.ts": `export const pointFrom = (x: number) => x;\n`,
+    "packages/element/package.json": JSON.stringify({ name: "@excalidraw/element" }),
+    "packages/element/src/shape.ts": `import { pointFrom } from "@excalidraw/math";\nexport const shape = () => pointFrom(1);\n`,
+  });
+  try {
+    const lines: string[] = [];
+    await bulkIndexProject(root, (line) => lines.push(line));
+    const nodes = lines.map((line) => JSON.parse(line)).filter((p) => "range" in p) as WireNode[];
+    const byName = new Map(nodes.map((n) => [`${n.name}:${n.nativeKind}`, n]));
+    const target = byName.get("@excalidraw/math:resolved_module");
+    assert.ok(target);
+    assert.equal(target.qualifiedName, "packages/math/src/index.ts");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+// --- `#private` package-imports specifiers, over a real tree --------------
+
+test("a `#private` import resolves to the real file its package.json `imports` map names", async () => {
+  const root = await makeProject({
+    "package.json": JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }),
+    "src/util.ts": `export const util = 1;\n`,
+    "src/index.ts": `import { util } from "#util";\nexport const start = () => util;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    const target = modules.find((m) => m.name === "#util");
+    assert.ok(target, "no placeholder for #util");
+    assert.equal(target.nativeKind, "resolved_module");
+    assert.equal(target.qualifiedName, "src/util.ts");
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a `#private` import with no matching `imports` key stays an unresolved placeholder, not a crash", async () => {
+  const root = await makeProject({
+    "package.json": JSON.stringify({ name: "single", imports: { "#util": "./src/util.ts" } }),
+    "src/util.ts": `export const util = 1;\n`,
+    "src/index.ts": `import { gone } from "#gone";\nexport const start = () => gone;\n`,
+  });
+  try {
+    const modules = await modulesOf(root);
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].qualifiedName, "#gone", "unresolved - the raw specifier, not a path");
+    assert.equal(modules[0].nativeKind, "external_module");
   } finally {
     await cleanup(root);
   }

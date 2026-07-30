@@ -5,9 +5,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  createPackageImportsIndex,
+  importsTargets,
   packageEntryTargets,
   parseBareSpecifier,
   readWorkspacePackages,
+  type PackageImportsConfig,
   type WorkspacePackage,
 } from "../src/workspace";
 
@@ -38,6 +41,15 @@ async function withProject(
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+}
+
+/** A symlink inside a fixture, added on top of the plain tree `makeProject`
+ * built - which stays symlink-unaware on purpose, since every other test here
+ * wants an ordinary directory tree. */
+async function symlink(root: string, linkRelPath: string, target: string): Promise<void> {
+  const linkAbs = path.join(root, linkRelPath);
+  await fs.mkdir(path.dirname(linkAbs), { recursive: true });
+  await fs.symlink(target, linkAbs);
 }
 
 // --- specifier shapes -----------------------------------------------------
@@ -267,6 +279,250 @@ test("a flow-sequence `packages` list is read as well", async () => {
     },
     (root) => {
       assert.deepEqual([...readWorkspacePackages(root).keys()], ["@acme/math"]);
+    },
+  );
+});
+
+// --- symlink policy (task 87) ---------------------------------------------
+
+/** The layout this exists for: the package's real files live outside
+ * `packages/`, and a link is what makes it a workspace member. Before the walk
+ * and this expansion followed links, such a package simply was not there. */
+test("a workspace glob matches a symlinked package directory, under the path the glob matched", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "vendor/math/package.json": manifest({ name: "@acme/math" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/math", "../vendor/math");
+      const packages = readWorkspacePackages(root);
+      assert.deepEqual([...packages.keys()], ["@acme/math"]);
+      assert.equal(
+        packages.get("@acme/math")?.dir,
+        "packages/math",
+        "the apparent path the pattern matched, not the path it resolves to",
+      );
+    },
+  );
+});
+
+test("a symlink cycle under a `**` pattern neither hangs nor invents packages", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n",
+      "packages/a/package.json": manifest({ name: "@acme/a" }),
+    },
+    async (root) => {
+      // Resolves to packages/a itself, which the expansion has already claimed.
+      // Without the guard, `**` would descend a/loop/loop/... to MAX_GLOB_DEPTH.
+      await symlink(root, "packages/a/loop", ".");
+      const packages = readWorkspacePackages(root);
+      assert.deepEqual([...packages.keys()], ["@acme/a"]);
+      assert.equal(packages.get("@acme/a")?.dir, "packages/a");
+    },
+  );
+});
+
+/**
+ * A real package directory and a link to it, both matched by the same `*`
+ * segment. Exactly one entry must come out, and *which* one is decided by the
+ * sort `subdirectoryLister` now applies: "original" sorts before "zalias", so
+ * the real directory is claimed first. Without that sort this assertion would be
+ * a coin flip on raw `readdir` order - which is the whole reason the sort is
+ * there, symlinked duplicates being visible at all only since task 87.
+ */
+test("a real package directory and a symlink alias of it collapse to one entry, sorted-first winning", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "packages/original/package.json": manifest({ name: "@acme/x" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/zalias", "./original");
+      const packages = readWorkspacePackages(root);
+      assert.equal(packages.size, 1);
+      assert.equal(packages.get("@acme/x")?.dir, "packages/original");
+    },
+  );
+});
+
+test("a workspace-glob symlink resolving outside the project root is refused", async () => {
+  const outsideRoot = await makeProject({
+    "package.json": manifest({ name: "@acme/outside" }),
+  });
+  try {
+    await withProject(
+      {
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+        "packages/real/package.json": manifest({ name: "@acme/real" }),
+      },
+      async (root) => {
+        await symlink(root, "packages/escape", outsideRoot);
+        const packages = readWorkspacePackages(root);
+        assert.equal(packages.has("@acme/outside"), false, "outside the project root");
+        assert.deepEqual([...packages.keys()], ["@acme/real"]);
+      },
+    );
+  } finally {
+    await fs.rm(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("a dangling symlink under a workspace glob is skipped, the real package still resolving", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "packages/real/package.json": manifest({ name: "@acme/real" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/broken", "./nope");
+      assert.deepEqual([...readWorkspacePackages(root).keys()], ["@acme/real"]);
+    },
+  );
+});
+
+// --- `#private` imports maps -----------------------------------------------
+
+function importsConfig(fields: Record<string, unknown>, dir = ""): PackageImportsConfig {
+  return { dir, imports: fields };
+}
+
+test("an exact imports-map key resolves to its declared target", () => {
+  const config = importsConfig({ "#util": "./src/util.ts" }, "packages/math");
+  assert.deepEqual(importsTargets(config, "#util"), ["packages/math/src/util.ts"]);
+});
+
+test("a wildcard imports-map key substitutes the captured part", () => {
+  const config = importsConfig({ "#lib/*": "./src/lib/*.ts" }, "packages/math");
+  assert.deepEqual(importsTargets(config, "#lib/point"), ["packages/math/src/lib/point.ts"]);
+});
+
+test("a specifier with no matching imports-map key resolves to nothing", () => {
+  const config = importsConfig({ "#util": "./src/util.ts" });
+  assert.deepEqual(importsTargets(config, "#other"), []);
+});
+
+test("a condition-object imports value is ranked the same way exportsTargets ranks one", () => {
+  const config = importsConfig({ "#dep": { import: "./src/dep.ts", require: "./dist/dep.cjs" } });
+  assert.deepEqual(importsTargets(config, "#dep"), ["src/dep.ts", "dist/dep.cjs"]);
+});
+
+test("all matching imports keys contribute, not just the first", () => {
+  // Contrived, but the same "let existence decide" contract exportsTargets
+  // documents: both an exact key and (hypothetically) a wildcard could match
+  // in principle, and nothing here should silently drop either.
+  const config = importsConfig({
+    "#a": "./one.ts",
+    "#b": "./two.ts",
+  });
+  assert.deepEqual(importsTargets(config, "#a"), ["one.ts"]);
+  assert.deepEqual(importsTargets(config, "#b"), ["two.ts"]);
+});
+
+test("an imports target escaping the package directory is refused", () => {
+  const config = importsConfig({ "#leak": "../../../etc/passwd" }, "packages/math");
+  assert.deepEqual(importsTargets(config, "#leak"), []);
+});
+
+test("nearest package.json wins: a sub-package's own imports map shadows the root's", async () => {
+  await withProject(
+    {
+      "package.json": manifest({ name: "root", imports: { "#shared": "./root-shared.ts" } }),
+      "packages/math/package.json": manifest({
+        name: "@acme/math",
+        imports: { "#util": "./src/util.ts" },
+      }),
+      "packages/math/src/util.ts": "export const util = 1;\n",
+    },
+    (root) => {
+      const index = createPackageImportsIndex(root);
+      const config = index("packages/math/src/index.ts");
+      assert.ok(config);
+      assert.equal(config.dir, "packages/math");
+      assert.deepEqual(config.imports, { "#util": "./src/util.ts" });
+    },
+  );
+});
+
+test("a plain, non-monorepo project's own root package.json is still read for `imports`", async () => {
+  await withProject(
+    {
+      "package.json": manifest({ name: "single", imports: { "#util": "./src/util.ts" } }),
+      "src/util.ts": "export const util = 1;\n",
+      "src/index.ts": 'import { util } from "#util";\n',
+    },
+    (root) => {
+      // No pnpm-workspace.yaml, no root `workspaces` field: readWorkspacePackages
+      // would see nothing here, yet the new mechanism must still find `imports`.
+      assert.equal(readWorkspacePackages(root).size, 0);
+
+      const index = createPackageImportsIndex(root);
+      const config = index("src/index.ts");
+      assert.ok(config);
+      assert.equal(config.dir, "");
+      assert.deepEqual(config.imports, { "#util": "./src/util.ts" });
+    },
+  );
+});
+
+test("a package.json with no `imports` field leaves a `#specifier` unresolved, not inherited from a grandparent", async () => {
+  await withProject(
+    {
+      "package.json": manifest({ name: "root", imports: { "#shared": "./shared.ts" } }),
+      "packages/math/package.json": manifest({ name: "@acme/math" }), // no `imports` of its own
+      "packages/math/src/index.ts": "export const x = 1;\n",
+    },
+    (root) => {
+      const index = createPackageImportsIndex(root);
+      assert.equal(index("packages/math/src/index.ts"), null);
+    },
+  );
+});
+
+// --- exports condition determinism (task 84 follow-up) --------------------
+
+/**
+ * The residual case CONDITION_PRIORITY's doc comment now spells out: a
+ * package that ships both an ESM and a CJS build, both actually committed to
+ * the tree (task 84 already keeps a gitignored/hard-excluded copy from ever
+ * winning, whatever its rank). The ordering must deterministically prefer the
+ * `import` condition over `require` every time, not just happen to.
+ */
+test("an exports map with both an import and a require target, both real files, always picks import", async () => {
+  await withProject(
+    {
+      "packages/dual/package.json": manifest({
+        name: "@acme/dual",
+        exports: { ".": { import: "./esm/index.js", require: "./cjs/index.cjs" } },
+      }),
+      "packages/dual/esm/index.js": "export const x = 1;\n",
+      "packages/dual/cjs/index.cjs": "module.exports = { x: 1 };\n",
+    },
+    async (root) => {
+      const packages = readWorkspacePackages(root);
+      // No workspace manifest here on purpose - packageEntryTargets is a pure
+      // function of the manifest, so a hand-built package record exercises it
+      // the same way the fixture's real, on-disk files prove the case is real.
+      const pkg: WorkspacePackage = {
+        dir: "packages/dual",
+        manifest: {
+          exports: { ".": { import: "./esm/index.js", require: "./cjs/index.cjs" } },
+        },
+      };
+      assert.equal(packages.size, 0);
+
+      const targets = packageEntryTargets(pkg, ".");
+      assert.deepEqual(targets.slice(0, 2), [
+        "packages/dual/esm/index.js",
+        "packages/dual/cjs/index.cjs",
+      ]);
+
+      // Both are genuinely on disk, not gitignored or hard-excluded - so the
+      // choice really is the ranking's, not existence deciding it by default.
+      const fs = await import("node:fs/promises");
+      await assert.doesNotReject(fs.stat(path.join(root, "packages/dual/esm/index.js")));
+      await assert.doesNotReject(fs.stat(path.join(root, "packages/dual/cjs/index.cjs")));
     },
   );
 });

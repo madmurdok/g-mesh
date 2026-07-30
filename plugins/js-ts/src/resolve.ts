@@ -17,12 +17,23 @@
 // That case matters because in a monorepo most cross-package imports are
 // written this way, not relatively.
 //
+// A bare specifier that is neither of those may still be an alias the project
+// declared for one of its own directories - `@/utils` -> `src/utils.ts`, the
+// house style of most app packages. That rewrite lives in a tsconfig/jsconfig
+// `paths` map (tsconfigPaths.ts), and once the alias is expanded it is again
+// the same path arithmetic against the same filesystem, so it too produces an
+// ordinary project-relative path.
+//
+// A `#`-prefixed specifier is a fourth, disjoint case: package.json's own
+// `imports` map, scoped to the importing file's nearest enclosing package
+// (workspace.ts's `createPackageImportsIndex`), not to the workspace as a
+// whole - a `#` name means something different in each package, the way an
+// `@/` alias means something different in each tsconfig.
+//
 // Everything else - "react", "node:crypto", any package that exists only
 // under `node_modules` - stays an unresolved placeholder (see `recordImport`
 // in extract.ts): no file of theirs is indexed, so there is no node an edge
-// could honestly point at. `paths` aliases and `imports` (#private) maps need
-// project configuration this pass does not read, and are left to the semantic
-// layer as well.
+// could honestly point at.
 
 // Depends on extract.ts, never the other way round: the extractor takes a
 // `SpecifierResolver` from its caller and knows nothing about how one is
@@ -32,11 +43,22 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { isSupportedFile, type SpecifierResolver } from "./extract";
+import { createIndexabilityChecker } from "./ignorePolicy";
 import {
+  createTsconfigPathsIndex,
+  expandPathsCandidates,
+  NO_TSCONFIG_PATHS,
+  type TsconfigPathsIndex,
+} from "./tsconfigPaths";
+import {
+  createPackageImportsIndex,
+  importsTargets,
+  NO_PACKAGE_IMPORTS,
   NO_WORKSPACE_PACKAGES,
   packageEntryTargets,
   parseBareSpecifier,
   readWorkspacePackages,
+  type PackageImportsIndex,
   type WorkspacePackages,
 } from "./workspace";
 
@@ -163,31 +185,136 @@ export function resolveWorkspaceSpecifier(
   return null;
 }
 
-/** Both resolutions in the single shape the extractor consumes. */
-export function createSpecifierResolver(
+/**
+ * The tsconfig-paths analog of `resolveWorkspaceSpecifier`: the alias rules in
+ * force for `fromFilePath` (see tsconfigPaths.ts - which config that is
+ * depends on where the file sits) expand the specifier into the paths it could
+ * name, and those go through the same `candidatePaths` pipeline as every other
+ * specifier kind, so the result is indistinguishable from a relative import's.
+ *
+ * Unlike workspace resolution this does depend on the importing file: a
+ * monorepo has one config per package, and the same `@/x` means a different
+ * directory in each of them.
+ */
+export function resolveTsconfigPathsSpecifier(
+  specifier: string,
+  fromFilePath: string,
+  tsconfigPaths: TsconfigPathsIndex,
   fileExists: FileExists,
-  workspacePackages: WorkspacePackages = NO_WORKSPACE_PACKAGES,
-): SpecifierResolver {
-  return (specifier, fromFilePath) =>
-    isRelativeSpecifier(specifier)
-      ? resolveRelativeSpecifier(specifier, fromFilePath, fileExists)
-      : resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists);
+): string | null {
+  if (isRelativeSpecifier(specifier)) return null;
+
+  const config = tsconfigPaths(fromFilePath);
+  if (config === null) return null;
+
+  for (const base of expandPathsCandidates(config, specifier)) {
+    for (const candidate of candidatePaths(base)) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return null;
 }
 
 /**
- * A [`FileExists`] backed by the real filesystem under `projectRoot`, with a
- * memo of what it has already looked up: one module is typically imported by
- * many files, and each miss costs several stat calls' worth of extension
- * guessing.
+ * The `#private` imports analog of `resolveWorkspaceSpecifier`: a `#`
+ * specifier is resolved against the `imports` map of the importing file's own
+ * nearest enclosing package (see workspace.ts's `createPackageImportsIndex`),
+ * never the whole project's workspace map - Node scopes `#imports` to a
+ * package boundary, not to a package name, so unlike workspace resolution
+ * this does depend on where `fromFilePath` sits.
+ */
+export function resolvePackageImportsSpecifier(
+  specifier: string,
+  fromFilePath: string,
+  packageImports: PackageImportsIndex,
+  fileExists: FileExists,
+): string | null {
+  if (!specifier.startsWith("#")) return null;
+
+  const config = packageImports(fromFilePath);
+  if (config === null) return null;
+
+  for (const base of importsTargets(config, specifier)) {
+    for (const candidate of candidatePaths(base)) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * All four resolutions in the single shape the extractor consumes.
+ *
+ * A bare specifier is offered to the workspace first and only falls through to
+ * the alias map when the workspace has no answer for it. The two do overlap in
+ * practice - excalidraw maps `@excalidraw/element/*` both in its manifests and
+ * in a `paths` entry - and the workspace answer is the authoritative one there:
+ * it is what the package manager's own resolution would produce, while a
+ * `paths` entry is a compile-time hint that is free to be stale. So the
+ * precedence is not "the two must agree", it is "workspace wins wherever it
+ * applies": a specifier the workspace resolves never reaches the alias map at
+ * all, whatever that map would have said about it.
+ *
+ * A `#`-prefixed specifier is its own branch, not a fallback after the other
+ * two: `#` names are syntactically disjoint from bare package names and from
+ * tsconfig `paths` keys (which are never written with a leading `#`), so
+ * there is no overlap to arbitrate - it either resolves through the importing
+ * file's own package `imports` map, or it does not resolve at all.
+ */
+export function createSpecifierResolver(
+  fileExists: FileExists,
+  workspacePackages: WorkspacePackages = NO_WORKSPACE_PACKAGES,
+  tsconfigPaths: TsconfigPathsIndex = NO_TSCONFIG_PATHS,
+  packageImports: PackageImportsIndex = NO_PACKAGE_IMPORTS,
+): SpecifierResolver {
+  return (specifier, fromFilePath) => {
+    if (isRelativeSpecifier(specifier)) {
+      return resolveRelativeSpecifier(specifier, fromFilePath, fileExists);
+    }
+    if (specifier.startsWith("#")) {
+      return resolvePackageImportsSpecifier(specifier, fromFilePath, packageImports, fileExists);
+    }
+    return (
+      resolveWorkspaceSpecifier(specifier, workspacePackages, fileExists) ??
+      resolveTsconfigPathsSpecifier(specifier, fromFilePath, tsconfigPaths, fileExists)
+    );
+  };
+}
+
+/**
+ * A [`FileExists`] backed by the real filesystem under `projectRoot`, answering
+ * the fuller question the index actually cares about: the path is a regular
+ * file *and* it is something the walk would index - not under a hard-excluded
+ * directory (`dist`, `node_modules`, ...), not gitignored (see
+ * ignorePolicy.ts, shared with `walkProjectFiles` so the two answers cannot
+ * drift apart). A build output that happens to be on disk is therefore not
+ * allowed to shadow the source file it was compiled from.
+ *
+ * The memo caches that combined answer, not raw filesystem existence: one
+ * module is typically imported by many files, and each miss costs several stat
+ * calls' worth of extension guessing.
  *
  * The memo is the reason this is a factory rather than a module-level
  * function: it must not outlive the assumption that the tree is not changing
  * underneath it. The bulk index is a one-shot process, so one instance covers
  * the whole walk; the long-lived plugin builds a fresh one per changed file
  * (see `reparseChangedFile`), so a file created since the last edit is seen.
+ *
+ * One known, deliberately out-of-scope gap (task 87): this has no notion of
+ * which of two real-path-aliased paths a walk's own traversal order already
+ * claimed (see symlinks.ts - when a directory is reachable both directly and
+ * through a symlink, only the first path reached is indexed). A candidate naming
+ * the *losing* path still stats fine and is reported as existing, so the edge is
+ * claimed resolved against a path that never became a `File` node and stays
+ * unlinked instead of eventually catching up. Narrow by construction: it needs a
+ * specifier that resolves through the aliased spelling rather than the indexed
+ * one. Closing it would mean making specifier resolution walk-order-aware, a
+ * materially bigger change than making the walk and the workspace-glob
+ * expansion agree with each other, which is all task 87 set out to do.
  */
 export function createProjectFileExists(projectRoot: string): FileExists {
   const memo = new Map<string, boolean>();
+  const isIndexable = createIndexabilityChecker(projectRoot);
   return (projectRelativePath: string): boolean => {
     const cached = memo.get(projectRelativePath);
     if (cached !== undefined) return cached;
@@ -197,7 +324,11 @@ export function createProjectFileExists(projectRoot: string): FileExists {
       // Path segments are re-joined with the platform separator; the caller's
       // path is normalized and cannot start with "..", so this stays inside
       // `projectRoot`.
-      exists = fs.statSync(path.join(projectRoot, ...projectRelativePath.split("/"))).isFile();
+      // The stat comes first deliberately: most candidate probes are misses
+      // that fail it, and those never pay for the gitignore-aware check.
+      exists =
+        fs.statSync(path.join(projectRoot, ...projectRelativePath.split("/"))).isFile() &&
+        isIndexable(projectRelativePath);
     } catch {
       exists = false; // missing, unreadable, or a broken symlink - all "no"
     }
@@ -214,11 +345,17 @@ export function createProjectFileExists(projectRoot: string): FileExists {
  * existence memo above - once per bulk-index walk, once per reparsed file. It
  * is the cheaper of the two answers to refresh (a handful of manifests, well
  * under a millisecond) and by far the less volatile, so nothing is gained by
- * holding it any longer than the memo it travels with.
+ * holding it any longer than the memo it travels with. The tsconfig index
+ * travels with them for the same reason, reading each config it is actually
+ * asked about at most once (see `createTsconfigPathsIndex`), and so does the
+ * package-imports index, reading each package.json it is actually asked
+ * about at most once (see `createPackageImportsIndex`).
  */
 export function createProjectResolver(projectRoot: string): SpecifierResolver {
   return createSpecifierResolver(
     createProjectFileExists(projectRoot),
     readWorkspacePackages(projectRoot),
+    createTsconfigPathsIndex(projectRoot),
+    createPackageImportsIndex(projectRoot),
   );
 }

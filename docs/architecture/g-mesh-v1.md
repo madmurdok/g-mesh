@@ -228,14 +228,37 @@ halves of the answer:
 - **The plugin** decides *which path* a specifier names. Extension guessing
   and `index.*` directory imports are language rules, and core is
   deliberately language-agnostic; the stat calls they cost land on the side
-  that is walking the tree anyway.
+  that is walking the tree anyway. Existence alone is not enough to claim a
+  path, so the same side also applies its own walk's exclusion policy — hard-excluded
+  directories, `.gitignore` — to every candidate: a target the walk would
+  never turn into a `File` node is never reported as resolved either. Without
+  that, a built checkout resolves `@excalidraw/math` to the `dist/` output
+  its manifest declares and loses the edge into the source the walk did index.
+
+Symlinks are **followed**, on both sides of that policy. A symlinked package —
+the normal yarn/lerna layout, and how vendored shared code is linked into
+`packages/` — is walked and indexed like any other, rather than being silently
+absent because a `Dirent` reports a link as neither file nor directory. The file
+walk and the workspace-glob expansion share one guard module
+(`plugins/js-ts/src/symlinks.ts`), each building its own instance per traversal,
+so the two cannot disagree about which packages exist and which files are theirs.
+The guard's rules: identity for cycle and duplicate detection is the resolved
+real path, never the path used to reach it; a link onto one of its own ancestors
+is refused rather than descended into forever; two paths onto the same real
+target (two links, or a real directory plus a link to it) index it exactly once,
+under whichever path the walk's own sorted depth-first order reaches first — the
+other is dropped entirely, never merged onto or renamed to a canonical path,
+because a package's identity here *is* the path it was reached by and rewriting
+it would break every specifier naming it; a link resolving outside the project
+root is refused on the same never-escape-`projectRoot` grounds as every other
+path this index holds; and a dangling link is a skip, not a crash.
 - **The core** decides *whether that path is a node*, in a linking pass
   (`core/src/graph/imports.rs`) that repoints the edge — once the cold-start
-  stream is over, and scoped to each diff afterwards. A file can exist on
-  disk and still have no node — gitignored, excluded, or another language —
-  and mid-walk it may simply not have been reached yet. Since edges are
-  foreign keys onto nodes, only the side that knows what the index holds can
-  point one at a real node.
+  stream is over, and scoped to each diff afterwards. What is left for it is
+  timing, not policy: a path can be a perfectly indexable target that simply
+  has not reached a `File` node yet mid-walk, or belong to another language's
+  plugin. Since edges are foreign keys onto nodes, only the side that knows
+  what the index holds can point one at a real node.
 
 An import that survives both steps unlinked stays what it was before any of
 this: a placeholder `Module` node carrying the raw specifier, with an
@@ -437,7 +460,15 @@ agent issues a normal single-hop paginated call on the node where it was
 cut; `maxDepth` → response includes `frontierNodes` to re-root the same
 traversal call one level further; `explorationBudget` → response includes
 an opaque `resumeToken` encoding visited-set + frontier queue, since budget
-is spent across the whole traversal rather than per-node.
+is spent across the whole traversal rather than per-node. That state is
+cumulative across an entire resume chain (each call reseeds from everything
+returned so far, see `graph::resume_token::ResumeState`'s doc comment), so
+the token grows every call - on real (32-hex-char) ids, a single budget
+cutoff alone reaches the hundreds of KB. `resumeToken` is gzipped before
+base64 for exactly that reason (measured ~2.3x smaller); it is well short of
+the 64 MiB NDJSON frame limit either way, but it is retransmitted by the
+caller on every hop of a chain, so keeping it small matters for an LLM
+agent's context budget even though nothing rejects the request outright.
 
 An import that resolved to nothing is still reported as a dependency —
 `get_dependencies` answers what a file depends on, and "on a package we do
@@ -500,6 +531,12 @@ MCP client on stdio — the shim is a pure repacking proxy.
 - **Bulk changes** (`git checkout`/`pull` touching hundreds of files):
   detected as a burst of watcher events in a short window and folded into
   one SQLite transaction instead of one per file.
+- **Symlink loops and aliases** in the tree being walked: symlinks are followed
+  (see [Import resolution](#import-resolution)), so a link cycle would otherwise
+  be an infinite descent and a link alias of a real directory a doubly-indexed
+  file. Both are refused by real-path identity — a location is claimed once, by
+  whichever path the sorted walk reaches first — and links escaping the project
+  root, or dangling, are skipped rather than crashing the walk.
 - <a id="storage-scaling-trigger"></a>**Graph traversal cost on hub nodes**:
   response-level `maxDepth`/`maxFanout` limit what's returned, but not what
   a recursive CTE visits internally — a separate internal exploration

@@ -9,20 +9,17 @@
 import * as fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import * as path from "node:path";
-import ignore, { type Ignore } from "ignore";
 
 import { extractFile, isSupportedFile, type ExtractedEdge, type ExtractedNode } from "./extract";
+import {
+  HARD_EXCLUDED_DIRS,
+  isIgnoredByLayers,
+  loadGitignoreLayer,
+  toPosixPath,
+  type GitignoreLayer,
+} from "./ignorePolicy";
 import { createProjectResolver } from "./resolve";
-
-/**
- * Directories skipped unconditionally, regardless of .gitignore contents.
- * `.claude` holds Claude Code's own session/worktree artifacts (e.g.
- * `.claude/worktrees/agent-<hash>/`, full copies of the project made for
- * parallel agent sessions) - real project source is never there, and a
- * project's own .gitignore has no reason to list it, so it needs the same
- * hard exclusion as `.git`.
- */
-const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", ".claude"]);
+import { canonicalizeProjectRoot, createSymlinkGuard, type SymlinkGuard } from "./symlinks";
 
 /**
  * Where bulk-indexed NDJSON lines go. A callback mirrors the simplest test
@@ -120,44 +117,10 @@ export function toWireNode(node: ExtractedNode): WireNode {
 }
 
 // --- gitignore-aware walk -------------------------------------------------
-
-/** One directory's own `.gitignore`, plus the (absolute) directory it applies to. */
-interface GitignoreLayer {
-  readonly baseDir: string;
-  readonly matcher: Ignore;
-}
-
-function toPosixPath(p: string): string {
-  return p.split(path.sep).join("/");
-}
-
-async function loadGitignoreLayer(dir: string): Promise<GitignoreLayer | null> {
-  let contents: string;
-  try {
-    contents = await fs.readFile(path.join(dir, ".gitignore"), "utf8");
-  } catch {
-    return null; // no .gitignore here - not an error
-  }
-  return { baseDir: dir, matcher: ignore().add(contents) };
-}
-
-/**
- * Combines every ancestor `.gitignore` layer the same way git does: each
- * layer's patterns apply to paths relative to that layer's own directory,
- * and a later (deeper, or later-declared) match - including a negation -
- * overrides an earlier one.
- */
-function isIgnoredByLayers(layers: readonly GitignoreLayer[], absPath: string): boolean {
-  let ignored = false;
-  for (const layer of layers) {
-    const rel = path.relative(layer.baseDir, absPath);
-    if (rel === "" || rel.startsWith("..")) continue; // not under this layer
-    const result = layer.matcher.test(toPosixPath(rel));
-    if (result.ignored) ignored = true;
-    else if (result.unignored) ignored = false;
-  }
-  return ignored;
-}
+// The exclusion policy itself lives in ignorePolicy.ts, shared with
+// resolve.ts so the two cannot disagree about what gets indexed; the symlink
+// policy lives in symlinks.ts, shared with workspace.ts's glob expansion for
+// the same reason.
 
 /**
  * Walks `projectRoot` depth-first, yielding project-relative POSIX paths of
@@ -165,15 +128,28 @@ function isIgnoredByLayers(layers: readonly GitignoreLayer[], absPath: string): 
  * `dist`, and `.claude` are never descended into, regardless of `.gitignore`
  * contents. Entries within a directory are visited in sorted order for
  * deterministic output.
+ *
+ * Symlinked directories and files are **followed**, and yielded under the path
+ * they were reached by rather than the path they resolve to - a symlinked
+ * package is indexed like any other. What that costs is a guard
+ * (`createSymlinkGuard`): a link onto one of its own ancestors is refused
+ * instead of descended into forever, a second path onto an already-walked real
+ * location is dropped so nothing is indexed twice, a link resolving outside the
+ * project root is refused, and a dangling link is skipped. The guard belongs to
+ * this one walk and is threaded through the recursion.
  */
 export async function* walkProjectFiles(projectRoot: string): AsyncGenerator<string> {
-  yield* walkDir(projectRoot, projectRoot, []);
+  // Canonicalized once, because every guard comparison is made against it and a
+  // project root reached through a symlink would otherwise be spelled two ways.
+  const projectRootReal = canonicalizeProjectRoot(projectRoot);
+  yield* walkDir(projectRootReal, projectRootReal, [], createSymlinkGuard(projectRootReal));
 }
 
 async function* walkDir(
   projectRoot: string,
   dir: string,
   layers: readonly GitignoreLayer[],
+  guard: SymlinkGuard,
 ): AsyncGenerator<string> {
   const ownLayer = await loadGitignoreLayer(dir);
   const nextLayers = ownLayer ? [...layers, ownLayer] : layers;
@@ -187,16 +163,22 @@ async function* walkDir(
   entries.sort((a, b) => a.name.localeCompare(b.name));
 
   for (const entry of entries) {
-    const abs = path.join(dir, entry.name);
+    // By name, before anything is resolved: a hard-excluded name is excluded
+    // whatever it turns out to be - including a symlink *called* node_modules -
+    // and settling that first also saves the guard's realpath call for it.
+    if (HARD_EXCLUDED_DIRS.has(entry.name)) continue;
 
-    if (entry.isDirectory()) {
-      if (HARD_EXCLUDED_DIRS.has(entry.name)) continue;
+    const resolved = guard(dir, entry);
+    if (resolved === null) continue; // cycle, duplicate real path, escapes projectRoot, or dangling
+    const { absPath: abs, isDirectory, isFile } = resolved;
+
+    if (isDirectory) {
       if (isIgnoredByLayers(nextLayers, abs)) continue;
-      yield* walkDir(projectRoot, abs, nextLayers);
+      yield* walkDir(projectRoot, abs, nextLayers, guard);
       continue;
     }
 
-    if (!entry.isFile()) continue; // symlinks, sockets, etc. - not source files
+    if (!isFile) continue; // neither file nor directory - a socket, device, fifo
     // Anything with an unsupported extension - including tsconfig.json - is
     // never opened here, which is what keeps a malicious tsconfig
     // `compilerOptions.plugins` entry inert (see security.test.ts).
