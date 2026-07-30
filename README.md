@@ -80,6 +80,38 @@ the project has never been indexed (see below), starts the file watcher, and
 serves the MCP tool surface over an `AF_UNIX` socket. The daemon outlives the
 shim and is reused by later connections for the same project.
 
+## Is this worth registering?
+
+Honest answer, from actual measurement (full numbers in
+`../g-mesh-bench/docs/results/v0.2.0-session-economy-findings.md`): g-mesh is
+**not** cheaper on average in token terms. On simple lookup-shaped questions
+(find a definition, list a file's exports, an unambiguous
+`find_implementations`) it costs *more* tokens than an agent just using
+Read/Grep/Glob — about +46% in isolated measurement, and worse (+67%) inside
+a long continuing session, because the dominant cost (re-reading the tool
+schemas on every turn) grows with conversation length rather than shrinking
+the way a one-time setup cost would.
+
+Where it wins, consistently and by a wide margin, is multi-hop questions
+(chained relationships — "which files call both X and Y", "what implements
+this interface, and which of those also call Z") and ambiguous-name
+resolution (two same-named symbols declared in different scopes or files).
+On these, a grep-based agent has real, unbounded tail risk — 20-40+ tool-call
+round-trips, 300-580k tokens, occasionally exhausting a real budget outright
+— while g-mesh keeps the same class of question in a bounded 11-15 turns and
+gets an answer grep cannot reach even in principle (re-export chains,
+same-qualified-name-but-different-declaration symbols).
+
+**Registration guidance**: worth registering for codebases where cross-file
+impact analysis, deep call graphs, or ambiguous naming are a real, recurring
+cost — monorepos, large multi-package projects, codebases with several
+same-named exports across modules. Not worth it for a small, single-package
+project where most real questions are simple lookups grep already handles
+fine — there the fixed tool-schema cost has nothing to pay itself back
+against. This is a per-project decision, orthogonal to the global-vs-per-project
+*scope* question the next section covers — that's about where a registration
+applies once you've decided to register at all.
+
 ## Register with an MCP client
 
 **Recommended (Claude Code): register once, globally.** Since the shim reads
