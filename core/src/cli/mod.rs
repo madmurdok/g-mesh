@@ -20,6 +20,7 @@
 //! command at a time.
 
 pub mod status;
+pub mod stop;
 
 use std::path::PathBuf;
 
@@ -118,7 +119,7 @@ fn dispatch(command: Command) -> Result<()> {
             PluginsCommand::List => not_implemented("plugins list"),
         },
         Command::Clean(_) => not_implemented("clean"),
-        Command::Stop => not_implemented("stop"),
+        Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),
     }

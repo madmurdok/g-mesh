@@ -161,10 +161,14 @@ below) to force a fresh full walk.
 ## State & cleanup
 
 Per-project state lives under `~/.g-mesh/projects/<hash-of-project-root>/`:
-SQLite DB, daemon socket, pid file, lock files. Delete a project's directory
+SQLite DB, daemon socket, pid files, lock files. Delete a project's directory
 there to force a clean reindex (schema mismatches also auto-wipe and
-reindex). To stop a running daemon, kill its pid from `daemon.pid` in that
-directory — there's no `g-mesh stop` command yet.
+reindex).
+
+Run `g-mesh status` in a project to see whether its daemon and plugin are up,
+how much of the project the index covers, and which files failed to parse.
+`g-mesh stop` shuts the daemon core and its plugin down; running it when
+nothing is up is a no-op, not an error.
 
 ## Run tests
 
