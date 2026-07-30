@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::plugin::PluginProcess;
+use crate::gc::last_used;
 use crate::mcp;
 use crate::storage::connection::{self, project_dir};
 use crate::storage::schema;
@@ -83,6 +84,11 @@ pub fn run(root: &Path) -> Result<()> {
     if schema::ensure_current(&conn).context("failed to check schema version")? {
         eprintln!("g-mesh daemon: schema (re)initialized - a full reindex is needed");
     }
+    // Recorded here rather than once the daemon is serving: a start that gets
+    // as far as opening the index is already this project being used, and a
+    // cold start that then spends minutes in its bulk walk must not read as
+    // minutes of idleness to a GC scan running alongside it.
+    last_used::touch(&conn).context("failed to record that the project was used")?;
     // Asked before anything can answer it, and answered by a recorded fact
     // rather than by the schema being fresh: a walk killed half way through
     // leaves a current schema behind a partial graph, and that project is
