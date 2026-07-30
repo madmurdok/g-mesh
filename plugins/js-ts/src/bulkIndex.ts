@@ -19,6 +19,7 @@ import {
   type GitignoreLayer,
 } from "./ignorePolicy";
 import { createProjectResolver } from "./resolve";
+import { canonicalizeProjectRoot, createSymlinkGuard, type SymlinkGuard } from "./symlinks";
 
 /**
  * Where bulk-indexed NDJSON lines go. A callback mirrors the simplest test
@@ -117,7 +118,9 @@ export function toWireNode(node: ExtractedNode): WireNode {
 
 // --- gitignore-aware walk -------------------------------------------------
 // The exclusion policy itself lives in ignorePolicy.ts, shared with
-// resolve.ts so the two cannot disagree about what gets indexed.
+// resolve.ts so the two cannot disagree about what gets indexed; the symlink
+// policy lives in symlinks.ts, shared with workspace.ts's glob expansion for
+// the same reason.
 
 /**
  * Walks `projectRoot` depth-first, yielding project-relative POSIX paths of
@@ -125,15 +128,28 @@ export function toWireNode(node: ExtractedNode): WireNode {
  * `dist`, and `.claude` are never descended into, regardless of `.gitignore`
  * contents. Entries within a directory are visited in sorted order for
  * deterministic output.
+ *
+ * Symlinked directories and files are **followed**, and yielded under the path
+ * they were reached by rather than the path they resolve to - a symlinked
+ * package is indexed like any other. What that costs is a guard
+ * (`createSymlinkGuard`): a link onto one of its own ancestors is refused
+ * instead of descended into forever, a second path onto an already-walked real
+ * location is dropped so nothing is indexed twice, a link resolving outside the
+ * project root is refused, and a dangling link is skipped. The guard belongs to
+ * this one walk and is threaded through the recursion.
  */
 export async function* walkProjectFiles(projectRoot: string): AsyncGenerator<string> {
-  yield* walkDir(projectRoot, projectRoot, []);
+  // Canonicalized once, because every guard comparison is made against it and a
+  // project root reached through a symlink would otherwise be spelled two ways.
+  const projectRootReal = canonicalizeProjectRoot(projectRoot);
+  yield* walkDir(projectRootReal, projectRootReal, [], createSymlinkGuard(projectRootReal));
 }
 
 async function* walkDir(
   projectRoot: string,
   dir: string,
   layers: readonly GitignoreLayer[],
+  guard: SymlinkGuard,
 ): AsyncGenerator<string> {
   const ownLayer = await loadGitignoreLayer(dir);
   const nextLayers = ownLayer ? [...layers, ownLayer] : layers;
@@ -147,16 +163,22 @@ async function* walkDir(
   entries.sort((a, b) => a.name.localeCompare(b.name));
 
   for (const entry of entries) {
-    const abs = path.join(dir, entry.name);
+    // By name, before anything is resolved: a hard-excluded name is excluded
+    // whatever it turns out to be - including a symlink *called* node_modules -
+    // and settling that first also saves the guard's realpath call for it.
+    if (HARD_EXCLUDED_DIRS.has(entry.name)) continue;
 
-    if (entry.isDirectory()) {
-      if (HARD_EXCLUDED_DIRS.has(entry.name)) continue;
+    const resolved = guard(dir, entry);
+    if (resolved === null) continue; // cycle, duplicate real path, escapes projectRoot, or dangling
+    const { absPath: abs, isDirectory, isFile } = resolved;
+
+    if (isDirectory) {
       if (isIgnoredByLayers(nextLayers, abs)) continue;
-      yield* walkDir(projectRoot, abs, nextLayers);
+      yield* walkDir(projectRoot, abs, nextLayers, guard);
       continue;
     }
 
-    if (!entry.isFile()) continue; // symlinks, sockets, etc. - not source files
+    if (!isFile) continue; // neither file nor directory - a socket, device, fifo
     // Anything with an unsupported extension - including tsconfig.json - is
     // never opened here, which is what keeps a malicious tsconfig
     // `compilerOptions.plugins` entry inert (see security.test.ts).

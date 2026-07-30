@@ -16,6 +16,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { canonicalizeProjectRoot, createSymlinkGuard, type SymlinkGuard } from "./symlinks";
+
 /** The package.json fields this resolution reads; everything else is ignored. */
 interface PackageManifest {
   readonly name?: unknown;
@@ -136,22 +138,37 @@ export function packageEntryTargets(pkg: WorkspacePackage, subpath: string): str
  * The workspace's packages, read from disk once. Callers cache the result for
  * as long as they cache their other filesystem answers (see resolve.ts): a
  * workspace manifest changes far more rarely than the sources it lists.
+ *
+ * Glob segments see symlinked directories, so a linked-in package (the normal
+ * yarn/lerna layout) is a workspace member like any other - under the path the
+ * pattern matched it by, not the path it resolves to. One guard
+ * (symlinks.ts) is built here and used for the whole expansion, which is what
+ * keeps a link cycle from turning a `**` pattern into an unbounded walk and a
+ * link alias of a real package directory from yielding it twice. It is the same
+ * guard logic bulkIndex.ts's file walk uses, deliberately: a package this
+ * expansion accepts whose files that walk refused (or the reverse) is the one
+ * disagreement neither side could detect on its own.
  */
 export function readWorkspacePackages(projectRoot: string): WorkspacePackages {
-  const patterns = workspacePatterns(projectRoot);
+  // Canonicalized before anything is read: the guard compares against this
+  // root, and a root reached through a symlink would otherwise be spelled two
+  // ways (see `canonicalizeProjectRoot`).
+  const projectRootReal = canonicalizeProjectRoot(projectRoot);
+  const patterns = workspacePatterns(projectRootReal);
   if (patterns.length === 0) return NO_WORKSPACE_PACKAGES;
 
   const excluded = patterns
     .filter((pattern) => pattern.startsWith("!"))
     .map((pattern) => globToRegExp(pattern.slice(1)));
-  const listSubdirectories = subdirectoryLister(projectRoot);
+  const guard = createSymlinkGuard(projectRootReal);
+  const listSubdirectories = subdirectoryLister(projectRootReal, guard);
 
   const packages = new Map<string, WorkspacePackage>();
   for (const pattern of patterns) {
     if (pattern.startsWith("!")) continue;
-    for (const dir of expandPattern(pattern, projectRoot, listSubdirectories)) {
+    for (const dir of expandPattern(pattern, projectRootReal, listSubdirectories)) {
       if (excluded.some((regex) => regex.test(dir))) continue;
-      const manifest = readJson(path.join(projectRoot, ...dir.split("/"), "package.json"));
+      const manifest = readJson(path.join(projectRootReal, ...dir.split("/"), "package.json"));
       if (manifest === null || typeof manifest.name !== "string") continue;
       // First declaration wins, like a re-declared symbol elsewhere in this plugin.
       if (!packages.has(manifest.name)) packages.set(manifest.name, { dir, manifest });
@@ -497,19 +514,35 @@ function descendants(
   return found;
 }
 
-function subdirectoryLister(projectRoot: string): (dir: string) => string[] {
+/**
+ * The subdirectories a glob segment may expand into, memoized per directory -
+ * which is also what keeps the guard honest: asking twice about the same
+ * directory would re-offer entries the guard has already claimed and get them
+ * all refused, so the memo is load-bearing, not just a saved `readdir`.
+ *
+ * Ignored names are dropped before the guard sees them (no `realpath` paid for a
+ * link named `node_modules`), and the surviving entries are **sorted**. That
+ * sort matters now that a symlink alias of a directory is visible at all: when a
+ * real directory and a link to it both match the same segment, only the first
+ * one reached is claimed, so which of the two becomes the package's `dir` would
+ * otherwise be raw `readdir` order - a machine- and filesystem-dependent answer
+ * to a question the tree alone should settle. bulkIndex.ts's walk already sorts
+ * its entries for the same reason, and the two have to agree.
+ */
+function subdirectoryLister(projectRoot: string, guard: SymlinkGuard): (dir: string) => string[] {
   const memo = new Map<string, string[]>();
   return (dir: string): string[] => {
     const cached = memo.get(dir);
     if (cached !== undefined) return cached;
 
+    const absDir = path.join(projectRoot, ...dir.split("/").filter(Boolean));
     let names: string[] = [];
     try {
       names = fs
-        .readdirSync(path.join(projectRoot, ...dir.split("/").filter(Boolean)), {
-          withFileTypes: true,
-        })
-        .filter((entry) => entry.isDirectory() && !isIgnoredDirectory(entry.name))
+        .readdirSync(absDir, { withFileTypes: true })
+        .filter((entry) => !isIgnoredDirectory(entry.name))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .filter((entry) => guard(absDir, entry)?.isDirectory === true)
         .map((entry) => entry.name);
     } catch {
       names = []; // missing or unreadable - nothing to expand into

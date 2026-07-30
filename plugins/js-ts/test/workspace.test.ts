@@ -43,6 +43,15 @@ async function withProject(
   }
 }
 
+/** A symlink inside a fixture, added on top of the plain tree `makeProject`
+ * built - which stays symlink-unaware on purpose, since every other test here
+ * wants an ordinary directory tree. */
+async function symlink(root: string, linkRelPath: string, target: string): Promise<void> {
+  const linkAbs = path.join(root, linkRelPath);
+  await fs.mkdir(path.dirname(linkAbs), { recursive: true });
+  await fs.symlink(target, linkAbs);
+}
+
 // --- specifier shapes -----------------------------------------------------
 
 test("a package specifier splits into its name and the subpath it addresses", () => {
@@ -270,6 +279,105 @@ test("a flow-sequence `packages` list is read as well", async () => {
     },
     (root) => {
       assert.deepEqual([...readWorkspacePackages(root).keys()], ["@acme/math"]);
+    },
+  );
+});
+
+// --- symlink policy (task 87) ---------------------------------------------
+
+/** The layout this exists for: the package's real files live outside
+ * `packages/`, and a link is what makes it a workspace member. Before the walk
+ * and this expansion followed links, such a package simply was not there. */
+test("a workspace glob matches a symlinked package directory, under the path the glob matched", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "vendor/math/package.json": manifest({ name: "@acme/math" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/math", "../vendor/math");
+      const packages = readWorkspacePackages(root);
+      assert.deepEqual([...packages.keys()], ["@acme/math"]);
+      assert.equal(
+        packages.get("@acme/math")?.dir,
+        "packages/math",
+        "the apparent path the pattern matched, not the path it resolves to",
+      );
+    },
+  );
+});
+
+test("a symlink cycle under a `**` pattern neither hangs nor invents packages", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n",
+      "packages/a/package.json": manifest({ name: "@acme/a" }),
+    },
+    async (root) => {
+      // Resolves to packages/a itself, which the expansion has already claimed.
+      // Without the guard, `**` would descend a/loop/loop/... to MAX_GLOB_DEPTH.
+      await symlink(root, "packages/a/loop", ".");
+      const packages = readWorkspacePackages(root);
+      assert.deepEqual([...packages.keys()], ["@acme/a"]);
+      assert.equal(packages.get("@acme/a")?.dir, "packages/a");
+    },
+  );
+});
+
+/**
+ * A real package directory and a link to it, both matched by the same `*`
+ * segment. Exactly one entry must come out, and *which* one is decided by the
+ * sort `subdirectoryLister` now applies: "original" sorts before "zalias", so
+ * the real directory is claimed first. Without that sort this assertion would be
+ * a coin flip on raw `readdir` order - which is the whole reason the sort is
+ * there, symlinked duplicates being visible at all only since task 87.
+ */
+test("a real package directory and a symlink alias of it collapse to one entry, sorted-first winning", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "packages/original/package.json": manifest({ name: "@acme/x" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/zalias", "./original");
+      const packages = readWorkspacePackages(root);
+      assert.equal(packages.size, 1);
+      assert.equal(packages.get("@acme/x")?.dir, "packages/original");
+    },
+  );
+});
+
+test("a workspace-glob symlink resolving outside the project root is refused", async () => {
+  const outsideRoot = await makeProject({
+    "package.json": manifest({ name: "@acme/outside" }),
+  });
+  try {
+    await withProject(
+      {
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+        "packages/real/package.json": manifest({ name: "@acme/real" }),
+      },
+      async (root) => {
+        await symlink(root, "packages/escape", outsideRoot);
+        const packages = readWorkspacePackages(root);
+        assert.equal(packages.has("@acme/outside"), false, "outside the project root");
+        assert.deepEqual([...packages.keys()], ["@acme/real"]);
+      },
+    );
+  } finally {
+    await fs.rm(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("a dangling symlink under a workspace glob is skipped, the real package still resolving", async () => {
+  await withProject(
+    {
+      "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+      "packages/real/package.json": manifest({ name: "@acme/real" }),
+    },
+    async (root) => {
+      await symlink(root, "packages/broken", "./nope");
+      assert.deepEqual([...readWorkspacePackages(root).keys()], ["@acme/real"]);
     },
   );
 });
