@@ -152,14 +152,10 @@ impl ServerHandler for GMeshMcpServer {
             .with_instructions(
                 "Structural code-graph queries over this project's index. Prefer these over \
                  grepping when you need definitions, references, call edges or imports.\n\n\
-                 Efficient usage: find_references/find_callers/find_callees/find_implementations \
-                 accept `symbol_name` directly - use it instead of calling find_definition first \
-                 when the name is likely unambiguous, to save a round-trip. If a symbol_name turns \
-                 out ambiguous, re-query using the `id` of the candidate you pick, not its \
-                 `qualifiedName` - the same qualifiedName can name more than one declaration. For a \
-                 symbol you expect to have many references/callers/implementations (a widely-used \
-                 utility, a base interface), pass a higher `limit` up front instead of paging \
-                 through the default 20 - one larger call is cheaper than several small ones.",
+                 Efficient usage: pass `symbol_name` directly to find_references/find_callers/\
+                 find_callees/find_implementations instead of calling find_definition first, and \
+                 raise `limit` for symbols with many results instead of paging - see each tool's \
+                 parameter docs for the exact mechanics (ambiguity handling, defaults).",
             )
     }
 }
@@ -190,18 +186,15 @@ pub struct SymbolQueryParams {
     /// Id of the anchor symbol, as returned by `find_definition`. Give this
     /// or `symbol_name`, never both.
     pub symbol_id: Option<String>,
-    /// Name of the anchor symbol, as an alternative to `symbol_id` that saves
-    /// the `find_definition` call: resolved exactly as `find_definition`
-    /// resolves it (a fully qualified name first, then the bare name). If the
-    /// name is ambiguous the answer is that tool's ranked candidate list
-    /// (`ambiguous: true`) instead of this tool's results - re-call with the
-    /// `id` of the candidate you pick as `symbol_id`.
+    /// Alternative to `symbol_id` that skips the `find_definition` call -
+    /// resolved the same way (qualified name first, then bare name). If
+    /// ambiguous, returns a ranked candidate list (`ambiguous: true`);
+    /// re-call with a candidate's `id` as `symbol_id`.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page of results.
     pub cursor: Option<String>,
-    /// Maximum results to return in this call (default 20, capped at 200).
-    /// Raise this to fetch a larger result set in one call instead of
-    /// paging through it with `cursor`.
+    /// Maximum results (default 20, capped at 200) - raise for a wide result
+    /// set instead of paging via `cursor`.
     pub limit: Option<u32>,
 }
 
