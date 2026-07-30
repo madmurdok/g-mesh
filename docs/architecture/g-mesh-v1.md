@@ -460,7 +460,15 @@ agent issues a normal single-hop paginated call on the node where it was
 cut; `maxDepth` → response includes `frontierNodes` to re-root the same
 traversal call one level further; `explorationBudget` → response includes
 an opaque `resumeToken` encoding visited-set + frontier queue, since budget
-is spent across the whole traversal rather than per-node.
+is spent across the whole traversal rather than per-node. That state is
+cumulative across an entire resume chain (each call reseeds from everything
+returned so far, see `graph::resume_token::ResumeState`'s doc comment), so
+the token grows every call - on real (32-hex-char) ids, a single budget
+cutoff alone reaches the hundreds of KB. `resumeToken` is gzipped before
+base64 for exactly that reason (measured ~2.3x smaller); it is well short of
+the 64 MiB NDJSON frame limit either way, but it is retransmitted by the
+caller on every hop of a chain, so keeping it small matters for an LLM
+agent's context budget even though nothing rejects the request outright.
 
 An import that resolved to nothing is still reported as a dependency —
 `get_dependencies` answers what a file depends on, and "on a package we do
