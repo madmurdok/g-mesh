@@ -36,6 +36,21 @@ async function cleanup(root: string): Promise<void> {
   await fs.rm(root, { recursive: true, force: true });
 }
 
+/** A symlink inside a fixture. `makeProject` only knows about regular files, and
+ * deliberately stays that way (every other test here wants a plain tree), so the
+ * symlink cases add the one link they are about on top of the tree it built. */
+async function symlink(root: string, linkRelPath: string, target: string): Promise<void> {
+  const linkAbs = path.join(root, linkRelPath);
+  await fs.mkdir(path.dirname(linkAbs), { recursive: true });
+  await fs.symlink(target, linkAbs);
+}
+
+async function walkedPaths(root: string): Promise<string[]> {
+  const files: string[] = [];
+  for await (const rel of walkProjectFiles(root)) files.push(rel);
+  return files;
+}
+
 /** Every field the wire contract (core/src/protocol/types.rs) requires,
  * checked without invoking any Rust code - see the ticket report for why
  * this structural check was chosen over a cross-process Rust conformance
@@ -341,6 +356,111 @@ test("accepts a real NodeJS.WritableStream sink, one write() call per line", asy
     for (const line of lines) {
       assertConformsToWireShape(JSON.parse(line));
     }
+  } finally {
+    await cleanup(root);
+  }
+});
+
+// --- symlink policy (task 87) ---------------------------------------------
+
+test("a symlinked package directory is walked, and indexed under its own apparent path", async () => {
+  const root = await makeProject({
+    "vendor/real-lib/index.ts": `export const shared = 1;\n`,
+  });
+  try {
+    // Nothing else lives at packages/aliased: the only way "index.ts" is
+    // reachable there is by following the link.
+    await symlink(root, "packages/aliased", "../vendor/real-lib");
+    assert.deepEqual(await walkedPaths(root), ["packages/aliased/index.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+/**
+ * The maybe-surprising half of "index a real location exactly once": the winner
+ * is whichever path the sorted, depth-first walk reaches first, and that can be
+ * the *symlink*. Here `packages/` sorts before `vendor/`, so the alias is
+ * reached first and claims the directory, and the real path is dropped outright
+ * rather than being preferred for being real or merged onto the alias.
+ *
+ * This is correct, not a bug to "fix" later: a file's identity in this index is
+ * the project-relative path it was reached by, so there is no canonical path to
+ * prefer - only a deterministic rule for picking one of two, which is what the
+ * sort makes it.
+ */
+test("two paths onto the same real directory index it exactly once, sorted-first path winning even when that is the symlink", async () => {
+  const root = await makeProject({
+    "vendor/shared/thing.ts": `export const thing = 1;\n`,
+  });
+  try {
+    await symlink(root, "packages/dup", "../vendor/shared");
+    assert.deepEqual(await walkedPaths(root), ["packages/dup/thing.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlinked file aliasing an already-walked real file is skipped, not indexed twice", async () => {
+  const root = await makeProject({
+    "src/index.ts": `export const x = 1;\n`,
+  });
+  try {
+    // Named to sort *after* index.ts on purpose: the real file is reached first
+    // and claims the location, so the alias is the one dropped. Named
+    // "alias.ts" instead, the same rule would flip the winner - which is the
+    // point of the test above, and why this one pins the ordering explicitly
+    // rather than implying links always lose.
+    await symlink(root, "src/zalias.ts", "./index.ts");
+    const files = await walkedPaths(root);
+    assert.ok(files.includes("src/index.ts"), "the real file must still be indexed");
+    assert.ok(!files.includes("src/zalias.ts"), "the alias must not be indexed a second time");
+    assert.deepEqual(files, ["src/index.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlink pointing back at its own containing directory does not loop forever", async () => {
+  const root = await makeProject({
+    "cycle/a.ts": `export const a = 1;\n`,
+  });
+  try {
+    // A genuine cycle: cycle/loop resolves to cycle itself, which the walk has
+    // already claimed by the time it looks at this entry. If the guard were
+    // missing, this test would hang rather than fail - the runner's own timeout
+    // is the assertion.
+    await symlink(root, "cycle/loop", ".");
+    assert.deepEqual(await walkedPaths(root), ["cycle/a.ts"]);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("a symlink resolving outside the project root is refused", async () => {
+  const root = await makeProject({ "src/index.ts": `export const x = 1;\n` });
+  const outsideRoot = await makeProject({ "outside/secret.ts": `export const secret = 1;\n` });
+  try {
+    await symlink(root, "packages/escape", path.join(outsideRoot, "outside"));
+    const files = await walkedPaths(root);
+    assert.ok(
+      files.every((rel) => !rel.startsWith("packages/escape")),
+      `nothing outside the project may be indexed, got ${JSON.stringify(files)}`,
+    );
+    assert.deepEqual(files, ["src/index.ts"]);
+  } finally {
+    await cleanup(root);
+    await cleanup(outsideRoot);
+  }
+});
+
+test("a dangling symlink is skipped rather than throwing", async () => {
+  const root = await makeProject({ "src/index.ts": `export const x = 1;\n` });
+  try {
+    await symlink(root, "packages/broken", "./does-not-exist");
+    const files = await walkedPaths(root);
+    assert.ok(files.every((rel) => !rel.startsWith("packages/broken")));
+    assert.deepEqual(files, ["src/index.ts"]);
   } finally {
     await cleanup(root);
   }

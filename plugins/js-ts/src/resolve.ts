@@ -299,6 +299,18 @@ export function createSpecifierResolver(
  * underneath it. The bulk index is a one-shot process, so one instance covers
  * the whole walk; the long-lived plugin builds a fresh one per changed file
  * (see `reparseChangedFile`), so a file created since the last edit is seen.
+ *
+ * One known, deliberately out-of-scope gap (task 87): this has no notion of
+ * which of two real-path-aliased paths a walk's own traversal order already
+ * claimed (see symlinks.ts - when a directory is reachable both directly and
+ * through a symlink, only the first path reached is indexed). A candidate naming
+ * the *losing* path still stats fine and is reported as existing, so the edge is
+ * claimed resolved against a path that never became a `File` node and stays
+ * unlinked instead of eventually catching up. Narrow by construction: it needs a
+ * specifier that resolves through the aliased spelling rather than the indexed
+ * one. Closing it would mean making specifier resolution walk-order-aware, a
+ * materially bigger change than making the walk and the workspace-glob
+ * expansion agree with each other, which is all task 87 set out to do.
  */
 export function createProjectFileExists(projectRoot: string): FileExists {
   const memo = new Map<string, boolean>();
