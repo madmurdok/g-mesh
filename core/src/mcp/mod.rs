@@ -88,7 +88,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_references",
-        description = "List every place a symbol is referenced, across the whole project. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
+        description = "List every place a symbol is referenced, across the whole project."
     )]
     async fn find_references(
         &self,
@@ -97,25 +97,19 @@ impl GMeshMcpServer {
         find_references::handle(&self.conn, params.0)
     }
 
-    #[tool(
-        name = "find_callers",
-        description = "List the functions that call the given function. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
-    )]
+    #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
         find_callers_callees::handle_callers(&self.conn, params.0)
     }
 
-    #[tool(
-        name = "find_callees",
-        description = "List the functions the given function calls. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
-    )]
+    #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
         find_callers_callees::handle_callees(&self.conn, params.0)
     }
 
     #[tool(
         name = "find_implementations",
-        description = "List the types that implement or extend the given interface, base class or abstract type. Anchor it with `symbol_name` to skip the `find_definition` call, or with a `symbol_id` you already have."
+        description = "List the types that implement or extend the given interface, base class or abstract type."
     )]
     async fn find_implementations(
         &self,
