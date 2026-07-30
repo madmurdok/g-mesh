@@ -302,8 +302,15 @@ export function extractIncremental(
 interface Scope {
   readonly prefix: string;
   readonly namespacePrefix: string;
-  /** Nearest enclosing Function node - the `from` of CALLS edges. */
-  readonly enclosingFunctionId: string | null;
+  /**
+   * The `from` of CALLS edges written here: the nearest enclosing Function
+   * node, or - inside a function expression that has no node of its own (a
+   * callback argument, an object-literal property value, an object-literal
+   * method) - the nearest enclosing declared symbol, which may be a Variable
+   * or a Type. See [`Extractor.callerFallback`]. Null only at module top
+   * level, where a call is made by nothing and degrades to a usage edge.
+   */
+  readonly enclosingCallerId: string | null;
   /** Nearest enclosing symbol (or the File) - the `from` of REFERENCES edges. */
   readonly enclosingSymbolId: string;
   /** qualifiedName of the enclosing class/interface, for `this.m()`. */
@@ -356,7 +363,18 @@ function qualify(prefix: string, name: string, separator: MemberSeparator = ".")
 }
 
 const CLASS_TYPES = new Set(["class_declaration", "abstract_class_declaration", "class"]);
-const FUNCTION_VALUE_TYPES = new Set(["arrow_function", "function_expression"]);
+
+/**
+ * Every way of writing a function as an *expression*. A declaration position
+ * (a `const`, a class field, `export default`) turns one of these into a
+ * Function node; anywhere else it is an unnamed function whose body is still
+ * walked, see the `visit` cases mirroring this set.
+ */
+const FUNCTION_VALUE_TYPES = new Set([
+  "arrow_function",
+  "function_expression",
+  "generator_function",
+]);
 
 class Extractor {
   private readonly nodes = new Map<string, ExtractedNode>();
@@ -392,7 +410,7 @@ class Extractor {
     const scope: Scope = {
       prefix: "",
       namespacePrefix: "",
-      enclosingFunctionId: null,
+      enclosingCallerId: null,
       enclosingSymbolId: this.fileNode.id,
       enclosingTypeQName: null,
       supertypeNames: [],
@@ -543,6 +561,20 @@ class Extractor {
         return;
       case "formal_parameters":
         this.visitParameters(node, scope);
+        return;
+      // A function expression in any position a declaration handler did not
+      // already claim: a callback argument (`.map(x => ...)`,
+      // `setTimeout(() => ...)`), an object-literal property value
+      // (`register({ perform: () => ... })`), an IIFE, an element of an array
+      // literal. It gets no node of its own - it has no name to hang one on,
+      // and a positional one would not survive an edit above it - but its
+      // body is a function body, so its locals stay out of the graph and its
+      // calls are attributed to the symbol it was written into rather than
+      // dropped. Mirrors `FUNCTION_VALUE_TYPES`.
+      case "arrow_function":
+      case "function_expression":
+      case "generator_function":
+        this.visitFunctionParts(node, scope);
         return;
       case "call_expression":
         this.handleCall(node, scope);
@@ -799,7 +831,7 @@ class Extractor {
     const memberScope: Scope = {
       ...scope,
       prefix: qualifiedName,
-      enclosingFunctionId: null,
+      enclosingCallerId: null,
       enclosingSymbolId: classNode.id,
       enclosingTypeQName: qualifiedName,
       supertypeNames,
@@ -843,7 +875,7 @@ class Extractor {
     const memberScope: Scope = {
       ...scope,
       prefix: qualifiedName,
-      enclosingFunctionId: null,
+      enclosingCallerId: null,
       enclosingSymbolId: typeNode.id,
       enclosingTypeQName: qualifiedName,
       supertypeNames,
@@ -1072,19 +1104,54 @@ class Extractor {
     this.visitFunctionParts(node, {
       ...scope,
       prefix: fn.qualifiedName,
-      enclosingFunctionId: fn.id,
+      enclosingCallerId: fn.id,
       enclosingSymbolId: fn.id,
       insideFunction: true,
     });
   }
 
+  /**
+   * Walks the parts of any function - one with a node of its own or an
+   * unnamed expression - as a function body: its locals stay out of the
+   * graph, and a call written in it is attributed to `enclosingCallerId`,
+   * which [`callerFallback`] supplies when the function has no node.
+   */
   private visitFunctionParts(node: SyntaxNode, scope: Scope): void {
-    const bodyScope: Scope = { ...scope, insideFunction: true };
+    const bodyScope: Scope = {
+      ...scope,
+      insideFunction: true,
+      enclosingCallerId: scope.enclosingCallerId ?? this.callerFallback(scope),
+    };
     this.visitField(node, "type_parameters", bodyScope);
     const parameters = node.childForFieldName("parameters");
     if (parameters) this.visitParameters(parameters, bodyScope);
     this.visitField(node, "return_type", bodyScope);
     this.visitField(node, "body", bodyScope);
+  }
+
+  /**
+   * Who a call made inside an unnamed function is attributed to, i.e. the
+   * `from` of its CALLS edge when the function itself is not a node: the
+   * nearest enclosing declared symbol - the `const` the callback was written
+   * into, the class whose field holds it - which is the symbol a reader would
+   * name as the caller, and the only stable identity available (an anonymous
+   * function has no name, and a positional one would break the rule that node
+   * ids survive edits elsewhere in the file, see [`nodeIdFor`]).
+   *
+   * Widening the `from` of a CALLS edge past `Function` is deliberate: the
+   * alternative - keeping the edge kind pure and dropping it - is what made
+   * `find_callers` silently omit every caller whose call site sits in a
+   * callback or an object-literal property value, which in idiomatic JS/TS is
+   * most of them. Nothing downstream constrains that end: core's linking pass
+   * only ever demands a kind of the *target* (`graph::symbol_links`), and
+   * `find_callers` reports whatever node it finds there, kind included.
+   *
+   * The File itself is the one symbol that does not count: a call written at
+   * module top level is made by nothing, so it keeps degrading to a usage
+   * edge (see [`resolveCall`]).
+   */
+  private callerFallback(scope: Scope): string | null {
+    return scope.enclosingSymbolId === this.fileNode.id ? null : scope.enclosingSymbolId;
   }
 
   /** Parameter names are bindings, not references; only their types and default values are. */
@@ -1202,12 +1269,14 @@ class Extractor {
   private resolveCall(call: PendingCall): void {
     const target = this.lookupCallTarget(call);
 
-    if (target?.kind === "Function" && call.scope.enclosingFunctionId !== null) {
-      this.addEdge(call.scope.enclosingFunctionId, "CALLS", target.id);
+    if (target?.kind === "Function" && call.scope.enclosingCallerId !== null) {
+      this.addEdge(call.scope.enclosingCallerId, "CALLS", target.id);
       return;
     }
-    // CALLS is Function -> Function by definition, so a call from module
-    // top level degrades to a usage edge from the File node.
+    // What a CALLS edge points *at* is always a Function, and it is always
+    // made from inside some function ([`callerFallback`] names which symbol
+    // that is when the function has no node). A call at module top level is
+    // neither, so it degrades to a usage edge from the File node.
     if (target) {
       this.addUsage(target, call.scope);
       return;
@@ -1219,11 +1288,11 @@ class Extractor {
       const imported = this.importedSymbol(call.name);
       if (imported === undefined) {
         this.resolveReference(call.name, call.scope);
-      } else if (call.scope.enclosingFunctionId !== null) {
-        this.addEdge(call.scope.enclosingFunctionId, "CALLS", imported.id);
+      } else if (call.scope.enclosingCallerId !== null) {
+        this.addEdge(call.scope.enclosingCallerId, "CALLS", imported.id);
       } else {
-        // Same rule as above: CALLS is Function -> Function by definition, so
-        // a call written at module top level degrades to a usage edge.
+        // Same rule as above: a call written at module top level is made by
+        // nothing, so it degrades to a usage edge.
         this.addUsage(imported, call.scope);
       }
     }
