@@ -43,6 +43,21 @@ pub fn resolve_page_size(limit: Option<u32>) -> usize {
 /// produces, so normal calls never notice this exists.
 pub const MAX_RESPONSE_BYTES: usize = 20_000;
 
+/// The `kind` value a `File` node carries. A `File` node's `qualifiedName`
+/// IS its own project-relative path by construction - see
+/// `plugins/js-ts/src/extract.ts`'s `run()`, which sets
+/// `qualifiedName: this.filePath` for the node it emits for the file itself
+/// - so it is byte-identical to that same row's `filePath` in every case,
+/// never worth sending twice. Its `startLine`/`startCol` are likewise
+/// always the file's own root syntax node position (`(0, 0)`), meaningless
+/// as a "where in this file" answer. Neither redundancy holds for any other
+/// kind (`Function`, `Type`, ...): a symbol's `qualifiedName` is genuinely
+/// different information from its containing file's `filePath`, and its
+/// `startLine`/`startCol` is a real, useful position. `find_references`,
+/// `find_callers`/`find_callees`, and `find_implementations` all key off
+/// this constant to omit the redundant fields for `File`-kind rows only.
+pub const FILE_KIND: &str = "File";
+
 /// One row a caller has already enriched from a [`ScoredEdge`] (typically by
 /// resolving its other endpoint into a wire-shaped `T`), carrying back just
 /// enough of the original edge - `resolved`, `locality`, and the edge's own

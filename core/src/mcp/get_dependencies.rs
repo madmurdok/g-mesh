@@ -65,12 +65,15 @@ const DEFAULT_MAX_DEPTH: u32 = 2;
 /// make. The edge list the walk collects is left out for the same reason it
 /// isn't needed here - impact analysis asks which files an edit reaches, not
 /// by which route.
+///
+/// No `name` field: it never carries information `qualifiedName` doesn't
+/// already have (at worst a shorter, less unique view of the same symbol) -
+/// same rule the single-hop tools' row shapes follow.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DependencyNode {
     id: String,
     kind: String,
-    name: String,
     qualified_name: String,
     /// The file this dependency *is*, and null when it is not one. An import
     /// `graph::imports` could not link - a package, or a relative path with
@@ -93,7 +96,6 @@ impl From<ReachedNode> for DependencyNode {
         Self {
             id: r.node.id,
             kind: r.node.kind,
-            name: r.node.name,
             qualified_name: r.node.qualified_name,
             file_path,
             depth: r.depth,
@@ -454,6 +456,24 @@ mod tests {
         let files: Vec<&str> =
             rows.iter().filter(|r| r["kind"] == "File").map(|r| r["filePath"].as_str().unwrap()).collect();
         assert_eq!(files, vec!["b.rs", "c.rs"], "real files are still addressed by their own path");
+    }
+
+    /// `name` never carries information `qualifiedName` doesn't already have
+    /// (at worst a shorter, less unique view of the same symbol) - dropped
+    /// entirely from every row, real file and unresolved-module placeholder
+    /// alike.
+    #[test]
+    fn no_row_carries_a_name_field() {
+        let mut conn = import_chain();
+        upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
+        imports(&mut conn, "a.rs", "mod_zod");
+
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let rows = body["results"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert!(row.get("name").is_none(), "the name field must never be present on any row: {row}");
+        }
     }
 
     #[test]
