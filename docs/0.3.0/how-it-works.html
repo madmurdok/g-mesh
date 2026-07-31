@@ -1227,18 +1227,31 @@ sequenceDiagram
       if (stored) return stored;
       return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
     }
+    // Raw diagram sources are captured once, into this closure-local array -
+    // never onto the DOM as a data-* attribute. If the page is ever saved or
+    // exported after mermaid has run (which replaces each pre's content with
+    // rendered SVG and stamps data-processed="true"), a DOM-attribute copy of
+    // the source would get serialized as flattened, newline-stripped HTML
+    // attribute text and silently corrupt the diagram in the saved copy.
+    var rawSources = null;
+    function captureRawSources() {
+      rawSources = Array.prototype.map.call(
+        document.querySelectorAll("pre.mermaid"),
+        function (el) { return el.textContent; }
+      );
+    }
     function applyMermaidTheme() {
       if (typeof mermaid === "undefined") return;
+      if (rawSources === null) captureRawSources();
       mermaid.initialize({
         startOnLoad: false,
         theme: currentTheme() === "dark" ? "dark" : "neutral",
         securityLevel: "loose",
         fontFamily: "ui-monospace, SF Mono, Consolas, monospace"
       });
-      document.querySelectorAll("pre.mermaid").forEach(function (el) {
-        if (!el.dataset.raw) el.dataset.raw = el.textContent;
+      document.querySelectorAll("pre.mermaid").forEach(function (el, i) {
         el.removeAttribute("data-processed");
-        el.textContent = el.dataset.raw;
+        el.textContent = rawSources[i];
       });
       mermaid.run({ querySelector: "pre.mermaid" });
     }
