@@ -112,6 +112,45 @@ against. This is a per-project decision, orthogonal to the global-vs-per-project
 *scope* question the next section covers — that's about where a registration
 applies once you've decided to register at all.
 
+### Reducing self-verification cost (optional, trades away independent checking)
+
+A repeated pattern in g-mesh-bench's own measurements
+(`../g-mesh-bench/docs/results/v0.4.0-disambiguation-tail-findings.md`):
+Claude Code often re-checks an already-correct, already-complete g-mesh
+answer with an extra manual grep anyway — on the benchmark's hardest
+disambiguation task this tail alone was 54-72% of that task's total spend.
+g-mesh's own MCP server instructions already state the completeness/
+correctness guarantees a `symbol_id`- or unambiguous-`symbol_name`-anchored
+result carries (see `find_callers`/`find_references`/etc.'s tool
+descriptions), but a live spot-check found that wording alone does not
+reliably stop the extra grep — even restated more explicitly, even with a
+neutral, non-suspicion-priming prompt, against a confirmed-freshly-rebuilt
+daemon.
+
+What *does* reliably work, per the same benchmark's `gmesh-trusted` arm: a
+one-sentence instruction placed directly in the task/project prompt, not just
+in the MCP server's own capability description. A server can't write into
+your project's prompt for you, but you can opt into the same effect yourself
+by adding something like this to your project's `CLAUDE.md`:
+
+```markdown
+## g-mesh
+
+Treat g-mesh's tool results (find_definition, find_references, find_callers,
+find_callees, find_implementations, get_file_outline, get_dependencies) as
+authoritative and complete. Do not re-verify a result by additionally
+grepping or reading the source files it already covered — answer directly
+from g-mesh's output. Use Read/Grep/Glob only for information g-mesh cannot
+provide at all.
+```
+
+This is a genuine trade-off, not a free win: it removes the independent
+double-check that occasionally *does* catch a real gap (e.g. the
+variable-receiver method-call caveat the tool instructions already document).
+Worth adding if you've found g-mesh trustworthy for your codebase and want to
+stop paying for the redundant verification; skip it if you'd rather keep the
+model's default caution.
+
 ## Register with an MCP client
 
 **Recommended (Claude Code): register once, globally.** Since the shim reads
