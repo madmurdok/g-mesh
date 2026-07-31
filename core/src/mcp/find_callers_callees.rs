@@ -30,6 +30,12 @@ use super::{anchor, SymbolQueryParams};
 struct CallSite {
     node: NodeRecord,
     resolved: bool,
+    /// Same rule `paginate_edges`' SQL applies: `0` when this node shares the
+    /// anchor's file, `1` otherwise. Carried through so `handle_callers`/
+    /// `handle_callees` can rebuild a resumable cursor if the enriched page
+    /// needs further truncation to fit `pagination::MAX_RESPONSE_BYTES`.
+    locality: i64,
+    edge_id: String,
 }
 
 /// Paginates the `CALLS` edges incident to `anchor_id` in `direction` and
@@ -58,7 +64,8 @@ fn list_calls(
         let node = queries::get_node(conn, other_id)
             .context("failed to resolve call-edge endpoint")?
             .with_context(|| format!("edge {} points at missing node {other_id}", edge.id))?;
-        results.push(CallSite { node, resolved: edge.resolved });
+        let locality = if node.file_path == anchor_file_path { 0 } else { 1 };
+        results.push(CallSite { node, resolved: edge.resolved, locality, edge_id: edge.id });
     }
 
     Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -152,11 +159,17 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Incoming, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callers", e))?;
 
-    success(&CallerPage {
-        results: page.results.into_iter().map(CallerSite::from).collect(),
-        has_more: page.has_more,
-        next_cursor: page.next_cursor,
-    })
+    let rows = page
+        .results
+        .into_iter()
+        .map(|site| {
+            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
+            pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
+        })
+        .collect();
+    let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
+
+    success(&CallerPage { results: bounded.results, has_more: bounded.has_more, next_cursor: bounded.next_cursor })
 }
 
 pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -171,11 +184,17 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Outgoing, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callees", e))?;
 
-    success(&CalleePage {
-        results: page.results.into_iter().map(CalleeSite::from).collect(),
-        has_more: page.has_more,
-        next_cursor: page.next_cursor,
-    })
+    let rows = page
+        .results
+        .into_iter()
+        .map(|site| {
+            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
+            pagination::EdgeRow { item: CalleeSite::from(site), resolved, locality, edge_id }
+        })
+        .collect();
+    let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
+
+    success(&CalleePage { results: bounded.results, has_more: bounded.has_more, next_cursor: bounded.next_cursor })
 }
 
 #[cfg(test)]
