@@ -190,11 +190,7 @@ fn bound_walk(
         }
     }
 
-    let fits = |n: usize| -> bool {
-        serde_json::to_vec(&dtos[..n]).map(|v| v.len()).unwrap_or(usize::MAX) <= pagination::MAX_RESPONSE_BYTES
-    };
-
-    if fits(dtos.len()) {
+    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
         return DependencyWalk {
             results: dtos,
             truncated: result.truncated,
@@ -202,23 +198,7 @@ fn bound_walk(
             frontier_nodes: result.frontier_nodes,
             resume_token: result.resume_token,
         };
-    }
-
-    // Longest prefix that still fits - `dtos` is non-empty here (an empty
-    // slice always "fits", so that case already returned above), and at
-    // least one row always survives even if it alone exceeds the budget: a
-    // resume token with no progress behind it would just loop forever.
-    let mut lo = 1usize;
-    let mut hi = dtos.len();
-    while lo < hi {
-        let mid = lo + (hi - lo + 1) / 2;
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let cut = lo;
+    };
 
     let mut visited = prior_visited;
     if let Some(id) = anchor_id {
