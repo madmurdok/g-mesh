@@ -11,8 +11,12 @@
 //!
 //! - **Daemon core**: the pid in `daemon.pid` plus whether anything is
 //!   accepting connections on the socket. Both, because either alone lies in
-//!   a way the other catches - a recycled pid looks alive, and a daemon still
-//!   in its cold-start bulk walk has not bound its socket yet.
+//!   a way the other catches - a recycled pid looks alive, and a socket file
+//!   outlives the process that bound it. Note that "running" no longer
+//!   implies "ready to answer": since task 105 the socket is bound before the
+//!   cold-start walk, so a daemon can be running, listening, and still
+//!   answering every tool call with "still indexing" - which is what the
+//!   `index:` line below reports on.
 //! - **Daemon build**: the stamp a live daemon publishes about the executable
 //!   it started from (`daemon::build_stamp`), compared with this command's
 //!   own. A daemon that outlived an upgrade answers every query correctly
@@ -63,10 +67,17 @@ const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreState {
-    /// Its pid is alive and it is accepting connections.
+    /// Its pid is alive and its socket is bound. Says nothing about whether
+    /// the index behind it is complete - a daemon in its cold-start walk
+    /// binds first and reports itself as still indexing per call (task 105).
+    /// `render` cross-references this with `IndexStatus::bulk_indexed` (task
+    /// 108) so a walk in progress reads as exactly that, not as a stuck
+    /// daemon next to an unrelated-looking "cold start still owed" line.
     Running { pid: u32 },
-    /// Its pid is alive but nothing answers on the socket - a daemon still
-    /// working through its cold-start bulk walk, or a wedged one.
+    /// Its pid is alive but nothing answers on the socket. Since the bind
+    /// moved ahead of the cold-start walk this no longer covers a daemon that
+    /// is merely busy indexing - it means one that died without clearing its
+    /// pid file, or a wedged one.
     NotAccepting { pid: u32 },
     /// No live daemon, whatever `daemon.pid` may still say.
     NotRunning,
@@ -195,10 +206,10 @@ fn core_state(project_root: &Path) -> Result<CoreState> {
 /// Compares the running daemon's published build with this command's own.
 ///
 /// `NotAccepting` is compared like `Running` rather than skipped: the stamp is
-/// published before the socket is bound (see `daemon::run`), so a daemon still
-/// working through its cold-start walk has already said which build it is -
-/// and that is exactly when someone is most likely to be asking why an
-/// upgrade has not taken effect.
+/// published before the socket is bound (see `daemon::run`), so even a daemon
+/// that has not got as far as binding has already said which build it is - and
+/// a daemon that is up but not answering is exactly when someone is most
+/// likely to be asking why an upgrade has not taken effect.
 ///
 /// Infallible, unlike its neighbours: every failure along the way - no
 /// executable to stat, no stamp on disk, an unreadable one - is the same
@@ -422,8 +433,19 @@ pub fn render(report: &Report) -> String {
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
 
     let index = &report.index;
+    // A daemon in its cold-start walk binds its socket and answers "still
+    // indexing" per call (task 105) well before `bulk_indexed` flips - so
+    // `!bulk_indexed` alone no longer means "nothing is happening about this".
+    // Cross-referencing `report.core` is what tells "a walk is under way right
+    // now" apart from "no daemon is doing anything about this at all", which
+    // is the only case that still means "still owed".
+    let daemon_alive = !matches!(report.core, CoreState::NotRunning);
     if !index.bulk_indexed {
-        let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
+        if daemon_alive {
+            let _ = writeln!(out, "  index:           building now - first walk in progress, nothing to restart");
+        } else {
+            let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
+        }
     }
     let _ = writeln!(
         out,
@@ -432,7 +454,11 @@ pub fn render(report: &Report) -> String {
         index.indexed,
         index.discovered
     );
-    let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
+    if !index.bulk_indexed && daemon_alive {
+        let _ = writeln!(out, "  dirty files:     {} awaiting the walk already in progress", index.dirty);
+    } else {
+        let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
+    }
 
     if index.syntax_error_files.is_empty() {
         let _ = writeln!(out, "  syntax errors:   none");
@@ -727,6 +753,44 @@ mod tests {
         assert!(rendered.contains("src/broken.ts"), "{rendered}");
     }
 
+    /// Task 108: a daemon mid-cold-start-walk (task 105 already made it
+    /// reachable and answering, not merely running) must not be reported next
+    /// to a line implying nothing is happening or that a restart is owed - the
+    /// walk already in progress is exactly what would do the work a "cold
+    /// start still owed" reading would suggest is missing.
+    #[test]
+    fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_owed() {
+        let report = Report {
+            project_root: PathBuf::from("/tmp/project"),
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            core: CoreState::Running { pid: 4242 },
+            build: BuildState::Current,
+            plugin: PluginState::Active { pid: 4243 },
+            last_used: None,
+            index: IndexStatus {
+                bulk_indexed: false,
+                discovered: 4,
+                indexed: 1,
+                dirty: 3,
+                syntax_error_files: Vec::new(),
+            },
+        };
+
+        let rendered = render(&report);
+
+        assert!(rendered.contains("running (pid 4242)"), "{rendered}");
+        assert!(rendered.contains("building now"), "{rendered}");
+        assert!(
+            !rendered.contains("cold start is still owed"),
+            "a live daemon is already doing the walk this line would suggest is missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("3 awaiting the walk already in progress"),
+            "the dirty count must not read as work nobody is doing:\n{rendered}"
+        );
+    }
+
     #[test]
     fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         let report = Report {
@@ -781,8 +845,8 @@ mod tests {
         build_stamp::write(&daemon::build_stamp_path_in(state.path()), &ours).unwrap();
 
         assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
-        // Still comparable while it works through its cold-start walk: the
-        // stamp is published before the socket is bound, not after.
+        // Still comparable for a daemon that is up but not answering on its
+        // socket: the stamp is published before the bind, not after.
         assert_eq!(
             build_state(CoreState::NotAccepting { pid: 1 }, state.path()),
             BuildState::Current

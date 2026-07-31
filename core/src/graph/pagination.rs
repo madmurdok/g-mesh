@@ -55,10 +55,10 @@ pub struct EdgeRow<T> {
     pub edge_id: String,
 }
 
-/// Longest prefix of `items` whose serialized JSON stays within `budget`
-/// bytes, found by binary search on the cut point rather than a linear scan
-/// - a handful of `serde_json::to_vec` calls on the whole candidate page
-/// instead of one per row. Returns `None` when the whole slice already fits
+/// Longest prefix of `items` whose serialized JSON stays within `budget` bytes,
+/// found by binary search on the cut point rather than a linear scan (a
+/// handful of `serde_json::to_vec` calls on the whole candidate page instead
+/// of one per row). Returns `None` when the whole slice already fits
 /// (including the empty slice, which always fits) - the caller's signal that
 /// nothing needed cutting. `Some(cut)` is never `Some(0)`, even when a single
 /// item alone exceeds `budget`: a caller building a continuation cursor from
@@ -72,8 +72,8 @@ pub struct EdgeRow<T> {
 /// Shared by [`bound_page`] and `mcp::get_dependencies::bound_walk`, which
 /// cut different row shapes (`EdgeRow<T>`'s `item`, `DependencyNode`) against
 /// the same [`MAX_RESPONSE_BYTES`] budget and then build different kinds of
-/// continuation (a structural cursor vs. a resume token) from the cut point
-/// - only the search itself was ever identical between them.
+/// continuation (a structural cursor vs. a resume token) from the cut point -
+/// only the search itself was ever identical between them.
 pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Option<usize> {
     let fits = |n: usize| -> bool {
         serde_json::to_vec(&items[..n]).map(|v| v.len()).unwrap_or(usize::MAX) <= budget
@@ -86,7 +86,7 @@ pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Optio
     let mut lo = 1usize;
     let mut hi = items.len();
     while lo < hi {
-        let mid = lo + (hi - lo + 1) / 2;
+        let mid = lo + (hi - lo).div_ceil(2);
         if fits(mid) {
             lo = mid;
         } else {
@@ -224,6 +224,10 @@ pub struct ScoredEdge {
 /// scope, search the whole project" for existing callers to see no behavior
 /// change, and an empty slice is the only spelling of "no scope" that doesn't
 /// need a separate sentinel.
+// Eight independently-meaningful parameters, each already documented above;
+// grouping them into a struct would only move the same list one level of
+// indirection away from its three call sites without shortening it.
+#[allow(clippy::too_many_arguments)]
 pub fn paginate_edges(
     conn: &Connection,
     anchor_node_id: &str,

@@ -1,6 +1,7 @@
 pub mod build_stamp;
 pub mod bulk_index;
 pub mod identity;
+pub mod indexing_status;
 pub mod plugin;
 
 use std::fs::{self, File, TryLockError};
@@ -10,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::plugin::PluginProcess;
 use crate::gc::last_used;
 use crate::mcp;
@@ -125,11 +127,27 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
-/// version), builds the initial index if the project has never been walked
-/// (`bulk_index`), registers the file watcher, and serves an MCP session per
-/// connection on the project's AF_UNIX socket. Simplified MVP lifecycle -
-/// runs until killed; the two-tier idle-timeout model and `g-mesh stop` are
-/// backlog.
+/// version), binds the project's AF_UNIX socket, builds the initial index if
+/// the project has never been walked (`bulk_index`), registers the file
+/// watcher, and serves an MCP session per connection. Simplified MVP
+/// lifecycle - runs until killed; the two-tier idle-timeout model and
+/// `g-mesh stop` are backlog.
+///
+/// # Why the socket is bound before the index exists
+///
+/// It used to be bound after the cold-start walk, so that a client could not
+/// reach a daemon whose graph was half built. Task 105 moved it ahead of the
+/// walk and put the same guarantee in the response layer instead: an accepted
+/// connection is answered with an explicit "still indexing" tool error until
+/// the walk commits (see `daemon::indexing_status`, which carries the full
+/// argument). Nobody is served off a partial graph either way; the difference
+/// is that a walk longer than `shim::BOOTSTRAP_TIMEOUT` now costs the caller a
+/// retry instead of costing it its whole tool surface.
+///
+/// The bind is deliberately the *first* slow-ish thing that happens, ahead of
+/// even the plugin spawn: the shim's bootstrap budget is a race against the
+/// socket appearing, and nothing the daemon does at startup should be allowed
+/// to grow into that budget again.
 ///
 /// Unix-only for now: AF_UNIX is available on Windows 10+ but is not wired
 /// up here (see the architecture doc's shim/daemon section).
@@ -197,6 +215,28 @@ pub fn run(root: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
 
+    let socket = dir.join(SOCKET_FILE);
+    // A socket file left behind by a crashed daemon makes bind() fail with
+    // AddrInUse forever, so it is cleared first. That is only safe because
+    // the singleton lock above guarantees no other daemon is serving this
+    // project: any socket file still here belongs to a dead one.
+    let _ = fs::remove_file(&socket);
+    // Bound here, before the plugin and long before the bulk walk: from this
+    // point a shim's `connect()` succeeds (the kernel queues it on the
+    // listener's backlog until the accept loop below is up), which is what
+    // its bootstrap timeout is actually waiting for. See this function's doc
+    // comment for what replaced the old "bind last" guarantee.
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
+
+    // Still written immediately after the bind, so "the pid file exists"
+    // continues to mean "something is listening" for `cli::status` and for
+    // the tests that wait on it - it just no longer also means "and the index
+    // is complete", which `meta.bulkIndexedAt` is the record of.
+    let pid_file = dir.join(PID_FILE);
+    fs::write(&pid_file, std::process::id().to_string())
+        .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
+
     // A protocol mismatch (or the plugin failing to start at all) is a hard
     // daemon-startup failure, matching handshake::verify's philosophy - there
     // is nothing useful this daemon can do without its plugin.
@@ -211,17 +251,56 @@ pub fn run(root: &Path) -> Result<()> {
         format!("failed to write plugin pid file {}", plugin_pid_file.display())
     })?;
 
+    // Decided from a fact recorded on disk, not from how this start went, so
+    // a restart against an already-walked project (the common case) is `ready`
+    // from its first instant and no caller ever sees "still indexing" for it.
+    let indexing =
+        if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
+
+    // The accept loop moves to a thread of its own so the walk below can run
+    // alongside it. It, not this function, is the daemon's real main loop;
+    // what is left here is finite startup work, and this thread spends the
+    // rest of its life joining on it.
+    let accepting = {
+        let conn = Arc::clone(&conn);
+        let plugin = Arc::clone(&plugin);
+        let indexing = indexing.clone();
+        thread::spawn(move || serve_forever(listener, conn, plugin, indexing))
+    };
+
     // Cold start only, and before the watcher: a bulk walk racing incremental
     // updates could commit its own (older) parse of a file over one the
-    // watcher had just refreshed. Nothing is accepted on the socket until
-    // this returns, so a client's first query is never answered off a half-
-    // built graph. A failure here is fatal for the same reason a failed
-    // plugin handshake is - an empty index that looks like a working one is
-    // worse than a daemon that says why it didn't start - and is recoverable:
-    // the completion marker stays unset, so the next start walks again.
+    // watcher had just refreshed. Connections accepted while this runs are
+    // answered with `mcp`'s "still indexing" error rather than off the batches
+    // committed so far, so a client's query is never answered off a half-built
+    // graph - the same promise the old "bind only once this returns" ordering
+    // made, kept without making the client unreachable to make it. A failure
+    // here is fatal for the same reason a failed plugin handshake is - an
+    // empty index that looks like a working one is worse than a daemon that
+    // says why it didn't start - and is recoverable: the completion marker
+    // stays unset, so the next start walks again. Any client connected at that
+    // moment loses its session when this process exits, which is the honest
+    // outcome: a daemon that stayed up would hold the singleton lock while
+    // serving nothing, and every later shim would find it listening, current,
+    // and reuse it forever.
     if needs_bulk_index {
         let summary = bulk_index::run(&canonical_root, &conn)
             .context("failed to build the project's initial index")?;
+        // Flipped *before* the completion marker is written, and the order
+        // matters. The two facts become true at the same moment - the walk is
+        // over - but they are read by different parties: the flag governs
+        // what this process answers, `bulkIndexedAt` governs whether the
+        // *next* process walks again. Writing the marker second means any
+        // outside observer of it (`cli::status`, the integration tests) can
+        // only ever see it once real answers are already being given; the
+        // other order would let someone read "indexed" off the database and
+        // still be told "still indexing" by the daemon that wrote it.
+        //
+        // Ahead of the watcher for the same reason a project that owed no
+        // walk starts out `ready`: the watcher only ever matters for edits
+        // made after it is registered, so gating answers on it would buy
+        // nothing the fast path does not already do without.
+        indexing.mark_ready();
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
         eprintln!(
@@ -264,35 +343,32 @@ pub fn run(root: &Path) -> Result<()> {
         });
     }
 
-    let socket = dir.join(SOCKET_FILE);
-    // A socket file left behind by a crashed daemon makes bind() fail with
-    // AddrInUse forever, so it is cleared first. That is only safe because
-    // the singleton lock above guarantees no other daemon is serving this
-    // project: any socket file still here belongs to a dead one.
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
-
-    let pid_file = dir.join(PID_FILE);
-    fs::write(&pid_file, std::process::id().to_string())
-        .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
-
-    serve_forever(listener, conn, plugin)
+    // The accept loop outlives every other piece of startup, so joining it is
+    // how this function blocks forever. It only ever returns by failing.
+    match accepting.join() {
+        Ok(result) => result,
+        Err(_) => bail!("the daemon's MCP accept loop panicked"),
+    }
 }
 
 /// Runs the MCP accept loop until the process is killed.
 ///
-/// This is the only async part of the daemon, and deliberately the last thing
-/// that happens: `rmcp` requires tokio, but SQLite, the plugin bridge and the
-/// watcher above have no use for it, so the runtime is entered here rather
-/// than wrapped around a daemon that would otherwise gain nothing from it.
-/// The listener is bound synchronously (above) and only then handed to tokio,
-/// which keeps every bind/pid-file ordering guarantee the bootstrap race
+/// This is the only async part of the daemon, and it is confined to a thread
+/// of its own: `rmcp` requires tokio, but SQLite, the plugin bridge, the
+/// watcher and the bulk walk have no use for it, so the runtime is entered
+/// here rather than wrapped around a daemon that would otherwise gain nothing
+/// from it. The listener is bound synchronously by [`run`] and only then
+/// handed to tokio, which keeps the bind/pid-file ordering the bootstrap race
 /// depends on exactly where it was.
+///
+/// `indexing` is cloned into every accepted session, which is what lets a
+/// connection made during the cold-start walk be answered honestly rather
+/// than refused - see `daemon::indexing_status`.
 fn serve_forever(
     listener: UnixListener,
     conn: Arc<Mutex<Connection>>,
     plugin: Arc<PluginProcess>,
+    indexing: IndexingStatus,
 ) -> Result<()> {
     // Two workers: connections are few (one per MCP client) and their work is
     // dominated by a mutex-guarded SQLite handle, so more threads would only
@@ -317,8 +393,9 @@ fn serve_forever(
                 .context("failed to accept a daemon connection")?;
             let conn = Arc::clone(&conn);
             let plugin = Arc::clone(&plugin);
+            let indexing = indexing.clone();
             tokio::spawn(async move {
-                if let Err(err) = mcp::serve_connection(stream, conn, plugin).await {
+                if let Err(err) = mcp::serve_connection(stream, conn, plugin, indexing).await {
                     eprintln!("g-mesh daemon: connection ended: {err:#}");
                 }
             });

@@ -18,8 +18,24 @@ use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 /// How long to keep retrying the first connect after bootstrapping a daemon,
 /// and how long to wait between attempts. The daemon needs a few milliseconds
 /// to bind; the bound stops a failed bootstrap from hanging the MCP client.
+///
+/// This is a budget for the daemon *binding*, and nothing else. It used to be
+/// a budget for the daemon binding **and** walking the whole project, which is
+/// what made a big enough project exceed it and cost its MCP client every tool
+/// it had; since task 105 the bind happens before the walk (`daemon::run`), so
+/// ten seconds is generous rather than nearly enough.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Shortens [`BOOTSTRAP_TIMEOUT`] for the test suite. Real installs never set
+/// it: the point of the constant is to be longer than any honest bind, and
+/// nothing outside a test wants it shorter.
+///
+/// It exists so that "a project whose cold-start walk outlasts the shim's
+/// bootstrap timeout still gets served" can be asserted in a couple of
+/// seconds - shrinking the timeout below the walk, rather than stretching the
+/// walk past ten real seconds on every commit.
+const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
 
 /// Set by Claude Code on every stdio MCP server it spawns, in every
 /// registration scope (local/project/user) - unlike the process's cwd, which
@@ -227,8 +243,20 @@ fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// [`BOOTSTRAP_TIMEOUT`], unless [`BOOTSTRAP_TIMEOUT_ENV`] names a shorter
+/// one. An unparseable value is ignored rather than fatal - a malformed knob
+/// nobody in production sets must not be a reason an MCP client fails to
+/// start.
+fn bootstrap_timeout() -> Duration {
+    std::env::var(BOOTSTRAP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .map_or(BOOTSTRAP_TIMEOUT, Duration::from_millis)
+}
+
 fn wait_until_listening(socket: &Path) -> Result<UnixStream> {
-    let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+    let timeout = bootstrap_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         match UnixStream::connect(socket) {
             Ok(stream) => return Ok(stream),
@@ -236,7 +264,7 @@ fn wait_until_listening(socket: &Path) -> Result<UnixStream> {
                 bail!(
                     "bootstrapped daemon did not accept connections on {} within {:?}: {err}",
                     socket.display(),
-                    BOOTSTRAP_TIMEOUT
+                    timeout
                 );
             }
             Err(_) => thread::sleep(BOOTSTRAP_RETRY_INTERVAL),

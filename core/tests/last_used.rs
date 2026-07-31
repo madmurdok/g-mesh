@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::gc::last_used::{self, LastUsed};
@@ -20,8 +20,10 @@ use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Comfortably longer than the millisecond resolution `lastUsed` is recorded
@@ -98,17 +100,6 @@ fn spawn_daemon(root: &Path) -> Child {
         .expect("failed to spawn the daemon")
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
-}
-
 /// One `initialize` + `tools/call` round trip straight over the daemon
 /// socket. `tools/call` specifically, not `tools/list`: `lastUsed` is
 /// advanced by the tool handlers, which is what "a request was handled"
@@ -167,9 +158,13 @@ fn receive<R: Read>(reader: &mut BufReader<R>) -> Value {
 fn a_daemon_start_and_every_handled_request_advance_last_used_on_disk() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    // The pid file is written once the socket is bound, so it is the signal
-    // that the daemon is up and has been through its startup path.
-    wait_for("the daemon to start listening", || project.pid_file().exists());
+    // Waited out in full rather than just to the bind: a call answered with
+    // "still indexing" deliberately does not touch `lastUsed` (see
+    // `mcp::GMeshMcpServer::still_indexing` on why it must not take the
+    // SQLite mutex the walk is holding), and the daemon's own startup touch
+    // already covers the walk. This test is about what a *handled* request
+    // does, so it has to make one.
+    wait_until_indexed(project.root());
 
     let after_start = project.last_used();
     assert!(
@@ -208,7 +203,7 @@ fn a_daemon_start_and_every_handled_request_advance_last_used_on_disk() {
 fn last_used_survives_the_daemon_that_wrote_it() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    wait_for("the daemon to start listening", || project.pid_file().exists());
+    wait_until_indexed(project.root());
 
     thread::sleep(TICK);
     call_a_tool(&project.socket());
