@@ -15,6 +15,7 @@
 //! plain `Mutex` guards the synchronous code always has.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -66,6 +67,33 @@ pub const STILL_INDEXING: &str =
      about the code from it. Retry the same call in a few seconds; a large repository can take \
      a minute or two to finish its first walk.";
 
+/// How long a tool call that lands while the cold-start walk is still running
+/// waits for it to finish before committing to [`STILL_INDEXING`].
+///
+/// Task 105 made every such call fail immediately, which fixed the case it
+/// was written for (a walk with real minutes left to run) but introduced a
+/// smaller one of its own: on a project small enough for the walk to finish
+/// in milliseconds, a call that happened to arrive a moment before
+/// `IndexingStatus::mark_ready` now paid for a whole extra round trip - a
+/// refusal, noticing it, a retry - purely because it asked on the wrong side
+/// of an instant. This window absorbs exactly that race: a call that arrives
+/// during it gets the walk's *actual* remaining time to finish before this
+/// module gives up on it.
+///
+/// Tens to low hundreds of milliseconds on purpose, not seconds - long enough
+/// that "the walk was basically done anyway" covers it, short enough that a
+/// project whose walk genuinely has real time left still gets task 105's
+/// fast, honest refusal rather than a second, quieter version of the problem
+/// task 105 exists to prevent. This is a race-absorber for calls arriving
+/// close to completion, not a general "wait a bit and hope" budget - a walk
+/// with 30 seconds left to run fails in `INDEXING_GRACE_WINDOW`, not in 30
+/// seconds.
+///
+/// Public for the same reason [`STILL_INDEXING`] is: the acceptance tests
+/// assert real elapsed time against this number, and a copy hand-maintained
+/// in `tests/` could drift from it silently.
+pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
+
 /// Serves one accepted socket connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
 /// connection per MCP client, so a client's session dies with its shim.
@@ -115,18 +143,36 @@ impl GMeshMcpServer {
     }
 
     /// `Some(...)` - a finished response the handler must return unchanged -
-    /// while the cold-start walk is still running; `None` once the index is
-    /// complete. Shaped like `find_definition::resolve_symbol_name`'s
-    /// "finished response or carry on" rather than a bare bool, so the
-    /// wording lives in exactly one place and no handler can invent its own.
+    /// once the cold-start walk has been given up on; `None` once the index
+    /// is complete, whether it already was when this call arrived or it
+    /// finished during the grace wait below. Shaped like
+    /// `find_definition::resolve_symbol_name`'s "finished response or carry
+    /// on" rather than a bare bool, so the wording lives in exactly one place
+    /// and no handler can invent its own.
     ///
     /// Every handler calls this as its *first* statement, ahead of
     /// [`mark_used`](Self::mark_used): that one takes the daemon's single
     /// SQLite mutex, which the walk holds for the length of each batch
     /// commit, and waiting on it to say "I am not going to read the database"
     /// would defeat the point of an atomic flag.
-    fn still_indexing(&self) -> Option<Result<CallToolResult, ErrorData>> {
-        self.indexing.is_indexing().then(|| tool_result::error(STILL_INDEXING))
+    ///
+    /// The fast path - the walk was already done - never touches the wait: a
+    /// project that owes no walk, or one whose walk finished before this call
+    /// arrived, reads `is_indexing() == false` and returns on the spot, same
+    /// as before task 107. Only a call that actually lands mid-walk pays for
+    /// [`INDEXING_GRACE_WINDOW`], and it pays for it by `await`ing
+    /// `IndexingStatus::wait_ready` - suspending this task, not blocking the
+    /// worker thread it runs on (see `daemon::serve_forever`'s two-worker
+    /// runtime, and `IndexingStatus`'s own doc comment for why a `Notify`
+    /// rather than a blocking primitive).
+    async fn still_indexing(&self) -> Option<Result<CallToolResult, ErrorData>> {
+        if !self.indexing.is_indexing() {
+            return None;
+        }
+        if self.indexing.wait_ready(INDEXING_GRACE_WINDOW).await {
+            return None;
+        }
+        Some(tool_result::error(STILL_INDEXING))
     }
 
     /// Advances the project's `lastUsed` stamp, which a later GC scan reads
@@ -155,7 +201,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindDefinitionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -170,7 +216,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -179,7 +225,7 @@ impl GMeshMcpServer {
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -188,7 +234,7 @@ impl GMeshMcpServer {
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -203,7 +249,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -218,7 +264,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetFileOutlineParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
@@ -233,7 +279,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing() {
+        if let Some(not_ready) = self.still_indexing().await {
             return not_ready;
         }
         self.mark_used();
