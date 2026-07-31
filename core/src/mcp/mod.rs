@@ -230,6 +230,15 @@ pub struct SymbolQueryParams {
     /// Maximum results (default 20, capped at 200) - raise for a wide result
     /// set instead of paging via `cursor`.
     pub limit: Option<u32>,
+    /// Restrict results to rows whose referencing/calling/implementing node
+    /// lives in one of these files (project-relative, matching `file_path`
+    /// exactly as it appears elsewhere in this tool's own output - no
+    /// prefix or glob matching). Use this to answer "of these known files,
+    /// which ones reference/call this symbol?" in one call instead of one
+    /// unscoped call plus a grep per file. Omit for the default, unscoped
+    /// search across the whole project; an empty array behaves identically
+    /// to omitting it, not "match nothing".
+    pub file_paths: Option<Vec<String>>,
 }
 
 /// `Default` is for tests that construct this by hand - see

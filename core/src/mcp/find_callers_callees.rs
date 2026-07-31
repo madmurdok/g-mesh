@@ -46,11 +46,12 @@ fn list_calls(
     conn: &Connection,
     anchor_id: &str,
     anchor_file_path: &str,
+    file_paths: &[&str],
     direction: Direction,
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<CallSite>> {
-    let page = pagination::paginate_edges(conn, anchor_id, direction, &["CALLS"], anchor_file_path, page_size, cursor)
+    let page = pagination::paginate_edges(conn, anchor_id, direction, &["CALLS"], file_paths, anchor_file_path, page_size, cursor)
         .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());
@@ -156,7 +157,8 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Incoming, page_size, params.cursor.as_deref())
+    let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let page = list_calls(&conn, &anchor.id, &anchor.file_path, &file_paths, Direction::Incoming, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callers", e))?;
 
     let rows = page
@@ -181,7 +183,8 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_calls(&conn, &anchor.id, &anchor.file_path, Direction::Outgoing, page_size, params.cursor.as_deref())
+    let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let page = list_calls(&conn, &anchor.id, &anchor.file_path, &file_paths, Direction::Outgoing, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find callees", e))?;
 
     let rows = page
@@ -415,7 +418,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_calls(&conn, "target", "target.rs", Direction::Incoming, 1, cursor.as_deref()).unwrap();
+            let page = list_calls(&conn, "target", "target.rs", &[], Direction::Incoming, 1, cursor.as_deref()).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|c| c.node.id));
             if !page.has_more {
@@ -426,6 +429,63 @@ mod tests {
 
         seen.sort();
         assert_eq!(seen, vec!["caller_a", "caller_b", "caller_c"], "all three callers must come back, once each");
+    }
+
+    /// Same membership-test shape as `find_references`'s benchmark repro, but
+    /// for `find_callers`: three known files call the target, a fourth known
+    /// file
+    /// doesn't, and an out-of-scope file also calls it - only the three
+    /// in-scope callers must come back.
+    #[test]
+    fn scoping_find_callers_to_a_known_file_set_returns_only_the_callers_within_it() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+
+        let known_files = ["k1.rs", "k2.rs", "k3.rs", "k4.rs"];
+        for (i, file) in known_files.iter().enumerate() {
+            let id = format!("known_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "rust")).unwrap();
+            if i < 3 {
+                upsert_edge(&mut conn, EdgeRecord::new(format!("e_known_{i}"), &id, "target", "CALLS", "tree-sitter", true))
+                    .unwrap();
+            }
+        }
+        upsert_node(&mut conn, NodeRecord::new("outsider", "Function", "outsider", "pkg::outsider", "unrelated.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_outsider", "outsider", "target", "CALLS", "tree-sitter", true)).unwrap();
+
+        let conn = Arc::new(Mutex::new(conn));
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        let body = json_body(&handle_callers(&conn, params).unwrap());
+        let mut file_paths: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        file_paths.sort();
+        assert_eq!(file_paths, vec!["k1.rs", "k2.rs", "k3.rs"], "must return exactly the known files that call the target");
+    }
+
+    /// Omitting `file_paths` must be indistinguishable from a call made
+    /// before this parameter existed, and an explicit empty array must
+    /// answer identically to omitting it - same convention `edge_kinds`
+    /// already uses for "no filter".
+    #[test]
+    fn omitting_file_paths_and_an_explicit_empty_array_both_behave_like_no_scope_for_callers() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let omitted = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        let explicit_empty = json_body(
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), file_paths: Some(Vec::new()), ..Default::default() },
+            )
+            .unwrap(),
+        );
+        assert_eq!(omitted, explicit_empty, "an explicit empty file_paths array must answer exactly as omitting it does");
+        assert_eq!(omitted["results"].as_array().unwrap().len(), 1);
     }
 
     /// A caller-supplied `limit` above the default page size must actually

@@ -57,6 +57,7 @@ fn list_implementations(
     conn: &Connection,
     anchor_id: &str,
     anchor_file_path: &str,
+    file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<ImplementationSite>> {
@@ -65,6 +66,7 @@ fn list_implementations(
         anchor_id,
         Direction::Incoming,
         &["SUPERTYPE_OF"],
+        file_paths,
         anchor_file_path,
         page_size,
         cursor,
@@ -108,7 +110,8 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_implementations(&conn, &anchor.id, &anchor.file_path, page_size, params.cursor.as_deref())
+    let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let page = list_implementations(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find implementations", e))?;
 
     success(&ImplementationPage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -219,7 +222,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_implementations(&conn, "target", "target.rs", 1, cursor.as_deref()).unwrap();
+            let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref()).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
             if !page.has_more {
