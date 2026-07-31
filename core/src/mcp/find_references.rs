@@ -66,6 +66,9 @@ struct ReferencePage {
     results: Vec<ReferenceSite>,
     has_more: bool,
     next_cursor: Option<String>,
+    /// See `Page::all_unresolved` - true when every reference in `results`
+    /// came from an edge the linker couldn't confirm.
+    all_unresolved: bool,
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
@@ -131,7 +134,12 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
     let page = list_references(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find references", e))?;
 
-    success(&ReferencePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
+    success(&ReferencePage {
+        results: page.results,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
+    })
 }
 
 #[cfg(test)]
@@ -430,6 +438,47 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
+        assert_eq!(body["allUnresolved"], false, "an empty page has nothing to be suspicious of");
+    }
+
+    /// The gap this field closes: a caller list-shaped like a complete
+    /// answer (`hasMore: false`, a plausible non-empty `results`) but built
+    /// entirely from name-matched edges the linker couldn't confirm - the
+    /// benchmark shape (g-mesh #104) where this was easy to mistake for a
+    /// verified, complete result.
+    #[test]
+    fn a_page_where_every_reference_is_unresolved_is_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+        assert_eq!(body["allUnresolved"], true, "every row unresolved must set the response-level marker");
+    }
+
+    /// A single confirmed row is enough to clear the marker, even though most
+    /// of the page is still unresolved - the field means "the whole answer
+    /// is unconfirmed", not "some rows are".
+    #[test]
+    fn a_page_with_at_least_one_resolved_reference_is_not_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 3);
+        assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
     }
 
     /// The whole point of `symbol_name`: an unambiguous name lands on the

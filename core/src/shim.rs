@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use crate::cli::stop;
 use crate::daemon;
+use crate::daemon::build_stamp::{self, Vintage};
 use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 
 /// How long to keep retrying the first connect after bootstrapping a daemon,
@@ -33,6 +35,12 @@ const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// resolved, the shim hashes that path, connects to the project's daemon
 /// socket (bootstrapping a detached daemon if nothing is listening) and then
 /// moves JSON-RPC frames between the two sides without interpreting them.
+///
+/// The shim is also the only process in the system that routinely holds both
+/// halves of the "is this daemon still the current build?" question - it is
+/// itself the newly installed binary, and it is about to talk to whatever has
+/// been running since before that install - which is why the staleness check
+/// lives here rather than in the daemon (see [`connect_or_bootstrap`]).
 pub fn run() -> Result<()> {
     let root = resolve_project_root()?;
     let stream = connect_or_bootstrap(&root)?;
@@ -46,27 +54,79 @@ fn resolve_project_root() -> Result<PathBuf> {
     }
 }
 
+/// What this shim found already serving the project.
+enum Incumbent {
+    /// Listening, and running a build no older than this one's - the
+    /// overwhelmingly common case, and the connection is already open.
+    Reusable(UnixStream),
+    /// Listening, but started from a build this one supersedes. Carries the
+    /// verdict so the warning can say which of the two ways it was reached.
+    Outdated(Vintage),
+    /// Nothing is listening.
+    Absent,
+}
+
+/// Finds the project's daemon and returns a connection to it, replacing or
+/// bootstrapping one as needed.
+///
+/// # Why the check is here, before a single byte is proxied
+///
+/// Retiring a daemon means killing a process a client may be talking to, so
+/// the only safe moment to consider it is *before* this shim's client has
+/// sent anything: no `initialize` has gone out, no `tools/call` is in flight,
+/// and the session that ends up on the socket only ever sees one daemon. A
+/// check anywhere later - sniffing the `initialize` response, polling
+/// mid-session - would mean tearing a live request down and replaying it, and
+/// would cost the shim its one real invariant: that it never parses a payload.
+/// The client's whole cost here is that the first connection took a moment
+/// longer.
+///
+/// The other party's session is not so lucky: a *different* client already
+/// connected to the retired daemon loses its connection and its shim exits,
+/// which its MCP client sees as the server going away. That is the deliberate
+/// trade - it happens once, at the moment a build changes, and the
+/// alternative is every session on the machine going on being answered by a
+/// build that has been replaced.
 fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
     let socket = daemon::socket_path(root)?;
     // A missing socket file, a refused connection and a socket left behind by
     // a dead daemon are all just "no daemon running" as far as the shim cares.
-    if let Ok(stream) = UnixStream::connect(&socket) {
+    if let Incumbent::Reusable(stream) = incumbent(root, &socket)? {
         return Ok(stream);
     }
 
-    // Nothing is listening, so this shim may have to bootstrap a daemon -
-    // a decision that has to be serialized across processes, because two
+    // Nothing usable is listening, so this shim may have to bootstrap a daemon
+    // - a decision that has to be serialized across processes, because two
     // shims started at the same moment for the same project would otherwise
     // both spawn one. The lock is held across the spawn *and* the wait
     // below, so by the time it is handed on the daemon is already up.
+    //
+    // Retiring an outdated daemon is serialized by the same lock, and for a
+    // sharper reason: two shims that independently decided to replace the
+    // incumbent would have the second one kill the *replacement* the first
+    // had just started.
     let lock = acquire_bootstrap_lock(root)?;
 
     // The re-check under the lock is what makes the lock worth taking: a
     // shim that queued behind another one finds the socket connectable here
-    // and connects instead of spawning a second daemon. Returning drops the
+    // and connects instead of spawning a second daemon - and, when the shim
+    // ahead of it was replacing an outdated daemon, finds the replacement
+    // current instead of retiring it all over again. Returning drops the
     // lock, handing it to whoever is waiting next.
-    if let Ok(stream) = UnixStream::connect(&socket) {
-        return Ok(stream);
+    match incumbent(root, &socket)? {
+        Incumbent::Reusable(stream) => return Ok(stream),
+        Incumbent::Outdated(vintage) => {
+            if !retire_outdated_daemon(root, vintage) {
+                // Nothing else this shim can safely do: bootstrapping over a
+                // daemon that would not stop just produces a second one that
+                // exits on the singleton lock. An outdated answer with a
+                // warning beside it beats an MCP client with no tools at all.
+                if let Ok(stream) = UnixStream::connect(&socket) {
+                    return Ok(stream);
+                }
+            }
+        }
+        Incumbent::Absent => {}
     }
 
     spawn_detached_daemon(root)?;
@@ -76,6 +136,67 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
     // every other shim on this project behind a lock nobody will release.
     drop(lock);
     stream
+}
+
+/// Connects to whatever is serving the project and judges whether it is still
+/// the build this shim came from.
+///
+/// The connection is opened first and the stamp consulted second, so a project
+/// with no daemon running pays nothing for the check at all.
+fn incumbent(root: &Path, socket: &Path) -> Result<Incumbent> {
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return Ok(Incumbent::Absent);
+    };
+
+    // A shim that cannot describe its own executable has no evidence about
+    // anyone else's, and must degrade to exactly the behavior it had before
+    // this check existed rather than act on a guess.
+    let Ok(ours) = build_stamp::of_running_process() else {
+        return Ok(Incumbent::Reusable(stream));
+    };
+
+    let published = build_stamp::read(&daemon::build_stamp_path(root)?);
+    match build_stamp::vintage(published.as_ref(), &ours) {
+        Vintage::Current => Ok(Incumbent::Reusable(stream)),
+        // Dropped rather than kept for a possible fallback: the retirement
+        // below is about to stop this daemon, and holding a connection open
+        // to a process being asked to exit only gives it a reason to linger.
+        outdated => {
+            drop(stream);
+            Ok(Incumbent::Outdated(outdated))
+        }
+    }
+}
+
+/// Stops a daemon this build supersedes, so the bootstrap below can put a
+/// current one in its place. Reports whether it is safe to bootstrap over.
+///
+/// `cli::stop::stop` rather than a shutdown path of this module's own: it
+/// already escalates `SIGTERM` to `SIGKILL`, already waits for the plugin the
+/// daemon leaves behind, and already promises not to return until everything
+/// it stopped is genuinely gone - which is exactly the guarantee bootstrapping
+/// immediately afterwards depends on. A second implementation of that would
+/// be a second thing to keep correct.
+fn retire_outdated_daemon(root: &Path, vintage: Vintage) -> bool {
+    // On stderr, which is where an MCP client collects its server's log: this
+    // is the one place a human or agent gets told that the upgrade they just
+    // installed had a running daemon in the way of it.
+    eprintln!(
+        "g-mesh mcp-shim: the daemon serving {} {} - replacing it so this build answers",
+        root.display(),
+        build_stamp::describe(vintage)
+    );
+
+    match stop::stop(root) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!(
+                "g-mesh mcp-shim: could not stop the outdated daemon ({err:#}) - \
+                 continuing with it, run `g-mesh stop` to force the upgrade through"
+            );
+            false
+        }
+    }
 }
 
 /// Opens (creating if absent) the project's bootstrap lock file and blocks
