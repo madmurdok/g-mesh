@@ -762,3 +762,45 @@ into defaults:
 - A hard cap on simultaneously-live daemon cores (LRU eviction) is a
   candidate if the long idle timeout alone proves insufficient — deferred
   until there's evidence it's actually needed.
+
+### Ideas surfaced while comparing kungfu (external tool)
+
+g-mesh-bench added kungfu ([denyzhirkov/kungfu](https://github.com/denyzhirkov/kungfu),
+a comparable Rust/tree-sitter MCP code-intelligence server) as a benchmark
+comparison arm; see g-mesh-bench's `docs/results/` for the head-to-head
+findings. Two things surfaced during that work are worth recording here even
+though neither was implemented — one is a real, verified gap in this
+project's own reasoning, the other is a pointer for when the already-planned
+semantic layer gets built:
+
+- **The `IndexingStatus`/`STILL_INDEXING` signal (added for cold start,
+  #99/#105/#107) does not cover the ongoing incremental-edit watcher path.**
+  `mark_ready()` is only called once, after the initial bulk walk
+  (`daemon/mod.rs:303`); the watcher's debounce → reparse → transaction cycle
+  (see "Incremental edit" above) never re-arms it. That means a query landing
+  in the (typically short, single-digit-hundreds-of-ms) window between a file
+  write and its debounced transaction committing gets a silent stale answer —
+  the same *shape* of "answered off an unready index" problem cold start was
+  explicitly fixed to avoid, just not yet extended to this second window. This
+  surfaced by contrast: kungfu triggers its reindex synchronously from a
+  Claude Code `PostToolUse` hook rather than a filesystem watcher, which
+  sidesteps the debounce window entirely for edits made through the tool (at
+  the cost of a fallback path for edits made outside it). Whether this window
+  is worth closing in g-mesh — and whether a hook-triggered trigger should
+  supplement the watcher for the common "agent edits via Claude Code" case —
+  is open; the debounce window is much narrower than cold start's, so this is
+  a considered trade-off to weigh, not an assumed bug.
+- **Semantic/embedding search**: this doc already planned an embedding model
+  (`jina-embeddings-v2-base-code`, above) but nothing in the current
+  implementation ships it yet. kungfu has a real, shipped opt-in semantic
+  layer (`BAAI/bge-small-en-v1.5`, 384-dim) — a concrete existing reference
+  point to look at for model/dimension trade-offs when this project's own
+  planned layer is actually built, not a new idea in itself.
+
+kungfu's other headline features — a `tiny/small/medium/full` context-budget
+tier and server-side "intent detection" query routing — were looked at and
+not carried forward as ideas: this project already made the deliberate choice
+to expose composable primitive tools plus byte-budget pagination
+(`pagination::longest_prefix_fitting`) and let the calling agent orchestrate,
+rather than a tiered-budget or server-side-routed API. Noted here so that
+choice reads as considered, not overlooked.
