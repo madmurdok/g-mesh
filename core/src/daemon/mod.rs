@@ -1,3 +1,4 @@
+pub mod build_stamp;
 pub mod bulk_index;
 pub mod identity;
 pub mod plugin;
@@ -26,6 +27,10 @@ const PID_FILE: &str = "daemon.pid";
 /// running" from "the plugin is running with no core left to serve" - see
 /// `cli::status` and `cli::stop`.
 const PLUGIN_PID_FILE: &str = "plugin.pid";
+/// Which build the live daemon started from, so a shim (or `cli::status`) can
+/// tell an incumbent that is still this build from one that has been left
+/// behind by an upgrade - see `daemon::build_stamp`.
+const BUILD_STAMP_FILE: &str = "daemon.build";
 /// Held by a shim while it decides whether to bootstrap a daemon and while
 /// it waits for the one it spawned to come up (see `shim::connect_or_bootstrap`).
 const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
@@ -64,6 +69,17 @@ pub fn pid_path_in(state_dir: &Path) -> PathBuf {
 
 pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(PLUGIN_PID_FILE)
+}
+
+/// Where the live daemon records the build it started from, resolved from a
+/// project root and - like the pid files - from an already-known state
+/// directory too, for callers that have one but no root.
+pub fn build_stamp_path(root: &Path) -> Result<PathBuf> {
+    Ok(build_stamp_path_in(&project_dir(root)?))
+}
+
+pub fn build_stamp_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(BUILD_STAMP_FILE)
 }
 
 /// The file shims serialize their bootstrap on, derived exactly like the
@@ -138,6 +154,23 @@ pub fn run(root: &Path) -> Result<()> {
             return Ok(());
         }
     };
+
+    // Published here - after the singleton lock, so it always describes the
+    // process that actually owns this project, and long before the socket is
+    // bound, so it is never *transiently* missing. That ordering is what
+    // lets a shim read "listening, but no stamp" as "a daemon from before
+    // this check existed" rather than "a daemon that has not got round to
+    // publishing yet"; see `daemon::build_stamp` for what is compared and why.
+    // Failing to publish is not fatal: the worst it costs is a daemon that
+    // reads as outdated and gets replaced, which is the safe direction.
+    match build_stamp::of_running_process() {
+        Ok(stamp) => {
+            if let Err(err) = build_stamp::write(&build_stamp_path_in(&dir), &stamp) {
+                eprintln!("g-mesh daemon: could not publish its build stamp: {err:#}");
+            }
+        }
+        Err(err) => eprintln!("g-mesh daemon: could not describe its own build: {err:#}"),
+    }
 
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     if schema::ensure_current(&conn).context("failed to check the index's schema and indexer versions")? {

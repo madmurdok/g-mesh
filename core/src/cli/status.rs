@@ -13,6 +13,11 @@
 //!   accepting connections on the socket. Both, because either alone lies in
 //!   a way the other catches - a recycled pid looks alive, and a daemon still
 //!   in its cold-start bulk walk has not bound its socket yet.
+//! - **Daemon build**: the stamp a live daemon publishes about the executable
+//!   it started from (`daemon::build_stamp`), compared with this command's
+//!   own. A daemon that outlived an upgrade answers every query correctly
+//!   *for the build it is*, so nothing else in this report can show it up -
+//!   which is precisely why it gets a line of its own.
 //! - **Plugin**: the pid in `plugin.pid`, checked the same way. The two-tier
 //!   idle model in the architecture doc (a plugin that sleeps after an idle
 //!   timeout while the core keeps queueing changes) is not built yet: today
@@ -37,6 +42,7 @@ use ignore::WalkBuilder;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::daemon;
+use crate::daemon::build_stamp::{self, Vintage};
 use crate::gc::last_used::{self, LastUsed};
 use crate::storage::connection::project_dir;
 use crate::watcher::staleness::mtime_millis;
@@ -64,6 +70,25 @@ pub enum CoreState {
     NotAccepting { pid: u32 },
     /// No live daemon, whatever `daemon.pid` may still say.
     NotRunning,
+}
+
+/// How the build a running daemon started from compares with the build
+/// answering this command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildState {
+    /// Nothing is running, so there is no build to compare against.
+    NotRunning,
+    /// The daemon started from this executable, or from one built later.
+    Current,
+    /// The daemon started from an executable built before this one: it
+    /// predates whatever has been installed since, and the index invalidation
+    /// that a start on the new build would have performed.
+    Outdated,
+    /// Running, but nothing usable is on record about its build - the shape
+    /// every daemon that predates this check has. Reported rather than
+    /// silently called current, because "we did not compare" and "we compared
+    /// and it matched" are different answers.
+    Unknown,
 }
 
 /// Whether the language plugin process is up.
@@ -116,6 +141,7 @@ pub struct Report {
     pub project_id: String,
     pub state_dir: PathBuf,
     pub core: CoreState,
+    pub build: BuildState,
     pub plugin: PluginState,
     pub last_used: Option<LastUsed>,
     pub index: IndexStatus,
@@ -141,6 +167,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
     Ok(Report {
         project_id,
         core,
+        build: build_state(core, &state_dir),
         plugin: plugin_state(project_root, core)?,
         last_used: last_used::read_from_project_dir(&state_dir)
             .context("failed to read the project's lastUsed")?,
@@ -163,6 +190,33 @@ fn core_state(project_root: &Path) -> Result<CoreState> {
     } else {
         CoreState::NotAccepting { pid }
     })
+}
+
+/// Compares the running daemon's published build with this command's own.
+///
+/// `NotAccepting` is compared like `Running` rather than skipped: the stamp is
+/// published before the socket is bound (see `daemon::run`), so a daemon still
+/// working through its cold-start walk has already said which build it is -
+/// and that is exactly when someone is most likely to be asking why an
+/// upgrade has not taken effect.
+///
+/// Infallible, unlike its neighbours: every failure along the way - no
+/// executable to stat, no stamp on disk, an unreadable one - is the same
+/// answer, `Unknown`, and none of them is a reason for `status` to refuse to
+/// print the rest of the report.
+fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
+    if matches!(core, CoreState::NotRunning) {
+        return BuildState::NotRunning;
+    }
+    let Ok(ours) = build_stamp::of_running_process() else {
+        return BuildState::Unknown;
+    };
+    let published = build_stamp::read(&daemon::build_stamp_path_in(state_dir));
+    match build_stamp::vintage(published.as_ref(), &ours) {
+        Vintage::Current => BuildState::Current,
+        Vintage::Outdated => BuildState::Outdated,
+        Vintage::Unknown => BuildState::Unknown,
+    }
 }
 
 fn plugin_state(project_root: &Path, core: CoreState) -> Result<PluginState> {
@@ -361,6 +415,9 @@ pub fn render(report: &Report) -> String {
     let _ = writeln!(out, "  project id:      {}", report.project_id);
     let _ = writeln!(out, "  state directory: {}", report.state_dir.display());
     let _ = writeln!(out, "  daemon core:     {}", describe_core(report.core));
+    if let Some(build) = describe_build(report.build) {
+        let _ = writeln!(out, "  daemon build:    {build}");
+    }
     let _ = writeln!(out, "  plugin:          {}", describe_plugin(report.plugin));
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
 
@@ -395,6 +452,28 @@ fn describe_core(core: CoreState) -> String {
             format!("running but not accepting connections yet (pid {pid})")
         }
         CoreState::NotRunning => "not running".to_string(),
+    }
+}
+
+/// `None` for a project with nothing running, whose report has no room for a
+/// line about a build that does not exist.
+///
+/// The two unhealthy states both name `g-mesh stop` even though a shim now
+/// replaces an outdated daemon on its own: someone running `status` is asking
+/// *now*, and telling them the next MCP call would have sorted it out is not
+/// an answer to that. Running it is harmless if the shim got there first.
+fn describe_build(build: BuildState) -> Option<&'static str> {
+    match build {
+        BuildState::NotRunning => None,
+        BuildState::Current => Some("this build"),
+        BuildState::Outdated => Some(
+            "older than this g-mesh - it predates any index invalidation this build \
+             would do; run `g-mesh stop`, or let the next MCP call replace it",
+        ),
+        BuildState::Unknown => Some(
+            "cannot be compared with this g-mesh - it published no build stamp, so it \
+             predates this check; run `g-mesh stop`, or let the next MCP call replace it",
+        ),
     }
 }
 
@@ -622,6 +701,7 @@ mod tests {
             project_id: "a1b2c3d4e5f6a7b8".to_string(),
             state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
             core: CoreState::Running { pid: 4242 },
+            build: BuildState::Current,
             plugin: PluginState::Active { pid: 4243 },
             last_used: Some(LastUsed {
                 timestamp: "2026-07-31 00:00:00.000".to_string(),
@@ -639,6 +719,7 @@ mod tests {
         let rendered = render(&report);
 
         assert!(rendered.contains("running (pid 4242)"), "{rendered}");
+        assert!(rendered.contains("daemon build:    this build"), "{rendered}");
         assert!(rendered.contains("active (pid 4243)"), "{rendered}");
         assert!(rendered.contains("3 hours ago"), "{rendered}");
         assert!(rendered.contains("75.0% (3/4 source files)"), "{rendered}");
@@ -653,6 +734,7 @@ mod tests {
             project_id: "a1b2c3d4e5f6a7b8".to_string(),
             state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
             core: CoreState::NotRunning,
+            build: BuildState::NotRunning,
             plugin: PluginState::Orphaned { pid: 99 },
             last_used: None,
             index: IndexStatus {
@@ -667,10 +749,64 @@ mod tests {
         let rendered = render(&report);
 
         assert!(rendered.contains("daemon core:     not running"), "{rendered}");
+        assert!(
+            !rendered.contains("daemon build:"),
+            "a project with no daemon has no build to report on:\n{rendered}"
+        );
         assert!(rendered.contains("orphaned (pid 99)"), "{rendered}");
         assert!(rendered.contains("never recorded"), "{rendered}");
         assert!(rendered.contains("never fully walked"), "{rendered}");
         assert!(rendered.contains("syntax errors:   none"), "{rendered}");
+    }
+
+    /// The whole point of the line: a daemon left behind by an upgrade
+    /// answers everything else in this report perfectly well, so this is the
+    /// only place the report can say something is wrong at all.
+    #[test]
+    fn a_daemon_left_behind_by_an_upgrade_is_called_out_with_what_to_do_about_it() {
+        for (state, expected) in [
+            (BuildState::Outdated, "older than this g-mesh"),
+            (BuildState::Unknown, "published no build stamp"),
+        ] {
+            let described = describe_build(state).expect("a running daemon always reports a build");
+            assert!(described.contains(expected), "{state:?} rendered as {described}");
+            assert!(described.contains("g-mesh stop"), "{state:?} must say what to do: {described}");
+        }
+    }
+
+    #[test]
+    fn a_daemon_that_published_this_builds_stamp_reads_as_current() {
+        let state = tempfile::tempdir().unwrap();
+        let ours = build_stamp::of_running_process().unwrap();
+        build_stamp::write(&daemon::build_stamp_path_in(state.path()), &ours).unwrap();
+
+        assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
+        // Still comparable while it works through its cold-start walk: the
+        // stamp is published before the socket is bound, not after.
+        assert_eq!(
+            build_state(CoreState::NotAccepting { pid: 1 }, state.path()),
+            BuildState::Current
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_published_an_older_builds_stamp_reads_as_outdated() {
+        let state = tempfile::tempdir().unwrap();
+        let mut older = build_stamp::of_running_process().unwrap();
+        older.exe_mtime_millis -= 24 * 60 * 60 * 1000;
+        build_stamp::write(&daemon::build_stamp_path_in(state.path()), &older).unwrap();
+
+        assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Outdated);
+    }
+
+    /// The state every daemon in the wild is in the first time a build
+    /// carrying this check meets it.
+    #[test]
+    fn a_daemon_that_published_no_stamp_at_all_reads_as_uncomparable() {
+        let state = tempfile::tempdir().unwrap();
+
+        assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Unknown);
+        assert_eq!(build_state(CoreState::NotRunning, state.path()), BuildState::NotRunning);
     }
 
     #[test]
