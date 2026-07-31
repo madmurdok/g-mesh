@@ -181,7 +181,15 @@ impl ServerHandler for GMeshMcpServer {
                  Efficient usage: pass `symbol_name` directly to find_references/find_callers/\
                  find_callees/find_implementations instead of calling find_definition first, and \
                  raise `limit` for symbols with many results instead of paging - see each tool's \
-                 parameter docs for the exact mechanics (ambiguity handling, defaults).",
+                 parameter docs for the exact mechanics (ambiguity handling, defaults).\n\n\
+                 A result anchored by `symbol_id` is already resolved per call site to that exact \
+                 declaration - other same-named declarations' call sites are excluded, so \
+                 re-checking one with grep is wasted work. `resolved: false` on a row marks an \
+                 edge the indexer could not confirm; that is the one row worth double-checking, \
+                 not the whole list. One honest gap: a method call reached through a variable \
+                 receiver (`x.foo()`) produces no edge by design, so caller/reference lists for \
+                 methods can under-report - bare calls and `this`/`super`/qualified-type calls do \
+                 not have this gap.",
             )
     }
 }
