@@ -55,7 +55,7 @@ fn list_calls(
         .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());
-    for edge in page.results {
+    for pagination::ScoredEdge { edge, locality } in page.results {
         // Outgoing: anchor is fromId, the callee sits at toId. Incoming: anchor
         // is toId, the caller sits at fromId.
         let other_id = match direction {
@@ -65,7 +65,6 @@ fn list_calls(
         let node = queries::get_node(conn, other_id)
             .context("failed to resolve call-edge endpoint")?
             .with_context(|| format!("edge {} points at missing node {other_id}", edge.id))?;
-        let locality = if node.file_path == anchor_file_path { 0 } else { 1 };
         results.push(CallSite { node, resolved: edge.resolved, locality, edge_id: edge.id });
     }
 

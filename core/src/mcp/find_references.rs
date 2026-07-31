@@ -93,13 +93,10 @@ fn list_references(
     .context("failed to paginate reference edges")?;
 
     let mut rows = Vec::with_capacity(page.results.len());
-    for edge in page.results {
+    for pagination::ScoredEdge { edge, locality } in page.results {
         let referencing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve referencing node")?
             .with_context(|| format!("edge {} references missing node {}", edge.id, edge.from_id))?;
-        // Same rule `paginate_edges`' SQL applies: locality 0 when the
-        // enriched row shares the anchor's file, 1 otherwise.
-        let locality = if referencing.file_path == anchor_file_path { 0 } else { 1 };
         rows.push(pagination::EdgeRow {
             resolved: edge.resolved,
             locality,

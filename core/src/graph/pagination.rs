@@ -43,13 +43,11 @@ pub fn resolve_page_size(limit: Option<u32>) -> usize {
 /// produces, so normal calls never notice this exists.
 pub const MAX_RESPONSE_BYTES: usize = 20_000;
 
-/// One row a caller has already enriched from a `paginate_edges` result,
-/// carrying back just enough of the source edge (`resolved`/`locality`/
-/// `edge_id`) for [`bound_page`] to rebuild the exact cursor `paginate_edges`
-/// would have produced had its SQL page ended right there. `locality` is
-/// cheaply recomputable by every caller (`0` when the enriched row's own
-/// file path equals the anchor's, `1` otherwise - the same rule the SQL
-/// query applies) without needing it threaded back out of `paginate_edges`.
+/// One row a caller has already enriched from a [`ScoredEdge`] (typically by
+/// resolving its other endpoint into a wire-shaped `T`), carrying back just
+/// enough of the original edge - `resolved`, `locality`, and the edge's own
+/// `id` - for [`bound_page`] to rebuild the exact cursor `paginate_edges`
+/// would have produced had its SQL page ended right there.
 pub struct EdgeRow<T> {
     pub item: T,
     pub resolved: bool,
@@ -167,6 +165,17 @@ pub enum Direction {
     Incoming,
 }
 
+/// An edge alongside the `locality` [`paginate_edges`] already computed for
+/// its own ordering (`0` when the edge's other endpoint shares the anchor's
+/// file, `1` otherwise) - returned rather than discarded so callers that
+/// need it (to build an [`EdgeRow`] for [`bound_page`], say) don't have to
+/// re-derive the identical rule by hand after separately resolving the other
+/// endpoint's node.
+pub struct ScoredEdge {
+    pub edge: EdgeRecord,
+    pub locality: i64,
+}
+
 /// Paginates the anchor node's incident edges, ordered per the structural
 /// ordering rule: `resolved: true` before `resolved: false`, then locality
 /// (an edge whose other endpoint shares `anchor_file_path` sorts first),
@@ -201,7 +210,7 @@ pub fn paginate_edges(
     anchor_file_path: &str,
     page_size: usize,
     cursor: Option<&str>,
-) -> Result<Page<EdgeRecord>> {
+) -> Result<Page<ScoredEdge>> {
     let decoded: Option<StructuralCursor> = cursor.map(decode_cursor).transpose()?;
 
     let (other_endpoint, this_endpoint) = match direction {
@@ -296,7 +305,7 @@ pub fn paginate_edges(
     });
 
     Ok(Page {
-        results: rows.into_iter().map(|(edge, _)| edge).collect(),
+        results: rows.into_iter().map(|(edge, locality)| ScoredEdge { edge, locality }).collect(),
         has_more,
         next_cursor,
     })
@@ -484,8 +493,8 @@ mod tests {
 
         let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
         assert_eq!(page.results.len(), 2);
-        assert!(page.results[0].resolved, "resolved edge must sort first at equal locality");
-        assert!(!page.results[1].resolved);
+        assert!(page.results[0].edge.resolved, "resolved edge must sort first at equal locality");
+        assert!(!page.results[1].edge.resolved);
         assert!(!page.has_more);
     }
 
@@ -499,8 +508,8 @@ mod tests {
         make_edge(&conn, "e_near", "root", "near", true);
 
         let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
-        assert_eq!(page.results[0].id, "e_near", "same-file target must sort before a distant one");
-        assert_eq!(page.results[1].id, "e_far");
+        assert_eq!(page.results[0].edge.id, "e_near", "same-file target must sort before a distant one");
+        assert_eq!(page.results[1].edge.id, "e_far");
     }
 
     #[test]
@@ -513,7 +522,7 @@ mod tests {
         make_edge(&conn, "e2", "caller2", "root", true);
 
         let page = paginate_edges(&conn, "root", Direction::Incoming, &[], &[], "a.rs", 10, None).unwrap();
-        let ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2"], "same-file caller must sort before the distant one");
     }
 
@@ -531,7 +540,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 2, cursor.as_deref()).unwrap();
-            seen.extend(page.results.iter().map(|e| e.id.clone()));
+            seen.extend(page.results.iter().map(|e| e.edge.id.clone()));
 
             // Simulate a background reindex inserting a new low-priority edge
             // (unresolved, distant file) after the first page - it must not
@@ -566,7 +575,7 @@ mod tests {
         make_edge(&conn, "e_out", "root", "out_of_scope", true);
 
         let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs"], "a.rs", 10, None).unwrap();
-        let ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(ids, vec!["e_in"], "only the row whose other endpoint is in the scoped file set must come back");
     }
 
@@ -582,7 +591,7 @@ mod tests {
         make_edge(&conn, "e_out", "root", "out", true);
 
         let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs", "c.rs"], "a.rs", 10, None).unwrap();
-        let mut ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
+        let mut ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["e_one", "e_two"], "every file in the scope set must contribute its rows");
     }
@@ -598,8 +607,8 @@ mod tests {
 
         let scoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
         let unscoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
-        let scoped_ids: Vec<&str> = scoped.results.iter().map(|e| e.id.as_str()).collect();
-        let unscoped_ids: Vec<&str> = unscoped.results.iter().map(|e| e.id.as_str()).collect();
+        let scoped_ids: Vec<&str> = scoped.results.iter().map(|e| e.edge.id.as_str()).collect();
+        let unscoped_ids: Vec<&str> = unscoped.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(scoped_ids, unscoped_ids, "an empty file_paths slice must return the exact same rows as omitting it");
         assert_eq!(scoped_ids, vec!["e_near", "e_far"]);
     }
@@ -628,7 +637,7 @@ mod tests {
         loop {
             let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["scoped.rs"], "a.rs", 1, cursor.as_deref()).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one scoped row per page");
-            seen.extend(page.results.iter().map(|e| e.id.clone()));
+            seen.extend(page.results.iter().map(|e| e.edge.id.clone()));
             if !page.has_more {
                 break;
             }
