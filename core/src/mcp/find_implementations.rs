@@ -47,6 +47,9 @@ struct ImplementationPage {
     results: Vec<ImplementationSite>,
     has_more: bool,
     next_cursor: Option<String>,
+    /// See `Page::all_unresolved` - true when every implementor in `results`
+    /// came from an edge the linker couldn't confirm.
+    all_unresolved: bool,
 }
 
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
@@ -111,7 +114,12 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
     let page = list_implementations(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find implementations", e))?;
 
-    success(&ImplementationPage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
+    success(&ImplementationPage {
+        results: page.results,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
+    })
 }
 
 #[cfg(test)]
@@ -178,6 +186,35 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
+        assert_eq!(body["allUnresolved"], false, "an empty page has nothing to be suspicious of");
+    }
+
+    #[test]
+    fn a_page_where_every_implementor_is_unresolved_is_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert_eq!(body["allUnresolved"], true, "every implementor unresolved must set the response-level marker");
+    }
+
+    #[test]
+    fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("impl_b", "Type", "B", "pkg::B", "b.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "impl_b", "interface", "SUPERTYPE_OF", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+        assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
     }
 
     /// Anchoring by name must reach the same node the id does - here the

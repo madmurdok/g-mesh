@@ -68,7 +68,10 @@ fn list_calls(
         results.push(CallSite { node, resolved: edge.resolved, locality, edge_id: edge.id });
     }
 
-    Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor })
+    // Intermediate page, ahead of the EdgeRow/bound_page step each handle_*
+    // does next - that step computes the real `all_unresolved` marker from
+    // each row's `resolved` bit, so this one is a placeholder nothing reads.
+    Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor, all_unresolved: false })
 }
 
 /// Wire shape for `find_callers`: the calling function on the other end of
@@ -137,6 +140,9 @@ struct CallerPage {
     results: Vec<CallerSite>,
     has_more: bool,
     next_cursor: Option<String>,
+    /// See `Page::all_unresolved` - true when every caller in `results` came
+    /// from an edge the linker couldn't confirm.
+    all_unresolved: bool,
 }
 
 #[derive(Serialize)]
@@ -145,6 +151,9 @@ struct CalleePage {
     results: Vec<CalleeSite>,
     has_more: bool,
     next_cursor: Option<String>,
+    /// See `Page::all_unresolved` - true when every callee in `results` came
+    /// from an edge the linker couldn't confirm.
+    all_unresolved: bool,
 }
 
 pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -170,7 +179,12 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         .collect();
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
-    success(&CallerPage { results: bounded.results, has_more: bounded.has_more, next_cursor: bounded.next_cursor })
+    success(&CallerPage {
+        results: bounded.results,
+        has_more: bounded.has_more,
+        next_cursor: bounded.next_cursor,
+        all_unresolved: bounded.all_unresolved,
+    })
 }
 
 pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -196,7 +210,12 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         .collect();
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
-    success(&CalleePage { results: bounded.results, has_more: bounded.has_more, next_cursor: bounded.next_cursor })
+    success(&CalleePage {
+        results: bounded.results,
+        has_more: bounded.has_more,
+        next_cursor: bounded.next_cursor,
+        all_unresolved: bounded.all_unresolved,
+    })
 }
 
 #[cfg(test)]
@@ -270,6 +289,44 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
+        assert_eq!(body["allUnresolved"], false, "an empty page has nothing to be suspicious of");
+    }
+
+    /// Mirrors `find_references`'s benchmark-shaped repro: a caller list that
+    /// looks like a complete answer (non-empty, `hasMore: false`) but is
+    /// built entirely from edges the linker couldn't confirm must say so at
+    /// the response level, not leave it to be inferred by scanning every
+    /// row's own `resolved` bit.
+    #[test]
+    fn a_page_where_every_caller_is_unresolved_is_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", false)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+        assert_eq!(body["allUnresolved"], true, "every caller unresolved must set the response-level marker");
+    }
+
+    #[test]
+    fn a_page_with_at_least_one_resolved_caller_is_not_flagged_all_unresolved() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "CALLS", "tree-sitter", false)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["results"].as_array().unwrap().len(), 3);
+        assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
     }
 
     #[test]
