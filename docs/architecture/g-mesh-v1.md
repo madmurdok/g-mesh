@@ -403,7 +403,8 @@ erDiagram
         string embeddingVersion
     }
     META {
-        string schema_version
+        string schema_version "DDL generation - mismatch wipes"
+        string indexer_version "extractor/linker generation - mismatch wipes"
         string embedding_model
         string lastUsed "per project, for GC idle check"
     }
@@ -567,11 +568,19 @@ MCP client on stdio — the shim is a pure repacking proxy.
   benchmark a synthetic large-monorepo-shaped graph with a hub node at the
   budget ceiling; if p95 latency exceeds ~200-300ms, migrate — this is the
   threshold at which MCP tool latency becomes agent-visible.
-- **Schema version mismatch** (core binary upgraded/downgraded): full local
-  reindex, no migration framework in v1 — the index is a reproducible
-  cache, not user data, so rebuilding is cheaper than maintaining
-  migrations. Revisit only if the schema stabilizes while core releases
-  stay frequent, or monorepo rebuild time becomes an UX problem at scale.
+- **Schema version mismatch** (the DDL changed): full local reindex, no
+  migration framework in v1 — the index is a reproducible cache, not user
+  data, so rebuilding is cheaper than maintaining migrations. Revisit only
+  if the schema stabilizes while core releases stay frequent, or monorepo
+  rebuild time becomes an UX problem at scale.
+- **Indexer version mismatch** (the same source tree would now produce a
+  different graph — a resolver fix, a new edge kind, changed linking):
+  same full local reindex, tracked separately in `meta.indexer_version`
+  because it is the far more frequent event and shares none of its timing
+  with a DDL change. Without it an index is never invalidated at all: the
+  schema still matches and the project has already been walked, so the
+  daemon keeps serving whatever generation of the extractor first filled
+  it, indefinitely and without a symptom other than wrong answers.
 - **SQLite durability**: WAL-mode transactional writes — a core crash
   mid-operation loses at most an uncommitted transaction, never corrupts
   the index.
