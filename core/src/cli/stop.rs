@@ -197,8 +197,15 @@ fn tidy_state_files(project_root: &Path) -> Result<()> {
     // A socket file outlives the daemon that bound it, and a leftover one is
     // what `daemon::run` has to clear before it can bind. Removing it here is
     // what "the socket is released" means to the next daemon.
+    //
+    // The build stamp goes with it, under the same condition and for a
+    // related reason: it describes the process that was serving this socket,
+    // so once nothing is answering there it describes nobody. Keyed off the
+    // socket rather than off the pid file the loop above may have just
+    // removed, which would read as "nothing running" whatever the truth.
     if !daemon::is_listening(project_root)? {
         let _ = fs::remove_file(daemon::socket_path(project_root)?);
+        let _ = fs::remove_file(daemon::build_stamp_path(project_root)?);
     }
     Ok(())
 }
