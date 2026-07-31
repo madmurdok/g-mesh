@@ -403,7 +403,8 @@ erDiagram
         string embeddingVersion
     }
     META {
-        string schema_version
+        string schema_version "DDL generation - mismatch wipes"
+        string indexer_version "extractor/linker generation - mismatch wipes"
         string embedding_model
         string lastUsed "per project, for GC idle check"
     }
@@ -475,9 +476,9 @@ not a unique handle either (excalidraw has two distinct
 could return the same candidate page forever.
 
 Traversal responses that hit a limit carry `truncated: true` and
-`truncatedBy: 'maxDepth' | 'maxFanout' | 'explorationBudget'` — never a
-silent "no more results". Continuation differs by cause: `maxFanout` →
-agent issues a normal single-hop paginated call on the node where it was
+`truncatedBy: 'maxDepth' | 'maxFanout' | 'explorationBudget' | 'responseSize'`
+— never a silent "no more results". Continuation differs by cause: `maxFanout`
+→ agent issues a normal single-hop paginated call on the node where it was
 cut; `maxDepth` → response includes `frontierNodes` to re-root the same
 traversal call one level further; `explorationBudget` → response includes
 an opaque `resumeToken` encoding visited-set + frontier queue, since budget
@@ -491,6 +492,27 @@ the 64 MiB NDJSON frame limit either way, but it is retransmitted by the
 caller on every hop of a chain, so keeping it small matters for an LLM
 agent's context budget even though nothing rejects the request outright.
 
+`responseSize` is a fourth, independent cause layered on top of the other
+three (`core::mcp::pagination::bound_page`/`bound_walk`): even a response
+already bounded by depth, fanout and row `limit` can still serialize to more
+JSON than an MCP client's own transport will accept as one tool result —
+measured directly in the g-mesh-bench benchmark corpus, where an unbounded
+`find_references` call came back at 54,600 characters and an `Incoming`
+`get_dependencies` walk at the old `maxDepth = 5` default came back at
+115,863, both rejected outright by the calling client rather than truncated.
+Neither of g-mesh's own transports (the control-plane JSON-RPC channel below,
+capped at 64 MiB; the shim's stdio NDJSON proxy, same cap) enforce anything
+close to this size, so the limit is external and not g-mesh's to learn
+exactly - the fix is to stay well under it by construction:
+`pagination::MAX_RESPONSE_BYTES` (20,000 bytes, comfortably under the
+smallest observed real rejection) bounds every list-shaped tool response's
+serialized size, truncating to the longest row prefix that still fits.
+Continuation for a `responseSize` cut reuses the `explorationBudget` arm's
+own `resumeToken` mechanism exactly (opaque token, cumulative across a resume
+chain) rather than a separate scheme, so a caller does not need to
+distinguish the two causes to know how to continue - only `truncatedBy`
+itself tells them why the cut happened, not how to resume from it.
+
 An import that resolved to nothing is still reported as a dependency —
 `get_dependencies` answers what a file depends on, and "on a package we do
 not index" is part of that answer — but as the `Module` placeholder it is,
@@ -499,9 +521,18 @@ path such a node stores is the importing file's, which as a dependency row
 would both name the wrong file and collide with the importer's own row in
 the same walk.
 
-Defaults (unvalidated, confirm on a prototype): `maxDepth = 5`,
-`maxFanout = 50`, internal exploration budget = 5000 visited nodes per
-query.
+Defaults (unvalidated, confirm on a prototype): the walk engine's own
+generic `maxDepth = 5`, `maxFanout = 50`, internal exploration budget = 5000
+visited nodes per query. `get_dependencies` itself defaults `maxDepth` to a
+stricter `2`, not the engine's 5 - an `Incoming` walk's fan-out compounds
+with every extra hop of depth in a way `maxFanout` alone cannot bound, and
+depth 5 is what produced the 115,863-character `responseSize` failure above
+on a real, shared module; depth 2 stays an order of magnitude more
+conservative while still answering the "what depends on what depends on
+this" shape the tool mostly exists for (see `mcp::get_dependencies`'s own
+`DEFAULT_MAX_DEPTH` doc comment for the full reasoning). An explicit
+`maxDepth` from the caller is always honored exactly, unaffected by this
+tighter default.
 
 ### Core ↔ language plugin protocol
 
@@ -567,11 +598,19 @@ MCP client on stdio — the shim is a pure repacking proxy.
   benchmark a synthetic large-monorepo-shaped graph with a hub node at the
   budget ceiling; if p95 latency exceeds ~200-300ms, migrate — this is the
   threshold at which MCP tool latency becomes agent-visible.
-- **Schema version mismatch** (core binary upgraded/downgraded): full local
-  reindex, no migration framework in v1 — the index is a reproducible
-  cache, not user data, so rebuilding is cheaper than maintaining
-  migrations. Revisit only if the schema stabilizes while core releases
-  stay frequent, or monorepo rebuild time becomes an UX problem at scale.
+- **Schema version mismatch** (the DDL changed): full local reindex, no
+  migration framework in v1 — the index is a reproducible cache, not user
+  data, so rebuilding is cheaper than maintaining migrations. Revisit only
+  if the schema stabilizes while core releases stay frequent, or monorepo
+  rebuild time becomes an UX problem at scale.
+- **Indexer version mismatch** (the same source tree would now produce a
+  different graph — a resolver fix, a new edge kind, changed linking):
+  same full local reindex, tracked separately in `meta.indexer_version`
+  because it is the far more frequent event and shares none of its timing
+  with a DDL change. Without it an index is never invalidated at all: the
+  schema still matches and the project has already been walked, so the
+  daemon keeps serving whatever generation of the extractor first filled
+  it, indefinitely and without a symptom other than wrong answers.
 - **SQLite durability**: WAL-mode transactional writes — a core crash
   mid-operation loses at most an uncommitted transaction, never corrupts
   the index.

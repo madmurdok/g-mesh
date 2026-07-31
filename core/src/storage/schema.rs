@@ -13,7 +13,44 @@ use rusqlite::{Connection, OptionalExtension};
 /// Bumped to "3" when `meta.bulkIndexedAt` was added (cold-start bulk index -
 /// see `daemon::bulk_index`): the daemon needs to know whether a full walk of
 /// the project has ever *finished*, which nothing in "2" recorded.
-pub const CURRENT_SCHEMA_VERSION: &str = "3";
+///
+/// Bumped to "4" when `meta.indexer_version` was added - see
+/// [`CURRENT_INDEXER_VERSION`] for the failure that column exists to end.
+pub const CURRENT_SCHEMA_VERSION: &str = "4";
+
+/// The generation of the extractor+linker whose output an index holds.
+///
+/// The schema version above answers "can this database still be read?". This
+/// one answers the question that turned out to matter far more in practice:
+/// "is what is *in* it still what today's code would produce?" The two are
+/// independent - fixing a resolver, teaching the extractor a new edge, or
+/// changing how core links placeholders all leave the DDL untouched while
+/// silently invalidating every row already stored.
+///
+/// Without this, an index simply never caught up. A project indexed once kept
+/// serving that first extraction for as long as its files did not change:
+/// the schema still matched, so nothing was wiped, and `bulkIndexedAt` was
+/// set, so no walk was owed. The measured case (task 96) was an index built
+/// on 2026-07-28, before module specifiers resolved at all, still answering
+/// `get_dependencies(..., Incoming)` with `[]` on a build three releases
+/// later - while the same query against a fresh index of the same tree
+/// returned all 39 importers. Every such answer is a confident,
+/// well-formed lie, which is worse than an error.
+///
+/// So: **bump this whenever a change makes the indexing pipeline produce
+/// different nodes or edges for the same source tree** - anything in
+/// `plugins/js-ts/src` that alters what is extracted or which specifiers
+/// resolve, and anything in `graph::imports` / `graph::symbol_links` that
+/// alters what gets linked. A mismatch takes the same path a schema mismatch
+/// does: wipe, then a full re-walk on the next daemon start. That costs one
+/// cold start per project per bump, which is the whole price of never serving
+/// a previous generation's graph.
+///
+/// It is deliberately *not* the crate version: releases and extraction
+/// changes are different events, and tying the two would both miss changes
+/// (a release that fixes nothing about extraction) and force pointless
+/// reindexes (a release that only touches the CLI).
+pub const CURRENT_INDEXER_VERSION: &str = "1";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md). `vectors` is deliberately not created
@@ -60,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
 CREATE TABLE IF NOT EXISTS meta (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version  TEXT NOT NULL,
+    indexer_version TEXT NOT NULL,
     embedding_model TEXT,
     lastUsed        TEXT NOT NULL,
     bulkIndexedAt   TEXT
@@ -82,32 +120,52 @@ pub fn apply(conn: &Connection) -> Result<()> {
     conn.execute_batch(DDL).context("failed to apply schema DDL")
 }
 
-/// Ensures the DB's schema matches [`CURRENT_SCHEMA_VERSION`], wiping and
-/// recreating it on mismatch - no migration framework, full reindex is the
-/// only upgrade path. Returns `true` if a full reindex is now required
-/// (fresh DB or version mismatch), `false` if the existing schema and data
-/// were already current and were left untouched.
+/// Ensures the DB matches both [`CURRENT_SCHEMA_VERSION`] (it can still be
+/// read) and [`CURRENT_INDEXER_VERSION`] (what it holds is still what today's
+/// pipeline would produce), wiping and recreating it on either mismatch - no
+/// migration framework, full reindex is the only upgrade path. Returns `true`
+/// if a full reindex is now required (fresh DB or either version stale),
+/// `false` if the existing schema and data were already current and were left
+/// untouched.
+///
+/// The two are read in sequence rather than in one query because a database
+/// old enough to fail the first check has no `indexer_version` column to
+/// select at all - `schema_version` is the one column every generation of
+/// this schema has had, so it is the only one safe to ask about first.
 pub fn ensure_current(conn: &Connection) -> Result<bool> {
     apply(conn)?;
 
-    let existing: Option<String> = conn
+    let schema: Option<String> = conn
         .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
         .optional()
         .context("failed to read schema_version")?;
 
-    match existing {
-        Some(version) if version == CURRENT_SCHEMA_VERSION => Ok(false),
-        Some(_) => {
-            wipe(conn)?;
-            apply(conn)?;
-            record_version(conn)?;
-            Ok(true)
-        }
-        None => {
-            record_version(conn)?;
-            Ok(true)
-        }
+    let Some(schema) = schema else {
+        record_version(conn)?;
+        return Ok(true);
+    };
+    if schema != CURRENT_SCHEMA_VERSION {
+        return reset(conn).map(|()| true);
     }
+
+    let indexer: String = conn
+        .query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0))
+        .context("failed to read indexer_version")?;
+    if indexer != CURRENT_INDEXER_VERSION {
+        return reset(conn).map(|()| true);
+    }
+
+    Ok(false)
+}
+
+/// Throws away everything a stale generation left behind and starts the index
+/// over empty. `bulkIndexedAt` going with it is the point, not a side effect:
+/// it is what makes the next daemon start walk the project again instead of
+/// trusting a graph nothing will ever refresh.
+fn reset(conn: &Connection) -> Result<()> {
+    wipe(conn)?;
+    apply(conn)?;
+    record_version(conn)
 }
 
 /// Whether a full project walk has ever finished for this index. `false`
@@ -141,10 +199,10 @@ fn wipe(conn: &Connection) -> Result<()> {
 
 fn record_version(conn: &Connection) -> Result<()> {
     conn.execute(
-        "INSERT INTO meta (id, schema_version, lastUsed) VALUES (1, ?1, CURRENT_TIMESTAMP)",
-        rusqlite::params![CURRENT_SCHEMA_VERSION],
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, ?1, ?2, CURRENT_TIMESTAMP)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION, CURRENT_INDEXER_VERSION],
     )
-    .context("failed to record schema_version")?;
+    .context("failed to record the schema and indexer versions")?;
     Ok(())
 }
 
@@ -252,8 +310,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO meta (id, schema_version, lastUsed) VALUES (1, '0', CURRENT_TIMESTAMP)",
-            [],
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '0', ?1, CURRENT_TIMESTAMP)",
+            rusqlite::params![CURRENT_INDEXER_VERSION],
         )
         .unwrap();
 
@@ -319,12 +377,53 @@ mod tests {
         );
     }
 
+    /// Task 96: the shape that let a 2026-07-28 index keep answering queries
+    /// three releases later. Nothing about the DDL changed, so the schema
+    /// check passed and the walk marker survived - and the stale graph was
+    /// served as if it were current.
+    #[test]
+    fn an_index_from_an_older_indexer_is_wiped_even_though_its_schema_still_matches() {
+        let conn = setup();
+        ensure_current(&conn).unwrap();
+        record_bulk_index(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("UPDATE meta SET indexer_version = '0' WHERE id = 1", []).unwrap();
+
+        assert!(ensure_current(&conn).unwrap(), "a previous generation's graph must not be kept");
+        let schema: String =
+            conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(schema, CURRENT_SCHEMA_VERSION, "the schema was current all along and stays so");
+        let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+        assert_eq!(node_count, 0, "what the old indexer produced must not survive");
+        assert!(
+            !bulk_index_completed(&conn).unwrap(),
+            "the project is owed a full walk, or the wipe just made the index emptier and no fresher"
+        );
+    }
+
+    #[test]
+    fn a_fresh_index_records_the_indexer_generation_that_will_fill_it() {
+        let conn = setup();
+        ensure_current(&conn).unwrap();
+
+        let indexer: String =
+            conn.query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(indexer, CURRENT_INDEXER_VERSION);
+        assert!(!ensure_current(&conn).unwrap(), "the stamp it just wrote must satisfy its own check");
+    }
+
     #[test]
     fn meta_round_trip() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO meta (id, schema_version, embedding_model, lastUsed)
-             VALUES (1, '1', 'jina-embeddings-v2-base-code', '2026-07-27T00:00:00Z')",
+            "INSERT INTO meta (id, schema_version, indexer_version, embedding_model, lastUsed)
+             VALUES (1, '1', '1', 'jina-embeddings-v2-base-code', '2026-07-27T00:00:00Z')",
             [],
         )
         .unwrap();

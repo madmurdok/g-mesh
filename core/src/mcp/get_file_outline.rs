@@ -19,11 +19,6 @@ use crate::storage::write::NodeRecord;
 use super::tool_result::{error, internal_error, success};
 use super::GetFileOutlineParams;
 
-/// Mirrors `find_references::REFERENCE_PAGE_SIZE` - no page-size convention
-/// exists beyond "20" yet, so this reuses it rather than inventing a second
-/// arbitrary number.
-const OUTLINE_PAGE_SIZE: usize = 20;
-
 /// One symbol the file declares. No `file_path` field - every entry in this
 /// list is by definition in the file the caller just named, so repeating it
 /// per row would only be noise.
@@ -97,7 +92,8 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: GetFileOutlineParams
         None => return error(format!("g-mesh: no file '{}' found in the index", params.file_path)),
     };
 
-    let page = list_outline(&conn, &file_node.id, OUTLINE_PAGE_SIZE, params.cursor.as_deref())
+    let page_size = pagination::resolve_page_size(params.limit);
+    let page = list_outline(&conn, &file_node.id, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to list file outline", e))?;
 
     success(&OutlinePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -154,7 +150,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_first", "file", "first", "DEFINES", "tree-sitter", false)).unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_second", "file", "second", "DEFINES", "tree-sitter", false)).unwrap();
 
-        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor: None };
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -167,7 +163,7 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
 
-        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor: None };
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -177,7 +173,7 @@ mod tests {
     #[test]
     fn unknown_file_path_is_a_tool_level_error() {
         let conn = setup();
-        let params = GetFileOutlineParams { file_path: "does/not/exist.rs".to_string(), cursor: None };
+        let params = GetFileOutlineParams { file_path: "does/not/exist.rs".to_string(), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does/not/exist.rs"));
     }
@@ -190,7 +186,7 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("not_the_file", "Function", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
 
-        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor: None };
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("a.rs"));
     }
@@ -209,7 +205,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor: cursor.clone() };
+            let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor: cursor.clone(), ..Default::default() };
             let result = handle(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
@@ -222,5 +218,69 @@ mod tests {
         }
 
         assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"], "every symbol must appear exactly once, in source order");
+    }
+
+    /// A file with more top-level symbols than the default page size must
+    /// still come back in one call when the caller raises `limit` past the
+    /// symbol count - the whole point of adding `limit` here, mirroring
+    /// `find_references`' `a_custom_limit_returns_more_than_the_default_page_in_one_call`.
+    #[test]
+    fn a_custom_limit_returns_a_large_file_in_one_call() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..30 {
+            let id = format!("n{i}");
+            upsert_node(&mut conn, symbol_at(&id, &id, i)).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false)).unwrap();
+        }
+
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(30), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let body = json_body(&result);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 30, "30 symbols must fit in a single page once limit covers them all");
+        assert_eq!(body["hasMore"], false);
+    }
+
+    /// Omitting `limit` must keep paging at the same default as before this
+    /// field existed - a caller that never touches `limit` must see no
+    /// behavior change.
+    #[test]
+    fn omitting_limit_keeps_the_default_page_size() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..25 {
+            let id = format!("n{i}");
+            upsert_node(&mut conn, symbol_at(&id, &id, i)).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false)).unwrap();
+        }
+
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let body = json_body(&result);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), pagination::DEFAULT_PAGE_SIZE, "no limit means the first page is exactly the default size");
+        assert_eq!(body["hasMore"], true, "25 symbols against the default page size must still have a next page");
+    }
+
+    /// A `limit` above the ceiling must be clamped, not honored verbatim or
+    /// rejected - same contract `pagination::resolve_page_size` gives the
+    /// symbol-query tools.
+    #[test]
+    fn an_oversized_limit_is_clamped_to_the_ceiling() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..(pagination::MAX_PAGE_SIZE as i64 + 5) {
+            let id = format!("n{i}");
+            upsert_node(&mut conn, symbol_at(&id, &id, i)).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false)).unwrap();
+        }
+
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(10_000), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let body = json_body(&result);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), pagination::MAX_PAGE_SIZE, "an oversized limit must clamp to the ceiling, not return every row");
+        assert_eq!(body["hasMore"], true);
     }
 }

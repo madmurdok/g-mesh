@@ -76,6 +76,7 @@ fn list_references(
     conn: &Connection,
     anchor_id: &str,
     anchor_file_path: &str,
+    file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<ReferenceSite>> {
@@ -84,31 +85,40 @@ fn list_references(
         anchor_id,
         Direction::Incoming,
         USAGE_EDGE_KINDS,
+        file_paths,
         anchor_file_path,
         page_size,
         cursor,
     )
     .context("failed to paginate reference edges")?;
 
-    let mut results = Vec::with_capacity(page.results.len());
+    let mut rows = Vec::with_capacity(page.results.len());
     for edge in page.results {
         let referencing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve referencing node")?
             .with_context(|| format!("edge {} references missing node {}", edge.id, edge.from_id))?;
-        results.push(ReferenceSite {
-            referencing_symbol_id: referencing.id,
-            name: referencing.name,
-            qualified_name: referencing.qualified_name,
-            kind: referencing.kind,
-            file_path: referencing.file_path,
-            start_line: referencing.start_line,
-            start_col: referencing.start_col,
-            reference_kind: edge.kind,
+        // Same rule `paginate_edges`' SQL applies: locality 0 when the
+        // enriched row shares the anchor's file, 1 otherwise.
+        let locality = if referencing.file_path == anchor_file_path { 0 } else { 1 };
+        rows.push(pagination::EdgeRow {
             resolved: edge.resolved,
+            locality,
+            edge_id: edge.id.clone(),
+            item: ReferenceSite {
+                referencing_symbol_id: referencing.id,
+                name: referencing.name,
+                qualified_name: referencing.qualified_name,
+                kind: referencing.kind,
+                file_path: referencing.file_path,
+                start_line: referencing.start_line,
+                start_col: referencing.start_col,
+                reference_kind: edge.kind,
+                resolved: edge.resolved,
+            },
         });
     }
 
-    Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor })
+    Ok(pagination::bound_page(rows, page.has_more, page.next_cursor))
 }
 
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -120,7 +130,8 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_references(&conn, &anchor.id, &anchor.file_path, page_size, params.cursor.as_deref())
+    let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let page = list_references(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find references", e))?;
 
     success(&ReferencePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
@@ -172,7 +183,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.rs", 1, cursor.as_deref()).unwrap();
+            let page = list_references(&conn, "target", "target.rs", &[], 1, cursor.as_deref()).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {
@@ -242,7 +253,7 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("sub", "Type", "Sub", "pkg::Sub", "sub.ts", "typescript")).unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_sub", "sub", "base", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
 
-        let page = list_references(&conn, "base", "base.ts", 10, None).unwrap();
+        let page = list_references(&conn, "base", "base.ts", &[], 10, None).unwrap();
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.results[0].referencing_symbol_id, "sub");
         assert_eq!(page.results[0].reference_kind, "SUPERTYPE_OF");
@@ -259,7 +270,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_def", "file", "target", "DEFINES", "tree-sitter", true)).unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_exp", "file", "target", "EXPORTS", "tree-sitter", true)).unwrap();
 
-        let page = list_references(&conn, "target", "tasks.ts", 10, None).unwrap();
+        let page = list_references(&conn, "target", "tasks.ts", &[], 10, None).unwrap();
         assert!(page.results.is_empty(), "a symbol's own declaration site is not a reference to it");
     }
 
@@ -279,7 +290,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.ts", 1, cursor.as_deref()).unwrap();
+            let page = list_references(&conn, "target", "target.ts", &[], 1, cursor.as_deref()).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {
@@ -309,6 +320,107 @@ mod tests {
         let body = json_body(&handle(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
+    }
+
+    /// Reproduces the benchmark's own membership-test shape (g-mesh-bench's
+    /// v0.4.0 outlier findings, section 3b): "of these N known files, which
+    /// ones reference symbol S?" Five known candidate files stand in for the
+    /// five Trail-implementation files from that corpus - three of them
+    /// actually reference the target, one is a known file that happens not
+    /// to, and a sixth file outside the known set also references it but
+    /// must not leak into a scoped answer. One call with `file_paths` set to
+    /// the five known files must return exactly the three that reference it,
+    /// where previously this required either one unscoped call plus manual
+    /// filtering, or one grep per candidate file.
+    #[test]
+    fn scoping_to_five_known_files_returns_exactly_the_ones_that_reference_it() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "pointFrom", "pkg::pointFrom", "target.ts", "typescript")).unwrap();
+
+        let known_files = ["trail1.ts", "trail2.ts", "trail3.ts", "trail4.ts", "trail5.ts"];
+        for (i, file) in known_files.iter().enumerate() {
+            let id = format!("known_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "typescript")).unwrap();
+            // Only the first three known files actually reference the target;
+            // trail4/trail5 are known candidates that turn out not to call it.
+            if i < 3 {
+                upsert_edge(&mut conn, EdgeRecord::new(format!("e_known_{i}"), &id, "target", "REFERENCES", "tree-sitter", true))
+                    .unwrap();
+            }
+        }
+        // A reference from outside the known set - must never appear in a
+        // scoped answer, however many other unrelated files reference the
+        // symbol too.
+        upsert_node(&mut conn, NodeRecord::new("outsider", "Function", "outsider", "pkg::outsider", "unrelated.ts", "typescript"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_outsider", "outsider", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+
+        let conn = Arc::new(Mutex::new(conn));
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        let body = json_body(&handle(&conn, params).unwrap());
+        let mut file_paths: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        file_paths.sort();
+        assert_eq!(
+            file_paths,
+            vec!["trail1.ts", "trail2.ts", "trail3.ts"],
+            "must return exactly the known files that reference the target, in one call"
+        );
+    }
+
+    /// A file outside the scope that also references the target must not
+    /// appear, and the row count must reflect the narrowed set, not the
+    /// project-wide one.
+    #[test]
+    fn scoping_find_references_excludes_a_referencing_file_outside_the_scope() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("in_scope", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("out_of_scope", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "in_scope", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "out_of_scope", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            file_paths: Some(vec!["a.rs".to_string()]),
+            ..Default::default()
+        };
+        let body = json_body(&handle(&conn, params).unwrap());
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
+        assert_eq!(results[0]["referencingSymbolId"], "in_scope");
+    }
+
+    /// Omitting `file_paths` entirely must be indistinguishable from a call
+    /// made before this parameter existed - the whole point of "empty/absent
+    /// means unfiltered" is that existing callers see no behavior change.
+    #[test]
+    fn omitting_file_paths_behaves_identically_to_before_this_change() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let omitted = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+        );
+        let explicit_empty = json_body(
+            &handle(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("target".to_string()), file_paths: Some(Vec::new()), ..Default::default() },
+            )
+            .unwrap(),
+        );
+        assert_eq!(omitted, explicit_empty, "an explicit empty file_paths array must answer exactly as omitting it does");
+        assert_eq!(omitted["results"].as_array().unwrap().len(), 2);
     }
 
     #[test]

@@ -181,7 +181,15 @@ impl ServerHandler for GMeshMcpServer {
                  Efficient usage: pass `symbol_name` directly to find_references/find_callers/\
                  find_callees/find_implementations instead of calling find_definition first, and \
                  raise `limit` for symbols with many results instead of paging - see each tool's \
-                 parameter docs for the exact mechanics (ambiguity handling, defaults).",
+                 parameter docs for the exact mechanics (ambiguity handling, defaults).\n\n\
+                 A result anchored by `symbol_id` is already resolved per call site to that exact \
+                 declaration - other same-named declarations' call sites are excluded, so \
+                 re-checking one with grep is wasted work. `resolved: false` on a row marks an \
+                 edge the indexer could not confirm; that is the one row worth double-checking, \
+                 not the whole list. One honest gap: a method call reached through a variable \
+                 receiver (`x.foo()`) produces no edge by design, so caller/reference lists for \
+                 methods can under-report - bare calls and `this`/`super`/qualified-type calls do \
+                 not have this gap.",
             )
     }
 }
@@ -222,14 +230,31 @@ pub struct SymbolQueryParams {
     /// Maximum results (default 20, capped at 200) - raise for a wide result
     /// set instead of paging via `cursor`.
     pub limit: Option<u32>,
+    /// Restrict results to rows whose referencing/calling/implementing node
+    /// lives in one of these files (project-relative, matching `file_path`
+    /// exactly as it appears elsewhere in this tool's own output - no
+    /// prefix or glob matching). Use this to answer "of these known files,
+    /// which ones reference/call this symbol?" in one call instead of one
+    /// unscoped call plus a grep per file. Omit for the default, unscoped
+    /// search across the whole project; an empty array behaves identically
+    /// to omitting it, not "match nothing".
+    pub file_paths: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+/// `Default` is for tests that construct this by hand - see
+/// `SymbolQueryParams`'s doc comment for why.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetFileOutlineParams {
     /// Project-relative path of the file to outline.
     pub file_path: String,
     /// Opaque cursor from a previous page of results.
     pub cursor: Option<String>,
+    /// Maximum symbols to return (default 20, capped at 200) - raise this for
+    /// a file with many top-level symbols instead of paging via `cursor`. A
+    /// file that fits in one call with `limit` set high enough is one round
+    /// trip instead of several, each of which re-pays the whole
+    /// conversation's cached prefix for a handful more rows.
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

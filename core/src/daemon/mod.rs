@@ -140,8 +140,8 @@ pub fn run(root: &Path) -> Result<()> {
     };
 
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
-    if schema::ensure_current(&conn).context("failed to check schema version")? {
-        eprintln!("g-mesh daemon: schema (re)initialized - a full reindex is needed");
+    if schema::ensure_current(&conn).context("failed to check the index's schema and indexer versions")? {
+        eprintln!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
     // Recorded here rather than once the daemon is serving: a start that gets
     // as far as opening the index is already this project being used, and a

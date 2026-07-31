@@ -26,16 +26,16 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Name plus the parameters a caller must supply - the half of each schema a
 /// follow-up ticket is not allowed to quietly change.
 const EXPECTED_TOOLS: [(&str, &[&str]); 7] = [
-    ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit"]),
-    ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit"]),
+    ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
+    ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     ("find_definition", &["symbol_name", "file_path", "position", "cursor"]),
-    ("find_implementations", &["symbol_id", "symbol_name", "cursor", "limit"]),
-    ("find_references", &["symbol_id", "symbol_name", "cursor", "limit"]),
+    ("find_implementations", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
+    ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     (
         "get_dependencies",
         &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"],
     ),
-    ("get_file_outline", &["file_path", "cursor"]),
+    ("get_file_outline", &["file_path", "cursor", "limit"]),
 ];
 
 /// Temp project root plus teardown of the daemon the shim bootstraps for it
