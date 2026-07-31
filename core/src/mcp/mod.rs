@@ -232,12 +232,20 @@ pub struct SymbolQueryParams {
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+/// `Default` is for tests that construct this by hand - see
+/// `SymbolQueryParams`'s doc comment for why.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetFileOutlineParams {
     /// Project-relative path of the file to outline.
     pub file_path: String,
     /// Opaque cursor from a previous page of results.
     pub cursor: Option<String>,
+    /// Maximum symbols to return (default 20, capped at 200) - raise this for
+    /// a file with many top-level symbols instead of paging via `cursor`. A
+    /// file that fits in one call with `limit` set high enough is one round
+    /// trip instead of several, each of which re-pays the whole
+    /// conversation's cached prefix for a handful more rows.
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

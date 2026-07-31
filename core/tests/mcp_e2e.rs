@@ -35,7 +35,7 @@ const EXPECTED_TOOLS: [(&str, &[&str]); 7] = [
         "get_dependencies",
         &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"],
     ),
-    ("get_file_outline", &["file_path", "cursor"]),
+    ("get_file_outline", &["file_path", "cursor", "limit"]),
 ];
 
 /// Temp project root plus teardown of the daemon the shim bootstraps for it
