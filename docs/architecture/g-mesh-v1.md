@@ -177,13 +177,20 @@ sequenceDiagram
     Agent->>Shim: spawn (stdio), cwd = project
     Shim->>Shim: hash(cwd), check socket
     Shim->>Core: bootstrap detached daemon
+    Core->>DB: open index, check schema/indexer version
+    Core-->>Shim: bind socket (before any indexing)
     Core->>Plugin: spawn language plugin
     Plugin->>Plugin: tree-sitter parse (parallel, per core)
     Plugin->>Plugin: resolve relative specifiers against the filesystem
     Plugin-->>Core: NDJSON stream: nodes/edges (structural)
     Core->>DB: batched transaction(s)
+    opt a tool call arrives while the walk is still running
+        Agent->>Core: find_definition(...)
+        Core-->>Agent: tool error - the index is still being built, retry
+    end
     Core->>DB: link resolved imports onto their File nodes
-    Core-->>Shim: index available (tree-sitter layer)
+    Core->>Core: mark indexing complete
+    Core-->>Agent: index available (tree-sitter layer)
     par async, non-blocking
         Plugin->>Plugin: TS compiler API semantic pass
         Plugin-->>Core: diff (resolved edges, upgraded `source`)
@@ -194,6 +201,21 @@ sequenceDiagram
 Structural graph is available almost immediately; semantic resolution
 (`source: 'ts-compiler'`, `resolved: true`) fills in asynchronously without
 blocking tool availability.
+
+<a id="bind-before-walk"></a>The socket is bound **before** the cold-start
+walk, not after it. The invariant is unchanged — *no caller is ever served off
+a half-built graph* — but it is enforced in the response rather than in the
+transport: a tool call arriving mid-walk is answered with an explicit
+tool-level error naming indexing as the reason, and the daemon starts giving
+real answers the instant the walk's last batch and its linking passes are
+committed. Refusing the connection outright enforced exactly the same thing
+and was the original design, on the reasoning that nothing should reach the
+agent until the plugin's whole stream has landed — "all or nothing". It stopped
+being viable once [an indexer-version bump](#failure-modes--edge-cases) made a
+full re-walk a routine part of *upgrading*: a walk longer than the shim's
+bootstrap timeout then left the MCP client with no g-mesh tools at all, which
+is a strictly worse answer than "not ready yet, ask again". "All or nothing"
+now describes the answers, which is where it was always doing the work.
 
 #### Import resolution
 
@@ -452,6 +474,15 @@ locality; `search_code` is ordered by similarity score. Every edge-derived
 result carries `resolved`/`source` so the agent knows how much to trust a
 given relationship.
 
+One response shape cuts across all of them: while a project's cold-start walk
+is running, every tool answers with a tool-level error whose text names
+indexing as the reason and asks the caller to retry (see
+[Cold start / initial index](#bind-before-walk)). Deliberately an error rather
+than an empty `results` page — an empty page with `hasMore: false` is
+indistinguishable from a genuine "nothing found", and an agent that reads it
+as one stops looking. The daemon's own MCP `instructions` say so too, so a
+client learns to retry rather than to fall back to grep.
+
 `find_references`/`find_callers`/`find_callees`/`find_implementations` also
 accept an optional `limit` (default 20, capped at 200) to raise the page
 size for a single call instead of paging through `cursor` — added after
@@ -611,6 +642,16 @@ MCP client on stdio — the shim is a pure repacking proxy.
   schema still matches and the project has already been walked, so the
   daemon keeps serving whatever generation of the extractor first filled
   it, indefinitely and without a symptom other than wrong answers.
+- **Cold-start walk longer than the shim's bootstrap timeout** (a large
+  monorepo's very first index, or any project's first start after an
+  indexer-version bump): the daemon binds its socket before the walk, so the
+  shim connects immediately, and every tool call until the walk commits comes
+  back as a tool-level error that names indexing as the reason and asks the
+  caller to retry (see [Cold start / initial index](#bind-before-walk)). The
+  alternative — bind last, which is what v1 originally specified — turned a
+  slow first index into an MCP client with no g-mesh tools at all and a bare
+  connection-timeout message to explain it. A caller told "not yet" retries; a
+  caller with no tools goes back to grepping.
 - **SQLite durability**: WAL-mode transactional writes — a core crash
   mid-operation loses at most an uncommitted transaction, never corrupts
   the index.

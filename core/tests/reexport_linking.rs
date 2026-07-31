@@ -25,6 +25,9 @@ use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// A two-package workspace. `@fixture/element` declares its entry as build
@@ -144,13 +147,16 @@ async fn find_callers_reaches_a_caller_that_imported_through_a_barrel() {
     let project = Project::new();
     let root = project.root().to_path_buf();
 
-    // The daemon runs its cold-start bulk index *before* it binds the socket,
-    // so a completed MCP handshake already implies a fully built index.
+    // The daemon binds its socket before its cold-start bulk index and says
+    // so per call while the walk runs (task 105), so a completed MCP
+    // handshake no longer implies a built index - the walk's own completion
+    // marker is what does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim").current_dir(&root);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
+    wait_until_indexed(&root);
 
     let callers = |name: &'static str| {
         let client = &client;

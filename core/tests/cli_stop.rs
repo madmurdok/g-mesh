@@ -63,9 +63,13 @@ impl Project {
             .spawn()
             .expect("failed to spawn the shim");
 
-        // The pid file is written once the daemon has bound its socket, so it
-        // is the signal that the bootstrap is complete.
-        wait_for("the daemon to start listening", || self.pid_file().exists());
+        // The *plugin's* pid file, not the daemon's: since task 105 the
+        // daemon's appears at the socket bind, which now happens before the
+        // plugin is spawned, so it no longer implies there is a plugin for
+        // `stop` to shut down. The plugin's is written immediately after that
+        // spawn, and `stop` clears both, so it can never be a previous
+        // daemon's leftover.
+        wait_for("the daemon to spawn its plugin", || self.plugin_pid_file().exists());
 
         // The shim was only the vehicle: the daemon it spawned is detached
         // and outlives it, which is what the `stop` under test has to reach.

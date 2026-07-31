@@ -40,6 +40,26 @@ const BULK_INDEX_FLAG: &str = "--bulk-index";
 /// row. A few thousand keeps both bounded without tuning.
 const BATCH_ITEMS: usize = 2_000;
 
+/// Holds a finished walk open for this many milliseconds before [`run`]
+/// returns, so the daemon has not yet recorded the walk as complete.
+///
+/// Real installs never set it. It exists so the test suite can observe the
+/// window in which the socket is bound and the index is not yet complete
+/// (task 105) without needing a repository large enough to take seconds to
+/// walk, and without a test that has to burn ten real seconds outlasting
+/// `shim::BOOTSTRAP_TIMEOUT`. Same rationale as
+/// [`plugin::PLUGIN_PATH_ENV`](crate::daemon::plugin::PLUGIN_PATH_ENV): an
+/// explicit, documented override beats a test that has to fake the whole
+/// subsystem to control one property of it.
+///
+/// Deliberately applied *after* everything is committed rather than before,
+/// which is what makes the window useful rather than merely long: a test can
+/// wait for the row it is about to ask for to appear in the database and only
+/// then ask, so a "still indexing" answer proves the flag is what gates the
+/// response - not an empty table, which would have produced a refusal-shaped
+/// answer (`no symbol named ... found`) all by itself.
+pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BulkIndexSummary {
     pub nodes: usize,
@@ -59,8 +79,10 @@ pub struct BulkIndexSummary {
 }
 
 /// Walks `project_root` through the plugin and commits everything it emits,
-/// returning only once the child has exited and the last batch is durable -
-/// callers rely on that to serve their first query off a complete graph.
+/// returning only once the child has exited and the last batch is durable.
+/// `daemon::run` turns that return into the moment its `IndexingStatus` flips
+/// and tools start answering for real, so "returned" has to mean "complete",
+/// not "nearly".
 ///
 /// Batching is safe to cut anywhere in the stream even though edges are
 /// foreign keys onto nodes: the plugin emits a file's nodes before that same
@@ -102,7 +124,19 @@ pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSum
         bail!("the JS/TS plugin's bulk index exited with {status}");
     }
 
+    hold_the_walk_open_for_tests();
     Ok(summary)
+}
+
+/// Honors [`WALK_DELAY_ENV`]. A no-op unless it is set to a number, which is
+/// every real run.
+fn hold_the_walk_open_for_tests() {
+    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok())
+    else {
+        return;
+    };
+    eprintln!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
+    std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
 /// Reads a whole NDJSON bulk stream to EOF, committing it in batches. Split
