@@ -186,10 +186,17 @@ impl ServerHandler for GMeshMcpServer {
                  declaration - other same-named declarations' call sites are excluded, so \
                  re-checking one with grep is wasted work. `resolved: false` on a row marks an \
                  edge the indexer could not confirm; that is the one row worth double-checking, \
-                 not the whole list. One honest gap: a method call reached through a variable \
-                 receiver (`x.foo()`) produces no edge by design, so caller/reference lists for \
-                 methods can under-report - bare calls and `this`/`super`/qualified-type calls do \
-                 not have this gap.",
+                 not the whole list. `find_references`/`find_callers`/`find_callees`/\
+                 `find_implementations` also carry a response-level `allUnresolved: true` when \
+                 *every* row in a non-empty `results` page is `resolved: false` - a legitimate \
+                 shape (genuinely unconfirmed name-matched edges), but one that otherwise reads \
+                 identically to an ordinary complete answer (`hasMore: false`, a plausible-looking \
+                 `results` array) unless every row is individually checked. Treat that whole page \
+                 as unconfirmed, not just its rows; it is never set on an empty page, since an \
+                 empty result has nothing to be suspicious of. One honest gap: a method call \
+                 reached through a variable receiver (`x.foo()`) produces no edge by design, so \
+                 caller/reference lists for methods can under-report - bare calls and \
+                 `this`/`super`/qualified-type calls do not have this gap.",
             )
     }
 }

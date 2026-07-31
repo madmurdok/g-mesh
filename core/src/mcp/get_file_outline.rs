@@ -79,6 +79,7 @@ fn list_outline(
         results: page.results.into_iter().map(OutlineSymbol::from).collect(),
         has_more: page.has_more,
         next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
     })
 }
 

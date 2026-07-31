@@ -106,14 +106,22 @@ pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Optio
 /// the common one.
 pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
     if rows.is_empty() {
-        return Page { results: Vec::new(), has_more, next_cursor };
+        return Page { results: Vec::new(), has_more, next_cursor, all_unresolved: false };
     }
 
     let items: Vec<&T> = rows.iter().map(|r| &r.item).collect();
     let Some(cut) = longest_prefix_fitting(&items, MAX_RESPONSE_BYTES) else {
-        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor };
+        let all_unresolved = rows.iter().all(|r| !r.resolved);
+        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor, all_unresolved };
     };
 
+    // Computed over the surviving prefix, not the pre-truncation `rows`: the
+    // marker describes the page actually sent. In practice the two never
+    // disagree - `paginate_edges` sorts `resolved: true` first, so a cut
+    // point can only ever drop trailing unresolved rows, never a resolved
+    // one - but the prefix is the honest source of truth if that ordering
+    // rule ever changes.
+    let all_unresolved = rows[..cut].iter().all(|r| !r.resolved);
     let boundary = &rows[cut - 1];
     let cursor = encode_cursor(&StructuralCursor {
         resolved: boundary.resolved,
@@ -125,6 +133,7 @@ pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_curs
         results: rows.into_iter().take(cut).map(|r| r.item).collect(),
         has_more: true,
         next_cursor: Some(cursor),
+        all_unresolved,
     }
 }
 
@@ -135,6 +144,20 @@ pub struct Page<T> {
     pub results: Vec<T>,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+    /// True when `results` is non-empty and *every* row came from a
+    /// `resolved: false` edge - the shape that looks like an ordinary
+    /// complete page (a plausible `results` array, `has_more: false`) but is
+    /// actually built entirely from name-matched edges the linker couldn't
+    /// confirm, distinguishable from a normal page today only by a caller
+    /// scanning every row's own `resolved` bit. [`bound_page`] computes this
+    /// from each [`EdgeRow`]'s `resolved` flag over whatever rows actually
+    /// survive truncation, so it reflects the page as sent, not the
+    /// pre-truncation candidate set. Always `false` for an empty page (there
+    /// is nothing to be suspicious of) and for pages built outside the
+    /// EdgeRow/bound_page path (`paginate_defines`, `paginate_by_score`, the
+    /// raw `paginate_edges` result), which have no per-row resolved concept
+    /// to report.
+    pub all_unresolved: bool,
 }
 
 fn encode_cursor<T: Serialize>(value: &T) -> String {
@@ -308,6 +331,10 @@ pub fn paginate_edges(
         results: rows.into_iter().map(|(edge, locality)| ScoredEdge { edge, locality }).collect(),
         has_more,
         next_cursor,
+        // Intermediate page: `bound_page` computes the real marker once
+        // callers have wrapped these rows in `EdgeRow`. Nothing here reads
+        // this field before that happens.
+        all_unresolved: false,
     })
 }
 
@@ -365,7 +392,9 @@ pub fn paginate_defines(
         encode_cursor(&SourceOrderCursor { start_line: last.start_line, start_col: last.start_col, id: last.id.clone() })
     });
 
-    Ok(Page { results: rows, has_more, next_cursor })
+    // No per-row resolved concept here - `DEFINES` rows are a file's own
+    // declarations, read back in source order, not name-matched edges.
+    Ok(Page { results: rows, has_more, next_cursor, all_unresolved: false })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +460,9 @@ pub fn paginate_by_score<T>(
         results: rows.into_iter().map(|(item, _, _)| item).collect(),
         has_more,
         next_cursor,
+        // No per-row resolved concept here - ranked by similarity score, not
+        // linker confidence.
+        all_unresolved: false,
     })
 }
 
@@ -741,6 +773,10 @@ mod tests {
         EdgeRow { item: Item { id: id.to_string(), blob: "x".repeat(blob_len) }, resolved: true, locality: 0, edge_id: format!("e_{id}") }
     }
 
+    fn edge_row_resolved(id: &str, resolved: bool) -> EdgeRow<Item> {
+        EdgeRow { item: Item { id: id.to_string(), blob: String::new() }, resolved, locality: 0, edge_id: format!("e_{id}") }
+    }
+
     #[test]
     fn a_page_that_already_fits_the_byte_budget_is_returned_completely_unchanged() {
         let rows = vec![edge_row("a", 10), edge_row("b", 10)];
@@ -795,5 +831,51 @@ mod tests {
         assert!(page.results.is_empty());
         assert!(!page.has_more);
         assert!(page.next_cursor.is_none());
+        assert!(!page.all_unresolved, "an empty page has nothing to be suspicious of");
+    }
+
+    #[test]
+    fn a_page_where_every_row_is_unresolved_is_flagged_all_unresolved() {
+        let rows = vec![edge_row_resolved("a", false), edge_row_resolved("b", false)];
+        let page = bound_page(rows, false, None);
+        assert!(page.all_unresolved, "every row unresolved must set the marker");
+    }
+
+    #[test]
+    fn a_page_with_at_least_one_resolved_row_is_not_flagged_even_if_most_rows_are_unresolved() {
+        let rows = vec![
+            edge_row_resolved("resolved", true),
+            edge_row_resolved("b", false),
+            edge_row_resolved("c", false),
+            edge_row_resolved("d", false),
+        ];
+        let page = bound_page(rows, false, None);
+        assert!(!page.all_unresolved, "a single resolved row must be enough to clear the marker");
+    }
+
+    #[test]
+    fn an_empty_result_set_is_never_flagged_all_unresolved() {
+        let page: Page<Item> = bound_page(Vec::new(), false, None);
+        assert!(!page.all_unresolved, "nothing to be suspicious of when there are no rows at all");
+    }
+
+    #[test]
+    fn all_unresolved_reflects_the_truncated_prefix_actually_returned() {
+        // Every row is unresolved and, individually, blows the byte budget -
+        // forcing bound_page down its truncation path. The marker must still
+        // come out true: truncation cuts the tail, but resolved:true rows
+        // always sort first, so a cut prefix can only ever contain a subset
+        // of an already-all-unresolved set.
+        let rows: Vec<EdgeRow<Item>> = (0..5)
+            .map(|i| EdgeRow {
+                item: Item { id: format!("n{i}"), blob: "x".repeat(MAX_RESPONSE_BYTES / 3) },
+                resolved: false,
+                locality: 0,
+                edge_id: format!("e_n{i}"),
+            })
+            .collect();
+        let page = bound_page(rows, false, None);
+        assert!(page.results.len() < 5, "must actually have truncated for this test to prove anything");
+        assert!(page.all_unresolved);
     }
 }
