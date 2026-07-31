@@ -27,6 +27,7 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 
 use crate::daemon::plugin::PluginProcess;
+use crate::gc::last_used;
 use crate::graph::pagination::Direction;
 use crate::protocol::types::Position;
 
@@ -75,6 +76,24 @@ impl GMeshMcpServer {
         Self { conn, plugin, tool_router: Self::tool_router() }
     }
 
+    /// Advances the project's `lastUsed` stamp, which a later GC scan reads
+    /// back off disk to decide how long a project has been idle
+    /// (`gc::last_used`).
+    ///
+    /// Called by every tool handler rather than once per connection: a client
+    /// holds one session open for its whole lifetime, so per-connection would
+    /// stamp a week-long editor session exactly once, at the start.
+    ///
+    /// Best-effort on purpose - a failure is reported and dropped. Bookkeeping
+    /// for a cleanup command that only ever prints warnings has no business
+    /// turning an answerable query into a tool error. The guard is taken and
+    /// released here, before the handler takes its own.
+    fn mark_used(&self) {
+        if let Err(err) = last_used::touch(&self.conn.lock().unwrap()) {
+            eprintln!("g-mesh daemon: failed to record lastUsed: {err:#}");
+        }
+    }
+
     #[tool(
         name = "find_definition",
         description = "Find where a symbol is defined. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it."
@@ -83,6 +102,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindDefinitionParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         find_definition::handle(&self.conn, params.0)
     }
 
@@ -94,16 +114,19 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         find_references::handle(&self.conn, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         find_callers_callees::handle_callers(&self.conn, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         find_callers_callees::handle_callees(&self.conn, params.0)
     }
 
@@ -115,6 +138,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         find_implementations::handle(&self.conn, params.0)
     }
 
@@ -126,6 +150,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetFileOutlineParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         get_file_outline::handle(&self.conn, params.0)
     }
 
@@ -137,6 +162,7 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.mark_used();
         get_dependencies::handle(&self.conn, params.0)
     }
 }

@@ -546,6 +546,7 @@ dependencies = [
  "dirs",
  "flate2",
  "ignore",
+ "libc",
  "notify",
  "rmcp",
  "rusqlite",
