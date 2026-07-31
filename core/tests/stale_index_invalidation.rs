@@ -24,6 +24,9 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// One file importing another - the smallest graph whose `Incoming` walk is
@@ -116,6 +119,11 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
+    // Waited for *after* the connection is up, which is what makes it correct
+    // across the invalidating restarts this file stages: the replacement
+    // daemon wipes the index - completion marker and all - before it binds,
+    // so a marker still readable here could only be the new walk's own.
+    wait_until_indexed(project.root());
 
     let result = client
         .call_tool(

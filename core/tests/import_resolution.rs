@@ -23,6 +23,9 @@ use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// A small ESM-TypeScript project, written the way real ones are: specifiers
@@ -133,13 +136,16 @@ async fn get_dependencies_walks_real_files_in_both_directions_after_a_cold_start
     let project = Project::new();
     let root = project.root().to_path_buf();
 
-    // The daemon runs its cold-start bulk index *before* it binds the socket,
-    // so a completed MCP handshake already implies a fully built index.
+    // The daemon binds its socket before its cold-start bulk index and says
+    // so per call while the walk runs (task 105), so a completed MCP
+    // handshake no longer implies a built index - the walk's own completion
+    // marker is what does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim").current_dir(&root);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
+    wait_until_indexed(&root);
 
     let dependencies = |args: Value| {
         let client = &client;

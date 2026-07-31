@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -117,9 +120,11 @@ fn assert_contains(haystack: &str, needle: &str) {
 fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project() {
     let project = Project::new();
     let mut daemon_process = spawn_daemon(project.root());
-    // The pid file is written after the cold-start bulk walk and the socket
-    // bind, so by the time it exists the index is complete.
-    wait_for("the daemon to start listening", || project.pid_file().exists());
+    // The daemon's pid file now appears at the socket bind, which is ahead of
+    // both the plugin spawn and the cold-start walk (task 105) - and this test
+    // asserts on the plugin's pid and on complete coverage, so it has to wait
+    // for the walk's own completion marker instead.
+    wait_until_indexed(project.root());
 
     let core_pid = project.recorded_pid(&project.pid_file());
     let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
@@ -150,7 +155,9 @@ fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project
 fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
     let project = Project::new();
     let mut daemon_process = spawn_daemon(project.root());
-    wait_for("the daemon to start listening", || project.pid_file().exists());
+    // The index this asserts on has to be the finished one - see the wait in
+    // the test above.
+    wait_until_indexed(project.root());
     let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
 
     // Killed, not stopped, so the pid files are deliberately left behind:

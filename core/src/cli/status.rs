@@ -11,8 +11,12 @@
 //!
 //! - **Daemon core**: the pid in `daemon.pid` plus whether anything is
 //!   accepting connections on the socket. Both, because either alone lies in
-//!   a way the other catches - a recycled pid looks alive, and a daemon still
-//!   in its cold-start bulk walk has not bound its socket yet.
+//!   a way the other catches - a recycled pid looks alive, and a socket file
+//!   outlives the process that bound it. Note that "running" no longer
+//!   implies "ready to answer": since task 105 the socket is bound before the
+//!   cold-start walk, so a daemon can be running, listening, and still
+//!   answering every tool call with "still indexing" - which is what the
+//!   `index:` line below reports on.
 //! - **Daemon build**: the stamp a live daemon publishes about the executable
 //!   it started from (`daemon::build_stamp`), compared with this command's
 //!   own. A daemon that outlived an upgrade answers every query correctly
@@ -63,10 +67,15 @@ const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreState {
-    /// Its pid is alive and it is accepting connections.
+    /// Its pid is alive and its socket is bound. Says nothing about whether
+    /// the index behind it is complete - a daemon in its cold-start walk
+    /// binds first and reports itself as still indexing per call (task 105),
+    /// so `index: never fully walked` below is the field that answers that.
     Running { pid: u32 },
-    /// Its pid is alive but nothing answers on the socket - a daemon still
-    /// working through its cold-start bulk walk, or a wedged one.
+    /// Its pid is alive but nothing answers on the socket. Since the bind
+    /// moved ahead of the cold-start walk this no longer covers a daemon that
+    /// is merely busy indexing - it means one that died without clearing its
+    /// pid file, or a wedged one.
     NotAccepting { pid: u32 },
     /// No live daemon, whatever `daemon.pid` may still say.
     NotRunning,
@@ -195,10 +204,10 @@ fn core_state(project_root: &Path) -> Result<CoreState> {
 /// Compares the running daemon's published build with this command's own.
 ///
 /// `NotAccepting` is compared like `Running` rather than skipped: the stamp is
-/// published before the socket is bound (see `daemon::run`), so a daemon still
-/// working through its cold-start walk has already said which build it is -
-/// and that is exactly when someone is most likely to be asking why an
-/// upgrade has not taken effect.
+/// published before the socket is bound (see `daemon::run`), so even a daemon
+/// that has not got as far as binding has already said which build it is - and
+/// a daemon that is up but not answering is exactly when someone is most
+/// likely to be asking why an upgrade has not taken effect.
 ///
 /// Infallible, unlike its neighbours: every failure along the way - no
 /// executable to stat, no stamp on disk, an unreadable one - is the same
@@ -781,8 +790,8 @@ mod tests {
         build_stamp::write(&daemon::build_stamp_path_in(state.path()), &ours).unwrap();
 
         assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
-        // Still comparable while it works through its cold-start walk: the
-        // stamp is published before the socket is bound, not after.
+        // Still comparable for a daemon that is up but not answering on its
+        // socket: the stamp is published before the bind, not after.
         assert_eq!(
             build_state(CoreState::NotAccepting { pid: 1 }, state.path()),
             BuildState::Current

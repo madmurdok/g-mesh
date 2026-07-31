@@ -20,6 +20,9 @@ use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
 
+mod common;
+use common::wait_until_indexed;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -240,11 +243,16 @@ fn daemon_opens_sqlite_watches_files_and_serves_the_mcp_tool_surface() {
     let _ = daemon.wait();
 }
 
-/// The cold-start guarantee: a project that already had source files when
-/// its daemon started answers the very first query out of a real index -
-/// no edit, no `touch`, nothing that could have reached the watcher.
+/// The cold-start guarantee: a project that already had source files when its
+/// daemon started ends up with them in the graph - no edit, no `touch`,
+/// nothing that could have reached the watcher, so only the bulk walk can
+/// have put them there.
+///
+/// The wait moved from the pid file to the walk's own completion marker when
+/// task 105 put the socket bind ahead of the walk; what is asserted below did
+/// not change at all.
 #[test]
-fn a_pre_existing_project_is_indexed_before_the_daemon_answers_anything() {
+fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
     let project = Project::new();
     project.seed(
         "src/greeter.ts",
@@ -260,11 +268,11 @@ fn a_pre_existing_project_is_indexed_before_the_daemon_answers_anything() {
     project.seed("src/util.ts", "export const VERSION = \"1\";\n");
 
     let mut daemon = spawn_daemon(project.root());
-    let pid_file = daemon::pid_path(project.root()).unwrap();
-    // The pid file is written only after the initial index has been
-    // committed, so waiting for it is also what makes the query below
-    // impossible to race - there is no sleep here, and there must not be.
-    wait_for("the daemon to start listening", || pid_file.exists());
+    // Waiting on the walk's completion marker rather than on the pid file:
+    // the pid file now appears at the bind, before the walk, so it says the
+    // daemon is reachable and nothing about whether it can answer yet. There
+    // is no sleep here, and there must not be.
+    wait_until_indexed(project.root());
 
     let socket = daemon::socket_path(project.root()).unwrap();
     let responses = mcp_session(&socket, vec![outline_request(1, "src/greeter.ts")]);
@@ -293,7 +301,11 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
 
     let mut first_daemon = spawn_daemon(project.root());
     let pid_file = daemon::pid_path(project.root()).unwrap();
-    wait_for("the first daemon to start listening", || pid_file.exists());
+    // The first daemon has to be allowed to *finish* its walk: killed part
+    // way through it would leave the completion marker unset, and the second
+    // start would legitimately walk again - which is the very thing this test
+    // is here to rule out.
+    wait_until_indexed(project.root());
     let _ = first_daemon.kill();
     let _ = first_daemon.wait();
     // Otherwise the wait for the *second* daemon would be satisfied by the
@@ -364,8 +376,10 @@ fn unknown_method_gets_a_json_rpc_error_not_a_crash() {
 fn a_rejected_tool_call_reports_an_error_result_rather_than_failing_the_session() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    let pid_file = daemon::pid_path(project.root()).unwrap();
-    wait_for("the daemon to start listening", || pid_file.exists());
+    // The refusal this pins is the handler's own; a call that arrived while
+    // the cold-start walk was still running would be refused by the
+    // still-indexing guard ahead of it instead, and prove nothing.
+    wait_until_indexed(project.root());
 
     let socket = daemon::socket_path(project.root()).unwrap();
     let responses = mcp_session(

@@ -26,6 +26,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::net::UnixStream;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::plugin::PluginProcess;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
@@ -40,15 +41,47 @@ mod get_dependencies;
 mod get_file_outline;
 mod tool_result;
 
+/// What every tool answers while the daemon's cold-start bulk walk is still
+/// running.
+///
+/// A tool-level error rather than an empty success page, for the reason task
+/// 104 gave for `allUnresolved`: an empty `results` array with
+/// `hasMore: false` is indistinguishable from a real, complete "nothing
+/// found", and an agent that reads it as one stops looking and goes off to
+/// grep. An `isError` result cannot be mistaken for an answer, and the
+/// wording says which kind of error it is - "not yet" rather than "no such
+/// symbol" or "bad arguments" - so a caller can act on it (wait and ask
+/// again) instead of concluding the project has no such symbol.
+///
+/// Deliberately one constant shared by all seven tools: the caller's next
+/// move does not depend on which tool it happened to ask, and a per-tool
+/// phrasing would only make the signal harder to recognize.
+///
+/// Public so the acceptance tests can assert against the text an agent
+/// actually receives rather than against a copy of it that could drift.
+pub const STILL_INDEXING: &str =
+    "g-mesh: this project's index is still being built - a first walk of the whole project, \
+     either because it has never been indexed or because an upgrade invalidated what it had. \
+     No structural answer exists yet, so this is NOT 'no results': do not conclude anything \
+     about the code from it. Retry the same call in a few seconds; a large repository can take \
+     a minute or two to finish its first walk.";
+
 /// Serves one accepted socket connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
 /// connection per MCP client, so a client's session dies with its shim.
+///
+/// `indexing` is consulted per *call*, not per connection, which is what
+/// makes a session opened during the cold-start walk recover on its own: the
+/// same long-lived session that was told "still indexing" gets real answers
+/// from the first call after the walk commits, with nothing to reconnect and
+/// nothing to re-initialize.
 pub async fn serve_connection(
     stream: UnixStream,
     conn: Arc<Mutex<Connection>>,
     plugin: Arc<PluginProcess>,
+    indexing: IndexingStatus,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, plugin)
+    let service = GMeshMcpServer::new(conn, plugin, indexing)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -67,13 +100,33 @@ pub struct GMeshMcpServer {
     conn: Arc<Mutex<Connection>>,
     #[allow(dead_code)]
     plugin: Arc<PluginProcess>,
+    indexing: IndexingStatus,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl GMeshMcpServer {
-    pub fn new(conn: Arc<Mutex<Connection>>, plugin: Arc<PluginProcess>) -> Self {
-        Self { conn, plugin, tool_router: Self::tool_router() }
+    pub fn new(
+        conn: Arc<Mutex<Connection>>,
+        plugin: Arc<PluginProcess>,
+        indexing: IndexingStatus,
+    ) -> Self {
+        Self { conn, plugin, indexing, tool_router: Self::tool_router() }
+    }
+
+    /// `Some(...)` - a finished response the handler must return unchanged -
+    /// while the cold-start walk is still running; `None` once the index is
+    /// complete. Shaped like `find_definition::resolve_symbol_name`'s
+    /// "finished response or carry on" rather than a bare bool, so the
+    /// wording lives in exactly one place and no handler can invent its own.
+    ///
+    /// Every handler calls this as its *first* statement, ahead of
+    /// [`mark_used`](Self::mark_used): that one takes the daemon's single
+    /// SQLite mutex, which the walk holds for the length of each batch
+    /// commit, and waiting on it to say "I am not going to read the database"
+    /// would defeat the point of an atomic flag.
+    fn still_indexing(&self) -> Option<Result<CallToolResult, ErrorData>> {
+        self.indexing.is_indexing().then(|| tool_result::error(STILL_INDEXING))
     }
 
     /// Advances the project's `lastUsed` stamp, which a later GC scan reads
@@ -102,6 +155,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindDefinitionParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         find_definition::handle(&self.conn, params.0)
     }
@@ -114,18 +170,27 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         find_references::handle(&self.conn, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         find_callers_callees::handle_callers(&self.conn, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         find_callers_callees::handle_callees(&self.conn, params.0)
     }
@@ -138,6 +203,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         find_implementations::handle(&self.conn, params.0)
     }
@@ -150,6 +218,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetFileOutlineParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         get_file_outline::handle(&self.conn, params.0)
     }
@@ -162,6 +233,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.still_indexing() {
+            return not_ready;
+        }
         self.mark_used();
         get_dependencies::handle(&self.conn, params.0)
     }
@@ -196,7 +270,13 @@ impl ServerHandler for GMeshMcpServer {
                  empty result has nothing to be suspicious of. One honest gap: a method call \
                  reached through a variable receiver (`x.foo()`) produces no edge by design, so \
                  caller/reference lists for methods can under-report - bare calls and \
-                 `this`/`super`/qualified-type calls do not have this gap.",
+                 `this`/`super`/qualified-type calls do not have this gap.\n\n\
+                 One more response shape worth recognizing: on a project being indexed for the \
+                 first time (or re-indexed after an upgrade), every tool returns an error whose \
+                 text says the index is still being built. That is a temporary \"not yet\", not \
+                 \"not found\" - retry the same call after a few seconds rather than falling \
+                 back to grep or concluding the symbol does not exist. Any *other* error, and \
+                 any successful-but-empty result, means what it says.",
             )
     }
 }
