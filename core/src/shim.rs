@@ -32,9 +32,9 @@ const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// nothing outside a test wants it shorter.
 ///
 /// It exists so that "a project whose cold-start walk outlasts the shim's
-/// bootstrap timeout still gets served" can be asserted in a couple of seconds
-/// - shrinking the timeout below the walk, rather than stretching the walk
-/// past ten real seconds on every commit.
+/// bootstrap timeout still gets served" can be asserted in a couple of
+/// seconds - shrinking the timeout below the walk, rather than stretching the
+/// walk past ten real seconds on every commit.
 const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
 
 /// Set by Claude Code on every stdio MCP server it spawns, in every

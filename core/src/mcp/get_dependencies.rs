@@ -119,9 +119,9 @@ struct DependencyWalk {
 }
 
 /// The wire spelling of each truncation cause, fixed by the contract in
-/// `docs/architecture/g-mesh-v1.md`, plus `bound_walk`'s own `"responseSize"`
-/// - not part of that contract since it isn't a `TruncatedBy` cause at all
-/// (it fires after `traversal` has already finished, on the wire DTO's own
+/// `docs/architecture/g-mesh-v1.md`, plus `bound_walk`'s own `"responseSize"` -
+/// not part of that contract since it isn't a `TruncatedBy` cause at all (it
+/// fires after `traversal` has already finished, on the wire DTO's own
 /// serialized size), but spelled the same way for consistency.
 fn wire_name(cause: TruncatedBy) -> &'static str {
     match cause {
