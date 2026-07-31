@@ -159,11 +159,25 @@ pub enum Direction {
 /// `REFERENCES` one - see `addUsage` in plugins/js-ts/src/extract.ts), so a
 /// tool whose question spans several of those kinds has to ask for all of
 /// them at once. An empty slice means "every kind".
+///
+/// `file_paths` narrows results to edges whose *other* endpoint (the
+/// referencing/calling/implementing node - `n` in the join below, never the
+/// anchor) lives in one of the given files. Exact string equality against
+/// `nodes.filePath`, matching how every other tool's `file_path` parameter is
+/// already stored and compared (project-relative, no leading `./`) - no
+/// prefix or glob matching, since a membership test against a known file set
+/// (the caller's own use case) never needs one and it would just be
+/// unreviewed surface area. Same "empty means unfiltered" convention as
+/// `edge_kinds`, for the same reason: omitting the parameter has to mean "no
+/// scope, search the whole project" for existing callers to see no behavior
+/// change, and an empty slice is the only spelling of "no scope" that doesn't
+/// need a separate sentinel.
 pub fn paginate_edges(
     conn: &Connection,
     anchor_node_id: &str,
     direction: Direction,
     edge_kinds: &[&str],
+    file_paths: &[&str],
     anchor_file_path: &str,
     page_size: usize,
     cursor: Option<&str>,
@@ -176,14 +190,21 @@ pub fn paginate_edges(
     };
 
     // The seven leading placeholders are fixed regardless of whether a cursor
-    // is present (`?3 = 0` makes the keyset predicate vacuously true); only
-    // the kind filter varies in width, so its placeholders continue after
-    // them.
+    // is present (`?3 = 0` makes the keyset predicate vacuously true); the
+    // kind filter's placeholders continue after them, and the scope filter's
+    // continue after those - both vary in width per call.
     let kind_filter = if edge_kinds.is_empty() {
         "1 = 1".to_string()
     } else {
         let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 8)).collect();
         format!("e.kind IN ({})", placeholders.join(", "))
+    };
+    let scope_filter = if file_paths.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let base = 8 + edge_kinds.len();
+        let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
+        format!("n.filePath IN ({})", placeholders.join(", "))
     };
     let sql = format!(
         "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.resolved AS resolved, \
@@ -191,6 +212,7 @@ pub fn paginate_edges(
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?2 \
            AND {kind_filter} \
+           AND {scope_filter} \
            AND ( \
              ?3 = 0 \
              OR e.resolved < ?4 \
@@ -217,6 +239,7 @@ pub fn paginate_edges(
         &limit,
     ];
     sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows: Vec<(EdgeRecord, i64)> = stmt
@@ -439,7 +462,7 @@ mod tests {
         make_edge(&conn, "e_unresolved", "root", "n1", false);
         make_edge(&conn, "e_resolved", "root", "n2", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
         assert_eq!(page.results.len(), 2);
         assert!(page.results[0].resolved, "resolved edge must sort first at equal locality");
         assert!(!page.results[1].resolved);
@@ -455,7 +478,7 @@ mod tests {
         make_edge(&conn, "e_far", "root", "far", true);
         make_edge(&conn, "e_near", "root", "near", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
         assert_eq!(page.results[0].id, "e_near", "same-file target must sort before a distant one");
         assert_eq!(page.results[1].id, "e_far");
     }
@@ -469,7 +492,7 @@ mod tests {
         make_edge(&conn, "e1", "caller1", "root", true);
         make_edge(&conn, "e2", "caller2", "root", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Incoming, &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(&conn, "root", Direction::Incoming, &[], &[], "a.rs", 10, None).unwrap();
         let ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2"], "same-file caller must sort before the distant one");
     }
@@ -487,7 +510,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], "a.rs", 2, cursor.as_deref()).unwrap();
+            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 2, cursor.as_deref()).unwrap();
             seen.extend(page.results.iter().map(|e| e.id.clone()));
 
             // Simulate a background reindex inserting a new low-priority edge
@@ -511,6 +534,93 @@ mod tests {
         }
         assert!(seen.contains(&"e_intruder".to_string()), "the new lowest-priority row lands on the final page");
         assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn file_paths_scope_excludes_rows_from_files_outside_the_given_set() {
+        let conn = setup();
+        make_node(&conn, "root", "a.rs");
+        make_node(&conn, "in_scope", "b.rs");
+        make_node(&conn, "out_of_scope", "c.rs");
+        make_edge(&conn, "e_in", "root", "in_scope", true);
+        make_edge(&conn, "e_out", "root", "out_of_scope", true);
+
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs"], "a.rs", 10, None).unwrap();
+        let ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["e_in"], "only the row whose other endpoint is in the scoped file set must come back");
+    }
+
+    #[test]
+    fn file_paths_scope_matches_against_multiple_files_at_once() {
+        let conn = setup();
+        make_node(&conn, "root", "a.rs");
+        make_node(&conn, "in_one", "b.rs");
+        make_node(&conn, "in_two", "c.rs");
+        make_node(&conn, "out", "d.rs");
+        make_edge(&conn, "e_one", "root", "in_one", true);
+        make_edge(&conn, "e_two", "root", "in_two", true);
+        make_edge(&conn, "e_out", "root", "out", true);
+
+        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs", "c.rs"], "a.rs", 10, None).unwrap();
+        let mut ids: Vec<&str> = page.results.iter().map(|e| e.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["e_one", "e_two"], "every file in the scope set must contribute its rows");
+    }
+
+    #[test]
+    fn an_empty_file_paths_slice_behaves_exactly_like_an_omitted_scope() {
+        let conn = setup();
+        make_node(&conn, "root", "a.rs");
+        make_node(&conn, "far", "b.rs");
+        make_node(&conn, "near", "a.rs");
+        make_edge(&conn, "e_far", "root", "far", true);
+        make_edge(&conn, "e_near", "root", "near", true);
+
+        let scoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let unscoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let scoped_ids: Vec<&str> = scoped.results.iter().map(|e| e.id.as_str()).collect();
+        let unscoped_ids: Vec<&str> = unscoped.results.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(scoped_ids, unscoped_ids, "an empty file_paths slice must return the exact same rows as omitting it");
+        assert_eq!(scoped_ids, vec!["e_near", "e_far"]);
+    }
+
+    #[test]
+    fn a_scope_narrowing_a_huge_result_set_down_to_one_page_still_paginates_correctly_across_the_boundary() {
+        // Reproduces the benchmark's shape: many rows exist project-wide, but
+        // scoping to a handful of known files should page through exactly
+        // those rows, with a cursor that resumes correctly - the scope filter
+        // must not corrupt cursor state derived from resolved/locality/id.
+        let conn = setup();
+        make_node(&conn, "root", "a.rs");
+        for i in 0..20 {
+            let id = format!("noise_{i}");
+            make_node(&conn, &id, "noise.rs");
+            make_edge(&conn, &format!("e_noise_{i}"), "root", &id, true);
+        }
+        for i in 0..3 {
+            let id = format!("scoped_{i}");
+            make_node(&conn, &id, "scoped.rs");
+            make_edge(&conn, &format!("e_scoped_{i}"), "root", &id, true);
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["scoped.rs"], "a.rs", 1, cursor.as_deref()).unwrap();
+            assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one scoped row per page");
+            seen.extend(page.results.iter().map(|e| e.id.clone()));
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["e_scoped_0", "e_scoped_1", "e_scoped_2"],
+            "only the scoped rows must be seen, each exactly once, none of the 20 noise rows leaking in"
+        );
     }
 
     fn make_node_at(conn: &Connection, id: &str, file_path: &str, start_line: i64, start_col: i64) {
