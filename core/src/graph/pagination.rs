@@ -57,35 +57,36 @@ pub struct EdgeRow<T> {
     pub edge_id: String,
 }
 
-/// Truncates an already row-limited page further, if serializing it would
-/// exceed [`MAX_RESPONSE_BYTES`], to the longest prefix that fits - handing
-/// back `has_more: true` and a cursor resuming right after the cut, reusing
-/// `paginate_edges`'s own cursor encoding rather than a byte-truncation-
-/// specific scheme. A page that already fits under the budget is returned
-/// completely unchanged, `has_more`/`next_cursor` included: this is pure
-/// headroom for the rare oversized page, never a new default behavior for
-/// the common one.
+/// Longest prefix of `items` whose serialized JSON stays within `budget`
+/// bytes, found by binary search on the cut point rather than a linear scan
+/// - a handful of `serde_json::to_vec` calls on the whole candidate page
+/// instead of one per row. Returns `None` when the whole slice already fits
+/// (including the empty slice, which always fits) - the caller's signal that
+/// nothing needed cutting. `Some(cut)` is never `Some(0)`, even when a single
+/// item alone exceeds `budget`: a caller building a continuation cursor from
+/// an empty kept prefix would produce "more available" with no progress
+/// behind it - an infinite loop by another name. (This is why the result
+/// can't just be a bare `usize` compared against `items.len()`: for a
+/// single-item slice that alone busts the budget, the clamped cut and the
+/// length are both 1, and only an explicit "did this actually get cut"
+/// signal tells the two cases apart.)
 ///
-/// Always keeps at least one row, even if a single row alone exceeds the
-/// budget - returning an empty page with `has_more: true` would be a
-/// continuation cursor with no progress behind it, an infinite loop by
-/// another name.
-pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
-    if rows.is_empty() {
-        return Page { results: Vec::new(), has_more, next_cursor };
-    }
-
+/// Shared by [`bound_page`] and `mcp::get_dependencies::bound_walk`, which
+/// cut different row shapes (`EdgeRow<T>`'s `item`, `DependencyNode`) against
+/// the same [`MAX_RESPONSE_BYTES`] budget and then build different kinds of
+/// continuation (a structural cursor vs. a resume token) from the cut point
+/// - only the search itself was ever identical between them.
+pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Option<usize> {
     let fits = |n: usize| -> bool {
-        let items: Vec<&T> = rows[..n].iter().map(|r| &r.item).collect();
-        serde_json::to_vec(&items).map(|v| v.len()).unwrap_or(usize::MAX) <= MAX_RESPONSE_BYTES
+        serde_json::to_vec(&items[..n]).map(|v| v.len()).unwrap_or(usize::MAX) <= budget
     };
 
-    if fits(rows.len()) {
-        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor };
+    if fits(items.len()) {
+        return None;
     }
 
     let mut lo = 1usize;
-    let mut hi = rows.len();
+    let mut hi = items.len();
     while lo < hi {
         let mid = lo + (hi - lo + 1) / 2;
         if fits(mid) {
@@ -94,7 +95,26 @@ pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_curs
             hi = mid - 1;
         }
     }
-    let cut = lo;
+    Some(lo)
+}
+
+/// Truncates an already row-limited page further, if serializing it would
+/// exceed [`MAX_RESPONSE_BYTES`], to the longest prefix that fits - handing
+/// back `has_more: true` and a cursor resuming right after the cut, reusing
+/// `paginate_edges`'s own cursor encoding rather than a byte-truncation-
+/// specific scheme. A page that already fits under the budget is returned
+/// completely unchanged, `has_more`/`next_cursor` included: this is pure
+/// headroom for the rare oversized page, never a new default behavior for
+/// the common one.
+pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
+    if rows.is_empty() {
+        return Page { results: Vec::new(), has_more, next_cursor };
+    }
+
+    let items: Vec<&T> = rows.iter().map(|r| &r.item).collect();
+    let Some(cut) = longest_prefix_fitting(&items, MAX_RESPONSE_BYTES) else {
+        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor };
+    };
 
     let boundary = &rows[cut - 1];
     let cursor = encode_cursor(&StructuralCursor {
