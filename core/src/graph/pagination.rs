@@ -23,6 +23,93 @@ pub fn resolve_page_size(limit: Option<u32>) -> usize {
     limit.map(|l| l as usize).unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)
 }
 
+/// Ceiling on a single MCP tool response body, in serialized-JSON bytes of
+/// its `results` array. `MAX_PAGE_SIZE` bounds *row count*, but the thing
+/// that actually gets a call rejected is bytes: a `find_references` call
+/// with `limit: 200` measured at 54,600 characters, and a `get_dependencies`
+/// walk at its old defaults measured at 115,863, both came back rejected
+/// outright by the MCP client's transport - not truncated, an error plus a
+/// filesystem path to the dropped output (g-mesh-bench's v0.4.0 outlier
+/// findings, `find_references`/`get_dependencies` sections). Neither of
+/// g-mesh's own transports enforce anything remotely this small - the
+/// core<->plugin control channel (`protocol::jsonrpc::MAX_BODY_BYTES`) and
+/// the shim's stdio proxy (`protocol::ndjson_frame::MAX_LINE_BYTES`) both cap
+/// frames at 64 MiB - so the rejection happens outside code this crate owns,
+/// most likely a client-side cap on tool-result size measured in tokens, not
+/// bytes. Without knowing that cap's exact value (and it isn't ours to
+/// control even if we did), the only safe move is to stay a good deal under
+/// the smallest size observed failing: 20,000 bytes is comfortably under
+/// 54,600 while still well above what a default-sized page (20 rows) ever
+/// produces, so normal calls never notice this exists.
+pub const MAX_RESPONSE_BYTES: usize = 20_000;
+
+/// One row a caller has already enriched from a `paginate_edges` result,
+/// carrying back just enough of the source edge (`resolved`/`locality`/
+/// `edge_id`) for [`bound_page`] to rebuild the exact cursor `paginate_edges`
+/// would have produced had its SQL page ended right there. `locality` is
+/// cheaply recomputable by every caller (`0` when the enriched row's own
+/// file path equals the anchor's, `1` otherwise - the same rule the SQL
+/// query applies) without needing it threaded back out of `paginate_edges`.
+pub struct EdgeRow<T> {
+    pub item: T,
+    pub resolved: bool,
+    pub locality: i64,
+    pub edge_id: String,
+}
+
+/// Truncates an already row-limited page further, if serializing it would
+/// exceed [`MAX_RESPONSE_BYTES`], to the longest prefix that fits - handing
+/// back `has_more: true` and a cursor resuming right after the cut, reusing
+/// `paginate_edges`'s own cursor encoding rather than a byte-truncation-
+/// specific scheme. A page that already fits under the budget is returned
+/// completely unchanged, `has_more`/`next_cursor` included: this is pure
+/// headroom for the rare oversized page, never a new default behavior for
+/// the common one.
+///
+/// Always keeps at least one row, even if a single row alone exceeds the
+/// budget - returning an empty page with `has_more: true` would be a
+/// continuation cursor with no progress behind it, an infinite loop by
+/// another name.
+pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
+    if rows.is_empty() {
+        return Page { results: Vec::new(), has_more, next_cursor };
+    }
+
+    let fits = |n: usize| -> bool {
+        let items: Vec<&T> = rows[..n].iter().map(|r| &r.item).collect();
+        serde_json::to_vec(&items).map(|v| v.len()).unwrap_or(usize::MAX) <= MAX_RESPONSE_BYTES
+    };
+
+    if fits(rows.len()) {
+        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor };
+    }
+
+    let mut lo = 1usize;
+    let mut hi = rows.len();
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let cut = lo;
+
+    let boundary = &rows[cut - 1];
+    let cursor = encode_cursor(&StructuralCursor {
+        resolved: boundary.resolved,
+        locality: boundary.locality,
+        id: boundary.edge_id.clone(),
+    });
+
+    Page {
+        results: rows.into_iter().take(cut).map(|r| r.item).collect(),
+        has_more: true,
+        next_cursor: Some(cursor),
+    }
+}
+
 /// Opaque cursor-paginated batch, shared shape for every list-shaped MCP
 /// tool response. Cursor instead of offset: background reindexing can
 /// shift/duplicate rows mid-pagination if positions are counted by offset.
@@ -503,5 +590,71 @@ mod tests {
 
         assert_eq!(page.results, vec!["high", "mid", "low"]);
         assert!(!page.has_more);
+    }
+
+    #[derive(Serialize)]
+    struct Item {
+        id: String,
+        blob: String,
+    }
+
+    fn edge_row(id: &str, blob_len: usize) -> EdgeRow<Item> {
+        EdgeRow { item: Item { id: id.to_string(), blob: "x".repeat(blob_len) }, resolved: true, locality: 0, edge_id: format!("e_{id}") }
+    }
+
+    #[test]
+    fn a_page_that_already_fits_the_byte_budget_is_returned_completely_unchanged() {
+        let rows = vec![edge_row("a", 10), edge_row("b", 10)];
+        let page = bound_page(rows, true, Some("upstream-cursor".to_string()));
+
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].id, "a");
+        assert_eq!(page.results[1].id, "b");
+        assert!(page.has_more, "has_more must pass through untouched when nothing needed truncating");
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("upstream-cursor"),
+            "an upstream cursor must not be replaced just because bound_page ran"
+        );
+    }
+
+    #[test]
+    fn an_oversized_page_truncates_to_the_longest_prefix_that_fits_the_budget() {
+        // Each row's blob is ~1000 bytes: comfortably under budget alone, but
+        // 30 of them together blow past MAX_RESPONSE_BYTES (20,000).
+        let rows: Vec<EdgeRow<Item>> = (0..30).map(|i| edge_row(&format!("n{i:02}"), 1000)).collect();
+        let page = bound_page(rows, false, None);
+
+        assert!(page.results.len() < 30, "the full 30 rows must not fit in one page: {}", page.results.len());
+        assert!(!page.results.is_empty());
+        assert!(page.has_more, "a byte-truncated page must always report more");
+        let cursor = page.next_cursor.expect("a byte-truncated page must carry a resumable cursor");
+
+        let raw = serde_json::to_vec(&page.results).unwrap();
+        assert!(raw.len() <= MAX_RESPONSE_BYTES, "the truncated page itself must respect the budget: {}", raw.len());
+
+        // The cursor must resume right after the last row actually returned,
+        // not an arbitrary or off-by-one boundary.
+        let last_included = page.results.last().unwrap().id.clone();
+        let decoded: StructuralCursor = decode_cursor(&cursor).unwrap();
+        assert_eq!(decoded.id, format!("e_{last_included}"));
+    }
+
+    #[test]
+    fn a_single_row_that_alone_exceeds_the_budget_is_still_returned_rather_than_an_empty_page() {
+        let rows = vec![edge_row("huge", MAX_RESPONSE_BYTES + 1000)];
+        let page = bound_page(rows, false, None);
+
+        assert_eq!(page.results.len(), 1, "at least one row must survive even if it alone busts the budget");
+        assert!(page.has_more, "an oversized single row is still a truncation, not a complete page");
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn an_empty_page_is_returned_unchanged_regardless_of_has_more() {
+        let page: Page<Item> = bound_page(Vec::new(), false, None);
+        assert!(page.results.is_empty());
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
     }
 }

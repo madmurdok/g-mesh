@@ -6,6 +6,7 @@
 //! leaves to its caller: which edge kind to follow, and how much of the
 //! result is the caller's business.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::CallToolResult;
@@ -13,8 +14,9 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::graph::pagination::Direction;
+use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
 
 use super::tool_result::{error, internal_error, success};
@@ -29,6 +31,32 @@ const IMPORT_EDGE: &str = "IMPORTS";
 /// standing in for a file this index does not have. See
 /// [`DependencyNode::file_path`] for why it needs a case of its own.
 const MODULE_KIND: &str = "Module";
+
+/// `get_dependencies`'s own default when the caller omits `max_depth` -
+/// deliberately far below `traversal::DEFAULT_MAX_DEPTH` (5), which stays
+/// `TraversalOptions`' generic, direction-agnostic default for any future
+/// caller of the walk engine and is left untouched here.
+///
+/// This tool's traffic is asymmetric in a way a single shared default can't
+/// account for: an `Outgoing` walk (what does this file import) is bounded by
+/// how many things one file imports, typically small; an `Incoming` walk
+/// (what imports this file) can fan out across an entire codebase from one
+/// shared/foundational module, and that fan-out *compounds* with every extra
+/// hop of depth - `max_fanout` (default 50, see `traversal::DEFAULT_MAX_FANOUT`)
+/// bounds one node's own children, not how wide a whole level gets. Measured
+/// on g-mesh-bench's corpus (v0.4.0 outlier findings, `get_dependencies`
+/// section): an `Incoming` walk of a shared math-utils entrypoint at the old
+/// depth-5 default produced a 115,863-character response the MCP client's
+/// transport rejected outright; the identical call at `max_depth: 1` dropped
+/// to 10,436 characters and succeeded. Depth 1 alone only answers "who
+/// directly depends on this", too narrow for the impact-analysis question
+/// this tool mostly exists for ("what would changing this break, and what
+/// depends on *that*"); depth 2 answers that shape while staying an order of
+/// magnitude more conservative than the walk engine's own default. The size-
+/// bounded truncation added alongside this default (`bound_walk`) is the
+/// backstop for the remaining cases where even depth 2 is too wide on an
+/// unusually shared module.
+const DEFAULT_MAX_DEPTH: u32 = 2;
 
 /// One reached dependency, with how many import hops away it is. No
 /// `resolved` flag, unlike the single-hop tools: a node several hops out is
@@ -90,25 +118,132 @@ struct DependencyWalk {
     resume_token: Option<String>,
 }
 
-impl From<TraversalResult> for DependencyWalk {
-    fn from(result: TraversalResult) -> Self {
-        Self {
-            results: result.nodes.into_iter().filter(|r| r.depth > 0).map(DependencyNode::from).collect(),
-            truncated: result.truncated,
-            truncated_by: result.truncated_by.map(wire_name),
-            frontier_nodes: result.frontier_nodes,
-            resume_token: result.resume_token,
-        }
-    }
-}
-
 /// The wire spelling of each truncation cause, fixed by the contract in
-/// `docs/architecture/g-mesh-v1.md`.
+/// `docs/architecture/g-mesh-v1.md`, plus `bound_walk`'s own `"responseSize"`
+/// - not part of that contract since it isn't a `TruncatedBy` cause at all
+/// (it fires after `traversal` has already finished, on the wire DTO's own
+/// serialized size), but spelled the same way for consistency.
 fn wire_name(cause: TruncatedBy) -> &'static str {
     match cause {
         TruncatedBy::MaxDepth => "maxDepth",
         TruncatedBy::MaxFanout => "maxFanout",
         TruncatedBy::ExplorationBudget => "explorationBudget",
+    }
+}
+
+/// A second, independent ceiling on top of `max_depth`/`max_fanout`: neither
+/// bounds the *total size* of a whole level, only depth (how many levels) or
+/// fanout (one node's own children) individually - a node can be depth- and
+/// fanout-bounded and still, summed across every node reached at a given
+/// depth, produce a response too large for `pagination::MAX_RESPONSE_BYTES`.
+///
+/// Reuses the exact resume-token mechanism `traversal::traverse`'s own
+/// exploration-budget cut already relies on (`graph::resume_token`), just
+/// built from wherever this function's own byte cut lands rather than
+/// wherever the CTE's internal row budget ran out - so a caller sees the
+/// same `resumeToken` continuation contract regardless of which cause
+/// actually cut the walk short. `visited` reseeds every kept node (plus the
+/// anchor) exactly the way an exploration-budget resume already does -
+/// `ResumeState`'s own doc comment explains why that is the conservative,
+/// provably-complete choice, not just cheaper to build. `walked` keeps only
+/// the edges whose child landed inside the kept set: an edge to a node this
+/// cut dropped must stay undiscovered as far as the token is concerned, or a
+/// resumed call would never re-offer it.
+///
+/// A response that already fits under budget comes back with the original
+/// result's `truncated`/`truncated_by`/`frontier_nodes`/`resume_token`
+/// completely unchanged - this function is pure headroom for the rare
+/// oversized level, never a new default for the common one.
+///
+/// `prior_visited`/`prior_walked` are the walk's history from *before* this
+/// call - empty for a fresh walk (`from_root`), or the incoming
+/// `resume_token`'s own `visited`/`walked` for a continuation (`continued`).
+/// `TraversalResult.nodes`/`.edges` from a resumed call hold only what that
+/// call newly discovered (see `traversal::resume`'s doc comment), so a token
+/// built from them alone - without folding in what earlier calls in the
+/// chain already reported - would forget that history and risk a later call
+/// re-discovering and re-returning an already-reported node. Whether the
+/// natural cause (`ExplorationBudget`) or this function's own byte cut is
+/// what carries the token forward, the chain must accumulate the same way
+/// `traversal::resume` already does internally for its own case (see
+/// `ResumeState`'s doc comment) - this is that same accumulation, one layer
+/// up, for the case `traversal.rs` cannot see: a response the JSON wire
+/// shape made too big.
+fn bound_walk(
+    result: TraversalResult,
+    direction: Direction,
+    edge_kind: Option<String>,
+    max_depth: u32,
+    max_fanout: u32,
+    prior_visited: Vec<VisitedNode>,
+    prior_walked: Vec<String>,
+) -> DependencyWalk {
+    // Present only on a fresh walk: a resumed call's `nodes` excludes
+    // already-visited nodes (the anchor included), so `prior_visited` already
+    // carries it forward instead.
+    let anchor_id = result.nodes.first().filter(|n| n.depth == 0).map(|n| n.node.id.clone());
+
+    let mut dtos: Vec<DependencyNode> = Vec::with_capacity(result.nodes.len());
+    for node in result.nodes {
+        if node.depth > 0 {
+            dtos.push(DependencyNode::from(node));
+        }
+    }
+
+    let fits = |n: usize| -> bool {
+        serde_json::to_vec(&dtos[..n]).map(|v| v.len()).unwrap_or(usize::MAX) <= pagination::MAX_RESPONSE_BYTES
+    };
+
+    if fits(dtos.len()) {
+        return DependencyWalk {
+            results: dtos,
+            truncated: result.truncated,
+            truncated_by: result.truncated_by.map(wire_name),
+            frontier_nodes: result.frontier_nodes,
+            resume_token: result.resume_token,
+        };
+    }
+
+    // Longest prefix that still fits - `dtos` is non-empty here (an empty
+    // slice always "fits", so that case already returned above), and at
+    // least one row always survives even if it alone exceeds the budget: a
+    // resume token with no progress behind it would just loop forever.
+    let mut lo = 1usize;
+    let mut hi = dtos.len();
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let cut = lo;
+
+    let mut visited = prior_visited;
+    if let Some(id) = anchor_id {
+        visited.push(VisitedNode { id, depth: 0 });
+    }
+    visited.extend(dtos[..cut].iter().map(|d| VisitedNode { id: d.id.clone(), depth: d.depth }));
+
+    let kept_ids: HashSet<&str> = dtos[..cut].iter().map(|d| d.id.as_str()).collect();
+    let mut walked = prior_walked;
+    walked.extend(result.edges.into_iter().filter_map(|e| {
+        let child = match direction {
+            Direction::Outgoing => &e.to_id,
+            Direction::Incoming => &e.from_id,
+        };
+        kept_ids.contains(child.as_str()).then_some(e.id)
+    }));
+
+    let token = resume_token::encode(&ResumeState { direction, edge_kind, max_depth, max_fanout, visited, walked });
+
+    DependencyWalk {
+        results: dtos.into_iter().take(cut).collect(),
+        truncated: true,
+        truncated_by: Some("responseSize"),
+        frontier_nodes: Vec::new(),
+        resume_token: Some(token),
     }
 }
 
@@ -127,16 +262,18 @@ struct WalkShape {
 fn from_root(conn: &Connection, root: String, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
     let mut options = TraversalOptions::new(root, shape.direction);
     options.edge_kind = Some(IMPORT_EDGE.to_string());
-    if let Some(max_depth) = shape.max_depth {
-        options.max_depth = max_depth;
-    }
+    // `DEFAULT_MAX_DEPTH` here, not `TraversalOptions::new`'s own default -
+    // see that constant's doc comment for why this tool needs a stricter one.
+    options.max_depth = shape.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
     if let Some(max_fanout) = shape.max_fanout {
         options.max_fanout = max_fanout;
     }
+    let (direction, edge_kind, max_depth, max_fanout) =
+        (options.direction, options.edge_kind.clone(), options.max_depth, options.max_fanout);
 
     let result =
         traversal::traverse(conn, options).map_err(|e| internal_error("failed to walk the import graph", e))?;
-    success(&DependencyWalk::from(result))
+    success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new()))
 }
 
 fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
@@ -165,9 +302,17 @@ fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<
 /// anchor, direction and limits of the walk it continues, so nothing about
 /// its shape is re-read from the parameters here.
 fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData> {
+    // Decoded a second time here (`traversal::resume` decodes its own copy
+    // internally) purely to read the walk's shape back out for `bound_walk` -
+    // cheap, and keeps `traversal`'s public surface free of a getter that
+    // exists for one caller.
+    let state = resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
+    let ResumeState { direction, edge_kind, max_depth, max_fanout, visited: prior_visited, walked: prior_walked } =
+        state;
+
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the import walk", e))?;
-    success(&DependencyWalk::from(result))
+    success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked))
 }
 
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
@@ -454,14 +599,28 @@ mod tests {
     /// Cause three, and the only one with state to carry: the internal
     /// budget - not a caller-facing limit - stops the walk mid-way, and the
     /// token it hands back continues it exactly where it left off.
+    ///
+    /// `DEFAULT_EXPLORATION_BUDGET` rows (5000) of `DependencyNode` JSON is
+    /// nowhere near `pagination::MAX_RESPONSE_BYTES` (20,000 bytes), so a
+    /// walk wide enough to hit the exploration budget always earns its own,
+    /// stricter `responseSize` cut before `explorationBudget` is ever visible
+    /// on the wire - see `bound_walk`'s doc comment. That row-count-scale
+    /// case is exercised directly at the `traversal` layer instead
+    /// (`graph::traversal::tests::exploration_budget_caps_visited_rows_...`,
+    /// `..._a_resume_chain_covers_the_whole_walk_exactly_once`); what this
+    /// tool-level test proves is the same "no continuation is dropped or
+    /// double-counted" property one layer up, at the response-size scale
+    /// (`bound_walk`'s `prior_visited`/`prior_walked` accumulation) that
+    /// callers actually see.
     #[test]
-    fn a_budget_cut_reports_exploration_budget_and_is_continued_by_its_token() {
-        // Wider than the internal budget, with the caller's own limits held
-        // open, so nothing but the budget can be what cuts this walk.
-        let over_budget = traversal::DEFAULT_EXPLORATION_BUDGET as usize + 100;
+    fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_everything_once() {
+        // Comfortably past what one response can return, comfortably short
+        // of the exploration budget - so nothing but the byte cap can be
+        // what's cutting each call in this chain.
+        let wide = 600;
         let mut conn = setup();
         let mut diff = Diff { upsert_nodes: vec![file("a.rs")], ..Default::default() };
-        for i in 0..over_budget {
+        for i in 0..wide {
             let path = format!("dep{i:05}.rs");
             diff.upsert_edges.push(EdgeRecord::new(format!("e{i:05}"), "a.rs", &path, "IMPORTS", "tree-sitter", true));
             diff.upsert_nodes.push(file(&path));
@@ -469,47 +628,127 @@ mod tests {
         write::apply_diff(&mut conn, &diff).unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = GetDependenciesParams {
-            max_fanout: Some(1_000_000),
-            max_depth: Some(10),
-            ..anchored_at("a.rs", Direction::Outgoing)
-        };
+        let params = GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at("a.rs", Direction::Outgoing) };
         let first = json_body(&handle(&conn, params).unwrap());
 
-        // The budget counts the anchor's own row too, so one fewer dependency
-        // than the budget fits into the first call.
         let first_len = first["results"].as_array().unwrap().len();
-        assert_eq!(first_len, traversal::DEFAULT_EXPLORATION_BUDGET as usize - 1);
+        assert!(first_len > 0 && first_len < wide, "one response must not hold all {wide} dependencies: {first_len}");
         assert_eq!(first["truncated"], true);
-        assert_eq!(first["truncatedBy"], "explorationBudget");
-        assert_eq!(first["frontierNodes"].as_array().unwrap().len(), 0, "a budget cut has no depth boundary");
-        let token = first["resumeToken"].as_str().expect("only a budget cut carries a token").to_string();
+        assert_eq!(first["truncatedBy"], "responseSize");
+        assert_eq!(first["frontierNodes"].as_array().unwrap().len(), 0, "a size cut is resumed, not re-rooted");
 
+        let mut all: Vec<String> =
+            first["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        let mut token = first["resumeToken"].as_str().map(str::to_string);
+        let mut calls = 1;
+
+        while let Some(t) = token {
+            let resumed = GetDependenciesParams {
+                file_path: None,
+                module_id: None,
+                // Ignored on a continuation: the token carries the walk's shape.
+                direction: Direction::Incoming,
+                max_depth: None,
+                max_fanout: None,
+                resume_token: Some(t),
+            };
+            let body = json_body(&handle(&conn, resumed).unwrap());
+            calls += 1;
+            all.extend(body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            token = body["resumeToken"].as_str().map(str::to_string);
+            assert!(calls < 50, "the chain must converge, not re-explore itself forever: {calls} calls so far");
+        }
+
+        assert!(calls > 2, "a page far smaller than {wide} deps must take more than one resume: only {calls} calls");
+
+        let mut deduped = all.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), all.len(), "no dependency may be returned twice across the chain");
+        assert_eq!(deduped.len(), wide, "the whole chain's union must be every dependency, exactly once");
+    }
+
+    /// Reproduces the shape of the two real `get_dependencies` failures in
+    /// g-mesh-bench's v0.4.0 outlier findings (a shared module's `Incoming`
+    /// fan-in producing a 115,863-character response the MCP client's
+    /// transport rejected outright) as a synthetic fixture: a single file
+    /// many other files import, none of it anywhere near the exploration
+    /// budget or a caller-set `max_fanout`, but still too much JSON for one
+    /// response.
+    #[test]
+    fn a_wide_fan_in_too_big_for_one_response_truncates_with_a_resume_token_instead_of_erroring() {
+        let wide = 400;
+        let mut conn = setup();
+        let core = "packages/core/src/index.ts";
+        let mut diff = Diff { upsert_nodes: vec![file(core)], ..Default::default() };
+        for i in 0..wide {
+            let path = format!("packages/consumer{i:05}/src/index.ts");
+            diff.upsert_edges.push(EdgeRecord::new(format!("e{i:05}"), &path, core, "IMPORTS", "tree-sitter", true));
+            diff.upsert_nodes.push(file(&path));
+        }
+        write::apply_diff(&mut conn, &diff).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at(core, Direction::Incoming) };
+        let body = json_body(&handle(&conn, params).unwrap());
+
+        let results = body["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "at least one row must always come back, even under an oversized level");
+        assert!(results.len() < wide, "the full {wide}-wide fan-in must not fit in one response");
+        assert_eq!(body["truncated"], true);
+        assert_eq!(body["truncatedBy"], "responseSize");
+        let raw_len = serde_json::to_vec(results).unwrap().len();
+        assert!(raw_len <= pagination::MAX_RESPONSE_BYTES, "the truncated page itself must respect the budget: {raw_len}");
+
+        let token = body["resumeToken"].as_str().expect("a size cut must carry a resume token").to_string();
         let resumed = GetDependenciesParams {
             file_path: None,
             module_id: None,
-            // Ignored on a continuation: the token carries the walk's shape.
-            direction: Direction::Incoming,
+            direction: Direction::Outgoing,
             max_depth: None,
             max_fanout: None,
             resume_token: Some(token),
         };
         let second = json_body(&handle(&conn, resumed).unwrap());
+        assert!(
+            !second["results"].as_array().unwrap().is_empty(),
+            "resuming must make forward progress on what the first call dropped"
+        );
+    }
 
-        assert_eq!(second["results"].as_array().unwrap().len(), over_budget - first_len, "the rest, and only the rest");
-        assert_eq!(second["truncated"], false, "the continuation ran out of graph, not of budget");
-        assert!(second["truncatedBy"].is_null());
-        assert!(second["resumeToken"].is_null());
+    /// Problem 2's fix: omitting `max_depth` must stop at this tool's own,
+    /// stricter default - not fall through to the walk engine's generic one
+    /// (`traversal::DEFAULT_MAX_DEPTH`, 5). A caller that passes `max_depth`
+    /// explicitly must still get exactly that depth, unaffected.
+    #[test]
+    fn omitting_max_depth_uses_this_tools_own_default_not_the_walk_engines() {
+        let mut conn = setup();
+        let chain = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+        for path in chain {
+            upsert_node(&mut conn, file(path)).unwrap();
+        }
+        for pair in chain.windows(2) {
+            imports(&mut conn, pair[0], pair[1]);
+        }
+        let conn = Arc::new(Mutex::new(conn));
 
-        let mut all: Vec<String> = first["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .chain(second["results"].as_array().unwrap().iter())
-            .map(|r| r["id"].as_str().unwrap().to_string())
-            .collect();
-        all.sort();
-        all.dedup();
-        assert_eq!(all.len(), over_budget, "the two calls together cover every dependency exactly once");
+        let defaulted = json_body(&handle(&conn, anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        assert_eq!(
+            reached(&defaulted),
+            vec![("b.rs".to_string(), 1), ("c.rs".to_string(), 2)],
+            "omitting max_depth must stop at DEFAULT_MAX_DEPTH (2), not the walk engine's default (5)"
+        );
+        assert_eq!(defaulted["truncated"], true);
+        assert_eq!(defaulted["truncatedBy"], "maxDepth");
+        assert_eq!(defaulted["frontierNodes"], serde_json::json!(["c.rs"]));
+
+        let explicit = GetDependenciesParams { max_depth: Some(4), ..anchored_at("a.rs", Direction::Outgoing) };
+        let body = json_body(&handle(&conn, explicit).unwrap());
+        assert_eq!(
+            reached(&body),
+            vec![("b.rs".to_string(), 1), ("c.rs".to_string(), 2), ("d.rs".to_string(), 3), ("e.rs".to_string(), 4)],
+            "an explicit max_depth must be honored exactly, unaffected by this tool's own default"
+        );
+        assert_eq!(body["truncated"], false);
     }
 }

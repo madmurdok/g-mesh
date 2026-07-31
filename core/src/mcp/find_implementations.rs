@@ -71,24 +71,32 @@ fn list_implementations(
     )
     .context("failed to paginate SUPERTYPE_OF edges")?;
 
-    let mut results = Vec::with_capacity(page.results.len());
+    let mut rows = Vec::with_capacity(page.results.len());
     for edge in page.results {
         let implementing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve implementing node")?
             .with_context(|| format!("edge {} points at missing node {}", edge.id, edge.from_id))?;
-        results.push(ImplementationSite {
-            implementing_symbol_id: implementing.id,
-            name: implementing.name,
-            qualified_name: implementing.qualified_name,
-            kind: implementing.kind,
-            file_path: implementing.file_path,
-            start_line: implementing.start_line,
-            start_col: implementing.start_col,
+        // Same rule `paginate_edges`' SQL applies: locality 0 when the
+        // enriched row shares the anchor's file, 1 otherwise.
+        let locality = if implementing.file_path == anchor_file_path { 0 } else { 1 };
+        rows.push(pagination::EdgeRow {
             resolved: edge.resolved,
+            locality,
+            edge_id: edge.id.clone(),
+            item: ImplementationSite {
+                implementing_symbol_id: implementing.id,
+                name: implementing.name,
+                qualified_name: implementing.qualified_name,
+                kind: implementing.kind,
+                file_path: implementing.file_path,
+                start_line: implementing.start_line,
+                start_col: implementing.start_col,
+                resolved: edge.resolved,
+            },
         });
     }
 
-    Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor })
+    Ok(pagination::bound_page(rows, page.has_more, page.next_cursor))
 }
 
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
