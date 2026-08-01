@@ -147,7 +147,7 @@ mod tests {
     /// time anything touches `lastUsed`.
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::ensure_current(&conn).unwrap();
+        schema::ensure_current(&conn, &crate::daemon::plugin::indexer_version()).unwrap();
         conn
     }
 
@@ -224,7 +224,7 @@ mod tests {
         let written = {
             let conn = Connection::open(dir.path().join("index.db")).unwrap();
             conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-            schema::ensure_current(&conn).unwrap();
+            schema::ensure_current(&conn, &crate::daemon::plugin::indexer_version()).unwrap();
             touch(&conn).unwrap();
             stamp(&conn)
         }; // connection closed here - nothing is holding the index open

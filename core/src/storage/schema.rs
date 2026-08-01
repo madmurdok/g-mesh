@@ -39,12 +39,28 @@ pub const CURRENT_SCHEMA_VERSION: &str = "4";
 ///
 /// So: **bump this whenever a change makes the indexing pipeline produce
 /// different nodes or edges for the same source tree** - anything in
-/// `plugins/js-ts/src` that alters what is extracted or which specifiers
-/// resolve, and anything in `graph::imports` / `graph::symbol_links` that
-/// alters what gets linked. A mismatch takes the same path a schema mismatch
-/// does: wipe, then a full re-walk on the next daemon start. That costs one
-/// cold start per project per bump, which is the whole price of never serving
-/// a previous generation's graph.
+/// `graph::imports` / `graph::symbol_links` that alters what gets linked, and
+/// anything outside the plugin's own compiled output (a tree-sitter grammar
+/// upgrade, say) that alters what is extracted. A mismatch takes the same path
+/// a schema mismatch does: wipe, then a full re-walk on the next daemon start.
+/// That costs one cold start per project per bump, which is the whole price of
+/// never serving a previous generation's graph.
+///
+/// # This constant is only half of what is compared
+///
+/// It used to be all of it, and that was the hole task 116 closed. The rule
+/// above said to bump it for "anything in `plugins/js-ts/src` that alters what
+/// is extracted", and task 115 - which rewrote how same-file edges resolve -
+/// did not, because nothing made it. Every index built before it went on being
+/// served afterwards: current schema, current constant, current binary, wrong
+/// answers.
+///
+/// What is written to `meta.indexer_version` is therefore this constant *plus*
+/// a digest of the plugin's compiled output - see
+/// `daemon::plugin::indexer_version`, which composes the two, and
+/// `daemon::plugin::fingerprint` for why the plugin's half is derived from the
+/// artifact rather than declared. This half remains for everything that digest
+/// cannot see, which is why it is still worth keeping honest by hand.
 ///
 /// It is deliberately *not* the crate version: releases and extraction
 /// changes are different events, and tying the two would both miss changes
@@ -121,18 +137,25 @@ pub fn apply(conn: &Connection) -> Result<()> {
 }
 
 /// Ensures the DB matches both [`CURRENT_SCHEMA_VERSION`] (it can still be
-/// read) and [`CURRENT_INDEXER_VERSION`] (what it holds is still what today's
-/// pipeline would produce), wiping and recreating it on either mismatch - no
-/// migration framework, full reindex is the only upgrade path. Returns `true`
-/// if a full reindex is now required (fresh DB or either version stale),
-/// `false` if the existing schema and data were already current and were left
-/// untouched.
+/// read) and `indexer_version` (what it holds is still what today's pipeline
+/// would produce), wiping and recreating it on either mismatch - no migration
+/// framework, full reindex is the only upgrade path. Returns `true` if a full
+/// reindex is now required (fresh DB or either version stale), `false` if the
+/// existing schema and data were already current and were left untouched.
+///
+/// `indexer_version` is passed in rather than read from a constant here
+/// because half of it is not a constant: it names the plugin build that will
+/// fill the index as well as core's own pipeline generation, and only the
+/// caller is in a position to look at the plugin (see
+/// `daemon::plugin::indexer_version`, which is what every non-test caller
+/// passes). Keeping it a parameter also keeps this module free of filesystem
+/// access it would otherwise have to do behind its callers' backs.
 ///
 /// The two are read in sequence rather than in one query because a database
 /// old enough to fail the first check has no `indexer_version` column to
 /// select at all - `schema_version` is the one column every generation of
 /// this schema has had, so it is the only one safe to ask about first.
-pub fn ensure_current(conn: &Connection) -> Result<bool> {
+pub fn ensure_current(conn: &Connection, indexer_version: &str) -> Result<bool> {
     apply(conn)?;
 
     let schema: Option<String> = conn
@@ -141,18 +164,18 @@ pub fn ensure_current(conn: &Connection) -> Result<bool> {
         .context("failed to read schema_version")?;
 
     let Some(schema) = schema else {
-        record_version(conn)?;
+        record_version(conn, indexer_version)?;
         return Ok(true);
     };
     if schema != CURRENT_SCHEMA_VERSION {
-        return reset(conn).map(|()| true);
+        return reset(conn, indexer_version).map(|()| true);
     }
 
     let indexer: String = conn
         .query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0))
         .context("failed to read indexer_version")?;
-    if indexer != CURRENT_INDEXER_VERSION {
-        return reset(conn).map(|()| true);
+    if indexer != indexer_version {
+        return reset(conn, indexer_version).map(|()| true);
     }
 
     Ok(false)
@@ -162,10 +185,17 @@ pub fn ensure_current(conn: &Connection) -> Result<bool> {
 /// over empty. `bulkIndexedAt` going with it is the point, not a side effect:
 /// it is what makes the next daemon start walk the project again instead of
 /// trusting a graph nothing will ever refresh.
-fn reset(conn: &Connection) -> Result<()> {
+///
+/// `pub(crate)` rather than private: `cli::reindex` calls this directly to
+/// give `g-mesh reindex` the same wipe a version mismatch triggers
+/// automatically, on demand instead of waiting for a version bump to notice
+/// one is owed. Both callers hand it a connection and both then owe it a
+/// fresh walk - `ensure_current` via the daemon's own cold-start path,
+/// `cli::reindex` by calling `daemon::bulk_index::run` itself.
+pub(crate) fn reset(conn: &Connection, indexer_version: &str) -> Result<()> {
     wipe(conn)?;
     apply(conn)?;
-    record_version(conn)
+    record_version(conn, indexer_version)
 }
 
 /// Whether a full project walk has ever finished for this index. `false`
@@ -197,10 +227,10 @@ fn wipe(conn: &Connection) -> Result<()> {
     .context("failed to wipe schema")
 }
 
-fn record_version(conn: &Connection) -> Result<()> {
+fn record_version(conn: &Connection, indexer_version: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, ?1, ?2, CURRENT_TIMESTAMP)",
-        rusqlite::params![CURRENT_SCHEMA_VERSION, CURRENT_INDEXER_VERSION],
+        rusqlite::params![CURRENT_SCHEMA_VERSION, indexer_version],
     )
     .context("failed to record the schema and indexer versions")?;
     Ok(())
@@ -209,6 +239,14 @@ fn record_version(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A generation string shaped like the one `daemon::plugin::indexer_version`
+    /// composes - this constant plus the plugin build's digest - so these tests
+    /// exercise the value that is really stored rather than only half of it.
+    const GENERATION: &str = "1+0123456789abcdef";
+    /// The same core pipeline with the plugin rebuilt: the shape of task 115's
+    /// change, and the one nothing used to notice.
+    const GENERATION_AFTER_A_PLUGIN_REBUILD: &str = "1+fedcba9876543210";
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -311,11 +349,11 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '0', ?1, CURRENT_TIMESTAMP)",
-            rusqlite::params![CURRENT_INDEXER_VERSION],
+            rusqlite::params![GENERATION],
         )
         .unwrap();
 
-        let reindex_needed = ensure_current(&conn).unwrap();
+        let reindex_needed = ensure_current(&conn, GENERATION).unwrap();
         assert!(reindex_needed);
 
         let version: String = conn
@@ -331,7 +369,7 @@ mod tests {
     fn leaves_current_version_untouched() {
         let conn = setup();
         // First call on a fresh DB: no meta row yet, so a reindex is (correctly) signaled.
-        assert!(ensure_current(&conn).unwrap());
+        assert!(ensure_current(&conn, GENERATION).unwrap());
 
         conn.execute(
             "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
@@ -341,7 +379,7 @@ mod tests {
         .unwrap();
 
         // Second call at the same (current) version must not wipe existing data.
-        let reindex_needed = ensure_current(&conn).unwrap();
+        let reindex_needed = ensure_current(&conn, GENERATION).unwrap();
         assert!(!reindex_needed);
 
         let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
@@ -351,7 +389,7 @@ mod tests {
     #[test]
     fn a_fresh_index_owes_a_bulk_index_until_one_is_recorded() {
         let conn = setup();
-        assert!(ensure_current(&conn).unwrap());
+        assert!(ensure_current(&conn, GENERATION).unwrap());
         assert!(!bulk_index_completed(&conn).unwrap(), "a fresh index has never been walked");
 
         record_bulk_index(&conn).unwrap();
@@ -359,18 +397,18 @@ mod tests {
 
         // The whole point of the flag: reopening an unchanged, already-walked
         // index must not ask for the walk again.
-        assert!(!ensure_current(&conn).unwrap());
+        assert!(!ensure_current(&conn, GENERATION).unwrap());
         assert!(bulk_index_completed(&conn).unwrap());
     }
 
     #[test]
     fn a_version_mismatch_wipe_makes_a_bulk_index_owed_again() {
         let conn = setup();
-        ensure_current(&conn).unwrap();
+        ensure_current(&conn, GENERATION).unwrap();
         record_bulk_index(&conn).unwrap();
 
         conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
-        assert!(ensure_current(&conn).unwrap());
+        assert!(ensure_current(&conn, GENERATION).unwrap());
         assert!(
             !bulk_index_completed(&conn).unwrap(),
             "data wiped by a version mismatch has to be walked again"
@@ -384,7 +422,7 @@ mod tests {
     #[test]
     fn an_index_from_an_older_indexer_is_wiped_even_though_its_schema_still_matches() {
         let conn = setup();
-        ensure_current(&conn).unwrap();
+        ensure_current(&conn, GENERATION).unwrap();
         record_bulk_index(&conn).unwrap();
         conn.execute(
             "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
@@ -395,7 +433,7 @@ mod tests {
 
         conn.execute("UPDATE meta SET indexer_version = '0' WHERE id = 1", []).unwrap();
 
-        assert!(ensure_current(&conn).unwrap(), "a previous generation's graph must not be kept");
+        assert!(ensure_current(&conn, GENERATION).unwrap(), "a previous generation's graph must not be kept");
         let schema: String =
             conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(schema, CURRENT_SCHEMA_VERSION, "the schema was current all along and stays so");
@@ -410,12 +448,44 @@ mod tests {
     #[test]
     fn a_fresh_index_records_the_indexer_generation_that_will_fill_it() {
         let conn = setup();
-        ensure_current(&conn).unwrap();
+        ensure_current(&conn, GENERATION).unwrap();
 
         let indexer: String =
             conn.query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
-        assert_eq!(indexer, CURRENT_INDEXER_VERSION);
-        assert!(!ensure_current(&conn).unwrap(), "the stamp it just wrote must satisfy its own check");
+        assert_eq!(indexer, GENERATION);
+        assert!(!ensure_current(&conn, GENERATION).unwrap(), "the stamp it just wrote must satisfy its own check");
+    }
+
+    /// Task 116: the generation that filled an index names the plugin build as
+    /// well as core's own pipeline, so rebuilding only the plugin invalidates
+    /// it - which is what did *not* happen when task 115 changed the extractor
+    /// and left every existing index serving the resolution it replaced.
+    #[test]
+    fn an_index_a_previous_plugin_build_filled_is_wiped_though_cores_own_generation_is_unchanged() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        record_bulk_index(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            ensure_current(&conn, GENERATION_AFTER_A_PLUGIN_REBUILD).unwrap(),
+            "a graph the previous plugin build produced must not be kept"
+        );
+
+        let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+        assert_eq!(node_count, 0, "what the old extractor produced must not survive");
+        assert!(
+            !bulk_index_completed(&conn).unwrap(),
+            "the project is owed a full walk by the plugin that replaced it"
+        );
+        let indexer: String =
+            conn.query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(indexer, GENERATION_AFTER_A_PLUGIN_REBUILD, "the new generation has to be recorded");
     }
 
     #[test]

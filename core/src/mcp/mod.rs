@@ -28,7 +28,7 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::plugin::PluginProcess;
+use crate::daemon::lifecycle::{CoreActivity, PluginSupervisor};
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
 use crate::protocol::types::Position;
@@ -106,10 +106,11 @@ pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
 pub async fn serve_connection(
     stream: UnixStream,
     conn: Arc<Mutex<Connection>>,
-    plugin: Arc<PluginProcess>,
+    plugin: Arc<PluginSupervisor>,
+    core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, plugin, indexing)
+    let service = GMeshMcpServer::new(conn, plugin, core_activity, indexing)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -120,14 +121,16 @@ pub async fn serve_connection(
 /// The structural query surface, backed by the project's index and the
 /// language plugin.
 ///
-/// Every handler answers out of `conn` alone; `plugin` is held but not read
-/// yet, because the tool that needs it - a query the index cannot answer
-/// without asking the language server - is still ahead of the MVP surface.
+/// Every handler answers out of `conn` alone. `plugin` is not there to be
+/// queried - no tool asks the language server a question - but to be *woken*:
+/// while it sleeps on its idle timeout the core queues the files that changed,
+/// and a tool call is the moment that queue has to be replayed before the
+/// index is read (see `daemon::lifecycle`).
 #[derive(Clone)]
 pub struct GMeshMcpServer {
     conn: Arc<Mutex<Connection>>,
-    #[allow(dead_code)]
-    plugin: Arc<PluginProcess>,
+    plugin: Arc<PluginSupervisor>,
+    core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     tool_router: ToolRouter<Self>,
 }
@@ -136,10 +139,63 @@ pub struct GMeshMcpServer {
 impl GMeshMcpServer {
     pub fn new(
         conn: Arc<Mutex<Connection>>,
-        plugin: Arc<PluginProcess>,
+        plugin: Arc<PluginSupervisor>,
+        core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,
     ) -> Self {
-        Self { conn, plugin, indexing, tool_router: Self::tool_router() }
+        Self { conn, plugin, core_activity, indexing, tool_router: Self::tool_router() }
+    }
+
+    /// Everything every handler owes before it reads the index, in the one
+    /// order they may happen in. `Some(...)` is a finished response the
+    /// handler must return unchanged; `None` means carry on and answer.
+    ///
+    /// The order is not arbitrary:
+    ///
+    /// 1. [`still_indexing`](Self::still_indexing) first, because a project
+    ///    whose first walk has not finished has no graph to bring up to date
+    ///    and no answer to give either way.
+    /// 2. [`mark_used`](Self::mark_used) next: it takes and releases the
+    ///    SQLite mutex on its own, and it must not be nested inside the plugin
+    ///    lock the replay below holds (see `daemon::lifecycle`'s lock order).
+    /// 3. The replay last, so the rows this call is about to read already
+    ///    include every change made while the plugin was asleep.
+    async fn prepare(&self) -> Option<Result<CallToolResult, ErrorData>> {
+        if let Some(not_ready) = self.still_indexing().await {
+            return Some(not_ready);
+        }
+        self.mark_used();
+        self.replay_queued_changes().await;
+        None
+    }
+
+    /// Brings the index up to date with whatever changed while the plugin was
+    /// asleep, and does nothing at all - not even a lock - when nothing did,
+    /// which is every call on a daemon whose plugin is awake.
+    ///
+    /// On the blocking thread pool rather than inline: waking the plugin means
+    /// spawning Node and warming tree-sitter, and the accept loop's runtime
+    /// has two worker threads (see `daemon::serve_forever`), so doing it on
+    /// one of them would stall every other session for the length of a
+    /// process spawn.
+    ///
+    /// A failure is logged, not returned. The caller asked a structural
+    /// question the index can already answer; refusing it because a *later*
+    /// edit could not be replayed would turn one unreadable file into a dead
+    /// tool surface, and the queue is left intact for the next call to retry.
+    async fn replay_queued_changes(&self) {
+        if !self.plugin.has_pending() {
+            return;
+        }
+        let plugin = Arc::clone(&self.plugin);
+        let conn = Arc::clone(&self.conn);
+        match tokio::task::spawn_blocking(move || plugin.replay_pending(&conn)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => eprintln!(
+                "g-mesh daemon: could not replay the changes queued while the plugin slept: {err:#}"
+            ),
+            Err(err) => eprintln!("g-mesh daemon: the plugin wake task failed: {err}"),
+        }
     }
 
     /// `Some(...)` - a finished response the handler must return unchanged -
@@ -150,7 +206,7 @@ impl GMeshMcpServer {
     /// on" rather than a bare bool, so the wording lives in exactly one place
     /// and no handler can invent its own.
     ///
-    /// Every handler calls this as its *first* statement, ahead of
+    /// [`prepare`](Self::prepare) calls this as its *first* step, ahead of
     /// [`mark_used`](Self::mark_used): that one takes the daemon's single
     /// SQLite mutex, which the walk holds for the length of each batch
     /// commit, and waiting on it to say "I am not going to read the database"
@@ -177,7 +233,16 @@ impl GMeshMcpServer {
 
     /// Advances the project's `lastUsed` stamp, which a later GC scan reads
     /// back off disk to decide how long a project has been idle
-    /// (`gc::last_used`).
+    /// (`gc::last_used`), and the core's own in-memory idle clock, which
+    /// decides when this daemon has been unused long enough to exit
+    /// (`daemon::lifecycle::CoreActivity`).
+    ///
+    /// The two are separate on purpose and neither can stand in for the other:
+    /// `lastUsed` is a durable record about the *project*, read by a command
+    /// that may run days later on disk this daemon no longer owns, while the
+    /// idle clock is a fact about this *process* that means nothing once it
+    /// exits. They are advanced together because one thing advances both - a
+    /// tool call.
     ///
     /// Called by every tool handler rather than once per connection: a client
     /// holds one session open for its whole lifetime, so per-connection would
@@ -188,6 +253,7 @@ impl GMeshMcpServer {
     /// turning an answerable query into a tool error. The guard is taken and
     /// released here, before the handler takes its own.
     fn mark_used(&self) {
+        self.core_activity.request();
         if let Err(err) = last_used::touch(&self.conn.lock().unwrap()) {
             eprintln!("g-mesh daemon: failed to record lastUsed: {err:#}");
         }
@@ -201,10 +267,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindDefinitionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         find_definition::handle(&self.conn, params.0)
     }
 
@@ -216,28 +281,25 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         find_references::handle(&self.conn, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         find_callers_callees::handle_callers(&self.conn, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         find_callers_callees::handle_callees(&self.conn, params.0)
     }
 
@@ -249,10 +311,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         find_implementations::handle(&self.conn, params.0)
     }
 
@@ -264,10 +325,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetFileOutlineParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         get_file_outline::handle(&self.conn, params.0)
     }
 
@@ -279,10 +339,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(not_ready) = self.still_indexing().await {
+        if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        self.mark_used();
         get_dependencies::handle(&self.conn, params.0)
     }
 }

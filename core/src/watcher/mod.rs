@@ -9,7 +9,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, ErrorKind as NotifyErrorKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+
+/// How often the polling fallback (see [`ProjectWatcher::new_inner`]) rescans
+/// its subtree for changes. Polling a large subtree is inherently more
+/// expensive than an OS watch, so this trades some latency for not hammering
+/// the filesystem - the fallback only engages for the specific subtree that
+/// couldn't get a real watch, not the whole project.
+const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Watches a project root for filesystem changes, filtering out anything
 /// `.gitignore` (plus `.git` and `.claude`, which `.gitignore` files don't
@@ -20,12 +27,35 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 pub struct ProjectWatcher {
     // Held only to keep the OS watch alive - dropping it stops watching.
     _watcher: RecommendedWatcher,
+    // Set only when the OS watch (e.g. inotify on Linux) ran out of watch
+    // capacity partway through and we fell back to polling for the subtree
+    // it couldn't cover. Held for the same reason as `_watcher` - dropping
+    // it stops the poll loop.
+    _poll_fallback: Option<PollWatcher>,
     events: Receiver<PathBuf>,
     gitignore: Gitignore,
 }
 
 impl ProjectWatcher {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Self::new_inner(root, None)
+    }
+
+    /// Test-only seam: lets tests simulate the exact error notify's inotify
+    /// backend returns when `fs.inotify.max_user_watches` is exhausted
+    /// (`ErrorKind::MaxFilesWatch`, raised on `ENOSPC` from `inotify_add_watch`),
+    /// without needing to actually exhaust a real inotify instance - not
+    /// reproducible on this dev platform (inotify is Linux-only) or
+    /// portably/non-flakily in CI.
+    #[cfg(test)]
+    fn new_simulating_watch_error(
+        root: impl AsRef<Path>,
+        simulated_error: notify::Error,
+    ) -> Result<Self> {
+        Self::new_inner(root, Some(simulated_error))
+    }
+
+    fn new_inner(root: impl AsRef<Path>, simulated_watch_error: Option<notify::Error>) -> Result<Self> {
         // notify's OS backends (FSEvents on macOS in particular) report
         // canonicalized paths - e.g. /var/... comes back as /private/var/...
         // since /var is a symlink. Building the gitignore matcher against a
@@ -50,19 +80,62 @@ impl ProjectWatcher {
         let gitignore = builder.build().context("failed to build gitignore matcher")?;
 
         let (tx, rx) = channel();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                for path in event.paths {
-                    let _ = tx.send(path);
+        let mut watcher = {
+            let tx = tx.clone();
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    for path in event.paths {
+                        let _ = tx.send(path);
+                    }
                 }
-            }
-        })
+            })
+        }
         .context("failed to create file watcher")?;
-        watcher
-            .watch(root, RecursiveMode::Recursive)
-            .with_context(|| format!("failed to watch {}", root.display()))?;
 
-        Ok(Self { _watcher: watcher, events: rx, gitignore })
+        let watch_result = match simulated_watch_error {
+            Some(err) => Err(err),
+            None => watcher.watch(root, RecursiveMode::Recursive),
+        };
+
+        let poll_fallback = match watch_result {
+            Ok(()) => None,
+            Err(err) if matches!(err.kind, NotifyErrorKind::MaxFilesWatch) => {
+                // notify's inotify backend walks the tree and adds one
+                // inotify watch per directory, aborting on the first
+                // ENOSPC (translated to `MaxFilesWatch`). `err.paths` names
+                // the specific directory it was on when that happened -
+                // everything walked before it already has a working
+                // inotify watch, so only *this* subtree needs a fallback,
+                // not the whole project.
+                let affected = err.paths.first().cloned().unwrap_or_else(|| root.to_path_buf());
+                eprintln!(
+                    "g-mesh: inotify watch limit reached at {} - falling back to polling for that subtree",
+                    affected.display()
+                );
+
+                let tx = tx.clone();
+                let mut poll_watcher = PollWatcher::new(
+                    move |res: notify::Result<notify::Event>| {
+                        if let Ok(event) = res {
+                            for path in event.paths {
+                                let _ = tx.send(path);
+                            }
+                        }
+                    },
+                    Config::default().with_poll_interval(POLL_FALLBACK_INTERVAL),
+                )
+                .context("failed to create polling fallback watcher")?;
+                poll_watcher
+                    .watch(&affected, RecursiveMode::Recursive)
+                    .with_context(|| format!("failed to poll-watch {}", affected.display()))?;
+                Some(poll_watcher)
+            }
+            // Any other watcher error (permissions, path gone, etc.) is a
+            // real failure - keep propagating it as before.
+            Err(err) => return Err(err).with_context(|| format!("failed to watch {}", root.display())),
+        };
+
+        Ok(Self { _watcher: watcher, _poll_fallback: poll_fallback, events: rx, gitignore })
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
@@ -101,6 +174,10 @@ mod tests {
     const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
     const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
     const DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+    // The polling fallback only rescans every POLL_FALLBACK_INTERVAL (2s), so
+    // give it a few cycles' worth of headroom to avoid a flaky race against
+    // the poll loop's own timer.
+    const POLL_EVENT_TIMEOUT: Duration = Duration::from_secs(7);
 
     /// macOS FSEvents can replay a creation event for the watched root
     /// itself (and other setup noise) shortly after `watch()` starts, even
@@ -179,5 +256,51 @@ mod tests {
 
         fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();
         assert!(watcher.next_change(EVENT_TIMEOUT).is_some());
+    }
+
+    /// Simulates the exact error notify's inotify backend raises when
+    /// `fs.inotify.max_user_watches` is exhausted partway through the
+    /// initial recursive watch (`ErrorKind::MaxFilesWatch`, with the
+    /// offending subtree in `paths` - see notify 6.1.1's
+    /// `inotify.rs::add_single_watch`, which maps `ENOSPC` from
+    /// `inotify_add_watch` to exactly this). `ProjectWatcher::new` must not
+    /// fail/crash on it - it should fall back to polling the affected
+    /// subtree and keep delivering changes from it.
+    #[test]
+    fn inotify_watch_limit_error_falls_back_to_polling_the_affected_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let affected = tmp.path().join("huge-subtree");
+        fs::create_dir(&affected).unwrap();
+        let affected = affected.canonicalize().unwrap();
+
+        let simulated =
+            notify::Error::new(notify::ErrorKind::MaxFilesWatch).add_path(affected.clone());
+
+        let watcher = ProjectWatcher::new_simulating_watch_error(tmp.path(), simulated)
+            .expect("a MaxFilesWatch error must trigger a polling fallback, not a hard failure");
+
+        fs::write(affected.join("file.txt"), b"hello").unwrap();
+        let changed = watcher.next_change(POLL_EVENT_TIMEOUT);
+        assert_eq!(
+            changed,
+            Some(affected.join("file.txt")),
+            "the polling fallback must still surface changes under the subtree \
+             that couldn't get a real inotify watch"
+        );
+    }
+
+    /// Non-limit watcher errors are real failures and must keep propagating
+    /// as before - only the specific `MaxFilesWatch` condition should engage
+    /// the polling fallback.
+    #[test]
+    fn non_watch_limit_error_still_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let simulated = notify::Error::new(notify::ErrorKind::PathNotFound);
+
+        let result = ProjectWatcher::new_simulating_watch_error(tmp.path(), simulated);
+        assert!(
+            result.is_err(),
+            "a non-watch-limit error must not be silently swallowed by the fallback"
+        );
     }
 }

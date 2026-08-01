@@ -22,13 +22,15 @@
 //!   own. A daemon that outlived an upgrade answers every query correctly
 //!   *for the build it is*, so nothing else in this report can show it up -
 //!   which is precisely why it gets a line of its own.
-//! - **Plugin**: the pid in `plugin.pid`, checked the same way. The two-tier
-//!   idle model in the architecture doc (a plugin that sleeps after an idle
-//!   timeout while the core keeps queueing changes) is not built yet: today
-//!   the daemon spawns exactly one plugin at startup and holds it for its
-//!   whole lifetime, so the states that can actually occur are "active",
-//!   "not running", and the failure case worth naming - a plugin still alive
-//!   with no core left to serve.
+//! - **Plugin**: the pid in `plugin.pid`, checked the same way, and then read
+//!   against the core's own state. The two-tier idle model is built
+//!   (`daemon::lifecycle`), so a plugin can legitimately be *absent* while its
+//!   core runs on: the core writes that pid file on every wake and clears it
+//!   on every sleep, which is what lets "no plugin, but a live core" be
+//!   reported as a plugin asleep on its idle timeout rather than as one that
+//!   never started. The remaining states are "active", the failure case worth
+//!   naming - a plugin still alive with no core left to serve - and "not
+//!   running", which now means neither of them is there.
 //! - **Dirty files / index coverage**: a gitignore-aware walk of the project,
 //!   cross-referenced against the `File` nodes and `indexed_files` baselines
 //!   in the index. See [`IndexStatus`] for exactly what each number counts.
@@ -95,6 +97,12 @@ pub enum BuildState {
     /// predates whatever has been installed since, and the index invalidation
     /// that a start on the new build would have performed.
     Outdated,
+    /// The daemon started from this very executable, but is holding a JS/TS
+    /// plugin that has been rebuilt since - so the graph it is serving was
+    /// computed by extraction logic that is no longer on disk. Reported apart
+    /// from `Outdated` because "your core binary is old" would be false here,
+    /// and would send someone looking in the wrong place.
+    PluginChanged,
     /// Running, but nothing usable is on record about its build - the shape
     /// every daemon that predates this check has. Reported rather than
     /// silently called current, because "we did not compare" and "we compared
@@ -105,8 +113,22 @@ pub enum BuildState {
 /// Whether the language plugin process is up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginState {
-    /// Running under a live core, which is the only healthy state today.
+    /// Running under a live core.
     Active { pid: u32 },
+    /// No plugin, but a live core that would have one if it needed it: the
+    /// healthy other half of the two-tier idle model, not a fault. The core is
+    /// queueing file changes and will replay them into a plugin it spawns on
+    /// the next request that needs one (`daemon::lifecycle`).
+    ///
+    /// Inferred rather than recorded, because a fact this transient does not
+    /// deserve a state file of its own: the core spawns a plugin at startup
+    /// and only ever stops one deliberately, so a running core with no plugin
+    /// pid on record has exactly one explanation. The window in which that is
+    /// wrong - the few milliseconds of a starting core that has bound its
+    /// socket and not yet spawned its plugin - reports "asleep" a moment
+    /// early, which is a better answer than "not running" is in the case that
+    /// actually lasts.
+    Asleep,
     /// Alive with no core serving this project: a leaked child of a daemon
     /// that died without closing its stdin. `g-mesh stop` clears it.
     Orphaned { pid: u32 },
@@ -226,21 +248,29 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     match build_stamp::vintage(published.as_ref(), &ours) {
         Vintage::Current => BuildState::Current,
         Vintage::Outdated => BuildState::Outdated,
+        Vintage::PluginChanged => BuildState::PluginChanged,
         Vintage::Unknown => BuildState::Unknown,
     }
 }
 
 fn plugin_state(project_root: &Path, core: CoreState) -> Result<PluginState> {
-    let Some(pid) = daemon::read_pid_file(&daemon::plugin_pid_path(project_root)?) else {
-        return Ok(PluginState::NotRunning);
-    };
-    if !daemon::is_process_alive(pid) {
-        return Ok(PluginState::NotRunning);
+    let live_pid = daemon::read_pid_file(&daemon::plugin_pid_path(project_root)?)
+        .filter(|&pid| daemon::is_process_alive(pid));
+    Ok(classify_plugin(live_pid, core))
+}
+
+/// The judgement itself, split from the two lookups that feed it so it can be
+/// exercised over its whole table without conjuring a live process (and a
+/// dead core to go with it) for every row.
+fn classify_plugin(live_pid: Option<u32>, core: CoreState) -> PluginState {
+    match (live_pid, core) {
+        (Some(pid), CoreState::NotRunning) => PluginState::Orphaned { pid },
+        (Some(pid), _) => PluginState::Active { pid },
+        // No plugin under a live core is the idle-sleep state, not a fault -
+        // see `PluginState::Asleep` for why this is inferred rather than read.
+        (None, CoreState::Running { .. } | CoreState::NotAccepting { .. }) => PluginState::Asleep,
+        (None, CoreState::NotRunning) => PluginState::NotRunning,
     }
-    Ok(match core {
-        CoreState::NotRunning => PluginState::Orphaned { pid },
-        _ => PluginState::Active { pid },
-    })
 }
 
 /// Cross-references what is on disk against what the index knows about it.
@@ -496,6 +526,11 @@ fn describe_build(build: BuildState) -> Option<&'static str> {
             "older than this g-mesh - it predates any index invalidation this build \
              would do; run `g-mesh stop`, or let the next MCP call replace it",
         ),
+        BuildState::PluginChanged => Some(
+            "this build, but holding a JS/TS plugin that has been rebuilt since - \
+             its graph came from extraction logic no longer on disk; run \
+             `g-mesh stop`, or let the next MCP call replace it",
+        ),
         BuildState::Unknown => Some(
             "cannot be compared with this g-mesh - it published no build stamp, so it \
              predates this check; run `g-mesh stop`, or let the next MCP call replace it",
@@ -505,9 +540,13 @@ fn describe_build(build: BuildState) -> Option<&'static str> {
 
 fn describe_plugin(plugin: PluginState) -> String {
     match plugin {
-        // Named "active" rather than "awake": there is no sleeping tier to
-        // contrast it with yet (see this module's docs).
         PluginState::Active { pid } => format!("active (pid {pid})"),
+        // Says what it costs and what undoes it, because "asleep" on its own
+        // reads like something to fix: nothing has to be restarted, and the
+        // next query does it anyway.
+        PluginState::Asleep => {
+            "asleep (idle timeout) - file changes are queued; the next query wakes it".to_string()
+        }
         PluginState::Orphaned { pid } => {
             format!("orphaned (pid {pid}) - no core is serving this project; run `g-mesh stop`")
         }
@@ -578,7 +617,7 @@ mod tests {
         /// computed against.
         fn index(&self) -> Connection {
             let conn = Connection::open(self.db_path()).unwrap();
-            schema::ensure_current(&conn).unwrap();
+            schema::ensure_current(&conn, &crate::daemon::plugin::indexer_version()).unwrap();
             conn
         }
 
@@ -823,6 +862,40 @@ mod tests {
         assert!(rendered.contains("syntax errors:   none"), "{rendered}");
     }
 
+    /// The state the two-tier idle model introduced: a plugin that is missing
+    /// on purpose. Reported as a healthy, self-correcting condition rather
+    /// than as the "not running" it is indistinguishable from on disk.
+    #[test]
+    fn a_plugin_asleep_under_a_live_core_is_reported_as_asleep_rather_than_missing() {
+        assert_eq!(
+            classify_plugin(None, CoreState::Running { pid: 1 }),
+            PluginState::Asleep,
+            "a live core with no plugin recorded has put it to sleep"
+        );
+        assert_eq!(
+            classify_plugin(None, CoreState::NotRunning),
+            PluginState::NotRunning,
+            "with no core either, there is nothing asleep - there is nothing at all"
+        );
+        // The states that predate the sleeping tier must read exactly as they
+        // always did.
+        assert_eq!(
+            classify_plugin(Some(7), CoreState::Running { pid: 1 }),
+            PluginState::Active { pid: 7 }
+        );
+        assert_eq!(
+            classify_plugin(Some(7), CoreState::NotRunning),
+            PluginState::Orphaned { pid: 7 }
+        );
+
+        let described = describe_plugin(PluginState::Asleep);
+        assert!(described.contains("asleep"), "{described}");
+        assert!(
+            described.contains("wakes it"),
+            "an asleep plugin needs no intervention, and the report has to say so: {described}"
+        );
+    }
+
     /// The whole point of the line: a daemon left behind by an upgrade
     /// answers everything else in this report perfectly well, so this is the
     /// only place the report can say something is wrong at all.
@@ -830,12 +903,31 @@ mod tests {
     fn a_daemon_left_behind_by_an_upgrade_is_called_out_with_what_to_do_about_it() {
         for (state, expected) in [
             (BuildState::Outdated, "older than this g-mesh"),
+            (BuildState::PluginChanged, "JS/TS plugin that has been rebuilt"),
             (BuildState::Unknown, "published no build stamp"),
         ] {
             let described = describe_build(state).expect("a running daemon always reports a build");
             assert!(described.contains(expected), "{state:?} rendered as {described}");
             assert!(described.contains("g-mesh stop"), "{state:?} must say what to do: {described}");
         }
+    }
+
+    /// A plugin-only rebuild must not be reported as an old core binary: the
+    /// binary is the one the person asking has just built, and being told
+    /// otherwise sends them to look at the wrong half of the pipeline.
+    #[test]
+    fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary() {
+        let state = tempfile::tempdir().unwrap();
+        let mut incumbent = build_stamp::of_running_process().unwrap();
+        incumbent.plugin = format!("{}-before", incumbent.plugin);
+        build_stamp::write(&daemon::build_stamp_path_in(state.path()), &incumbent).unwrap();
+
+        assert_eq!(
+            build_state(CoreState::Running { pid: 1 }, state.path()),
+            BuildState::PluginChanged
+        );
+        let described = describe_build(BuildState::PluginChanged).unwrap();
+        assert!(!described.contains("older than this g-mesh"), "{described}");
     }
 
     #[test]

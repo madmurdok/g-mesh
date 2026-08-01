@@ -2,11 +2,17 @@
 //! language plugin.
 //!
 //! The architecture doc's lifecycle model says the core deliberately does not
-//! die on a short idle timeout - it lives until it is explicitly stopped - so
+//! die on a short idle timeout - it lives until it is explicitly stopped, or
+//! until a much longer timeout of its own expires (`daemon::lifecycle`) - so
 //! this command is what makes that "explicitly" mean something. Until it
 //! existed the only documented way to stop a daemon was to read its pid out
 //! of `daemon.pid` and kill it by hand, which is also the only way to find
 //! out afterwards that its plugin was still running.
+//!
+//! A plugin asleep on *its* idle timeout is not something this command has to
+//! handle specially, and that is by construction: the core clears `plugin.pid`
+//! when it puts one to sleep, so the plugin half of a stop is simply a no-op -
+//! the same shape as stopping a project whose plugin never started.
 //!
 //! # Shutdown order, and why the plugin is waited for rather than killed
 //!

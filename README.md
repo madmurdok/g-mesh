@@ -205,6 +205,27 @@ is no rescan on start, so such a file is only picked up the next time it
 changes with a daemon up — or by deleting the project's state directory (see
 below) to force a fresh full walk.
 
+## Idle behaviour
+
+The daemon is two processes with very different costs, and each has its own
+idle timeout:
+
+- The **JS/TS plugin** (the expensive one — tree-sitter plus the TypeScript
+  compiler API in a Node process) exits after an hour with no reparse work.
+  While it is asleep the core keeps watching the project and remembers which
+  files changed; the next query wakes it and replays exactly that list, not
+  the whole project. `g-mesh status` reports it as `asleep`, which needs no
+  action.
+- The **daemon core** (socket, index handle, watcher) is cheap and stays up
+  across that, because re-registering fs watchers is the expensive part of a
+  start. It exits on its own only after 24 hours with no MCP requests and
+  nobody connected, releasing its socket and pid files; the next query
+  bootstraps a fresh daemon exactly as a first-ever query does. The index on
+  disk is untouched either way, so nothing is reindexed because of it.
+
+Both are configurable per project once the config file lands; today they are
+the defaults above.
+
 ## Tools exposed
 
 `find_definition`, `find_references`, `find_callers`, `find_callees`,
@@ -214,8 +235,15 @@ below) to force a fresh full walk.
 
 Per-project state lives under `~/.g-mesh/projects/<hash-of-project-root>/`:
 SQLite DB, daemon socket, pid files, lock files. Delete a project's directory
-there to force a clean reindex (schema mismatches also auto-wipe and
-reindex).
+there to force a clean reindex.
+
+Upgrading g-mesh does not need that, though: an index records which build of
+the indexing pipeline filled it — core's own generation *and* a digest of the
+JS/TS plugin's compiled output — and an index that no longer matches is wiped
+and re-walked on the next daemon start. A daemon already running when the
+upgrade lands is retired first, whether it is the core binary or only the
+plugin that was rebuilt, so the next MCP call is answered by what is on disk
+now. `g-mesh status` says which build the running daemon came from.
 
 Run `g-mesh status` in a project to see whether its daemon and plugin are up,
 how much of the project the index covers, and which files failed to parse.
