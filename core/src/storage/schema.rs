@@ -185,7 +185,14 @@ pub fn ensure_current(conn: &Connection, indexer_version: &str) -> Result<bool> 
 /// over empty. `bulkIndexedAt` going with it is the point, not a side effect:
 /// it is what makes the next daemon start walk the project again instead of
 /// trusting a graph nothing will ever refresh.
-fn reset(conn: &Connection, indexer_version: &str) -> Result<()> {
+///
+/// `pub(crate)` rather than private: `cli::reindex` calls this directly to
+/// give `g-mesh reindex` the same wipe a version mismatch triggers
+/// automatically, on demand instead of waiting for a version bump to notice
+/// one is owed. Both callers hand it a connection and both then owe it a
+/// fresh walk - `ensure_current` via the daemon's own cold-start path,
+/// `cli::reindex` by calling `daemon::bulk_index::run` itself.
+pub(crate) fn reset(conn: &Connection, indexer_version: &str) -> Result<()> {
     wipe(conn)?;
     apply(conn)?;
     record_version(conn, indexer_version)
