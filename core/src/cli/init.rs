@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::cli::stop;
+use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::plugin;
@@ -81,22 +81,31 @@ pub struct Outcome {
     /// `None` when the project was already fully walked and the bulk index
     /// was skipped rather than repeated.
     pub summary: Option<BulkIndexSummary>,
+    /// The `--agent` targets that were requested, carried through so
+    /// [`render`] knows which of `agent_instructions`'s fields to report on.
+    /// Empty means `--agent` was not used at all, in which case `render`
+    /// prints nothing extra - `init`'s behavior is unchanged when the flag is
+    /// unused.
+    pub agents: Vec<AgentTarget>,
+    pub agent_instructions: agent_instructions::Outcome,
 }
 
 /// Bootstraps the project the current directory belongs to.
-pub fn run() -> Result<()> {
+pub fn run(agents: &[AgentTarget]) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
-    let outcome = init(&cwd)?;
+    let outcome = init(&cwd, agents)?;
     print!("{}", render(&outcome, &cwd));
     Ok(())
 }
 
 /// Sets `project_root`'s g-mesh state up: its state directory, a default
-/// `config.toml` if it does not already have one, and a fully walked index.
+/// `config.toml` if it does not already have one, a fully walked index, and,
+/// when `agents` is non-empty, the project-instruction files named in it (see
+/// [`agent_instructions::apply`]).
 ///
 /// Split out from [`run`] so it can be exercised against a temporary project
 /// root without taking over the process's real cwd.
-pub fn init(project_root: &Path) -> Result<Outcome> {
+pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     let stop_outcome = stop::stop(project_root)?;
 
     let state_dir = connection::project_dir(project_root)
@@ -133,12 +142,17 @@ pub fn init(project_root: &Path) -> Result<Outcome> {
         Some(summary)
     };
 
+    let agent_instructions_outcome = agent_instructions::apply(project_root, agents)
+        .context("failed to set up agent instruction files")?;
+
     Ok(Outcome {
         project_id,
         state_dir,
         daemon_was_running: stop_outcome.stopped_anything(),
         config_written,
         summary,
+        agents: agents.to_vec(),
+        agent_instructions: agent_instructions_outcome,
     })
 }
 
@@ -178,6 +192,34 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
             let _ = writeln!(out, "  index:      already fully indexed - nothing to do");
         }
     }
+    if !outcome.agents.is_empty() {
+        if outcome.agent_instructions.agents_md_written {
+            let _ = writeln!(out, "  AGENTS.md:  wrote the g-mesh code-search snippet");
+        } else {
+            let _ = writeln!(out, "  AGENTS.md:  already had the g-mesh snippet - left untouched");
+        }
+        for agent in &outcome.agents {
+            match agent {
+                AgentTarget::AgentsMd => {}
+                AgentTarget::Claude => {
+                    if outcome.agent_instructions.claude_md_written {
+                        let _ = writeln!(out, "  CLAUDE.md:  wrote the @AGENTS.md bridge line");
+                    } else {
+                        let _ =
+                            writeln!(out, "  CLAUDE.md:  already bridges to AGENTS.md - left untouched");
+                    }
+                }
+                AgentTarget::Gemini => {
+                    if outcome.agent_instructions.gemini_md_written {
+                        let _ = writeln!(out, "  GEMINI.md:  wrote the @AGENTS.md bridge line");
+                    } else {
+                        let _ =
+                            writeln!(out, "  GEMINI.md:  already bridges to AGENTS.md - left untouched");
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -199,6 +241,8 @@ mod tests {
                 linked_imports: 2,
                 linked_symbols: 1,
             }),
+            agents: Vec::new(),
+            agent_instructions: agent_instructions::Outcome::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -217,6 +261,8 @@ mod tests {
             daemon_was_running: false,
             config_written: false,
             summary: None,
+            agents: Vec::new(),
+            agent_instructions: agent_instructions::Outcome::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -233,10 +279,85 @@ mod tests {
             daemon_was_running: true,
             config_written: false,
             summary: Some(BulkIndexSummary::default()),
+            agents: Vec::new(),
+            agent_instructions: agent_instructions::Outcome::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
         assert!(rendered.contains("stopped so init could rebuild safely"), "{rendered}");
+    }
+
+    /// `--agent` unused (empty list) must print nothing extra - `init`'s
+    /// behavior is unchanged from before this feature existed.
+    #[test]
+    fn no_agents_requested_prints_nothing_about_agent_instructions() {
+        let outcome = Outcome {
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            daemon_was_running: false,
+            config_written: false,
+            summary: None,
+            agents: Vec::new(),
+            agent_instructions: agent_instructions::Outcome::default(),
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(!rendered.contains("AGENTS.md"), "{rendered}");
+        assert!(!rendered.contains("CLAUDE.md"), "{rendered}");
+        assert!(!rendered.contains("GEMINI.md"), "{rendered}");
+    }
+
+    /// Requested agents whose files were freshly written are reported as
+    /// written, one line per file actually touched.
+    #[test]
+    fn requested_agents_that_were_written_are_reported() {
+        let outcome = Outcome {
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            daemon_was_running: false,
+            config_written: false,
+            summary: None,
+            agents: vec![AgentTarget::Claude, AgentTarget::Gemini],
+            agent_instructions: agent_instructions::Outcome {
+                agents_md_written: true,
+                claude_md_written: true,
+                gemini_md_written: true,
+            },
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(rendered.contains("AGENTS.md:  wrote the g-mesh code-search snippet"), "{rendered}");
+        assert!(rendered.contains("CLAUDE.md:  wrote the @AGENTS.md bridge line"), "{rendered}");
+        assert!(rendered.contains("GEMINI.md:  wrote the @AGENTS.md bridge line"), "{rendered}");
+    }
+
+    /// A second `init --agent claude` against an already-set-up project
+    /// reports that everything was already present, not a fresh write.
+    #[test]
+    fn requested_agents_already_present_are_reported_as_left_untouched() {
+        let outcome = Outcome {
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            daemon_was_running: false,
+            config_written: false,
+            summary: None,
+            agents: vec![AgentTarget::Claude],
+            agent_instructions: agent_instructions::Outcome::default(),
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(
+            rendered.contains("AGENTS.md:  already had the g-mesh snippet - left untouched"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("CLAUDE.md:  already bridges to AGENTS.md - left untouched"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("GEMINI.md"), "Gemini was never requested: {rendered}");
     }
 }
