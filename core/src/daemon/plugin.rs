@@ -38,6 +38,7 @@ use crate::protocol::handshake;
 use crate::protocol::types::RequestId;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::apply::apply_file_change as apply_file_change_diff;
+use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Overrides where the plugin's compiled entry point lives. Real installs
 /// never need this - the default already resolves to the bundled plugin -
@@ -430,6 +431,39 @@ impl PluginProcess {
             self.send_one(conn, &file_path)?;
             self.remove_pending(&file_path);
         }
+    }
+
+    /// Synchronous per-file staleness check plus reindex-if-needed, per
+    /// `watcher::staleness::ensure_fresh` - see
+    /// `daemon::lifecycle::PluginSupervisor::ensure_fresh`'s doc for why this
+    /// exists and what gap it closes.
+    ///
+    /// The mtime/hash comparison (`watcher::staleness::is_stale`) runs
+    /// without this process's `state` lock at all - the overwhelmingly common
+    /// case (nothing changed) must not queue behind a live reparse it has
+    /// nothing to do with, matching the whole point of `watcher::staleness`'s
+    /// two-tier design. Only a real mismatch takes the lock, for exactly the
+    /// one round trip a live watcher event would also pay for.
+    ///
+    /// Unlike [`Self::apply_file_change`], this does not go through the
+    /// pending-queue crash-recovery path: a plugin that has crashed since the
+    /// last round trip surfaces as an ordinary `Err` here, which the MCP
+    /// layer logs and treats as best-effort (see `mcp::GMeshMcpServer::
+    /// ensure_file_fresh`) rather than something worth relaunching a process
+    /// over on a mere freshness check.
+    pub fn ensure_fresh(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<StalenessOutcome> {
+        {
+            let guard = conn.lock().unwrap();
+            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
+                return Ok(StalenessOutcome::AlreadyFresh);
+            }
+        }
+
+        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let mut state = self.state.lock().unwrap();
+        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
+        let mut conn = conn.lock().unwrap();
+        staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id)
     }
 
     fn send_one(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<()> {

@@ -2,14 +2,28 @@
 //!
 //! The filesystem watcher (`watcher::mod`, `watcher::debounce`,
 //! `watcher::burst`) is the normal path that keeps the index up to date, but
-//! it can miss events entirely on some filesystems (network drives, WSL's
-//! polling fallback, etc). This module is the safety net: before a future
-//! MCP tool handler answers a query that touches a given file, it should
-//! call [`ensure_fresh`], which compares the file's on-disk state against
+//! it can miss changes entirely - not just on some filesystems (network
+//! drives, WSL's polling fallback), but on *any* filesystem whenever the
+//! change happens while this project's daemon is not running at all: nothing
+//! re-walks an already-current index on restart (see
+//! `storage::schema::ensure_current`), and a watcher that has not started yet
+//! cannot have seen an event that occurred before it did. This module is the
+//! safety net: before a handler answers a query that touches a given file, it
+//! calls [`ensure_fresh`], which compares the file's on-disk state against
 //! what's recorded in the `indexed_files` table and, on a mismatch,
 //! synchronously reindexes it via `watcher::apply::apply_file_change` before
 //! the caller proceeds - so no tool response is ever silently based on
 //! stale data.
+//!
+//! Wired into `mcp::GMeshMcpServer` via
+//! `daemon::lifecycle::PluginSupervisor::ensure_fresh` /
+//! `daemon::plugin::PluginProcess::ensure_fresh`, for the three tools that
+//! anchor a query on one specific file (`find_definition`,
+//! `get_file_outline`, `get_dependencies`). See that module's doc comment for
+//! why this is a materially different gap from the one
+//! `daemon::indexing_status`'s "Why the incremental-edit watcher path does
+//! not re-arm this" section reasons about, and for why the other four tools
+//! (symbol-anchored, not file-anchored) are deliberately left out.
 //!
 //! # Two-tier mtime/hash design
 //!
@@ -102,6 +116,68 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
     file_path: &str,
     request_id: RequestId,
 ) -> Result<StalenessOutcome> {
+    match decide(conn, project_root, file_path)? {
+        Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
+        Decision::ContentUnchanged { mtime, hash } => {
+            // Content is unchanged (e.g. a touch, or a byte-identical
+            // rewrite) - just refresh the mtime baseline so the next check
+            // hits the fast path again. No reindex.
+            upsert_indexed_file(conn, file_path, mtime, &hash)?;
+            Ok(StalenessOutcome::MtimeMismatchContentUnchanged)
+        }
+        Decision::NeedsReindex { mtime, hash, had_prior_record } => {
+            // Genuinely stale (or never indexed) - synchronously reindex
+            // before recording the new baseline.
+            apply_file_change(reader, writer, conn, file_path, request_id)
+                .context("failed to synchronously reindex stale file")?;
+            upsert_indexed_file(conn, file_path, mtime, &hash)?;
+            Ok(if had_prior_record {
+                StalenessOutcome::ReindexedViaHashMismatch
+            } else {
+                StalenessOutcome::ReindexedNoPriorRecord
+            })
+        }
+    }
+}
+
+/// Whether [`ensure_fresh`] would need to reindex `file_path` right now -
+/// the plugin-free half of its decision, for a caller that guards the actual
+/// reindex with a lock (e.g. `daemon::plugin::PluginProcess`'s stdin/stdout
+/// pair) it does not want to take for the overwhelmingly common case of
+/// nothing having changed. Pays only for [`decide`]'s stat-plus-maybe-hash
+/// cost, never a reader/writer round trip.
+///
+/// A `ContentUnchanged` decision is resolved here exactly as `ensure_fresh`
+/// resolves it - the mtime baseline is refreshed before returning - so a
+/// caller that gets `false` back needs to do nothing further, same guarantee
+/// `ensure_fresh` gives for that outcome.
+pub fn is_stale(conn: &Connection, project_root: &Path, file_path: &str) -> Result<bool> {
+    match decide(conn, project_root, file_path)? {
+        Decision::AlreadyFresh => Ok(false),
+        Decision::ContentUnchanged { mtime, hash } => {
+            upsert_indexed_file(conn, file_path, mtime, &hash)?;
+            Ok(false)
+        }
+        Decision::NeedsReindex { .. } => Ok(true),
+    }
+}
+
+/// The plugin-free half of [`ensure_fresh`]'s two-tier mtime/hash decision -
+/// see the module doc for the full procedure. Shared by `ensure_fresh`
+/// (which acts on it, reindexing when it says to) and [`is_stale`] (which
+/// only needs to know whether it would).
+enum Decision {
+    /// Recorded mtime matched current on-disk mtime.
+    AlreadyFresh,
+    /// mtime differed but content didn't - the caller still owes the
+    /// `indexed_files` table a refreshed mtime baseline.
+    ContentUnchanged { mtime: i64, hash: String },
+    /// Genuinely stale, or never indexed - the caller owes a reindex, then
+    /// this mtime/hash as the new baseline.
+    NeedsReindex { mtime: i64, hash: String, had_prior_record: bool },
+}
+
+fn decide(conn: &Connection, project_root: &Path, file_path: &str) -> Result<Decision> {
     let full_path = project_root.join(file_path);
     let metadata = fs::metadata(&full_path)
         .with_context(|| format!("failed to stat {}", full_path.display()))?;
@@ -112,8 +188,8 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
 
     if let Some(record) = &prior {
         if record.mtime_millis == current_mtime {
-            // Fast path: no file read, no reindex.
-            return Ok(StalenessOutcome::AlreadyFresh);
+            // Fast path: no file read.
+            return Ok(Decision::AlreadyFresh);
         }
     }
 
@@ -124,25 +200,11 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
 
     if let Some(record) = &prior {
         if record.content_hash == current_hash {
-            // Content is unchanged (e.g. a touch, or a byte-identical
-            // rewrite) - just refresh the mtime baseline so the next check
-            // hits the fast path again. No reindex.
-            upsert_indexed_file(conn, file_path, current_mtime, &current_hash)?;
-            return Ok(StalenessOutcome::MtimeMismatchContentUnchanged);
+            return Ok(Decision::ContentUnchanged { mtime: current_mtime, hash: current_hash });
         }
     }
 
-    // Genuinely stale (or never indexed) - synchronously reindex before
-    // recording the new baseline.
-    apply_file_change(reader, writer, conn, file_path, request_id)
-        .context("failed to synchronously reindex stale file")?;
-    upsert_indexed_file(conn, file_path, current_mtime, &current_hash)?;
-
-    Ok(if prior.is_some() {
-        StalenessOutcome::ReindexedViaHashMismatch
-    } else {
-        StalenessOutcome::ReindexedNoPriorRecord
-    })
+    Ok(Decision::NeedsReindex { mtime: current_mtime, hash: current_hash, had_prior_record: prior.is_some() })
 }
 
 struct IndexedFileRecord {

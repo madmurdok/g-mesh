@@ -291,9 +291,19 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
 }
 
 /// The other half of that guarantee: the walk is a *cold start*, not a
-/// startup routine. A file added while no daemon was running stays unindexed
-/// until something tells the daemon about it - which is exactly what proves
-/// the second start did not walk the project again.
+/// startup routine - a restart against an already-indexed project must not
+/// re-crawl the whole tree. Proven here by a file added while no daemon was
+/// running that nothing ever asks about (`src/third.ts`): if the second start
+/// had walked the project again, it would be in the index; it must not be.
+///
+/// `src/second.ts`, also added while no daemon was running, *is* asked about
+/// (via `get_file_outline`) and *is* expected to come back - not because the
+/// restart walked the project, but because `watcher::staleness::ensure_fresh`
+/// (task 117) now runs a per-file mtime/hash check before that one handler
+/// answers and synchronously reindexes just the file the query named. That is
+/// what keeps this consistent with the guarantee this test is really about:
+/// `src/third.ts` proves no bulk walk happened; `src/second.ts` proves a
+/// query-time, single-file catch-up is not the same thing as one.
 #[test]
 fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     let project = Project::new();
@@ -312,9 +322,13 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     // dead one's file, and the session below could race the real startup.
     std::fs::remove_file(&pid_file).expect("failed to clear the stale pid file");
 
-    // Written with nothing watching and nothing serving: only a second full
-    // walk could get it into the index.
+    // Both written with nothing watching and nothing serving: only a second
+    // full walk could get either into the index on its own. `second.ts` is
+    // queried below and must be caught by the per-file staleness check;
+    // `third.ts` is never queried by anything and must stay uncaught by it -
+    // that asymmetry is what tells a full re-walk apart from one.
     project.seed("src/second.ts", "export function second(): number {\n  return 2;\n}\n");
+    project.seed("src/third.ts", "export function third(): number {\n  return 3;\n}\n");
 
     let mut second_daemon = spawn_daemon(project.root());
     wait_for("the second daemon to start listening", || pid_file.exists());
@@ -332,10 +346,21 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     );
     assert_eq!(symbol_names(&responses[0]), vec!["first".to_string()]);
     assert_eq!(
-        responses[1]["result"]["isError"], true,
-        "an already-indexed project must not be walked again on restart: {}",
+        responses[1]["result"]["isError"], false,
+        "a file added while no daemon was running must still be caught by the query-time \
+         staleness check once something asks about it: {}",
         responses[1]
     );
+    assert_eq!(symbol_names(&responses[1]), vec!["second".to_string()]);
+
+    // The file nothing asked about must still be missing - the query-time
+    // check above reindexed exactly the one file it was asked about, not the
+    // project.
+    let db_path = project_dir(project.root()).unwrap().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let third_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = 'third'", [], |row| row.get(0)).unwrap();
+    assert_eq!(third_count, 0, "a file nothing queried must not appear, or the restart walked the project after all");
 
     let _ = second_daemon.kill();
     let _ = second_daemon.wait();
