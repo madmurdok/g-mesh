@@ -20,6 +20,7 @@
 //! command at a time.
 
 pub mod clean;
+pub mod config_wizard;
 pub mod init;
 pub mod reindex;
 pub mod status;
@@ -115,7 +116,7 @@ pub fn run() -> Result<()> {
 fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Init => init::run(),
-        Command::Config { .. } => not_implemented("config"),
+        Command::Config { global } => config_wizard::run(global),
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
@@ -272,9 +273,6 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_fail_rather_than_pretending_to_work() {
-        let err = dispatch(Command::Config { global: false }).expect_err("config is not built yet");
-        assert!(err.to_string().contains("not implemented"), "unexpected message: {err}");
-
         let err = dispatch(Command::Plugins { command: PluginsCommand::List })
             .expect_err("plugins list is not built yet");
         assert!(err.to_string().contains("not implemented"), "unexpected message: {err}");
