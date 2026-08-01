@@ -254,10 +254,13 @@ pub fn run(root: &Path) -> Result<()> {
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
 
-    // Both idle timers are resolved once, here, and handed to everything that
-    // has to honor them - see `daemon::lifecycle` for what each one governs
-    // and where the numbers will come from once the TOML config lands.
-    let timeouts = IdleTimeouts::from_env();
+    // Both idle timers are resolved once, here, from the project's
+    // config.toml (or its documented defaults, for a project with none), and
+    // handed to everything that has to honor them - see `daemon::lifecycle`
+    // for what each one governs.
+    let project_config = crate::config::read_project_config(root)
+        .context("failed to read the project's config.toml")?;
+    let timeouts = IdleTimeouts::from_config(&project_config);
 
     // A protocol mismatch (or the plugin failing to start at all) is a hard
     // daemon-startup failure, matching handshake::verify's philosophy - there

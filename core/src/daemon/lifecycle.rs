@@ -22,12 +22,16 @@
 //!
 //! # Where the numbers come from
 //!
-//! From [`IdleTimeouts::from_env`], which today means "the documented defaults,
-//! unless a test overrides them". The real `plugin.idleTimeoutMinutes` /
-//! `daemon.coreIdleTimeoutHours` settings live in the per-project TOML config
-//! that is still a separate ticket; when it lands, the only thing that has to
-//! change is where this struct is built from - every consumer below already
-//! takes the timeouts as data rather than reading them itself.
+//! From [`IdleTimeouts::from_config`]: a project's `config.toml`
+//! (`config::read_project_config`) supplies `plugin.idleTimeoutMinutes` /
+//! `daemon.coreIdleTimeoutHours`, or this module's own documented defaults if
+//! the project has no config.toml - `config::PluginConfig` /
+//! `config::DaemonConfig` default to the same 60 / 24 this module does, so
+//! the two can never quietly disagree. The `G_MESH_*_IDLE_MS` env overrides
+//! above config for the same reason they always have: a test can drive the
+//! real timer directly without a config.toml, and real installs never set
+//! them. Every consumer below still takes the resolved timeouts as data
+//! rather than reading either source itself.
 //!
 //! # Lock order
 //!
@@ -48,6 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::config::ProjectConfig;
 use crate::daemon::plugin::PluginProcess;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -108,18 +113,29 @@ impl Default for IdleTimeouts {
 }
 
 impl IdleTimeouts {
-    /// The documented defaults, unless the test-only environment overrides
-    /// name something else.
-    pub fn from_env() -> Self {
+    /// `config`'s timeouts (a project's `config.toml`, or
+    /// `ProjectConfig::default()` for a project with none), unless the
+    /// test-only environment overrides name something else.
+    ///
+    /// `config.plugin.idle_timeout_minutes` / `config.daemon
+    /// .core_idle_timeout_hours` default to 60 / 24 - the same values
+    /// [`DEFAULT_PLUGIN_IDLE`] / [`DEFAULT_CORE_IDLE`] hold here - so a
+    /// project with no config.toml resolves to exactly what this module
+    /// produced before config existed.
+    pub fn from_config(config: &ProjectConfig) -> Self {
+        let plugin_default =
+            Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
+        let core_default =
+            Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
             plugin: parse_timeout(
                 std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
-                DEFAULT_PLUGIN_IDLE,
+                plugin_default,
                 PLUGIN_IDLE_ENV,
             ),
             core: parse_timeout(
                 std::env::var(CORE_IDLE_ENV).ok().as_deref(),
-                DEFAULT_CORE_IDLE,
+                core_default,
                 CORE_IDLE_ENV,
             ),
         }
@@ -580,6 +596,81 @@ mod tests {
     #[test]
     fn an_unset_timeout_reads_as_its_documented_default() {
         assert_eq!(parse_timeout(None, DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
+    }
+
+    /// Guards every test below that touches [`PLUGIN_IDLE_ENV`] /
+    /// [`CORE_IDLE_ENV`]: they are process-wide state, and `cargo test` runs
+    /// this module's tests on multiple threads by default, so two of them
+    /// setting/clearing the same variable at once would be a genuine race,
+    /// not just noise. Held for the lifetime of each test that needs it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A project with no config.toml (`ProjectConfig::default()`) must
+    /// resolve to exactly the pre-config defaults - task #38's behavior,
+    /// unchanged now that config is wired in.
+    #[test]
+    fn a_default_config_resolves_to_the_documented_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(PLUGIN_IDLE_ENV);
+        std::env::remove_var(CORE_IDLE_ENV);
+
+        let resolved = IdleTimeouts::from_config(&ProjectConfig::default());
+        assert_eq!(resolved, IdleTimeouts::default());
+        assert_eq!(resolved.plugin, Some(DEFAULT_PLUGIN_IDLE));
+        assert_eq!(resolved.core, Some(DEFAULT_CORE_IDLE));
+    }
+
+    /// The acceptance criterion at the unit level: a config.toml with a
+    /// shortened `plugin.idleTimeoutMinutes` actually produces a shortened
+    /// plugin timer, not the hardcoded default.
+    #[test]
+    fn a_configured_plugin_idle_timeout_overrides_the_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(PLUGIN_IDLE_ENV);
+        std::env::remove_var(CORE_IDLE_ENV);
+
+        let config = ProjectConfig {
+            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5 },
+            ..ProjectConfig::default()
+        };
+        let resolved = IdleTimeouts::from_config(&config);
+        assert_eq!(resolved.plugin, Some(Duration::from_secs(5 * 60)));
+        // The core timeout is untouched by a config that only sets [plugin].
+        assert_eq!(resolved.core, Some(DEFAULT_CORE_IDLE));
+    }
+
+    /// Same claim, for `daemon.coreIdleTimeoutHours`.
+    #[test]
+    fn a_configured_core_idle_timeout_overrides_the_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(PLUGIN_IDLE_ENV);
+        std::env::remove_var(CORE_IDLE_ENV);
+
+        let config = ProjectConfig {
+            daemon: crate::config::DaemonConfig { core_idle_timeout_hours: 2 },
+            ..ProjectConfig::default()
+        };
+        let resolved = IdleTimeouts::from_config(&config);
+        assert_eq!(resolved.core, Some(Duration::from_secs(2 * 60 * 60)));
+        assert_eq!(resolved.plugin, Some(DEFAULT_PLUGIN_IDLE));
+    }
+
+    /// The test-only env override still wins over a configured value - the
+    /// same precedence it always had over the hardcoded default, now proven
+    /// against a config that disagrees with it too.
+    #[test]
+    fn the_env_override_still_wins_over_a_configured_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(PLUGIN_IDLE_ENV, "250");
+
+        let config = ProjectConfig {
+            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5 },
+            ..ProjectConfig::default()
+        };
+        let resolved = IdleTimeouts::from_config(&config);
+        assert_eq!(resolved.plugin, Some(Duration::from_millis(250)));
+
+        std::env::remove_var(PLUGIN_IDLE_ENV);
     }
 
     #[test]
