@@ -7,3 +7,4 @@
 //! maintains and reads the facts that decision is made from.
 
 pub mod last_used;
+pub mod warning;

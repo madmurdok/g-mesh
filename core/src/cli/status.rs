@@ -50,6 +50,7 @@ use rusqlite::{Connection, OpenFlags};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::gc::last_used::{self, LastUsed};
+use crate::gc::warning;
 use crate::storage::connection::project_dir;
 use crate::watcher::staleness::mtime_millis;
 
@@ -181,9 +182,17 @@ pub struct Report {
 }
 
 /// Reports on the project the current directory belongs to.
+///
+/// Also prints the GC idle-project warning (`gc::warning`) after the report,
+/// if `cleanup.enabled` and any project is past `cleanup.idleThresholdDays` -
+/// `status` is a command a human runs and reads at a terminal, exactly the
+/// audience that warning is for. It is never printed here for `mcp-shim` or
+/// `daemon`, whose stdout is protocol traffic read by an MCP client, not a
+/// person.
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     print!("{}", render(&collect(&cwd)?));
+    warning::maybe_print_stale_projects_warning()?;
     Ok(())
 }
 
