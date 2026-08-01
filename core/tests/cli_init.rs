@@ -65,6 +65,21 @@ impl Project {
             .expect("failed to run `g-mesh init`")
     }
 
+    fn init_with_agents(&self, agents: &str) -> Output {
+        Command::new(BIN)
+            .arg("init")
+            .arg("--agent")
+            .arg(agents)
+            .current_dir(self.root())
+            .output()
+            .expect("failed to run `g-mesh init --agent`")
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.root().join(rel))
+            .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"))
+    }
+
     fn status(&self) -> String {
         let output = Command::new(BIN)
             .arg("status")
@@ -163,4 +178,58 @@ fn init_run_twice_leaves_an_existing_config_alone_and_skips_the_repeat_walk() {
 
     let contents = std::fs::read_to_string(project.config_path()).expect("failed to read config.toml");
     assert_eq!(contents, customized, "a second init must not overwrite a hand-edited config");
+}
+
+/// `init --agent claude` against a fresh project writes both AGENTS.md (the
+/// shared cross-tool snippet) and a CLAUDE.md that bridges to it via
+/// Claude Code's `@path` import syntax. A second run must not touch either
+/// file again.
+#[test]
+fn init_with_agent_claude_writes_agents_md_and_a_claude_md_bridge_and_is_idempotent() {
+    let project = Project::new();
+
+    let first = project.init_with_agents("claude");
+    assert!(
+        first.status.success(),
+        "`g-mesh init --agent claude` failed with {}: {}",
+        first.status,
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout = String::from_utf8(first.stdout).expect("init output is not valid UTF-8");
+    assert_contains(&stdout, "AGENTS.md:  wrote the g-mesh code-search snippet");
+    assert_contains(&stdout, "CLAUDE.md:  wrote the @AGENTS.md bridge line");
+
+    let agents_md = project.read("AGENTS.md");
+    assert!(agents_md.contains("Code search (TypeScript/JavaScript projects)"), "{agents_md}");
+    let claude_md = project.read("CLAUDE.md");
+    assert!(claude_md.starts_with("@AGENTS.md"), "{claude_md}");
+
+    // Running it again must be a no-op on both files.
+    let second = project.init_with_agents("claude");
+    assert!(
+        second.status.success(),
+        "second `g-mesh init --agent claude` failed with {}: {}",
+        second.status,
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8(second.stdout).expect("init output is not valid UTF-8");
+    assert_contains(&stdout, "AGENTS.md:  already had the g-mesh snippet - left untouched");
+    assert_contains(&stdout, "CLAUDE.md:  already bridges to AGENTS.md - left untouched");
+
+    assert_eq!(project.read("AGENTS.md"), agents_md, "a second init must not change AGENTS.md");
+    assert_eq!(project.read("CLAUDE.md"), claude_md, "a second init must not change CLAUDE.md");
+}
+
+/// `init` without `--agent` must not write any of these files at all - the
+/// flag's absence means exactly what it always meant.
+#[test]
+fn init_without_agent_writes_no_agent_instruction_files() {
+    let project = Project::new();
+
+    let output = project.init();
+    assert!(output.status.success(), "`g-mesh init` failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert!(!project.root().join("AGENTS.md").exists());
+    assert!(!project.root().join("CLAUDE.md").exists());
+    assert!(!project.root().join("GEMINI.md").exists());
 }

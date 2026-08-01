@@ -19,6 +19,7 @@
 //! before it grew a command at a time; `dispatch` below no longer has a
 //! `not_implemented` fallback to fall into.
 
+pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;
 pub mod init;
@@ -30,7 +31,7 @@ pub mod stop;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{daemon, shim};
 
@@ -45,7 +46,14 @@ pub struct Cli {
 pub enum Command {
     /// Set this project's g-mesh state up with default settings (optional -
     /// the zero-config path works without it).
-    Init,
+    Init {
+        /// Auto-install project-instruction files for the named coding
+        /// agent(s) - e.g. `--agent claude,gemini`. Repeatable and
+        /// comma-delimited; omitted means none are written, matching
+        /// `init`'s existing no-flags behavior exactly.
+        #[arg(long, value_delimiter = ',')]
+        agent: Vec<AgentTarget>,
+    },
     /// Edit g-mesh settings interactively.
     Config {
         /// Edit the global `~/.g-mesh/config.toml` instead of this project's
@@ -87,6 +95,26 @@ pub enum PluginsCommand {
     List,
 }
 
+/// A coding agent/tool `init --agent` can auto-install project-instruction
+/// files for.
+///
+/// `AgentsMd` alone writes only `AGENTS.md` - useful for the many tools
+/// (Cursor, Windsurf, GitHub Copilot, OpenAI Codex CLI, Kimi Code CLI, Aider,
+/// ...) that read it natively and need nothing else. `Claude` and `Gemini`
+/// each additionally bridge `CLAUDE.md`/`GEMINI.md` to it, since neither tool
+/// reads `AGENTS.md` on its own - see `cli::agent_instructions` for why one
+/// shared file plus small bridges is the whole design.
+///
+/// clap's `ValueEnum` derive kebab-cases variant names by default, so
+/// `AgentsMd` parses as `--agent agents-md` - confirmed by
+/// `agent_flag_kebab_cases_agents_md` below rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentTarget {
+    AgentsMd,
+    Claude,
+    Gemini,
+}
+
 /// `clean`'s target is one positional argument because the three documented
 /// forms - a project id, `expired`, `all` - are alternatives for the same
 /// slot, not independent flags. Telling them apart is the `clean` command's
@@ -116,7 +144,7 @@ pub fn run() -> Result<()> {
 /// taking over the process's real argv.
 fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Init => init::run(),
+        Command::Init { agent } => init::run(&agent),
         Command::Config { global } => config_wizard::run(global),
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
@@ -224,6 +252,49 @@ mod tests {
             assert!(parse(&[name]).is_ok(), "`g-mesh {name}` must parse");
             assert!(parse(&[name, "extra"]).is_err(), "`g-mesh {name}` takes no arguments");
         }
+    }
+
+    /// `init` without `--agent` at all - the existing, unchanged default -
+    /// parses to an empty target list.
+    #[test]
+    fn init_without_agent_parses_to_an_empty_target_list() {
+        assert!(matches!(command_of(&["init"]), Command::Init { agent } if agent.is_empty()));
+    }
+
+    /// clap's `ValueEnum` derive kebab-cases variant names by default, so
+    /// `AgentsMd` must parse as `agents-md` - the exact thing
+    /// `AgentTarget`'s doc comment claims, checked here rather than assumed.
+    #[test]
+    fn agent_flag_kebab_cases_agents_md() {
+        match command_of(&["init", "--agent", "agents-md"]) {
+            Command::Init { agent } => assert_eq!(agent, vec![AgentTarget::AgentsMd]),
+            other => panic!("expected the init subcommand, got {other:?}"),
+        }
+    }
+
+    /// `--agent` is repeatable and comma-delimited, and both forms land in
+    /// the same list in the order given.
+    #[test]
+    fn agent_flag_accepts_comma_delimited_and_repeated_values() {
+        match command_of(&["init", "--agent", "claude,gemini"]) {
+            Command::Init { agent } => {
+                assert_eq!(agent, vec![AgentTarget::Claude, AgentTarget::Gemini])
+            }
+            other => panic!("expected the init subcommand, got {other:?}"),
+        }
+
+        match command_of(&["init", "--agent", "claude", "--agent", "gemini"]) {
+            Command::Init { agent } => {
+                assert_eq!(agent, vec![AgentTarget::Claude, AgentTarget::Gemini])
+            }
+            other => panic!("expected the init subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_agent_value_is_a_clap_error() {
+        let err = parse(&["init", "--agent", "chatgpt"]).expect_err("chatgpt is not a supported target");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]
