@@ -49,6 +49,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::plugin::PluginProcess;
+use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
 /// the pauses inside one working session (an agent that goes quiet for a
@@ -325,6 +326,53 @@ impl PluginSupervisor {
             }
         }
         Ok(replayed)
+    }
+
+    /// Synchronously brings `file_path` up to date if it has changed since it
+    /// was last indexed, per `watcher::staleness::ensure_fresh` - the
+    /// query-time safety net for a change the watcher never applied at all,
+    /// as opposed to one still in flight.
+    ///
+    /// This is a genuinely different gap from the one
+    /// `daemon::indexing_status`'s "Why the incremental-edit watcher path
+    /// does not re-arm this" section (task 111) reasons about. That argument
+    /// - a query blocks on the same mutex a live `apply_file_change` commit
+    /// holds, so it can only ever read stale-but-consistent data, never torn
+    /// data - is about a change the watcher *has already seen* and is in the
+    /// middle of applying. It says nothing about a change the watcher never
+    /// saw happen at all: an edit made while this project's daemon was not
+    /// running (nothing re-walks an already-current index on restart - see
+    /// `storage::schema::ensure_current`), or on a filesystem whose watcher
+    /// backend silently drops events. No mutex is held in that case because
+    /// nothing is applying anything - the staleness would persist forever,
+    /// not just for a narrow, self-correcting window - which is the real,
+    /// separate gap task 111 flagged as worth its own task rather than
+    /// folding into `IndexingStatus`, and this method is that task's wiring.
+    ///
+    /// Wakes the plugin exactly like [`replay_pending`](Self::replay_pending)
+    /// - spawning it if it is asleep - but only when the mtime/hash
+    /// comparison actually calls for a reindex; the common case (nothing
+    /// changed) resolves off the `indexed_files` table alone and never
+    /// touches the plugin lock, matching the two-tier design
+    /// `watcher::staleness` itself documents.
+    pub fn ensure_fresh(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<StalenessOutcome> {
+        {
+            let guard = conn.lock().unwrap();
+            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
+                return Ok(StalenessOutcome::AlreadyFresh);
+            }
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        if inner.process.is_none() {
+            let process = PluginProcess::spawn(&self.project_root)
+                .context("failed to wake the JS/TS plugin for a query-time staleness check")?;
+            write_pid_file(&self.pid_file, process.pid());
+            inner.process = Some(process);
+        }
+        self.touch();
+        let process = inner.process.as_ref().expect("just spawned or already running");
+        process.ensure_fresh(conn, file_path)
     }
 
     /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work.

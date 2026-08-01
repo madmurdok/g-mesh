@@ -198,6 +198,48 @@ impl GMeshMcpServer {
         }
     }
 
+    /// Query-time staleness safety net (`watcher::staleness::ensure_fresh`,
+    /// wired via `daemon::lifecycle::PluginSupervisor::ensure_fresh`) for the
+    /// three tools that anchor their answer on one specific file:
+    /// `find_definition`, `get_file_outline`, `get_dependencies`. Closes a
+    /// gap [`replay_queued_changes`](Self::replay_queued_changes) does not:
+    /// that one catches up on changes the watcher *did* see while the plugin
+    /// slept, but a change the watcher never saw at all - because this
+    /// project's daemon was not running when it happened, or because the
+    /// watcher backend missed the filesystem event outright - never enters
+    /// that queue in the first place. See `watcher::staleness`'s module doc
+    /// for the full mtime/hash procedure this runs, and
+    /// `PluginSupervisor::ensure_fresh`'s doc for why this is a different gap
+    /// from the one `daemon::indexing_status` documents leaving open.
+    ///
+    /// Not called for the four symbol-anchored tools (`find_references`,
+    /// `find_callers`, `find_callees`, `find_implementations`): resolving
+    /// which file(s) their answer even touches requires running the query
+    /// itself, so there is no single file to check ahead of it without
+    /// paying to read and hash every file the query *might* touch - exactly
+    /// the cost `watcher::staleness`'s own docs rule out.
+    ///
+    /// On the blocking thread pool for the same reason
+    /// [`replay_queued_changes`](Self::replay_queued_changes) is: the rare
+    /// case where this actually reindexes means a synchronous round trip to
+    /// the plugin process. Best-effort like that method too - a failure here
+    /// must not turn an otherwise-answerable query into a tool error, so it
+    /// is logged and the handler proceeds with whatever the index currently
+    /// holds.
+    async fn ensure_file_fresh(&self, file_path: &str) {
+        let plugin = Arc::clone(&self.plugin);
+        let conn = Arc::clone(&self.conn);
+        let owned_path = file_path.to_string();
+        let task_path = owned_path.clone();
+        match tokio::task::spawn_blocking(move || plugin.ensure_fresh(&conn, &task_path)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => eprintln!(
+                "g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}"
+            ),
+            Err(err) => eprintln!("g-mesh daemon: the staleness-check task failed: {err}"),
+        }
+    }
+
     /// `Some(...)` - a finished response the handler must return unchanged -
     /// once the cold-start walk has been given up on; `None` once the index
     /// is complete, whether it already was when this call arrived or it
@@ -270,6 +312,9 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
+        if let Some(file_path) = &params.0.file_path {
+            self.ensure_file_fresh(file_path).await;
+        }
         find_definition::handle(&self.conn, params.0)
     }
 
@@ -328,6 +373,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
+        self.ensure_file_fresh(&params.0.file_path).await;
         get_file_outline::handle(&self.conn, params.0)
     }
 
@@ -341,6 +387,9 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
+        }
+        if let Some(file_path) = &params.0.file_path {
+            self.ensure_file_fresh(file_path).await;
         }
         get_dependencies::handle(&self.conn, params.0)
     }
