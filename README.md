@@ -164,6 +164,29 @@ instruction that suppresses it throws away the one honest quality signal in
 the response — and the measurements above show the expensive part of the tail
 is already gone without it.
 
+**A second, unrelated truncation bug (fixed in 0.13.0):** Claude Code
+truncates an MCP server's `instructions` field at 2KB — a single flat cap on
+that one field, independent of and not shared with each tool's own 2KB
+`description` budget. `GMeshMcpServer::get_info()`'s instructions text had
+grown to 3016 bytes, so the model never saw the back half of it, including
+the single most directly actionable line ("only fall back to grep when you
+specifically suspect a variable-receiver method call was missed, not as a
+routine double-check"). Trimmed to 1804 bytes with the core anti-grep rule
+moved to the front, per Claude Code's own documented advice to put critical
+details near the start of a field that might get cut.
+
+That fix helped, but did not close the gap alone — evidence for the same
+point this section already makes above. A live before/after comparison
+(`g-mesh-bench`, `G_MESH_BENCH_REPS=low`, 8 `task-tracker-mcp` tasks, `gmesh`
+arm): mean turns 3.8 → 3.1 (matching the `gmesh-trusted` arm's 3.1) and
+sessions with a habitual re-grep after a fully-resolved (`resolved: true`,
+`allUnresolved: false`) answer dropped from 4/8 to 1/8 — real progress, but
+not zero. The one remaining case was an ordinary symbol lookup re-checked
+with grep for no signaled reason at all, confirming again that a
+well-written, correctly-sized server instructions field narrows the habit
+but a project-level `CLAUDE.md` instruction (the snippet above) is still
+what actually closes it.
+
 ## Register with an MCP client
 
 **Recommended (Claude Code): register once, globally.** Since the shim reads
