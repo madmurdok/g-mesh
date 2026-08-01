@@ -115,12 +115,22 @@ test("extracts SUPERTYPE_OF, CALLS and IMPORTS edges", () => {
   );
 });
 
-test("every edge is unresolved and attributed to tree-sitter", () => {
+test("an edge onto a declaration of this file is resolved; one onto a placeholder is not", () => {
   const result = extractFile("src/greeter.ts", GREETER_TS);
   assert.ok(result.edges.length > 0);
+  const byId = new Map(result.nodes.map((n) => [n.id, n]));
+
   for (const edge of result.edges) {
     assert.equal(edge.source, "tree-sitter");
-    assert.equal(edge.resolved, false);
+    const target = byId.get(edge.toId)!;
+    // The only non-declaration target here is the unresolvable `./i18n`
+    // module: everything else is declared in this very file, so nothing about
+    // those edges is left for core to confirm.
+    assert.equal(
+      edge.resolved,
+      target.nativeKind !== "external_module",
+      `${edge.kind} -> ${target.qualifiedName}`,
+    );
   }
 });
 
@@ -355,12 +365,14 @@ test("a bare specifier and a dangling relative one keep the old placeholder beha
   }
 });
 
-test("resolution never claims an edge is resolved - that is core's call", () => {
+test("specifier resolution never claims an IMPORTS edge is resolved - that is core's call", () => {
   const result = extractFile("src/index.ts", IMPORTER_TS, {
     resolveSpecifier: resolverOver({ "./db/connection.js": "src/db/connection.ts" }),
   });
 
-  for (const edge of result.edges) {
+  const imports = result.edges.filter((e) => e.kind === "IMPORTS");
+  assert.ok(imports.length > 0);
+  for (const edge of imports) {
     assert.equal(edge.source, "tree-sitter");
     assert.equal(edge.resolved, false, "the target node is still a placeholder until core links it");
   }
@@ -805,4 +817,179 @@ test("parses files larger than the native parser's default read buffer", () => {
 
   assert.equal(result.hasSyntaxErrors, false);
   assert.equal(result.nodes.filter((n) => n.kind === "Function").length, 2000);
+});
+
+// --- lexical scoping -----------------------------------------------------
+//
+// Everything below guards the one thing that makes a same-file edge worth
+// `resolved: true`: a name matched here is matched against the declarations
+// the usage can actually reach. A local of the same name is not one of them,
+// and neither is a class member, which no bare name can address.
+
+/** Every CALLS/REFERENCES edge, as `KIND from -> to`, for whole-result asserts. */
+function usageEdges(result: ExtractResult): string[] {
+  const byId = new Map(result.nodes.map((n) => [n.id, n]));
+  return result.edges
+    .filter((e) => e.kind === "CALLS" || e.kind === "REFERENCES")
+    .map((e) => `${e.kind} ${byId.get(e.fromId)?.qualifiedName} -> ${byId.get(e.toId)?.qualifiedName}`)
+    .sort();
+}
+
+for (const [label, shadow] of [
+  ["a parameter", "export function outer(helper: () => void): void {\n  helper();\n}"],
+  ["a local const", "export function outer(): void {\n  const helper = () => {};\n  helper();\n}"],
+  [
+    "a nested function declaration",
+    "export function outer(): void {\n  function helper(): void {}\n  helper();\n}",
+  ],
+  [
+    "a hoisted `var` declared below the call",
+    "export function outer(): void {\n  helper();\n  var helper = () => {};\n}",
+  ],
+  ["a destructured local", "export function outer(o: any): void {\n  const { a: helper } = o;\n  helper();\n}"],
+  ["a `catch` parameter", "export function outer(): void {\n  try {} catch (helper) { helper(); }\n}"],
+  ["a `for...of` binding", "export function outer(xs: any[]): void {\n  for (const helper of xs) helper();\n}"],
+  ["a callback parameter", "export function outer(xs: any[]): void {\n  xs.forEach((helper) => helper());\n}"],
+] as const) {
+  test(`${label} shadowing a file-level function suppresses the call edge`, () => {
+    const result = extractFile("src/p.ts", `function helper(): void {}\n\n${shadow}\n`);
+    assert.deepEqual(usageEdges(result), [], "the call names the local, and locals are not graph symbols");
+  });
+}
+
+test("shadowing confined to one block leaves a call outside it resolved", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `function helper(): void {}
+
+export function outer(): void {
+  { const helper = 1; void helper; }
+  helper();
+}
+`,
+  );
+
+  // Over-approximating shadowing to the whole function would drop this, and
+  // completeness for bare calls is a documented guarantee - so the scope
+  // chain follows real block scoping instead.
+  assert.ok(hasEdge(result, "CALLS", "outer", "helper"));
+});
+
+test("a function's own name is not shadowed by itself, so recursion resolves", () => {
+  const direct = extractFile(
+    "src/p.ts",
+    `export function walk(n: number): void {\n  if (n) walk(n - 1);\n}\n`,
+  );
+  assert.ok(hasEdge(direct, "CALLS", "walk", "walk"));
+
+  // `var f = function f() { f() }` - the inner binding and the symbol the
+  // function was declared into are the same function.
+  const expression = extractFile("src/p.js", `var walk = function walk(n) {\n  if (n) walk(n - 1);\n};\n`);
+  assert.ok(hasEdge(expression, "CALLS", "walk", "walk"));
+});
+
+test("a bare name never resolves to a class member, which only a receiver can address", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `class Logger {
+  log(message: string): void {}
+  private level = 0;
+}
+
+export function outer(): void {
+  log("hi");
+  void level;
+}
+`,
+  );
+
+  assert.deepEqual(
+    usageEdges(result),
+    [],
+    "`log`/`level` are unbound here; matching them onto Logger's members is the wrong-edge case",
+  );
+});
+
+test("a member is still reached through a receiver that names its owner", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `class Logger {
+  log(message: string): void { this.flush(); }
+  private flush(): void {}
+  static of(): Logger { return new Logger(); }
+}
+
+export function outer(): void {
+  Logger.of();
+}
+`,
+  );
+
+  assert.ok(hasEdge(result, "CALLS", "Logger#log", "Logger#flush"), "`this.` names the owner");
+  assert.ok(hasEdge(result, "CALLS", "outer", "Logger.of"), "`Class.` names the owner");
+});
+
+test("a local shadowing an import claims neither the import nor a same-named declaration", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { mutate } from "./lib";
+
+export function run(): void {
+  const mutate = () => {};
+  mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.deepEqual(usageEdges(result), []);
+  assert.deepEqual(result.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND), []);
+});
+
+test("a method whose name matches an import calls the import, not itself", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { encrypt } from "./lib";
+
+export class Envelope {
+  async encrypt(): Promise<void> {
+    await encrypt();
+  }
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // The bare call cannot mean the method - only `this.encrypt()` could - so
+  // it falls through to the import, which is what a reader sees too.
+  assert.ok(hasEdge(result, "CALLS", "Envelope#encrypt", "src/lib.ts#encrypt"));
+  assert.ok(!hasEdge(result, "CALLS", "Envelope#encrypt", "Envelope#encrypt"));
+});
+
+test("an edge onto a symbol this file declares is resolved, one onto an imported symbol is not", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import { remote } from "./lib";
+
+function local(): void {}
+
+export function run(): void {
+  local();
+  remote();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  const byId = new Map(result.nodes.map((n) => [n.id, n]));
+  const calls = new Map(
+    result.edges.filter((e) => e.kind === "CALLS").map((e) => [byId.get(e.toId)!.qualifiedName, e.resolved]),
+  );
+
+  assert.equal(calls.get("local"), true, "nothing about a same-file call is left to confirm");
+  assert.equal(
+    calls.get("src/lib.ts#remote"),
+    false,
+    "whether that file exports it is a fact about the index, which only core has",
+  );
 });

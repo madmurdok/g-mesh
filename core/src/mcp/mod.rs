@@ -306,9 +306,16 @@ impl ServerHandler for GMeshMcpServer {
                  the same symbol_id internally - identical guarantee either way, so passing \
                  symbol_name directly per the efficiency note above does not lose it), is already \
                  resolved per call site to that exact declaration - other same-named declarations' \
-                 call sites are excluded, so re-checking one with grep is wasted work. `resolved: false` on a row marks an \
-                 edge the indexer could not confirm; that is the one row worth double-checking, \
-                 not the whole list. `find_references`/`find_callers`/`find_callees`/\
+                 call sites are excluded, so re-checking one with grep is wasted work. \
+                 `resolved: false` marks the one thing the indexer could not settle on its own: \
+                 an edge whose target is in *another* file, where whether that file is indexed \
+                 and really exports the name is not knowable from the usage alone. Everything \
+                 else - every edge whose target is declared in the same file as the usage - is \
+                 `resolved: true`, matched against the declarations actually in scope there, so \
+                 a same-file call site is never the reason to reach for grep. That makes \
+                 `resolved: false` a narrow, informative signal rather than a general disclaimer: \
+                 it is worth a look on that row, and only that row. \
+                 `find_references`/`find_callers`/`find_callees`/\
                  `find_implementations` also carry a response-level `allUnresolved: true` when \
                  *every* row in a non-empty `results` page is `resolved: false` - a legitimate \
                  shape (genuinely unconfirmed name-matched edges), but one that otherwise reads \

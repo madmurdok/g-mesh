@@ -1,21 +1,31 @@
 // Syntax-only (tree-sitter) extraction of graph nodes/edges from a single
 // JS/TS source file. Field names mirror core's NodeRecord/EdgeRecord
-// (core/src/storage/write.rs) in camelCase; the NDJSON wire encoding that
-// carries them to the core is a separate ticket, as is any TS-compiler-API
-// semantic layer - everything produced here is name-based and therefore
-// `resolved: false` / `source: 'tree-sitter'`. The one exception is module
-// specifiers, which are literals rather than names: the ones naming a file of
-// this project - relative, or a package of its own workspace - are resolved to
-// a real path here (see `recordImport`) and core turns that into
-// a `resolved: true` edge once it has confirmed the target is in the index.
-// Symbols reached *through* such a specifier ride on the same handshake: a
-// call or reference to an imported name gets a pending-symbol placeholder
-// (see `PENDING_SYMBOL_NATIVE_KIND`) naming the file and the export it is
-// waiting for, which core links the same way. Where that file only passes the
-// name through - a barrel doing `export * from`/`export { x } from`, which is
-// what a workspace specifier usually lands on - a re-export placeholder (see
-// `REEXPORT_NATIVE_KIND`) records the next hop, so core can follow the chain
-// to wherever the declaration really is.
+// (core/src/storage/write.rs) in camelCase; any TS-compiler-API semantic
+// layer is a separate ticket, so everything produced here is name-based and
+// `source: 'tree-sitter'`.
+//
+// `resolved`, though, is not decided by that - it is decided by what an edge
+// points at (see `Extractor.addEdge`). This pass sees exactly one file, and
+// within it a name match is not a guess: the file's own declarations are all
+// here, and the lexical scope chain (see `LocalBindings`) says which of them a
+// given usage can actually reach. An edge onto one of them is `resolved: true`
+// with nothing left to confirm. What genuinely cannot be settled here is
+// anything crossing the file boundary, and those edges stay `resolved: false`
+// until core says otherwise:
+//
+//  - Module specifiers are literals rather than names, so the ones naming a
+//    file of this project - relative, or a package of its own workspace - are
+//    resolved to a real path here (see `recordImport`); core turns that into a
+//    `resolved: true` edge once it has confirmed the target is in the index.
+//  - Symbols reached *through* such a specifier ride on the same handshake: a
+//    call or reference to an imported name gets a pending-symbol placeholder
+//    (see `PENDING_SYMBOL_NATIVE_KIND`) naming the file and the export it is
+//    waiting for, which core links the same way.
+//  - Where that file only passes the name through - a barrel doing
+//    `export * from`/`export { x } from`, which is what a workspace specifier
+//    usually lands on - a re-export placeholder (see `REEXPORT_NATIVE_KIND`)
+//    records the next hop, so core can follow the chain to wherever the
+//    declaration really is.
 
 import { createHash } from "node:crypto";
 import * as path from "node:path";
@@ -91,6 +101,24 @@ export const REEXPORT_NATIVE_KIND = "reexport";
  * spelled that way.
  */
 export const REEXPORT_ALL_NAME = "*";
+
+/**
+ * Every `nativeKind` that marks a node as standing in for something outside
+ * this file rather than being a declaration in it. An edge onto one is a
+ * question for core (does that file exist in the index, does it export that
+ * name?); an edge onto anything else is already answered - which is exactly
+ * the line `resolved` draws, see [`Extractor.addEdge`].
+ */
+const PLACEHOLDER_NATIVE_KINDS: ReadonlySet<string> = new Set([
+  "external_module",
+  RESOLVED_MODULE_NATIVE_KIND,
+  PENDING_SYMBOL_NATIVE_KIND,
+  REEXPORT_NATIVE_KIND,
+]);
+
+function isPlaceholder(node: ExtractedNode): boolean {
+  return node.nativeKind !== undefined && PLACEHOLDER_NATIVE_KINDS.has(node.nativeKind);
+}
 
 /**
  * How a pending-symbol placeholder is addressed: the target file's
@@ -337,6 +365,13 @@ interface Scope {
   readonly prefix: string;
   readonly namespacePrefix: string;
   /**
+   * Names bound by the enclosing function/block chain - parameters, locals,
+   * nested declarations. None of them is a graph symbol, so a name found here
+   * is *not* the file-level declaration that happens to share its spelling:
+   * see [`LocalBindings`].
+   */
+  readonly locals: LocalBindings | null;
+  /**
    * The `from` of CALLS edges written here: the nearest enclosing Function
    * node, or - inside a function expression that has no node of its own (a
    * callback argument, an object-literal property value, an object-literal
@@ -353,6 +388,34 @@ interface Scope {
   readonly supertypeNames: readonly string[];
   /** Inside a function body: locals are deliberately not graph nodes. */
   readonly insideFunction: boolean;
+}
+
+/**
+ * One link of the lexical scope chain: the names a function or block binds,
+ * and the scope enclosing it. Locals are deliberately not graph nodes, so
+ * without this a call to one - a parameter, a `const`, a nested `function` -
+ * name-matches the file-level declaration of the same name and produces an
+ * edge to a symbol the call site cannot even see. Knowing the name is bound
+ * locally is enough to drop it; what it is bound *to* never needs answering.
+ *
+ * The chain follows real JS/TS scoping rather than over-approximating to the
+ * whole function: `var`/`function` hoist to the function body
+ * ([`collectHoistedBindings`]), `let`/`const`/`class` bind per block
+ * ([`collectBlockBindings`]), so a name shadowed inside one block still
+ * resolves normally at a call site outside it. Over-approximating would only
+ * ever lose real edges, and completeness of `find_callers` for bare calls is
+ * a documented guarantee.
+ */
+interface LocalBindings {
+  readonly names: ReadonlySet<string>;
+  readonly parent: LocalBindings | null;
+}
+
+function isLocallyBound(name: string, bindings: LocalBindings | null): boolean {
+  for (let scope = bindings; scope !== null; scope = scope.parent) {
+    if (scope.names.has(name)) return true;
+  }
+  return false;
 }
 
 type CallReceiver = "none" | "this" | "super" | "qualified";
@@ -414,7 +477,6 @@ class Extractor {
   private readonly nodes = new Map<string, ExtractedNode>();
   private readonly edges = new Map<string, ExtractedEdge>();
   /** Declared symbols only - import placeholders must not shadow real names. */
-  private readonly byName = new Map<string, ExtractedNode[]>();
   private readonly byQualifiedName = new Map<string, ExtractedNode>();
   /** Local name -> the imported symbol it stands for, for names this file
    * uses but does not declare. Consulted only after the declared-symbol
@@ -444,6 +506,7 @@ class Extractor {
     const scope: Scope = {
       prefix: "",
       namespacePrefix: "",
+      locals: null,
       enclosingCallerId: null,
       enclosingSymbolId: this.fileNode.id,
       enclosingTypeQName: null,
@@ -520,24 +583,36 @@ class Extractor {
     if (!this.byQualifiedName.has(node.qualifiedName)) {
       this.byQualifiedName.set(node.qualifiedName, node);
     }
-    const sameName = this.byName.get(node.name);
-    if (sameName) {
-      if (!sameName.includes(node)) sameName.push(node);
-    } else {
-      this.byName.set(node.name, [node]);
-    }
 
     this.addEdge(this.fileNode.id, "DEFINES", node.id);
     if (node.exported) this.addEdge(this.fileNode.id, "EXPORTS", node.id);
     return node;
   }
 
+  /**
+   * `resolved` is decided by what the edge points at, not by which pass made
+   * it. A target declared in this very file is a real node, found by matching
+   * the name against the declarations actually in scope at the usage
+   * ([`lookupByName`], [`lookupMember`], [`isLocallyBound`]) - there is
+   * nothing left for anyone to confirm, and saying otherwise would flag the
+   * majority of a typical `find_callers` page as unconfirmed and send the
+   * caller off to re-grep answers that were never in doubt.
+   *
+   * A target that is a *placeholder* - an import, a symbol another file
+   * declares, a re-export hop - is the opposite: whether that file even
+   * exists in the index, let alone exports the name, is a fact only core
+   * holds, so the edge stays unresolved until core repoints it
+   * (`graph::imports`, `graph::symbol_links`). That is the honest,
+   * still-meaningful `resolved: false`.
+   */
   private addEdge(fromId: string, kind: EdgeKind, toId: string): void {
     // Edges are FK-constrained in SQLite; never emit a dangling one.
-    if (!this.nodes.has(fromId) || !this.nodes.has(toId)) return;
+    const target = this.nodes.get(toId);
+    if (!this.nodes.has(fromId) || target === undefined) return;
     const id = edgeIdFor(fromId, kind, toId);
     if (this.edges.has(id)) return;
-    this.edges.set(id, { id, fromId, toId, kind, source: EDGE_SOURCE, resolved: false });
+    const resolved = !isPlaceholder(target);
+    this.edges.set(id, { id, fromId, toId, kind, source: EDGE_SOURCE, resolved });
   }
 
   private markExported(node: ExtractedNode): void {
@@ -609,6 +684,20 @@ class Extractor {
       case "function_expression":
       case "generator_function":
         this.visitFunctionParts(node, scope);
+        return;
+      // Block-scoped binding forms. Each opens a scope of its own so a name
+      // shadowed in one block still resolves to the file-level declaration at
+      // a call site outside it - see [`LocalBindings`].
+      case "statement_block":
+      case "switch_body":
+        this.visitChildren(node, blockScope(node, scope));
+        return;
+      case "catch_clause":
+        this.visitCatchClause(node, scope);
+        return;
+      case "for_statement":
+      case "for_in_statement":
+        this.visitForStatement(node, scope);
         return;
       case "call_expression":
         this.handleCall(node, scope);
@@ -1197,6 +1286,7 @@ class Extractor {
     const bodyScope: Scope = {
       ...scope,
       insideFunction: true,
+      locals: functionScope(node, scope.locals),
       enclosingCallerId: scope.enclosingCallerId ?? this.callerFallback(scope),
     };
     this.visitField(node, "type_parameters", bodyScope);
@@ -1229,6 +1319,46 @@ class Extractor {
    */
   private callerFallback(scope: Scope): string | null {
     return scope.enclosingSymbolId === this.fileNode.id ? null : scope.enclosingSymbolId;
+  }
+
+  /**
+   * `catch (err) { ... }` binds `err` for the handler body only. The clause's
+   * parameter sits in a `parameter` field, which [`isBindingPosition`] does
+   * not recognise, so without the binding the name would also read as a usage.
+   */
+  private visitCatchClause(node: SyntaxNode, scope: Scope): void {
+    const names = new Set<string>();
+    const parameter = node.childForFieldName("parameter");
+    if (parameter) collectPatternNames(parameter, names);
+    const inner: Scope = { ...scope, locals: { names, parent: scope.locals } };
+    for (const child of node.namedChildren) {
+      if (child.id !== parameter?.id) this.visit(child, inner);
+    }
+  }
+
+  /**
+   * `for (const x of xs)` / `for (let i = 0; ...)` bind their loop variables
+   * for the header and the body. The subject of a `for...of`/`for...in` is
+   * evaluated outside that binding, so it keeps the enclosing scope.
+   *
+   * `for (existing of xs)` - no declaration keyword - binds nothing; it
+   * assigns to a name that already exists, which may well be one of this
+   * file's symbols, so its scope is left alone.
+   */
+  private visitForStatement(node: SyntaxNode, scope: Scope): void {
+    const names = new Set<string>();
+    const left = node.childForFieldName("left"); // for...of / for...in
+    if (left && declaresBinding(node)) collectPatternNames(left, names);
+    const initializer = node.childForFieldName("initializer"); // classic `for`
+    if (initializer) collectDeclarationNames(initializer, names);
+
+    const inner: Scope = { ...scope, locals: { names, parent: scope.locals } };
+    const right = node.childForFieldName("right");
+    if (right) this.visit(right, scope);
+    for (const child of node.namedChildren) {
+      if (child.id === left?.id || child.id === right?.id) continue;
+      this.visit(child, inner);
+    }
   }
 
   /** Parameter names are bindings, not references; only their types and default values are. */
@@ -1344,6 +1474,20 @@ class Extractor {
   }
 
   private resolveCall(call: PendingCall): void {
+    // A name the call site's own scope chain binds is a local - a parameter,
+    // a `const`, a nested `function` - and locals are not graph symbols, so
+    // there is nothing here to point an edge at. `this.m()`/`super.m()` name a
+    // member rather than a binding and so cannot be shadowed this way.
+    const shadowable = call.receiver === "qualified" ? call.objectName : call.name;
+    if (
+      call.receiver !== "this" &&
+      call.receiver !== "super" &&
+      shadowable !== undefined &&
+      isLocallyBound(shadowable, call.scope.locals)
+    ) {
+      return;
+    }
+
     const target = this.lookupCallTarget(call);
 
     if (target?.kind === "Function" && call.scope.enclosingCallerId !== null) {
@@ -1410,6 +1554,7 @@ class Extractor {
   }
 
   private resolveReference(name: string, scope: Scope): void {
+    if (isLocallyBound(name, scope.locals)) return; // a local, not this file's symbol
     const target = this.lookupByName(name, scope.namespacePrefix) ?? this.importedSymbol(name);
     if (target) this.addUsage(target, scope);
   }
@@ -1456,11 +1601,19 @@ class Extractor {
   }
 
   /**
-   * Name-based lookup: an exact qualifiedName match walking out through the
-   * enclosing namespaces first, then a unique file-level symbol of that
-   * name. Ambiguity (several same-named candidates) yields nothing - a
-   * missing edge beats a wrong one, and disambiguating overloads or
-   * shadowing needs the semantic layer.
+   * What an unqualified name written at `namespacePrefix` denotes: an exact
+   * qualifiedName match, tried innermost-namespace-first and ending at the
+   * module root - which is precisely the set of declarations a bare name can
+   * reach. Anything else in the file is addressable only through a receiver
+   * (`this.m()`, `Class.s()`, `NS.f()`) and so is deliberately *not* a
+   * candidate here: matching a class member by its bare name alone used to
+   * turn an unrelated `log()` call into an edge onto some class's `#log`
+   * method, which is the wrong-edge case the invariant forbids. Members are
+   * reached through [`lookupMember`], from a receiver that named their owner.
+   *
+   * Callers must have ruled out a local of the same name first
+   * ([`isLocallyBound`]); locals are not nodes, so nothing here can tell one
+   * apart from the file-level declaration it shadows.
    */
   private lookupByName(name: string, namespacePrefix: string, kind?: NodeKind): ExtractedNode | undefined {
     // Innermost namespace outwards, ending at the module root ("").
@@ -1469,11 +1622,188 @@ class Extractor {
       if (candidate && (kind === undefined || candidate.kind === kind)) return candidate;
       if (prefix.length === 0) break;
     }
+    return undefined;
+  }
+}
 
-    const candidates = (this.byName.get(name) ?? []).filter(
-      (node) => kind === undefined || node.kind === kind,
-    );
-    return candidates.length === 1 ? candidates[0] : undefined;
+// --- lexical scope ------------------------------------------------------
+
+/**
+ * The scope a function body runs in: its parameters, plus the `var`s and
+ * function declarations that hoist to the top of the body. Pushed once per
+ * function, on the one code path every function body goes through
+ * ([`Extractor.visitFunctionParts`]).
+ */
+function functionScope(fn: SyntaxNode, parent: LocalBindings | null): LocalBindings {
+  const names = new Set<string>();
+
+  const parameters = fn.childForFieldName("parameters");
+  if (parameters) for (const parameter of parameters.namedChildren) collectPatternNames(parameter, names);
+  // An arrow function with one unparenthesized parameter (`x => ...`).
+  const parameter = fn.childForFieldName("parameter");
+  if (parameter) collectPatternNames(parameter, names);
+  // A function's own name is deliberately *not* bound here. For a declaration
+  // it is this file's symbol, so binding it would erase every recursive call;
+  // for a named function expression (`var f = function f() { f() }`, the
+  // classic self-recursion idiom) the inner binding and the symbol the
+  // function was declared into denote the same function anyway, so resolving
+  // the recursive call onto that symbol is right rather than merely tolerable.
+
+  const body = fn.childForFieldName("body");
+  if (body) collectHoistedBindings(body, names);
+
+  return { names, parent };
+}
+
+/** The scope a `{ ... }` block (or a `switch` body) opens: its own `let`/`const`/`class`/`function`. */
+function blockScope(block: SyntaxNode, scope: Scope): Scope {
+  const names = new Set<string>();
+  collectBlockBindings(block, names);
+  return names.size === 0 ? scope : { ...scope, locals: { names, parent: scope.locals } };
+}
+
+/**
+ * Node types [`collectHoistedBindings`] does not descend into. A `var` or a
+ * function declaration is a *statement*, and the only way one hides under an
+ * expression is inside a function or class body - which that walk already
+ * stops at. So skipping the bulky expression carriers costs nothing and keeps
+ * the hoisting pre-scan from re-walking every argument list and object
+ * literal in the file. Deliberately a deny-list: a type missing from it is
+ * merely walked needlessly, whereas an allow-list that missed one would
+ * silently stop recognising a binding.
+ */
+const NO_STATEMENTS_INSIDE: ReadonlySet<string> = new Set([
+  "arguments",
+  "array",
+  "binary_expression",
+  "call_expression",
+  "comment",
+  "member_expression",
+  "object",
+  "string",
+  "template_string",
+  "type_annotation",
+  "type_arguments",
+  "type_parameters",
+]);
+
+/**
+ * `var` and function declarations bind for the whole function body however
+ * deeply they are nested, so this descends through blocks - but never into a
+ * nested function or class body, whose own declarations belong to their own
+ * scope and are collected when the walk reaches them.
+ */
+function collectHoistedBindings(node: SyntaxNode, into: Set<string>): void {
+  for (const child of node.namedChildren) {
+    if (NO_STATEMENTS_INSIDE.has(child.type)) continue;
+    switch (child.type) {
+      case "function_declaration":
+      case "generator_function_declaration": {
+        const name = child.childForFieldName("name");
+        if (name) into.add(name.text);
+        continue;
+      }
+      case "arrow_function":
+      case "function_expression":
+      case "generator_function":
+      case "method_definition":
+      case "class_declaration":
+      case "abstract_class_declaration":
+      case "class":
+        continue;
+      case "variable_declaration": // `var` - the one declaration form that hoists
+        collectDeclarationNames(child, into);
+        break;
+      default:
+        break;
+    }
+    collectHoistedBindings(child, into);
+  }
+}
+
+/** The block-scoped declarations written directly in a block (or `switch` case). */
+function collectBlockBindings(block: SyntaxNode, into: Set<string>): void {
+  for (const child of block.namedChildren) {
+    switch (child.type) {
+      case "lexical_declaration":
+        collectDeclarationNames(child, into);
+        break;
+      case "class_declaration":
+      case "abstract_class_declaration":
+      case "function_declaration":
+      case "generator_function_declaration": {
+        const name = child.childForFieldName("name");
+        if (name) into.add(name.text);
+        break;
+      }
+      case "switch_case":
+      case "switch_default":
+        // A `switch` body is one scope shared by every case.
+        collectBlockBindings(child, into);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+/** Whether a `for...of`/`for...in` header declares its loop variable rather than assigning to an existing one. */
+function declaresBinding(statement: SyntaxNode): boolean {
+  return statement.children.some(
+    (child) => child.type === "var" || child.type === "let" || child.type === "const",
+  );
+}
+
+/** Every name the declarators of a `var`/`let`/`const` statement bind. */
+function collectDeclarationNames(declaration: SyntaxNode, into: Set<string>): void {
+  for (const declarator of declaration.namedChildren) {
+    if (declarator.type !== "variable_declarator") continue;
+    const name = declarator.childForFieldName("name");
+    if (name) collectPatternNames(name, into);
+  }
+}
+
+/**
+ * Every name a binding pattern introduces - a plain identifier, a
+ * destructuring of any shape, a parameter with a type or a default. Only the
+ * binding side is walked: a default value (`{ a = fallback() }`) is an
+ * expression evaluated in the enclosing scope, not a name being bound.
+ */
+function collectPatternNames(node: SyntaxNode, into: Set<string>): void {
+  switch (node.type) {
+    case "identifier":
+    case "shorthand_property_identifier_pattern":
+      into.add(node.text);
+      return;
+    case "required_parameter":
+    case "optional_parameter": {
+      const pattern = node.childForFieldName("pattern");
+      if (pattern) collectPatternNames(pattern, into);
+      return;
+    }
+    case "assignment_pattern":
+    case "object_assignment_pattern": {
+      const left = node.childForFieldName("left");
+      if (left) collectPatternNames(left, into);
+      return;
+    }
+    case "pair_pattern": {
+      const value = node.childForFieldName("value");
+      if (value) collectPatternNames(value, into);
+      return;
+    }
+    case "object_pattern":
+    case "array_pattern":
+    case "rest_pattern":
+      for (const child of node.namedChildren) collectPatternNames(child, into);
+      return;
+    case "lexical_declaration":
+    case "variable_declaration":
+      // `for (const [k, v] of ...)`: the loop variable arrives declared.
+      collectDeclarationNames(node, into);
+      return;
+    default:
+      return;
   }
 }
 
