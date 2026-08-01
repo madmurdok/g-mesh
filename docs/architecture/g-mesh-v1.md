@@ -774,22 +774,41 @@ project's own reasoning, the other is a pointer for when the already-planned
 semantic layer gets built:
 
 - **The `IndexingStatus`/`STILL_INDEXING` signal (added for cold start,
-  #99/#105/#107) does not cover the ongoing incremental-edit watcher path.**
-  `mark_ready()` is only called once, after the initial bulk walk
-  (`daemon/mod.rs:303`); the watcher's debounce → reparse → transaction cycle
-  (see "Incremental edit" above) never re-arms it. That means a query landing
-  in the (typically short, single-digit-hundreds-of-ms) window between a file
-  write and its debounced transaction committing gets a silent stale answer —
-  the same *shape* of "answered off an unready index" problem cold start was
-  explicitly fixed to avoid, just not yet extended to this second window. This
-  surfaced by contrast: kungfu triggers its reindex synchronously from a
-  Claude Code `PostToolUse` hook rather than a filesystem watcher, which
-  sidesteps the debounce window entirely for edits made through the tool (at
-  the cost of a fallback path for edits made outside it). Whether this window
-  is worth closing in g-mesh — and whether a hook-triggered trigger should
-  supplement the watcher for the common "agent edits via Claude Code" case —
-  is open; the debounce window is much narrower than cold start's, so this is
-  a considered trade-off to weigh, not an assumed bug.
+  #99/#105/#107) does not cover the ongoing incremental-edit watcher path —
+  decided (task #111) to leave it that way.** `mark_ready()` is only called
+  once, after the initial bulk walk (`daemon/mod.rs:303`); the watcher's
+  write → reparse → transaction cycle (see "Incremental edit" above) never
+  re-arms it, so a query landing in that window gets a silent stale (pre-edit)
+  answer instead of a "still indexing" signal. Investigating this surfaced two
+  corrections to the framing above: first, there is currently no debounce
+  actually wired into `daemon::run`'s watcher thread — `watcher::debounce::
+  Debouncer` exists and is unit-tested but is never constructed there — so the
+  real window is "OS file-watch event latency plus one reparse-and-commit
+  round trip to the plugin", not a deliberate hundreds-of-ms batching delay;
+  second, `apply_file_change` holds the same connection mutex every MCP
+  handler locks to answer a query for that entire round trip, and `apply_diff`
+  is one transaction, so a query can never observe torn or half-committed
+  data — only a query that arrives *before* the watcher thread has picked the
+  change off its channel reads pre-edit data, and only silently, never
+  inconsistently. That makes this a narrower failure mode than cold start's,
+  where an in-progress graph can have nodes with no edges yet — a confidently
+  *wrong* answer, not just a delayed one. The decision: not worth extending
+  `IndexingStatus` to cover it, because `IndexingStatus` is deliberately a
+  single project-wide flag — correct for a bulk walk that really does leave
+  the whole graph incomplete, but the wrong shape for a single-file edit;
+  flipping it around every watcher commit would make an unrelated query pause
+  or read "still indexing" on every save in a live-edited project, trading a
+  rare, narrow, internally-consistent staleness for a much more common false
+  positive. A per-file signal would need a genuinely different mechanism —
+  `watcher::staleness::ensure_fresh` was written for close to that shape (an
+  mtime/hash check before answering) but, per this investigation, is not
+  currently called from any MCP handler, a separate real gap noted here but
+  out of this task's scope and worth its own task rather than folding into
+  `IndexingStatus`. kungfu's `PostToolUse`-hook-triggered reindex, which
+  sidesteps the watcher's race window entirely for edits made through Claude
+  Code's own Edit tool, remains a reasonable idea for the common case but is a
+  separate mechanism from this signaling question and was not evaluated
+  further here.
 - **Semantic/embedding search**: this doc already planned an embedding model
   (`jina-embeddings-v2-base-code`, above) but nothing in the current
   implementation ships it yet. kungfu has a real, shipped opt-in semantic
