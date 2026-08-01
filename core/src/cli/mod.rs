@@ -20,6 +20,7 @@
 //! command at a time.
 
 pub mod clean;
+pub mod plugins;
 pub mod reindex;
 pub mod status;
 pub mod stop;
@@ -118,7 +119,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
-            PluginsCommand::List => not_implemented("plugins list"),
+            PluginsCommand::List => plugins::run(),
         },
         Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
