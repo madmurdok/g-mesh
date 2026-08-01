@@ -97,6 +97,12 @@ pub enum BuildState {
     /// predates whatever has been installed since, and the index invalidation
     /// that a start on the new build would have performed.
     Outdated,
+    /// The daemon started from this very executable, but is holding a JS/TS
+    /// plugin that has been rebuilt since - so the graph it is serving was
+    /// computed by extraction logic that is no longer on disk. Reported apart
+    /// from `Outdated` because "your core binary is old" would be false here,
+    /// and would send someone looking in the wrong place.
+    PluginChanged,
     /// Running, but nothing usable is on record about its build - the shape
     /// every daemon that predates this check has. Reported rather than
     /// silently called current, because "we did not compare" and "we compared
@@ -242,6 +248,7 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     match build_stamp::vintage(published.as_ref(), &ours) {
         Vintage::Current => BuildState::Current,
         Vintage::Outdated => BuildState::Outdated,
+        Vintage::PluginChanged => BuildState::PluginChanged,
         Vintage::Unknown => BuildState::Unknown,
     }
 }
@@ -519,6 +526,11 @@ fn describe_build(build: BuildState) -> Option<&'static str> {
             "older than this g-mesh - it predates any index invalidation this build \
              would do; run `g-mesh stop`, or let the next MCP call replace it",
         ),
+        BuildState::PluginChanged => Some(
+            "this build, but holding a JS/TS plugin that has been rebuilt since - \
+             its graph came from extraction logic no longer on disk; run \
+             `g-mesh stop`, or let the next MCP call replace it",
+        ),
         BuildState::Unknown => Some(
             "cannot be compared with this g-mesh - it published no build stamp, so it \
              predates this check; run `g-mesh stop`, or let the next MCP call replace it",
@@ -605,7 +617,7 @@ mod tests {
         /// computed against.
         fn index(&self) -> Connection {
             let conn = Connection::open(self.db_path()).unwrap();
-            schema::ensure_current(&conn).unwrap();
+            schema::ensure_current(&conn, &crate::daemon::plugin::indexer_version()).unwrap();
             conn
         }
 
@@ -891,12 +903,31 @@ mod tests {
     fn a_daemon_left_behind_by_an_upgrade_is_called_out_with_what_to_do_about_it() {
         for (state, expected) in [
             (BuildState::Outdated, "older than this g-mesh"),
+            (BuildState::PluginChanged, "JS/TS plugin that has been rebuilt"),
             (BuildState::Unknown, "published no build stamp"),
         ] {
             let described = describe_build(state).expect("a running daemon always reports a build");
             assert!(described.contains(expected), "{state:?} rendered as {described}");
             assert!(described.contains("g-mesh stop"), "{state:?} must say what to do: {described}");
         }
+    }
+
+    /// A plugin-only rebuild must not be reported as an old core binary: the
+    /// binary is the one the person asking has just built, and being told
+    /// otherwise sends them to look at the wrong half of the pipeline.
+    #[test]
+    fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary() {
+        let state = tempfile::tempdir().unwrap();
+        let mut incumbent = build_stamp::of_running_process().unwrap();
+        incumbent.plugin = format!("{}-before", incumbent.plugin);
+        build_stamp::write(&daemon::build_stamp_path_in(state.path()), &incumbent).unwrap();
+
+        assert_eq!(
+            build_state(CoreState::Running { pid: 1 }, state.path()),
+            BuildState::PluginChanged
+        );
+        let described = describe_build(BuildState::PluginChanged).unwrap();
+        assert!(!described.contains("older than this g-mesh"), "{described}");
     }
 
     #[test]

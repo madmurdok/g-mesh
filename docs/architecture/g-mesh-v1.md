@@ -426,7 +426,7 @@ erDiagram
     }
     META {
         string schema_version "DDL generation - mismatch wipes"
-        string indexer_version "extractor/linker generation - mismatch wipes"
+        string indexer_version "core pipeline generation + plugin build digest - mismatch wipes"
         string embedding_model
         string lastUsed "per project, for GC idle check"
     }
@@ -642,6 +642,24 @@ MCP client on stdio — the shim is a pure repacking proxy.
   schema still matches and the project has already been walked, so the
   daemon keeps serving whatever generation of the extractor first filled
   it, indefinitely and without a symptom other than wrong answers.
+  `indexer_version` is two facts joined, because the pipeline is two
+  artifacts: a constant core maintains by hand for its own linking stage,
+  and a digest of the language plugin's compiled output. The constant alone
+  was what shipped first, and it failed the way hand-maintained invalidation
+  keys do — a release changed the extractor and left it alone, so every
+  existing index went on serving the previous extraction with a current
+  schema, a current constant and a current binary. The plugin's half is
+  derived from the artifact so that nothing has to remember; the constant
+  remains for what the digest cannot see (a grammar dependency upgrade,
+  core-side linking changes).
+- **Plugin rebuilt under a running daemon** (`npm run build` after an
+  extractor change, with the core binary untouched): the daemon's published
+  build stamp carries the same plugin digest, so a shim finds the incumbent
+  holding a plugin that no longer exists on disk and retires it — after which
+  the mismatch above wipes and re-walks. Detected only when the two
+  executables are the same file: the core binary's mtime still decides
+  first and by ordering, so a shim never retires a daemon from a build ahead
+  of its own (see `daemon::build_stamp`).
 - **Cold-start walk longer than the shim's bootstrap timeout** (a large
   monorepo's very first index, or any project's first start after an
   indexer-version bump): the daemon binds its socket before the walk, so the

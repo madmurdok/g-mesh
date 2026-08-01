@@ -200,7 +200,15 @@ pub fn run(root: &Path) -> Result<()> {
     }
 
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
-    if schema::ensure_current(&conn).context("failed to check the index's schema and indexer versions")? {
+    // The generation names the plugin build this daemon is about to spawn as
+    // well as core's own pipeline (`plugin::indexer_version`), so an index
+    // filled by a plugin that has since been rebuilt is thrown away here -
+    // which is what makes the walk below happen at all. Before task 116 only
+    // core's half was compared, and a plugin-only change left every existing
+    // index intact and wrong.
+    if schema::ensure_current(&conn, &plugin::indexer_version())
+        .context("failed to check the index's schema and indexer versions")?
+    {
         eprintln!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
     // Recorded here rather than once the daemon is serving: a start that gets
