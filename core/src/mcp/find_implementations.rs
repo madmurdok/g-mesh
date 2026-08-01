@@ -25,16 +25,24 @@ use super::{anchor, SymbolQueryParams};
 
 /// One implementing/extending type on the other end of an inbound
 /// `SUPERTYPE_OF` edge.
+///
+/// No `name` field: it never carries information `qualifiedName` doesn't
+/// already have. `qualifiedName`/`startLine`/`startCol` are `None` - omitted
+/// from the wire JSON entirely, never emitted as `null` or `0` - exactly
+/// when `kind` is [`pagination::FILE_KIND`]; see that constant's doc comment
+/// for why both are pure redundancy on a `File`-kind row.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImplementationSite {
     implementing_symbol_id: String,
-    name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     file_path: String,
-    start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     resolved: bool,
 }
 
@@ -81,18 +89,18 @@ fn list_implementations(
         let implementing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve implementing node")?
             .with_context(|| format!("edge {} points at missing node {}", edge.id, edge.from_id))?;
+        let is_file = implementing.kind == pagination::FILE_KIND;
         rows.push(pagination::EdgeRow {
             resolved: edge.resolved,
             locality,
             edge_id: edge.id.clone(),
             item: ImplementationSite {
                 implementing_symbol_id: implementing.id,
-                name: implementing.name,
-                qualified_name: implementing.qualified_name,
+                qualified_name: (!is_file).then_some(implementing.qualified_name),
                 kind: implementing.kind,
                 file_path: implementing.file_path,
-                start_line: implementing.start_line,
-                start_col: implementing.start_col,
+                start_line: (!is_file).then_some(implementing.start_line),
+                start_col: (!is_file).then_some(implementing.start_col),
                 resolved: edge.resolved,
             },
         });
@@ -174,6 +182,37 @@ mod tests {
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the interface has exactly one direct implementor, not the transitive subclass");
         assert_eq!(results[0]["implementingSymbolId"], "class_a");
+    }
+
+    /// `SUPERTYPE_OF`'s `from_id` is never realistically a `File` node in
+    /// practice (only `Type` nodes extend/implement), but the row shape
+    /// itself must not special-case that away: same `name`-dropping,
+    /// `qualifiedName`/`startLine`/`startCol`-omitting rule as
+    /// `find_references`/`find_callers`/`find_callees` for any `File`-kind
+    /// row, proven directly against the raw resolver rather than relying on
+    /// it never being exercised.
+    #[test]
+    fn a_file_kind_implementing_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "weird.rs", "src/weird.rs", "src/weird.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("class_a", "Type", "ClassA", "pkg::ClassA", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_class", "class_a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+
+        let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None).unwrap();
+        assert_eq!(page.results.len(), 2);
+
+        let file_row = page.results.iter().find(|r| r.kind == "File").expect("the File-kind row must be present");
+        assert!(file_row.qualified_name.is_none(), "qualifiedName duplicates filePath for a File-kind row");
+        assert!(file_row.start_line.is_none(), "startLine is meaningless for a File-kind row");
+        assert!(file_row.start_col.is_none(), "startCol is meaningless for a File-kind row");
+        assert_eq!(file_row.file_path, "src/weird.rs");
+
+        let symbol_row = page.results.iter().find(|r| r.kind == "Type").expect("the Type-kind row must be present");
+        assert_eq!(symbol_row.qualified_name.as_deref(), Some("pkg::ClassA"), "a symbol-kind row must still carry its qualifiedName");
+        assert_eq!(symbol_row.start_line, Some(0), "a symbol-kind row must still carry its startLine");
+        assert_eq!(symbol_row.start_col, Some(0), "a symbol-kind row must still carry its startCol");
     }
 
     #[test]

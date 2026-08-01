@@ -40,16 +40,25 @@ const USAGE_EDGE_KINDS: &[&str] = &["CALLS", "REFERENCES", "SUPERTYPE_OF"];
 /// *referencing* node's own span - the closest thing to "where this
 /// reference lives" the current schema can answer without a token-level
 /// range table.
+///
+/// No `name` field: it never carries information `qualifiedName` doesn't
+/// already have (at worst a shorter, less unique view of the same symbol).
+/// `qualifiedName`/`startLine`/`startCol` are `None` - omitted from the wire
+/// JSON entirely via `skip_serializing_if`, never emitted as `null` or `0` -
+/// exactly when `kind` is [`pagination::FILE_KIND`]; see that constant's doc
+/// comment for why both are pure redundancy on a `File`-kind row.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferenceSite {
     referencing_symbol_id: String,
-    name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     file_path: String,
-    start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     /// Which `USAGE_EDGE_KINDS` edge produced this row - the result set is a
     /// union of several kinds, so without it a call is indistinguishable from
     /// a plain value usage.
@@ -100,18 +109,18 @@ fn list_references(
         let referencing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve referencing node")?
             .with_context(|| format!("edge {} references missing node {}", edge.id, edge.from_id))?;
+        let is_file = referencing.kind == pagination::FILE_KIND;
         rows.push(pagination::EdgeRow {
             resolved: edge.resolved,
             locality,
             edge_id: edge.id.clone(),
             item: ReferenceSite {
                 referencing_symbol_id: referencing.id,
-                name: referencing.name,
-                qualified_name: referencing.qualified_name,
+                qualified_name: (!is_file).then_some(referencing.qualified_name),
                 kind: referencing.kind,
                 file_path: referencing.file_path,
-                start_line: referencing.start_line,
-                start_col: referencing.start_col,
+                start_line: (!is_file).then_some(referencing.start_line),
+                start_col: (!is_file).then_some(referencing.start_col),
                 reference_kind: edge.kind,
                 resolved: edge.resolved,
             },
@@ -262,6 +271,46 @@ mod tests {
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.results[0].referencing_symbol_id, "sub");
         assert_eq!(page.results[0].reference_kind, "SUPERTYPE_OF");
+    }
+
+    /// A top-level reference with no enclosing function attributes to the
+    /// `File` node itself (`extract.ts`'s "degrades to a usage edge from the
+    /// File node" case) - the shape that motivated trimming `name` and
+    /// omitting `qualifiedName`/`startLine`/`startCol` from `File`-kind rows:
+    /// they duplicate `filePath` (`qualifiedName`) or are meaningless
+    /// (`startLine`/`startCol`, always the file's own root position). Both
+    /// must be entirely absent from the JSON, not present as duplicated text
+    /// or as `0`/`0`. Symbol-kind rows are untouched by this and keep both.
+    #[test]
+    fn a_file_kind_referencing_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "index.ts", "src/index.ts", "src/index.ts", "typescript")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.ts", "typescript"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body =
+            json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        for row in results {
+            assert!(row.get("name").is_none(), "the name field must never be present on any row: {row}");
+        }
+
+        let file_row = results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
+        assert!(file_row.get("qualifiedName").is_none(), "qualifiedName duplicates filePath for a File-kind row: {file_row}");
+        assert!(file_row.get("startLine").is_none(), "startLine is meaningless for a File-kind row: {file_row}");
+        assert!(file_row.get("startCol").is_none(), "startCol is meaningless for a File-kind row: {file_row}");
+        assert_eq!(file_row["filePath"], "src/index.ts");
+
+        let symbol_row = results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
+        assert_eq!(symbol_row["qualifiedName"], "pkg::caller", "a symbol-kind row must still carry its qualifiedName");
+        assert_eq!(symbol_row["startLine"], 0, "a symbol-kind row must still carry its startLine");
+        assert_eq!(symbol_row["startCol"], 0, "a symbol-kind row must still carry its startCol");
     }
 
     /// Widening the filter must not drag in declaration-side edges: the File

@@ -76,59 +76,70 @@ fn list_calls(
 
 /// Wire shape for `find_callers`: the calling function on the other end of
 /// each inbound `CALLS` edge.
+///
+/// No `name` field: it never carries information `qualifiedName` doesn't
+/// already have. `qualifiedName`/`startLine`/`startCol` are `None` - omitted
+/// from the wire JSON entirely, never emitted as `null` or `0` - exactly
+/// when `kind` is [`pagination::FILE_KIND`]; see that constant's doc comment
+/// for why both are pure redundancy on a `File`-kind row.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CallerSite {
     caller_symbol_id: String,
-    name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     file_path: String,
-    start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     resolved: bool,
 }
 
 impl From<CallSite> for CallerSite {
     fn from(site: CallSite) -> Self {
+        let is_file = site.node.kind == pagination::FILE_KIND;
         CallerSite {
             caller_symbol_id: site.node.id,
-            name: site.node.name,
-            qualified_name: site.node.qualified_name,
+            qualified_name: (!is_file).then_some(site.node.qualified_name),
             kind: site.node.kind,
             file_path: site.node.file_path,
-            start_line: site.node.start_line,
-            start_col: site.node.start_col,
+            start_line: (!is_file).then_some(site.node.start_line),
+            start_col: (!is_file).then_some(site.node.start_col),
             resolved: site.resolved,
         }
     }
 }
 
 /// Wire shape for `find_callees`: the called function on the other end of
-/// each outbound `CALLS` edge.
+/// each outbound `CALLS` edge. Same `name`/`qualifiedName`/`startLine`/
+/// `startCol` rules as [`CallerSite`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CalleeSite {
     callee_symbol_id: String,
-    name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     file_path: String,
-    start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     resolved: bool,
 }
 
 impl From<CallSite> for CalleeSite {
     fn from(site: CallSite) -> Self {
+        let is_file = site.node.kind == pagination::FILE_KIND;
         CalleeSite {
             callee_symbol_id: site.node.id,
-            name: site.node.name,
-            qualified_name: site.node.qualified_name,
+            qualified_name: (!is_file).then_some(site.node.qualified_name),
             kind: site.node.kind,
             file_path: site.node.file_path,
-            start_line: site.node.start_line,
-            start_col: site.node.start_col,
+            start_line: (!is_file).then_some(site.node.start_line),
+            start_col: (!is_file).then_some(site.node.start_col),
             resolved: site.resolved,
         }
     }
@@ -279,6 +290,45 @@ mod tests {
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "B has exactly one callee, not the transitive chain");
         assert_eq!(results[0]["calleeSymbolId"], "c");
+    }
+
+    /// A top-level call with no enclosing function attributes to the `File`
+    /// node itself - the shape that motivated trimming `name` and omitting
+    /// `qualifiedName`/`startLine`/`startCol` from `File`-kind rows: they
+    /// duplicate `filePath` (`qualifiedName`) or are meaningless
+    /// (`startLine`/`startCol`, always the file's own root position). Both
+    /// must be entirely absent from the JSON. Symbol-kind rows keep both,
+    /// unaffected.
+    #[test]
+    fn a_file_kind_caller_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "main.rs", "src/main.rs", "src/main.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "CALLS", "tree-sitter", true)).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+        );
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        for row in results {
+            assert!(row.get("name").is_none(), "the name field must never be present on any row: {row}");
+        }
+
+        let file_row = results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
+        assert!(file_row.get("qualifiedName").is_none(), "qualifiedName duplicates filePath for a File-kind row: {file_row}");
+        assert!(file_row.get("startLine").is_none(), "startLine is meaningless for a File-kind row: {file_row}");
+        assert!(file_row.get("startCol").is_none(), "startCol is meaningless for a File-kind row: {file_row}");
+        assert_eq!(file_row["filePath"], "src/main.rs");
+
+        let symbol_row = results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
+        assert_eq!(symbol_row["qualifiedName"], "pkg::caller", "a symbol-kind row must still carry its qualifiedName");
+        assert_eq!(symbol_row["startLine"], 0, "a symbol-kind row must still carry its startLine");
+        assert_eq!(symbol_row["startCol"], 0, "a symbol-kind row must still carry its startCol");
     }
 
     #[test]

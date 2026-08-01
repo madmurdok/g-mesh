@@ -302,11 +302,20 @@ impl ServerHandler for GMeshMcpServer {
                  find_callees/find_implementations instead of calling find_definition first, and \
                  raise `limit` for symbols with many results instead of paging - see each tool's \
                  parameter docs for the exact mechanics (ambiguity handling, defaults).\n\n\
-                 A result anchored by `symbol_id` is already resolved per call site to that exact \
-                 declaration - other same-named declarations' call sites are excluded, so \
-                 re-checking one with grep is wasted work. `resolved: false` on a row marks an \
-                 edge the indexer could not confirm; that is the one row worth double-checking, \
-                 not the whole list. `find_references`/`find_callers`/`find_callees`/\
+                 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` (resolved to \
+                 the same symbol_id internally - identical guarantee either way, so passing \
+                 symbol_name directly per the efficiency note above does not lose it), is already \
+                 resolved per call site to that exact declaration - other same-named declarations' \
+                 call sites are excluded, so re-checking one with grep is wasted work. \
+                 `resolved: false` marks the one thing the indexer could not settle on its own: \
+                 an edge whose target is in *another* file, where whether that file is indexed \
+                 and really exports the name is not knowable from the usage alone. Everything \
+                 else - every edge whose target is declared in the same file as the usage - is \
+                 `resolved: true`, matched against the declarations actually in scope there, so \
+                 a same-file call site is never the reason to reach for grep. That makes \
+                 `resolved: false` a narrow, informative signal rather than a general disclaimer: \
+                 it is worth a look on that row, and only that row. \
+                 `find_references`/`find_callers`/`find_callees`/\
                  `find_implementations` also carry a response-level `allUnresolved: true` when \
                  *every* row in a non-empty `results` page is `resolved: false` - a legitimate \
                  shape (genuinely unconfirmed name-matched edges), but one that otherwise reads \
@@ -315,8 +324,13 @@ impl ServerHandler for GMeshMcpServer {
                  as unconfirmed, not just its rows; it is never set on an empty page, since an \
                  empty result has nothing to be suspicious of. One honest gap: a method call \
                  reached through a variable receiver (`x.foo()`) produces no edge by design, so \
-                 caller/reference lists for methods can under-report - bare calls and \
-                 `this`/`super`/qualified-type calls do not have this gap.\n\n\
+                 caller/reference lists for methods can under-report. This is the ONLY \
+                 completeness gap: for bare function calls and `this`/`super`/qualified-type \
+                 calls, a `hasMore: false` page is exhaustive - every call site is already \
+                 accounted for, and grepping afterward to check for more just re-derives what \
+                 the response already guarantees. Only fall back to grep when you specifically \
+                 suspect a variable-receiver method call was missed, not as a routine \
+                 double-check.\n\n\
                  One more response shape worth recognizing: on a project being indexed for the \
                  first time (or re-indexed after an upgrade), every tool returns an error whose \
                  text says the index is still being built. That is a temporary \"not yet\", not \
