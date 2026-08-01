@@ -320,7 +320,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_references",
-        description = "List every place a symbol is referenced, across the whole project."
+        description = "List every place a declared symbol (function, type, etc.) is referenced, across the whole project. Not for files/modules - for \"what imports this file\" use get_dependencies instead."
     )]
     async fn find_references(
         &self,

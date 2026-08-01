@@ -78,6 +78,10 @@ struct ReferencePage {
     /// See `Page::all_unresolved` - true when every reference in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
+    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
+    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
@@ -137,6 +141,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         Ok(node) => node,
         Err(finished) => return Ok(finished),
     };
+    let hint = anchor::file_anchor_hint(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -148,6 +153,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
+        hint,
     })
 }
 
@@ -565,6 +571,44 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
+    }
+
+    /// The footgun this hint closes: `symbol_name` resolves through
+    /// `queries::find_by_name`/`find_by_qualified_name`, neither of which
+    /// filter by kind, so a name that happens to match a file's basename
+    /// (e.g. `"connection.ts"`) anchors on that `File` node exactly as if it
+    /// were a declared symbol. `find_references` never walks an edge kind
+    /// incident on a File node in this direction, so the answer is a
+    /// perfectly honest but useless empty page - unless the response tells
+    /// the caller to retry with `get_dependencies` instead.
+    #[test]
+    fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"))
+            .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
+        let body = json_body(&handle(&conn, params).unwrap());
+
+        let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
+        assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 0, "a File anchor still answers as an empty page, not an error");
+        assert_eq!(body["hasMore"], false);
+        assert_eq!(body["allUnresolved"], false);
+    }
+
+    /// Purely additive: an ordinary symbol anchor must never carry the
+    /// `hint` field at all, not even as `null` - mirrors how the File-kind
+    /// row tests assert `qualifiedName`/`startLine` are absent, not null.
+    #[test]
+    fn a_normal_symbol_anchor_never_carries_a_hint_field() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert!(body.get("hint").is_none(), "hint must be entirely absent, not null, on a normal symbol anchor: {body}");
     }
 
     #[test]
