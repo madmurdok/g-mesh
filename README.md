@@ -214,8 +214,15 @@ below) to force a fresh full walk.
 
 Per-project state lives under `~/.g-mesh/projects/<hash-of-project-root>/`:
 SQLite DB, daemon socket, pid files, lock files. Delete a project's directory
-there to force a clean reindex (schema mismatches also auto-wipe and
-reindex).
+there to force a clean reindex.
+
+Upgrading g-mesh does not need that, though: an index records which build of
+the indexing pipeline filled it — core's own generation *and* a digest of the
+JS/TS plugin's compiled output — and an index that no longer matches is wiped
+and re-walked on the next daemon start. A daemon already running when the
+upgrade lands is retired first, whether it is the core binary or only the
+plugin that was rebuilt, so the next MCP call is answered by what is on disk
+now. `g-mesh status` says which build the running daemon came from.
 
 Run `g-mesh status` in a project to see whether its daemon and plugin are up,
 how much of the project the index covers, and which files failed to parse.
