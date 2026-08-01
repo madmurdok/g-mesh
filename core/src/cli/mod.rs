@@ -20,6 +20,7 @@
 //! command at a time.
 
 pub mod clean;
+pub mod init;
 pub mod reindex;
 pub mod status;
 pub mod stop;
@@ -113,7 +114,7 @@ pub fn run() -> Result<()> {
 /// taking over the process's real argv.
 fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Init => not_implemented("init"),
+        Command::Init => init::run(),
         Command::Config { .. } => not_implemented("config"),
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
@@ -271,7 +272,11 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_fail_rather_than_pretending_to_work() {
-        let err = dispatch(Command::Init).expect_err("init is not built yet");
+        let err = dispatch(Command::Config { global: false }).expect_err("config is not built yet");
+        assert!(err.to_string().contains("not implemented"), "unexpected message: {err}");
+
+        let err = dispatch(Command::Plugins { command: PluginsCommand::List })
+            .expect_err("plugins list is not built yet");
         assert!(err.to_string().contains("not implemented"), "unexpected message: {err}");
     }
 }
