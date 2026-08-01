@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -26,6 +27,10 @@ use crate::watcher::apply::apply_file_change as apply_file_change_diff;
 /// but it lets the integration test suite point at a build without
 /// depending on the daemon binary's own install location.
 pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
+
+/// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
+/// the hint and exited.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Shared with `daemon::bulk_index`, which spawns the same entry point in
 /// its one-shot mode - both must honor the same override.
@@ -51,11 +56,12 @@ struct PluginIo {
 /// full actor/async rewrite is more than this ticket needs.
 pub struct PluginProcess {
     // Kept alive so the child is not dropped (and its pipes closed) while
-    // still in use; only its pid is ever read, never its exit status.
-    // Killing it explicitly on daemon shutdown is unnecessary: the OS closes
-    // the daemon's end of the child's stdin when the daemon process exits,
-    // which the plugin already treats as its cue to exit (see index.ts's
-    // stdin "end" handler).
+    // still in use. A daemon that is killed outright still needs nothing from
+    // it: the OS closes the daemon's end of the child's stdin, which the
+    // plugin already treats as its cue to exit (see index.ts's stdin "end"
+    // handler). What [`shutdown`](Self::shutdown) adds is the *deliberate*
+    // ending of a plugin whose core carries on - a sleep on the idle timeout -
+    // where nothing closes those pipes unless this process says so.
     child: Child,
     io: Mutex<PluginIo>,
     next_id: AtomicI64,
@@ -103,6 +109,43 @@ impl PluginProcess {
     /// has to reason about the plugin from outside this process.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Ends this plugin process and waits for it to be gone, consuming the
+    /// handle - what `daemon::lifecycle` calls when the plugin has been idle
+    /// long enough to sleep, and again on the core's own way out.
+    ///
+    /// Closing the pipes is the whole shutdown on the ordinary path: the
+    /// plugin exits on its stdin's `end` event (index.ts), which is the same
+    /// mechanism that makes it die with a core that was killed. The signal is
+    /// only insurance against a plugin that does not notice - a hung reparse,
+    /// a future handler that swallows the event - because a "sleeping" plugin
+    /// still holding its half gigabyte of tsserver would be the exact cost
+    /// this timeout exists to avoid.
+    ///
+    /// Reaping matters as much as ending: the daemon is this process's parent
+    /// for its whole run, so an unwaited child would sit as a zombie until the
+    /// core exits, and `is_process_alive` (which `cli::status` and the tests
+    /// ask) cannot tell a zombie from a running process.
+    pub fn shutdown(self, grace: Duration) -> Result<()> {
+        // Destructured rather than dropped field by field: dropping `io`
+        // closes both pipes, and closing the write half of the plugin's stdin
+        // is precisely the "please exit" signal.
+        let Self { mut child, io, .. } = self;
+        drop(io);
+
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait().context("failed to check whether the plugin had exited")? {
+                Some(_) => return Ok(()),
+                None if Instant::now() >= deadline => break,
+                None => std::thread::sleep(EXIT_POLL_INTERVAL),
+            }
+        }
+
+        child.kill().context("failed to signal a plugin that ignored its closed stdin")?;
+        child.wait().context("failed to reap the plugin process")?;
+        Ok(())
     }
 
     /// Sends a `FileChanged` request for `file_path` to the plugin and
