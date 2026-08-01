@@ -154,6 +154,10 @@ struct CallerPage {
     /// See `Page::all_unresolved` - true when every caller in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
+    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
+    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +169,10 @@ struct CalleePage {
     /// See `Page::all_unresolved` - true when every callee in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
+    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
+    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
 }
 
 pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -174,6 +182,7 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Ok(node) => node,
         Err(finished) => return Ok(finished),
     };
+    let hint = anchor::file_anchor_hint(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -195,6 +204,7 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
+        hint,
     })
 }
 
@@ -205,6 +215,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Ok(node) => node,
         Err(finished) => return Ok(finished),
     };
+    let hint = anchor::file_anchor_hint(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -226,6 +237,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
+        hint,
     })
 }
 
@@ -612,6 +624,59 @@ mod tests {
         let body = json_body(&handle_callers(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
+    }
+
+    /// The footgun this hint closes: `symbol_name`/`symbol_id` resolution
+    /// doesn't filter by kind, so a name matching a file's basename anchors
+    /// on that `File` node exactly as if it were a declared symbol, and
+    /// neither `find_callers` nor `find_callees` ever walks a `CALLS` edge
+    /// incident on a File node - see `anchor::file_anchor_hint`. Both
+    /// directions get their own assertion here (unlike the small-page-size
+    /// loop test above, which proves the identical `list_calls` code once and
+    /// leans on the trivial A/B/C chain for the other direction) because each
+    /// `handle_*` builds its own response struct with its own `hint` field,
+    /// so only exercising one would leave the other's wiring unverified.
+    #[test]
+    fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies_for_both_directions() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"))
+            .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let callers = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() }).unwrap(),
+        );
+        let callers_hint = callers["hint"].as_str().expect("a File-anchored find_callers call must carry a hint");
+        assert!(callers_hint.contains("get_dependencies"), "{callers_hint}");
+        assert_eq!(callers["results"].as_array().unwrap().len(), 0);
+        assert_eq!(callers["hasMore"], false);
+        assert_eq!(callers["allUnresolved"], false);
+
+        let callees = json_body(
+            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() }).unwrap(),
+        );
+        let callees_hint = callees["hint"].as_str().expect("a File-anchored find_callees call must carry a hint");
+        assert!(callees_hint.contains("get_dependencies"), "{callees_hint}");
+        assert_eq!(callees["results"].as_array().unwrap().len(), 0);
+        assert_eq!(callees["hasMore"], false);
+        assert_eq!(callees["allUnresolved"], false);
+    }
+
+    /// Purely additive: an ordinary symbol anchor must never carry the
+    /// `hint` field at all, not even as `null`.
+    #[test]
+    fn a_normal_symbol_anchor_never_carries_a_hint_field() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let callers = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert!(callers.get("hint").is_none(), "hint must be entirely absent, not null: {callers}");
+
+        let callees = json_body(
+            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert!(callees.get("hint").is_none(), "hint must be entirely absent, not null: {callees}");
     }
 
     #[test]

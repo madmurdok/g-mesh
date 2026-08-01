@@ -24,6 +24,7 @@ use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 
+use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
 
@@ -49,6 +50,22 @@ pub(super) fn resolve(conn: &Connection, params: &SymbolQueryParams) -> Anchor {
             error("g-mesh: give either `symbol_id`, or `symbol_name` to have it resolved by name").map(Err)
         }
     }
+}
+
+/// Some when `node` is what `symbol_name`/`symbol_id` resolved to, but is a
+/// `File` node rather than a declared symbol - reachable because
+/// `queries::find_by_name`/`find_by_qualified_name` don't filter by kind, so a
+/// name that happens to match a file's basename resolves here instead of
+/// erroring. None of the four tools built on this anchor ever walk an edge
+/// kind incident on a File node in this direction (imports are `IMPORTS`
+/// edges into a Module node - get_dependencies's concern, not this anchor's),
+/// so every such call answers a technically-honest but useless empty page.
+pub(super) fn file_anchor_hint(node: &NodeRecord) -> Option<&'static str> {
+    (node.kind == pagination::FILE_KIND).then_some(
+        "This name resolved to a file, not a declared symbol, so the results above are \
+         always empty - none of this tool's edge kinds target a file. For \"what imports \
+         this file\" use get_dependencies(file_path, direction: \"Incoming\") instead.",
+    )
 }
 
 fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
