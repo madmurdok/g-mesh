@@ -2,20 +2,22 @@ pub mod build_stamp;
 pub mod bulk_index;
 pub mod identity;
 pub mod indexing_status;
+pub mod lifecycle;
 pub mod plugin;
 
 use std::fs::{self, File, TryLockError};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::plugin::PluginProcess;
+use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts, PluginSupervisor};
 use crate::gc::last_used;
 use crate::mcp;
 use crate::storage::connection::{self, project_dir};
@@ -41,6 +43,14 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// the shim holds that one *while* spawning the daemon, so a daemon waiting
 /// on it would deadlock against the shim waiting for the daemon.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
+
+/// How long the watcher thread blocks waiting for the next change before
+/// looping round to wait again. Nothing depends on the number - the loop is
+/// unconditional - it only keeps the thread from parking forever on a channel
+/// whose sender may have gone away. Deliberately not related to either idle
+/// timeout: the plugin's sleep is decided by `daemon::lifecycle`, never by how
+/// long this happened to wait.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The AF_UNIX socket a project's daemon listens on. The shim derives the
 /// same path from its own cwd, which is how the two find each other without
@@ -129,9 +139,8 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// Per-project daemon core: opens the SQLite index (checking schema
 /// version), binds the project's AF_UNIX socket, builds the initial index if
 /// the project has never been walked (`bulk_index`), registers the file
-/// watcher, and serves an MCP session per connection. Simplified MVP
-/// lifecycle - runs until killed; the two-tier idle-timeout model and
-/// `g-mesh stop` are backlog.
+/// watcher, and serves an MCP session per connection until it is stopped or
+/// its own long idle timeout expires (`daemon::lifecycle`).
 ///
 /// # Why the socket is bound before the index exists
 ///
@@ -237,19 +246,28 @@ pub fn run(root: &Path) -> Result<()> {
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
 
+    // Both idle timers are resolved once, here, and handed to everything that
+    // has to honor them - see `daemon::lifecycle` for what each one governs
+    // and where the numbers will come from once the TOML config lands.
+    let timeouts = IdleTimeouts::from_env();
+
     // A protocol mismatch (or the plugin failing to start at all) is a hard
     // daemon-startup failure, matching handshake::verify's philosophy - there
     // is nothing useful this daemon can do without its plugin.
-    let plugin = Arc::new(
-        PluginProcess::spawn(&canonical_root).context("failed to start the JS/TS plugin")?,
-    );
-    // Recorded as soon as it exists, not at the end of startup: a daemon that
-    // dies during its bulk walk would otherwise leave a running plugin behind
-    // that nothing outside this process could name (see `cli::stop`).
-    let plugin_pid_file = dir.join(PLUGIN_PID_FILE);
-    fs::write(&plugin_pid_file, plugin.pid().to_string()).with_context(|| {
-        format!("failed to write plugin pid file {}", plugin_pid_file.display())
-    })?;
+    //
+    // The supervisor, not the process, is what the rest of the daemon gets:
+    // from here on the plugin is allowed to be *absent* (asleep on its idle
+    // timeout) with file changes queueing up behind it, which nothing holding
+    // a bare process handle could express. Its pid is recorded as soon as it
+    // exists, not at the end of startup: a daemon that dies during its bulk
+    // walk would otherwise leave a running plugin behind that nothing outside
+    // this process could name (see `cli::stop`).
+    let plugin = PluginSupervisor::start(&canonical_root, dir.join(PLUGIN_PID_FILE), timeouts.plugin)?;
+
+    // Starts ticking at startup, so a daemon nobody ever connects to still
+    // goes away on its own eventually rather than living until the machine
+    // reboots.
+    let core_activity = CoreActivity::new();
 
     // Decided from a fact recorded on disk, not from how this start went, so
     // a restart against an already-walked project (the common case) is `ready`
@@ -260,13 +278,22 @@ pub fn run(root: &Path) -> Result<()> {
     // The accept loop moves to a thread of its own so the walk below can run
     // alongside it. It, not this function, is the daemon's real main loop;
     // what is left here is finite startup work, and this thread spends the
-    // rest of its life joining on it.
-    let accepting = {
+    // rest of its life supervising (`lifecycle::supervise`).
+    //
+    // Its outcome comes back over a channel rather than through `join`,
+    // because the supervising thread has to wake on a schedule of its own -
+    // and a `join` it could not interrupt is exactly what stopped the old MVP
+    // daemon from ever ending by itself.
+    let (accept_result, accept_loop) = mpsc::channel();
+    {
         let conn = Arc::clone(&conn);
         let plugin = Arc::clone(&plugin);
+        let core_activity = Arc::clone(&core_activity);
         let indexing = indexing.clone();
-        thread::spawn(move || serve_forever(listener, conn, plugin, indexing))
-    };
+        thread::spawn(move || {
+            let _ = accept_result.send(serve_forever(listener, conn, plugin, core_activity, indexing));
+        });
+    }
 
     // Cold start only, and before the watcher: a bulk walk racing incremental
     // updates could commit its own (older) parse of a file over one the
@@ -303,6 +330,10 @@ pub fn run(root: &Path) -> Result<()> {
         indexing.mark_ready();
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
+        // A walk that took minutes is minutes the core spent working, not
+        // minutes of silence - the same reasoning `last_used::touch` above
+        // applies to a GC scan, applied to the core's own idle timer.
+        core_activity.request();
         eprintln!(
             "g-mesh daemon: initial index built - {} nodes, {} edges ({} imports linked to their target file)",
             summary.nodes, summary.edges, summary.linked_imports
@@ -326,8 +357,8 @@ pub fn run(root: &Path) -> Result<()> {
         // acceptance criteria - left for a later pass rather than scope-
         // creeping into a batching rewrite here.
         thread::spawn(move || loop {
-            match watcher.next_change(Duration::from_secs(3600)) {
-                None => continue, // nothing arrived within the idle timeout; keep waiting
+            match watcher.next_change(WATCH_POLL_INTERVAL) {
+                None => continue, // nothing arrived within the poll window; keep waiting
                 Some(path) => {
                     let Some(file_path) = relative_wire_path(&root, &path) else {
                         // Outside the project root - shouldn't happen given how
@@ -335,20 +366,29 @@ pub fn run(root: &Path) -> Result<()> {
                         // route a plugin request for if it does.
                         continue;
                     };
-                    if let Err(err) = plugin.apply_file_change(&conn, file_path) {
-                        eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+                    if file_path.is_empty() {
+                        // The project root itself, which macOS reports as a
+                        // change to the directory a file was written in. There
+                        // is no file to reparse, and queueing it would put a
+                        // path the plugin cannot answer for into the replay
+                        // list a sleeping core builds.
+                        continue;
                     }
+                    // Applied now if the plugin is awake, queued for the next
+                    // request if it is asleep - the supervisor owns that
+                    // decision because only it can read both facts at once.
+                    plugin.file_changed(&conn, file_path);
                 }
             }
         });
     }
 
-    // The accept loop outlives every other piece of startup, so joining it is
-    // how this function blocks forever. It only ever returns by failing.
-    match accepting.join() {
-        Ok(result) => result,
-        Err(_) => bail!("the daemon's MCP accept loop panicked"),
-    }
+    // Startup is over; what is left is the two idle timers and the accept
+    // loop's outcome, whichever arrives first. `supervise` returning `Ok` is
+    // this daemon deciding it has been unused long enough to go - `main`
+    // returns and the OS reclaims the socket, the watchers and the SQLite
+    // handle.
+    lifecycle::supervise(&dir, &plugin, &core_activity, timeouts, accept_loop)
 }
 
 /// Runs the MCP accept loop until the process is killed.
@@ -364,10 +404,16 @@ pub fn run(root: &Path) -> Result<()> {
 /// `indexing` is cloned into every accepted session, which is what lets a
 /// connection made during the cold-start walk be answered honestly rather
 /// than refused - see `daemon::indexing_status`.
+///
+/// `core_activity` is what stops the core's own idle timeout from firing under
+/// a client that is merely quiet: every accepted connection holds a guard for
+/// as long as it lives, so only a project with nobody attached can ever be
+/// found idle.
 fn serve_forever(
     listener: UnixListener,
     conn: Arc<Mutex<Connection>>,
-    plugin: Arc<PluginProcess>,
+    plugin: Arc<PluginSupervisor>,
+    core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
 ) -> Result<()> {
     // Two workers: connections are few (one per MCP client) and their work is
@@ -394,8 +440,18 @@ fn serve_forever(
             let conn = Arc::clone(&conn);
             let plugin = Arc::clone(&plugin);
             let indexing = indexing.clone();
+            // Taken here rather than inside the task, so the count rises
+            // before this loop can come back round and consider the core
+            // unattended.
+            let attached = core_activity.connection_opened();
+            let core_activity = Arc::clone(&core_activity);
             tokio::spawn(async move {
-                if let Err(err) = mcp::serve_connection(stream, conn, plugin, indexing).await {
+                // Dropped when this session ends, whichever way it ends, which
+                // is also what restarts the core's idle clock.
+                let _attached = attached;
+                if let Err(err) =
+                    mcp::serve_connection(stream, conn, plugin, core_activity, indexing).await
+                {
                     eprintln!("g-mesh daemon: connection ended: {err:#}");
                 }
             });

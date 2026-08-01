@@ -205,6 +205,27 @@ is no rescan on start, so such a file is only picked up the next time it
 changes with a daemon up — or by deleting the project's state directory (see
 below) to force a fresh full walk.
 
+## Idle behaviour
+
+The daemon is two processes with very different costs, and each has its own
+idle timeout:
+
+- The **JS/TS plugin** (the expensive one — tree-sitter plus the TypeScript
+  compiler API in a Node process) exits after an hour with no reparse work.
+  While it is asleep the core keeps watching the project and remembers which
+  files changed; the next query wakes it and replays exactly that list, not
+  the whole project. `g-mesh status` reports it as `asleep`, which needs no
+  action.
+- The **daemon core** (socket, index handle, watcher) is cheap and stays up
+  across that, because re-registering fs watchers is the expensive part of a
+  start. It exits on its own only after 24 hours with no MCP requests and
+  nobody connected, releasing its socket and pid files; the next query
+  bootstraps a fresh daemon exactly as a first-ever query does. The index on
+  disk is untouched either way, so nothing is reindexed because of it.
+
+Both are configurable per project once the config file lands; today they are
+the defaults above.
+
 ## Tools exposed
 
 `find_definition`, `find_references`, `find_callers`, `find_callees`,
