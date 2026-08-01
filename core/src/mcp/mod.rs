@@ -404,47 +404,39 @@ impl ServerHandler for GMeshMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("g-mesh", env!("CARGO_PKG_VERSION")))
             .with_instructions(
+                // Claude Code truncates this field at 2KB (independent of, and not shared
+                // with, each tool's own 2KB description budget), and with tool search's
+                // default deferred loading this is the only trust signal a model sees
+                // before individual tool schemas even load - so the core anti-grep rule
+                // goes first, and the two legitimate exceptions stay concrete rather than
+                // getting cut mid-sentence. Keep this under ~1900 bytes with a safety
+                // margin; verify with the byte length, not a visual estimate, after editing.
                 "Structural code-graph queries over this project's index. Prefer these over \
                  grepping when you need definitions, references, call edges or imports.\n\n\
-                 Efficient usage: pass `symbol_name` directly to find_references/find_callers/\
-                 find_callees/find_implementations instead of calling find_definition first, and \
-                 raise `limit` for symbols with many results instead of paging - see each tool's \
-                 parameter docs for the exact mechanics (ambiguity handling, defaults).\n\n\
-                 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` (resolved to \
-                 the same symbol_id internally - identical guarantee either way, so passing \
-                 symbol_name directly per the efficiency note above does not lose it), is already \
-                 resolved per call site to that exact declaration - other same-named declarations' \
-                 call sites are excluded, so re-checking one with grep is wasted work. \
-                 `resolved: false` marks the one thing the indexer could not settle on its own: \
-                 an edge whose target is in *another* file, where whether that file is indexed \
-                 and really exports the name is not knowable from the usage alone. Everything \
-                 else - every edge whose target is declared in the same file as the usage - is \
-                 `resolved: true`, matched against the declarations actually in scope there, so \
-                 a same-file call site is never the reason to reach for grep. That makes \
-                 `resolved: false` a narrow, informative signal rather than a general disclaimer: \
-                 it is worth a look on that row, and only that row. \
-                 `find_references`/`find_callers`/`find_callees`/\
-                 `find_implementations` also carry a response-level `allUnresolved: true` when \
-                 *every* row in a non-empty `results` page is `resolved: false` - a legitimate \
-                 shape (genuinely unconfirmed name-matched edges), but one that otherwise reads \
-                 identically to an ordinary complete answer (`hasMore: false`, a plausible-looking \
-                 `results` array) unless every row is individually checked. Treat that whole page \
-                 as unconfirmed, not just its rows; it is never set on an empty page, since an \
-                 empty result has nothing to be suspicious of. One honest gap: a method call \
-                 reached through a variable receiver (`x.foo()`) produces no edge by design, so \
-                 caller/reference lists for methods can under-report. This is the ONLY \
-                 completeness gap: for bare function calls and `this`/`super`/qualified-type \
-                 calls, a `hasMore: false` page is exhaustive - every call site is already \
-                 accounted for, and grepping afterward to check for more just re-derives what \
-                 the response already guarantees. Only fall back to grep when you specifically \
-                 suspect a variable-receiver method call was missed, not as a routine \
-                 double-check.\n\n\
-                 One more response shape worth recognizing: on a project being indexed for the \
-                 first time (or re-indexed after an upgrade), every tool returns an error whose \
-                 text says the index is still being built. That is a temporary \"not yet\", not \
-                 \"not found\" - retry the same call after a few seconds rather than falling \
-                 back to grep or concluding the symbol does not exist. Any *other* error, and \
-                 any successful-but-empty result, means what it says.",
+                 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
+                 (excludes other same-named declarations' call sites, same guarantee either \
+                 way), is already resolved per call site to that exact declaration - do not \
+                 re-check it with grep as a routine habit. Only fall back to grep for one of \
+                 the two specific gaps below, never as a general double-check.\n\n\
+                 `resolved: false` marks the one thing the indexer could not settle alone: an \
+                 edge whose target is in *another* file, where whether that file exports the \
+                 name isn't knowable from the usage alone. Every same-file edge is \
+                 `resolved: true` - never a reason to grep. find_references/find_callers/\
+                 find_callees/find_implementations also carry a response-level \
+                 `allUnresolved: true` when *every* row in a non-empty page is unconfirmed - \
+                 the page otherwise looks complete (`hasMore: false`, plausible results), so \
+                 check this field, not just individual rows. Never set on an empty page.\n\n\
+                 Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
+                 call through a variable receiver (`x.foo()`) produces no edge by design, so \
+                 caller/reference lists for methods can under-report; bare function calls and \
+                 this/super/qualified-type calls have no such gap, and a `hasMore: false` \
+                 page for those is exhaustive. (2) On a project's first index, or a re-index \
+                 after an upgrade, every tool errors with a \"still building\" message - that \
+                 is temporary, retry after a few seconds rather than concluding the symbol \
+                 does not exist.\n\n\
+                 Efficient usage: pass `symbol_name` directly to the four tools above instead \
+                 of calling find_definition first, and raise `limit` for symbols with many \
+                 results instead of paging.",
             )
     }
 }
