@@ -35,6 +35,56 @@
 //! strictly a refinement of the same answer, not a third option: it either
 //! resolves to the real answer a few milliseconds later than a poll would
 //! have, or to the exact same "still indexing" this module already gave.
+//!
+//! # Why the incremental-edit watcher path does not re-arm this
+//!
+//! Task 111 asked the mirror question of 105/107's: does a query landing
+//! between a file write and the watcher's `apply_file_change` commit
+//! (`daemon::plugin::PluginProcess::apply_file_change`, driven by
+//! `daemon::run`'s watcher thread) deserve the same honesty this type gives
+//! a query landing during the cold-start walk? The answer settled on is no,
+//! for reasons specific to this second window that do not hold for the
+//! first:
+//!
+//! - **The window is narrower than it sounds, and for a reason worth
+//!   recording.** `daemon::run`'s watcher thread has no debounce actually
+//!   wired in - `watcher::debounce::Debouncer` is built and unit-tested but
+//!   never constructed there (see that function's own comment). So the gap a
+//!   query can land in is "OS file-watch event latency plus one
+//!   reparse-and-commit round trip to the plugin", not a deliberately
+//!   batched settling window. It only grows under a burst of near-simultaneous
+//!   writes (e.g. `git checkout`), and then only because changes are applied
+//!   one at a time, never because anything is waiting on purpose.
+//! - **It cannot be answered with a torn or half-built graph.**
+//!   `apply_file_change` holds the *same* `Arc<Mutex<Connection>>` every MCP
+//!   handler locks to answer a query, for the entire reparse-plus-commit, and
+//!   `storage::write::apply_diff` is one transaction. A query that arrives
+//!   while a commit is in flight simply blocks on that mutex until it
+//!   finishes and then reads the post-edit graph; only a query that arrives
+//!   *before* the watcher thread has pulled the change off its channel reads
+//!   pre-edit data - stale, but internally consistent. That is a strictly
+//!   narrower failure mode than cold start's, where a query mid-walk can see
+//!   nodes with no edges yet: a confidently *wrong* answer, not merely a
+//!   delayed one.
+//! - **Reusing this type's shape would widen the blast radius it is meant to
+//!   narrow.** `IndexingStatus` is deliberately one project-wide flag -
+//!   correct for the bulk walk, because the whole graph really is incomplete
+//!   until `mark_ready` fires. A single incremental edit touches one file.
+//!   Flipping the same global flag around every watcher commit would make an
+//!   unrelated query - about a file the edit never touched - pause or read
+//!   "still indexing" on every save in a live-edited project, which trades a
+//!   rare, narrow, internally-consistent staleness for a far more common
+//!   false positive. Honestly closing this window would need a per-file
+//!   signal, not a global one - a different and larger mechanism than this
+//!   type provides. `watcher::staleness::ensure_fresh` was written for close
+//!   to that shape (an mtime/hash check before answering) but, per this
+//!   investigation, is not currently called from any MCP handler - a real,
+//!   separate gap worth its own task, not a reason to bend this one into a
+//!   shape it does not fit.
+//!
+//! So `mark_ready` stays a once-only call from the bulk walk. See
+//! `docs/architecture/g-mesh-v1.md`'s "Ideas surfaced while comparing
+//! kungfu" subsection for the fuller writeup this decision closes out.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
