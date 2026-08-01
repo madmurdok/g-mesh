@@ -112,44 +112,57 @@ against. This is a per-project decision, orthogonal to the global-vs-per-project
 *scope* question the next section covers — that's about where a registration
 applies once you've decided to register at all.
 
-### Reducing self-verification cost (optional, trades away independent checking)
+### Reducing self-verification cost (optional)
 
 A repeated pattern in g-mesh-bench's own measurements
 (`../g-mesh-bench/docs/results/v0.4.0-disambiguation-tail-findings.md`):
 Claude Code often re-checks an already-correct, already-complete g-mesh
 answer with an extra manual grep anyway — on the benchmark's hardest
 disambiguation task this tail alone was 54-72% of that task's total spend.
-g-mesh's own MCP server instructions already state the completeness/
-correctness guarantees a `symbol_id`- or unambiguous-`symbol_name`-anchored
-result carries (see `find_callers`/`find_references`/etc.'s tool
-descriptions), but a live spot-check found that wording alone does not
-reliably stop the extra grep — even restated more explicitly, even with a
-neutral, non-suspicion-priming prompt, against a confirmed-freshly-rebuilt
-daemon.
+Restating the guarantees in the MCP server's own instructions did not stop
+it, in repeated live spot-checks.
 
-What *does* reliably work, per the same benchmark's `gmesh-trusted` arm: a
-one-sentence instruction placed directly in the task/project prompt, not just
-in the MCP server's own capability description. A server can't write into
-your project's prompt for you, but you can opt into the same effect yourself
-by adding something like this to your project's `CLAUDE.md`:
+Most of that turned out not to be a wording problem. Until this was fixed,
+*every* edge left the extractor `resolved: false`, including the ones it had
+matched against a declaration sitting in the same file — so on a typical
+`find_callers` result the majority of rows carried the marker that the tool
+instructions describe as the row worth double-checking. The agent's extra
+grep was a rational response to that. Two genuine wrong-edge bugs behind it
+were fixed at the same time (a call to a local shadowing a same-named
+file-level function, and a bare name matching a class member no bare name can
+reach), and a same-file edge now says `resolved: true`. Corpus-wide that
+moves `resolved: false` from 100% of edges to ~8% — the cross-file ones core
+really could not confirm.
+
+Measured on the same prompt against the same project, before and after
+(4 samples each, `claude -p`, sonnet): mean cost $0.081 → $0.050, mean turns
+6.5 → 4.25, and the long verification tails (one run spent 6 greps and 3 reads
+re-checking rows) disappeared. What is left in the "after" runs is a single
+grep serving a question g-mesh does not answer at all — "which *other*
+symbols have similar names?" — not a re-check of what it did answer.
+
+If you still want to trim that last step, put a short instruction in your
+project's `CLAUDE.md` (a task/project prompt reaches the model more reliably
+than a server capability description does):
 
 ```markdown
 ## g-mesh
 
 Treat g-mesh's tool results (find_definition, find_references, find_callers,
 find_callees, find_implementations, get_file_outline, get_dependencies) as
-authoritative and complete. Do not re-verify a result by additionally
-grepping or reading the source files it already covered — answer directly
-from g-mesh's output. Use Read/Grep/Glob only for information g-mesh cannot
-provide at all.
+complete for the question they answer: don't re-grep or re-read the files a
+result already covered just to confirm it. Two things are still worth
+checking, and grep is the right tool for both: a row marked
+`resolved: false` (the target is in another file and could not be confirmed),
+and anything the result does not claim to cover — e.g. which other symbols
+have similar names, or a method call made through a variable receiver.
 ```
 
-This is a genuine trade-off, not a free win: it removes the independent
-double-check that occasionally *does* catch a real gap (e.g. the
-variable-receiver method-call caveat the tool instructions already document).
-Worth adding if you've found g-mesh trustworthy for your codebase and want to
-stop paying for the redundant verification; skip it if you'd rather keep the
-model's default caution.
+Prefer that shape over a blanket "never verify anything". `resolved: false`
+is now a narrow, accurate flag rather than a blanket disclaimer, so an
+instruction that suppresses it throws away the one honest quality signal in
+the response — and the measurements above show the expensive part of the tail
+is already gone without it.
 
 ## Register with an MCP client
 
