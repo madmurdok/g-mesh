@@ -20,6 +20,7 @@
 //! command at a time.
 
 pub mod clean;
+pub mod config_wizard;
 pub mod reindex;
 pub mod status;
 pub mod stop;
@@ -114,7 +115,7 @@ pub fn run() -> Result<()> {
 fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Init => not_implemented("init"),
-        Command::Config { .. } => not_implemented("config"),
+        Command::Config { global } => config_wizard::run(global),
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
