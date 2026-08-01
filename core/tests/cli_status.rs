@@ -8,17 +8,61 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use g_mesh::config::{self, CleanupConfig, GlobalConfig};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
+use g_mesh::storage::schema;
+use rusqlite::Connection;
 
 mod common;
 use common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serializes the two tests below that rewrite the real
+/// `~/.g-mesh/config.toml`: with no override hook to point `config::mod` at
+/// a scratch directory, two threads flipping `cleanup.enabled` at the same
+/// time would race on that one shared file.
+static GLOBAL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Temporarily replaces `~/.g-mesh/config.toml` with a known value, and
+/// restores whatever (if anything) was there before it on drop - so a test
+/// exercising `cleanup.enabled` never leaves the developer's real global
+/// config mutated.
+struct GlobalConfigGuard {
+    path: PathBuf,
+    original: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl GlobalConfigGuard {
+    fn set(cfg: &GlobalConfig) -> Self {
+        let lock = GLOBAL_CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path =
+            config::global_config_path().expect("failed to resolve the global config path");
+        let original = std::fs::read_to_string(&path).ok();
+        config::write_global_config(cfg).expect("failed to write the global config");
+        Self { path, original, _lock: lock }
+    }
+}
+
+impl Drop for GlobalConfigGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(contents) => {
+                let _ = std::fs::write(&self.path, contents);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
 
 /// A project with a known, deliberately mixed index state.
 struct Project {
@@ -74,6 +118,22 @@ impl Project {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("status output is not valid UTF-8")
+    }
+
+    /// Builds this project's index with no daemon involved, and backdates
+    /// `lastUsed` by `idle_days` - the on-disk state a project idle past the
+    /// GC warning's threshold would have.
+    fn backdate_last_used(&self, idle_days: u64) {
+        std::fs::create_dir_all(self.state_dir()).expect("failed to create the state directory");
+        let conn = Connection::open(self.state_dir().join("index.db"))
+            .expect("failed to open index.db");
+        schema::ensure_current(&conn, &daemon::plugin::indexer_version())
+            .expect("failed to initialize the schema");
+        conn.execute(
+            "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
+            rusqlite::params![format!("-{idle_days} days")],
+        )
+        .expect("failed to backdate lastUsed");
     }
 }
 
@@ -199,4 +259,39 @@ fn status_on_a_project_that_was_never_indexed_reports_an_empty_state() {
     assert_contains(&status, "index coverage:  0.0% (0/2 source files)");
     assert_contains(&status, "dirty files:     2 awaiting reindex");
     assert_contains(&status, "syntax errors:   none");
+}
+
+/// Task #62's acceptance criterion: a project whose `lastUsed` is older
+/// than `cleanup.idleThresholdDays` makes `g-mesh status` print the GC
+/// warning naming it, when `cleanup.enabled` is on.
+#[test]
+fn status_warns_about_a_project_idle_past_the_threshold() {
+    let _config = GlobalConfigGuard::set(&GlobalConfig {
+        cleanup: CleanupConfig { enabled: true, idle_threshold_days: 90 },
+    });
+    let project = Project::new();
+    project.backdate_last_used(100);
+    let project_id =
+        project.state_dir().file_name().unwrap().to_string_lossy().into_owned();
+
+    let status = project.status();
+
+    assert_contains(&status, "idle for more than 90 days");
+    assert_contains(&status, &project_id);
+    assert_contains(&status, "g-mesh clean expired");
+}
+
+/// The other half of the same criterion: `cleanup.enabled = false` prints
+/// nothing at all, regardless of how idle a project is.
+#[test]
+fn status_prints_no_warning_when_cleanup_is_disabled() {
+    let _config = GlobalConfigGuard::set(&GlobalConfig {
+        cleanup: CleanupConfig { enabled: false, idle_threshold_days: 90 },
+    });
+    let project = Project::new();
+    project.backdate_last_used(100);
+
+    let status = project.status();
+
+    assert!(!status.contains("idle for more than"), "{status}");
 }

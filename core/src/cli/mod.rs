@@ -13,20 +13,23 @@
 //!   (`shim::spawn_detached_daemon`), never typed by a human, so it is hidden
 //!   from `--help` while staying exactly as parseable as before.
 //!
-//! Everything else is a human-facing command. The ones that are not built yet
-//! parse their documented arguments and then fail with a plain "not
-//! implemented yet" - the surface is declared up front, the way the MCP tool
-//! schemas were, so `--help` describes the finished CLI rather than growing a
-//! command at a time.
+//! Everything else is a human-facing command, and every one of them is
+//! implemented as of release 0.11.0 - the surface was declared up front, the
+//! way the MCP tool schemas were, so `--help` described the finished CLI
+//! before it grew a command at a time; `dispatch` below no longer has a
+//! `not_implemented` fallback to fall into.
 
 pub mod clean;
+pub mod config_wizard;
+pub mod init;
+pub mod plugins;
 pub mod reindex;
 pub mod status;
 pub mod stop;
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{daemon, shim};
@@ -113,22 +116,18 @@ pub fn run() -> Result<()> {
 /// taking over the process's real argv.
 fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Init => not_implemented("init"),
-        Command::Config { .. } => not_implemented("config"),
+        Command::Init => init::run(),
+        Command::Config { global } => config_wizard::run(global),
         Command::Status => status::run(),
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
-            PluginsCommand::List => not_implemented("plugins list"),
+            PluginsCommand::List => plugins::run(),
         },
         Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),
     }
-}
-
-fn not_implemented(name: &str) -> Result<()> {
-    bail!("`g-mesh {name}` is not implemented yet")
 }
 
 #[cfg(test)]
@@ -267,11 +266,5 @@ mod tests {
             daemon.is_hide_set(),
             "the shim's private daemon entry point must stay out of --help"
         );
-    }
-
-    #[test]
-    fn unimplemented_commands_fail_rather_than_pretending_to_work() {
-        let err = dispatch(Command::Init).expect_err("init is not built yet");
-        assert!(err.to_string().contains("not implemented"), "unexpected message: {err}");
     }
 }
