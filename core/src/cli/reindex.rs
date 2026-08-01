@@ -35,6 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
+use crate::daemon::plugin;
 use crate::storage::{connection, schema};
 
 /// What a `reindex` actually did.
@@ -64,7 +65,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
 
     let conn = connection::open(project_root)
         .context("failed to open the project's SQLite index")?;
-    schema::reset(&conn).context("failed to reset the project's index")?;
+    schema::reset(&conn, &plugin::indexer_version()).context("failed to reset the project's index")?;
 
     let canonical_root = project_root.canonicalize().with_context(|| {
         format!("failed to canonicalize project root {}", project_root.display())
