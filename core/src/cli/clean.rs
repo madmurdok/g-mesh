@@ -38,19 +38,16 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::cli::CleanArgs;
+use crate::config;
 use crate::daemon::{self, identity::project_hash};
 use crate::gc::last_used;
 use crate::storage::connection::projects_root;
 
-/// How long a project must go unused before `clean expired` will delete it.
-///
-/// The architecture doc puts this in `~/.g-mesh/config.toml` as
-/// `cleanup.idleThresholdDays`, but no config file exists yet (its own
-/// backlog ticket) - so the documented default is hard-coded here rather than
-/// a config system being invented around a single number.
-pub const IDLE_THRESHOLD_DAYS: u64 = 90;
-
-const IDLE_THRESHOLD: Duration = Duration::from_secs(IDLE_THRESHOLD_DAYS * 24 * 60 * 60);
+/// Converts a day count from `cleanup.idleThresholdDays` into the [`Duration`]
+/// [`Candidate::is_expired`] compares against.
+fn idle_threshold(idle_threshold_days: u64) -> Duration {
+    Duration::from_secs(idle_threshold_days * 24 * 60 * 60)
+}
 
 /// What a `clean` invocation is scoped to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +56,8 @@ pub enum Target {
     Cwd,
     /// One project, named by the `<hash>` directory it lives in.
     Project(String),
-    /// Every project idle for longer than [`IDLE_THRESHOLD_DAYS`].
+    /// Every project idle for longer than `cleanup.idleThresholdDays`
+    /// (default 90 - see [`config::CleanupConfig`]).
     Expired,
     /// Every project.
     All,
@@ -94,8 +92,17 @@ pub enum Outcome {
     /// One explicitly scoped project was deleted.
     Deleted { id: String, path: PathBuf },
     /// A bulk form ran. `skipped_running` names the projects it left alone
-    /// because a daemon was serving them.
-    DeletedMany { scope: Scope, ids: Vec<String>, skipped_running: Vec<String> },
+    /// because a daemon was serving them. `idle_threshold_days` is the
+    /// threshold actually applied (only meaningful for `Scope::Expired`, but
+    /// carried unconditionally so `render` never has to reconstruct it) -
+    /// from `cleanup.idleThresholdDays`, not necessarily the documented
+    /// default.
+    DeletedMany {
+        scope: Scope,
+        ids: Vec<String>,
+        skipped_running: Vec<String>,
+        idle_threshold_days: u64,
+    },
     /// `clean all` without `--force`: a count, and nothing touched.
     WouldDelete { count: usize },
 }
@@ -104,7 +111,14 @@ pub enum Outcome {
 pub fn run(args: &CleanArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     let root = projects_root().context("failed to resolve ~/.g-mesh/projects")?;
-    let outcome = clean(&Target::parse(args.target.as_deref()), args.force, &root, &cwd)?;
+    let idle_threshold_days = config::read_global_config()?.cleanup.idle_threshold_days;
+    let outcome = clean(
+        &Target::parse(args.target.as_deref()),
+        args.force,
+        &root,
+        &cwd,
+        idle_threshold_days,
+    )?;
     print!("{}", render(&outcome));
     Ok(())
 }
@@ -114,22 +128,26 @@ pub fn run(args: &CleanArgs) -> Result<()> {
 /// `projects_root` and `cwd` are parameters rather than read from the
 /// environment so that the whole command - including the variants that delete
 /// every project there is - can be tested against a directory that is not the
-/// developer's own.
+/// developer's own. `idle_threshold_days` is a parameter for the same reason:
+/// it is `cleanup.idleThresholdDays` from the global config, but read by the
+/// caller (`run`) rather than here, so a test can exercise a shortened
+/// threshold without a real `~/.g-mesh/config.toml` in the picture.
 pub fn clean(
     target: &Target,
     force: bool,
     projects_root: &Path,
     cwd: &Path,
+    idle_threshold_days: u64,
 ) -> Result<Outcome> {
     match target {
         Target::Cwd => clean_one(&cwd_project_id(cwd)?, projects_root, CwdScoped::Yes),
         Target::Project(id) => clean_one(id, projects_root, CwdScoped::No),
-        Target::Expired => clean_many(Scope::Expired, projects_root),
+        Target::Expired => clean_many(Scope::Expired, projects_root, idle_threshold_days),
         Target::All => {
             if !force {
                 return Ok(Outcome::WouldDelete { count: candidates(projects_root)?.len() });
             }
-            clean_many(Scope::All, projects_root)
+            clean_many(Scope::All, projects_root, idle_threshold_days)
         }
     }
 }
@@ -174,12 +192,13 @@ fn clean_one(id: &str, projects_root: &Path, scoped: CwdScoped) -> Result<Outcom
     Ok(Outcome::Deleted { id: id.to_string(), path })
 }
 
-fn clean_many(scope: Scope, projects_root: &Path) -> Result<Outcome> {
+fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> Result<Outcome> {
     let mut ids = Vec::new();
     let mut skipped_running = Vec::new();
+    let threshold = idle_threshold(idle_threshold_days);
 
     for candidate in candidates(projects_root)? {
-        if matches!(scope, Scope::Expired) && !candidate.is_expired() {
+        if matches!(scope, Scope::Expired) && !candidate.is_expired(threshold) {
             continue;
         }
         if candidate.daemon_running {
@@ -190,7 +209,7 @@ fn clean_many(scope: Scope, projects_root: &Path) -> Result<Outcome> {
         ids.push(candidate.id);
     }
 
-    Ok(Outcome::DeletedMany { scope, ids, skipped_running })
+    Ok(Outcome::DeletedMany { scope, ids, skipped_running, idle_threshold_days })
 }
 
 /// Rejects anything that is not a bare directory name.
@@ -220,8 +239,8 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn is_expired(&self) -> bool {
-        self.idle.is_some_and(|idle| idle > IDLE_THRESHOLD)
+    fn is_expired(&self, threshold: Duration) -> bool {
+        self.idle.is_some_and(|idle| idle > threshold)
     }
 }
 
@@ -293,19 +312,19 @@ pub fn render(outcome: &Outcome) -> String {
                  re-run with --force to confirm. Nothing was deleted.\n"
             )
         }
-        Outcome::DeletedMany { scope, ids, skipped_running } => {
+        Outcome::DeletedMany { scope, ids, skipped_running, idle_threshold_days } => {
             let mut out = String::new();
             match (scope, ids.len()) {
                 (Scope::Expired, 0) => {
                     let _ = writeln!(
                         out,
-                        "g-mesh: no project has been idle for more than {IDLE_THRESHOLD_DAYS} days"
+                        "g-mesh: no project has been idle for more than {idle_threshold_days} days"
                     );
                 }
                 (Scope::Expired, count) => {
                     let _ = writeln!(
                         out,
-                        "g-mesh: deleted {count} project index(es) idle for more than {IDLE_THRESHOLD_DAYS} days"
+                        "g-mesh: deleted {count} project index(es) idle for more than {idle_threshold_days} days"
                     );
                 }
                 (Scope::All, 0) => {
@@ -392,9 +411,25 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// The documented default (`cleanup.idleThresholdDays`) - mirrors
+    /// `config::CleanupConfig::default()` rather than hard-coding a second
+    /// `90` here, so the two can never quietly drift apart.
+    fn default_idle_threshold_days() -> u64 {
+        config::CleanupConfig::default().idle_threshold_days
+    }
+
     fn clean_in(projects: &Projects, target: Target, force: bool) -> Result<Outcome> {
+        clean_in_with_threshold(projects, target, force, default_idle_threshold_days())
+    }
+
+    fn clean_in_with_threshold(
+        projects: &Projects,
+        target: Target,
+        force: bool,
+        idle_threshold_days: u64,
+    ) -> Result<Outcome> {
         let cwd = unrelated_cwd();
-        clean(&target, force, projects.root(), cwd.path())
+        clean(&target, force, projects.root(), cwd.path(), idle_threshold_days)
     }
 
     /// `expect_err` with the offending input in the panic message.
@@ -469,7 +504,7 @@ mod tests {
         projects.add("aaaa1111", 1);
         let cwd = unrelated_cwd();
 
-        let err = clean(&Target::Cwd, false, projects.root(), cwd.path())
+        let err = clean(&Target::Cwd, false, projects.root(), cwd.path(), default_idle_threshold_days())
             .expect_err("this directory has no index");
 
         assert!(err.to_string().contains("pass an explicit <project-id>"), "{err}");
@@ -483,7 +518,9 @@ mod tests {
         let id = project_hash(cwd.path()).unwrap();
         projects.add(&id, 1);
 
-        let outcome = clean(&Target::Cwd, false, projects.root(), cwd.path()).unwrap();
+        let outcome =
+            clean(&Target::Cwd, false, projects.root(), cwd.path(), default_idle_threshold_days())
+                .unwrap();
 
         assert!(matches!(outcome, Outcome::Deleted { id: ref got, .. } if *got == id));
         assert!(!projects.exists(&id));
@@ -491,29 +528,68 @@ mod tests {
 
     #[test]
     fn expired_deletes_only_what_is_past_the_threshold() {
+        let threshold = default_idle_threshold_days();
         let projects = Projects::new();
-        projects.add("aaaa1111", IDLE_THRESHOLD_DAYS + 10);
-        projects.add("bbbb2222", IDLE_THRESHOLD_DAYS - 10);
-        projects.add("cccc3333", IDLE_THRESHOLD_DAYS + 200);
+        projects.add("aaaa1111", threshold + 10);
+        projects.add("bbbb2222", threshold - 10);
+        projects.add("cccc3333", threshold + 200);
 
         let outcome = clean_in(&projects, Target::Expired, false).unwrap();
 
         match outcome {
-            Outcome::DeletedMany { scope, ids, skipped_running } => {
+            Outcome::DeletedMany { scope, ids, skipped_running, idle_threshold_days } => {
                 assert_eq!(scope, Scope::Expired);
                 assert_eq!(ids, vec!["aaaa1111", "cccc3333"]);
                 assert!(skipped_running.is_empty());
+                assert_eq!(idle_threshold_days, threshold);
             }
             other => panic!("expected a bulk delete, got {other:?}"),
         }
         assert!(projects.exists("bbbb2222"), "a project inside the threshold must survive");
     }
 
+    /// The whole point of wiring the threshold to config: a shortened
+    /// `cleanup.idleThresholdDays` marks a project stale that the documented
+    /// default (90 days) would still consider fresh.
+    #[test]
+    fn a_shortened_config_threshold_expires_a_project_the_default_would_spare() {
+        let projects = Projects::new();
+        // Idle 10 days: well inside the 90-day default, so nothing here would
+        // move if the threshold were still hard-coded.
+        projects.add("aaaa1111", 10);
+
+        let outcome =
+            clean_in_with_threshold(&projects, Target::Expired, false, 5).unwrap();
+
+        match outcome {
+            Outcome::DeletedMany { ids, idle_threshold_days, .. } => {
+                assert_eq!(ids, vec!["aaaa1111"], "a 5-day threshold must treat 10 idle days as stale");
+                assert_eq!(idle_threshold_days, 5);
+            }
+            other => panic!("expected a bulk delete, got {other:?}"),
+        }
+        assert!(!projects.exists("aaaa1111"));
+    }
+
+    /// The same project, judged against the untouched 90-day default, must
+    /// survive - the config-driven threshold changes the outcome, not the
+    /// default itself.
+    #[test]
+    fn the_same_idle_time_survives_under_the_unshortened_default() {
+        let projects = Projects::new();
+        projects.add("aaaa1111", 10);
+
+        let outcome = clean_in(&projects, Target::Expired, false).unwrap();
+
+        assert!(matches!(outcome, Outcome::DeletedMany { ref ids, .. } if ids.is_empty()));
+        assert!(projects.exists("aaaa1111"));
+    }
+
     /// `expired` needs no `--force`: it is already scoped by the data.
     #[test]
     fn expired_needs_no_force() {
         let projects = Projects::new();
-        projects.add("aaaa1111", IDLE_THRESHOLD_DAYS + 1);
+        projects.add("aaaa1111", default_idle_threshold_days() + 1);
 
         clean_in(&projects, Target::Expired, false).unwrap();
 
@@ -625,10 +701,18 @@ mod tests {
         let cwd = unrelated_cwd();
 
         assert_eq!(
-            clean(&Target::All, false, &never_created, cwd.path()).unwrap(),
+            clean(&Target::All, false, &never_created, cwd.path(), default_idle_threshold_days())
+                .unwrap(),
             Outcome::WouldDelete { count: 0 }
         );
-        let outcome = clean(&Target::Expired, false, &never_created, cwd.path()).unwrap();
+        let outcome = clean(
+            &Target::Expired,
+            false,
+            &never_created,
+            cwd.path(),
+            default_idle_threshold_days(),
+        )
+        .unwrap();
         assert!(matches!(outcome, Outcome::DeletedMany { ref ids, .. } if ids.is_empty()));
     }
 

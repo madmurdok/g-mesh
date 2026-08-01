@@ -131,9 +131,10 @@ pub struct GlobalConfig {
 
 /// `[cleanup]`: the GC warning `cli::clean` and every other interactive
 /// command are documented to print (never an automatic deletion - see
-/// `cli::clean`'s module docs). Not wired to that warning yet; today
-/// `cli::clean::IDLE_THRESHOLD_DAYS` hard-codes the same default this struct
-/// documents.
+/// `cli::clean`'s module docs), plus the threshold `cli::clean::run` uses to
+/// decide what `clean expired` treats as stale. `idle_threshold_days` is
+/// wired to that deletion decision; `enabled` is not consulted there - it
+/// only gates the warning print, a separate consumer (task #62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CleanupConfig {
@@ -148,9 +149,9 @@ pub struct CleanupConfig {
 
 impl Default for CleanupConfig {
     fn default() -> Self {
-        // Documented default: architecture doc,
-        // "cleanup.idleThresholdDays (default 90)" - same value
-        // `cli::clean::IDLE_THRESHOLD_DAYS` hard-codes today.
+        // Documented default: architecture doc, "cleanup.idleThresholdDays
+        // (default 90)" - what `cli::clean::run` falls back to when no
+        // `~/.g-mesh/config.toml` exists.
         Self { enabled: true, idle_threshold_days: 90 }
     }
 }
