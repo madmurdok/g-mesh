@@ -5,10 +5,19 @@
 //! anchor" - `SUPERTYPE_OF` edges point subtype -> supertype (fromId is the
 //! implementing/extending type, toId is the interface/base type it points
 //! at), so "who implements this interface" is the `Incoming` direction,
-//! resolving each edge's `from_id`. Single-hop only by design: a class
-//! extending a class that implements the anchor interface must NOT show up
-//! here, only the direct implementor/extender does.
+//! resolving each edge's `from_id`. Single-hop by default: a class extending
+//! a class that implements the anchor interface does NOT show up in the
+//! default response, only the direct implementor/extender does - that is a
+//! deliberate, cheap default, not a limitation nothing can see past. An agent
+//! that genuinely needs the whole hierarchy (root-caused via a real
+//! g-mesh-bench run: a task asked for implementors "including classes that
+//! only get it indirectly by extending another implementation", and a session
+//! that trusted a single-hop `hasMore: false` page as complete missed two of
+//! them) can opt in with `transitive: true`, which walks the same
+//! `SUPERTYPE_OF` edges transitively via `graph::traversal` - see
+//! [`dispatch`] and [`from_root`].
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -19,9 +28,19 @@ use serde::Serialize;
 
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::graph::resume_token::{self, ResumeState, VisitedNode};
+use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
 
-use super::tool_result::{internal_error, success};
-use super::{anchor, SymbolQueryParams};
+use super::tool_result::{error, internal_error, success};
+use super::{anchor, FindImplementationsParams, SymbolQueryParams};
+
+/// The one edge kind both the single-hop and transitive walks follow -
+/// pulled out for the transitive path's own `TraversalOptions`/`ResumeState`
+/// construction; the single-hop path below still spells it as a literal in
+/// `list_implementations`'s `paginate_edges` call, which predates this
+/// constant and has its own passing test suite - not worth touching for a
+/// rename with zero behavior change.
+const SUPERTYPE_EDGE: &str = "SUPERTYPE_OF";
 
 /// One implementing/extending type on the other end of an inbound
 /// `SUPERTYPE_OF` edge.
@@ -134,6 +153,250 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         all_unresolved: page.all_unresolved,
         hint,
     })
+}
+
+/// One implementing/extending type reached by the transitive walk, at the
+/// hop count it was reached at rather than a `resolved` flag - a multi-hop
+/// path can't honestly carry one boolean the way a direct edge's
+/// [`ImplementationSite::resolved`] can; see `get_dependencies.rs`'s
+/// `DependencyNode` doc comment, which explains the identical omission for
+/// its own transitive rows.
+///
+/// `qualifiedName`/`startLine`/`startCol` follow the exact same
+/// File-kind-omits-them rule as `ImplementationSite`; in practice a
+/// `SUPERTYPE_OF` edge's `fromId` is never a `File` node, but the row shape
+/// doesn't special-case that away, matching `ImplementationSite`'s own
+/// doc comment.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransitiveImplementationSite {
+    implementing_symbol_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
+    kind: String,
+    file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
+    /// `SUPERTYPE_OF` hops from the anchor interface/base type. Always >= 1:
+    /// the anchor itself is the walk's depth-0 node and is not reported back
+    /// to the caller who named it, same convention as `get_dependencies`.
+    depth: u32,
+}
+
+impl From<ReachedNode> for TransitiveImplementationSite {
+    fn from(r: ReachedNode) -> Self {
+        let is_file = r.node.kind == pagination::FILE_KIND;
+        Self {
+            implementing_symbol_id: r.node.id,
+            qualified_name: (!is_file).then_some(r.node.qualified_name),
+            kind: r.node.kind,
+            file_path: r.node.file_path,
+            start_line: (!is_file).then_some(r.node.start_line),
+            start_col: (!is_file).then_some(r.node.start_col),
+            depth: r.depth,
+        }
+    }
+}
+
+/// The transitive walk's own response envelope - not the single-hop
+/// `ImplementationPage`'s `results`/`hasMore`/`nextCursor` shape, which has
+/// no depth semantics to express. Mirrors `get_dependencies.rs`'s
+/// `DependencyWalk` field-for-field (see that struct's own doc comment for
+/// why `frontierNodes`/`resumeToken` are each populated only by their own
+/// truncation cause), plus the one field this tool's single-hop response
+/// already has that a fresh walk can still need: `hint`, present only when
+/// the anchor resolved to a `File` node (see `anchor::file_anchor_hint`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransitiveImplementationWalk {
+    results: Vec<TransitiveImplementationSite>,
+    truncated: bool,
+    truncated_by: Option<&'static str>,
+    frontier_nodes: Vec<String>,
+    resume_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
+/// The wire spelling of each truncation cause - identical mapping to
+/// `get_dependencies.rs`'s own `wire_name`, plus this function's own
+/// `"responseSize"` for the same reason: fixed by
+/// `docs/architecture/g-mesh-v1.md`'s truncation contract, not a per-tool
+/// choice.
+fn wire_name(cause: TruncatedBy) -> &'static str {
+    match cause {
+        TruncatedBy::MaxDepth => "maxDepth",
+        TruncatedBy::MaxFanout => "maxFanout",
+        TruncatedBy::ExplorationBudget => "explorationBudget",
+    }
+}
+
+/// This tool's own `bound_walk`-equivalent: the exact same byte-budget
+/// second-cut pattern `get_dependencies.rs`'s `bound_walk` implements for its
+/// own row/response types, rebuilt here against
+/// `TransitiveImplementationSite`/`TransitiveImplementationWalk` rather than
+/// shared with it. Not generalized into one helper across both tools - this
+/// is only the second caller of the pattern, and each caller's row shape,
+/// response envelope and edge-direction convention differ enough that a
+/// shared version would need its own generic parameters and trait bounds to
+/// stand in for what are, today, three or four straightforward lines apiece.
+///
+/// Unlike `get_dependencies`, this tool's walk never varies `direction` or
+/// `edge_kind` - it is always `Incoming` over `SUPERTYPE_OF` - so, unlike
+/// that function, this one does not need either as a parameter; they are
+/// baked into the `ResumeState` built at the bottom instead.
+fn bound_walk(
+    result: TraversalResult,
+    max_depth: u32,
+    max_fanout: u32,
+    hint: Option<&'static str>,
+    prior_visited: Vec<VisitedNode>,
+    prior_walked: Vec<String>,
+) -> TransitiveImplementationWalk {
+    // Present only on a fresh walk: a resumed call's `nodes` excludes
+    // already-visited nodes (the anchor included), so `prior_visited` already
+    // carries it forward instead.
+    let anchor_id = result.nodes.first().filter(|n| n.depth == 0).map(|n| n.node.id.clone());
+
+    let mut dtos: Vec<TransitiveImplementationSite> = Vec::with_capacity(result.nodes.len());
+    for node in result.nodes {
+        if node.depth > 0 {
+            dtos.push(TransitiveImplementationSite::from(node));
+        }
+    }
+
+    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
+        return TransitiveImplementationWalk {
+            results: dtos,
+            truncated: result.truncated,
+            truncated_by: result.truncated_by.map(wire_name),
+            frontier_nodes: result.frontier_nodes,
+            resume_token: result.resume_token,
+            hint,
+        };
+    };
+
+    let mut visited = prior_visited;
+    if let Some(id) = anchor_id {
+        visited.push(VisitedNode { id, depth: 0 });
+    }
+    visited.extend(dtos[..cut].iter().map(|d| VisitedNode { id: d.implementing_symbol_id.clone(), depth: d.depth }));
+
+    let kept_ids: HashSet<&str> = dtos[..cut].iter().map(|d| d.implementing_symbol_id.as_str()).collect();
+    let mut walked = prior_walked;
+    // `Direction::Incoming`: the child this walk expanded through is always
+    // the edge's `from_id` (the implementing/extending type) - see this
+    // file's own module doc for the `SUPERTYPE_OF` direction convention.
+    walked.extend(result.edges.into_iter().filter_map(|e| kept_ids.contains(e.from_id.as_str()).then_some(e.id)));
+
+    let token = resume_token::encode(&ResumeState {
+        direction: Direction::Incoming,
+        edge_kind: Some(SUPERTYPE_EDGE.to_string()),
+        max_depth,
+        max_fanout,
+        visited,
+        walked,
+    });
+
+    TransitiveImplementationWalk {
+        results: dtos.into_iter().take(cut).collect(),
+        truncated: true,
+        truncated_by: Some("responseSize"),
+        frontier_nodes: Vec::new(),
+        resume_token: Some(token),
+        hint,
+    }
+}
+
+/// The transitive walk from a resolved anchor node, at
+/// `traversal::DEFAULT_MAX_DEPTH` (5) unless the caller narrows it -
+/// deliberately NOT `get_dependencies`'s own stricter default (2; see that
+/// tool's `DEFAULT_MAX_DEPTH` doc comment for the reasoning behind it). That
+/// tighter default exists because an `IMPORTS` walk can fan out from one
+/// shared, foundational module across an entire codebase, and that fan-out
+/// compounds with every extra hop of depth. A `SUPERTYPE_OF` hierarchy has no
+/// equivalent hub: a real class/interface hierarchy is a handful of levels of
+/// subclassing or interface implementation at most, nothing in the extractor
+/// makes "half the codebase extends this one type" a shape that occurs, so
+/// the walk engine's own generic, direction-agnostic default is the right
+/// one here rather than a tool-specific tightening.
+fn from_root(
+    conn: &Connection,
+    anchor_id: String,
+    hint: Option<&'static str>,
+    max_depth: Option<u32>,
+) -> Result<CallToolResult, ErrorData> {
+    let mut options = TraversalOptions::new(anchor_id, Direction::Incoming);
+    options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
+    if let Some(depth) = max_depth {
+        options.max_depth = depth;
+    }
+    let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
+
+    let result = traversal::traverse(conn, options)
+        .map_err(|e| internal_error("failed to walk the implementation hierarchy", e))?;
+    success(&bound_walk(result, max_depth, max_fanout, hint, Vec::new(), Vec::new()))
+}
+
+/// Continues a transitive walk the exploration budget or a prior
+/// `responseSize` cut left short. The token carries the anchor, depth/fanout
+/// limits and history of the walk it continues, so nothing about its shape is
+/// re-read from the parameters here - same contract as
+/// `get_dependencies.rs`'s own `continued`.
+///
+/// `hint` is always `None` here rather than recomputed: it only ever fires
+/// for a `File`-kind anchor, and a `File` node has no incoming `SUPERTYPE_OF`
+/// edges to walk, so a walk that reached a truncation cause worth resuming
+/// could never have started from one - there is no real case this drops.
+fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData> {
+    let state = resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
+    let ResumeState { max_depth, max_fanout, visited: prior_visited, walked: prior_walked, .. } = state;
+
+    let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
+        .map_err(|e| internal_error("failed to resume the implementation walk", e))?;
+    success(&bound_walk(result, max_depth, max_fanout, None, prior_visited, prior_walked))
+}
+
+/// The entry point `mod.rs` calls. Dispatches on `transitive`/`resume_token`
+/// and otherwise defers entirely to the unmodified single-hop [`handle`]:
+/// the non-transitive path here is not a reimplementation of that logic, it
+/// *is* that logic, called with a plain [`SymbolQueryParams`] built from this
+/// struct's shared fields - which is what makes the single-hop response
+/// byte-identical to what it was before this file gained a `transitive`
+/// concept, by construction rather than by parallel maintenance.
+pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementationsParams) -> Result<CallToolResult, ErrorData> {
+    let FindImplementationsParams { symbol_id, symbol_name, cursor, limit, file_paths, transitive, max_depth, resume_token } =
+        params;
+
+    if let Some(token) = resume_token {
+        // An anchor or `transitive` next to a token is a contradiction, not a
+        // preference to resolve silently: the token already names the walk
+        // it continues - same rule `get_dependencies.rs` applies to
+        // `resume_token` alongside `file_path`/`module_id`.
+        if symbol_id.is_some() || symbol_name.is_some() || transitive.is_some() {
+            return error(
+                "g-mesh: `resume_token` already carries the walk it continues - call it without `symbol_id`/`symbol_name`/`transitive`",
+            );
+        }
+        let conn = conn.lock().unwrap();
+        return continued(&conn, &token);
+    }
+
+    let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
+
+    if !transitive.unwrap_or(false) {
+        return handle(conn, symbol_params);
+    }
+
+    let conn = conn.lock().unwrap();
+    let anchor = match anchor::resolve(&conn, &symbol_params)? {
+        Ok(node) => node,
+        Err(finished) => return Ok(finished),
+    };
+    let hint = anchor::file_anchor_hint(&anchor);
+    from_root(&conn, anchor.id, hint, max_depth)
 }
 
 #[cfg(test)]
@@ -395,5 +658,275 @@ mod tests {
 
         seen.sort();
         assert_eq!(seen, vec!["impl_a", "impl_b", "impl_c"]);
+    }
+
+    // --- transitive mode -------------------------------------------------
+
+    /// The core backward-compatibility guarantee: `dispatch` (what `mod.rs`
+    /// now calls) with `transitive` absent must answer byte-for-byte the same
+    /// JSON the old, still-unmodified `handle` produces for the equivalent
+    /// `SymbolQueryParams` - not just "a similar shape". No transitive-only
+    /// field (`truncated`, `truncatedBy`, `frontierNodes`, `depth`) may leak
+    /// into it.
+    #[test]
+    fn dispatch_without_transitive_answers_byte_identically_to_the_unmodified_single_hop_handle() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let via_handle = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() }).unwrap(),
+        );
+        let via_dispatch = json_body(
+            &dispatch(&conn, FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+
+        assert_eq!(via_dispatch, via_handle, "transitive absent must be byte-identical to the pre-existing shape");
+        assert!(via_dispatch.get("truncated").is_none());
+        assert!(via_dispatch.get("truncatedBy").is_none());
+        assert!(via_dispatch.get("frontierNodes").is_none());
+        assert!(via_dispatch.get("depth").is_none());
+    }
+
+    /// The acceptance criteria's own motivating case: Interface <- ClassA <-
+    /// ClassB. `transitive: true` must reach both, at their correct hop
+    /// counts; absent and explicit `false` must still answer only the direct
+    /// implementor, exactly like today.
+    #[test]
+    fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_single_hop() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let absent = json_body(
+            &dispatch(&conn, FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() })
+                .unwrap(),
+        );
+        assert_eq!(absent["results"].as_array().unwrap().len(), 1, "absent transitive must stay single-hop");
+        assert_eq!(absent["results"][0]["implementingSymbolId"], "class_a");
+
+        let explicit_false = json_body(
+            &dispatch(
+                &conn,
+                FindImplementationsParams {
+                    symbol_id: Some("interface".to_string()),
+                    transitive: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(explicit_false, absent, "transitive: false must answer exactly like omitting it");
+
+        let walked = json_body(
+            &dispatch(
+                &conn,
+                FindImplementationsParams {
+                    symbol_id: Some("interface".to_string()),
+                    transitive: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let reached: Vec<(String, u64)> = walked["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["implementingSymbolId"].as_str().unwrap().to_string(), r["depth"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(reached, vec![("class_a".to_string(), 1), ("class_b".to_string(), 2)]);
+        assert_eq!(walked["truncated"], false);
+        assert!(walked["truncatedBy"].is_null());
+        assert_eq!(walked["frontierNodes"].as_array().unwrap().len(), 0);
+        assert!(walked["resumeToken"].is_null());
+    }
+
+    /// interface <- a <- b <- c <- d (`SUPERTYPE_OF` edges point subtype ->
+    /// supertype), so a transitive walk from `interface` reaches a (depth 1),
+    /// b (depth 2), c (depth 3), d (depth 4).
+    fn setup_deep_chain() -> Connection {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        for id in ["a", "b", "c", "d"] {
+            upsert_node(&mut conn, NodeRecord::new(id, "Type", id, format!("pkg::{id}"), format!("{id}.rs"), "rust")).unwrap();
+        }
+        upsert_edge(&mut conn, EdgeRecord::new("e_a_iface", "a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b_a", "b", "a", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c_b", "c", "b", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_d_c", "d", "c", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        conn
+    }
+
+    /// Truncation contract, cause one: the walk stopped at `max_depth`, so
+    /// the caller gets the boundary to re-root on and nothing else - same
+    /// contract `get_dependencies`'s own depth-cut test proves.
+    #[test]
+    fn a_max_depth_cut_reports_frontier_nodes_to_re_root_on() {
+        let conn = Arc::new(Mutex::new(setup_deep_chain()));
+        let params = FindImplementationsParams {
+            symbol_id: Some("interface".to_string()),
+            transitive: Some(true),
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        let body = json_body(&dispatch(&conn, params).unwrap());
+
+        let reached: Vec<(String, u64)> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["implementingSymbolId"].as_str().unwrap().to_string(), r["depth"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(reached, vec![("a".to_string(), 1), ("b".to_string(), 2)]);
+        assert_eq!(body["truncated"], true);
+        assert_eq!(body["truncatedBy"], "maxDepth");
+        assert_eq!(body["frontierNodes"], serde_json::json!(["b"]), "the level to re-root the same call on");
+        assert!(body["resumeToken"].is_null(), "a depth cut is re-rooted, not resumed");
+    }
+
+    /// Truncation contract, cause two: a node had more implementors than the
+    /// fan-out cap. `FindImplementationsParams` has no caller-facing
+    /// `max_fanout` knob (only `max_depth` is exposed, per the acceptance
+    /// criteria), so this drives `bound_walk` directly off a `TraversalResult`
+    /// built with a narrowed `TraversalOptions.max_fanout` - the same thing
+    /// `dispatch`/`from_root` would do internally, just with the one field
+    /// this tool's own params don't surface.
+    #[test]
+    fn a_max_fanout_cut_reports_max_fanout_with_no_continuation_field() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        for id in ["a", "b", "c"] {
+            upsert_node(&mut conn, NodeRecord::new(id, "Type", id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{id}"), id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
+                .unwrap();
+        }
+
+        let mut options = TraversalOptions::new("interface", Direction::Incoming);
+        options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
+        options.max_fanout = 1;
+        let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
+        let result = traversal::traverse(&conn, options).unwrap();
+        let walk = bound_walk(result, max_depth, max_fanout, None, Vec::new(), Vec::new());
+
+        assert_eq!(walk.results.len(), 1, "one of the three implementors, and a warning");
+        assert!(walk.truncated);
+        assert_eq!(walk.truncated_by, Some("maxFanout"));
+        assert!(walk.frontier_nodes.is_empty(), "a fanout cut is paginated per node, not re-rooted");
+        assert!(walk.resume_token.is_none());
+    }
+
+    /// Truncation contract, cause three: the response-size budget, continued
+    /// by its token across a resume chain whose union covers every
+    /// implementor exactly once - same property `get_dependencies`'s own
+    /// equivalent test proves for `IMPORTS`. Driven through `traverse` +
+    /// `bound_walk`/`continued` directly for the same reason as the fanout
+    /// test above: reaching this cause needs `max_fanout` wide enough to
+    /// clear this tool's own 50-per-level default, which
+    /// `FindImplementationsParams` does not expose.
+    #[test]
+    fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_implementor_once() {
+        let wide: usize = 600;
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        for i in 0..wide {
+            let id = format!("impl{i:05}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
+                .unwrap();
+        }
+
+        let mut options = TraversalOptions::new("interface", Direction::Incoming);
+        options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
+        options.max_fanout = 10_000;
+        let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
+        let result = traversal::traverse(&conn, options).unwrap();
+        let first = bound_walk(result, max_depth, max_fanout, None, Vec::new(), Vec::new());
+
+        assert!(!first.results.is_empty(), "at least one row must come back");
+        assert!(first.results.len() < wide, "one response must not hold all {wide} implementors: {}", first.results.len());
+        assert!(first.truncated);
+        assert_eq!(first.truncated_by, Some("responseSize"));
+        assert!(first.frontier_nodes.is_empty(), "a size cut is resumed, not re-rooted");
+
+        let mut all: Vec<String> = first.results.iter().map(|r| r.implementing_symbol_id.clone()).collect();
+        let mut token = first.resume_token.clone();
+        let mut calls = 1;
+
+        while let Some(t) = token {
+            let body = json_body(&continued(&conn, &t).unwrap());
+            calls += 1;
+            all.extend(body["results"].as_array().unwrap().iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
+            token = body["resumeToken"].as_str().map(str::to_string);
+            assert!(calls < 50, "the chain must converge, not re-explore itself forever: {calls} calls so far");
+        }
+
+        assert!(calls > 2, "a page far smaller than {wide} implementors must take more than one resume: only {calls} calls");
+
+        let mut deduped = all.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), all.len(), "no implementor may be returned twice across the chain");
+        assert_eq!(deduped.len(), wide, "the whole chain's union must be every implementor, exactly once");
+    }
+
+    /// An anchor or `transitive` next to a `resume_token` is a contradiction,
+    /// not a preference to resolve silently - same rule `get_dependencies`
+    /// applies to `resume_token` alongside `file_path`/`module_id`.
+    #[test]
+    fn resume_token_alongside_an_anchor_or_transitive_is_a_tool_level_error() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let with_symbol_id = dispatch(
+            &conn,
+            FindImplementationsParams {
+                symbol_id: Some("interface".to_string()),
+                resume_token: Some("whatever".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(error_text(&with_symbol_id).contains("resume_token"));
+
+        let with_symbol_name = dispatch(
+            &conn,
+            FindImplementationsParams {
+                symbol_name: Some("Iface".to_string()),
+                resume_token: Some("whatever".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(error_text(&with_symbol_name).contains("resume_token"));
+
+        let with_transitive_only = dispatch(
+            &conn,
+            FindImplementationsParams { transitive: Some(true), resume_token: Some("whatever".to_string()), ..Default::default() },
+        )
+        .unwrap();
+        assert!(error_text(&with_transitive_only).contains("resume_token"));
+    }
+
+    /// The same footgun `a_file_anchor_carries_a_hint_pointing_at_get_dependencies`
+    /// proves for the single-hop path must still be caught in transitive
+    /// mode: a name matching a file's basename anchors on that `File` node,
+    /// and no `SUPERTYPE_OF` edge is ever incident on one, so the walk is
+    /// honestly empty either way.
+    #[test]
+    fn a_file_anchor_hint_still_fires_in_transitive_mode() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"),
+        )
+        .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params =
+            FindImplementationsParams { symbol_id: Some("file".to_string()), transitive: Some(true), ..Default::default() };
+        let body = json_body(&dispatch(&conn, params).unwrap());
+
+        let hint = body["hint"].as_str().expect("a File-anchored transitive call must still carry a hint");
+        assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 0, "a File anchor still answers as an empty walk, not an error");
+        assert_eq!(body["truncated"], false);
+        assert!(body["resumeToken"].is_null());
     }
 }
