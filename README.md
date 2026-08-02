@@ -156,6 +156,9 @@ checking, and grep is the right tool for both: a row marked
 `resolved: false` (the target is in another file and could not be confirmed),
 and anything the result does not claim to cover — e.g. which other symbols
 have similar names, or a method call made through a variable receiver.
+find_implementations only returns direct implementors/extenders by default —
+pass transitive: true for indirect ones (a class extending another
+implementation).
 ```
 
 Prefer that shape over a blanket "never verify anything". `resolved: false`
