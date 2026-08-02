@@ -245,6 +245,7 @@ async fn get_dependencies_walks_real_files_in_both_directions_after_a_cold_start
         .as_array()
         .unwrap()
         .iter()
+        .filter(|row| row["kind"] == "Module")
         .map(|row| row["qualifiedName"].as_str().unwrap())
         .collect();
     assert!(
