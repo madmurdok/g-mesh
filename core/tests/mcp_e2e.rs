@@ -29,7 +29,10 @@ const EXPECTED_TOOLS: [(&str, &[&str]); 7] = [
     ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     ("find_definition", &["symbol_name", "file_path", "position", "cursor"]),
-    ("find_implementations", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
+    (
+        "find_implementations",
+        &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "transitive", "max_depth", "resume_token"],
+    ),
     ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     (
         "get_dependencies",

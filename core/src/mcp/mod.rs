@@ -350,16 +350,16 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_implementations",
-        description = "List the types that implement or extend the given interface, base class or abstract type."
+        description = "List the types that implement or extend the given interface, base class or abstract type. Direct implementors/extenders only by default; pass `transitive: true` to also include indirect ones (X extends Y extends the anchor), walked up to a bounded depth."
     )]
     async fn find_implementations(
         &self,
-        params: Parameters<SymbolQueryParams>,
+        params: Parameters<FindImplementationsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_implementations::handle(&self.conn, params.0)
+        find_implementations::dispatch(&self.conn, params.0)
     }
 
     #[tool(
@@ -486,6 +486,61 @@ pub struct SymbolQueryParams {
     /// search across the whole project; an empty array behaves identically
     /// to omitting it, not "match nothing".
     pub file_paths: Option<Vec<String>>,
+}
+
+/// `find_implementations`'s own params, not folded into `SymbolQueryParams`:
+/// the three fields below (`transitive`/`max_depth`/`resume_token`) name a
+/// transitive-walk concept `find_references`/`find_callers`/`find_callees`
+/// have no equivalent of, and adding them to the shared struct would put a
+/// `resume_token` field in front of three tools that can never populate or
+/// consume one.
+///
+/// The first five fields are a deliberate duplicate of `SymbolQueryParams`'s
+/// own - `find_implementations::dispatch` builds a `SymbolQueryParams` from
+/// them to reuse the existing single-hop `handle` unchanged, so their names,
+/// types and semantics must stay identical to that struct's.
+///
+/// `Default` is for the tests that construct this by hand - see
+/// `SymbolQueryParams`'s doc comment for why.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct FindImplementationsParams {
+    /// Id of the anchor symbol, as returned by `find_definition`. Give this
+    /// or `symbol_name`, never both.
+    pub symbol_id: Option<String>,
+    /// Alternative to `symbol_id` that skips the `find_definition` call -
+    /// resolved the same way (qualified name first, then bare name). If
+    /// ambiguous, returns a ranked candidate list (`ambiguous: true`);
+    /// re-call with a candidate's `id` as `symbol_id`.
+    pub symbol_name: Option<String>,
+    /// Opaque cursor from a previous page of results. Only meaningful when
+    /// `transitive` is absent/false - the transitive walk's own continuation
+    /// is `resume_token`, not this field.
+    pub cursor: Option<String>,
+    /// Maximum results (default 20, capped at 200) - raise for a wide result
+    /// set instead of paging via `cursor`. Ignored when `transitive: true`.
+    pub limit: Option<u32>,
+    /// Restrict results to rows whose implementing/extending node lives in
+    /// one of these files (project-relative, matching `file_path` exactly as
+    /// it appears elsewhere in this tool's own output - no prefix or glob
+    /// matching). Omit for the default, unscoped search across the whole
+    /// project; an empty array behaves identically to omitting it, not
+    /// "match nothing". Ignored when `transitive: true`.
+    pub file_paths: Option<Vec<String>>,
+    /// Walk the whole implementer/extender hierarchy instead of just the
+    /// direct one, up to `max_depth` hops (e.g. a class extending a class
+    /// that implements the anchor interface). Absent or `false` behaves
+    /// exactly as this tool always has: direct implementors/extenders only.
+    pub transitive: Option<bool>,
+    /// How many `extends`/`implements` hops to follow when `transitive:
+    /// true`. Defaults to the walk engine's own default (5) - a real type
+    /// hierarchy has nowhere near the fan-out risk an import graph does, so
+    /// this tool does not tighten it further. Ignored without `transitive:
+    /// true`.
+    pub max_depth: Option<u32>,
+    /// Opaque token from a previous, truncated transitive walk - continues
+    /// that walk exactly. Give this alone, without `symbol_id`/`symbol_name`/
+    /// `transitive`: the token already carries the walk it continues.
+    pub resume_token: Option<String>,
 }
 
 /// `Default` is for tests that construct this by hand - see
