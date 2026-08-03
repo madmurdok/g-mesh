@@ -562,6 +562,273 @@ export function run(): number {
   }
 });
 
+// --- question 3: which overload a call binds ------------------------------
+//
+// The structural layer cannot answer these at all. An edge is identified by
+// `(from, kind, to)`, so `parse("x")` and `parse(10, 16)` written in one
+// function are *one* edge pointing at the whole symbol, and the positions that
+// told them apart are gone by the time the walk ends.
+
+/** Two overload signatures plus an implementation, and a class method written
+ * the same way - the shapes "Overloads and merged declarations" is about. */
+const OVERLOADED_LIB = `export function parse(input: string): string[];
+export function parse(input: number, radix?: number): number;
+export function parse(input: string | number, radix?: number): unknown {
+  return typeof input === "string" ? [input] : Number(input);
+}
+`;
+
+/** Every `CALLS` edge the diff carries onto `targetId`, by the ordinal it
+ * bound - which is the whole shape this question produces. */
+function bindingsOnto(result: SemanticPassResult, targetId: string): Map<number, ExtractedEdge> {
+  const bound = new Map<number, ExtractedEdge>();
+  for (const edge of result.upsertEdges) {
+    if (edge.kind !== "CALLS" || edge.toId !== targetId) continue;
+    assert.equal(edge.source, "ts-compiler", "a bound edge is the checker's answer");
+    assert.equal(edge.resolved, true, "and needs nothing further from core");
+    assert.ok(edge.toDeclaration !== undefined, "and names a declaration");
+    assert.equal(bound.has(edge.toDeclaration), false, "one edge per ordinal, never two");
+    bound.set(edge.toDeclaration, edge);
+  }
+  return bound;
+}
+
+/** The structural pass's own `CALLS` edges for a file, by the caller's name -
+ * derived rather than hardcoded, so a test pins the binding and not a hash. */
+async function structuralCalls(root: string, file: string): Promise<Map<string, ExtractedEdge>> {
+  const source = await fs.readFile(path.join(root, file), "utf8");
+  const result = extractFile(file, source, { resolveSpecifier: createProjectResolver(root) });
+  const byId = new Map(result.nodes.map((node) => [node.id, node]));
+  const calls = new Map<string, ExtractedEdge>();
+  for (const edge of result.edges) {
+    if (edge.kind !== "CALLS") continue;
+    const from = byId.get(edge.fromId);
+    assert.ok(from, "a CALLS edge must come from a node of this file");
+    assert.equal(edge.source, "tree-sitter");
+    assert.equal(
+      edge.toDeclaration,
+      undefined,
+      "the structural walk can never say which overload a call bound",
+    );
+    calls.set(from.name, edge);
+  }
+  return calls;
+}
+
+test("a call of an overloaded function binds the overload TypeScript itself picks", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/lib.ts": OVERLOADED_LIB,
+    "src/use.ts": `import { parse } from "./lib";
+
+export function useString(): string[] {
+  return parse("x") as string[];
+}
+
+export function useNumber(): number {
+  return parse(10, 16);
+}
+`,
+  });
+  const project = new SemanticProject(root);
+  try {
+    const structural = await structuralCalls(root, "src/use.ts");
+    const parseId = await declarationId(root, "src/lib.ts", "parse");
+    // Both callers collapse onto the same symbol, and the structural layer has
+    // nothing to distinguish them by - which is the gap being closed.
+    assert.equal(structural.get("useString")?.toId, structural.get("useNumber")?.toId);
+
+    const diff = await runSemanticPass(root, ["src/use.ts"], { project });
+    const bound = bindingsOnto(diff, parseId);
+
+    // Ordinal 0 is `parse(input: string)`, ordinal 1 `parse(input: number, ...)`
+    // - source order, which is what a declaration list is ordered by.
+    assert.deepEqual([...bound.keys()].sort(), [0, 1]);
+    assert.equal(bound.get(0)?.fromId, structural.get("useString")?.fromId);
+    assert.equal(bound.get(1)?.fromId, structural.get("useNumber")?.fromId);
+
+    // The collapsed edges go out in the same diff that replaces them, or the
+    // graph would carry a third `CALLS` edge saying strictly less.
+    assert.deepEqual(
+      [...diff.deleteEdgeIds].sort(),
+      [structural.get("useString")!.id, structural.get("useNumber")!.id].sort(),
+    );
+
+    // The target travels with the edges, declaration list and all, so the diff
+    // cannot land core in a dangling-foreign-key state.
+    const target = diff.upsertNodes.find((node) => node.id === parseId);
+    assert.ok(target, "the declaration must travel with the edges");
+    assert.deepEqual(
+      target.declarations?.map((declaration) => [declaration.ordinal, declaration.hasBody]),
+      [
+        [0, false],
+        [1, false],
+        [2, true],
+      ],
+      "two signatures and the implementation TypeScript never shows a caller",
+    );
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one caller calling two overloads keeps both bindings instead of collapsing them", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/lib.ts": OVERLOADED_LIB,
+    "src/use.ts": `import { parse } from "./lib";
+
+export function useBoth(): number {
+  const words = parse("x") as string[];
+  return parse(10, 16) + words.length;
+}
+`,
+  });
+  const project = new SemanticProject(root);
+  try {
+    const structural = await structuralCalls(root, "src/use.ts");
+    const collapsed = structural.get("useBoth");
+    assert.ok(collapsed, "the structural pass emits one edge for both calls");
+    const parseId = await declarationId(root, "src/lib.ts", "parse");
+
+    const diff = await runSemanticPass(root, ["src/use.ts"], { project });
+    const bound = bindingsOnto(diff, parseId);
+
+    // The reason `toDeclaration` is part of the edge id: with it outside, the
+    // second binding would overwrite the first and one of the two calls would
+    // simply vanish from the graph.
+    assert.deepEqual([...bound.keys()].sort(), [0, 1]);
+    assert.equal(bound.get(0)!.fromId, collapsed.fromId);
+    assert.equal(bound.get(1)!.fromId, collapsed.fromId);
+    assert.notEqual(bound.get(0)!.id, bound.get(1)!.id, "two bindings, two edges");
+    assert.deepEqual(diff.deleteEdgeIds, [collapsed.id]);
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an overloaded method called through `this` binds the matching signature", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/repo.ts": `export class Repo {
+  find(id: string): string;
+  find(id: number): number;
+  find(id: string | number): string | number {
+    return id;
+  }
+
+  byName(): string {
+    return this.find("a") as string;
+  }
+
+  byIndex(): number {
+    return this.find(7) as number;
+  }
+}
+`,
+  });
+  const project = new SemanticProject(root);
+  try {
+    const structural = await structuralCalls(root, "src/repo.ts");
+    const findId = structural.get("byName")?.toId;
+    assert.ok(findId, "`this.find(...)` is a CALLS edge the structural pass does emit");
+    // The method's overloads are one node under the (path, kind, qualifiedName,
+    // nativeKind) rule, so both callers already point at the same place.
+    assert.equal(structural.get("byIndex")?.toId, findId);
+
+    const diff = await runSemanticPass(root, ["src/repo.ts"], { project });
+    const bound = bindingsOnto(diff, findId);
+
+    assert.deepEqual([...bound.keys()].sort(), [0, 1]);
+    assert.equal(bound.get(0)!.fromId, structural.get("byName")!.fromId);
+    assert.equal(bound.get(1)!.fromId, structural.get("byIndex")!.fromId);
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The filter that keeps this from being one subprocess round trip per call in
+ * the project: a call whose target is written once has nothing to choose
+ * between, and is dropped without the checker ever being started.
+ */
+test("a call of an ordinary function is never asked about, so no child is started", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/lib.ts": "export function parse(input: string): string[] {\n  return [input];\n}\n",
+    "src/use.ts":
+      'import { parse } from "./lib";\n\nexport function run(): string[] {\n  return parse("x");\n}\n',
+  });
+  const project = new SemanticProject(root);
+  try {
+    const diff = await runSemanticPass(root, [], { project });
+    assert.deepEqual(diff.upsertEdges, []);
+    assert.deepEqual(diff.deleteEdgeIds, []);
+    assert.equal(project.isRunning, false, "deciding that costs no ~265MB child");
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A binding is an edge id no other pass produces, so nothing else can retract
+ * it: deleting the call that made it has to be this pass's own job.
+ */
+test("deleting one of two overloaded calls retracts the binding it left behind", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/lib.ts": OVERLOADED_LIB,
+    "src/use.ts": `import { parse } from "./lib";
+
+export function useBoth(): number {
+  const words = parse("x") as string[];
+  return parse(10, 16) + words.length;
+}
+`,
+  });
+  try {
+    const parseId = await declarationId(root, "src/lib.ts", "parse");
+    const before = bindingsOnto(await pass(root, ["src/use.ts"]), parseId);
+    assert.deepEqual([...before.keys()].sort(), [0, 1]);
+
+    // The `number` call goes away; the `string` one stays. A fresh child per
+    // pass, exactly as the namespace half's own retraction test does: an open
+    // file's content is client-owned, and keeping tsserver in step with an edit
+    // is the incremental pass's ticket, not this one's.
+    await fs.writeFile(
+      path.join(root, "src/use.ts"),
+      `import { parse } from "./lib";
+
+export function useBoth(): number {
+  return (parse("x") as string[]).length;
+}
+`,
+      "utf8",
+    );
+    resetIncrementalState();
+    const diff = await pass(root, ["src/use.ts"]);
+
+    const after = bindingsOnto(diff, parseId);
+    assert.deepEqual([...after.keys()], [0], "only the surviving call is bound");
+    assert.equal(
+      diff.deleteEdgeIds.includes(before.get(1)!.id),
+      true,
+      "and the deleted call's binding does not outlive its source line",
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 /**
  * A file importing the same symbol both ways addresses one placeholder from
  * two directions - the address is all a node id is derived from. The pass must

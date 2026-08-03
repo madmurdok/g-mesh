@@ -366,6 +366,7 @@ test("an incremental reparse yields exactly what a full parse of the new text wo
       edges,
       hasSyntaxErrors: expected.hasSyntaxErrors,
       namespaceMemberUses: expected.namespaceMemberUses,
+      overloadCallSites: expected.overloadCallSites,
     };
   }
 });

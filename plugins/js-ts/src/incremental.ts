@@ -287,6 +287,7 @@ const EMPTY_RESULT: ExtractResult = {
   edges: [],
   hasSyntaxErrors: false,
   namespaceMemberUses: [],
+  overloadCallSites: [],
 };
 
 function diffResults(
