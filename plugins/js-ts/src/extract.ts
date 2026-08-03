@@ -1583,7 +1583,36 @@ class Extractor {
     });
   }
 
-  /** `require("x")` / `import("x")` with a literal specifier, same as a static import. */
+  /**
+   * `require("x")` / `import("x")` with a literal specifier, same as a
+   * static import. A *computed* specifier - `import(\`./plugins/${name}\`)`,
+   * `import(getPath())` - is not: this asks only whether the whole first
+   * argument node is itself a string/template literal, so anything computed
+   * is meant to fall through to `false`, leaving the call recorded as an
+   * ordinary unresolved-name call (see `handleCall`) rather than an IMPORTS
+   * edge - with one existing exception, below.
+   *
+   * That exception is a real bug, not a feature: `stringLiteralValue` on a
+   * `template_string` with interpolation returns whichever `string_fragment`
+   * happens to come first among its named children, unconditionally, never
+   * `undefined` for that shape. So `import(\`./plugins/${name}/index\`)` is
+   * recorded today as an IMPORTS edge to the literal path `./plugins/` - a
+   * silently *wrong* resolution, worse than the honestly-missing edge this
+   * method is supposed to produce for anything it cannot resolve. Whichever
+   * ticket implements the statically-safe subset below must close this
+   * rather than build on top of it.
+   *
+   * Which computed shapes are worth resolving statically, and which are a
+   * deliberate, permanent limit, is scoped in full in
+   * `docs/architecture/g-mesh-v1.md` ("Computed import specifiers"). Short
+   * version: a template built purely from same-file `const`/enum-member
+   * constants folds without running anything and needs no compiler help,
+   * just deferring this call past the walk the way `pendingCalls` already
+   * does; a specifier that is the return value of an arbitrary call, or
+   * reads `process.env`/argv, cannot be resolved by any static pass -
+   * tree-sitter or the full type checker alike - and is an intentional, final
+   * limit, not a gap to close later.
+   */
   private recordCallImport(node: SyntaxNode): boolean {
     const args = node.childForFieldName("arguments");
     const first = args?.namedChildren[0];
