@@ -206,6 +206,15 @@ Structural graph is available almost immediately; semantic resolution
 (`source: 'ts-compiler'`, `resolved: true`) fills in asynchronously without
 blocking tool availability.
 
+"Asynchronously" is a statement about *answers*, not about the wire. The
+pass is requested over the ordinary synchronous control plane
+(`semanticPass`, below): core sends one request and waits for its diff, the
+same way it waits for a `fileChanged` diff. What makes it non-blocking is
+where it sits — the walk's index is committed and the daemon is already
+serving off it before the request goes out, so no tool call waits on the
+checker, and a pass that fails or never answers costs the graph nothing it
+had.
+
 <a id="bind-before-walk"></a>The socket is bound **before** the cold-start
 walk, not after it. The invariant is unchanged — *no caller is ever served off
 a half-built graph* — but it is enforced in the response rather than in the
@@ -571,7 +580,8 @@ tighter default.
 
 ### Core ↔ language plugin protocol
 
-- **Control plane** (reindex requests, file-changed notifications, status):
+- **Control plane** (reindex requests, file-changed notifications, status,
+  semantic-pass requests):
   JSON-RPC 2.0 with LSP-style framing (`Content-Length` header + JSON body)
   — chosen partly so a `tsserver`-based plugin needs little adapter code.
   Measured against a real `tsserver` (see [TS semantic layer](#ts-semantic-layer)),
@@ -595,6 +605,27 @@ tighter default.
   (first-party or third-party) against the protocol — correct edge
   kinds/types, valid NDJSON framing — independent of how complete that
   plugin's language coverage is.
+- **`semanticPass`**: core asks for the semantic layer's answer with a
+  control-plane request like any other — core-initiated, one round trip,
+  answered with the *same* diff shape `fileChanged` answers with. It is sent
+  at two moments: once the cold-start walk has committed and the daemon has
+  begun serving off it, and again after each incremental reparse settles.
+  Its `params.filePaths` is a list rather than a single path because those
+  two moments differ in kind; an **empty** list is the cold-start case and
+  means "everything indexed so far", not "nothing".
+
+  The diff it answers with goes through the pipeline an ordinary reparse
+  already runs (`apply_diff` → `imports::link_diff` →
+  `symbol_links::link_diff`) and needs no storage or schema work of its own:
+  an edge id is derived from the edge's content, so a re-sent edge is
+  upserted onto its existing row, flipping exactly its `source`
+  (`tree-sitter` → `ts-compiler`) and `resolved` (`false` → `true`) and
+  leaving every edge the pass did not answer for untouched.
+
+  A failed pass is logged and dropped, never propagated. It improves a graph
+  that is already committed and serviceable, so failing the reparse (or
+  daemon startup) because the checker was unavailable would trade a better
+  answer that did not arrive for a worse one that did.
 
 <a id="ts-semantic-layer"></a>
 ### TS semantic layer: `tsserver` subprocess, not the in-process compiler API
