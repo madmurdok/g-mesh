@@ -17,6 +17,9 @@
 //    file of this project - relative, or a package of its own workspace - are
 //    resolved to a real path here (see `recordImport`); core turns that into a
 //    `resolved: true` edge once it has confirmed the target is in the index.
+//    A *computed* `import()`/`require()` specifier is the same edge whenever
+//    this file's own constants are enough to compute it, and no edge at all
+//    otherwise - never a partial one (see `recordCallImport`).
 //  - Symbols reached *through* such a specifier ride on the same handshake: a
 //    call or reference to an imported name gets a pending-symbol placeholder
 //    (see `PENDING_SYMBOL_NATIVE_KIND`) naming the file and the export it is
@@ -479,6 +482,45 @@ interface PendingCall {
   readonly objectName?: string;
 }
 
+/**
+ * An `import()`/`require()` whose first argument is *shaped* like something
+ * this pass can fold to one or more literal specifiers, kept until the walk is
+ * over for the same reason [`PendingCall`] is: the constants it interpolates
+ * are ordinary file-level declarations, and a declaration may well be written
+ * below the call that reads it (an `import()` inside a function body, a
+ * `const` at the bottom of the module). Deciding at the call site would resolve
+ * exactly the imports whose constants happen to come first.
+ *
+ * Whether it folds at all is only settled in [`Extractor.resolveCallImport`];
+ * "shaped like" is the cheap syntactic pre-test ([`isFoldableSpecifierShape`]),
+ * which is all that is needed to keep a specifier that could never fold - a
+ * bare function call, `process.env.X` - on exactly the path it took before.
+ */
+interface PendingCallImport {
+  /** The call's first argument: the specifier expression itself. */
+  readonly specifier: SyntaxNode;
+  readonly scope: Scope;
+  /**
+   * What to fall back to when the fold fails, for `require(...)` only: the
+   * call it would have been recorded as had this never looked like an import
+   * (see [`Extractor.handleCall`]). `import(...)` is not a call of anything
+   * nameable, so it has none.
+   */
+  readonly fallbackCall: PendingCall | null;
+}
+
+/**
+ * A file-level `const` whose initializer is kept for constant folding: the
+ * expression itself rather than a folded value, because folding it may need to
+ * fold *another* constant, and the order declarations are walked in says
+ * nothing about the order they read each other in.
+ */
+interface ConstantInitializer {
+  readonly value: SyntaxNode;
+  /** The scope the initializer is written in - what names it can reach. */
+  readonly scope: Scope;
+}
+
 interface PendingReference {
   readonly name: string;
   readonly scope: Scope;
@@ -539,6 +581,58 @@ const FUNCTION_VALUE_TYPES = new Set([
   "generator_function",
 ]);
 
+/** How Node's path module is spelled as a specifier. */
+const PATH_MODULE_SPECIFIERS: ReadonlySet<string> = new Set(["path", "node:path"]);
+
+/**
+ * The `path` members that are pure arithmetic on their arguments, so that a
+ * call of one made entirely of literals *is* a literal. Deliberately just
+ * these two: everything else on that module either reads the filesystem or
+ * answers a question about a path rather than building one.
+ */
+const PATH_JOIN_MEMBERS: ReadonlySet<string> = new Set(["join", "resolve"]);
+
+/**
+ * Whether an `import()`/`require()` argument is worth deferring for a fold
+ * attempt at all - a purely syntactic question, asked at the call site so that
+ * a shape no fold could ever read (`import(getPath())`, `import(a + b)`) keeps
+ * taking exactly the path it took before this existed, without waiting until
+ * the end of the walk to say so. A `true` here promises nothing about the fold
+ * succeeding; see [`Extractor.foldSpecifiers`].
+ */
+function isFoldableSpecifierShape(node: SyntaxNode): boolean {
+  switch (node.type) {
+    // A literal, or a template that may or may not interpolate.
+    case "string":
+    case "template_string":
+    // `cond ? "./a" : "./b"` - one edge per branch, if every branch folds.
+    case "ternary_expression":
+    // A name that may be bound to a literal (`SPECIFIER`, `Plugin.Foo`).
+    case "identifier":
+    case "member_expression":
+      return true;
+    // `path.join(__dirname, ...)` and nothing else shaped like a call.
+    case "call_expression":
+      return isPathArithmeticShape(node);
+    default:
+      return false;
+  }
+}
+
+/** `<identifier>.join(...)` / `<identifier>.resolve(...)`, whatever the receiver
+ * turns out to be - which only [`Extractor.foldPathCall`] can say. */
+function isPathArithmeticShape(node: SyntaxNode): boolean {
+  const callee = node.childForFieldName("function");
+  if (callee?.type !== "member_expression") return false;
+  const object = callee.childForFieldName("object");
+  const property = callee.childForFieldName("property");
+  return (
+    object?.type === "identifier" &&
+    property !== null &&
+    PATH_JOIN_MEMBERS.has(property.text)
+  );
+}
+
 class Extractor {
   private readonly nodes = new Map<string, ExtractedNode>();
   private readonly edges = new Map<string, ExtractedEdge>();
@@ -555,7 +649,25 @@ class Extractor {
    * a module whose members need a checker to attribute.
    */
   private readonly namespaceBindings = new Map<string, ImportBinding>();
+  /**
+   * Local names bound to Node's `path` module - `import * as path`,
+   * `import path from`, `const path = require("node:path")`. Kept apart from
+   * both import maps above for the same reason they are kept apart from each
+   * other: this name stands for neither a symbol nor a module of *this*
+   * project (`node:path` resolves to nothing here), and the only question ever
+   * asked of it is whether `path.join(...)` at some site is real path
+   * arithmetic - see [`foldPathCall`].
+   */
+  private readonly pathModuleBindings = new Set<string>();
+  /** Node id of a file-level `const` -> the initializer to fold, for the
+   * constants a computed specifier may interpolate. */
+  private readonly constantInitializers = new Map<string, ConstantInitializer>();
+  /** `<enum qualifiedName>.<member>` -> the string literal it is initialized
+   * to. Enum members are not graph symbols, so this is the only record of
+   * them, and it exists only to fold `import(`./p/${Plugin.Foo}`)`. */
+  private readonly enumMemberValues = new Map<string, string>();
   private readonly pendingCalls: PendingCall[] = [];
+  private readonly pendingCallImports: PendingCallImport[] = [];
   private readonly pendingReferences: PendingReference[] = [];
   private readonly pendingSupertypes: PendingSupertype[] = [];
   private readonly pendingMemberAccesses: PendingMemberAccess[] = [];
@@ -860,6 +972,32 @@ class Extractor {
     if (!source) return;
     const targetPath = this.recordImport(source);
     if (targetPath !== null) this.recordImportBindings(node, targetPath);
+    this.recordPathModuleBinding(node, stringLiteralValue(source));
+  }
+
+  /**
+   * `import * as path from "node:path"` / `import path from "path"`: the one
+   * import of a module *outside* this project whose local name is worth
+   * keeping, because `path.join(__dirname, "./x")` written against it is a
+   * specifier this pass can compute (see [`foldPathCall`]).
+   *
+   * Named imports (`import { join } from "path"`) are deliberately not
+   * recorded: what they bind is a bare `join(...)` with no receiver to
+   * recognise, and a bare name is exactly what this pass refuses to guess at.
+   */
+  private recordPathModuleBinding(statement: SyntaxNode, specifier: string | undefined): void {
+    if (specifier === undefined || !PATH_MODULE_SPECIFIERS.has(specifier)) return;
+    const clause = statement.children.find((child) => child.type === "import_clause");
+    if (!clause) return;
+    for (const child of clause.namedChildren) {
+      if (child.type === "identifier") {
+        this.pathModuleBindings.add(child.text);
+        continue;
+      }
+      if (child.type !== "namespace_import") continue;
+      const local = child.namedChildren.find((name) => name.type === "identifier");
+      if (local) this.pathModuleBindings.add(local.text);
+    }
   }
 
   /**
@@ -945,13 +1083,24 @@ class Extractor {
   private recordImport(source: SyntaxNode): string | null {
     const specifier = stringLiteralValue(source);
     if (specifier === undefined) return null;
+    return this.recordSpecifier(specifier, source);
+  }
 
+  /**
+   * [`recordImport`] once the specifier text is in hand, which for a computed
+   * one is not the source text of any single node ([`resolveCallImport`]). `at`
+   * is only where the placeholder is anchored - a node's identity is its
+   * qualifiedName, so several specifiers folded from one call site (the
+   * branches of a ternary) are several targets anchored at the same node, not
+   * one target.
+   */
+  private recordSpecifier(specifier: string, at: SyntaxNode): string | null {
     const resolvedPath = this.resolveSpecifier?.(specifier, this.filePath) ?? null;
     const target = this.addNode({
       kind: "Module",
       name: specifier,
       qualifiedName: resolvedPath ?? specifier,
-      at: source,
+      at,
       nativeKind: resolvedPath === null ? "external_module" : RESOLVED_MODULE_NATIVE_KIND,
     });
     this.addEdge(this.fileNode.id, "IMPORTS", target.id);
@@ -1188,16 +1337,44 @@ class Extractor {
   ): void {
     const nameNode = node.childForFieldName("name");
     if (!nameNode || scope.insideFunction) return;
+    const qualifiedName = qualify(scope.prefix, nameNode.text);
     // Enum members are values inside the type, below symbol granularity.
     this.declareSymbol({
       kind: "Type",
       name: nameNode.text,
-      qualifiedName: qualify(scope.prefix, nameNode.text),
+      qualifiedName,
       at: node,
       nativeKind: "enum",
       docComment: docCommentFor(outer),
       exported,
     });
+    this.recordEnumMemberValues(node, qualifiedName);
+  }
+
+  /**
+   * The string members of an enum, kept for constant folding only - a member
+   * named in a computed specifier (`import(`./p/${Plugin.Foo}`)`) is the one
+   * qualified reference this pass can fold, since the member name pins down
+   * *which* value is meant rather than leaving a value of enum type.
+   *
+   * A member with no initializer, or one initialized to anything but a string
+   * literal, is not recorded: it is a number, or an expression, and either way
+   * not a specifier.
+   */
+  private recordEnumMemberValues(node: SyntaxNode, qualifiedName: string): void {
+    const body = node.childForFieldName("body");
+    if (!body) return;
+    for (const member of body.namedChildren) {
+      if (member.type !== "enum_assignment") continue;
+      const name = member.childForFieldName("name");
+      const value = member.childForFieldName("value");
+      if (!name || !value) continue;
+      const literal = stringLiteralValue(value);
+      if (literal === undefined) continue;
+      const key = `${qualifiedName}.${name.text}`;
+      // First declaration wins, as everywhere else here.
+      if (!this.enumMemberValues.has(key)) this.enumMemberValues.set(key, literal);
+    }
   }
 
   private handleNamespace(
@@ -1364,6 +1541,13 @@ class Extractor {
         docComment: docCommentFor(outer),
         exported,
       });
+      // Only a `const` is worth folding: `let`/`var` say nothing about the
+      // value at the moment some other line reads it. First declaration wins,
+      // as everywhere else here.
+      if (value && keyword?.type === "const" && !this.constantInitializers.has(variable.id)) {
+        this.constantInitializers.set(variable.id, { value, scope });
+        if (isPathModuleRequire(value)) this.pathModuleBindings.add(nameNode.text);
+      }
       const valueScope: Scope = { ...scope, enclosingSymbolId: variable.id };
       this.visitField(declarator, "type", valueScope);
       if (value) this.visit(value, valueScope);
@@ -1492,11 +1676,12 @@ class Extractor {
 
     if (callee) {
       if (callee.type === "identifier" && callee.text === "require") {
-        if (!this.recordCallImport(node)) {
-          this.pendingCalls.push({ name: callee.text, receiver: "none", scope });
-        }
+        // A `require(...)` this pass cannot read as an import is still a call
+        // of the name `require`, which a file is free to declare itself.
+        const asCall: PendingCall = { name: callee.text, receiver: "none", scope };
+        if (!this.recordCallImport(node, scope, asCall)) this.pendingCalls.push(asCall);
       } else if (callee.type === "import") {
-        this.recordCallImport(node);
+        this.recordCallImport(node, scope, null);
       } else if (callee.type === "identifier") {
         this.pendingCalls.push({ name: callee.text, receiver: "none", scope });
       } else if (callee.type === "super") {
@@ -1584,46 +1769,240 @@ class Extractor {
   }
 
   /**
-   * `require("x")` / `import("x")` with a literal specifier, same as a
-   * static import. A *computed* specifier - `import(\`./plugins/${name}\`)`,
-   * `import(getPath())` - is not: this asks only whether the whole first
-   * argument node is itself a string/template literal, so anything computed
-   * is meant to fall through to `false`, leaving the call recorded as an
-   * ordinary unresolved-name call (see `handleCall`) rather than an IMPORTS
-   * edge - with one existing exception, below.
+   * `require(...)` / `import(...)`: an import like any other whenever its
+   * specifier can be *computed here*, which for a literal is nothing to
+   * compute and for the shapes below is same-file constant folding
+   * ([`foldSpecifiers`], run past the walk - see [`PendingCallImport`]).
    *
-   * That exception is a real bug, not a feature: `stringLiteralValue` on a
-   * `template_string` with interpolation returns whichever `string_fragment`
-   * happens to come first among its named children, unconditionally, never
-   * `undefined` for that shape. So `import(\`./plugins/${name}/index\`)` is
-   * recorded today as an IMPORTS edge to the literal path `./plugins/` - a
-   * silently *wrong* resolution, worse than the honestly-missing edge this
-   * method is supposed to produce for anything it cannot resolve. Whichever
-   * ticket implements the statically-safe subset below must close this
-   * rather than build on top of it.
+   * Returns whether the call was taken as an import at all. `false` leaves it
+   * on the path it took before this existed: an ordinary call of an
+   * unresolved name, which matters only for `require`, a name a file may
+   * declare itself (see [`handleCall`]) - and a deferred specifier that turns
+   * out not to fold falls back to exactly that, so the two answers stay the
+   * same set of edges either way.
    *
-   * Which computed shapes are worth resolving statically, and which are a
-   * deliberate, permanent limit, is scoped in full in
-   * `docs/architecture/g-mesh-v1.md` ("Computed import specifiers"). Short
-   * version: a template built purely from same-file `const`/enum-member
-   * constants folds without running anything and needs no compiler help,
-   * just deferring this call past the walk the way `pendingCalls` already
-   * does; a specifier that is the return value of an arbitrary call, or
-   * reads `process.env`/argv, cannot be resolved by any static pass -
-   * tree-sitter or the full type checker alike - and is an intentional, final
-   * limit, not a gap to close later.
+   * What folds, and what is a deliberate permanent limit rather than a gap to
+   * close later, is scoped in full in `docs/architecture/g-mesh-v1.md`
+   * ("Computed import specifiers"). In short, resolvable without running
+   * anything and therefore resolved here:
+   *
+   *  - a template literal whose every interpolation is a same-file `const`
+   *    bound to a string (possibly through another such `const`) or a named
+   *    string enum member - `import(\`./plugins/${NAME}/index\`)`;
+   *  - a conditional of such branches, `import(cond ? "./a" : "./b")`, which
+   *    records one IMPORTS edge per branch: a File node carries more than one
+   *    outgoing IMPORTS edge in the ordinary multi-import case, so this is not
+   *    a new edge shape;
+   *  - `path.join(__dirname, ...)` / `path.resolve(__dirname, ...)` over
+   *    static segments, which is plain arithmetic on this file's own directory
+   *    and so is just a relative specifier spelled the long way.
+   *
+   * Everything else - a specifier built from a value only the checker could
+   * type, from another file's constant, from `process.env`, or from an
+   * arbitrary call - produces no edge at all. Not a wrong one: until this was
+   * built, `stringLiteralValue` returned the *first* `string_fragment` of an
+   * interpolated template unconditionally, so `import(\`./plugins/${name}\`)`
+   * was recorded as an IMPORTS edge to the truncated path `./plugins/`. A
+   * missing edge is the honest answer for what cannot be computed; a wrong one
+   * is worse than the gap it hides.
    */
-  private recordCallImport(node: SyntaxNode): boolean {
+  private recordCallImport(
+    node: SyntaxNode,
+    scope: Scope,
+    fallbackCall: PendingCall | null,
+  ): boolean {
     const args = node.childForFieldName("arguments");
     const first = args?.namedChildren[0];
-    if (!first || stringLiteralValue(first) === undefined) return false;
-    this.recordImport(first);
+    if (!first || !isFoldableSpecifierShape(first)) return false;
+    this.pendingCallImports.push({ specifier: first, scope, fallbackCall });
     return true;
+  }
+
+  // --- computed specifiers ----------------------------------------------
+
+  /**
+   * One IMPORTS edge per specifier the call's argument can be folded to, or -
+   * when it folds to none - nothing at all, plus the fallback the call site
+   * would have recorded had it never looked like an import. Runs before the
+   * pending *calls* are resolved, which is what lets that fallback rejoin them
+   * (see [`resolvePending`]).
+   */
+  private resolveCallImport(pending: PendingCallImport): void {
+    const specifiers = this.foldSpecifiers(pending.specifier, pending.scope);
+    // An empty specifier names nothing, so it is no more resolvable than an
+    // interpolation this pass cannot read.
+    if (specifiers === undefined || specifiers.some((specifier) => specifier.length === 0)) {
+      if (pending.fallbackCall !== null) this.pendingCalls.push(pending.fallbackCall);
+      return;
+    }
+    for (const specifier of specifiers) this.recordSpecifier(specifier, pending.specifier);
+  }
+
+  /**
+   * Every specifier one call site can name, or `undefined` if any part of it
+   * is not statically known - all or nothing, deliberately. A conditional with
+   * one dynamic branch would still have one perfectly real literal branch, but
+   * recording only that turns "this file may import either of two modules"
+   * into "this file imports this one", which reads as a complete answer and is
+   * not one.
+   *
+   * Only a conditional ever yields more than one, and it does so by recursion
+   * rather than by folding branches into a product, so a chain of them stays
+   * linear in the number of branches written.
+   */
+  private foldSpecifiers(node: SyntaxNode, scope: Scope): string[] | undefined {
+    if (node.type === "ternary_expression") {
+      const branches: string[] = [];
+      for (const field of ["consequence", "alternative"]) {
+        const branch = node.childForFieldName(field);
+        if (!branch) return undefined;
+        const folded = this.foldSpecifiers(branch, scope);
+        if (folded === undefined) return undefined;
+        branches.push(...folded);
+      }
+      return branches;
+    }
+    const single = this.foldStatic(node, scope, new Set());
+    return single === undefined ? undefined : [single];
+  }
+
+  /**
+   * The one string an expression evaluates to, or `undefined` when that is not
+   * knowable without running the program - which is the answer for everything
+   * this deliberately does not handle. It is a constant folder over a closed
+   * set of shapes, not an interpreter: no arithmetic, no concatenation
+   * operator, no method calls, nothing reached through a value.
+   *
+   * `folding` carries the constants already being folded, so a `const` that
+   * (illegally, but parseably) reads itself terminates instead of recursing.
+   */
+  private foldStatic(node: SyntaxNode, scope: Scope, folding: Set<string>): string | undefined {
+    switch (node.type) {
+      case "string":
+      case "template_string":
+        return this.foldQuoted(node, scope, folding);
+      case "identifier":
+        return this.foldConstant(node.text, scope, folding);
+      case "member_expression":
+        return this.foldEnumMember(node, scope);
+      case "call_expression":
+        return this.foldPathCall(node, scope, folding);
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * A quoted literal's text, with every `${...}` folded in turn. Only plain
+   * fragments and interpolations are accepted: an escape sequence is a part
+   * whose *value* differs from its source text, and decoding one is not what
+   * this is for - refusing is the same rule the rest of this follows.
+   */
+  private foldQuoted(node: SyntaxNode, scope: Scope, folding: Set<string>): string | undefined {
+    let text = "";
+    for (const part of node.namedChildren) {
+      if (part.type === "string_fragment") {
+        text += part.text;
+        continue;
+      }
+      if (part.type !== "template_substitution") return undefined;
+      const expression = part.namedChildren[0];
+      if (!expression) return undefined;
+      const value = this.foldStatic(expression, scope, folding);
+      if (value === undefined) return undefined;
+      text += value;
+    }
+    return text; // an empty literal has no parts at all
+  }
+
+  /**
+   * What a bare name is bound to, when this file binds it to a string
+   * constant. Everything else is refused by the same rules the rest of the
+   * pass resolves names by: a local of that name shadows the declaration, and
+   * what a local holds is not tracked at all; a name this file does not
+   * declare belongs to another file, whose constants this pass never sees.
+   */
+  private foldConstant(name: string, scope: Scope, folding: Set<string>): string | undefined {
+    if (isLocallyBound(name, scope.locals)) return undefined;
+    const declaration = this.lookupByName(name, scope.namespacePrefix, "Variable");
+    if (declaration === undefined) return undefined;
+    const initializer = this.constantInitializers.get(declaration.id);
+    if (initializer === undefined || folding.has(declaration.id)) return undefined;
+
+    folding.add(declaration.id);
+    // The initializer is folded in the scope it was *written* in, not the one
+    // that reads it - the names it can reach are its own.
+    const value = this.foldStatic(initializer.value, initializer.scope, folding);
+    folding.delete(declaration.id);
+    return value;
+  }
+
+  /**
+   * `Plugin.Foo` where `Plugin` is an enum this file declares and `Foo` is one
+   * of its string members. A *value* of enum type is not this - which member
+   * it holds is a question for the checker, and one it can only answer as a
+   * union of them - so only a member named outright folds.
+   */
+  private foldEnumMember(node: SyntaxNode, scope: Scope): string | undefined {
+    const object = node.childForFieldName("object");
+    const property = node.childForFieldName("property");
+    if (object?.type !== "identifier" || !property) return undefined;
+    if (isLocallyBound(object.text, scope.locals)) return undefined;
+    const owner = this.lookupType(object.text, scope);
+    if (owner === undefined || owner.nativeKind !== "enum") return undefined;
+    return this.enumMemberValues.get(`${owner.qualifiedName}.${property.text}`);
+  }
+
+  /**
+   * `path.join(__dirname, "./plugins", "index.js")` and its `path.resolve`
+   * twin: arithmetic over this file's own directory, which is exactly what a
+   * relative specifier is, so the result is handed on as one
+   * (`./plugins/index.js`) and resolves through the same path as any other.
+   *
+   * Everything that would make it *not* that is refused: a receiver not known
+   * to be Node's path module, an anchor that is not `__dirname` (a value, a
+   * bare cwd-relative join - neither says which directory it starts from), a
+   * segment that does not fold, and an absolute segment, which `resolve`
+   * discards everything before rather than appending to. A dynamic *tail*
+   * (`path.join(__dirname, "./plugins", name)`) is refused by the same rule
+   * that refuses any unfoldable segment: it narrows the answer to a directory,
+   * and enumerating a directory's files as candidate targets is a different
+   * feature (see the doc section named above).
+   */
+  private foldPathCall(node: SyntaxNode, scope: Scope, folding: Set<string>): string | undefined {
+    if (!isPathArithmeticShape(node)) return undefined;
+    const receiver = node.childForFieldName("function")?.childForFieldName("object");
+    if (!receiver) return undefined;
+    if (isLocallyBound(receiver.text, scope.locals)) return undefined;
+    if (!this.pathModuleBindings.has(receiver.text)) return undefined;
+
+    const args = node.childForFieldName("arguments")?.namedChildren ?? [];
+    const anchor = args[0];
+    if (anchor?.type !== "identifier" || anchor.text !== "__dirname") return undefined;
+    if (isLocallyBound(anchor.text, scope.locals)) return undefined;
+
+    const segments: string[] = [];
+    for (const argument of args.slice(1)) {
+      const segment = this.foldStatic(argument, scope, folding);
+      if (segment === undefined || segment.startsWith("/")) return undefined;
+      segments.push(segment);
+    }
+    // `path.join(__dirname)` is the directory itself, which imports nothing.
+    if (segments.length === 0) return undefined;
+
+    const joined = path.posix.join(...segments);
+    if (joined === "." || joined === "") return undefined;
+    // A specifier that does not start with `.` or `/` is a *package* name, so
+    // the relative one has to say so out loud.
+    return joined.startsWith(".") ? joined : `./${joined}`;
   }
 
   // --- name resolution --------------------------------------------------
 
   private resolvePending(): void {
+    // First: a computed specifier folds against this file's declarations, and
+    // a fold that fails hands the call back to `pendingCalls` below.
+    for (const callImport of this.pendingCallImports) this.resolveCallImport(callImport);
     for (const name of this.pendingExports) {
       const target = this.lookupByName(name, "");
       if (target) this.markExported(target);
@@ -2042,13 +2421,40 @@ function isBindingPosition(node: SyntaxNode): boolean {
   return false;
 }
 
-/** Text of a string literal node, without quotes; undefined if it isn't one. */
+/**
+ * Text of a string literal node, without quotes; undefined unless the literal
+ * really is its own text - one plain run of characters and nothing else.
+ *
+ * A literal made of several parts is not: a template's `${...}` stands for a
+ * value this cannot see, and an escape sequence stands for a character its
+ * source text does not spell. Both split the node into fragments, and this
+ * used to return whichever came first, unconditionally - which is why
+ * `import(\`./plugins/${name}\`)` was recorded as an import of the truncated
+ * path `./plugins/`. A part it cannot read makes the whole literal unreadable
+ * *here*; folding one that can be folded anyway is
+ * [`Extractor.foldStatic`]'s job, and it needs the parts, not a prefix of them.
+ */
 function stringLiteralValue(node: SyntaxNode): string | undefined {
   if (node.type !== "string" && node.type !== "template_string") return undefined;
-  const fragment = node.namedChildren.find((child) => child.type === "string_fragment");
-  if (fragment) return fragment.text;
-  // Empty literal (`""`) has no fragment child.
-  return node.text.length >= 2 ? node.text.slice(1, -1) : undefined;
+  const parts = node.namedChildren;
+  if (parts.some((child) => child.type !== "string_fragment")) return undefined;
+  // Empty literal (`""`) has no fragment child at all.
+  if (parts.length === 0) return node.text.length >= 2 ? node.text.slice(1, -1) : undefined;
+  return parts.map((fragment) => fragment.text).join("");
+}
+
+/**
+ * `require("node:path")` as an initializer - the CommonJS spelling of the
+ * namespace import [`Extractor.recordPathModuleBinding`] recognises, and the
+ * one a `path.join(__dirname, ...)` specifier is most often written next to.
+ */
+function isPathModuleRequire(value: SyntaxNode): boolean {
+  if (value.type !== "call_expression") return false;
+  const callee = value.childForFieldName("function");
+  if (callee?.type !== "identifier" || callee.text !== "require") return false;
+  const argument = value.childForFieldName("arguments")?.namedChildren[0];
+  const specifier = argument === undefined ? undefined : stringLiteralValue(argument);
+  return specifier !== undefined && PATH_MODULE_SPECIFIERS.has(specifier);
 }
 
 /**

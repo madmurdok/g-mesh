@@ -311,25 +311,28 @@ Everything above assumes the specifier is a string literal — what
 `import(path.join(__dirname, name))` are all legal, and none of them is a
 literal.
 
-`recordCallImport` today only asks whether the first argument node is a
-literal at all, and — this is a real bug this scoping pass surfaced, not a
-hypothetical — it is *not* consistent about it. A plain literal or a
-template string with no interpolation resolves correctly. A template string
-that *does* interpolate does not fail cleanly: `stringLiteralValue` returns
+`recordCallImport` used to only ask whether the first argument node was a
+literal at all, and — a real bug the scoping pass surfaced, not a
+hypothetical — it was *not* consistent about it. A plain literal or a
+template string with no interpolation resolved correctly. A template string
+that *did* interpolate did not fail cleanly: `stringLiteralValue` returned
 the first `string_fragment` child of the `template_string` node,
 unconditionally, rather than checking whether a `template_substitution`
-sibling exists at all. So `import(\`./plugins/${name}/index\`)` is recorded
-today as an IMPORTS edge to the literal path `./plugins/` — a silently
-*wrong* resolution, not an honestly missing one, which is worse than the gap
-this ticket set out to scope. The follow-up ticket implementing the subset
-below should close this as part of that work rather than build on top of it.
+sibling existed at all. So `import(\`./plugins/${name}/index\`)` was recorded
+as an IMPORTS edge to the literal path `./plugins/` — a silently *wrong*
+resolution, not an honestly missing one, which is worse than the gap the
+scoping set out to describe. That is closed: `stringLiteralValue` now answers
+only for a literal that really is its own text (one plain run of characters —
+an escape sequence splits a literal into parts the same way an interpolation
+does, and truncated the same way), and a specifier made of parts is either
+folded whole or not resolved at all.
 
-Scoping what is worth building means drawing a real line between what a
-static pass — tree-sitter alone, or the TS-compiler-backed semantic pass
-(`plugins/js-ts/src/semantic.ts`) — can honestly answer, and what only
-running the program answers. Concretely:
+Drawing the line meant separating what a static pass — tree-sitter alone, or
+the TS-compiler-backed semantic pass (`plugins/js-ts/src/semantic.ts`) — can
+honestly answer from what only running the program answers. Concretely:
 
-**Resolvable without running anything (in scope for the next ticket):**
+**Resolvable without running anything (implemented in `recordCallImport` /
+`foldSpecifiers`):**
 
 - A template literal whose every interpolated part is itself statically
   known *within the same file*: a reference to a `const` bound to a string
@@ -338,21 +341,30 @@ running the program answers. Concretely:
   string literal, declared in the file the pass is already walking. The
   scope/binding machinery this needs — resolving a name to its declaration
   and asking what that declaration is — already exists for exactly this kind
-  of same-file question (`LocalBindings`, `lookupByName`, `lookupType`); what
-  is missing is that `recordCallImport` decides at the call site instead of
-  deferring past the walk the way `pendingCalls`/`pendingSupertypes` already
-  do.
+  of same-file question (`LocalBindings`, `lookupByName`, `lookupType`), and
+  is what the fold reuses. `recordCallImport` no longer decides at the call
+  site: a specifier *shaped* like one of these is deferred as a
+  `PendingCallImport` and folded in `resolvePending`, the way
+  `pendingCalls`/`pendingSupertypes` already are, because the constant a call
+  reads is often declared below it. A bare `import(SPECIFIER)` naming such a
+  constant is the same fold with no template around it, and resolves too.
 - A short conditional of literal branches — `import(cond ? "./a" : "./b")` —
-  resolvable by recording one IMPORTS edge per literal branch from the same
-  call site. A File node already carries more than one outgoing IMPORTS edge
-  in the ordinary multi-import case, so this is not a new edge shape, just
-  more than one `recordImport` call attributed to one AST node.
+  resolved by recording one IMPORTS edge per branch from the same call site. A
+  File node already carries more than one outgoing IMPORTS edge in the
+  ordinary multi-import case, so this is not a new edge shape, just more than
+  one `recordSpecifier` call attributed to one AST node. All or nothing: one
+  branch that does not fold drops the whole site, because recording the branch
+  that did fold reads as the complete answer to what the call site imports and
+  is not one.
 - `path.join(__dirname, ...)` / `path.resolve(__dirname, ...)` where the
-  receiver is a bare identifier already known — via the namespace-import
-  bookkeeping `recordImportBindings` builds — to be `node:path`, and every
-  segment after the `__dirname` anchor is a string literal: plain path
-  arithmetic against this file's own directory, no different in kind from the
-  relative-specifier resolution `recordImport` already does.
+  receiver is a bare identifier known to be `node:path` — bound by
+  `import * as path` / `import path from` / `const path = require("node:path")`,
+  which `recordPathModuleBinding` tracks separately from the two import maps
+  because `node:path` resolves to no file of this project — and every segment
+  after the `__dirname` anchor folds: plain path arithmetic against this
+  file's own directory, no different in kind from the relative-specifier
+  resolution `recordImport` already does. An absolute segment is refused
+  rather than joined, since `resolve` would discard everything before it.
 
 **Theoretically resolvable, not worth this release:**
 
@@ -395,10 +407,16 @@ close later:**
   checker itself cannot narrow it to a literal, nothing built on top of the
   checker has a better answer than the checker does.
 
-The next ticket ("Implement resolution for the statically-resolvable
-computed-import subset") is scoped to exactly the first bucket above, and
-should fix the `stringLiteralValue` truncation bug described above as part
-of that work rather than leave it as a silent wrong answer.
+Everything in the second and third buckets produces no edge — not a guess, not
+a partial one — and the extractor's tests pin that boundary as deliberately as
+they pin the first bucket's resolutions. Note what the first bucket's edges
+are *not*: folding is arithmetic on this file's own syntax, no compiler is
+asked anything, so a folded specifier lands on the same
+`source: "tree-sitter"` IMPORTS edge into the same placeholder `Module` node
+as the static `import "./x"` two lines above it, and stays `resolved: false`
+until core confirms the target is in the index. There is no separate kind of
+edge for "computed, then resolved" — by the time the edge exists, the
+specifier is just a specifier.
 
 #### Cross-file symbol resolution
 
