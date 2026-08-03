@@ -464,6 +464,159 @@ for it, so the `IMPORTS` edge has somewhere to point (see
 file the specifier is *written in*, not a file it names — nothing else in the
 model works that way, and the query layer accounts for it.
 
+<a id="overloads"></a>
+### Overloads and merged declarations: one node per declaration group
+
+One symbol can be written as several declarations — TypeScript overloads, an
+interface or namespace merged across statements, a function that also carries
+a namespace. A node's identity does not mention position or signature
+(`nodeIdFor` = `hash(filePath, kind, qualifiedName, nativeKind)`, deliberately,
+so ids survive edits elsewhere in the file), so all of them land on one node
+and everything but the first is discarded.
+
+Measured on a fixture with every shape of this (Node 20.6.1, TypeScript 5.9.3,
+`plugins/js-ts/src/extract.ts` at release 0.19.0), the damage is worse than
+"the first declaration wins":
+
+- **Top-level overload signatures are dropped entirely.** `tree-sitter`
+  parses `export function parse(input: string): string[];` as
+  `function_signature`, a type `Extractor.visit` has no case for, so it falls
+  through to a plain child walk. `parse` gets exactly one node, built from the
+  implementation, and its `signature` is
+  `parse(input: string | number, radix?: number): any` — the one signature
+  TypeScript deliberately never shows a caller.
+- **A class method's overloads split the method in two.** `methodNativeKind`
+  maps `method_signature` → `"method_signature"` and `method_definition` →
+  `"method"`, and `nativeKind` is part of the id, so `Repo#find` with two
+  overloads and an implementation becomes **two** nodes — one holding the
+  first signature, one holding the implementation — and the second overload is
+  lost. `get_file_outline` already answers that file with a confusing extra
+  row today.
+- **Nothing anywhere records which overload a call site binds to**, which is
+  the question the semantic layer exists to answer.
+
+**TypeScript's own model, measured rather than assumed.** Every row below is
+a real `tsserver` answer against that fixture, through
+`plugins/js-ts/src/semantic.ts`'s live child:
+
+| asked of `tsserver` | overloaded `parse` (2 sigs + impl) | merged `interface Options` (2 decls) | `class Model` + `interface Model` |
+| --- | --- | --- | --- |
+| `navtree` (its own file outline) | **one** row, `spans: 3` | **one** row, `spans: 2`, members unioned | **two** rows, `spans: 1` each |
+| `definition` at a use | **1** location — the overload actually bound | 2 locations | 2 locations |
+| `definition` at the import specifier | 3 locations | 2 locations | 2 locations |
+| `navto` (search by name) | 1 row, at the implementation | 2 rows | 2 rows |
+| `quickinfo` | first *call* signature + `(+1 overload)` | `interface Options` | — |
+| `references` from any one declaration | the same whole-symbol answer from all three | — | — |
+
+Two facts decide the design. First, `definition` at a call site really does
+return the single bound overload (`parse("x")` → the `string` signature,
+`parse(10, 16)` → the `number` one; likewise for class and interface methods),
+so the call-site question is answerable. Second, `tsserver` does **not**
+distinguish "overload" from "merge" anywhere: both are one symbol with N
+declarations, and what separates a merge from a genuinely separate symbol is
+the *declaration kind*, not the number of declarations. Its outline groups by
+(name, kind) and hangs N spans off the row — which is precisely what
+`nodeIdFor` already keys on:
+
+| declarations in one file | `tsserver` `navtree` | g-mesh nodes today | agree? |
+| --- | --- | --- | --- |
+| `function parse` ×3 (2 sigs + impl) | 1 row, 3 spans | 1 node | yes |
+| `interface Options` ×2 | 1 row, 2 spans | 1 node | yes |
+| `namespace NS` ×2 | 1 row, 2 spans, members unioned | 1 node, members unioned | yes |
+| `function widget` + `namespace widget` | 2 rows | 2 nodes | yes |
+| `class Model` + `interface Model` | 2 rows | 2 nodes | yes |
+| `get value` + `set value` | 2 rows (`getter`, `setter`) | 2 nodes | yes |
+| `find` ×3 in a class body | 1 row, 3 spans | **2 nodes** | **no** |
+
+So the node id scheme is already isomorphic to TypeScript's own grouping, in
+every case but the last. **The identity scheme is kept; what it was missing is
+that a node holds only one declaration's worth of data.**
+
+**The rule.** Two declarations in one file belong to the same node **iff they
+agree on `(filePath, kind, qualifiedName, nativeKind)`**. Overloads and merges
+are the same fact under this rule, deliberately — TypeScript treats them the
+same way, and the existing merged-namespace behaviour (one `Module` node,
+members unioned from both statements) is already right and stays untouched.
+What distinguishes an overload set is not identity but whether its
+declarations carry *distinct call signatures*, which is a property of the
+declaration list; and *which* one a given use binds to is a property of a call
+site, which is why it belongs on an edge and not in a node.
+
+**The shape.**
+
+- A node gains an ordered **declaration list** — one entry per declaration in
+  source order, each with its own range, its own `signature`, and whether it
+  has a body. Stored as a `DECLARATIONS` child table (`nodeId` FK, `ordinal`,
+  range, `signature`, `hasBody`), written only for nodes with more than one
+  declaration, so an ordinary symbol costs zero extra rows and its NDJSON wire
+  shape is byte-identical to today's.
+- The node's own flat fields stay, and stay primary — which is what keeps
+  every single-declaration node bit-for-bit unchanged. For a multi-declaration
+  node they are filled the way TypeScript's own tools fill them: **range** from
+  the implementation if there is one, else the first declaration (what `navto`
+  points at); **`signature`** from the first *call* signature, never the
+  implementation's (what `quickinfo` displays); **`docComment`** from the first
+  declaration that has one; **`exported`** OR'd across all of them, as today.
+- An edge gains **`toDeclaration`** — an ordinal into the target node's
+  declaration list, set only by the semantic pass, only on `CALLS`, and only
+  when the target really has more than one call signature. It participates in
+  edge identity via `edgeIdFor(from, kind, to, toDeclaration?)` hashing
+  `toDeclaration ?? ""`, exactly as `nodeIdFor` already hashes
+  `nativeKind ?? ""`: absent, the hash is identical to today's, so **no
+  existing edge id changes**. Participating in identity is what lets one
+  function calling two overloads store both bindings instead of one
+  overwriting the other.
+- `schema_version` 4 → 5. A mismatch wipes and rebuilds, so there is no
+  migration to write.
+
+**What each MCP tool answers for a multi-declaration symbol.**
+
+| tool | behaviour |
+| --- | --- |
+| `get_file_outline` | One row per node, as today — an overloaded function is listed **once**, matching `navtree`. Rows for multi-declaration symbols carry `declarationCount` and, for functions, `signatures` (all call signatures, implementation excluded). The only row-count change on any real file is that `Repo#find`'s spurious second row disappears. |
+| `find_definition(symbolName)` | One node. An overloaded or merged name is **not** `ambiguous` — it is one symbol, so no candidate page is returned and no extra round trip is forced. The node carries `signatures` and `declarations` when there is more than one; its `signature`/range are the primary ones above, which is a straight fix to today's answer for `parse`. |
+| `find_definition(file, position)` | Same node as by name. At a call site the semantic pass annotated, the response also carries `boundDeclaration` (the ordinal) so the caller learns which overload that position binds — the direct mirror of `tsserver`'s own single-location `definition`. |
+| `find_callers` | Unchanged row set: inbound `CALLS` **grouped back to one row per caller**, so page sizes, `limit` and pagination behave exactly as today even though storage now holds one edge per bound overload. A row additionally carries `boundSignatures` naming which overloads that caller binds. Anchoring by `symbolId` means the whole symbol; there is no per-overload anchor, and none is offered. |
+| `find_callees` | Mirror image: one row per callee symbol, with `boundSignatures` when the callee is overloaded. |
+| `find_references` | Symbol-wide, unpartitioned — which is what `tsserver` itself does: asked from any one of `over`'s three declarations it returned the same whole-symbol answer, three times identically. Other declarations of the same symbol are declarations, not usages, so they do not appear as reference rows (unchanged from today). |
+| `find_implementations` | Unaffected. `SUPERTYPE_OF` is type-level and has no per-declaration variant; a merged interface is one node, so it keeps giving one answer rather than one per merged statement. |
+| `get_dependencies` | Unaffected — `File`/`Module` granularity. |
+| `search_code` | Unaffected: still one vector per node (`VECTORS.nodeId`), with all call signatures available as embedding input. |
+
+**Why not a node per overload declaration.** It is the obvious shape and it was
+rejected on three counts. (1) A per-overload id cannot use position — ids must
+survive edits elsewhere in the file — so it would have to hash the signature
+text, which makes *renaming a parameter* a delete-plus-insert: every inbound
+edge is destroyed and rebuilt and the node's embedding vector is evicted, on an
+edit that changed nothing semantic. (2) `find_definition("parse")` would start
+answering with an `ambiguous: true` candidate page for a name that is not
+ambiguous at all, forcing a second round trip on the single most common lookup
+— the exact cost the `symbolName` anchor was added to remove. (3) It gives no
+account of merges, so it needs the merge rule as a *second*, separate
+mechanism anyway; the shape above needs one rule for both because TypeScript
+has one. Its genuine advantage — an inbound edge onto a specific overload is
+addressable by plain node id, with no new edge column — is real but small
+against those.
+
+**Known limitation, unchanged by this.** `class Model` + `interface Model` are
+one symbol to TypeScript but two nodes here, since a `Type` node cannot be both
+at once, so `find_definition("Model")` returns an ambiguous pair. That is
+pre-existing and deliberate (the two declarations carry genuinely different
+information), and `tsserver`'s own outline lists them as two rows too.
+
+**Implementation follow-ups.** In `extract.ts`: add `function_signature` to the
+declaration switch so top-level overload signatures are seen at all; stop
+`methodNativeKind` returning `method_signature`, so a method's signatures and
+its implementation share one node (`getter`/`setter`/`constructor`/
+`abstract_method` keep splitting, and `navtree` agrees — it labels a
+signature-only interface method `method` as well). Two consequences of
+`nativeKind` being part of the id: the choice must be made when a declaration
+is first seen and can never be "upgraded" once the node exists, and dropping
+`method_signature` changes the id of every interface and overload-signature
+method — a one-time reindex, already paid for by the `schema_version` bump.
+Then the semantic pass fills `toDeclaration` from `definition` at each
+unresolved-or-overloaded call site.
+
 ## Interfaces
 
 ### MCP tools
@@ -775,8 +928,9 @@ backstop is `tsserver`'s own: it exits when its stdin closes. The project's
 natively, from the file's own location upward, so nothing of
 `tsconfigPaths.ts` is reused here; `projectInfo` reports which config was
 actually in force, which is what the tests assert on rather than assuming.
-Turning answers into resolved edges (overloads, re-exports, the
-`semanticPass` control message) is separate work.
+Turning answers into resolved edges (re-exports, the `semanticPass` control
+message) is separate work; the node and edge shape overloads resolve *into* is
+decided in [Overloads and merged declarations](#overloads).
 
 ### Shim ↔ daemon
 
