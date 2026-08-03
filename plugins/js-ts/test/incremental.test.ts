@@ -378,6 +378,101 @@ test("a file edited into a syntax error keeps reparsing and flags it", () => {
   assert.ok(!isEmptyDiff(diff), "a broken edit must still produce a diff");
 });
 
+// --- overload declaration lists --------------------------------------------
+
+/**
+ * An overloaded `parse` next to an ordinary function, shaped so a change can
+ * be confined to a *declaration* and nothing else:
+ *
+ *  - `parse`'s own primary fields are taken from other declarations than the
+ *    second one - its range from the implementation, its signature from the
+ *    first call signature, its doc comment from the first declaration that has
+ *    one - so an edit to the second overload alone moves nothing the diff
+ *    could have noticed without comparing declaration lists.
+ *  - `plain` is the control, and sits *after* `parse` so an edit inside it
+ *    cannot shift a single one of `parse`'s positions.
+ */
+const OVERLOADS = `/** Parses a value. */
+export function parse(input: string): string[];
+export function parse(input: number, radix?: number): number;
+export function parse(input: string | number, radix?: number): any {
+  return typeof input === "string" ? [input] : input;
+}
+
+export function plain(a: number): number {
+  return a + 1;
+}
+`;
+
+const OVERLOADS_FILE = "src/overloads.ts";
+
+function reparseFromOverloads(next: string): FileDiff {
+  resetIncrementalState();
+  reparseFile(OVERLOADS_FILE, OVERLOADS);
+  return reparseFile(OVERLOADS_FILE, next);
+}
+
+test("editing one overload signature reports the symbol as changed", () => {
+  // Same length, so no range anywhere moves, and only the second declaration's
+  // signature differs. Before `nodesEqual` compared declaration lists, this
+  // diff was empty and the stored list went on describing a signature the file
+  // no longer had.
+  const next = edited(OVERLOADS, "radix?: number): number;", "radix?: number): bigint;");
+  assert.notEqual(next, OVERLOADS);
+
+  const diff = reparseFromOverloads(next);
+
+  assert.deepEqual(nodeLabels(diff.addedNodes), ["Function:parse"]);
+  assert.deepEqual(nodeLabels(diff.removedNodes), ["Function:parse"]);
+  const [added] = diff.addedNodes;
+  const [removed] = diff.removedNodes;
+  assert.equal(added.id, removed.id, "an edited overload is the same symbol, not a new one");
+  assert.equal(added.signature, removed.signature, "the primary signature is unchanged - the list is not");
+  assert.equal(added.declarations?.[1].signature, "parse(input: number, radix?: number): bigint");
+  assert.equal(removed.declarations?.[1].signature, "parse(input: number, radix?: number): number");
+});
+
+test("an edit elsewhere leaves an overloaded symbol out of the diff entirely", () => {
+  // The other direction, and the one that costs something real when it is
+  // wrong: a declaration list rebuilt into fresh objects every reparse must
+  // not read as a change. `parse` reported as changed is `parse` removed and
+  // re-added - its embedding evicted and its inbound edges torn down - to
+  // arrive at the node it already was.
+  // Same length again, so nothing of `parse`'s can have moved; `plain`'s own
+  // signature really does change, so the diff is non-empty and the assertion
+  // below is about what the diff *left out*, not about it being empty.
+  const next = edited(OVERLOADS, "export function plain(a: number)", "export function plain(a: bigint)");
+  const diff = reparseFromOverloads(next);
+
+  assert.equal(
+    touchedNames(diff).has("parse"),
+    false,
+    `an untouched overloaded symbol must not be in the diff: ${JSON.stringify(nodeLabels(diff.addedNodes))}`,
+  );
+  assert.deepEqual(nodeLabels(diff.addedNodes), ["Function:plain"]);
+});
+
+test("reparsing identical text with an overloaded symbol is an empty diff", () => {
+  resetIncrementalState();
+  reparseFile(OVERLOADS_FILE, OVERLOADS);
+  const diff = reparseFile(OVERLOADS_FILE, OVERLOADS);
+
+  assert.ok(isEmptyDiff(diff), `expected an empty diff, got ${JSON.stringify(nodeLabels(diff.addedNodes))}`);
+});
+
+test("deleting an overload leaves a shorter list, not a stale one", () => {
+  const next = edited(OVERLOADS, "export function parse(input: number, radix?: number): number;\n", "");
+  const diff = reparseFromOverloads(next);
+
+  const [added] = diff.addedNodes.filter((n) => n.qualifiedName === "parse");
+  assert.equal(added.declarations?.length, 2);
+  assert.deepEqual(
+    added.declarations?.map((d) => d.ordinal),
+    [0, 1],
+    "ordinals are re-derived from source order, never carried over",
+  );
+});
+
 // --- reading from disk -----------------------------------------------------
 
 test("reparseChangedFile reads the project-relative path and keys state by it", async () => {

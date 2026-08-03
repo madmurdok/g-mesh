@@ -572,6 +572,13 @@ erDiagram
         string nativeKind "language-specific detail, e.g. trait_impl"
         bool hasSyntaxErrors "on File nodes"
     }
+    DECLARATIONS {
+        string nodeId FK
+        int ordinal PK "source order, what toDeclaration names"
+        string range "start/end line-col of this declaration"
+        string signature "this declaration's own"
+        bool hasBody "implementation, not an overload signature"
+    }
     EDGES {
         string id PK
         string fromId FK
@@ -579,6 +586,7 @@ erDiagram
         string kind "DEFINES, IMPORTS, CALLS, SUPERTYPE_OF, REFERENCES, EXPORTS"
         string source "tree-sitter | ts-compiler"
         bool resolved
+        int toDeclaration "which overload this call bound; NULL for all but"
     }
     VECTORS {
         string nodeId FK
@@ -594,6 +602,7 @@ erDiagram
     NODES ||--o{ EDGES : "fromId"
     NODES ||--o{ EDGES : "toId"
     NODES ||--o| VECTORS : "has"
+    NODES ||--o{ DECLARATIONS : "written as (none unless several)"
 ```
 
 Granularity is symbol-level: `File`, `Module` (namespace/package/crate),
@@ -709,12 +718,14 @@ site, which is why it belongs on an edge and not in a node.
 - An edge gains **`toDeclaration`** — an ordinal into the target node's
   declaration list, set only by the semantic pass, only on `CALLS`, and only
   when the target really has more than one call signature. It participates in
-  edge identity via `edgeIdFor(from, kind, to, toDeclaration?)` hashing
-  `toDeclaration ?? ""`, exactly as `nodeIdFor` already hashes
-  `nativeKind ?? ""`: absent, the hash is identical to today's, so **no
-  existing edge id changes**. Participating in identity is what lets one
-  function calling two overloads store both bindings instead of one
-  overwriting the other.
+  edge identity, via `edgeIdFor(from, kind, to, toDeclaration?)` appending it
+  to the hashed string when it is there and appending *nothing* when it is
+  not — deliberately unlike `nodeIdFor`, which always hashes a field for
+  `nativeKind ?? ""`; a trailing separator would be enough to move every
+  existing edge id, and the point is that **no existing edge id changes**.
+  Participating in identity is what lets one function calling two overloads
+  store both bindings instead of one overwriting the other. Ordinal `0` is a
+  real binding and hashes differently from an absent one.
 - `schema_version` 4 → 5. A mismatch wipes and rebuilds, so there is no
   migration to write.
 

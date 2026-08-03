@@ -87,6 +87,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: None,
         })
         .unwrap()
     }
@@ -99,6 +100,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: EdgeSource::TreeSitter,
             resolved: false,
+            to_declaration: None,
         })
         .unwrap()
     }

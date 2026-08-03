@@ -195,13 +195,16 @@ export interface ExtractedNode {
    * costs nothing. The fields above stay primary and describe the symbol as a
    * whole; this says what it is actually made of.
    *
-   * Deliberately not part of `toWireNode` (bulkIndex.ts) yet: core has no
-   * `DECLARATIONS` table to put it in, and shipping a field it would drop on
-   * the floor would also make an edit to one overload look like a changed
-   * node to `nodesEqual` (incremental.ts), re-writing a byte-identical wire
-   * node and evicting its embedding for nothing. The consumer this is for is
-   * in-process - the semantic pass, which matches a `tsserver` definition
-   * location against these ranges to learn the ordinal a call site bound.
+   * Carried through to core unchanged (`toWireNode` in bulkIndex.ts) and
+   * stored in its `declarations` child table, keyed by this node's id. Absent
+   * is the ordinary case and means exactly "one declaration": it is why a
+   * single-declaration node's wire line is byte-identical to what it was
+   * before any of this existed, so nothing here may ever be filled in with an
+   * empty list.
+   *
+   * Its other consumer is in-process - the semantic pass, which matches a
+   * `tsserver` definition location against these ranges to learn the ordinal a
+   * call site bound, and records that on the edge as `toDeclaration`.
    */
   declarations?: SymbolDeclaration[];
 }
@@ -214,6 +217,18 @@ export interface ExtractedEdge {
   kind: EdgeKind;
   source: EdgeSource;
   resolved: boolean;
+  /**
+   * Which of the target's declarations this call binds, as an ordinal into its
+   * [`SymbolDeclaration`] list. Present only on `CALLS`, only when the target
+   * really has more than one call signature, and only from the semantic pass -
+   * the structural walk cannot know which overload a call resolves to, so
+   * every edge built here leaves it absent.
+   *
+   * It is part of the edge id ([`edgeIdFor`]), which is what lets one caller
+   * that calls two overloads of the same function keep both bindings instead
+   * of collapsing them onto a single edge.
+   */
+  toDeclaration?: number;
 }
 
 /**
@@ -374,9 +389,32 @@ export function nodeIdFor(
   return hash(`node ${filePath} ${kind} ${qualifiedName} ${nativeKind ?? ""}`);
 }
 
-/** Edges carry no position, so identity is the (from, kind, to) triple - repeated calls between the same pair collapse into one edge. */
-export function edgeIdFor(fromId: string, kind: EdgeKind, toId: string): string {
-  return hash(`edge ${fromId} ${kind} ${toId}`);
+/**
+ * Edges carry no position, so identity is the (from, kind, to) triple -
+ * repeated calls between the same pair collapse into one edge.
+ *
+ * `toDeclaration` joins that triple once a call site is known to bind one
+ * particular declaration of its target (see "Overloads and merged
+ * declarations" in docs/architecture/g-mesh-v1.md). Collapsing is exactly
+ * what must *not* happen there: a function calling both `parse("x")` and
+ * `parse(10, 16)` binds two different declarations of one symbol, and with
+ * the ordinal outside the id the second binding would just overwrite the
+ * first.
+ *
+ * An absent one contributes nothing to the hashed string - not an empty
+ * field, the way [`nodeIdFor`] spells an absent `nativeKind`, since that
+ * would still change the hash. Every edge that binds no particular
+ * declaration, which is every edge the structural pass emits, therefore
+ * keeps exactly the id it has always had.
+ */
+export function edgeIdFor(
+  fromId: string,
+  kind: EdgeKind,
+  toId: string,
+  toDeclaration?: number,
+): string {
+  const binding = toDeclaration === undefined ? "" : ` ${toDeclaration}`;
+  return hash(`edge ${fromId} ${kind} ${toId}${binding}`);
 }
 
 /** A tree-sitter parse tree. Re-exported so callers that hold one across

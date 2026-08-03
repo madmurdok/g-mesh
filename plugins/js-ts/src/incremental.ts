@@ -22,6 +22,7 @@ import {
   type ExtractOptions,
   type ExtractResult,
   type ParsedTree,
+  type SymbolDeclaration,
 } from "./extract";
 import { createProjectResolver } from "./resolve";
 
@@ -195,8 +196,44 @@ function nodesEqual(a: ExtractedNode, b: ExtractedNode): boolean {
     a.docComment === b.docComment &&
     a.language === b.language &&
     a.nativeKind === b.nativeKind &&
-    a.hasSyntaxErrors === b.hasSyntaxErrors
+    a.hasSyntaxErrors === b.hasSyntaxErrors &&
+    declarationsEqual(a.declarations, b.declarations)
   );
+}
+
+/**
+ * Declaration lists compared by order and contents, which is the only
+ * comparison that is right in both directions. Reference equality would say
+ * "changed" every reparse, since each extraction builds fresh objects - and a
+ * node reported as changed is removed and re-added, which costs a live symbol
+ * its embedding and its inbound edges for nothing. Ignoring the lists instead
+ * would say "unchanged" when an overload signature was edited, silently
+ * leaving the stored list describing code that no longer exists.
+ *
+ * Order matters rather than being incidental: `ordinal` is a declaration's
+ * identity, the thing a call site's binding is recorded against, so two lists
+ * holding the same declarations in a different order are genuinely different.
+ * (`ordinal` is compared as a field of its own too - a list rebuilt with the
+ * same ranges but renumbered is not the same list.)
+ */
+function declarationsEqual(
+  a: SymbolDeclaration[] | undefined,
+  b: SymbolDeclaration[] | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (a.length !== b.length) return false;
+  return a.every((declaration, index) => {
+    const other = b[index];
+    return (
+      declaration.ordinal === other.ordinal &&
+      declaration.startLine === other.startLine &&
+      declaration.startCol === other.startCol &&
+      declaration.endLine === other.endLine &&
+      declaration.endCol === other.endCol &&
+      declaration.signature === other.signature &&
+      declaration.hasBody === other.hasBody
+    );
+  });
 }
 
 function edgesEqual(a: ExtractedEdge, b: ExtractedEdge): boolean {
@@ -206,7 +243,12 @@ function edgesEqual(a: ExtractedEdge, b: ExtractedEdge): boolean {
     a.toId === b.toId &&
     a.kind === b.kind &&
     a.source === b.source &&
-    a.resolved === b.resolved
+    a.resolved === b.resolved &&
+    // Part of the edge id already, so two edges that disagree here disagree
+    // about `id` too and never reach this comparison as a pair - checked all
+    // the same, so that the day something derives an id differently this
+    // stays a content comparison rather than a restatement of the id.
+    a.toDeclaration === b.toDeclaration
   );
 }
 

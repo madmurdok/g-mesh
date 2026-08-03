@@ -10,7 +10,13 @@ import * as fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import * as path from "node:path";
 
-import { extractFile, isSupportedFile, type ExtractedEdge, type ExtractedNode } from "./extract";
+import {
+  extractFile,
+  isSupportedFile,
+  type ExtractedEdge,
+  type ExtractedNode,
+  type SymbolDeclaration,
+} from "./extract";
 import {
   HARD_EXCLUDED_DIRS,
   isIgnoredByLayers,
@@ -91,13 +97,26 @@ export interface WireNode {
   language: string;
   nativeKind: string | null;
   hasSyntaxErrors: boolean;
+  /**
+   * The symbol's declaration list, passed through from `ExtractedNode`
+   * unchanged (flat line/col, unlike the node's own range - core's
+   * `WireDeclaration` is the same flat shape, so there is nothing to
+   * translate).
+   *
+   * Optional rather than nullable, unlike every field above it: a node with
+   * one declaration must not grow so much as an empty list or a `null` here.
+   * The design's promise is that the ordinary case is byte-identical to what
+   * this function emitted before declarations existed, and `JSON.stringify`
+   * keeps that promise only for a key that is absent.
+   */
+  declarations?: SymbolDeclaration[];
 }
 
 /** Identical shape to `ExtractedEdge` - passed through unchanged. */
 export type WireEdge = ExtractedEdge;
 
 export function toWireNode(node: ExtractedNode): WireNode {
-  return {
+  const wire: WireNode = {
     id: node.id,
     kind: node.kind,
     name: node.name,
@@ -114,6 +133,13 @@ export function toWireNode(node: ExtractedNode): WireNode {
     nativeKind: node.nativeKind ?? null,
     hasSyntaxErrors: node.hasSyntaxErrors,
   };
+  // Assigned only when there is a list, never as `declarations: undefined`:
+  // the key has to be missing from the object, not merely undefined in it, so
+  // that a single-declaration node's line is byte-for-byte what it was before
+  // this field existed - and so a caller comparing wire nodes structurally
+  // sees no new property either.
+  if (node.declarations !== undefined) wire.declarations = node.declarations;
+  return wire;
 }
 
 // --- gitignore-aware walk -------------------------------------------------

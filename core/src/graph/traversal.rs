@@ -355,7 +355,8 @@ fn run_walk(
         "{cte} \
          SELECT n.*, w.depth AS depth, \
                 e.id AS walkedEdgeId, e.fromId AS walkedFromId, e.toId AS walkedToId, \
-                e.kind AS walkedKind, e.source AS walkedSource, e.resolved AS walkedResolved \
+                e.kind AS walkedKind, e.source AS walkedSource, e.resolved AS walkedResolved, \
+                e.toDeclaration AS walkedToDeclaration \
          FROM walk w \
          JOIN nodes n ON n.id = w.node_id \
          LEFT JOIN edges e ON e.id = w.edge_id \
@@ -375,6 +376,7 @@ fn run_walk(
                     kind: row.get("walkedKind")?,
                     source: row.get("walkedSource")?,
                     resolved: row.get("walkedResolved")?,
+                    to_declaration: row.get("walkedToDeclaration")?,
                 }),
                 None => None,
             };
