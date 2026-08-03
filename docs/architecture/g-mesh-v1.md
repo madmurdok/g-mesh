@@ -140,7 +140,8 @@ graph TD
     Core --- ToolLogic
     Core --- SockListener
 
-    Core -->|JSON-RPC (control)<br/>NDJSON (bulk graph)| Plugin["Language plugin process<br/>(JS/TS: tree-sitter + TS compiler API)"]
+    Core -->|JSON-RPC (control)<br/>NDJSON (bulk graph)| Plugin["Language plugin process<br/>(JS/TS: tree-sitter)"]
+    Plugin -->|tsserver protocol| TsServer["tsserver child<br/>(semantic pass, killable)"]
     Core -->|rusqlite, WAL mode| DB[("SQLite + sqlite-vec<br/>~/.g-mesh/projects/&lt;hash&gt;/index.db")]
 
     Config[("~/.g-mesh/projects/&lt;hash&gt;/config.toml<br/>~/.g-mesh/config.toml (global)")] -.-> Core
@@ -156,9 +157,12 @@ graph TD
   [MCP transport & lifecycle](#lifecycle).
 - **Language plugin process**: one per active language per project, spawned
   and owned by the core. For JS/TS: tree-sitter for the fast structural
-  layer, TypeScript compiler API for point semantic resolution. Read-only
-  access to project source; never writes to the index directly — all writes
-  go through the core.
+  layer, and for point semantic resolution a `tsserver` child of its own
+  (see [TS semantic layer](#ts-semantic-layer) — the compiler is
+  deliberately *not* loaded in-process, because it is synchronous and would
+  stall the plugin's event loop for seconds at a time). Read-only access to
+  project source; never writes to the index directly — all writes go
+  through the core.
 - **Storage**: single SQLite file per project, WAL mode, holding both graph
   tables and the `sqlite-vec` vector index.
 
@@ -192,7 +196,7 @@ sequenceDiagram
     Core->>Core: mark indexing complete
     Core-->>Agent: index available (tree-sitter layer)
     par async, non-blocking
-        Plugin->>Plugin: TS compiler API semantic pass
+        Plugin->>Plugin: semantic pass (tsserver child)
         Plugin-->>Core: diff (resolved edges, upgraded `source`)
         Core->>DB: batched transaction
     end
@@ -569,7 +573,16 @@ tighter default.
 
 - **Control plane** (reindex requests, file-changed notifications, status):
   JSON-RPC 2.0 with LSP-style framing (`Content-Length` header + JSON body)
-  — chosen so a `tsserver`-based plugin needs almost no adapter.
+  — chosen partly so a `tsserver`-based plugin needs little adapter code.
+  Measured against a real `tsserver` (see [TS semantic layer](#ts-semantic-layer)),
+  that holds for half the wire and not the other: `tsserver`'s *output* is
+  byte-identical `Content-Length: N\r\n\r\n{body}` framing, which
+  `plugins/js-ts/src/jsonrpc.ts`'s `FrameReader` parses verbatim, but its
+  *input* is newline-delimited JSON and it rejects a `Content-Length` frame
+  outright (`Unexpected token 'C', "Content-Length: 45" is not valid JSON`),
+  with a `{seq, type: "request", command, arguments}` envelope rather than
+  JSON-RPC 2.0's `{jsonrpc, id, method, params}`. "Almost no adapter" was
+  optimistic; ~40 lines is the real figure.
 - **Bulk graph transfer** (initial full index): NDJSON, one compact JSON
   object per line, streamed rather than buffered. Producer must emit
   single-line compact JSON; core's parser strips trailing `\r` (Windows)
@@ -582,6 +595,143 @@ tighter default.
   (first-party or third-party) against the protocol — correct edge
   kinds/types, valid NDJSON framing — independent of how complete that
   plugin's language coverage is.
+
+<a id="ts-semantic-layer"></a>
+### TS semantic layer: `tsserver` subprocess, not the in-process compiler API
+
+The JS/TS plugin's semantic pass drives TypeScript's own type checker
+through a **`tsserver` child process**, not through `ts.createProgram` /
+`ts.createLanguageService` inside the plugin process.
+
+Both shapes give *identical answers* — same compiler, same checker, and the
+prototypes agreed symbol-for-symbol on every probe (136 of 200 identifier
+probes resolved, same 136 under both). So the choice is not about
+correctness; it is about where the compiler's cost and its failure modes
+land. Numbers below are measured, not estimated: Node 20.6.1, TypeScript
+5.9.3, macOS/arm64, against `task-tracker-mcp` (46 root files, ~7.3k LOC,
+`node_modules` present) and `excalidraw` (618 root files, a real
+multi-package monorepo with `paths` aliases — measured *without* its
+`node_modules`, so its figures are a floor, not a real-world number).
+
+| | in-process (`LanguageService`) | `tsserver` subprocess |
+| --- | --- | --- |
+| First semantic answer, 46 files (median of 5) | **1686 ms** (1466–1825) | 2527 ms (2328–2643) |
+| First semantic answer, 618 files | **2626–2738 ms** | 2447–2469 ms |
+| Worst event-loop stall reaching it, 46 files | 1677 ms (1456–1815) | **26 ms** (3–44) |
+| Worst event-loop stall reaching it, 618 files | 2618–2729 ms | **8–41 ms** |
+| Plugin-process RSS once warm, 46 files | 243.6 MB | **24.9 MB** (+265 MB in the child) |
+| Plugin-process RSS once warm, 618 files | 359–369 MB | **25.7–26.0 MB** (+314–316 MB in the child) |
+| Re-query after one edit | 84 ms | **44 ms** |
+| Per-edge cost over 200 probes, cold | 3.20 ms | **3.06 ms** |
+| Per-edge cost over 200 probes, warm | ~1 ms (direct call) | 0.47 ms incl. round trip |
+
+Four things decided it, in order of weight.
+
+**1. The compiler API is synchronous, and the pass is specified as async.**
+The [cold-start diagram](#1-cold-start--initial-index) already draws the
+semantic pass as `par, async, non-blocking` alongside the plugin's other
+work. In-process that drawing is false: the plugin is one Node event loop
+that also carries the control plane and the tree-sitter reparse path
+(`plugins/js-ts/src/incremental.ts`), and building a `Program` stalls it in
+one unbroken block — **1677 ms** on a 46-file project, **2729 ms** on 618
+files, versus **26 ms** worst-case with the subprocess. A `fileChanged`
+notification arriving in that window simply is not served. Recovering async
+in-process means a `worker_thread`, which is a subprocess with extra steps,
+worse isolation, and no version fidelity (point 4).
+
+**2. Blast radius.** The semantic pass is an *optional upgrade* over an
+index that already works without it, so it must not be able to take that
+index down. Capping the heap at 80 MB to force the compiler to OOM: the
+in-process plugin died outright (`SIGABRT`, exit 134), which under
+[plugin-crash handling](#failure-modes--edge-cases) costs a relaunch and a
+dirty-file replay of the *structural* layer too. The same cap applied to
+the child left the plugin alive at 24.9 MB with an uninterrupted heartbeat,
+free to report the failure and keep serving tree-sitter queries. g-mesh
+targets repos where the compiler OOMing is a real outcome, not a
+hypothetical.
+
+**3. The memory is reclaimable, and it is only paid when used.** Killing
+the child returns all ~265 MB to the OS. In-process it does not come back:
+after `service.dispose()` plus two forced GCs (which needs `--expose-gc`,
+so the real plugin would do worse) RSS settled at 146.4 MB, against a
+30.8 MB tree-sitter-only baseline. Worse, merely `require`ing the compiler
+— zero compiler work done — costs **+61.5 MB permanently** (21.6 MB bare
+Node → 92.3 MB), a tax paid on every plugin process including plain-JS
+projects with no `tsconfig.json` that will never run a semantic pass. Both
+shapes need `typescript` as a runtime `dependencies` entry either way
+(`tsserver` ships *inside* that package), so promoting it is not a cost
+unique to the in-process shape — but only the subprocess shape gets to not
+*load* it.
+
+**4. Version fidelity.** The subprocess can be spawned from the *target
+project's own* `node_modules/typescript/lib/tsserver.js` (verified present
+and independently spawnable), falling back to the bundled copy — so a
+project pinned to an older TypeScript is analyzed by the compiler it
+actually builds with. The in-process equivalent is `require`ing an
+arbitrary-version 9.1 MB compiler into the plugin's own heap: API drift on
+every version, and arbitrary project code executing in-process.
+
+**The one real cost on the security side, and how it is paid.** This is
+the single axis where the in-process shape is genuinely better, and it was
+nearly missed: the plugin's `security.test.ts` encodes the [Security
+Model](#security-model)'s first mitigation as an executable invariant, and
+the prototype tripped it. All three results below come from that file's own
+malicious-plugin fixture, pointed at each shape in turn.
+
+A bare in-process `LanguageService` never loads a project's
+`compilerOptions.plugins`: the config parser does surface them
+(`options.plugins` came back as `[{name: "evil-ts-plugin"}]`), but nothing
+acts on them — plugin loading lives in tsserver's `Project`, not in
+`createLanguageService` — so the fixture answered semantics normally and
+never executed. The mitigation holds structurally, for free. tsserver *does*
+know how to load them, so the subprocess turns that structural guarantee
+into a default: with `--allowLocalPluginLoads` it **does** `require()` an
+attacker-controlled plugin out of the project's own `node_modules`; without
+it, it **does not**, and still answers semantic queries normally. The flag is off unless passed, so the mitigation survives
+— and `security.test.ts` now pins that neither it nor
+`--globalPlugins`/`--pluginProbeLocations` ever reaches the spawn, alongside
+`--disableAutomaticTypingAcquisition` (ATA npm-installs `@types/*`, and is
+the only network path in the `typescript` package). That is the same
+assurance shape the other mitigations already have — true by construction,
+pinned by a test that fails loudly — not a weakening of it. `child_process`
+is on that file's forbidden-pattern list as a shell-out proxy; the
+exemption is scoped to `semantic.ts` alone and bounded by a test asserting
+the only thing it ever spawns is Node itself with an argv array, never a
+shell. Running the checker out-of-process also *contains* any future
+compiler-side execution bug in a child rather than in the process holding
+the index.
+
+What (b) costs, and why it is affordable: **+841 ms** to the first answer
+on the small project (the child pays its own Node boot and module load
+serially). That lands entirely off the critical path — the pass is async by
+construction and the structural index is already queryable — and it
+*inverts* on the larger project, where the child is already ahead
+(2447–2469 ms vs 2626–2738 ms). Protocol overhead is **under 0.5 ms per
+edge** warm, far below the ~3 ms the checking itself costs, so a backlog of
+10k unresolved edges pays a few seconds of framing against minutes of real
+work. The adapter is ~40 lines.
+
+**`ts.createProgram` is ruled out explicitly**, separately from the
+in-process/subprocess axis: it is the worst option on every measured axis,
+including against the in-process `LanguageService`. Re-querying after a
+single edit took **715 ms** (570 ms rebuild with `oldProgram` reuse + 145 ms
+to answer) versus 84 ms, and RSS grew 235 → 338 MB across that one edit
+because the superseded `Program` stays reachable. Anything in-process would
+have to be `LanguageService`-shaped anyway.
+
+The incremental fit is the one place the two shapes are close, and it
+favours the subprocess for a reason worth recording: `tsserver`'s `change`
+command takes `{line, offset, endLine, endOffset, insertString}`, which is
+the shape `incremental.ts`'s `computeSourceEdit` **already derives** from
+its old/new text diff. The existing edit derivation feeds `tsserver`
+directly modulo 0-based-row → 1-based-line conversion, and the invalidation
+itself is `tsserver`'s problem rather than ours. Point queries also do not
+require an `open` first — an unopened file answered in 2.2 ms — so the pass
+can walk the unresolved-edge backlog without managing an open-file set.
+
+A minimal client skeleton for this, unwired, is in
+`plugins/js-ts/src/semantic.ts`; the protocol plumbing and the runtime
+lifecycle are separate work.
 
 ### Shim ↔ daemon
 
@@ -732,13 +882,20 @@ Cheap, targeted mitigations instead:
 - Plugins never load tsconfig-style `plugins` extension points that execute
   code at language-server startup (a known attack vector via a malicious
   `tsconfig.json`) — not needed for indexing, so skipping it removes the
-  vector for free.
+  vector for free. The structural layer never opens `tsconfig.json` at all;
+  the [semantic layer](#ts-semantic-layer) drives a `tsserver`, which *can*
+  load them, so it is spawned without `--allowLocalPluginLoads` (verified:
+  with the flag a plugin in the project's `node_modules` executes, without
+  it it does not) and without `--globalPlugins`/`--pluginProbeLocations`.
 - Plugins have no write access to the index at all — writes are core-only;
   the protocol only carries plugin → core diffs over stdio. Plugin file
   access is read-only on project source; write access, if any, is limited
   to the plugin's own temp/log files.
 - Plugins get no network access beyond what analysis strictly needs,
-  reinforcing "project content doesn't leave the machine".
+  reinforcing "project content doesn't leave the machine". For JS/TS that
+  means `tsserver` always runs with `--disableAutomaticTypingAcquisition`:
+  typings acquisition npm-installs `@types/*` for the project and is the
+  only network path the `typescript` package has.
 - The trust model is documented plainly: a plugin runs in the same trust
   zone as an editor's language server — no stronger guarantee is implied.
 
