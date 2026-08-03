@@ -276,6 +276,21 @@ defaults when a project or machine has never run either.
 `find_definition`, `find_references`, `find_callers`, `find_callees`,
 `find_implementations`, `get_file_outline`, `get_dependencies`.
 
+## Known limits
+
+**Computed `import()`/`require()` specifiers.** `import(\`./plugins/${name}/index.js\`)`
+resolves when every interpolated part is a same-file constant (a `const`
+bound to a string literal, a named string enum member, a literal ternary, or
+`path.join`/`path.resolve(__dirname, ...)`) — that is arithmetic over one
+file's own syntax, no different in kind from resolving a plain relative
+`import "./x"`. `import(getSpecifier(id))` and anything else whose value only
+exists at runtime (an argument, `process.env`, an arbitrary function call)
+does not resolve and never will — no edge is recorded for it, not a wrong or
+partial one. This is a permanent limit, not a gap scheduled to close: a
+static analysis pass cannot evaluate an expression that only has a value once
+the program is actually running. Full scope and reasoning in
+`docs/architecture/g-mesh-v1.md` ("Computed import specifiers").
+
 ## State & cleanup
 
 Per-project state lives under `~/.g-mesh/projects/<hash-of-project-root>/`:
