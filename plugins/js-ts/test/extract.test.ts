@@ -14,6 +14,7 @@ import {
   type ExtractOptions,
   type ExtractResult,
   type ExtractedNode,
+  type NamespaceMemberUse,
   type NodeKind,
 } from "../src/extract";
 
@@ -992,4 +993,149 @@ export function run(): void {
     false,
     "whether that file exports it is a fact about the index, which only core has",
   );
+});
+
+// --- namespace imports ----------------------------------------------------
+//
+// `import * as ns` still binds no symbol here, and still emits no edge of its
+// own - what is new is that the sites written against it are *recorded* rather
+// than dropped, so semanticPass.ts can ask a checker which export each names.
+
+function uses(result: ExtractResult): NamespaceMemberUse[] {
+  return result.namespaceMemberUses;
+}
+
+test("a namespace import emits no edge of its own, but records the member sites", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export function run(): void {
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // The gap this exists to close: nothing here names `mutate`, so the
+  // structural pass has nothing to point an edge at and emits none.
+  assert.deepEqual(
+    result.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND),
+    [],
+    "the extractor must not guess which export `lib.mutate` names",
+  );
+  assert.deepEqual(
+    result.edges.filter((e) => e.kind === "CALLS"),
+    [],
+    "and must not invent a call edge either",
+  );
+
+  assert.equal(uses(result).length, 1);
+  const [use] = uses(result);
+  assert.equal(use.memberName, "mutate");
+  assert.equal(use.namespaceName, "lib");
+  assert.equal(use.modulePath, "src/lib.ts");
+  assert.equal(use.edgeKind, "CALLS");
+  assert.equal(use.fromId, node(result, "Function", "run").id);
+  // The recorded position is the member name itself - what a point query is
+  // aimed at - not the receiver and not the whole expression.
+  assert.equal(use.line, 3);
+  assert.equal(use.col, "  lib.".length);
+});
+
+test("a namespace member read outside a call is recorded as a reference", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export const answer = lib.value;
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.equal(uses(result).length, 1);
+  assert.equal(uses(result)[0].edgeKind, "REFERENCES");
+  assert.equal(uses(result)[0].memberName, "value");
+  assert.equal(uses(result)[0].fromId, node(result, "Variable", "answer").id);
+});
+
+test("a namespace call at module top level degrades to a reference from the file", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+lib.boot();
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // Same rule an ordinary imported call follows: a CALLS edge is made by some
+  // function, and a call written at module top level is made by none.
+  assert.equal(uses(result)[0].edgeKind, "REFERENCES");
+  assert.equal(uses(result)[0].fromId, node(result, "File", "src/app.ts").id);
+});
+
+test("a namespace import of a specifier outside this project records nothing", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as p from "node:path";
+
+export function run(): string {
+  return p.join("a", "b");
+}
+`,
+    { resolveSpecifier: () => null },
+  );
+
+  // Nothing of `node:path` is in this index, so no placeholder addressed at it
+  // could ever be linked - and asking a checker about it would be pure cost.
+  assert.deepEqual(uses(result), []);
+});
+
+test("a local binding shadowing a namespace import is not a namespace member access", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export function run(lib: { mutate(): void }): void {
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.deepEqual(uses(result), [], "the parameter shadows the import, as it does in the language");
+});
+
+test("an ordinary property access on a value is not mistaken for a namespace member", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `const config = { mutate(): void {} };
+
+export function run(): void {
+  config.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.deepEqual(uses(result), []);
+});
+
+test("recording namespace sites leaves the edges a named import already resolved alone", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+import { helper } from "./lib";
+
+export function run(): void {
+  helper();
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "CALLS", "run", "src/lib.ts#helper"));
+  assert.equal(uses(result).length, 1);
 });

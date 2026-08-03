@@ -240,7 +240,12 @@ function diffItems<T extends { id: string }>(
   return { added, removed };
 }
 
-const EMPTY_RESULT: ExtractResult = { nodes: [], edges: [], hasSyntaxErrors: false };
+const EMPTY_RESULT: ExtractResult = {
+  nodes: [],
+  edges: [],
+  hasSyntaxErrors: false,
+  namespaceMemberUses: [],
+};
 
 function diffResults(
   filePath: string,
@@ -280,6 +285,19 @@ const fileStates = new Map<string, FileState>();
 
 export function hasCachedFile(filePath: string): boolean {
   return fileStates.has(filePath);
+}
+
+/**
+ * The extraction core was last told about for `filePath`, if this process
+ * still holds it.
+ *
+ * Read by semanticPass.ts, which needs the *committed* extraction rather than
+ * a fresh one: the ids it writes edges from have to be ids that are actually in
+ * the index. A miss (a cold process, a file only the bulk-index run ever saw)
+ * is normal and the caller re-parses instead.
+ */
+export function cachedExtraction(filePath: string): ExtractResult | undefined {
+  return fileStates.get(filePath)?.result;
 }
 
 /** Drops one file's state - e.g. after a delete, so a re-creation is treated

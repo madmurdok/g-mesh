@@ -167,11 +167,59 @@ export interface ExtractedEdge {
   resolved: boolean;
 }
 
+/**
+ * One `ns.member` written where `ns` was bound by `import * as ns from "./x"`
+ * and `"./x"` resolved to a file of this project.
+ *
+ * Not a node and not an edge - a *question*, addressed to the semantic layer
+ * and answered by it (semanticPass.ts). The structural pass deliberately emits
+ * nothing for these sites: it never sees the bare name `member` at all, only a
+ * property access on a module object, and which export that names is a fact
+ * about another file's exports plus TypeScript's own alias resolution. The
+ * placeholder such a use eventually hangs on is therefore built by the semantic
+ * pass rather than here, from the declaration `tsserver` actually points at -
+ * which is why this rides alongside the extraction instead of inside it, and
+ * never reaches core on the wire.
+ */
+export interface NamespaceMemberUse {
+  /** Node id the usage edge is written from - see [`Scope`]. */
+  fromId: string;
+  /** `CALLS` when the site is a call made from inside a function; else `REFERENCES`. */
+  edgeKind: "CALLS" | "REFERENCES";
+  /**
+   * Project-relative POSIX path of the module `ns` names - the reason this
+   * site is a question at all (a namespace import of a package binds nothing
+   * this index contains, and is never recorded).
+   *
+   * Deliberately *not* the address the placeholder ends up with: which file
+   * really declares the member is the checker's answer, and it is often a
+   * different one - a barrel forwards, an alias renames.
+   */
+  modulePath: string;
+  /** The local name of the namespace binding (`ns`), for diagnostics. */
+  namespaceName: string;
+  /** The name written after the dot. */
+  memberName: string;
+  /** Zero-based position of the member name, tree-sitter's own convention. */
+  line: number;
+  col: number;
+  /** Zero-based position of the `import * as ns` binding - where the
+   * placeholder the semantic pass builds is anchored, matching how an ordinary
+   * import placeholder is anchored at its own binding site. */
+  bindingLine: number;
+  bindingCol: number;
+}
+
 export interface ExtractResult {
   nodes: ExtractedNode[];
   edges: ExtractedEdge[];
   /** True when tree-sitter's error-tolerant parse hit ERROR/MISSING nodes. */
   hasSyntaxErrors: boolean;
+  /**
+   * Sites only a type checker can resolve, collected for semanticPass.ts.
+   * Empty for the vast majority of files, and never part of the wire diff.
+   */
+  namespaceMemberUses: NamespaceMemberUse[];
 }
 
 /**
@@ -440,6 +488,21 @@ interface PendingSupertype {
 }
 
 /**
+ * A `<identifier>.<property>` site, kept until the walk is over because
+ * whether the receiver is a namespace import is only settled once every import
+ * has been seen - and because a local of the same name shadows one, which the
+ * scope chain at the site decides.
+ */
+interface PendingMemberAccess {
+  readonly objectName: string;
+  readonly memberName: string;
+  /** The property node, i.e. what a semantic query is pointed at. */
+  readonly at: SyntaxNode;
+  readonly scope: Scope;
+  readonly isCall: boolean;
+}
+
+/**
  * One local name introduced by an import whose specifier resolved to a file
  * in this project - i.e. a name this file uses but another file declares.
  */
@@ -482,10 +545,19 @@ class Extractor {
    * uses but does not declare. Consulted only after the declared-symbol
    * lookup has failed, so a local always shadows an import. */
   private readonly importBindings = new Map<string, ImportBinding>();
+  /**
+   * Local name -> the module `import * as <name>` bound it to. Kept apart from
+   * `importBindings` on purpose: that map answers "which symbol does this name
+   * stand for", and a namespace binding stands for no single symbol - only for
+   * a module whose members need a checker to attribute.
+   */
+  private readonly namespaceBindings = new Map<string, ImportBinding>();
   private readonly pendingCalls: PendingCall[] = [];
   private readonly pendingReferences: PendingReference[] = [];
   private readonly pendingSupertypes: PendingSupertype[] = [];
+  private readonly pendingMemberAccesses: PendingMemberAccess[] = [];
   private readonly pendingExports: string[] = [];
+  private readonly namespaceMemberUses: NamespaceMemberUse[] = [];
   private fileNode!: ExtractedNode;
 
   constructor(
@@ -520,6 +592,7 @@ class Extractor {
       nodes: [...this.nodes.values()],
       edges: [...this.edges.values()],
       hasSyntaxErrors: this.hasSyntaxErrors,
+      namespaceMemberUses: this.namespaceMemberUses,
     };
   }
 
@@ -719,6 +792,9 @@ class Extractor {
       case "new_expression":
         this.handleNew(node, scope);
         return;
+      case "member_expression":
+        this.handleMemberExpression(node, scope);
+        return;
       case "identifier":
       case "type_identifier":
       case "shorthand_property_identifier":
@@ -790,11 +866,14 @@ class Extractor {
    * index, so a placeholder for one could never be linked to anything (which
    * specifiers resolve at all is resolve.ts's call).
    *
-   * `import * as NS from "./x"` is deliberately not recorded. The binding
-   * names a whole module rather than one symbol, so `NS.f()` would have to
-   * resolve `f` against the target file's exports - and this pass cannot tell
-   * that apart from an ordinary property access on a value, which is the kind
-   * of guess the extractor does not make.
+   * `import * as NS from "./x"` binds no *symbol*, and still does not: the
+   * name stands for a whole module, so `NS.f()` would have to resolve `f`
+   * against the target file's exports, and this pass cannot tell that apart
+   * from an ordinary property access on a value - the kind of guess the
+   * extractor does not make. What it does record is the binding itself, in
+   * [`namespaceBindings`], so that the member accesses written against it can
+   * be handed to the semantic layer as questions rather than dropped on the
+   * floor (see [`NamespaceMemberUse`]).
    */
   private recordImportBindings(statement: SyntaxNode, targetPath: string): void {
     const clause = statement.children.find((child) => child.type === "import_clause");
@@ -806,7 +885,16 @@ class Extractor {
         this.bindImport(child, targetPath, "default");
         continue;
       }
-      if (child.type !== "named_imports") continue; // namespace_import: see above
+      if (child.type === "namespace_import") {
+        const local = child.namedChildren.find((name) => name.type === "identifier");
+        // The imported name is the module itself; only `targetPath` and the
+        // binding's position are ever read back out of this entry.
+        if (local && !this.namespaceBindings.has(local.text)) {
+          this.namespaceBindings.set(local.text, { targetPath, importedName: local.text, at: local });
+        }
+        continue;
+      }
+      if (child.type !== "named_imports") continue;
       for (const specifier of child.namedChildren) {
         if (specifier.type !== "import_specifier") continue;
         const name = specifier.childForFieldName("name");
@@ -1430,6 +1518,7 @@ class Extractor {
             objectName: object.text,
             scope,
           });
+          this.recordMemberAccess(object, property, scope, true);
         } else if (object) {
           this.visit(object, scope);
         }
@@ -1456,6 +1545,39 @@ class Extractor {
       this.visit(constructor, scope);
     }
     if (args) this.visitChildren(args, scope);
+  }
+
+  /**
+   * `obj.prop` outside a call position. Structurally this is exactly what the
+   * default branch of [`visit`] already did - the receiver is walked (and so
+   * may become a reference), the property name is not a binding anyone here
+   * can resolve - and that is kept verbatim. The one addition is recording the
+   * site, in case the receiver turns out to be a namespace import.
+   */
+  private handleMemberExpression(node: SyntaxNode, scope: Scope): void {
+    const object = node.childForFieldName("object");
+    const property = node.childForFieldName("property");
+    if (object?.type === "identifier" && property) {
+      this.recordMemberAccess(object, property, scope, false);
+    }
+    this.visitChildren(node, scope);
+  }
+
+  /** Kept until [`resolvePending`], which is the first point at which every
+   * import has been seen and the receiver can be tested against them. */
+  private recordMemberAccess(
+    object: SyntaxNode,
+    property: SyntaxNode,
+    scope: Scope,
+    isCall: boolean,
+  ): void {
+    this.pendingMemberAccesses.push({
+      objectName: object.text,
+      memberName: property.text,
+      at: property,
+      scope,
+      isCall,
+    });
   }
 
   /** `require("x")` / `import("x")` with a literal specifier, same as a static import. */
@@ -1485,6 +1607,42 @@ class Extractor {
     for (const reference of this.pendingReferences) {
       this.resolveReference(reference.name, reference.scope);
     }
+    for (const access of this.pendingMemberAccesses) this.collectNamespaceMemberUse(access);
+  }
+
+  /**
+   * Keeps `ns.member` when - and only when - `ns` really is a namespace import
+   * of a file in this project.
+   *
+   * Three things are ruled out first, all of them by the same rule the rest of
+   * this pass follows: a local binding of that name shadows the import, so the
+   * receiver is some other value entirely; a name this file *declares* likewise
+   * shadows it; and a specifier that resolved to nothing in this project was
+   * never bound here at all (`recordImportBindings` is only reached for one
+   * that did). What is left is a genuine module-member access - and *which*
+   * export it names is the question handed on, never answered here.
+   */
+  private collectNamespaceMemberUse(access: PendingMemberAccess): void {
+    const binding = this.namespaceBindings.get(access.objectName);
+    if (binding === undefined) return;
+    if (isLocallyBound(access.objectName, access.scope.locals)) return;
+    if (this.lookupByName(access.objectName, access.scope.namespacePrefix) !== undefined) return;
+
+    // Same split as `resolveCall`: a CALLS edge is Function -> Function, so a
+    // call written at module top level - made by nothing - degrades to a usage
+    // edge from the enclosing symbol, exactly as an ordinary imported call does.
+    const asCall = access.isCall && access.scope.enclosingCallerId !== null;
+    this.namespaceMemberUses.push({
+      fromId: asCall ? (access.scope.enclosingCallerId as string) : access.scope.enclosingSymbolId,
+      edgeKind: asCall ? "CALLS" : "REFERENCES",
+      modulePath: binding.targetPath,
+      namespaceName: access.objectName,
+      memberName: access.memberName,
+      line: access.at.startPosition.row,
+      col: access.at.startPosition.column,
+      bindingLine: binding.at.startPosition.row,
+      bindingCol: binding.at.startPosition.column,
+    });
   }
 
   private resolveCall(call: PendingCall): void {

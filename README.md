@@ -1,8 +1,10 @@
 # g-mesh
 
 Local structural code-graph indexer for AI agents, exposed as an MCP server.
-MVP scope: JavaScript/TypeScript only, structural (tree-sitter) resolution —
-no TS compiler API semantics yet. See `REQUIREMENTS.md` and
+MVP scope: JavaScript/TypeScript only. Resolution is structural (tree-sitter)
+first, with a semantic pass over it that drives the project's own `tsserver`
+for the questions a name-matching layer cannot answer — today, the members of
+an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 `docs/architecture/g-mesh-v1.md` for the full design.
 
 ## Layout
@@ -249,10 +251,10 @@ The daemon is two processes with very different costs, and each has its own
 idle timeout:
 
 - The **JS/TS plugin** (the expensive one — tree-sitter parsing in a Node
-  process; `typescript` is a devDependency of the plugin's own build, not a
-  runtime dependency — the TS compiler API semantic layer is still backlog,
-  see the note at the top of this file) exits after an hour with no reparse
-  work.
+  process; `typescript` is a runtime dependency, since `tsserver` ships inside
+  that package, but it is never loaded in this process — the checker runs as a
+  child, spawned only by the first semantic question actually asked and killed
+  with the plugin) exits after an hour with no reparse work.
   While it is asleep the core keeps watching the project and remembers which
   files changed; the next query wakes it and replays exactly that list, not
   the whole project. `g-mesh status` reports it as `asleep`, which needs no
