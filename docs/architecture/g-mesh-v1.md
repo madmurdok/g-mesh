@@ -778,14 +778,58 @@ already forces from the rebuilt plugin's own digest. A node that has more than
 one declaration now carries the ordered list, and its primary range, signature
 and doc comment are filled from the group as described above.
 
-Still open, in this order: the storage half — the `DECLARATIONS` table, the
-`toDeclaration` edge column, `edgeIdFor` hashing it, `schema_version` 4 → 5 —
-which is also what puts `declarations` on the wire (`toWireNode` deliberately
-does not send a field core would drop, and `nodesEqual` deliberately does not
-compare one, which would otherwise churn a byte-identical node out of an edit
-to an overload); and then the semantic pass filling `toDeclaration` from
-`definition` at each unresolved-or-overloaded call site, for which the
-extractor's declaration ranges are the lookup table.
+The storage half is **done**: the `DECLARATIONS` table, the `toDeclaration`
+edge column, `edgeIdFor` hashing it, `schema_version` 4 → 5 — which is also
+what puts `declarations` on the wire (`toWireNode` deliberately does not send a
+field core would drop, and `nodesEqual` deliberately does not compare one,
+which would otherwise churn a byte-identical node out of an edit to an
+overload).
+
+The semantic pass filling `toDeclaration` is **done** too, as a third question
+in `semanticPass.ts` beside the namespace and re-export ones. `definition`
+asked at the *callee token* is the whole mechanism, and the measurement that
+settles it is the row above: at a call site it returns **one** location, the
+overload TypeScript's own resolution picked (`parse("x")` → ordinal 0,
+`parse(10, 16)` → ordinal 1; class methods likewise), where the same request at
+an import specifier returns all three declarations unranked. `quickinfo` was
+the alternative — it does put the resolved signature first — but it answers in
+prose that would have to be matched back against a declaration's `signature`
+string, whereas a position matches a declaration's own range exactly. So the
+ordinal is read by containment against the extractor's declaration ranges, not
+by comparing signature text.
+
+Three things that fell out of building it, none of them obvious from the design
+above:
+
+- **The extractor had to start recording call-site positions** — an edge
+  carries none (identity is `(from, kind, to)`), so by the end of the walk
+  *where* a call was written is simply gone. `ExtractResult.overloadCallSites`
+  is that record, kept only where an answer could differ from what is already
+  stored: a target this file declares with more than one declaration, or one in
+  another file the walk must not read. The pass then drops the second group
+  against the target file's own extraction, so the round trips actually spent
+  are the calls to things really written more than once.
+- **A node's own range does not cover its overload signatures.** For a
+  multi-declaration node the primary range is the *implementation's* (see
+  above), so a `definition` landing on a signature three lines up falls outside
+  the very node it belongs to. Matching has to go through the declaration list,
+  which is also what makes it yield the node and the ordinal in one step.
+- **The collapsed edge has to be retracted, not merely superseded.** The bound
+  edges have ids the structural pass never emits (`edgeIdFor` hashes the
+  ordinal in), so adding them would leave the unbound edge to be linked
+  alongside — three `CALLS` edges for a caller of two overloads, one of them
+  saying strictly less. It goes out for deletion in the same diff, and only
+  when *every* call site behind it resolved; a partial answer leaves it exactly
+  as the structural pass wrote it. For the same reason the bound edges are
+  booked for retraction like the namespace half's: nothing else can retract an
+  id nothing else emits.
+
+Not reached, and deliberately: a call whose target arrives through a re-export
+is bound to the symbol but not to an overload (the barrel does not declare it,
+and following the chain is the second question's job), and a method called
+through a variable receiver (`r.find("a")`) has no `CALLS` edge to bind in the
+first place. Both leave the structural layer's own answer standing, which is
+the standing rule — a missing refinement beats a wrong one.
 
 <a id="generics"></a>
 ### Generic types: the written syntax is indexed, instantiation is not

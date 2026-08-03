@@ -274,6 +274,46 @@ export interface NamespaceMemberUse {
   bindingCol: number;
 }
 
+/**
+ * One written call whose target *might* turn out to have several declarations,
+ * and where on the page it is written.
+ *
+ * A question for semanticPass.ts, in the same spirit as [`NamespaceMemberUse`]
+ * and for the same reason: which overload a call binds is a fact about types,
+ * and this walk has none. It exists at all because an edge carries no position
+ * - identity is `(from, kind, to)` ([`edgeIdFor`]) - so by the time the
+ * structural pass is over, *where* the call was written is gone, and that
+ * position is precisely what the checker has to be asked about.
+ *
+ * One record per call site, not per edge: `parse("x")` and `parse(10, 16)` in
+ * one function collapse onto a single `CALLS` edge here, and prying them back
+ * apart into two bindings is the whole point of the exercise.
+ *
+ * **Kept only where an answer could differ from what is already recorded**, so
+ * that the extraction a long-lived process caches (incremental.ts) does not
+ * grow a record per call in the project:
+ *
+ *  - the target is declared in this file and has more than one declaration -
+ *    an overload set, decidable here; or
+ *  - the target is a pending-symbol placeholder, whose declarations live in
+ *    another file this walk must not read. The pass filters those the cheap
+ *    way, by looking at that file's own extraction, before spending a round
+ *    trip on any of them.
+ *
+ * Every other call - the overwhelming majority, to an ordinary
+ * single-declaration function - is dropped where it is found.
+ */
+export interface OverloadCallSite {
+  /** Node id the `CALLS` edge is written from. */
+  fromId: string;
+  /** Node id it points at: a node of this file, or a pending-symbol placeholder. */
+  toId: string;
+  /** Zero-based position of the callee's *name* token - tree-sitter's own
+   * convention, and the token whose declaration is being asked for. */
+  line: number;
+  col: number;
+}
+
 export interface ExtractResult {
   nodes: ExtractedNode[];
   edges: ExtractedEdge[];
@@ -284,6 +324,11 @@ export interface ExtractResult {
    * Empty for the vast majority of files, and never part of the wire diff.
    */
   namespaceMemberUses: NamespaceMemberUse[];
+  /**
+   * Call sites whose target may be an overload set, likewise collected for
+   * semanticPass.ts and likewise never part of the wire diff.
+   */
+  overloadCallSites: OverloadCallSite[];
 }
 
 /**
@@ -573,6 +618,12 @@ interface PendingCall {
   readonly scope: Scope;
   /** Receiver identifier for `qualified` calls (`Base.s()`, `NS.f()`). */
   readonly objectName?: string;
+  /**
+   * The callee's name token. Carried only so that a call which turns out to
+   * point at an overload set can be handed to the checker as a *position*
+   * ([`OverloadCallSite`]) - the edge it produces has none.
+   */
+  readonly at: SyntaxNode;
 }
 
 /**
@@ -808,6 +859,15 @@ class Extractor {
   private readonly pendingMemberAccesses: PendingMemberAccess[] = [];
   private readonly pendingExports: string[] = [];
   private readonly namespaceMemberUses: NamespaceMemberUse[] = [];
+  /**
+   * Every call site that produced a `CALLS` edge, before it is known which of
+   * them could possibly bind an overload. Narrowed to the few that can in
+   * [`Extractor.keptCallSites`], once `fillDeclarationLists` has settled which
+   * of this file's own symbols have more than one declaration - a fact that is
+   * not available while the walk is still running, since the second overload
+   * may be written below the call that binds the first.
+   */
+  private readonly callSites: OverloadCallSite[] = [];
   private fileNode!: ExtractedNode;
 
   constructor(
@@ -845,7 +905,24 @@ class Extractor {
       edges: [...this.edges.values()],
       hasSyntaxErrors: this.hasSyntaxErrors,
       namespaceMemberUses: this.namespaceMemberUses,
+      overloadCallSites: this.keptCallSites(),
     };
+  }
+
+  /**
+   * The call sites worth keeping - see [`OverloadCallSite`] for why almost
+   * none of them are. Run after `fillDeclarationLists`, which is what makes
+   * "does this file's own `parse` have more than one declaration" answerable.
+   */
+  private keptCallSites(): OverloadCallSite[] {
+    return this.callSites.filter((site) => {
+      const target = this.nodes.get(site.toId);
+      if (target === undefined) return false;
+      // Declared elsewhere: this walk cannot know, so the pass decides.
+      if (target.nativeKind === PENDING_SYMBOL_NATIVE_KIND) return true;
+      // Declared here: one declaration means there is nothing to choose between.
+      return target.declarations !== undefined;
+    });
   }
 
   // --- node/edge construction ----------------------------------------
@@ -1025,6 +1102,22 @@ class Extractor {
     if (this.edges.has(id)) return;
     const resolved = !isPlaceholder(target);
     this.edges.set(id, { id, fromId, toId, kind, source: EDGE_SOURCE, resolved });
+  }
+
+  /**
+   * Remembers where a call that produced a `CALLS` edge was written. Only the
+   * edge's own existence is checked here - whether its target can have several
+   * declarations is settled later ([`Extractor.keptCallSites`]), because while
+   * the walk runs the answer is still being written.
+   */
+  private recordCallSite(fromId: string, toId: string, at: SyntaxNode): void {
+    if (!this.edges.has(edgeIdFor(fromId, "CALLS", toId))) return;
+    this.callSites.push({
+      fromId,
+      toId,
+      line: at.startPosition.row,
+      col: at.startPosition.column,
+    });
   }
 
   private markExported(node: ExtractedNode): void {
@@ -1928,14 +2021,14 @@ class Extractor {
       if (callee.type === "identifier" && callee.text === "require") {
         // A `require(...)` this pass cannot read as an import is still a call
         // of the name `require`, which a file is free to declare itself.
-        const asCall: PendingCall = { name: callee.text, receiver: "none", scope };
+        const asCall: PendingCall = { name: callee.text, receiver: "none", scope, at: callee };
         if (!this.recordCallImport(node, scope, asCall)) this.pendingCalls.push(asCall);
       } else if (callee.type === "import") {
         this.recordCallImport(node, scope, null);
       } else if (callee.type === "identifier") {
-        this.pendingCalls.push({ name: callee.text, receiver: "none", scope });
+        this.pendingCalls.push({ name: callee.text, receiver: "none", scope, at: callee });
       } else if (callee.type === "super") {
-        this.pendingCalls.push({ name: "constructor", receiver: "super", scope });
+        this.pendingCalls.push({ name: "constructor", receiver: "super", scope, at: callee });
       } else if (callee.type === "member_expression") {
         const object = callee.childForFieldName("object");
         const property = callee.childForFieldName("property");
@@ -1944,6 +2037,7 @@ class Extractor {
             name: property.text,
             receiver: object.type === "this" ? "this" : "super",
             scope,
+            at: property,
           });
         } else if (object && property && object.type === "identifier") {
           // `Base.s()` / `NS.f()`: a bare identifier receiver can name a
@@ -1955,6 +2049,7 @@ class Extractor {
             receiver: "qualified",
             objectName: object.text,
             scope,
+            at: property,
           });
           this.recordMemberAccess(object, property, scope, true);
         } else if (object) {
@@ -1981,6 +2076,7 @@ class Extractor {
         receiver: "qualified",
         objectName: constructor.text,
         scope,
+        at: constructor,
       });
     } else if (constructor) {
       this.visit(constructor, scope);
@@ -2367,6 +2463,7 @@ class Extractor {
 
     if (target?.kind === "Function" && call.scope.enclosingCallerId !== null) {
       this.addEdge(call.scope.enclosingCallerId, "CALLS", target.id);
+      this.recordCallSite(call.scope.enclosingCallerId, target.id, call.at);
       return;
     }
     // What a CALLS edge points *at* is always a Function, and it is always
@@ -2386,6 +2483,7 @@ class Extractor {
         this.resolveReference(call.name, call.scope);
       } else if (call.scope.enclosingCallerId !== null) {
         this.addEdge(call.scope.enclosingCallerId, "CALLS", imported.id);
+        this.recordCallSite(call.scope.enclosingCallerId, imported.id, call.at);
       } else {
         // Same rule as above: a call written at module top level is made by
         // nothing, so it degrades to a usage edge.

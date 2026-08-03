@@ -7,11 +7,11 @@
 // needs storage or protocol work of its own (docs/architecture/g-mesh-v1.md,
 // "Core <-> language plugin protocol").
 //
-// ## The two questions it asks
+// ## The three questions it asks
 //
-// They are opposite shapes, and the pass does both in one sweep because they
-// share every expensive thing they need: one extraction per file, one tsserver
-// child, one failure budget.
+// They are different shapes, and the pass does all of them in one sweep because
+// they share every expensive thing they need: one extraction per file, one
+// tsserver child, one failure budget.
 //
 //  1. **A namespace member use** - `import * as ns from "./mod"` then
 //     `ns.someExport()`. There is no unresolved edge to upgrade here: the
@@ -31,6 +31,19 @@
 //     **same** edge re-sent under its own id with a better `toId`,
 //     `source: "ts-compiler"` and `resolved: true`; `apply_diff`'s
 //     `ON CONFLICT(id) DO UPDATE` rewrites the row in place.
+//
+//  3. **A call of an overloaded function** - `parse("x")` and `parse(10, 16)`
+//     where `parse` is written as two signatures and an implementation. The
+//     structural pass emits an edge, and it is not wrong so much as *unable to
+//     be more specific*: an edge's identity is `(from, kind, to)`, so both
+//     calls collapse onto one edge pointing at the whole symbol, and the
+//     position each was written at - the only thing that could tell them apart
+//     - is gone by the time the walk ends. What this pass produces for it is
+//     **one edge per distinct overload actually bound**, carrying the
+//     `toDeclaration` ordinal into that symbol's declaration list, and the
+//     collapsed edge is retracted in the same diff (see "Replacing a collapsed
+//     edge" below). See "Overloads and merged declarations" in
+//     docs/architecture/g-mesh-v1.md.
 //
 // ## Why the first emits a placeholder and the second a real node id
 //
@@ -92,6 +105,90 @@
 // collision list. Deterministic, and not a rule worth reimplementing here -
 // the point of driving the real compiler is that the answer comes from it.
 //
+// ## Which overload a call binds, and how the answer is read
+//
+// `definition` again, asked at the *callee token* rather than at an import
+// specifier - and the difference between those two positions is the entire
+// mechanism. Measured against TypeScript 5.9.3 (Node 20.6.1) on a fixture with
+// `function parse` written as two signatures plus an implementation, and a
+// class method `find` written the same way:
+//
+//   | asked at                          | `definition` returns |
+//   | --------------------------------- | -------------------- |
+//   | `parse("x")`                      | **1** - the `string` signature (ordinal 0) |
+//   | `parse(10, 16)`                   | **1** - the `number` signature (ordinal 1) |
+//   | `r.find("a")` / `r.find(7)`       | **1** each, the matching method signature |
+//   | the `import { parse }` specifier  | **3** - every declaration, unranked |
+//
+// So the call-site question is answerable and the import-site one is not, which
+// is why question 2 above refuses anything but a single location and this one
+// does not have to: TypeScript's own overload resolution has already run, and
+// `definition` reports its result. `quickinfo` is the other candidate - it
+// reads `(alias) parse(input: string): string[] (+1 overload)`, the *resolved*
+// signature first - but it answers in prose, which would have to be matched
+// back against a declaration's `signature` string. `definition` answers in a
+// position, and a position matches a declaration's own range exactly, so that
+// is what is used.
+//
+// Reading the ordinal off that position is then a containment test against the
+// declaration list the structural pass already built - not a signature
+// comparison, and deliberately: the ordinals *are* source order
+// (`Extractor.fillDeclarationLists` sorts them), and the location tsserver
+// returns is the declaration's name token, which lies inside exactly one of
+// those ranges.
+//
+// Note what this cannot reach, because the structural pass emits no edge for
+// it: a method called through a variable receiver (`r.find("a")` where `r` is a
+// parameter) is by design not a `CALLS` edge at all, so there is nothing to
+// bind. The overloads reachable here are the ones an edge already exists for -
+// a bare name, `this.m()`, `super.m()`, `Type.staticMethod()`.
+//
+// ## Which call sites are worth asking about
+//
+// A round trip per call in the project would be absurd, so two filters stand in
+// front of this, neither of which needs the checker:
+//
+//   - the extractor keeps a call site only when its target could possibly have
+//     several declarations - one it declares itself and gave a declaration list
+//     to, or one that lives in another file and so is unknowable there
+//     (`OverloadCallSite`);
+//   - this pass then resolves that second group against the target file's own
+//     extraction, which it is parsing anyway, and drops every call whose target
+//     file declares the name with a single declaration. That is nearly all of
+//     them: overload sets are rare, and an ordinary imported function is one.
+//
+// What survives both is calls to things that really are written more than once,
+// and that is what tsserver is asked about.
+//
+// ## Replacing a collapsed edge
+//
+// The bound edges cannot simply be added. The structural edge they refine is
+// still there, pointing at the same symbol with no ordinal, and core would go
+// on to link it like any other - leaving a caller of two overloads with three
+// `CALLS` edges, one of them saying strictly less than the other two. So the
+// collapsed edge is listed for deletion in the same diff that adds the bound
+// ones; `apply_diff` deletes before it upserts, inside one transaction, so
+// there is no moment at which the call is represented by nothing.
+//
+// Two rules keep that from ever losing information:
+//
+//   - **all or nothing per edge.** Every call site behind an edge must resolve
+//     to a declaration ordinal, or the edge is left exactly as the structural
+//     pass wrote it. Retracting an edge on the strength of a partial answer
+//     would drop the calls that did not resolve.
+//   - **the bound edges are this pass's own to retract**, and so are booked in
+//     `emittedEdgesByFile` alongside the namespace half. This is the one place
+//     the "never book an upgraded edge" rule above does *not* apply, and the
+//     reason is the same one that motivates the rule: an upgraded edge keeps
+//     the structural pass's id, so the structural diff retracts it: these have
+//     ids the structural pass never emits (`edgeIdFor` hashes the ordinal in),
+//     so nothing else can. Deleting the last `parse(10, 16)` in a file must not
+//     leave its binding behind.
+//
+// A pass that answers nothing here - no checker, a refusal, an edit that made
+// the target ordinary again - deletes nothing and the structural edge stands,
+// which is the whole fallback: the fast layer's answer, un-refined.
+//
 // ## What it costs when there is nothing to do
 //
 // One gate, and it is the one that matters: a `tsserver` child (~1.2s, ~265MB)
@@ -133,7 +230,9 @@ import {
   type ExtractResult,
   type NamespaceMemberUse,
   type NodeKind,
+  type OverloadCallSite,
   type SpecifierResolver,
+  type SymbolDeclaration,
 } from "./extract";
 import { createIndexabilityChecker, toPosixPath } from "./ignorePolicy";
 import { cachedExtraction } from "./incremental";
@@ -181,10 +280,18 @@ export interface SemanticPassResult {
   upsertNodes: ExtractedNode[];
   upsertEdges: ExtractedEdge[];
   /**
-   * Only ever edges this pass itself wrote for a namespace member use that has
-   * since gone. An upgraded edge is never retracted here: it is the structural
-   * pass's own edge, and deleting the call deletes it through the ordinary
-   * reparse diff.
+   * Two things, and nothing else:
+   *
+   *  - edges this pass itself wrote - for a namespace member use, or for one
+   *    overload of a call - that no longer have a site behind them. Nothing
+   *    else can retract these: the structural pass never emitted them, so its
+   *    reparse diff cannot list them as removed.
+   *  - the collapsed `CALLS` edge a set of bound ones has just replaced, sent
+   *    in the same diff that adds them.
+   *
+   * An upgraded edge is never retracted here: it is the structural pass's own
+   * edge under its own id, and deleting the call deletes it through the
+   * ordinary reparse diff.
    */
   deleteEdgeIds: string[];
   /** Files actually looked at, for the log line. */
@@ -207,11 +314,13 @@ export interface SemanticPassOptions {
  * like incremental.ts's parse cache and for the same reason - the cold path is
  * a full rebuild, so there is nothing to persist.
  *
- * Its job is deletions, and only for the namespace half. A `ns.someExport()`
- * call that an edit removes leaves an edge nothing else can retract: the
- * structural reparse diff never knew about it, so it cannot list it as removed.
- * Remembering what this pass emitted, and diffing the next emission against it,
- * is what keeps a deleted call from outliving its source line.
+ * Its job is deletions, for the two halves that emit edge ids of their own. A
+ * `ns.someExport()` call that an edit removes - or the last `parse(10, 16)` in
+ * a file, whose binding is an edge id no other pass produces - leaves an edge
+ * nothing else can retract: the structural reparse diff never knew about it, so
+ * it cannot list it as removed. Remembering what this pass emitted, and diffing
+ * the next emission against it, is what keeps a deleted call from outliving its
+ * source line.
  */
 const emittedEdgesByFile = new Map<string, Set<string>>();
 
@@ -262,17 +371,20 @@ export async function runSemanticPass(
       structural: new Map(extraction.nodes.map((node) => [node.id, node])),
       uses: extraction.namespaceMemberUses,
       upgrades: await upgradeQuestionsIn(filePath, extraction, index),
+      bindings: await bindingQuestionsIn(filePath, extraction, index),
     });
   }
 
   const out = new PassOutput();
   const namespaceWork = scanned.filter((entry) => entry.uses.length > 0);
   const upgradeWork = scanned.flatMap((entry) => entry.upgrades);
+  const bindingWork = scanned.flatMap((entry) => entry.bindings);
 
-  if (namespaceWork.length > 0 || upgradeWork.length > 0) {
+  if (namespaceWork.length > 0 || upgradeWork.length > 0 || bindingWork.length > 0) {
     options.onLog?.(
       `semantic pass: ${namespaceWork.length} file(s) with namespace member uses, ` +
-        `${upgradeWork.length} re-exported name(s) to ask the compiler about`,
+        `${upgradeWork.length} re-exported name(s), ` +
+        `${bindingWork.length} overloaded call(s) to ask the compiler about`,
     );
     const checker = new Checker(
       options.project ?? semanticProjectFor(projectRoot, { onLog: options.onLog }),
@@ -283,6 +395,7 @@ export async function runSemanticPass(
     // placeholder - would be the one that lands.
     for (const entry of namespaceWork) await askNamespaceUses(entry, index, checker, out);
     for (const question of upgradeWork) await askUpgrade(question, index, checker, out);
+    for (const question of bindingWork) await askBinding(question, index, checker, out);
   }
 
   return out.finish(scope, filesScanned);
@@ -301,6 +414,28 @@ interface ScopedFile {
   uses: NamespaceMemberUse[];
   /** Edges it emitted but could not resolve - question 2. */
   upgrades: UpgradeQuestion[];
+  /** Edges it emitted that collapse several overloads - question 3. */
+  bindings: BindingQuestion[];
+}
+
+/**
+ * One `CALLS` edge whose target may be an overload set, and every call site
+ * that collapsed into it.
+ *
+ * The unit is the *edge*, not the call site, because the edge is what gets
+ * replaced: its fate depends on all of its call sites at once (see "Replacing
+ * a collapsed edge" in the module comment), so they have to be decided
+ * together.
+ */
+interface BindingQuestion {
+  /** Project-relative path of the file the calls are written in. */
+  filePath: string;
+  /** The collapsed edge the structural pass emitted. */
+  edge: ExtractedEdge;
+  /** Distinct positions to ask about - repeated identical ones are one question. */
+  sites: OverloadCallSite[];
+  /** `<name> at <file>`, for diagnostics. */
+  label: string;
 }
 
 /** One placeholder's worth of upgrade work: the position to ask tsserver
@@ -358,6 +493,67 @@ async function upgradeQuestionsIn(
     questions.push(question);
   }
   return questions;
+}
+
+/**
+ * The calls in one file worth asking the checker to pin to an overload: those
+ * whose target really does have more than one declaration.
+ *
+ * The extractor has already dropped every call to something it could see was
+ * ordinary; what is left to decide here is the calls whose target lives in
+ * another file, which it deliberately does not read. That is a lookup in an
+ * extraction this pass is holding anyway, not a round trip - see "Which call
+ * sites are worth asking about" in the module comment.
+ */
+async function bindingQuestionsIn(
+  filePath: string,
+  extraction: ExtractResult,
+  index: ProjectIndex,
+): Promise<BindingQuestion[]> {
+  if (extraction.overloadCallSites.length === 0) return [];
+
+  const byId = new Map(extraction.nodes.map((node) => [node.id, node]));
+  const byEdge = new Map<string, BindingQuestion>();
+  // Same answer per target, and a barrel of overloads is asked about once per
+  // importing call rather than once per file, so this is worth memoizing.
+  const targetIsOverloaded = new Map<string, boolean>();
+
+  for (const site of extraction.overloadCallSites) {
+    const target = byId.get(site.toId);
+    if (target === undefined) continue;
+
+    if (target.nativeKind === PENDING_SYMBOL_NATIVE_KIND) {
+      let overloaded = targetIsOverloaded.get(target.id);
+      if (overloaded === undefined) {
+        const address = splitAddress(target.qualifiedName);
+        overloaded =
+          address !== undefined && (await index.declaresOverloadSet(address.file, address.name));
+        targetIsOverloaded.set(target.id, overloaded);
+      }
+      if (!overloaded) continue;
+    }
+
+    // The id the structural pass gave the collapsed edge: no ordinal, which is
+    // exactly what makes it the one being refined.
+    const edgeId = edgeIdFor(site.fromId, "CALLS", site.toId);
+    const existing = byEdge.get(edgeId);
+    if (existing !== undefined) {
+      if (!existing.sites.some((seen) => seen.line === site.line && seen.col === site.col)) {
+        existing.sites.push(site);
+      }
+      continue;
+    }
+    const edge = extraction.edges.find((candidate) => candidate.id === edgeId);
+    if (edge === undefined) continue;
+    byEdge.set(edgeId, {
+      filePath,
+      edge,
+      sites: [site],
+      label: `${target.name} at ${filePath}`,
+    });
+  }
+
+  return [...byEdge.values()];
 }
 
 // --- asking, and what an answer becomes ----------------------------------
@@ -472,6 +668,73 @@ async function askUpgrade(
     if (target.id === edge.fromId) continue; // a self-edge carries no information
     out.upgradedEdge({ ...edge, toId: target.id, source: SEMANTIC_EDGE_SOURCE, resolved: true }, target);
   }
+}
+
+/**
+ * Question 3, for one collapsed edge: the overloads its calls actually bind,
+ * as one edge each.
+ *
+ * Refused whole, leaving the structural edge untouched, when any call site
+ * behind it does not reach exactly one declaration of one overloaded target -
+ * the all-or-nothing rule from the module comment, which is what makes it safe
+ * to retract the edge those calls were sharing.
+ */
+async function askBinding(
+  question: BindingQuestion,
+  index: ProjectIndex,
+  checker: Checker,
+  out: PassOutput,
+): Promise<void> {
+  let target: ExtractedNode | undefined;
+  const ordinals = new Set<number>();
+
+  for (const site of question.sites) {
+    const definitions = await checker.definitionAt(
+      index.absolute(question.filePath),
+      site.line,
+      site.col,
+      question.label,
+    );
+    // One location is what a *call site* gets - overload resolution has already
+    // run by the time tsserver answers (see the module comment's measurement).
+    // Anything else is a question this pass did not think it was asking.
+    if (definitions === null || definitions.length !== 1) {
+      out.unresolved += 1;
+      return;
+    }
+    const bound = await index.declarationBindingAt(definitions[0]);
+    // No declaration list covering it means the target is not the overload set
+    // this pass took it for - a single-declaration function, or a declaration
+    // in a file the index does not hold. Nothing to record, and nothing wrong
+    // with the edge as it stands.
+    if (bound === undefined) {
+      out.unresolved += 1;
+      return;
+    }
+    // A `CALLS` edge only ever lands on a Function, exactly as core's own walk
+    // would have insisted (`LINKABLE_EDGE_KINDS`).
+    if (bound.node.kind !== LINKABLE_EDGE_KINDS.get("CALLS")) {
+      out.unresolved += 1;
+      return;
+    }
+    // Every call site behind one edge names one symbol by construction; if the
+    // checker disagrees, it is answering about something this pass cannot map
+    // back onto the edge it holds.
+    if (target !== undefined && target.id !== bound.node.id) {
+      out.unresolved += 1;
+      return;
+    }
+    target = bound.node;
+    ordinals.add(bound.ordinal);
+  }
+
+  if (target === undefined) return;
+  out.boundEdges(
+    question.filePath,
+    question.edge,
+    target,
+    [...ordinals].sort((a, b) => a - b),
+  );
 }
 
 /**
@@ -651,6 +914,76 @@ class ProjectIndex {
   }
 
   /**
+   * Whether `file` exports a *function* called `name` that is written more
+   * than once - the cheap standing-in-front-of-tsserver test for "could a call
+   * of this bind one overload rather than the symbol as a whole".
+   *
+   * Loose on purpose. It only has to be right about which questions are worth
+   * a round trip; which overload is the checker's answer, and a call whose
+   * target turns out ordinary after all is refused there
+   * ([`askBinding`]) rather than mis-bound here.
+   *
+   * A name arriving through a re-export is not seen as overloaded by this and
+   * so is never asked about: the barrel does not declare it, and following the
+   * chain is what question 2 exists for. That leaves such a call bound to the
+   * symbol rather than to one of its overloads, which is the same answer the
+   * structural pass gives and so costs nothing that was ever there.
+   */
+  async declaresOverloadSet(file: string, name: string): Promise<boolean> {
+    const result = await this.extractionOf(file);
+    if (result === null) return false;
+    return result.nodes.some(
+      (node) =>
+        node.exported &&
+        node.name === name &&
+        node.kind === "Function" &&
+        node.declarations !== undefined &&
+        !isPlaceholder(node),
+    );
+  }
+
+  /**
+   * The declaration a `definition` answer landed *inside*, as the node owning
+   * it plus that declaration's ordinal - or undefined when no node in that
+   * file has a declaration list covering the position.
+   *
+   * Deliberately not [`ProjectIndex.declarationAt`], which matches a node's own
+   * range: for an overloaded symbol that range is the *implementation's*
+   * (`Extractor.fillDeclarationLists`), so a definition landing on an overload
+   * signature three lines above it falls outside the very node it belongs to.
+   * The declaration list is the only record that covers all of them, and
+   * looking there answers both halves of the question at once - which node, and
+   * which of its declarations.
+   *
+   * Tightest match wins, for the same reason it does when matching nodes: an
+   * overloaded method inside a namespace written twice is covered by both
+   * lists, and the method is the one the call named.
+   */
+  async declarationBindingAt(
+    definition: DefinitionLocation,
+  ): Promise<{ node: ExtractedNode; ordinal: number } | undefined> {
+    const relative = this.indexedPathOf(definition.file);
+    if (relative === undefined) return undefined;
+
+    const result = await this.extractionOf(relative);
+    if (result === null) return undefined;
+
+    const line = definition.start.line - 1;
+    const col = definition.start.offset - 1;
+    let best: { node: ExtractedNode; declaration: SymbolDeclaration } | undefined;
+    for (const node of result.nodes) {
+      if (node.declarations === undefined || isPlaceholder(node)) continue;
+      for (const declaration of node.declarations) {
+        if (!covers(declaration, line, col)) continue;
+        if (best === undefined || isTighter(declaration, best.declaration)) {
+          best = { node, declaration };
+        }
+      }
+    }
+    return best === undefined ? undefined : { node: best.node, ordinal: best.declaration.ordinal };
+  }
+
+  /**
    * An absolute path as this index spells it - project-relative POSIX - or
    * undefined when it is not a path this index holds anything for: outside the
    * project, gitignored, hard-excluded (`node_modules`), or an extension this
@@ -756,17 +1089,14 @@ class PassOutput {
   private readonly nodes = new Map<string, ExtractedNode>();
   private readonly edges = new Map<string, ExtractedEdge>();
   private readonly emitted = new Map<string, Set<string>>();
+  /** Collapsed edges replaced by bound ones, to go out in the same diff. */
+  private readonly replaced = new Set<string>();
   unresolved = 0;
 
   placeholderEdge(filePath: string, placeholder: ExtractedNode, edge: ExtractedEdge): void {
     this.nodes.set(placeholder.id, placeholder);
     this.edges.set(edge.id, edge);
-    let ids = this.emitted.get(filePath);
-    if (ids === undefined) {
-      ids = new Set<string>();
-      this.emitted.set(filePath, ids);
-    }
-    ids.add(edge.id);
+    this.book(filePath, edge.id);
   }
 
   upgradedEdge(edge: ExtractedEdge, target: ExtractedNode): void {
@@ -775,12 +1105,59 @@ class PassOutput {
   }
 
   /**
+   * One `CALLS` edge per overload the calls behind `collapsed` bound, and
+   * `collapsed` itself retired.
+   *
+   * Booked for retraction like the placeholder half and unlike the upgrade
+   * half: `edgeIdFor` hashes the ordinal in, so these ids are ones the
+   * structural pass never emits and its diff can therefore never retract.
+   */
+  boundEdges(
+    filePath: string,
+    collapsed: ExtractedEdge,
+    target: ExtractedNode,
+    ordinals: readonly number[],
+  ): void {
+    if (ordinals.length === 0) return;
+    this.nodes.set(target.id, target);
+    for (const ordinal of ordinals) {
+      const edge: ExtractedEdge = {
+        id: edgeIdFor(collapsed.fromId, "CALLS", target.id, ordinal),
+        fromId: collapsed.fromId,
+        toId: target.id,
+        kind: "CALLS",
+        source: SEMANTIC_EDGE_SOURCE,
+        // Unlike the placeholder half, this one has the declaration in hand -
+        // there is nothing left for core to look up.
+        resolved: true,
+        toDeclaration: ordinal,
+      };
+      this.edges.set(edge.id, edge);
+      this.book(filePath, edge.id);
+    }
+    this.replaced.add(collapsed.id);
+  }
+
+  private book(filePath: string, edgeId: string): void {
+    let ids = this.emitted.get(filePath);
+    if (ids === undefined) {
+      ids = new Set<string>();
+      this.emitted.set(filePath, ids);
+    }
+    ids.add(edgeId);
+  }
+
+  /**
    * The diff, once every question has been asked: what to write, and what a
    * previous pass wrote for these same files that no longer has a call site
    * behind it.
    */
   finish(scope: readonly string[], filesScanned: number): SemanticPassResult {
-    const deleteEdgeIds: string[] = [];
+    // A collapsed edge goes out with the bound edges that replace it. Guarded
+    // against the one way that could destroy information: an id this pass is
+    // also writing (`apply_diff` deletes before it upserts, so the write would
+    // survive, but a diff that says both about one id is not one to send).
+    const deleteEdgeIds: string[] = [...this.replaced].filter((id) => !this.edges.has(id));
     for (const filePath of scope) {
       const ids = this.emitted.get(filePath);
       for (const previous of emittedEdgesByFile.get(filePath) ?? NO_EDGE_IDS) {
@@ -813,17 +1190,26 @@ function splitAddress(address: string): { file: string; name: string } | undefin
   return { file: address.slice(0, cut), name: address.slice(cut + 1) };
 }
 
-/** Whether `node`'s span covers a zero-based (line, col). */
-function covers(node: ExtractedNode, line: number, col: number): boolean {
-  if (line < node.startLine || line > node.endLine) return false;
-  if (line === node.startLine && col < node.startCol) return false;
-  if (line === node.endLine && col > node.endCol) return false;
+/** A zero-based source range - what a node and a single declaration of one
+ * have in common, and all either of the two tests below needs. */
+interface Span {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+}
+
+/** Whether `span` covers a zero-based (line, col). */
+function covers(span: Span, line: number, col: number): boolean {
+  if (line < span.startLine || line > span.endLine) return false;
+  if (line === span.startLine && col < span.startCol) return false;
+  if (line === span.endLine && col > span.endCol) return false;
   return true;
 }
 
 /** Whether `a` spans strictly less source than `b` - the tie-break that picks
  * a method over the class containing it. */
-function isTighter(a: ExtractedNode, b: ExtractedNode): boolean {
+function isTighter(a: Span, b: Span): boolean {
   const aLines = a.endLine - a.startLine;
   const bLines = b.endLine - b.startLine;
   if (aLines !== bLines) return aLines < bLines;
