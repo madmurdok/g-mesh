@@ -38,6 +38,18 @@
 // layer up in semanticPass.ts, which is what index.ts's `semanticPass` handler
 // calls - this file only knows how to ask a compiler a question. index.ts
 // itself only ties the child's lifetime to the plugin's own.
+//
+// What this file can ask is also the boundary for how far a *computed*
+// import()/require() specifier (`import(\`./plugins/${name}\`)`) can ever be
+// resolved statically - scoped in full at `recordCallImport` in extract.ts
+// and in docs/architecture/g-mesh-v1.md ("Computed import specifiers"). The
+// short version: `definition`/`projectInfo` are the whole query surface
+// today, and most of the statically-resolvable subset needs neither one -
+// it is same-file constant folding extract.ts can already do on its own.
+// The cases that would need this file to do more (a specifier's constant
+// living in another file, or a value the checker can only type as a finite
+// literal union) need a query this file does not have yet, which is exactly
+// why that part of the scope is future work, not this release's.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";

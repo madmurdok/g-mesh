@@ -302,6 +302,104 @@ unresolved `IMPORTS` edge into it. That covers off-workspace packages
 at nothing is reported as pointing at nothing, never quietly dropped and
 never invented.
 
+#### Computed import specifiers
+
+Everything above assumes the specifier is a string literal — what
+`stringLiteralValue` extracts from a `string` or `template_string` node in
+`plugins/js-ts/src/extract.ts`. `import()`/`require()` do not require that:
+`import(\`./plugins/${name}\`)`, `import(getPath())`,
+`import(path.join(__dirname, name))` are all legal, and none of them is a
+literal.
+
+`recordCallImport` today only asks whether the first argument node is a
+literal at all, and — this is a real bug this scoping pass surfaced, not a
+hypothetical — it is *not* consistent about it. A plain literal or a
+template string with no interpolation resolves correctly. A template string
+that *does* interpolate does not fail cleanly: `stringLiteralValue` returns
+the first `string_fragment` child of the `template_string` node,
+unconditionally, rather than checking whether a `template_substitution`
+sibling exists at all. So `import(\`./plugins/${name}/index\`)` is recorded
+today as an IMPORTS edge to the literal path `./plugins/` — a silently
+*wrong* resolution, not an honestly missing one, which is worse than the gap
+this ticket set out to scope. The follow-up ticket implementing the subset
+below should close this as part of that work rather than build on top of it.
+
+Scoping what is worth building means drawing a real line between what a
+static pass — tree-sitter alone, or the TS-compiler-backed semantic pass
+(`plugins/js-ts/src/semantic.ts`) — can honestly answer, and what only
+running the program answers. Concretely:
+
+**Resolvable without running anything (in scope for the next ticket):**
+
+- A template literal whose every interpolated part is itself statically
+  known *within the same file*: a reference to a `const` bound to a string
+  literal (or to another such fully-static template), or a qualified
+  reference to an enum member (`Plugin.Foo`) whose own initializer is a
+  string literal, declared in the file the pass is already walking. The
+  scope/binding machinery this needs — resolving a name to its declaration
+  and asking what that declaration is — already exists for exactly this kind
+  of same-file question (`LocalBindings`, `lookupByName`, `lookupType`); what
+  is missing is that `recordCallImport` decides at the call site instead of
+  deferring past the walk the way `pendingCalls`/`pendingSupertypes` already
+  do.
+- A short conditional of literal branches — `import(cond ? "./a" : "./b")` —
+  resolvable by recording one IMPORTS edge per literal branch from the same
+  call site. A File node already carries more than one outgoing IMPORTS edge
+  in the ordinary multi-import case, so this is not a new edge shape, just
+  more than one `recordImport` call attributed to one AST node.
+- `path.join(__dirname, ...)` / `path.resolve(__dirname, ...)` where the
+  receiver is a bare identifier already known — via the namespace-import
+  bookkeeping `recordImportBindings` builds — to be `node:path`, and every
+  segment after the `__dirname` anchor is a string literal: plain path
+  arithmetic against this file's own directory, no different in kind from the
+  relative-specifier resolution `recordImport` already does.
+
+**Theoretically resolvable, not worth this release:**
+
+- Any of the above where the constant lives in *another* file. The pass sees
+  one file at a time, so folding it needs either a new tsserver query that
+  returns a symbol's literal value directly, or chaining the semantic pass's
+  existing `definition` request (`SemanticProject.definition` in
+  `plugins/js-ts/src/semantic.ts`) to the declaration site and re-running the
+  same structural fold there. That is real plumbing, not a shape decision,
+  and deserves its own ticket.
+- A specifier whose interpolated part is not one known literal but a value
+  the checker can only *type* as a finite union of literals (a
+  `"a" | "b" | "c"` parameter, or a plain value of enum type rather than one
+  named member). `semantic.ts`/`semanticPass.ts` only ever ask
+  `definition`/`projectInfo` today — nothing asks the checker for a type at
+  all — so this needs both a new query and a real decision about what "one
+  call site, N candidate files" should mean as an edge set. Guessing across N
+  files starts to look more like a lint hint than an index edge, and that
+  tradeoff deserves its own discussion rather than riding in on this ticket.
+- `path.join`/`path.resolve` where the *last* segment, not the whole
+  specifier, is dynamic (`path.join(__dirname, "./plugins", name)`).
+  Resolvable only down to "somewhere under `./plugins`" — turning that into
+  edges means enumerating a directory's contents as fan-out candidates, a
+  materially different feature (directory-level fan-out) than resolving a
+  specifier, and out of scope here.
+
+**Not resolvable, by construction — a hard limit to document, not a gap to
+close later:**
+
+- `import(getPath())` / `import(computeSpecifier())`: the specifier is the
+  return value of an arbitrary function call. Nothing about a function's
+  return value is knowable without running it — it may read a file, hit the
+  network, branch on an argument — and no amount of static analysis,
+  tree-sitter or the full checker alike, changes that.
+- A specifier built from `process.env.*`, `process.argv`, or any other
+  environment/I-O-sourced value — its value is only ever known at runtime, by
+  definition of what those are.
+- A specifier fed from a variable TypeScript's own checker widens to plain
+  `string` (reassigned in a loop, mutated across branches, etc.) — if the
+  checker itself cannot narrow it to a literal, nothing built on top of the
+  checker has a better answer than the checker does.
+
+The next ticket ("Implement resolution for the statically-resolvable
+computed-import subset") is scoped to exactly the first bucket above, and
+should fix the `stringLiteralValue` truncation bug described above as part
+of that work rather than leave it as a silent wrong answer.
+
 #### Cross-file symbol resolution
 
 A resolved import is also what makes the *symbols* behind it resolvable. The
