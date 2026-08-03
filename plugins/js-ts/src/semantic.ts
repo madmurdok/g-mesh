@@ -50,6 +50,39 @@
 // living in another file, or a value the checker can only type as a finite
 // literal union) need a query this file does not have yet, which is exactly
 // why that part of the scope is future work, not this release's.
+//
+// ## Generics need nothing from this layer
+//
+// Recorded here because it is the natural place to come looking. Release
+// 0.19.0 scoped what generic-type resolution g-mesh should do
+// (docs/architecture/g-mesh-v1.md, "Generic types"), and the answer is that
+// **none of it lands in this file**: everything worth building is a name
+// written in the source that the structural pass walks past, and this layer
+// gains no new command, no new capability and no new question.
+//
+// The measurements behind that, taken through [`SemanticProject.definition`]
+// as it already stands (TypeScript 5.9.3, one fixture file, one live child):
+//
+//   - `definition` **already instantiates type parameters**, with no
+//     generics-specific code anywhere. Given `class Box<T> { get(): T }`,
+//     asked at the `spin` of `box.get().spin()` it answers `Widget#spin` when
+//     `box: Box<Widget>` and `Gadget#spin` when the receiver is
+//     `Box<Gadget>` - two different declarations, from the same point query.
+//     So the generic half of "resolve a method call through a container" is
+//     free. What is missing is the *other* half: the structural pass emits no
+//     edge, and therefore this pass is handed no question, for any method call
+//     on a variable receiver at all. That is typed-receiver resolution, and it
+//     is its own ticket.
+//   - `definition` **cannot** answer what a generic function returns
+//     concretely: asked at `identity(1)` it returns the declaration of
+//     `identity`, not an instantiation. That question is `quickinfo`'s, and
+//     nothing in the graph has a field to put the answer in.
+//   - `definition` **stops at a type alias**: for `type Handler<T> =
+//     BaseHandler<T>`, asked at `Handler` in an `implements` clause, it
+//     returns the alias declaration - exactly where core's own name-matching
+//     walk already stops. Seeing through an alias would need `typeDefinition`
+//     or a checker-side walk, so that gap is not one this plumbing quietly
+//     closes.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";

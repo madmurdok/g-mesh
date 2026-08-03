@@ -2027,7 +2027,14 @@ function isWholeModuleReexport(statement: SyntaxNode): boolean {
   return statement.children.some((child) => child.type === "*");
 }
 
-/** Identifiers introducing a binding are declarations, not usages. */
+/**
+ * Identifiers introducing a binding are declarations, not usages.
+ *
+ * One known misfire, recorded in the "Generic types" section below: a
+ * `generic_type` holds its *head* in a field called `name`, so `Box` in
+ * `Box<Widget>` reads as a binding here and is dropped, while the same `Box`
+ * written without arguments is recorded.
+ */
 function isBindingPosition(node: SyntaxNode): boolean {
   const parent = node.parent;
   if (!parent) return false;
@@ -2051,10 +2058,76 @@ function stringLiteralValue(node: SyntaxNode): string | undefined {
   return node.text.length >= 2 ? node.text.slice(1, -1) : undefined;
 }
 
+// --- generic types --------------------------------------------------------
+//
+// What this pass does with generics, and what it deliberately does not. The
+// full version, with the corpus counts behind it, is
+// docs/architecture/g-mesh-v1.md ("Generic types: the written syntax is
+// indexed, instantiation is not"); this is the part a reader of *this* file
+// needs.
+//
+// The rule: **a name someone wrote down is a reference; an instantiation is
+// not a symbol.** `Box<Widget>` mentions two types and this pass should record
+// both. `Box<Widget>` is *not* a thing that can be declared, so it will never
+// be a node - there is one of it per use site and no declaration to hang it on.
+//
+// Three sites drop an explicitly written name today, all of them for the same
+// kind of reason - a special-cased handler reads the fields it cares about and
+// a generic one is not among them:
+//
+//  1. **The head of a `generic_type`.** It lives in a field called `name`, and
+//     [`isBindingPosition`] treats every `name` field as a declaration, so
+//     `Box` in `x: Box<Widget>` is discarded while `x: Box` is recorded. This
+//     is the expensive one: measured on the excalidraw corpus, 68 of its 81
+//     project-declared generic types are *never* written bare, so
+//     `find_references` on them answers nothing.
+//  2. **Type arguments in a heritage clause.** [`heritageNames`] returns the
+//     head and never descends into `type_arguments`, and nothing else walks
+//     the clause, so `class W extends Box<Widget>` records no mention of
+//     `Widget` at all.
+//  3. **Type arguments at a call or `new` site.** [`Extractor.handleCall`] and
+//     [`Extractor.handleNew`] read `function`/`constructor` and `arguments`;
+//     `type_arguments` is a third field neither reads, so `new Box<Widget>()`
+//     and `make<Widget>()` record nothing. In this very file,
+//     `new Map<string, ExtractedEdge>()` is why `Extractor` has no edge onto
+//     `ExtractedEdge`.
+//
+// Type arguments written in an ordinary type annotation already work, because
+// nothing special-cases those - the default child walk reaches them.
+//
+// Two things the fix has to get right. Walking a heritage clause's
+// `type_arguments` must not walk the clause itself: the head is already a
+// `SUPERTYPE_OF` edge, and core's `find_references` unions `SUPERTYPE_OF` with
+// `REFERENCES`, so the head would be reported twice. And a declaration's own
+// `<T, ...>` names have to shadow file-level types inside it the way
+// [`LocalBindings`] shadows value declarations - they are not tracked at all
+// today, which is why `interface T {}` beside `class Box<T> { item: T }` in
+// one file already emits a wrong `REFERENCES Box -> T`.
+//
+// **Not done here, on purpose.** Nothing in this pass instantiates a type
+// parameter. `box.get().spin()` does not resolve to `Widget#spin` when
+// `box: Box<Widget>` - but generics is not what stops it. No method call on a
+// variable receiver produces an edge, generic or not: `box.get()` is recorded
+// as a `qualified` call and then dropped by [`resolveCall`], because `box` is
+// a local binding and locals are not graph symbols; and `.spin()`, whose
+// receiver is a call rather than a bare identifier, is never even recorded
+// ([`handleCall`] walks such a receiver and records nothing for the property).
+// That is typed-receiver resolution, a feature of its own, and when it exists
+// the checker instantiates `T` for free (measured through semantic.ts's
+// plumbing - see its module comment).
+// Likewise a generic function's concrete return type at a call site: it is one
+// value per use site and `signature` is one string per declaration, so there
+// is nothing here to store it in.
+
 /**
  * Supertype names from a `class_heritage` / `extends_type_clause`. Generic
  * arguments are dropped (`Base<T>` -> `Base`); qualified names are kept
  * whole (`NS.Base`) so they can match a namespaced declaration.
+ *
+ * Dropping them is right for *this* answer - `class W extends Box<Widget>` is
+ * a subtype of `Box`, not of `Widget` - but it is not the whole answer: the
+ * arguments are still names this file mentions, and nothing else walks the
+ * clause to record them. See the "Generic types" note above.
  */
 function heritageNames(clause: SyntaxNode): string[] {
   const names: string[] = [];
