@@ -538,8 +538,22 @@ class Extractor {
     const id = nodeIdFor(this.filePath, params.kind, params.qualifiedName, params.nativeKind);
     const existing = this.nodes.get(id);
     // Same id twice means the same symbol declared twice - overload
-    // signatures, or a namespace/interface merged across statements. First
-    // declaration wins; disambiguating them needs the semantic layer.
+    // signatures, or a namespace/interface merged across statements. Both are
+    // one symbol with several declarations, and agreeing on
+    // (filePath, kind, qualifiedName, nativeKind) is exactly the rule for
+    // that: verified against tsserver's own file outline, which groups
+    // declarations the same way and hangs N spans off one row, splitting only
+    // where this id already splits (class vs interface, getter vs setter,
+    // function vs namespace). See "Overloads and merged declarations" in
+    // docs/architecture/g-mesh-v1.md.
+    //
+    // What is missing is not the grouping but the group's *contents*: the
+    // first declaration wins outright, so a function's node reports the
+    // implementation signature TypeScript never shows a caller, and later
+    // overloads are lost. The design calls for an ordered declaration list
+    // here and a `toDeclaration` ordinal on the CALLS edge the semantic pass
+    // writes; building it is a separate ticket, and until then this stays
+    // first-declaration-wins.
     if (existing) {
       if (params.exported) existing.exported = true;
       return existing;
