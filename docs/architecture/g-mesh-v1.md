@@ -775,6 +775,24 @@ tighter default.
   (`tree-sitter` → `ts-compiler`) and `resolved` (`false` → `true`) and
   leaving every edge the pass did not answer for untouched.
 
+  **Not every answer is an upgrade.** `import * as ns from "./mod"` followed
+  by `ns.someExport()` has no edge to upgrade at all: the structural pass
+  never sees the bare name `someExport` at the use site, only a property
+  access on a module object, so it emits nothing for it — deliberately, since
+  telling that apart from an ordinary property access needs a checker. The
+  pass therefore *adds* an edge, and adds the pending-symbol placeholder it
+  hangs on, addressed at the declaration `tsserver`'s `definition` reported
+  rather than at the module the namespace names. Addressing it that way is
+  the point: the checker has already followed the alias chain, so a member
+  republished by a barrel and renamed on the way lands on the file that
+  really declares it. From there `symbol_links::link_diff` links it exactly
+  as it links a named import's placeholder — the address is the whole
+  contract, and `source` is the plugin's to set, so a repointed edge keeps
+  saying `ts-compiler`. Retracting an edge whose call site an edit deleted is
+  the pass's own job (the reparse diff never knew about it), which is why the
+  plugin remembers what it last emitted per file
+  (`plugins/js-ts/src/semanticPass.ts`).
+
   A failed pass is logged and dropped, never propagated. It improves a graph
   that is already committed and serviceable, so failing the reparse (or
   daemon startup) because the checker was unavailable would trade a better
@@ -928,9 +946,13 @@ backstop is `tsserver`'s own: it exits when its stdin closes. The project's
 natively, from the file's own location upward, so nothing of
 `tsconfigPaths.ts` is reused here; `projectInfo` reports which config was
 actually in force, which is what the tests assert on rather than assuming.
-Turning answers into resolved edges (re-exports, the `semanticPass` control
-message) is separate work; the node and edge shape overloads resolve *into* is
-decided in [Overloads and merged declarations](#overloads).
+Turning answers into edges lives one file over, in
+`plugins/js-ts/src/semanticPass.ts`, so this one knows no g-mesh vocabulary at
+all: it decides which sites are worth a question and what an answer becomes in
+the graph (today, namespace-import member accesses — see
+[`semanticPass`](#core--language-plugin-protocol) above). The node and edge
+shape overloads resolve *into* is decided in
+[Overloads and merged declarations](#overloads).
 
 ### Shim ↔ daemon
 

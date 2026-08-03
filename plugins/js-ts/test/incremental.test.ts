@@ -361,7 +361,12 @@ test("an incremental reparse yields exactly what a full parse of the new text wo
       new Set(edges.map((e) => JSON.stringify(e))),
       new Set(expected.edges.map((e) => JSON.stringify(e))),
     );
-    state = { nodes, edges, hasSyntaxErrors: expected.hasSyntaxErrors };
+    state = {
+      nodes,
+      edges,
+      hasSyntaxErrors: expected.hasSyntaxErrors,
+      namespaceMemberUses: expected.namespaceMemberUses,
+    };
   }
 });
 
