@@ -764,11 +764,11 @@ lost. Measured against the `tree-sitter-typescript` 0.23 grammar and
 them of *explicitly written* names, none of them requiring a type checker to
 see:
 
-| written | recorded today | why |
+| written | recorded before this landed | why |
 | --- | --- | --- |
-| `x: Box<Widget>` | `Widget` only | `generic_type` holds its head in a field called `name`, and `isBindingPosition` reads *every* `name` field as a declaration — so the head is discarded as if it were being bound. The plain `x: Box` in the same position is recorded. |
-| `class W extends Box<Widget>`, `implements Reg<Widget>`, `interface I extends Base<Widget>` | `Box`/`Reg`/`Base` only, as `SUPERTYPE_OF` | `heritageNames` returns the head and never descends into `type_arguments`; the clause itself is never walked, so nothing else sees them either. |
-| `new Box<Widget>()`, `make<Widget>()` | neither | `handleCall`/`handleNew` read the `function`/`constructor` and `arguments` fields. `type_arguments` is a third field on those nodes, and nothing reads it. |
+| `x: Box<Widget>` | `Widget` only | `generic_type` holds its head in a field called `name`, and `isBindingPosition` read *every* `name` field as a declaration — so the head was discarded as if it were being bound. The plain `x: Box` in the same position was recorded. |
+| `class W extends Box<Widget>`, `implements Reg<Widget>`, `interface I extends Base<Widget>` | `Box`/`Reg`/`Base` only, as `SUPERTYPE_OF` | `heritageNames` returns the head and never descends into `type_arguments`; the clause itself was never walked, so nothing else saw them either. |
+| `new Box<Widget>()`, `make<Widget>()` | neither | `handleCall`/`handleNew` read the `function`/`constructor` and `arguments` fields. `type_arguments` is a third field on those nodes, and nothing read it. |
 
 How much that costs depends entirely on whether a project declares generic
 types of its own, so it was counted on the bench corpora rather than guessed
@@ -786,44 +786,46 @@ declares; a `Map<string, number>` loses nothing, because neither `Map` nor
 
 Two numbers decide it. First, **68 of excalidraw's 81 project-declared generic
 types are never once written bare** — every use is `X<…>` — so
-`find_references` on them today returns nothing at all beyond whatever a
-heritage clause happens to contribute. A generic type is written with its
-arguments essentially always; that is what makes it generic. Second, this is
+`find_references` on them returned nothing at all beyond whatever a
+heritage clause happened to contribute. A generic type is written with its
+arguments essentially always; that is what makes it generic. Second, this was
 not only other people's code: `find_references("ExtractedEdge")` in *this*
-repo lists neither `Extractor` nor `PassOutput`, the only two symbols that
+repo listed neither `Extractor` nor `PassOutput`, the only two symbols that
 hold one, because both hold it as `new Map<string, ExtractedEdge>()`. Same
 for `ExtractResult` and `ProjectIndex`, and for `ImportBinding` and
 `Extractor`.
 
-**What gets built.** Three changes in the structural pass, no schema change,
+**What is built.** Three changes in the structural pass, no schema change,
 no new node or edge kind, no checker:
 
-1. **A generic type's own name is a reference.** `isBindingPosition` stops
-   claiming `generic_type`'s `name` field, so `Box<Widget>` records `Box`
+1. **A generic type's own name is a reference.** `isBindingPosition` no longer
+   claims `generic_type`'s `name` field, so `Box<Widget>` records `Box`
    exactly as `Box` alone already does. This is the one that matters; the
    other two are the same principle at the sites a special-cased handler
    skips.
 2. **Explicit type arguments are references.** The `type_arguments` of a
    heritage clause, a call expression and a `new` expression are walked like
-   any other type position. The heritage case must walk *only* the
-   `type_arguments` subtree, never the clause: the head is already a
-   `SUPERTYPE_OF` edge, and `find_references` unions `SUPERTYPE_OF` with
-   `REFERENCES`, so walking the whole clause would report one referencing
-   symbol twice.
+   any other type position. The heritage case walks *only* the
+   `type_arguments` subtree, never the clause (`visitHeritageTypeArguments`):
+   the head is already a `SUPERTYPE_OF` edge, and `find_references` unions
+   `SUPERTYPE_OF` with `REFERENCES`, so walking the whole clause would report
+   one referencing symbol twice.
 3. **Type parameters are scoped bindings.** A declaration's own `<T, …>`
-   names shadow file-level types inside it, tracked the way `LocalBindings`
-   already tracks value locals. Today they are not tracked at all, so
-   `interface T {…}` plus `class Box<T> { item: T }` in one file emits a
-   wrong `REFERENCES Box -> T` onto the interface. That is pre-existing, and
-   it is the reason this lands *with* (1) and (2) rather than after: those
-   multiply the names resolved out of type positions by roughly seven, and a
-   type argument written inside a generic function is usually a type
-   parameter. Measured, the collision is rare — across excalidraw's 449 type
-   parameters, no file uses one whose name it also declares or imports — but
-   "a missing edge beats a wrong one" is the standing rule, and the guard is
-   cheap.
+   names shadow file-level types inside it (`typeParameterScope`), tracked the
+   way `LocalBindings` already tracks value locals — in a chain of their own,
+   because the shadowing is one-way: a type parameter hides a *type* of that
+   name and nothing else, so only a type-position reference consults it.
+   Untracked, `interface T {…}` plus `class Box<T> { item: T }` in one file
+   emits a wrong `REFERENCES Box -> T` onto the interface. That was
+   pre-existing, and it is the reason this landed *with* (1) and (2) rather
+   than after: those multiply the names resolved out of type positions by
+   roughly seven, and a type argument written inside a generic function is
+   usually a type parameter. Measured, the collision is rare — across
+   excalidraw's 449 type parameters, no file uses one whose name it also
+   declares or imports — but "a missing edge beats a wrong one" is the
+   standing rule, and the guard is cheap.
 
-Fixture sketches (one file each, asserted through `extractFile` exactly as
+Fixtures (one file each, asserted through `extractFile` exactly as
 `plugins/js-ts/test/extract.test.ts` already asserts `SUPERTYPE_OF`):
 
 ```ts
