@@ -74,7 +74,14 @@ const DEFAULT_MAX_DEPTH: u32 = 2;
 struct DependencyNode {
     id: String,
     kind: String,
-    qualified_name: String,
+    /// Omitted (not `null`) for a `File`-kind row: a `File` node's
+    /// `qualifiedName` IS its own `filePath` by construction (see
+    /// `pagination::FILE_KIND`'s doc comment), so a `File` row would otherwise
+    /// carry the exact same path string twice. Present for `Module` rows,
+    /// where it's the only field that carries the specifier at all - the
+    /// mirror image of `file_path` below being absent there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     /// The file this dependency *is*, and null when it is not one. An import
     /// `graph::imports` could not link - a package, or a relative path with
     /// nothing indexed behind it - stays a `Module` placeholder whose stored
@@ -92,11 +99,12 @@ struct DependencyNode {
 
 impl From<ReachedNode> for DependencyNode {
     fn from(r: ReachedNode) -> Self {
+        let is_file = r.node.kind == pagination::FILE_KIND;
         let file_path = (r.node.kind != MODULE_KIND).then_some(r.node.file_path);
         Self {
             id: r.node.id,
             kind: r.node.kind,
-            qualified_name: r.node.qualified_name,
+            qualified_name: (!is_file).then_some(r.node.qualified_name),
             file_path,
             depth: r.depth,
         }
@@ -456,6 +464,31 @@ mod tests {
         let files: Vec<&str> =
             rows.iter().filter(|r| r["kind"] == "File").map(|r| r["filePath"].as_str().unwrap()).collect();
         assert_eq!(files, vec!["b.rs", "c.rs"], "real files are still addressed by their own path");
+    }
+
+    /// A `File`-kind row's `qualifiedName` is byte-identical to its own
+    /// `filePath` by construction (see `pagination::FILE_KIND`'s doc comment),
+    /// so it must be omitted from the wire JSON entirely rather than repeat
+    /// the same path string twice. A `Module` placeholder has no `filePath`
+    /// of its own, so it keeps `qualifiedName` as the only field carrying the
+    /// specifier - the mirror image of the previous test.
+    #[test]
+    fn a_file_kind_row_omits_qualified_name_a_module_row_keeps_it() {
+        let mut conn = import_chain();
+        upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
+        imports(&mut conn, "a.rs", "mod_zod");
+
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let rows = body["results"].as_array().unwrap();
+
+        let files: Vec<&serde_json::Value> = rows.iter().filter(|r| r["kind"] == "File").collect();
+        assert!(!files.is_empty());
+        for file in files {
+            assert!(file.get("qualifiedName").is_none(), "a File row must not repeat its own filePath as qualifiedName: {file}");
+        }
+
+        let module = rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
+        assert_eq!(module["qualifiedName"], "zod", "a Module row has no filePath, so qualifiedName must stay");
     }
 
     /// `name` never carries information `qualifiedName` doesn't already have

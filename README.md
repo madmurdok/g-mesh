@@ -83,14 +83,23 @@ shim and is reused by later connections for the same project.
 ## Is this worth registering?
 
 Honest answer, from actual measurement (full numbers in
-`../g-mesh-bench/docs/results/v0.2.0-session-economy-findings.md`): g-mesh is
-**not** cheaper on average in token terms. On simple lookup-shaped questions
-(find a definition, list a file's exports, an unambiguous
-`find_implementations`) it costs *more* tokens than an agent just using
-Read/Grep/Glob — about +46% in isolated measurement, and worse (+67%) inside
-a long continuing session, because the dominant cost (re-reading the tool
-schemas on every turn) grows with conversation length rather than shrinking
-the way a one-time setup cost would.
+`../g-mesh-bench/docs/results/v0.2.0-session-economy-findings.md`): on simple
+lookup-shaped questions (find a definition, list a file's exports, an
+unambiguous `find_implementations`) g-mesh costs *more* tokens than an agent
+just using Read/Grep/Glob — about +46% in isolated measurement, and worse
+(+67%) inside a long continuing session at the time of that measurement,
+because the fixed tool-schema cost is paid on every turn rather than once.
+That specific +46%/+67% figure is from v0.2.0 and predates several
+schema/response-size trims since (0.8.0's redundant-field cut, 0.13.0's
+server-instructions truncation fix) that shrank the same fixed cost this
+number is measuring — the gap is very likely narrower now, but hasn't been
+remeasured on this exact "simple lookup" task shape; don't treat +46%/+67%
+as current without rerunning that experiment. What *is* current (see the
+`gmesh-configured` default and its own measurements in `g-mesh-bench`,
+including a same-day comparison on a real code-edit task where the
+`gmesh-configured` arm came in at roughly half baseline's turns and cost) is
+that this fixed-cost problem does not show up the same way on harder task
+shapes — see below.
 
 Where it wins, consistently and by a wide margin, is multi-hop questions
 (chained relationships — "which files call both X and Y", "what implements
@@ -160,6 +169,7 @@ than a server capability description does):
   - If a `symbol_name` turns out ambiguous, the result carries `ambiguous: true` with a ranked candidate list — re-query using a candidate's `id` as `symbol_id`, not its `qualifiedName` (the same qualifiedName can name more than one declaration).
 - Typical flow: call `find_references`/`find_callers`/`find_callees`/`find_implementations` directly with `symbol_name` when it's likely unique; only call `find_definition` first if you expect ambiguity or need the declaration site itself. Use `get_file_outline` first if you don't already know the right symbol name.
 - A `find_references`/`find_callers`/`find_callees`/`find_implementations` result is complete for the question it answers when: it was anchored by `symbol_id` or an unambiguous `symbol_name` (same guarantee either way), every row shows `resolved: true`, and the response has no `allUnresolved: true` flag — don't re-verify that with grep/Read. As of g-mesh 0.8.x, `resolved: false` is a narrow, accurate signal (only edges whose target is in another file g-mesh couldn't confirm — same-file edges are always `resolved: true`, matched against declarations actually in scope), not a blanket disclaimer, so still check: a row that shows `resolved: false` (check that row, not the whole list), a response with `allUnresolved: true` (the whole page is unconfirmed), or anything the result doesn't claim to cover at all — e.g. whether other, similarly-named symbols exist elsewhere, or a method call reached through a variable receiver (`x.foo()`, which produces no edge by design). Measured on real g-mesh-bench runs after the 0.8.x same-file-resolution fix: mean cost dropped ~38% and mean turns ~35% on the task this was tested on, with the remaining tool calls answering things g-mesh genuinely doesn't cover rather than re-checking it — but grep/Read still earn their keep on the cases above, so don't suppress those.
+- Resolving an ambiguous name (the bullet above on `ambiguous: true` candidates) to a specific `symbol_id` doesn't reopen the completeness question: a `find_references`/`find_callers`/`find_callees`/`find_implementations` page anchored by that `symbol_id` carries the exact same `resolved: true`/no-`allUnresolved` guarantee as an unambiguous `symbol_name` query. Once you've picked the right candidate, treat its result as final — don't grep/Read each returned call site file-by-file to reconfirm it's "really" that symbol and not the same-named other one, and don't run a second, broad text search across the repo to check for anything the query might have missed. Both duplicate work the tool has already resolved, the same way re-verifying a plain unambiguous result would.
 - `find_implementations` only returns direct implementors/extenders by default — a class extending a class that implements the anchor interface won't show up in a `hasMore: false` page. For the whole hierarchy, re-call with `transitive: true` (walks the same edges transitively, up to a bounded depth, resumable via `resume_token`).
 ```
 
@@ -238,8 +248,11 @@ below) to force a fresh full walk.
 The daemon is two processes with very different costs, and each has its own
 idle timeout:
 
-- The **JS/TS plugin** (the expensive one — tree-sitter plus the TypeScript
-  compiler API in a Node process) exits after an hour with no reparse work.
+- The **JS/TS plugin** (the expensive one — tree-sitter parsing in a Node
+  process; `typescript` is a devDependency of the plugin's own build, not a
+  runtime dependency — the TS compiler API semantic layer is still backlog,
+  see the note at the top of this file) exits after an hour with no reparse
+  work.
   While it is asleep the core keeps watching the project and remembers which
   files changed; the next query wakes it and replays exactly that list, not
   the whole project. `g-mesh status` reports it as `asleep`, which needs no
@@ -251,8 +264,10 @@ idle timeout:
   bootstraps a fresh daemon exactly as a first-ever query does. The index on
   disk is untouched either way, so nothing is reindexed because of it.
 
-Both are configurable per project once the config file lands; today they are
-the defaults above.
+Both are configurable via `[plugin] idleTimeoutMinutes` (per-project
+`config.toml`) and `[daemon] coreIdleTimeoutHours` (global `~/.g-mesh/config.toml`)
+— see `g-mesh config` / `g-mesh config --global`. The values above are the
+defaults when a project or machine has never run either.
 
 ## Tools exposed
 

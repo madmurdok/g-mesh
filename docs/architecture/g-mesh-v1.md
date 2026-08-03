@@ -819,10 +819,33 @@ semantic layer gets built:
   rare, narrow, internally-consistent staleness for a much more common false
   positive. A per-file signal would need a genuinely different mechanism —
   `watcher::staleness::ensure_fresh` was written for close to that shape (an
-  mtime/hash check before answering) but, per this investigation, is not
-  currently called from any MCP handler, a separate real gap noted here but
-  out of this task's scope and worth its own task rather than folding into
-  `IndexingStatus`. kungfu's `PostToolUse`-hook-triggered reindex, which
+  mtime/hash check before answering). **Update (task #117, closed):** this
+  actually was a real, unfinished gap, not redundant with the mutex-
+  serialization argument above — that argument only covers a query landing
+  *while* a watcher commit is in flight; it says nothing about a file edited
+  while no daemon was running at all, which `storage::schema::ensure_current`
+  does not catch on restart either. `ensure_fresh` is now wired into the
+  three file-anchored MCP tools (`find_definition`, `get_file_outline`,
+  `get_dependencies`) — deliberately not the four symbol-anchored ones
+  (`find_references`/`find_callers`/`find_callees`/`find_implementations`),
+  which have no single file to check before resolving the query itself.
+  Proven by `core/tests/query_time_staleness.rs`: edit a file while the
+  daemon is down, restart, query immediately — the edit is now visible with
+  no artificial delay.
+
+  A separate, still-open gap surfaced by the same investigation, distinct
+  from staleness: `watcher::debounce::Debouncer` and `watcher::burst::
+  BurstBatcher` are both implemented and unit-tested but neither is actually
+  constructed in `daemon/mod.rs`'s watcher loop (confirmed directly — the
+  only reference there is a comment: "wiring them in is nice-to-have, not
+  required by this ticket's acceptance criteria - left for a later pass").
+  Every file-watch event today triggers its own individual reparse/plugin
+  round-trip with no coalescing, so a burst of rapid saves (editor autosave,
+  a bulk find-and-replace, a branch checkout touching many files) costs one
+  round-trip per file rather than one per batch. Not yet filed as its own
+  task as of this writing.
+
+  kungfu's `PostToolUse`-hook-triggered reindex, which
   sidesteps the watcher's race window entirely for edits made through Claude
   Code's own Edit tool, remains a reasonable idea for the common case but is a
   separate mechanism from this signaling question and was not evaluated

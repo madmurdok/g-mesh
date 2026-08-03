@@ -54,8 +54,10 @@ pub const MAX_RESPONSE_BYTES: usize = 20_000;
 /// kind (`Function`, `Type`, ...): a symbol's `qualifiedName` is genuinely
 /// different information from its containing file's `filePath`, and its
 /// `startLine`/`startCol` is a real, useful position. `find_references`,
-/// `find_callers`/`find_callees`, and `find_implementations` all key off
-/// this constant to omit the redundant fields for `File`-kind rows only.
+/// `find_callers`/`find_callees`, `find_implementations`, and
+/// `get_dependencies` (whose `DependencyNode` has no `startLine`/`startCol`
+/// to begin with, so only `qualifiedName` applies there) all key off this
+/// constant to omit the redundant fields for `File`-kind rows only.
 pub const FILE_KIND: &str = "File";
 
 /// One row a caller has already enriched from a [`ScoredEdge`] (typically by
