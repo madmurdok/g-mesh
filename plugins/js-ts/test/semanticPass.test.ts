@@ -276,6 +276,115 @@ test("a whole-project pass finds the same edge without being told which file to 
   }
 });
 
+// --- question 2, again: a default export is published under no one's name --
+
+/**
+ * The other family the name-matching walk documents as beyond it, and the one
+ * `core/tests/default_export_linking.rs` follows through to a tool answer:
+ * `export default class Foo {}` publishes `default` while declaring `Foo`, so
+ * an importer's edge is addressed at `shape.ts#default` - a name that file does
+ * not declare and no chain will ever produce.
+ *
+ * The local binding (`Bar`) is not the difficulty and is not even visible from
+ * here: a placeholder is addressed by the *exporting* file's name for the
+ * symbol, so two importers calling it two different things write down the same
+ * address. What the checker adds is the other end of it.
+ */
+test("a default export imported under another name is upgraded onto the class it really is", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/shape.ts": "export default class Foo {\n  area(): number {\n    return 1;\n  }\n}\n",
+    "src/caller.ts":
+      'import Bar from "./shape";\n\nexport function run(): number {\n  return new Bar().area();\n}\n',
+    "src/other.ts":
+      'import Widget from "./shape";\n\nexport function measure(): number {\n  return new Widget().area();\n}\n',
+  });
+  const project = new SemanticProject(root);
+  try {
+    const declaration = await declarationId(root, "src/shape.ts", "Foo");
+
+    const diff = await runSemanticPass(root, [], { project });
+
+    assert.equal(diff.upsertEdges.length, 2, "one usage in each importing file");
+    for (const edge of diff.upsertEdges) {
+      assert.equal(edge.kind, "REFERENCES");
+      assert.equal(edge.source, "ts-compiler");
+      assert.equal(edge.resolved, true);
+      assert.equal(
+        edge.toId,
+        declaration,
+        "both land on `Foo`, whatever their own file called the binding",
+      );
+    }
+    assert.deepEqual(
+      diff.upsertNodes.map((node) => [node.filePath, node.name, node.kind]),
+      [["src/shape.ts", "Foo", "Type"]],
+      "the declaration travels once, however many edges point at it",
+    );
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The same problem in two other spellings, both of which the checker collapses
+ * into the one answer: `export default Widget` after a plain `class Widget {}`,
+ * reached through a barrel that only forwards `default` on. Neither hop is a
+ * name a walk could match on.
+ */
+test("an indirect default, re-exported through a barrel, is followed to the declaration", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/widget.ts": "export class Widget {\n  id = 1;\n}\n\nexport default Widget;\n",
+    "src/index.ts": 'export { default } from "./widget";\n',
+    "src/caller.ts": 'import Anything from "./index";\n\nexport const x = new Anything();\n',
+  });
+  const project = new SemanticProject(root);
+  try {
+    const diff = await runSemanticPass(root, ["src/caller.ts"], { project });
+
+    assert.equal(diff.upsertEdges.length, 1);
+    assert.equal(diff.upsertEdges[0].source, "ts-compiler");
+    assert.equal(diff.upsertEdges[0].resolved, true);
+    assert.equal(diff.upsertEdges[0].toId, await declarationId(root, "src/widget.ts", "Widget"));
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * And the case that must *not* be asked about, for the same reason a named
+ * import of a declared name is not: `export default () => {}` has no name, so
+ * the structural pass calls the node `default` itself and the address matches
+ * on its own. Paying a round trip to relabel a good edge would buy nothing.
+ */
+test("an anonymous default is left to the structural layer, which already matches it", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/anon.ts": "export default () => 2;\n",
+    "src/caller.ts": 'import run from "./anon";\n\nexport const r = run();\n',
+  });
+  const project = new SemanticProject(root);
+  try {
+    const diff = await runSemanticPass(root, ["src/caller.ts"], { project });
+
+    assert.deepEqual(diff.upsertEdges, []);
+    assert.equal(
+      project.isRunning,
+      false,
+      "a name the target file declares itself is never worth a checker",
+    );
+  } finally {
+    project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- both questions in one sweep ------------------------------------------
 
 /**

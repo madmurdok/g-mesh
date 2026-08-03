@@ -825,6 +825,22 @@ tighter default.
   plugin remembers what it last emitted per file
   (`plugins/js-ts/src/semanticPass.ts`).
 
+  **Which unresolved edges are re-asked**: only those whose target file does
+  not itself declare the name. Where it does, core's own walk reaches the same
+  node in a lookup and a round trip would buy nothing; where it does not, the
+  name comes through a re-export chain, which is the family that walk
+  documents as beyond it. Two shapes fall in it. One is a barrel with two
+  `export *` branches offering a name — ambiguous to a name-matching walk,
+  settled in the language, which hands a consumer the first branch to offer
+  it. The other is `export default class Foo {}` imported as
+  `import Bar from "./x"`: the edge is addressed at `x.ts#default`, a name no
+  file ever declares, so no chain will ever produce it — while `definition` at
+  the importer's own binding lands straight on `Foo`. The local name (`Bar`)
+  is not the difficulty and never reaches the index at all, which is also why
+  every importer of that default is answered the same way whatever each of
+  them called it (`core/tests/default_export_linking.rs` follows one through
+  to a `find_references` answer).
+
   A failed pass is logged and dropped, never propagated. It improves a graph
   that is already committed and serviceable, so failing the reparse (or
   daemon startup) because the checker was unavailable would trade a better

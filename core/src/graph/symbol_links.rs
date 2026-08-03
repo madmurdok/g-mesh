@@ -63,14 +63,22 @@
 //!    `Foo`), which only a semantic layer can tie together.
 //!
 //! "Unresolved" is not always the last word on these. The JS/TS plugin's
-//! semantic pass re-asks the ones that come through a re-export chain of the
-//! compiler itself and re-sends the edge with `source: "ts-compiler"` when it
-//! gets a single answer (`plugins/js-ts/src/semanticPass.ts`) - two `export *`
-//! branches offering one name are ambiguous *here*, where all a name-matching
-//! walk can see is two equally good candidates, and settled in the language,
-//! which hands a consumer the first branch to offer it. That upgrade arrives
-//! as an ordinary diff through [`link_diff`]'s own caller and needs nothing
-//! from this pass but that it left the edge alone.
+//! semantic pass re-asks the ones whose target file does not declare the name
+//! of the compiler itself and re-sends the edge with `source: "ts-compiler"`
+//! when it gets a single answer (`plugins/js-ts/src/semanticPass.ts`). Both of
+//! the last two bullets are that shape:
+//!
+//!  - two `export *` branches offering one name are ambiguous *here*, where
+//!    all a name-matching walk can see is two equally good candidates, and
+//!    settled in the language, which hands a consumer the first branch to
+//!    offer it;
+//!  - `default` is a name no file ever declares, so the walk above has nothing
+//!    to match however far it follows the chain - while `definition` at the
+//!    importer's own binding lands straight on `Foo`, whatever that importer
+//!    called it locally (the local name never reaches this index at all).
+//!
+//! That upgrade arrives as an ordinary diff through [`link_diff`]'s own caller
+//! and needs nothing from this pass but that it left the edge alone.
 //!
 //! ## Placeholders the semantic pass sends
 //!
