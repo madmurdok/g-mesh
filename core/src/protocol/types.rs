@@ -98,10 +98,10 @@ pub enum RequestId {
 }
 
 /// The control-plane payload shapes: reindex request, file-changed
-/// notification, status query. Which of these is a "request" (expects a
-/// response) vs. a "notification" (fire-and-forget) is determined by
-/// whether `ControlEnvelope.id` is present, per JSON-RPC 2.0 - not by this
-/// enum itself.
+/// notification, status query, semantic-pass request. Which of these is a
+/// "request" (expects a response) vs. a "notification" (fire-and-forget) is
+/// determined by whether `ControlEnvelope.id` is present, per JSON-RPC 2.0 -
+/// not by this enum itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "camelCase")]
 pub enum ControlMessage {
@@ -113,6 +113,19 @@ pub enum ControlMessage {
     #[serde(rename_all = "camelCase")]
     FileChanged { file_path: String },
     Status,
+    /// Asks the plugin's semantic layer to re-answer what the structural
+    /// (tree-sitter) pass could only guess at, and reply with the edges it
+    /// can now upgrade - see `watcher::apply::apply_semantic_pass`.
+    ///
+    /// Plural `file_paths`, unlike every other variant, because the two
+    /// moments core sends this are different in kind: after an incremental
+    /// reparse it names the one file that just settled, while after the
+    /// cold-start bulk walk there is no single file to name - the whole
+    /// project just became resolvable at once. An **empty** list is that
+    /// second case, and means "everything indexed so far", not "nothing":
+    /// a request with nothing to do would not be worth a round trip.
+    #[serde(rename_all = "camelCase")]
+    SemanticPass { file_paths: Vec<String> },
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -141,6 +154,16 @@ pub struct Handshake {
 /// `storage::write::Diff` field-for-field (same `upsert`/`delete`
 /// vocabulary, not a separate "added/removed" one) but using the
 /// `WireNode`/`WireEdge` bulk-transfer shapes instead of storage records.
+///
+/// `SemanticPass` answers in this same shape rather than one of its own,
+/// and that is not merely a convenience: a semantic upgrade *is* a diff.
+/// Every node and edge here already carries its own `filePath`/`id`, so
+/// nothing about the type is singular-file-specific, and an upgraded edge
+/// re-sent under its existing (content-derived) id is upserted in place by
+/// `storage::write::apply_diff`'s `ON CONFLICT(id) DO UPDATE`, flipping
+/// exactly its `source`/`resolved` and leaving every other edge alone.
+/// A separate-but-identical type would have bought nothing and given the
+/// two shapes room to drift apart.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeDiff {
@@ -157,7 +180,9 @@ pub struct FileChangeDiff {
 /// Minimal JSON-RPC 2.0 response envelope carrying a `FileChangeDiff` -
 /// the counterpart to `ControlEnvelope` (which is the request/notification
 /// side only). Kept as one concrete response type rather than a generic
-/// `ControlResponse<T>` since this ticket only needs this one shape.
+/// `ControlResponse<T>`: both methods that answer with a diff (`FileChanged`
+/// and `SemanticPass`) answer with *this* diff, so there is still only one
+/// shape to be generic over.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileChangeResponse {
     pub jsonrpc: String,
@@ -240,6 +265,41 @@ mod tests {
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(!json.contains("\"id\""), "notifications must omit id per JSON-RPC 2.0");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
+
+    #[test]
+    fn semantic_pass_request_round_trips_with_camel_case_params() {
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(7)),
+            message: ControlMessage::SemanticPass {
+                file_paths: vec!["src/a.ts".to_string(), "src/b.ts".to_string()],
+            },
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"semanticPass\""), "{json}");
+        assert!(json.contains("\"filePaths\""), "{json}");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
+
+    /// The post-bulk-index shape: no single file to name, so the list is
+    /// empty and means "everything". It still has to be a present, valid
+    /// `filePaths` array on the wire - a plugin validating strictly (as the
+    /// JS/TS one does) rejects a missing one.
+    #[test]
+    fn a_whole_project_semantic_pass_still_carries_an_explicit_empty_list() {
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(1)),
+            message: ControlMessage::SemanticPass { file_paths: Vec::new() },
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"filePaths\":[]"), "{json}");
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
     }

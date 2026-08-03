@@ -79,6 +79,38 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
   }
 }
 
+/**
+ * Answers a semantic pass. Core is waiting on a diff, exactly as it waits
+ * on one for `fileChanged`, and gets one - an empty one for now.
+ *
+ * The pass has no resolution logic yet on purpose: standing up the tsserver
+ * client in semantic.ts is a separate ticket, and the four sub-problems it
+ * feeds (call targets, supertypes, re-exports, aliased imports) are epics of
+ * their own. What this ticket owes them is a wire to be plugged into, and an
+ * empty diff is a complete, honest answer over it - core's `apply_diff`
+ * treats it as the no-op it is, so nothing in the index moves until there is
+ * something real to say.
+ *
+ * `filePaths` is logged rather than used, for the same reason: an empty list
+ * ("the whole project", sent once the cold-start walk lands) and a one-entry
+ * list (a reparse that just settled) will mean very different amounts of
+ * work to a real pass, and nothing at all to this one.
+ */
+function handleSemanticPass(filePaths: string[], id: ControlEnvelope["id"]): void {
+  log(
+    filePaths.length === 0
+      ? "semantic pass requested for the whole project"
+      : `semantic pass requested for: ${filePaths.join(", ")}`,
+  );
+  // Same contract as handleFileChanged: core blocks on a response to any
+  // request it sent, so a request must always be answered with a diff -
+  // never with the `{ acknowledged: true }` shape the no-op methods use,
+  // which core would fail to deserialize as one.
+  if (id !== undefined) {
+    writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result: EMPTY_WIRE_DIFF });
+  }
+}
+
 async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): Promise<void> {
   switch (envelope.method) {
     case "reindex":
@@ -93,6 +125,12 @@ async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): P
     case "fileChanged":
       await handleFileChanged(projectRoot, envelope.params?.filePath ?? "", envelope.id);
       return; // handleFileChanged already sent the (only) response, if any
+    case "semanticPass":
+      // parseControlEnvelope has already established filePaths is a real
+      // string[] for this method; the `?? []` is for the type, not a case
+      // that can happen.
+      handleSemanticPass(envelope.params?.filePaths ?? [], envelope.id);
+      return; // answered with a diff, not the acknowledgement below
     case "status":
       log("status requested");
       break;

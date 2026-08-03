@@ -190,3 +190,72 @@ test("malformed JSON body does not crash the plugin", async () => {
     child.kill();
   }
 });
+
+/**
+ * The protocol plumbing this ticket adds, end to end against the real
+ * process: core sends a semanticPass request, and gets a *diff* back on the
+ * same connection - the same response shape fileChanged answers with, which
+ * is what lets core run the answer through the one commit-and-link pipeline
+ * it already has. The diff is empty because the resolution logic is a later
+ * ticket; the round trip is the contract being pinned here.
+ */
+test("plugin answers a semanticPass request with a diff-shaped result", async () => {
+  const child = spawnPlugin();
+  const out = collectFrames(child.stdout);
+
+  try {
+    await out.wait(1); // handshake
+
+    const request = {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "semanticPass",
+      params: { filePaths: ["src/a.ts"] },
+    };
+    child.stdin.write(encodeFrame(Buffer.from(JSON.stringify(request))));
+
+    await out.wait(2);
+    const response = JSON.parse(out.frames[1].toString("utf8"));
+    assert.equal(response.id, 7);
+    // Every key core's FileChangeDiff expects, and nothing shaped like the
+    // `{ acknowledged: true }` the no-op methods answer with - core
+    // deserializes this into a diff and would reject that.
+    assert.deepEqual(response.result, {
+      upsertNodes: [],
+      deleteNodeIds: [],
+      upsertEdges: [],
+      deleteEdgeIds: [],
+    });
+    assert.equal(child.exitCode, null, "process must still be alive");
+  } finally {
+    child.kill();
+  }
+});
+
+test("a whole-project semanticPass (empty filePaths) is answered the same way", async () => {
+  const child = spawnPlugin();
+  const out = collectFrames(child.stdout);
+  const stderrLines: string[] = [];
+  child.stderr.on("data", (c: Buffer) => stderrLines.push(c.toString("utf8")));
+
+  try {
+    await out.wait(1); // handshake
+
+    child.stdin.write(
+      encodeFrame(
+        Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 8, method: "semanticPass", params: { filePaths: [] } })),
+      ),
+    );
+
+    await out.wait(2);
+    const response = JSON.parse(out.frames[1].toString("utf8"));
+    assert.equal(response.id, 8);
+    assert.deepEqual(response.result.upsertEdges, []);
+    assert.ok(
+      stderrLines.some((line) => line.includes("whole project")),
+      "an empty list must be read as the whole project, not as nothing to do",
+    );
+  } finally {
+    child.kill();
+  }
+});

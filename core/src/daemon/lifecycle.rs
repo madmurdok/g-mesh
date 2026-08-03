@@ -344,6 +344,30 @@ impl PluginSupervisor {
         Ok(replayed)
     }
 
+    /// Runs a whole-project semantic pass, if the plugin is awake. Returns
+    /// whether it actually ran.
+    ///
+    /// Called once the cold-start bulk walk has committed and the daemon has
+    /// begun answering off it: the structural graph is what makes tools
+    /// usable, and the semantic layer's confirmations land on top of it
+    /// afterwards (see the architecture doc's cold-start sequence).
+    ///
+    /// A sleeping plugin is deliberately left asleep rather than woken. This
+    /// pass has no queue behind it and nothing waiting on its answer, so
+    /// respawning a tsserver to run one would spend exactly what sleeping
+    /// exists to save - the same reasoning
+    /// [`replay_pending`](Self::replay_pending) applies to an empty queue.
+    /// In practice this is unreachable at the one call site there is (the
+    /// plugin cannot have idled out during its own project's first walk),
+    /// which is precisely why it must not be an error.
+    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        let Some(process) = inner.process.as_ref() else { return Ok(false) };
+        self.touch();
+        process.semantic_pass(conn, file_paths)?;
+        Ok(true)
+    }
+
     /// Synchronously brings `file_path` up to date if it has changed since it
     /// was last indexed, per `watcher::staleness::ensure_fresh` - the
     /// query-time safety net for a change the watcher never applied at all,
