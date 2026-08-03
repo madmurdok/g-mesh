@@ -649,6 +649,159 @@ method — a one-time reindex, already paid for by the `schema_version` bump.
 Then the semantic pass fills `toDeclaration` from `definition` at each
 unresolved-or-overloaded call site.
 
+<a id="generics"></a>
+### Generic types: the written syntax is indexed, instantiation is not
+
+The graph is symbol-level and its edges answer one question: *which symbol
+mentions which*. A generic type is a symbol like any other, and a type
+argument is a mention like any other — but an **instantiation** is not a
+symbol at all. `Box<Widget>` will never be a node: it has no declaration site,
+there is one of it per use, and nothing in the data model could carry it.
+That is the line, and everything below follows from where it falls.
+
+Unlike the release's other three sub-problems, generics arrived with no
+failing test to anchor on — so the first job was finding out what is actually
+lost. Measured against the `tree-sitter-typescript` 0.23 grammar and
+`plugins/js-ts/src/extract.ts` at release 0.19.0, it is three drops, all of
+them of *explicitly written* names, none of them requiring a type checker to
+see:
+
+| written | recorded today | why |
+| --- | --- | --- |
+| `x: Box<Widget>` | `Widget` only | `generic_type` holds its head in a field called `name`, and `isBindingPosition` reads *every* `name` field as a declaration — so the head is discarded as if it were being bound. The plain `x: Box` in the same position is recorded. |
+| `class W extends Box<Widget>`, `implements Reg<Widget>`, `interface I extends Base<Widget>` | `Box`/`Reg`/`Base` only, as `SUPERTYPE_OF` | `heritageNames` returns the head and never descends into `type_arguments`; the clause itself is never walked, so nothing else sees them either. |
+| `new Box<Widget>()`, `make<Widget>()` | neither | `handleCall`/`handleNew` read the `function`/`constructor` and `arguments` fields. `type_arguments` is a third field on those nodes, and nothing reads it. |
+
+How much that costs depends entirely on whether a project declares generic
+types of its own, so it was counted on the bench corpora rather than guessed
+(non-`.d.ts` `.ts`/`.tsx`, `node_modules` and build output excluded):
+
+| corpus | files | generic types declared | `X<…>` head uses dropped | bare `X` uses kept | heritage type args dropped | call/`new` type args dropped |
+| --- | --- | --- | --- | --- | --- | --- |
+| excalidraw | 614 | 81 of 689 | 665 | 108 | 10 of 12 | 610 of 801 |
+| task-tracker-mcp | 46 | 0 of 51 | 0 | 0 | 0 | 0 of 8 |
+| g-mesh `plugins/js-ts/src` | 13 | 1 of 74 | 1 | 0 | 0 | 16 of 53 |
+
+(The last two columns count only arguments naming a type the project itself
+declares; a `Map<string, number>` loses nothing, because neither `Map` nor
+`string` is a node here.)
+
+Two numbers decide it. First, **68 of excalidraw's 81 project-declared generic
+types are never once written bare** — every use is `X<…>` — so
+`find_references` on them today returns nothing at all beyond whatever a
+heritage clause happens to contribute. A generic type is written with its
+arguments essentially always; that is what makes it generic. Second, this is
+not only other people's code: `find_references("ExtractedEdge")` in *this*
+repo lists neither `Extractor` nor `PassOutput`, the only two symbols that
+hold one, because both hold it as `new Map<string, ExtractedEdge>()`. Same
+for `ExtractResult` and `ProjectIndex`, and for `ImportBinding` and
+`Extractor`.
+
+**What gets built.** Three changes in the structural pass, no schema change,
+no new node or edge kind, no checker:
+
+1. **A generic type's own name is a reference.** `isBindingPosition` stops
+   claiming `generic_type`'s `name` field, so `Box<Widget>` records `Box`
+   exactly as `Box` alone already does. This is the one that matters; the
+   other two are the same principle at the sites a special-cased handler
+   skips.
+2. **Explicit type arguments are references.** The `type_arguments` of a
+   heritage clause, a call expression and a `new` expression are walked like
+   any other type position. The heritage case must walk *only* the
+   `type_arguments` subtree, never the clause: the head is already a
+   `SUPERTYPE_OF` edge, and `find_references` unions `SUPERTYPE_OF` with
+   `REFERENCES`, so walking the whole clause would report one referencing
+   symbol twice.
+3. **Type parameters are scoped bindings.** A declaration's own `<T, …>`
+   names shadow file-level types inside it, tracked the way `LocalBindings`
+   already tracks value locals. Today they are not tracked at all, so
+   `interface T {…}` plus `class Box<T> { item: T }` in one file emits a
+   wrong `REFERENCES Box -> T` onto the interface. That is pre-existing, and
+   it is the reason this lands *with* (1) and (2) rather than after: those
+   multiply the names resolved out of type positions by roughly seven, and a
+   type argument written inside a generic function is usually a type
+   parameter. Measured, the collision is rare — across excalidraw's 449 type
+   parameters, no file uses one whose name it also declares or imports — but
+   "a missing edge beats a wrong one" is the standing rule, and the guard is
+   cheap.
+
+Fixture sketches (one file each, asserted through `extractFile` exactly as
+`plugins/js-ts/test/extract.test.ts` already asserts `SUPERTYPE_OF`):
+
+```ts
+// (1) the head of a generic type
+export class Widget {}
+export class Box<T> {}
+export const held: Box<Widget> = null!;   // REFERENCES held -> Box  AND  held -> Widget
+export type Held = Box<Widget>;           // REFERENCES Held -> Box  AND  Held -> Widget
+
+// (2) explicit type arguments
+export interface Reg<T> {}
+export class WidgetBox extends Box<Widget> implements Reg<Widget> {}
+//   SUPERTYPE_OF WidgetBox -> Box, -> Reg   (unchanged, and NOT duplicated as REFERENCES)
+//   REFERENCES   WidgetBox -> Widget        (new, once, not twice)
+export function build() {
+  return new Box<Widget>();               // REFERENCES build -> Widget
+}
+
+// (3) a type parameter is not a reference to the type of the same name
+export interface T { tag: string }
+export class Holder<T> { item: T }        // NO edge Holder -> T
+```
+
+**Deliberately out of scope.** Each of these was investigated against real
+code rather than waved off, and each is out for a different reason:
+
+- **Instantiating a type parameter at a use site** — `box.get().spin()`
+  resolving to `Widget#spin` when `box: Box<Widget>`. Not out because it is
+  hard: asked through the existing plumbing
+  (`SemanticProject.definition`, a plain point query), `tsserver` answers it
+  correctly and with no generics-specific code — `box.get().spin()` lands on
+  `Widget#spin` and `other.get().spin()` on `Gadget#spin` in the same file.
+  It is out because **generics is not what blocks it**. The structural pass
+  emits no edge for *any* method call on a variable receiver, generic or not:
+  `box.get()` itself produces nothing, since `resolveCall` drops a call whose
+  receiver is a local binding, and `.spin()` on the result of a call is not
+  even recorded. Until typed-receiver resolution exists as a
+  feature of its own, instantiating `T` buys exactly nothing; once it exists,
+  the checker instantiates `T` for free. Either way it is not generics work.
+- **A concrete return type in `signature`** — `Box<T>.get(): T` rendered as
+  `get(): Widget`. There is no such thing to store: a generic method has one
+  concrete return type *per use site*, and `signature` is one string per
+  declaration. Writing any one of them into the node would be a claim the
+  language does not make. (`definition` cannot answer it either — asked at
+  `identity(1)` it returns the declaration of `identity`, not an
+  instantiation. It would need `quickinfo`, which is not in the plumbing.)
+- **Mixin base classes** — `function Loud<TB extends Ctor<Base>>(B: TB) {
+  return class extends B {…} }`. Recovering `Base` means resolving a type
+  parameter's constraint to a construct signature and taking its instance
+  type: real instantiation, and the head of the rabbit hole this section
+  exists to stay out of. It is also vanishingly rare — excalidraw contains
+  two anonymous `class extends` sites and both extend a concrete class.
+- **`find_implementations` through a constraint bound** — the candidate this
+  scope started from, and measured to be **not a gap**.
+  `class NumberBox implements Container<Comparable>` already produces
+  `SUPERTYPE_OF NumberBox -> Container`, because heritage matching strips the
+  arguments and matches the head by name; and `T extends Comparable` is a
+  constraint, not a subtype relation of the declaring type, so it correctly
+  becomes an ordinary `REFERENCES`. Nothing to build.
+- **Type alias transparency** — `type Handler<T> = BaseHandler<T>` then
+  `implements Handler<string>` points `SUPERTYPE_OF` at the alias, so
+  `find_implementations(BaseHandler)` misses the class. A real gap, but not a
+  generic one: a non-generic alias behaves identically. It is also not
+  reachable through this plumbing — `definition` at `Handler` in the
+  implements clause returns the *alias* declaration, exactly where the
+  name-matching walk already stops, so it would need `typeDefinition` or a
+  checker-side walk. Its own ticket.
+- **Full bidirectional type inference** — the standing no. g-mesh does not
+  and will not compute types; where a type is needed, it asks the compiler
+  that already computed it.
+
+The through-line: **the generics gap in g-mesh is a syntax-visibility gap,
+not a type-inference gap.** Everything worth building is a name someone
+wrote down and the walker skipped; everything that needs a type computed is
+either already the checker's job or has no consumer among the MCP tools.
+
 ## Interfaces
 
 ### MCP tools
