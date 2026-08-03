@@ -2,6 +2,7 @@ import { FrameReader, writeMessage } from "./jsonrpc";
 import { parseControlEnvelope, ControlEnvelope, PROTOCOL_VERSION, JSONRPC_VERSION } from "./protocol";
 import { reparseChangedFile, type FileDiff } from "./incremental";
 import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
+import { stopSemanticProjects } from "./semantic";
 
 const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
 
@@ -190,7 +191,16 @@ function main(): void {
     }
   });
 
-  process.stdin.on("end", () => process.exit(0));
+  // Core ends a plugin by closing its stdin (daemon::plugin::shutdown), so
+  // this is the plugin's whole shutdown path - and the only place a semantic
+  // child, which is many times this process's own size, gets to be released
+  // deliberately rather than by a backstop. Nothing here starts one: the
+  // checker is spawned by the first semantic question asked of it and this
+  // is a no-op for the (common) run where none ever is.
+  process.stdin.on("end", () => {
+    stopSemanticProjects();
+    process.exit(0);
+  });
 }
 
 main();

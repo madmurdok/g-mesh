@@ -725,13 +725,27 @@ command takes `{line, offset, endLine, endOffset, insertString}`, which is
 the shape `incremental.ts`'s `computeSourceEdit` **already derives** from
 its old/new text diff. The existing edit derivation feeds `tsserver`
 directly modulo 0-based-row → 1-based-line conversion, and the invalidation
-itself is `tsserver`'s problem rather than ours. Point queries also do not
-require an `open` first — an unopened file answered in 2.2 ms — so the pass
-can walk the unresolved-edge backlog without managing an open-file set.
+itself is `tsserver`'s problem rather than ours. Point queries are also
+per-*project*, not per-file: an unopened file answers in 2.2 ms — but only
+once some file in its project has been opened. Asked of a freshly spawned
+child, a `definition` on an unopened file fails outright with `No Project`,
+so the pass does keep one piece of open-file state after all (which files it
+has sent an `open` for, one notification each, no round trip), rather than
+none at all.
 
-A minimal client skeleton for this, unwired, is in
-`plugins/js-ts/src/semantic.ts`; the protocol plumbing and the runtime
-lifecycle are separate work.
+The client is `plugins/js-ts/src/semantic.ts`: `SemanticServer` is the
+~40-line wire adapter over one child, `SemanticProject` its lifecycle — one
+child per project root, spawned by the first semantic question actually asked
+(never at plugin startup), replaced lazily if it dies, and stopped with the
+plugin on its stdin's `end`, with a `process.on("exit")` hook as the backstop
+against orphaning one. Under a `SIGKILL` neither can run, and there the
+backstop is `tsserver`'s own: it exits when its stdin closes. The project's
+`tsconfig.json` — `paths` aliases included — is applied by `tsserver`
+natively, from the file's own location upward, so nothing of
+`tsconfigPaths.ts` is reused here; `projectInfo` reports which config was
+actually in force, which is what the tests assert on rather than assuming.
+Turning answers into resolved edges (overloads, re-exports, the
+`semanticPass` control message) is separate work.
 
 ### Shim ↔ daemon
 

@@ -13,6 +13,7 @@ import https = require("node:https");
 
 import { bulkIndexProject, type WireNode } from "../src/bulkIndex";
 import { isSupportedFile } from "../src/extract";
+import { SemanticProject } from "../src/semantic";
 
 // Regression tests for the three mitigations documented in
 // docs/architecture/g-mesh-v1.md's Security Model section: (1) a project's
@@ -111,6 +112,84 @@ test("a malicious tsconfig.json `plugins` entry is never loaded/executed during 
     // forbidden thing, which the marker-file assertion above already covers).
     assert.ok(!nodes.some((n) => n.filePath === "tsconfig.json"));
   } finally {
+    await cleanup(root);
+  }
+});
+
+/**
+ * The same fixture in the shape tsserver can actually be made to execute: a
+ * plugin *package* under the project's own `node_modules`, which is how a
+ * real `compilerOptions.plugins` entry is written (a package name, not a
+ * relative path) and how a compromised dependency would arrive.
+ *
+ * The distinction is what gives the test below teeth, and it was measured,
+ * not assumed: the relative-path form used above is not loaded even *with*
+ * `--allowLocalPluginLoads` (tsserver resolves plugin names out of
+ * `node_modules`, so it never finds it), while this form is executed the
+ * moment that flag is passed - and is not, without it. Asserting on a form
+ * that cannot execute either way would pass forever and prove nothing.
+ */
+function tsserverPluginFixtureFiles(): Record<string, string> {
+  return {
+    "tsconfig.json": JSON.stringify(
+      { compilerOptions: { strict: true, plugins: [{ name: "evil-ts-plugin" }] }, include: ["src"] },
+      null,
+      2,
+    ) + "\n",
+    "node_modules/evil-ts-plugin/package.json": JSON.stringify({
+      name: "evil-ts-plugin",
+      version: "1.0.0",
+      main: "index.js",
+    }) + "\n",
+    // The side effect runs at require() time, before any language-service
+    // hook - being loaded at all is the compromise, whatever it returns.
+    "node_modules/evil-ts-plugin/index.js": `const fs = require("node:fs");
+const path = require("node:path");
+fs.writeFileSync(path.join(__dirname, "..", "..", "${EVIL_MARKER}"), String(Date.now()));
+module.exports = function init() {
+  return { create: (info) => info.languageService };
+};
+`,
+    "src/good.ts": `export function double(n: number): number {\n  return n * 2;\n}\n`,
+  };
+}
+
+/**
+ * The same mitigation, one layer deeper. The test above covers the indexing
+ * walk, which never opens a tsconfig at all; this one covers the semantic
+ * pass, which hands the *whole project* - malicious `plugins` entry included -
+ * to a real tsserver that genuinely knows how to load such a plugin. The
+ * source-level assertions further down pin that `--allowLocalPluginLoads` is
+ * absent from the spawn; this pins the consequence, by running the thing.
+ */
+test("the tsserver child does not execute a malicious tsconfig.json `plugins` entry either", async () => {
+  const root = await makeProject(tsserverPluginFixtureFiles());
+  const project = new SemanticProject(root);
+  try {
+    const file = path.join(root, "src", "good.ts");
+
+    // A real semantic answer, so this cannot pass by tsserver having failed
+    // to load the project (which would also have skipped the plugin).
+    const definitions = await project.definition(file, { line: 1, offset: 17 });
+    assert.equal(definitions.length, 1, "sanity: the fixture must still answer semantic queries");
+    assert.equal(definitions[0].file, file);
+
+    // And it must have read the very tsconfig.json carrying the plugins entry
+    // - otherwise "the plugin did not run" would only mean "the config never
+    // reached the compiler".
+    assert.equal(
+      await project.configuredProjectFor(file),
+      path.join(root, "tsconfig.json"),
+      "sanity: the malicious tsconfig must be the config actually in force",
+    );
+
+    assert.equal(
+      existsSync(path.join(root, EVIL_MARKER)),
+      false,
+      "tsserver must never require() a project's compilerOptions.plugins entry",
+    );
+  } finally {
+    project.stop();
     await cleanup(root);
   }
 });
