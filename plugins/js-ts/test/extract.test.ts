@@ -1369,3 +1369,148 @@ export function run(): void {
   assert.ok(hasEdge(result, "CALLS", "run", "src/lib.ts#helper"));
   assert.equal(uses(result).length, 1);
 });
+
+// --- generic types ---------------------------------------------------------
+//
+// A name someone wrote down is a reference; an instantiation is not a symbol.
+// `Box<Widget>` mentions two types and both are recorded - `Box<Widget>` itself
+// never becomes a node. The three sites below each used to drop an explicitly
+// written name, and the fourth test guards the prerequisite that makes them
+// safe: a declaration's own `<T, ...>` must not name-match a file-level type.
+// See "Generic types" in docs/architecture/g-mesh-v1.md.
+
+test("a generic type's head is a reference, exactly as the same name written bare is", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+
+export const held: Box<Widget> = null!;
+export const plain: Box = null!;
+export type Held = Box<Widget>;
+`,
+  );
+
+  // `Box` used to be discarded here and only kept in `plain`, because a
+  // generic type holds its head in a field called `name` - the field every
+  // other declaration binds through.
+  assert.deepEqual(usageEdges(result), [
+    "REFERENCES Held -> Box",
+    "REFERENCES Held -> Widget",
+    "REFERENCES held -> Box",
+    "REFERENCES held -> Widget",
+    "REFERENCES plain -> Box",
+  ]);
+
+  // Nothing here needs a checker: these are ordinary structural edges onto
+  // declarations of this very file.
+  for (const edge of result.edges) {
+    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.resolved, true);
+  }
+});
+
+test("type arguments in a heritage clause are references, and the head stays only a supertype", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+export interface Reg<T> {}
+
+export class WidgetBox extends Box<Widget> implements Reg<Widget> {}
+export interface WidgetReg extends Reg<Widget> {}
+`,
+  );
+
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetBox", "Box"));
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetBox", "Reg"));
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetReg", "Reg"));
+
+  // `Widget` was dropped entirely; `Box`/`Reg` must stay SUPERTYPE_OF *only*,
+  // because find_references unions the two kinds and would otherwise report
+  // one written name twice.
+  assert.deepEqual(usageEdges(result), [
+    "REFERENCES WidgetBox -> Widget",
+    "REFERENCES WidgetReg -> Widget",
+  ]);
+});
+
+test("type arguments at a call and a `new` site are references", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+export function identity<V>(value: V): V {
+  return value;
+}
+
+export function build() {
+  return new Box<Widget>();
+}
+
+export function pick() {
+  return identity<Widget>(null!);
+}
+`,
+  );
+
+  // Neither function annotates a type, so `Widget` can only have come from the
+  // `type_arguments` field - the third field beside `function`/`constructor`
+  // and `arguments`, which neither handler used to read.
+  assert.deepEqual(usageEdges(result), [
+    "CALLS pick -> identity",
+    "REFERENCES build -> Box",
+    "REFERENCES build -> Widget",
+    "REFERENCES pick -> Widget",
+  ]);
+});
+
+test("a type parameter shadows a file-level type of the same name", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export interface T { tag: string }
+
+export class Holder<T> {
+  item: T;
+  wrap<T>(value: T): T {
+    return value;
+  }
+}
+
+export type Held<T> = Holder<T>;
+export type Mapper = <T>(x: T) => T;
+export interface Factory {
+  <T>(x: T): T;
+}
+export function keep<T>(value: T): T {
+  return value;
+}
+
+export const real: T = { tag: "" };
+`,
+  );
+
+  // Every `T` above but the last is a type parameter, i.e. a type this
+  // declaration itself declares - matching it onto the interface is the
+  // wrong-edge case, and the generic fixes above multiply how often a bare
+  // type-parameter name is walked. `real` proves the shadowing is scoped to
+  // the declaration rather than suppressing the name file-wide.
+  assert.deepEqual(usageEdges(result), ["REFERENCES Held -> Holder", "REFERENCES real -> T"]);
+});
+
+test("a type parameter shadows a type of that name and nothing else", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export function make(): void {}
+
+export function run<make>(value: make): void {
+  make();
+}
+`,
+  );
+
+  // Contrived - nobody names a type parameter after a function - but it pins
+  // the rule the shadowing is written to: `<T>` binds in the type namespace
+  // only, so the call still names this file's function.
+  assert.deepEqual(usageEdges(result), ["CALLS run -> make"]);
+});

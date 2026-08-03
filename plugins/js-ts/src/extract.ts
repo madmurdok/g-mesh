@@ -426,6 +426,14 @@ interface Scope {
    */
   readonly locals: LocalBindings | null;
   /**
+   * The type parameters of the enclosing declaration chain - a class's,
+   * interface's, type alias's or function's own `<T, ...>`. Kept apart from
+   * `locals` because they bind in the *type* namespace only: a type parameter
+   * shadows a file-level type of the same name, and nothing else. See
+   * [`typeParameterScope`].
+   */
+  readonly typeParameters: LocalBindings | null;
+  /**
    * The `from` of CALLS edges written here: the nearest enclosing Function
    * node, or - inside a function expression that has no node of its own (a
    * callback argument, an object-literal property value, an object-literal
@@ -459,6 +467,10 @@ interface Scope {
  * resolves normally at a call site outside it. Over-approximating would only
  * ever lose real edges, and completeness of `find_callers` for bare calls is
  * a documented guarantee.
+ *
+ * The same shape carries type parameters, in a chain of their own
+ * ([`Scope.typeParameters`]): they are names bound by a declaration and not
+ * graph symbols either, only in the type namespace rather than the value one.
  */
 interface LocalBindings {
   readonly names: ReadonlySet<string>;
@@ -524,6 +536,12 @@ interface ConstantInitializer {
 interface PendingReference {
   readonly name: string;
   readonly scope: Scope;
+  /**
+   * Written in a type position - a `type_identifier` rather than an
+   * `identifier`. Only there can an enclosing declaration's type parameter
+   * shadow the name, since that is the only namespace one binds in.
+   */
+  readonly typePosition: boolean;
 }
 
 interface PendingSupertype {
@@ -694,6 +712,7 @@ class Extractor {
       prefix: "",
       namespacePrefix: "",
       locals: null,
+      typeParameters: null,
       enclosingCallerId: null,
       enclosingSymbolId: this.fileNode.id,
       enclosingTypeQName: null,
@@ -910,10 +929,28 @@ class Extractor {
       case "member_expression":
         this.handleMemberExpression(node, scope);
         return;
+      // Anonymous forms carrying type parameters of their own - `type Map =
+      // <T>(x: T) => T`, an object type's call/construct signature, an ambient
+      // `declare function f<T>()`. No handler claims them, so this is the only
+      // place their `<T, ...>` can be brought into scope; the children are
+      // walked exactly as the default branch walks them.
+      case "function_type":
+      case "constructor_type":
+      case "call_signature":
+      case "construct_signature":
+      case "function_signature":
+        this.visitChildren(node, typeParameterScope(node, scope));
+        return;
       case "identifier":
       case "type_identifier":
       case "shorthand_property_identifier":
-        if (!isBindingPosition(node)) this.pendingReferences.push({ name: node.text, scope });
+        if (!isBindingPosition(node)) {
+          this.pendingReferences.push({
+            name: node.text,
+            scope,
+            typePosition: node.type === "type_identifier",
+          });
+        }
         return;
       default:
         this.visitChildren(node, scope);
@@ -1229,7 +1266,11 @@ class Extractor {
     if (scope.insideFunction) {
       // A class declared inside a function body is a local: no node, but its
       // methods still hold calls/references worth recording.
-      const localScope: Scope = { ...scope, enclosingTypeQName: null, supertypeNames };
+      const localScope: Scope = typeParameterScope(node, {
+        ...scope,
+        enclosingTypeQName: null,
+        supertypeNames,
+      });
       if (body) this.visitChildren(body, localScope);
       return;
     }
@@ -1248,15 +1289,16 @@ class Extractor {
       this.pendingSupertypes.push({ fromId: classNode.id, name: supertype, scope });
     }
 
-    const memberScope: Scope = {
+    const memberScope: Scope = typeParameterScope(node, {
       ...scope,
       prefix: qualifiedName,
       enclosingCallerId: null,
       enclosingSymbolId: classNode.id,
       enclosingTypeQName: qualifiedName,
       supertypeNames,
-    };
+    });
     this.visitField(node, "type_parameters", memberScope);
+    if (heritage) this.visitHeritageTypeArguments(heritage, memberScope);
     if (body) this.visitChildren(body, memberScope);
   }
 
@@ -1272,7 +1314,7 @@ class Extractor {
     const body = node.childForFieldName("body");
 
     if (scope.insideFunction) {
-      if (body) this.visitChildren(body, scope);
+      if (body) this.visitChildren(body, typeParameterScope(node, scope));
       return;
     }
 
@@ -1292,15 +1334,16 @@ class Extractor {
       this.pendingSupertypes.push({ fromId: typeNode.id, name: supertype, scope });
     }
 
-    const memberScope: Scope = {
+    const memberScope: Scope = typeParameterScope(node, {
       ...scope,
       prefix: qualifiedName,
       enclosingCallerId: null,
       enclosingSymbolId: typeNode.id,
       enclosingTypeQName: qualifiedName,
       supertypeNames,
-    };
+    });
     this.visitField(node, "type_parameters", memberScope);
+    if (extendsClause) this.visitHeritageTypeArguments(extendsClause, memberScope);
     if (body) this.visitChildren(body, memberScope);
   }
 
@@ -1313,7 +1356,7 @@ class Extractor {
     const nameNode = node.childForFieldName("name");
     if (!nameNode) return;
     if (scope.insideFunction) {
-      this.visitField(node, "value", scope);
+      this.visitField(node, "value", typeParameterScope(node, scope));
       return;
     }
 
@@ -1326,7 +1369,11 @@ class Extractor {
       docComment: docCommentFor(outer),
       exported,
     });
-    this.visitField(node, "value", { ...scope, enclosingSymbolId: aliasNode.id });
+    this.visitField(
+      node,
+      "value",
+      typeParameterScope(node, { ...scope, enclosingSymbolId: aliasNode.id }),
+    );
   }
 
   private handleEnum(
@@ -1573,7 +1620,7 @@ class Extractor {
    */
   private visitFunctionParts(node: SyntaxNode, scope: Scope): void {
     const bodyScope: Scope = {
-      ...scope,
+      ...typeParameterScope(node, scope),
       insideFunction: true,
       locals: functionScope(node, scope.locals),
       enclosingCallerId: scope.enclosingCallerId ?? this.callerFallback(scope),
@@ -1715,6 +1762,9 @@ class Extractor {
       }
     }
 
+    // `identity<Widget>(x)`: a third field beside `function` and `arguments`,
+    // holding names this call site mentions like any other type position.
+    this.visitField(node, "type_arguments", scope);
     if (args) this.visitChildren(args, scope);
   }
 
@@ -1732,7 +1782,46 @@ class Extractor {
     } else if (constructor) {
       this.visit(constructor, scope);
     }
+    // `new Box<Widget>()` - same third field as on a call expression.
+    this.visitField(node, "type_arguments", scope);
     if (args) this.visitChildren(args, scope);
+  }
+
+  /**
+   * The type arguments written in a heritage clause - the `Widget` of
+   * `extends Box<Widget>` / `implements Reg<Widget>` - which nothing else
+   * walks: the clause is read for its supertype *names* ([`heritageNames`])
+   * and then left alone.
+   *
+   * Only the arguments are walked, never the head. The head is already a
+   * SUPERTYPE_OF edge, and core's `find_references` unions SUPERTYPE_OF with
+   * REFERENCES, so walking the clause wholesale would report the same
+   * referencing symbol twice for one written name.
+   *
+   * The two shapes come from the grammar: a class's `extends` takes an
+   * *expression* head and hangs `type_arguments` off the clause beside it,
+   * while `implements` and an interface's `extends` take types, each a
+   * `generic_type` owning its own arguments.
+   */
+  private visitHeritageTypeArguments(clause: SyntaxNode, scope: Scope): void {
+    for (const child of clause.namedChildren) {
+      switch (child.type) {
+        case "extends_clause":
+        case "implements_clause":
+          this.visitHeritageTypeArguments(child, scope);
+          break;
+        case "type_arguments":
+          this.visitChildren(child, scope);
+          break;
+        case "generic_type": {
+          const args = child.childForFieldName("type_arguments");
+          if (args) this.visitChildren(args, scope);
+          break;
+        }
+        default:
+          break;
+      }
+    }
   }
 
   /**
@@ -2016,7 +2105,7 @@ class Extractor {
     }
     for (const call of this.pendingCalls) this.resolveCall(call);
     for (const reference of this.pendingReferences) {
-      this.resolveReference(reference.name, reference.scope);
+      this.resolveReference(reference.name, reference.scope, reference.typePosition);
     }
     for (const access of this.pendingMemberAccesses) this.collectNamespaceMemberUse(access);
   }
@@ -2136,8 +2225,15 @@ class Extractor {
     }
   }
 
-  private resolveReference(name: string, scope: Scope): void {
+  /**
+   * `typePosition` says the name was written where only a type can go, which
+   * is the only place an enclosing declaration's type parameter can shadow it
+   * (see [`typeParameterScope`]) - a type parameter binds no value, so a
+   * same-named `identifier` still means this file's symbol.
+   */
+  private resolveReference(name: string, scope: Scope, typePosition = false): void {
     if (isLocallyBound(name, scope.locals)) return; // a local, not this file's symbol
+    if (typePosition && isLocallyBound(name, scope.typeParameters)) return;
     const target = this.lookupByName(name, scope.namespacePrefix) ?? this.importedSymbol(name);
     if (target) this.addUsage(target, scope);
   }
@@ -2236,6 +2332,35 @@ function functionScope(fn: SyntaxNode, parent: LocalBindings | null): LocalBindi
   if (body) collectHoistedBindings(body, names);
 
   return { names, parent };
+}
+
+/**
+ * The scope a declaration's own `<T, ...>` opens. A type parameter is a type
+ * declared *by* this declaration and scoped to it, so a use of that name
+ * inside it is not a use of a file-level type that happens to share the
+ * spelling - `interface T {}` beside `class Box<T> { item: T }` used to emit a
+ * wrong `REFERENCES Box -> T` onto the interface.
+ *
+ * Bound in a chain of its own rather than in `locals` because the shadowing is
+ * one-way: a type parameter hides a type of that name and nothing else, so
+ * `Box` the value stays reachable inside `f<Box>()`. Only a type-position
+ * reference consults it ([`Extractor.resolveReference`]).
+ *
+ * Returns `scope` unchanged when there are no type parameters, so the
+ * overwhelmingly common non-generic declaration allocates nothing.
+ */
+function typeParameterScope(node: SyntaxNode, scope: Scope): Scope {
+  const list = node.childForFieldName("type_parameters");
+  if (!list) return scope;
+  const names = new Set<string>();
+  for (const parameter of list.namedChildren) {
+    if (parameter.type !== "type_parameter") continue;
+    const name = parameter.childForFieldName("name");
+    if (name) names.add(name.text);
+  }
+  return names.size === 0
+    ? scope
+    : { ...scope, typeParameters: { names, parent: scope.typeParameters } };
 }
 
 /** The scope a `{ ... }` block (or a `switch` body) opens: its own `let`/`const`/`class`/`function`. */
@@ -2409,16 +2534,18 @@ function isWholeModuleReexport(statement: SyntaxNode): boolean {
 /**
  * Identifiers introducing a binding are declarations, not usages.
  *
- * One known misfire, recorded in the "Generic types" section below: a
- * `generic_type` holds its *head* in a field called `name`, so `Box` in
- * `Box<Widget>` reads as a binding here and is dropped, while the same `Box`
- * written without arguments is recorded.
+ * The `name` field is what most of them have in common, which is why two
+ * shapes have to be excluded by hand: a JSX element and a `generic_type` both
+ * hold in that field the name of something being *used*.
  */
 function isBindingPosition(node: SyntaxNode): boolean {
   const parent = node.parent;
   if (!parent) return false;
   // A JSX element's `name` is a usage of the component, not a binding.
   if (parent.type.startsWith("jsx_")) return false;
+  // Neither is a generic type's head: `Box<Widget>` mentions `Box` exactly as
+  // the bare `Box` in the same position does, and nothing is declared here.
+  if (parent.type === "generic_type") return false;
   for (const field of ["name", "pattern", "alias"]) {
     if (parent.childForFieldName(field)?.id === node.id) return true;
   }
@@ -2477,38 +2604,40 @@ function isPathModuleRequire(value: SyntaxNode): boolean {
 // both. `Box<Widget>` is *not* a thing that can be declared, so it will never
 // be a node - there is one of it per use site and no declaration to hang it on.
 //
-// Three sites drop an explicitly written name today, all of them for the same
-// kind of reason - a special-cased handler reads the fields it cares about and
-// a generic one is not among them:
+// Three sites used to drop an explicitly written name, all of them for the
+// same kind of reason - a special-cased handler reads the fields it cares
+// about and a generic one was not among them. Each is now recorded as an
+// ordinary `REFERENCES` edge; type arguments written in a plain type
+// annotation always worked, because nothing special-cases those and the
+// default child walk reaches them.
 //
 //  1. **The head of a `generic_type`.** It lives in a field called `name`, and
-//     [`isBindingPosition`] treats every `name` field as a declaration, so
-//     `Box` in `x: Box<Widget>` is discarded while `x: Box` is recorded. This
-//     is the expensive one: measured on the excalidraw corpus, 68 of its 81
-//     project-declared generic types are *never* written bare, so
-//     `find_references` on them answers nothing.
+//     [`isBindingPosition`] treats a `name` field as a declaration, so `Box`
+//     in `x: Box<Widget>` was discarded while `x: Box` was recorded. That
+//     function now excludes the head by hand. This is the expensive one:
+//     measured on the excalidraw corpus, 68 of its 81 project-declared generic
+//     types are *never* written bare, so `find_references` on them answered
+//     nothing at all.
 //  2. **Type arguments in a heritage clause.** [`heritageNames`] returns the
-//     head and never descends into `type_arguments`, and nothing else walks
-//     the clause, so `class W extends Box<Widget>` records no mention of
-//     `Widget` at all.
+//     head and never descends into `type_arguments`, and nothing else walked
+//     the clause, so `class W extends Box<Widget>` recorded no mention of
+//     `Widget`. [`Extractor.visitHeritageTypeArguments`] walks the arguments -
+//     and *only* the arguments: the head is already a `SUPERTYPE_OF` edge, and
+//     core's `find_references` unions `SUPERTYPE_OF` with `REFERENCES`, so
+//     walking the clause wholesale would report it twice.
 //  3. **Type arguments at a call or `new` site.** [`Extractor.handleCall`] and
 //     [`Extractor.handleNew`] read `function`/`constructor` and `arguments`;
-//     `type_arguments` is a third field neither reads, so `new Box<Widget>()`
-//     and `make<Widget>()` record nothing. In this very file,
-//     `new Map<string, ExtractedEdge>()` is why `Extractor` has no edge onto
-//     `ExtractedEdge`.
+//     `type_arguments` is a third field on those nodes, and both now read it,
+//     so `new Box<Widget>()` and `make<Widget>()` record `Widget`. In this
+//     very file, `new Map<string, ExtractedEdge>()` is why `Extractor` used to
+//     have no edge onto `ExtractedEdge`.
 //
-// Type arguments written in an ordinary type annotation already work, because
-// nothing special-cases those - the default child walk reaches them.
-//
-// Two things the fix has to get right. Walking a heritage clause's
-// `type_arguments` must not walk the clause itself: the head is already a
-// `SUPERTYPE_OF` edge, and core's `find_references` unions `SUPERTYPE_OF` with
-// `REFERENCES`, so the head would be reported twice. And a declaration's own
-// `<T, ...>` names have to shadow file-level types inside it the way
-// [`LocalBindings`] shadows value declarations - they are not tracked at all
-// today, which is why `interface T {}` beside `class Box<T> { item: T }` in
-// one file already emits a wrong `REFERENCES Box -> T`.
+// The prerequisite for all three: a declaration's own `<T, ...>` names shadow
+// file-level types inside it, tracked by [`typeParameterScope`] the way
+// [`LocalBindings`] tracks value locals. Untracked, `interface T {}` beside
+// `class Box<T> { item: T }` in one file emits a wrong `REFERENCES Box -> T`
+// onto the interface - and the three fixes above multiply how often a bare
+// type-parameter name is walked, so they would have multiplied that too.
 //
 // **Not done here, on purpose.** Nothing in this pass instantiates a type
 // parameter. `box.get().spin()` does not resolve to `Widget#spin` when
@@ -2532,8 +2661,10 @@ function isPathModuleRequire(value: SyntaxNode): boolean {
  *
  * Dropping them is right for *this* answer - `class W extends Box<Widget>` is
  * a subtype of `Box`, not of `Widget` - but it is not the whole answer: the
- * arguments are still names this file mentions, and nothing else walks the
- * clause to record them. See the "Generic types" note above.
+ * arguments are still names this file mentions, so they are recorded as
+ * ordinary references by [`Extractor.visitHeritageTypeArguments`], which is
+ * the only other thing that reads a heritage clause. See the "Generic types"
+ * note above.
  */
 function heritageNames(clause: SyntaxNode): string[] {
   const names: string[] = [];
