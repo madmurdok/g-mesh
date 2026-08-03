@@ -33,10 +33,10 @@
 //     file in" is handled, because tsserver will not answer a point query
 //     until the file's project is loaded (see `ensureOpen`).
 //
-// Still deliberately not wired into index.ts's message *dispatch*: the
-// `semanticPass` control message, and the g-mesh-specific resolution logic
-// behind it (overloads, re-exports, upgrading unresolved edges), are separate
-// tickets. index.ts only ties the child's lifetime to the plugin's own.
+// No g-mesh vocabulary reaches either of them: which edges are worth asking
+// about, and what a `definition` answer means for the graph, live one layer up
+// in semanticPass.ts, which is what index.ts's `semanticPass` handler calls.
+// index.ts itself only ties the child's lifetime to the plugin's own.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";

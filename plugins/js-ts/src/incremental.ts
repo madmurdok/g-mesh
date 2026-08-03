@@ -282,6 +282,19 @@ export function hasCachedFile(filePath: string): boolean {
   return fileStates.has(filePath);
 }
 
+/**
+ * The extraction core was last told about for `filePath`, or undefined if this
+ * process has never parsed it.
+ *
+ * Read-only, and deliberately not a parse: the semantic pass (semanticPass.ts)
+ * runs immediately after a reparse of the same file and needs the very nodes
+ * and edges that reparse produced - re-deriving them would both cost a second
+ * parse and risk answering about a file that changed again in between.
+ */
+export function cachedExtraction(filePath: string): ExtractResult | undefined {
+  return fileStates.get(filePath)?.result;
+}
+
 /** Drops one file's state - e.g. after a delete, so a re-creation is treated
  * as a first sighting rather than diffed against a stale tree. */
 export function forgetFile(filePath: string): boolean {

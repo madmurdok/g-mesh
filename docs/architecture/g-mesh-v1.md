@@ -343,6 +343,38 @@ re-exports under the same one, as it does in the language; a cycle terminates
 on the walk's visited set rather than hanging the index; and a chain that ends
 nowhere leaves the edge exactly as unresolved as before, never guessed at.
 
+What that walk cannot settle is a name **two** branches offer at the same
+depth — `export * from "./a"; export * from "./b"` where both declare
+`mutate`. All a name-matching walk sees is two equally good candidates, so it
+leaves the edge alone. The language does have an answer, and the semantic pass
+(`plugins/js-ts/src/semanticPass.ts`) asks the compiler for it rather than
+reimplementing it. Measured against TypeScript 5.9.3 on exactly that fixture:
+
+| asked | answer |
+| --- | --- |
+| `tsc --noEmit` | `TS2308: Module "./a" has already exported a member named 'mutate'`, reported on the **second** `export *` — a diagnostic about the barrel, not one that removes the name from a consumer's view |
+| `definition` at a consumer's `import { mutate } from "./index"` | exactly **one** location, in `a.ts` |
+| `quickinfo` at the call site | `(alias) mutate(): "a"` |
+| the same, with the two `export *` statements swapped | `b.ts` |
+
+So the rule is *the first `export *` in the barrel's own source order that
+offers the name* — not the first file alphabetically, not the shortest chain —
+which is `extendExportSymbols` in the checker: the first star export to
+contribute a name keeps it, and later ones only add to the TS2308 collision
+list. The pass re-sends the edge under its own id with `source: "ts-compiler"`,
+`resolved: true` and the declaration it landed on, and core's `apply_diff`
+rewrites the row in place.
+
+To keep that cheap, the pass only ever asks about a placeholder whose target
+file does **not** itself declare the name: where it does, core's own walk
+reaches the same node in a lookup instead of a subprocess round trip, so the
+questions actually put to the checker are barrel questions — a small fraction
+of a project's imports. An answer is dropped, leaving the edge exactly as the
+structural pass left it, when the checker returns anything but a single
+location, when that location is outside what this index holds (a
+`node_modules` or gitignored declaration), or when the declaration is of the
+wrong kind for the edge.
+
 Unlike an import placeholder, a linked-away symbol placeholder is kept rather
 than deleted: it carries one edge per usage, so a later edit to the same file
 can add another one to it, and the plugin sends that new edge without

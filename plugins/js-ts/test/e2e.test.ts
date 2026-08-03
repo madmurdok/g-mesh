@@ -11,8 +11,13 @@ import { PROTOCOL_VERSION } from "../src/protocol";
 // wire protocol at it exactly as core would, playing the "core" role.
 const ENTRY = path.join(__dirname, "..", "src", "index.js");
 
-function spawnPlugin(): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [ENTRY], { stdio: ["pipe", "pipe", "pipe"] });
+/** `projectRoot` is the argv core passes the real plugin; omitting it falls
+ * back to this process's cwd, exactly as the plugin documents. Tests that make
+ * the plugin *walk* the project pass a root of their own rather than letting
+ * it loose on the repository checkout. */
+function spawnPlugin(projectRoot?: string): ChildProcessWithoutNullStreams {
+  const args = projectRoot === undefined ? [ENTRY] : [ENTRY, projectRoot];
+  return spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"] });
 }
 
 interface FrameCollector {
@@ -196,8 +201,10 @@ test("malformed JSON body does not crash the plugin", async () => {
  * process: core sends a semanticPass request, and gets a *diff* back on the
  * same connection - the same response shape fileChanged answers with, which
  * is what lets core run the answer through the one commit-and-link pipeline
- * it already has. The diff is empty because the resolution logic is a later
- * ticket; the round trip is the contract being pinned here.
+ * it already has. The round trip is the contract being pinned here; that the
+ * diff comes back empty is a property of the fixture, not of the handler -
+ * `src/a.ts` does not exist under this root, so there is nothing to resolve.
+ * What the resolution logic itself answers is semanticPass.test.ts's subject.
  */
 test("plugin answers a semanticPass request with a diff-shaped result", async () => {
   const child = spawnPlugin();
@@ -233,7 +240,11 @@ test("plugin answers a semanticPass request with a diff-shaped result", async ()
 });
 
 test("a whole-project semanticPass (empty filePaths) is answered the same way", async () => {
-  const child = spawnPlugin();
+  // An empty list really does make the plugin walk the tree it was pointed at,
+  // so it is pointed at a tree of this test's own rather than at whatever the
+  // suite happens to be run from.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-e2e-semantic-"));
+  const child = spawnPlugin(root);
   const out = collectFrames(child.stdout);
   const stderrLines: string[] = [];
   child.stderr.on("data", (c: Buffer) => stderrLines.push(c.toString("utf8")));
@@ -257,5 +268,6 @@ test("a whole-project semanticPass (empty filePaths) is answered the same way", 
     );
   } finally {
     child.kill();
+    await fs.rm(root, { recursive: true, force: true });
   }
 });

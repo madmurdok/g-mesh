@@ -62,6 +62,16 @@
 //!    under a declared name (`export default class Foo {}` is a node called
 //!    `Foo`), which only a semantic layer can tie together.
 //!
+//! "Unresolved" is not always the last word on these. The JS/TS plugin's
+//! semantic pass re-asks the ones that come through a re-export chain of the
+//! compiler itself and re-sends the edge with `source: "ts-compiler"` when it
+//! gets a single answer (`plugins/js-ts/src/semanticPass.ts`) - two `export *`
+//! branches offering one name are ambiguous *here*, where all a name-matching
+//! walk can see is two equally good candidates, and settled in the language,
+//! which hands a consumer the first branch to offer it. That upgrade arrives
+//! as an ordinary diff through [`link_diff`]'s own caller and needs nothing
+//! from this pass but that it left the edge alone.
+//!
 //! ## Why the placeholder is kept
 //!
 //! Unlike `graph::imports`, a linked-away placeholder is *not* deleted, even
@@ -688,6 +698,13 @@ mod tests {
         .unwrap()
     }
 
+    /// Which layer last answered for an edge - the other half of what a
+    /// semantic upgrade changes about a row.
+    fn edge_source(conn: &Connection, edge_id: &str) -> String {
+        conn.query_row("SELECT source FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0))
+            .unwrap()
+    }
+
     fn count(conn: &Connection, table: &str) -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
     }
@@ -1144,9 +1161,15 @@ mod tests {
         assert_eq!(edge_target(&conn, &edge).0, "Function:index.ts:mutate");
     }
 
-    /// Two `export *` branches offering the same name: the language calls that
-    /// an error, and this pass calls it ambiguous - a missing edge beats a
-    /// wrong one, exactly as for a name one file exports twice.
+    /// Two `export *` branches offering the same name: this pass calls it
+    /// ambiguous - a missing edge beats a wrong one, exactly as for a name one
+    /// file exports twice - and the semantic layer, which has the compiler's
+    /// own module resolution, settles it afterwards.
+    ///
+    /// The two halves are asserted in order on purpose. The first is the
+    /// contract of the fast layer, which has to keep behaving exactly as it
+    /// did: whatever the checker later says, an index that has only been
+    /// through the structural pass must not claim to know which branch won.
     #[test]
     fn two_reexport_branches_offering_one_name_leave_the_edge_unresolved() {
         let mut conn = setup();
@@ -1168,6 +1191,38 @@ mod tests {
 
         assert_eq!(link_all(&mut conn).unwrap(), LinkSummary::default());
         assert!(!edge_target(&conn, &edge).1);
+        assert_eq!(edge_source(&conn, &edge), "tree-sitter");
+
+        // What the semantic pass answers, in the shape it answers it: the edge
+        // re-sent under its own id (`plugins/js-ts/src/semanticPass.ts`), which
+        // is why this needed no storage path of its own - `apply_diff`'s
+        // ON CONFLICT rewrites the row in place.
+        //
+        // `a.ts` and not `b.ts` because that is what TypeScript's own module
+        // resolution hands a consumer, measured rather than assumed (tsc /
+        // tsserver 5.9.3 on exactly this fixture): `tsc --noEmit` reports the
+        // TS2308 ambiguity against the *second* `export *`, a barrel-level
+        // diagnostic, while `definition` at the importer's `mutate` returns
+        // exactly one location - the first branch's - and swapping the two
+        // statements swaps the answer. See semanticPass.ts's module comment.
+        let upgrade = Diff {
+            upsert_edges: vec![EdgeRecord::new(
+                edge.clone(),
+                "Function:caller.ts:run",
+                "Function:a.ts:mutate",
+                "CALLS",
+                "ts-compiler",
+                true,
+            )],
+            ..Default::default()
+        };
+        apply_diff(&mut conn, &upgrade).unwrap();
+
+        // Nothing left for this pass to link: the edge no longer hangs on the
+        // placeholder, so the two layers cannot fight over it.
+        assert_eq!(link_diff(&mut conn, &upgrade).unwrap(), LinkSummary::default());
+        assert_eq!(edge_target(&conn, &edge), ("Function:a.ts:mutate".to_string(), true));
+        assert_eq!(edge_source(&conn, &edge), "ts-compiler");
     }
 
     /// `export * from "./x"` republishes every *named* export of `./x` and

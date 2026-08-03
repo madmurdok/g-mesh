@@ -3,6 +3,7 @@ import { parseControlEnvelope, ControlEnvelope, PROTOCOL_VERSION, JSONRPC_VERSIO
 import { reparseChangedFile, type FileDiff } from "./incremental";
 import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
 import { stopSemanticProjects } from "./semantic";
+import { runSemanticPass } from "./semanticPass";
 
 const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
 
@@ -80,34 +81,54 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
 }
 
 /**
- * Answers a semantic pass. Core is waiting on a diff, exactly as it waits
- * on one for `fileChanged`, and gets one - an empty one for now.
+ * Answers a semantic pass: asks semanticPass.ts what TypeScript's own checker
+ * can resolve that the structural pass could not, and sends it back as the
+ * same diff shape `fileChanged` answers with.
  *
- * The pass has no resolution logic yet on purpose: standing up the tsserver
- * client in semantic.ts is a separate ticket, and the four sub-problems it
- * feeds (call targets, supertypes, re-exports, aliased imports) are epics of
- * their own. What this ticket owes them is a wire to be plugged into, and an
- * empty diff is a complete, honest answer over it - core's `apply_diff`
- * treats it as the no-op it is, so nothing in the index moves until there is
- * something real to say.
+ * `filePaths` scopes the work - one entry after a reparse that just settled,
+ * an **empty** list for "the whole project", which is what core sends once the
+ * cold-start walk has landed.
  *
- * `filePaths` is logged rather than used, for the same reason: an empty list
- * ("the whole project", sent once the cold-start walk lands) and a one-entry
- * list (a reparse that just settled) will mean very different amounts of
- * work to a real pass, and nothing at all to this one.
+ * A pass that fails answers with an empty diff rather than with an error.
+ * Core drops a failing semantic pass on the floor by design (it is an upgrade
+ * over a graph that is already committed and serviceable), and an empty diff
+ * is the same outcome reached without making core parse a failure first - but
+ * a partial answer, which is what a per-question failure inside the pass
+ * degrades to, still gets through.
  */
-function handleSemanticPass(filePaths: string[], id: ControlEnvelope["id"]): void {
+async function handleSemanticPass(
+  projectRoot: string,
+  filePaths: string[],
+  id: ControlEnvelope["id"],
+): Promise<void> {
   log(
     filePaths.length === 0
       ? "semantic pass requested for the whole project"
       : `semantic pass requested for: ${filePaths.join(", ")}`,
   );
+
+  let result = EMPTY_WIRE_DIFF;
+  try {
+    const diff = await runSemanticPass(projectRoot, filePaths, { onLog: log });
+    result = {
+      upsertNodes: diff.upsertNodes.map(toWireNode),
+      deleteNodeIds: [],
+      upsertEdges: diff.upsertEdges,
+      deleteEdgeIds: [],
+    };
+    if (diff.upsertEdges.length > 0) {
+      log(`semantic pass resolved ${diff.upsertEdges.length} edge(s) the structural pass could not`);
+    }
+  } catch (err) {
+    log(`semantic pass failed: ${(err as Error).message}`);
+  }
+
   // Same contract as handleFileChanged: core blocks on a response to any
   // request it sent, so a request must always be answered with a diff -
   // never with the `{ acknowledged: true }` shape the no-op methods use,
   // which core would fail to deserialize as one.
   if (id !== undefined) {
-    writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result: EMPTY_WIRE_DIFF });
+    writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result });
   }
 }
 
@@ -129,7 +150,7 @@ async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): P
       // parseControlEnvelope has already established filePaths is a real
       // string[] for this method; the `?? []` is for the type, not a case
       // that can happen.
-      handleSemanticPass(envelope.params?.filePaths ?? [], envelope.id);
+      await handleSemanticPass(projectRoot, envelope.params?.filePaths ?? [], envelope.id);
       return; // answered with a diff, not the acknowledgement below
     case "status":
       log("status requested");
