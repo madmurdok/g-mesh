@@ -116,7 +116,10 @@ const PLACEHOLDER_NATIVE_KINDS: ReadonlySet<string> = new Set([
   REEXPORT_NATIVE_KIND,
 ]);
 
-function isPlaceholder(node: ExtractedNode): boolean {
+/** Whether a node stands in for something outside its own file rather than
+ * declaring anything. Exported because the semantic pass has to be able to
+ * refuse one as the answer to "where is this declared" (semanticPass.ts). */
+export function isPlaceholder(node: ExtractedNode): boolean {
   return node.nativeKind !== undefined && PLACEHOLDER_NATIVE_KINDS.has(node.nativeKind);
 }
 

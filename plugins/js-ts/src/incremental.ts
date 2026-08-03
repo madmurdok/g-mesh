@@ -291,10 +291,13 @@ export function hasCachedFile(filePath: string): boolean {
  * The extraction core was last told about for `filePath`, if this process
  * still holds it.
  *
- * Read by semanticPass.ts, which needs the *committed* extraction rather than
- * a fresh one: the ids it writes edges from have to be ids that are actually in
- * the index. A miss (a cold process, a file only the bulk-index run ever saw)
- * is normal and the caller re-parses instead.
+ * Read-only, and deliberately not a parse: semanticPass.ts runs immediately
+ * after a reparse of the same file and needs the *committed* extraction rather
+ * than a fresh one - the ids it writes edges from have to be ids that are
+ * actually in the index, and re-deriving them would both cost a second parse
+ * and risk answering about a file that changed again in between. A miss (a cold
+ * process, a file only the bulk-index run ever saw) is normal and the caller
+ * re-parses instead.
  */
 export function cachedExtraction(filePath: string): ExtractResult | undefined {
   return fileStates.get(filePath)?.result;

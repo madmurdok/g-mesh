@@ -81,20 +81,22 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
 }
 
 /**
- * Answers a semantic pass: what TypeScript's own checker can resolve that
- * tree-sitter could not (semanticPass.ts).
+ * Answers a semantic pass: asks semanticPass.ts what TypeScript's own checker
+ * can resolve that the structural pass could not, and sends it back as the
+ * same diff shape `fileChanged` answers with.
  *
  * An empty `filePaths` means the whole project - the wire's own convention,
  * sent once the cold-start walk lands - and a one-entry list a reparse that
  * just settled. The pass itself distinguishes them; everything else here is
  * the same contract `handleFileChanged` has.
  *
- * A failure answers with an empty diff rather than propagating. Core blocks on
- * a response to any request it sent, so a request must always be answered with
- * a diff - never with the `{ acknowledged: true }` shape the no-op methods
- * use, which core would fail to deserialize as one - and an empty diff is the
- * honest answer for a pass that could not run: the index keeps whatever the
- * structural layer already resolved, which is the state it was in anyway.
+ * A pass that fails answers with an empty diff rather than with an error. Core
+ * drops a failing semantic pass on the floor by design (it is an upgrade over a
+ * graph that is already committed and serviceable), and an empty diff is the
+ * same outcome reached without making core parse a failure first: the index
+ * keeps whatever the structural layer already resolved, which is the state it
+ * was in anyway. A *partial* answer, which is what a per-question failure
+ * inside the pass degrades to, still gets through.
  */
 async function handleSemanticPass(
   projectRoot: string,
@@ -121,13 +123,17 @@ async function handleSemanticPass(
       deleteEdgeIds: pass.deleteEdgeIds,
     };
     log(
-      `semantic pass over ${pass.filesScanned} file(s): ${pass.upsertEdges.length} edge(s) resolved, ` +
+      `semantic pass over ${pass.filesScanned} file(s): ${pass.upsertEdges.length} edge(s) answered, ` +
         `${pass.deleteEdgeIds.length} retracted, ${pass.unresolvedUses} left unresolved`,
     );
   } catch (err) {
     log(`semantic pass failed: ${(err as Error).message}`);
   }
 
+  // Same contract as handleFileChanged: core blocks on a response to any
+  // request it sent, so a request must always be answered with a diff -
+  // never with the `{ acknowledged: true }` shape the no-op methods use,
+  // which core would fail to deserialize as one.
   if (id !== undefined) {
     writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result });
   }
