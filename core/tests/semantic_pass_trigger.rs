@@ -212,25 +212,46 @@ fn core_asks_for_a_semantic_pass_after_each_incremental_reparse() {
         })
         .len();
 
-    fs::write(
-        harness.root().join("edited.ts"),
-        "export function edited(): number {\n  return 1;\n}\n",
-    )
-    .unwrap();
+    // Re-edited until the watcher answers, rather than written once. The
+    // watcher is registered a moment *after* the cold-start pass this test
+    // just waited for (see `daemon::run`), and nothing marks the instant it
+    // starts - so a single write can land in that gap, where it is not
+    // missed-and-retried but missed outright, and the test would then hang
+    // on an event that is never coming. Editing again costs nothing when the
+    // watcher is already up: the first edit answers and the loop ends.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut edits = 0;
+    let methods = loop {
+        edits += 1;
+        fs::write(
+            harness.root().join("edited.ts"),
+            format!("export function edited(): number {{\n  return {edits};\n}}\n"),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
 
-    let methods = harness.wait_for("the watcher's reparse and the pass that follows it", |methods| {
-        let tail = &methods[after_startup.min(methods.len())..];
-        tail.iter().any(|m| m == "fileChanged")
-            && tail.iter().skip_while(|m| *m != "fileChanged").any(|m| m == "semanticPass")
-    });
+        let methods = harness.methods();
+        // Only the tail is considered, so a reparse can only be credited to
+        // the edit above - never to anything startup did.
+        let settled = methods.get(after_startup..).is_some_and(|tail| {
+            position_of(tail, "fileChanged")
+                .is_some_and(|changed| tail[changed..].iter().any(|m| m == "semanticPass"))
+        });
+        if settled {
+            break methods;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no reparse-and-pass arrived after {edits} edit(s); methods: {methods:?}"
+        );
+    };
 
     let tail = &methods[after_startup..];
     let changed = position_of(tail, "fileChanged").expect("the watcher must have routed the edit");
-    let pass = tail[changed..]
-        .iter()
-        .position(|m| m == "semanticPass")
-        .expect("a settled reparse must be followed by a semantic pass");
-    assert!(pass > 0, "the pass follows the reparse it upgrades: {tail:?}");
+    assert!(
+        tail[changed..].iter().any(|m| m == "semanticPass"),
+        "a settled reparse must be followed by a semantic pass: {tail:?}"
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();
