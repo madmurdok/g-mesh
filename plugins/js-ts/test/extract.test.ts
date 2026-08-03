@@ -379,6 +379,236 @@ test("specifier resolution never claims an IMPORTS edge is resolved - that is co
   }
 });
 
+// --- computed import specifiers ------------------------------------------
+//
+// Scoped in docs/architecture/g-mesh-v1.md ("Computed import specifiers"):
+// what folds without running anything is resolved, everything else produces no
+// edge at all - never a wrong one.
+
+/** Every specifier this file imports, by the qualifiedName of the placeholder
+ * it landed on, sorted - so "no edge at all" is assertable as `[]`. */
+function importedModules(result: ExtractResult): string[] {
+  const byId = new Map(result.nodes.map((n) => [n.id, n]));
+  return result.edges
+    .filter((edge) => edge.kind === "IMPORTS")
+    .map((edge) => byId.get(edge.toId)?.qualifiedName ?? "<dangling>")
+    .sort();
+}
+
+test("a template specifier folds through the same-file constants it interpolates", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(): Promise<void> {
+  await import(\`./plugins/\${NAME}/index\`);
+  await import(\`./p/\${DEEP}.js\`);
+}
+
+const NAME = "alpha";
+const DEEP = \`\${NAME}/deep\`;
+`,
+  );
+
+  // Both constants are declared *below* the call that reads them, which is the
+  // whole reason the fold is deferred past the walk.
+  assert.deepEqual(importedModules(result), ["./p/alpha/deep.js", "./plugins/alpha/index"]);
+});
+
+test("a named string enum member folds; nothing else about an enum does", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `enum Plugin {
+  Foo = "foo",
+  Count = 2,
+}
+
+export async function boot(which: Plugin): Promise<void> {
+  await import(\`./p/\${Plugin.Foo}.js\`);
+  // Not a member named outright, a value of enum type: which one it holds is
+  // the checker's question, and only ever answerable as a union.
+  await import(\`./p/\${which}.js\`);
+  // A number is not a specifier.
+  await import(\`./p/\${Plugin.Count}.js\`);
+}
+`,
+  );
+
+  assert.deepEqual(importedModules(result), ["./p/foo.js"]);
+});
+
+test("a conditional specifier records one import per branch", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(dev: boolean, alt: boolean): Promise<void> {
+  await import(dev ? "./dev" : alt ? "./alt" : "./prod");
+}
+`,
+  );
+
+  // A File node already carries several outgoing IMPORTS edges in the
+  // ordinary multi-import case, so a fan-out is not a new edge shape.
+  assert.deepEqual(importedModules(result), ["./alt", "./dev", "./prod"]);
+});
+
+test("a conditional with one dynamic branch records neither branch", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(dev: boolean): Promise<void> {
+  await import(dev ? "./dev" : getPath());
+}
+`,
+  );
+
+  // "./dev" is real, but recording it alone reads as the complete answer to
+  // what this call site imports, and it is not one.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("path.join(__dirname, ...) is a relative specifier spelled the long way", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `import * as path from "node:path";
+
+const NAME = "alpha";
+
+export async function boot(): Promise<void> {
+  await import(path.join(__dirname, "./plugins", \`\${NAME}.js\`));
+  await import(path.resolve(__dirname, "..", "shared.js"));
+}
+`,
+  );
+
+  assert.deepEqual(importedModules(result), ["../shared.js", "./plugins/alpha.js", "node:path"]);
+});
+
+test("the path module is recognised however it was bound, and only it", () => {
+  const cjs = extractFile(
+    "src/index.js",
+    `const path = require("node:path");
+
+module.exports = () => import(path.join(__dirname, "plugins", "index.js"));
+`,
+  );
+  assert.deepEqual(importedModules(cjs), ["./plugins/index.js", "node:path"]);
+
+  const aliased = extractFile(
+    "src/index.ts",
+    `import nodePath from "path";
+
+export const boot = () => import(nodePath.join(__dirname, "boot.js"));
+`,
+  );
+  assert.deepEqual(importedModules(aliased), ["./boot.js", "path"]);
+
+  // Same call shape, receiver bound to something else entirely.
+  const impostor = extractFile(
+    "src/index.ts",
+    `import * as path from "./mypath";
+
+export const boot = () => import(path.join(__dirname, "boot.js"));
+`,
+  );
+  assert.deepEqual(importedModules(impostor), ["./mypath"]);
+});
+
+test("a computed specifier that is not statically known records no edge at all", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `import * as path from "node:path";
+import { REMOTE } from "./names";
+
+let mutable = "alpha";
+
+export async function boot(which: string): Promise<void> {
+  // The regression this whole feature had to close: a truncated first
+  // fragment ("./plugins/") used to be recorded as the specifier.
+  await import(\`./plugins/\${which}/index\`);
+  // Another file's constant - this pass sees one file.
+  await import(\`./p/\${REMOTE}.js\`);
+  // Not a constant at all.
+  await import(\`./p/\${mutable}.js\`);
+  await import(\`./p/\${process.env.PLUGIN}.js\`);
+  await import(getPath());
+  // Resolvable only down to a directory, which is a different feature.
+  await import(path.join(__dirname, "./plugins", which));
+}
+`,
+  );
+
+  // Only the two static imports at the top, and nothing shaped like
+  // "./plugins/" or "./p/" anywhere.
+  assert.deepEqual(importedModules(result), ["./names", "node:path"]);
+});
+
+test("a literal made of parts is never truncated into a specifier", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `declare const suffix: string;
+
+enum Plugin {
+  Foo = \`foo-\${suffix}\`,
+}
+
+export const boot = () => import(\`./p/\${Plugin.Foo}.js\`);
+export const legacy = () => import(\`./p/a\\tb\`);
+`,
+  );
+
+  // Reading the first fragment of a multi-part literal and calling it the
+  // value - "foo-" here, "./p/a" there - is what recorded a *wrong* import
+  // rather than none at all. Both are unreadable, so both name nothing.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("a local binding shadows the constant a specifier would otherwise fold to", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `const NAME = "alpha";
+
+export async function boot(NAME: string): Promise<void> {
+  await import(\`./p/\${NAME}.js\`);
+}
+`,
+  );
+
+  // The parameter is what the call site reads, and what a local holds is not
+  // tracked - the same rule every other name resolution here follows.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("a folded specifier is an ordinary import edge, resolved by the same handshake", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `const NAME = "alpha";
+export const boot = () => import(\`./plugins/\${NAME}.js\`);
+`,
+    { resolveSpecifier: (specifier) => (specifier === "./plugins/alpha.js" ? "src/plugins/alpha.ts" : null) },
+  );
+
+  // Folding happens in the structural pass - no compiler is asked anything -
+  // so the edge is a `tree-sitter` one, and `resolved` stays core's call
+  // exactly as for a static `import "./plugins/alpha.js"`.
+  const placeholder = node(result, "Module", "src/plugins/alpha.ts");
+  assert.equal(placeholder.nativeKind, RESOLVED_MODULE_NATIVE_KIND);
+  assert.equal(placeholder.name, "./plugins/alpha.js", "the computed specifier is what it names");
+  const imports = result.edges.filter((e) => e.kind === "IMPORTS");
+  assert.equal(imports.length, 1);
+  assert.equal(imports[0].source, "tree-sitter");
+  assert.equal(imports[0].resolved, false, "the target node is still a placeholder until core links it");
+});
+
+test("a require() that is no import is still a call of a name this file may declare", () => {
+  const result = extractFile(
+    "src/index.js",
+    `function require(id) { return id; }
+
+function boot() { return require(getPath()); }
+`,
+  );
+
+  assert.deepEqual(importedModules(result), []);
+  assert.ok(hasEdge(result, "CALLS", "boot", "require"));
+});
+
 test("two specifiers naming the same file collapse into one placeholder", () => {
   const result = extractFile(
     "src/index.ts",

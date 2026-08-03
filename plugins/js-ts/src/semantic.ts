@@ -44,12 +44,13 @@
 // resolved statically - scoped in full at `recordCallImport` in extract.ts
 // and in docs/architecture/g-mesh-v1.md ("Computed import specifiers"). The
 // short version: `definition`/`projectInfo` are the whole query surface
-// today, and most of the statically-resolvable subset needs neither one -
-// it is same-file constant folding extract.ts can already do on its own.
-// The cases that would need this file to do more (a specifier's constant
-// living in another file, or a value the checker can only type as a finite
-// literal union) need a query this file does not have yet, which is exactly
-// why that part of the scope is future work, not this release's.
+// today, and the statically-resolvable subset that is implemented needs
+// neither one - it is same-file constant folding extract.ts does on its own,
+// which is why no computed specifier reaches this file at all. The cases that
+// would need this file to do more (a specifier's constant living in another
+// file, or a value the checker can only type as a finite literal union) need
+// a query this file does not have yet, which is exactly why that part of the
+// scope is future work, not this release's.
 //
 // ## Generics need nothing from this layer
 //
