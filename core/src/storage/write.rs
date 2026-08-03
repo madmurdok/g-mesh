@@ -1,6 +1,26 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+/// One declaration of a symbol that has several - a row of the `declarations`
+/// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
+/// (plugins/js-ts/src/extract.ts) field for field, which is also the wire
+/// shape (`protocol::types::WireDeclaration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationRecord {
+    /// Position in the owning node's declaration list, source-ordered from 0.
+    /// What an edge's `to_declaration` names.
+    pub ordinal: i64,
+    pub start_line: i64,
+    pub start_col: i64,
+    pub end_line: i64,
+    pub end_col: i64,
+    pub signature: Option<String>,
+    /// Whether this declaration carries an implementation - the difference
+    /// between an overload signature and the implementation TypeScript never
+    /// shows a caller.
+    pub has_body: bool,
+}
+
 pub struct NodeRecord {
     pub id: String,
     pub kind: String,
@@ -17,6 +37,18 @@ pub struct NodeRecord {
     pub language: String,
     pub native_kind: Option<String>,
     pub has_syntax_errors: bool,
+    /// Every declaration this symbol is written as, in source order - empty
+    /// for the single-declaration symbols that are nearly all of them, since
+    /// the flat fields above already describe those completely.
+    ///
+    /// **Write-side only.** The read path (`graph::queries::map_node_row`)
+    /// leaves this empty rather than joining the child table on every lookup,
+    /// so a `NodeRecord` that came *out* of the database says nothing about
+    /// declarations - and must not be handed straight back to [`apply_diff`],
+    /// which would read that silence as "this symbol has one declaration now"
+    /// and drop the rows. Nothing does that today; a future reader that needs
+    /// the list should load it explicitly.
+    pub declarations: Vec<DeclarationRecord>,
 }
 
 impl NodeRecord {
@@ -45,6 +77,7 @@ impl NodeRecord {
             language: language.into(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: Vec::new(),
         }
     }
 }
@@ -56,6 +89,11 @@ pub struct EdgeRecord {
     pub kind: String,
     pub source: String,
     pub resolved: bool,
+    /// Which of the target's declarations this edge binds, as an ordinal into
+    /// its declaration list. `None` for everything that binds no particular
+    /// one - every structural-pass edge, and every edge whose target has a
+    /// single declaration. See `edges.toDeclaration` in `storage::schema`.
+    pub to_declaration: Option<i64>,
 }
 
 impl EdgeRecord {
@@ -74,6 +112,7 @@ impl EdgeRecord {
             kind: kind.into(),
             source: source.into(),
             resolved,
+            to_declaration: None,
         }
     }
 }
@@ -114,6 +153,13 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             .context("failed to delete edge")?;
     }
     for id in &diff.delete_node_ids {
+        // Explicitly, rather than leaning on the child table's ON DELETE
+        // CASCADE: `foreign_keys` is off on the connection the daemon actually
+        // runs on (`storage::connection::open` sets WAL and nothing else), so
+        // the cascade only fires in tests that switch it on. Left orphaned,
+        // these rows would be handed to whoever next takes this node's id.
+        tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's declarations")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id])
             .context("failed to delete node")?;
     }
@@ -155,18 +201,60 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             ],
         )
         .context("failed to upsert node")?;
+
+        // A declaration list is replaced wholesale, never merged into: it
+        // describes how the symbol is written *now*, so an overload deleted
+        // between two reparses has to leave with the edit that deleted it.
+        // Issued for every node, including the overwhelming majority that
+        // carry no list at all - the alternative is not knowing whether this
+        // node used to have one, and a probe of a (nodeId, ordinal) primary
+        // key that matches nothing is the cheapest possible way to find out.
+        // `prepare_cached` keeps that to one prepared statement per
+        // transaction rather than one per node.
+        tx.prepare_cached("DELETE FROM declarations WHERE nodeId = ?1")
+            .context("failed to prepare the declaration replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's declarations")?;
+        for declaration in &node.declarations {
+            tx.prepare_cached(
+                "INSERT INTO declarations
+                    (nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .context("failed to prepare the declaration insert")?
+            .execute(params![
+                node.id,
+                declaration.ordinal,
+                declaration.start_line,
+                declaration.start_col,
+                declaration.end_line,
+                declaration.end_col,
+                declaration.signature,
+                declaration.has_body,
+            ])
+            .context("failed to insert a declaration")?;
+        }
     }
     for edge in &diff.upsert_edges {
         tx.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO edges (id, fromId, toId, kind, source, resolved, toDeclaration)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                 fromId = excluded.fromId,
                 toId = excluded.toId,
                 kind = excluded.kind,
                 source = excluded.source,
-                resolved = excluded.resolved",
-            params![edge.id, edge.from_id, edge.to_id, edge.kind, edge.source, edge.resolved],
+                resolved = excluded.resolved,
+                toDeclaration = excluded.toDeclaration",
+            params![
+                edge.id,
+                edge.from_id,
+                edge.to_id,
+                edge.kind,
+                edge.source,
+                edge.resolved,
+                edge.to_declaration
+            ],
         )
         .context("failed to upsert edge")?;
     }
@@ -231,6 +319,222 @@ mod tests {
 
         assert_eq!(count(&conn, "nodes"), 2); // n1, n3 (n2 deleted)
         assert_eq!(count(&conn, "edges"), 1); // e2 (e1 deleted)
+    }
+
+    fn declaration(ordinal: i64, signature: &str, has_body: bool) -> DeclarationRecord {
+        DeclarationRecord {
+            ordinal,
+            start_line: ordinal,
+            start_col: 7,
+            end_line: ordinal,
+            end_col: 47,
+            signature: Some(signature.to_string()),
+            has_body,
+        }
+    }
+
+    fn overloaded(declarations: Vec<DeclarationRecord>) -> NodeRecord {
+        let mut node = NodeRecord::new("n1", "Function", "parse", "parse", "src/parse.ts", "typescript");
+        node.declarations = declarations;
+        node
+    }
+
+    /// Every declaration row a node has, ordered, as (ordinal, signature,
+    /// hasBody) - the fields the acceptance criteria names.
+    fn declarations_of(conn: &Connection, node_id: &str) -> Vec<(i64, Option<String>, bool)> {
+        let mut stmt = conn
+            .prepare("SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = ?1 ORDER BY ordinal")
+            .unwrap();
+        stmt.query_map(params![node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_nodes_declarations_are_persisted_with_it() {
+        let mut conn = setup();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![overloaded(vec![
+                    declaration(0, "parse(input: string): string[]", false),
+                    declaration(1, "parse(input: number): number", false),
+                    declaration(2, "parse(input: string | number): any", true),
+                ])],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            declarations_of(&conn, "n1"),
+            vec![
+                (0, Some("parse(input: string): string[]".to_string()), false),
+                (1, Some("parse(input: number): number".to_string()), false),
+                (2, Some("parse(input: string | number): any".to_string()), true),
+            ]
+        );
+    }
+
+    /// The 99% case, and the reason the child table exists rather than more
+    /// columns on `nodes`: an ordinary symbol costs no rows at all.
+    #[test]
+    fn a_single_declaration_node_writes_no_declaration_rows() {
+        let mut conn = setup();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![NodeRecord::new(
+                    "n1",
+                    "Function",
+                    "once",
+                    "once",
+                    "src/lib.ts",
+                    "typescript",
+                )],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "declarations"), 0);
+    }
+
+    #[test]
+    fn re_upserting_a_node_replaces_its_declarations_instead_of_appending() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![overloaded(vec![
+                    declaration(0, "parse(input: string): string[]", false),
+                    declaration(1, "parse(input: number): number", false),
+                    declaration(2, "parse(input: string | number): any", true),
+                ])],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The second overload is deleted from the source: the list is shorter
+        // and renumbered, and the row describing the deleted one has to go
+        // with it rather than linger at ordinal 2.
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![overloaded(vec![
+                    declaration(0, "parse(input: string): string[]", false),
+                    declaration(1, "parse(input: string | number): any", true),
+                ])],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            declarations_of(&conn, "n1"),
+            vec![
+                (0, Some("parse(input: string): string[]".to_string()), false),
+                (1, Some("parse(input: string | number): any".to_string()), true),
+            ]
+        );
+    }
+
+    /// The other half of "replace, don't accumulate": a symbol that stops
+    /// being overloaded arrives with no list at all, and must not keep the one
+    /// it had.
+    #[test]
+    fn a_node_that_lost_its_overloads_keeps_no_declaration_rows() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![overloaded(vec![
+                    declaration(0, "parse(input: string): string[]", false),
+                    declaration(1, "parse(input: string): string[] {}", true),
+                ])],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "declarations"), 2);
+
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![overloaded(Vec::new())], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(count(&conn, "declarations"), 0);
+    }
+
+    /// `foreign_keys` is off on the connection the daemon actually runs on, so
+    /// the child table's ON DELETE CASCADE never fires there - the delete has
+    /// to be explicit, or a deleted node's declarations would be inherited by
+    /// whatever next claims its id.
+    #[test]
+    fn deleting_a_node_takes_its_declarations_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![overloaded(vec![
+                    declaration(0, "parse(input: string): string[]", false),
+                    declaration(1, "parse(input: string): string[] {}", true),
+                ])],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "declarations"), 2);
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["n1".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        assert_eq!(count(&conn, "declarations"), 0, "orphaned rows would be handed to the next node with this id");
+    }
+
+    #[test]
+    fn an_edges_declaration_binding_round_trips_and_is_upgradable_in_place() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    NodeRecord::new("n1", "Function", "caller", "caller", "src/lib.ts", "typescript"),
+                    NodeRecord::new("n2", "Function", "parse", "parse", "src/lib.ts", "typescript"),
+                ],
+                upsert_edges: vec![EdgeRecord::new("e1", "n1", "n2", "CALLS", "tree-sitter", false)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let unbound: Option<i64> = conn
+            .query_row("SELECT toDeclaration FROM edges WHERE id = 'e1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(unbound, None, "the structural pass binds no declaration");
+
+        // The semantic pass' shape: the same edge re-sent under its own id,
+        // now carrying what the checker resolved. Note this only ever happens
+        // for an edge whose id already accounts for the binding - see
+        // `edgeIdFor` - but the write path must carry the column either way.
+        let mut upgraded = EdgeRecord::new("e1", "n1", "n2", "CALLS", "ts-compiler", true);
+        upgraded.to_declaration = Some(1);
+        apply_diff(&mut conn, &Diff { upsert_edges: vec![upgraded], ..Default::default() }).unwrap();
+
+        let (source, bound): (String, Option<i64>) = conn
+            .query_row("SELECT source, toDeclaration FROM edges WHERE id = 'e1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(source, "ts-compiler");
+        assert_eq!(bound, Some(1));
+        assert_eq!(count(&conn, "edges"), 1, "an upgrade updates the row in place");
     }
 
     #[test]

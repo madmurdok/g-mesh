@@ -16,7 +16,14 @@ use rusqlite::{Connection, OptionalExtension};
 ///
 /// Bumped to "4" when `meta.indexer_version` was added - see
 /// [`CURRENT_INDEXER_VERSION`] for the failure that column exists to end.
-pub const CURRENT_SCHEMA_VERSION: &str = "4";
+///
+/// Bumped to "5" when `declarations` and `edges.toDeclaration` were added -
+/// see "Overloads and merged declarations" in docs/architecture/g-mesh-v1.md.
+/// A symbol written as several declarations (overload signatures beside their
+/// implementation, an interface or namespace merged across statements) used to
+/// keep only one of them; the child table is where the rest now live, and the
+/// edge column is where a call site's binding to one of them goes.
+pub const CURRENT_SCHEMA_VERSION: &str = "5";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -93,13 +100,48 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_filePath ON nodes(filePath);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualifiedName ON nodes(qualifiedName);
 
+-- One row per declaration of a symbol that has more than one - overload
+-- signatures beside their implementation, an interface or a namespace written
+-- across several statements. A symbol with a single declaration (nearly every
+-- symbol in a real file) has *no* rows here: the node's own flat columns
+-- already say everything about it, and costing the ordinary case nothing is
+-- the whole point of hanging this off to the side instead of widening `nodes`.
+--
+-- `ordinal` is source order from 0, and it is an identity rather than a
+-- presentation detail: it is what `edges.toDeclaration` names when the
+-- semantic pass says which overload a call site bound.
+--
+-- Written only through `storage::write::apply_diff`, which replaces a node's
+-- whole set on every upsert of it - an overload list is a fact about the
+-- symbol as it is written now, never an accumulation across edits.
+CREATE TABLE IF NOT EXISTS declarations (
+    nodeId    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    ordinal   INTEGER NOT NULL,
+    startLine INTEGER NOT NULL,
+    startCol  INTEGER NOT NULL,
+    endLine   INTEGER NOT NULL,
+    endCol    INTEGER NOT NULL,
+    signature TEXT,
+    hasBody   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (nodeId, ordinal)
+);
+
+-- toDeclaration: which of the target's declarations this edge binds, as an
+-- ordinal into `declarations`. NULL for every edge that binds no particular
+-- one, which is every edge the structural pass produces and every edge whose
+-- target has a single declaration - i.e. almost all of them. Set only on
+-- CALLS, only by the semantic pass, and part of the edge's own identity (see
+-- `edgeIdFor` in plugins/js-ts/src/extract.ts), so one caller calling two
+-- overloads of the same function stores both bindings instead of one
+-- overwriting the other.
 CREATE TABLE IF NOT EXISTS edges (
-    id       TEXT PRIMARY KEY,
-    fromId   TEXT NOT NULL REFERENCES nodes(id),
-    toId     TEXT NOT NULL REFERENCES nodes(id),
-    kind     TEXT NOT NULL,
-    source   TEXT NOT NULL CHECK (source IN ('tree-sitter', 'ts-compiler')),
-    resolved INTEGER NOT NULL DEFAULT 0
+    id            TEXT PRIMARY KEY,
+    fromId        TEXT NOT NULL REFERENCES nodes(id),
+    toId          TEXT NOT NULL REFERENCES nodes(id),
+    kind          TEXT NOT NULL,
+    source        TEXT NOT NULL CHECK (source IN ('tree-sitter', 'ts-compiler')),
+    resolved      INTEGER NOT NULL DEFAULT 0,
+    toDeclaration INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_fromId ON edges(fromId);
@@ -222,7 +264,10 @@ pub fn record_bulk_index(conn: &Connection) -> Result<()> {
 
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
+        // Children before parents: with `foreign_keys` on, dropping `nodes`
+        // while `declarations`/`edges` still reference it is an error rather
+        // than a cascade.
+        "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
     )
     .context("failed to wipe schema")
 }
@@ -265,7 +310,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables.sort();
-        assert_eq!(tables, vec!["edges", "indexed_files", "meta", "nodes"]);
+        assert_eq!(tables, vec!["declarations", "edges", "indexed_files", "meta", "nodes"]);
 
         let indexes: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
@@ -336,6 +381,97 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "CALLS");
         assert!(!resolved);
+    }
+
+    #[test]
+    fn declarations_round_trip_in_ordinal_order() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'parse', 'parse', 'src/parse.ts', 3, 7, 5, 1, 'typescript')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody)
+             VALUES ('n1', 1, 2, 7, 2, 61, 'parse(input: number): number', 0),
+                    ('n1', 0, 1, 7, 1, 47, 'parse(input: string): string[]', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = 'n1' ORDER BY ordinal")
+            .unwrap();
+        let rows: Vec<(i64, String, bool)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "parse(input: string): string[]".to_string(), false),
+                (1, "parse(input: number): number".to_string(), false),
+            ],
+            "ordinal is what orders a declaration list, not insertion order"
+        );
+    }
+
+    /// Two declarations of one node cannot share an ordinal: it is the address
+    /// an edge's `toDeclaration` uses, so a duplicate would make "which
+    /// overload did this call bind" unanswerable.
+    #[test]
+    fn a_node_cannot_have_two_declarations_at_the_same_ordinal() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'parse', 'parse', 'src/parse.ts', 3, 7, 5, 1, 'typescript')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
+             VALUES ('n1', 0, 1, 7, 1, 47, 0)",
+            [],
+        )
+        .unwrap();
+
+        let clash = conn.execute(
+            "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
+             VALUES ('n1', 0, 9, 0, 9, 9, 1)",
+            [],
+        );
+        assert!(clash.is_err());
+    }
+
+    #[test]
+    fn an_edge_records_which_declaration_it_bound() {
+        let conn = setup();
+        for id in ["n1", "n2"] {
+            conn.execute(
+                "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+                 VALUES (?1, 'Function', 'f', 'f', 'src/lib.ts', 1, 0, 3, 1, 'typescript')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO edges (id, fromId, toId, kind, source, resolved, toDeclaration)
+             VALUES ('bound', 'n1', 'n2', 'CALLS', 'ts-compiler', 1, 2),
+                    ('unbound', 'n2', 'n1', 'CALLS', 'tree-sitter', 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let bound: Option<i64> = conn
+            .query_row("SELECT toDeclaration FROM edges WHERE id = 'bound'", [], |row| row.get(0))
+            .unwrap();
+        let unbound: Option<i64> = conn
+            .query_row("SELECT toDeclaration FROM edges WHERE id = 'unbound'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bound, Some(2));
+        assert_eq!(unbound, None, "binding no particular declaration is the default, and stays NULL");
     }
 
     #[test]

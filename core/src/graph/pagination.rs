@@ -281,6 +281,7 @@ pub fn paginate_edges(
     };
     let sql = format!(
         "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.resolved AS resolved, \
+         e.toDeclaration AS toDeclaration, \
          CASE WHEN n.filePath = ?1 THEN 0 ELSE 1 END AS locality \
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?2 \
@@ -328,6 +329,7 @@ pub fn paginate_edges(
                         kind: row.get("kind")?,
                         source: row.get("source")?,
                         resolved: row.get("resolved")?,
+                        to_declaration: row.get("toDeclaration")?,
                     },
                     locality,
                 ))

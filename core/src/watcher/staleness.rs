@@ -303,6 +303,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: None,
         }
     }
 

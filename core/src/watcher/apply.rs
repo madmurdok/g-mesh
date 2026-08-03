@@ -28,7 +28,7 @@ use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
     JSONRPC_VERSION,
 };
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::{apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -226,19 +226,38 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
         language: node.language,
         native_kind: node.native_kind,
         has_syntax_errors: node.has_syntax_errors,
+        // Absent means "one declaration", which is no rows in the child table
+        // - the same thing an empty list means to `apply_diff`, which replaces
+        // whatever was stored either way.
+        declarations: node
+            .declarations
+            .unwrap_or_default()
+            .into_iter()
+            .map(|declaration| DeclarationRecord {
+                ordinal: declaration.ordinal as i64,
+                start_line: declaration.start_line as i64,
+                start_col: declaration.start_col as i64,
+                end_line: declaration.end_line as i64,
+                end_col: declaration.end_col as i64,
+                signature: declaration.signature,
+                has_body: declaration.has_body,
+            })
+            .collect(),
     }
 }
 
 /// Wire edge -> storage record; see [`to_node_record`] on why this is shared.
 pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
-    EdgeRecord::new(
+    let mut record = EdgeRecord::new(
         edge.id,
         edge.from_id,
         edge.to_id,
         edge_kind_wire_value(&edge.kind),
         edge_source_wire_value(&edge.source),
         edge.resolved,
-    )
+    );
+    record.to_declaration = edge.to_declaration.map(|ordinal| ordinal as i64);
+    record
 }
 
 /// `nodes.kind` in the schema is a plain string matching `NodeKind`'s Rust
@@ -298,6 +317,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: None,
         }
     }
 
@@ -362,6 +382,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: EdgeSource::TreeSitter,
             resolved: false,
+            to_declaration: None,
         }
     }
 
@@ -370,6 +391,75 @@ mod tests {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_wire_nodes_declaration_list_becomes_storage_records() {
+        use crate::protocol::types::WireDeclaration;
+
+        let mut node = canned_node("n1");
+        node.declarations = Some(vec![
+            WireDeclaration {
+                ordinal: 0,
+                start_line: 1,
+                start_col: 7,
+                end_line: 1,
+                end_col: 47,
+                signature: Some("parse(input: string): string[]".to_string()),
+                has_body: false,
+            },
+            WireDeclaration {
+                ordinal: 1,
+                start_line: 3,
+                start_col: 7,
+                end_line: 5,
+                end_col: 1,
+                signature: None,
+                has_body: true,
+            },
+        ]);
+
+        let record = to_node_record(node);
+
+        assert_eq!(
+            record.declarations,
+            vec![
+                DeclarationRecord {
+                    ordinal: 0,
+                    start_line: 1,
+                    start_col: 7,
+                    end_line: 1,
+                    end_col: 47,
+                    signature: Some("parse(input: string): string[]".to_string()),
+                    has_body: false,
+                },
+                DeclarationRecord {
+                    ordinal: 1,
+                    start_line: 3,
+                    start_col: 7,
+                    end_line: 5,
+                    end_col: 1,
+                    signature: None,
+                    has_body: true,
+                },
+            ]
+        );
+        // And an ordinary node still says "no declarations", which `apply_diff`
+        // reads as "one" - the same thing an absent field on the wire means.
+        assert!(to_node_record(canned_node("n2")).declarations.is_empty());
+    }
+
+    #[test]
+    fn a_wire_edges_declaration_binding_becomes_a_storage_record() {
+        let mut edge = unresolved_edge("e1", "n1", "n2");
+        assert_eq!(to_edge_record(edge.clone()).to_declaration, None);
+
+        edge.to_declaration = Some(0);
+        assert_eq!(
+            to_edge_record(edge).to_declaration,
+            Some(0),
+            "ordinal 0 is a binding, not the absence of one"
+        );
     }
 
     #[test]
@@ -392,6 +482,7 @@ mod tests {
                     kind: EdgeKind::Calls,
                     source: EdgeSource::TreeSitter,
                     resolved: false,
+                    to_declaration: None,
                 }],
                 delete_edge_ids: vec![],
             },

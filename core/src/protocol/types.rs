@@ -55,6 +55,30 @@ pub enum EdgeSource {
     TsCompiler,
 }
 
+/// One declaration of a symbol written as several - an overload signature
+/// beside its implementation, an interface or a namespace merged across
+/// statements. Mirrors the plugin's `SymbolDeclaration`
+/// (plugins/js-ts/src/extract.ts) exactly, flat line/col fields and all,
+/// rather than nesting a [`Range`] the way [`WireNode`] does: this shape
+/// crosses the wire as the plugin already builds it in process, and a
+/// transformation on the way out would be one more thing for the two sides to
+/// disagree about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireDeclaration {
+    /// Source order from 0 - the ordinal [`WireEdge::to_declaration`] names.
+    pub ordinal: u32,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    /// Absent for a declaration with no signature of its own - a merged
+    /// interface or namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub has_body: bool,
+}
+
 /// Bulk-transfer wire shape for a single graph node (one NDJSON line).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +99,17 @@ pub struct WireNode {
     pub native_kind: Option<String>,
     #[serde(default)]
     pub has_syntax_errors: bool,
+    /// Every declaration this symbol is written as, in source order - sent
+    /// **only** when there is more than one.
+    ///
+    /// `skip_serializing_if` is load-bearing rather than tidiness: the design
+    /// promises an ordinary single-declaration node stays byte-identical on
+    /// the wire, and the plugin holds up its half by omitting the key
+    /// entirely (`toWireNode` in plugins/js-ts/src/bulkIndex.ts). An empty
+    /// list would be a different, and equally wrong, way to say "one
+    /// declaration" - hence `Option`, not `Vec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declarations: Option<Vec<WireDeclaration>>,
 }
 
 /// Bulk-transfer wire shape for a single graph edge (one NDJSON line).
@@ -87,6 +122,19 @@ pub struct WireEdge {
     pub kind: EdgeKind,
     pub source: EdgeSource,
     pub resolved: bool,
+    /// Which of the target's declarations this edge binds, as an ordinal into
+    /// its declaration list. Set only on [`EdgeKind::Calls`], only by the
+    /// semantic pass, and only when the target really has more than one call
+    /// signature - so it is absent on every edge the structural pass emits,
+    /// and omitted rather than sent as `null` for exactly the reason
+    /// [`WireNode::declarations`] is.
+    ///
+    /// It is part of the edge's identity (`edgeIdFor` in
+    /// plugins/js-ts/src/extract.ts), which is what lets one caller that calls
+    /// two overloads of the same function record both bindings instead of one
+    /// overwriting the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_declaration: Option<u32>,
 }
 
 /// JSON-RPC request id - either form is legal per the JSON-RPC 2.0 spec.
@@ -212,6 +260,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -229,6 +278,7 @@ mod tests {
             kind: EdgeKind::SupertypeOf,
             source: EdgeSource::TsCompiler,
             resolved: true,
+            to_declaration: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();
@@ -236,6 +286,90 @@ mod tests {
         assert!(json.contains("\"ts-compiler\""));
         let round_tripped: WireEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(edge, round_tripped);
+    }
+
+    /// Exactly what `toWireNode` (plugins/js-ts/src/bulkIndex.ts) emits for an
+    /// overloaded `parse` - copied from that plugin's own output rather than
+    /// hand-written, so this asserts against the real wire bytes and not
+    /// against what serde would have produced from the Rust struct.
+    const OVERLOADED_NODE_LINE: &str = r#"{"id":"5ff9a3373000bb2f00e38ba616f6cd46","kind":"Function","name":"parse","qualifiedName":"parse","filePath":"src/overloads.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"parse(input: string): string[]","exported":true,"docComment":"Parses a value.","language":"typescript","nativeKind":"function","hasSyntaxErrors":false,"declarations":[{"ordinal":0,"startLine":1,"startCol":7,"endLine":1,"endCol":47,"hasBody":false,"signature":"parse(input: string): string[]"},{"ordinal":1,"startLine":2,"startCol":7,"endLine":2,"endCol":61,"hasBody":false,"signature":"parse(input: number, radix?: number): number"},{"ordinal":2,"startLine":3,"startCol":7,"endLine":5,"endCol":1,"hasBody":true,"signature":"parse(input: string | number, radix?: number): any"}]}"#;
+
+    #[test]
+    fn a_declaration_list_deserializes_from_what_the_plugin_actually_sends() {
+        let node: WireNode = serde_json::from_str(OVERLOADED_NODE_LINE).unwrap();
+
+        let declarations = node.declarations.as_ref().expect("an overloaded symbol carries its list");
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(declarations[0].ordinal, 0);
+        assert_eq!(declarations[0].start_line, 1);
+        assert_eq!(declarations[0].end_col, 47);
+        assert_eq!(declarations[0].signature.as_deref(), Some("parse(input: string): string[]"));
+        assert!(!declarations[0].has_body);
+        assert!(declarations[2].has_body, "the implementation is the one with a body");
+
+        // Re-serializing has to produce the same list back, since this is the
+        // shape core hands to storage.
+        let round_tripped: WireNode = serde_json::from_str(&serde_json::to_string(&node).unwrap()).unwrap();
+        assert_eq!(node, round_tripped);
+    }
+
+    /// The design's central promise: a node with one declaration is
+    /// byte-identical to what it was before declarations existed. Serde's half
+    /// of it - the plugin's half is asserted in its own suite.
+    #[test]
+    fn an_ordinary_node_carries_no_declarations_key_at_all() {
+        let node = WireNode {
+            id: "n1".to_string(),
+            kind: NodeKind::Function,
+            name: "foo".to_string(),
+            qualified_name: "foo".to_string(),
+            file_path: "src/lib.ts".to_string(),
+            range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
+            signature: None,
+            exported: true,
+            doc_comment: None,
+            language: "typescript".to_string(),
+            native_kind: None,
+            has_syntax_errors: false,
+            declarations: None,
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(!json.contains("declarations"), "{json}");
+
+        // And a line from a plugin that never heard of the field is still a
+        // valid node, rather than a parse failure.
+        let without: WireNode = serde_json::from_str(
+            r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"foo","filePath":"src/lib.ts","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"exported":true,"language":"typescript"}"#,
+        )
+        .unwrap();
+        assert_eq!(without.declarations, None);
+    }
+
+    #[test]
+    fn an_edge_binding_an_overload_round_trips_and_is_omitted_when_absent() {
+        let unbound = WireEdge {
+            id: "e1".to_string(),
+            from_id: "n1".to_string(),
+            to_id: "n2".to_string(),
+            kind: EdgeKind::Calls,
+            source: EdgeSource::TreeSitter,
+            resolved: false,
+            to_declaration: None,
+        };
+        assert!(!serde_json::to_string(&unbound).unwrap().contains("toDeclaration"));
+
+        let bound = WireEdge { to_declaration: Some(2), ..unbound.clone() };
+        let json = serde_json::to_string(&bound).unwrap();
+        assert!(json.contains("\"toDeclaration\":2"), "{json}");
+        assert_eq!(serde_json::from_str::<WireEdge>(&json).unwrap(), bound);
+
+        // Ordinal 0 is a binding like any other, and must survive the trip as
+        // itself rather than collapsing into "none".
+        let first = WireEdge { to_declaration: Some(0), ..unbound };
+        let json = serde_json::to_string(&first).unwrap();
+        assert!(json.contains("\"toDeclaration\":0"), "{json}");
+        assert_eq!(serde_json::from_str::<WireEdge>(&json).unwrap().to_declaration, Some(0));
     }
 
     #[test]
@@ -323,6 +457,7 @@ mod tests {
                 language: "rust".to_string(),
                 native_kind: None,
                 has_syntax_errors: false,
+                declarations: None,
             }],
             delete_node_ids: vec!["n2".to_string()],
             upsert_edges: vec![WireEdge {
@@ -332,6 +467,7 @@ mod tests {
                 kind: EdgeKind::Calls,
                 source: EdgeSource::TreeSitter,
                 resolved: false,
+                to_declaration: None,
             }],
             delete_edge_ids: vec!["e2".to_string()],
         };

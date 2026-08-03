@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  edgeIdFor,
   extractFile,
   isSupportedFile,
   nodeIdFor,
@@ -297,6 +298,56 @@ test("an overloaded function reports the first call signature, not the implement
   assert.equal(parse.exported, true);
   assert.equal(parse.nativeKind, "function");
   assert.equal(parse.id, nodeIdFor("src/parse.ts", "Function", "parse", "function"));
+});
+
+/**
+ * What `edgeIdFor("from-node", "CALLS", "to-node")` hashed to before
+ * `toDeclaration` existed, pinned rather than recomputed: "an edge that binds
+ * no particular declaration keeps exactly the id it always had" is a promise
+ * about a *previous* release, and only a literal can hold the current code to
+ * it. (Nothing breaks visibly if it slips - a schema bump rebuilds every
+ * index - but every stored id would silently be a different one, and the
+ * semantic pass upgrades edges by re-sending them under the id the structural
+ * pass gave them.)
+ */
+const UNBOUND_CALL_EDGE_ID = "271ad00f31b2f4a8d240120d5e5104a2";
+
+test("an edge that binds no declaration keeps the id it has always had", () => {
+  assert.equal(edgeIdFor("from-node", "CALLS", "to-node"), UNBOUND_CALL_EDGE_ID);
+  assert.equal(
+    edgeIdFor("from-node", "CALLS", "to-node", undefined),
+    UNBOUND_CALL_EDGE_ID,
+    "passing the new argument as absent must be the same thing as not passing it",
+  );
+});
+
+test("a call bound to one overload gets an id of its own", () => {
+  const zero = edgeIdFor("from-node", "CALLS", "to-node", 0);
+  const two = edgeIdFor("from-node", "CALLS", "to-node", 2);
+
+  // Ordinal 0 is a real binding, not a stand-in for "none": a caller that
+  // binds the first overload and one that binds no particular declaration are
+  // different facts and must not share a row.
+  assert.notEqual(zero, UNBOUND_CALL_EDGE_ID);
+  assert.notEqual(zero, two);
+  // The point of putting it in the id: one caller calling two overloads of the
+  // same function stores both bindings instead of one overwriting the other.
+  assert.equal(new Set([UNBOUND_CALL_EDGE_ID, zero, two]).size, 3);
+});
+
+test("the structural pass never binds a declaration on its own", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+
+  // Which overload a call site resolves to is a checker's answer; tree-sitter
+  // matches names. Every edge here must therefore leave `toDeclaration` alone
+  // - including its id, or a later upgrade could not find the edge to upgrade.
+  assert.deepEqual(
+    result.edges.filter((edge) => edge.toDeclaration !== undefined),
+    [],
+  );
+  for (const edge of result.edges) {
+    assert.equal(edge.id, edgeIdFor(edge.fromId, edge.kind, edge.toId));
+  }
 });
 
 test("a symbol declared once carries no declaration list at all", () => {

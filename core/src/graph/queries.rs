@@ -31,6 +31,12 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         language: row.get("language")?,
         native_kind: row.get("nativeKind")?,
         has_syntax_errors: row.get("hasSyntaxErrors")?,
+        // Deliberately not joined: almost no node has declaration rows, and
+        // every reader of this function today asks about the symbol as a
+        // whole, which the flat fields above already answer. See the field's
+        // own doc comment for why a record read this way must not be written
+        // straight back.
+        declarations: Vec::new(),
     })
 }
 
@@ -42,6 +48,7 @@ fn map_edge_row(row: &Row) -> rusqlite::Result<EdgeRecord> {
         kind: row.get("kind")?,
         source: row.get("source")?,
         resolved: row.get("resolved")?,
+        to_declaration: row.get("toDeclaration")?,
     })
 }
 
