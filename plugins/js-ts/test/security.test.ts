@@ -133,16 +133,82 @@ const FORBIDDEN_SOURCE_PATTERNS: RegExp[] = [
   /from\s+["'](?:node:)?(?:http|https|net|dgram|dns|tls)["']/,
 ];
 
+/**
+ * `child_process` is on the forbidden list as a shell-out proxy for network
+ * access, and exactly one module is allowed to break that: semantic.ts spawns
+ * `tsserver`, which is the whole point of the subprocess decision recorded in
+ * docs/architecture/g-mesh-v1.md ("TS semantic layer"). The exemption is
+ * narrow by design - it covers only that one pattern in only that one file,
+ * and the two tests below pin *what* it is allowed to spawn - so a second
+ * module growing a subprocess, or this one growing a `fetch`, still fails.
+ */
+const SUBPROCESS_EXEMPT: ReadonlyMap<string, RegExp> = new Map([
+  ["semantic.ts", /\bchild_process\b/],
+]);
+
 test("no source file imports or invokes a networking API", async () => {
   const entries = await fs.readdir(SRC_DIR);
   const tsFiles = entries.filter((f) => f.endsWith(".ts"));
   assert.ok(tsFiles.length > 0, "sanity: expected to find .ts files under src/");
   for (const file of tsFiles) {
     const contents = await fs.readFile(path.join(SRC_DIR, file), "utf8");
+    const exempt = SUBPROCESS_EXEMPT.get(file);
     for (const pattern of FORBIDDEN_SOURCE_PATTERNS) {
+      if (exempt !== undefined && exempt.source === pattern.source) continue;
       assert.ok(!pattern.test(contents), `src/${file} matches forbidden network pattern ${pattern}`);
     }
   }
+});
+
+test("semantic.ts spawns only a tsserver, never a shell", async () => {
+  const contents = await fs.readFile(path.join(SRC_DIR, "semantic.ts"), "utf8");
+  // `exec`/`execSync`/`spawnSync` with a shell string is the dangerous shape;
+  // `spawn(process.execPath, [...])` with an argv array is not.
+  for (const forbidden of [/\bexecSync\s*\(/, /\bexec\s*\(/, /\bspawnSync\s*\(/, /\bshell\s*:/]) {
+    assert.ok(!forbidden.test(contents), `semantic.ts must not use ${forbidden}`);
+  }
+  assert.ok(/spawn\(\s*process\.execPath/.test(contents), "the only spawn must be of Node itself");
+});
+
+/**
+ * Comments stripped, so a flag *named* in a doc comment explaining why it is
+ * forbidden does not read as the flag being used. Deliberately naive - it
+ * would also cut a `//` inside a string literal - which is why the caller
+ * asserts a known code landmark survived.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+test("tsserver is never spawned with plugin loading or typings acquisition enabled", async () => {
+  const raw = await fs.readFile(path.join(SRC_DIR, "semantic.ts"), "utf8");
+  const contents = stripComments(raw);
+  assert.ok(
+    /const DEFAULT_ARGS = \[/.test(contents),
+    "sanity: comment stripping must not have eaten the spawn arguments",
+  );
+
+  // Measured, not assumed (see the architecture note): with
+  // `--allowLocalPluginLoads`, tsserver *does* require() a malicious
+  // `compilerOptions.plugins` entry out of the project's own node_modules -
+  // the exact code-execution vector mitigation (1) above exists to close.
+  // Without the flag it does not, and still answers semantics normally. That
+  // default is load-bearing, so pin it.
+  assert.ok(
+    !/allowLocalPluginLoads/.test(contents),
+    "--allowLocalPluginLoads re-opens the malicious-tsconfig-plugin vector",
+  );
+  assert.ok(
+    !/globalPlugins|pluginProbeLocations/.test(contents),
+    "plugin probe locations would let tsserver load extension code g-mesh does not need",
+  );
+  // Automatic typings acquisition is the one genuinely networked thing in the
+  // `typescript` package: it npm-installs `@types/*` for the project. g-mesh
+  // indexes what is on disk, so it must always be off.
+  assert.ok(
+    /--disableAutomaticTypingAcquisition/.test(contents),
+    "ATA is the typescript package's network path and must be disabled",
+  );
 });
 
 test("package.json declares no networking-capable runtime dependency", async () => {
@@ -152,7 +218,18 @@ test("package.json declares no networking-capable runtime dependency", async () 
   // runtime dependency must be a deliberate, reviewed edit to this set -
   // never a silent side effect of `npm install` introducing something with
   // network capability the static scan above doesn't know to look for.
-  const ALLOWED_RUNTIME_DEPS = new Set(["ignore", "tree-sitter", "tree-sitter-javascript", "tree-sitter-typescript"]);
+  // `typescript` is a runtime dependency because `tsserver` ships inside it
+  // (see the "TS semantic layer" note in docs/architecture/g-mesh-v1.md - it
+  // would be a runtime dependency under the in-process shape too). Its one
+  // network path is automatic typings acquisition, which the test above pins
+  // as always disabled.
+  const ALLOWED_RUNTIME_DEPS = new Set([
+    "ignore",
+    "tree-sitter",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "typescript",
+  ]);
   for (const dep of Object.keys(pkg.dependencies ?? {})) {
     assert.ok(
       ALLOWED_RUNTIME_DEPS.has(dep),
