@@ -235,6 +235,178 @@ test("a getter and a setter sharing a name stay distinct nodes", () => {
   assert.equal(node(result, "Function", "Box.of").nativeKind, "method");
 });
 
+// --- overloads and merged declarations -----------------------------------
+// One symbol written as several declarations: TypeScript treats an overload
+// set and a merge as the same fact, and so does the node id - what the node
+// gains is the group's contents. See "Overloads and merged declarations" in
+// docs/architecture/g-mesh-v1.md.
+
+const OVERLOADED_PARSE_TS = `/** Turns text into whatever it names. */
+export function parse(input: string): string[];
+export function parse(input: number, radix?: number): number;
+export function parse(input: string | number, radix?: number): any {
+  return input;
+}
+`;
+
+test("two overload signatures and their implementation are one node with a declaration each", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+
+  // `node` fails on a second match, so this already asserts they did not split.
+  const parse = node(result, "Function", "parse");
+  const declarations = parse.declarations ?? [];
+
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.signature),
+    [
+      "parse(input: string): string[]",
+      "parse(input: number, radix?: number): number",
+      "parse(input: string | number, radix?: number): any",
+    ],
+    "every signature is kept, not just the first one seen",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.ordinal),
+    [0, 1, 2],
+    "ordinals number the declarations in source order",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.hasBody),
+    [false, false, true],
+    "only the implementation has a body",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.startLine),
+    [1, 2, 3],
+    "each declaration keeps its own range",
+  );
+});
+
+test("an overloaded function reports the first call signature, not the implementation's", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+  const parse = node(result, "Function", "parse");
+
+  // `parse(input: string | number, ...)` is the signature TypeScript never
+  // shows a caller, and it is what this node used to report.
+  assert.equal(parse.signature, "parse(input: string): string[]");
+  // The range stays the implementation's, which is where `navto` points.
+  assert.equal(parse.startLine, 3);
+  assert.equal(parse.endLine, 5);
+  // The doc comment sits on the first overload, not on the implementation.
+  assert.equal(parse.docComment, "Turns text into whatever it names.");
+  assert.equal(parse.exported, true);
+  assert.equal(parse.nativeKind, "function");
+  assert.equal(parse.id, nodeIdFor("src/parse.ts", "Function", "parse", "function"));
+});
+
+test("a symbol declared once carries no declaration list at all", () => {
+  const result = extractFile("src/single.ts", `export function once(a: string): void {}\n`);
+
+  assert.equal(node(result, "Function", "once").declarations, undefined);
+  assert.deepEqual(
+    result.nodes.filter((n) => n.declarations !== undefined),
+    [],
+    "an ordinary file pays nothing for the overload model",
+  );
+});
+
+test("an overloaded method and its implementation stay one node, as tsserver's outline has it", () => {
+  const result = extractFile(
+    "src/repo.ts",
+    `export class Repo {
+  find(id: string): void;
+  find(id: number): void;
+  find(id: string | number): void {}
+}
+`,
+  );
+
+  const find = node(result, "Function", "Repo#find");
+  assert.equal(find.nativeKind, "method", "a signature-only method is a method like any other");
+  assert.equal(find.id, nodeIdFor("src/repo.ts", "Function", "Repo#find", "method"));
+  assert.deepEqual(
+    (find.declarations ?? []).map((declaration) => declaration.signature),
+    ["find(id: string): void", "find(id: number): void", "find(id: string | number): void"],
+  );
+});
+
+test("an interface method is a method too, so it cannot collide with an implementing class's", () => {
+  const result = extractFile(
+    "src/shape.ts",
+    `export interface Shape {
+  draw(): void;
+  get size(): number;
+}
+`,
+  );
+
+  assert.equal(node(result, "Function", "Shape#draw").nativeKind, "method");
+  assert.equal(node(result, "Function", "Shape#size").nativeKind, "getter");
+  assert.equal(node(result, "Function", "Shape#draw").declarations, undefined);
+});
+
+test("a merged interface stays one node whose range is its first declaration", () => {
+  const result = extractFile(
+    "src/options.ts",
+    `export interface Options {
+  retries: number;
+}
+
+export interface Options {
+  timeout: number;
+}
+`,
+  );
+
+  const options = node(result, "Type", "Options");
+  assert.deepEqual(
+    (options.declarations ?? []).map((declaration) => [declaration.startLine, declaration.hasBody]),
+    [
+      [0, true],
+      [4, true],
+    ],
+    "a merge is the same fact as an overload set: both declarations are kept",
+  );
+  // No implementation to prefer, so the first declaration keeps the range -
+  // unchanged from before there was a declaration list at all.
+  assert.equal(options.startLine, 0);
+  assert.equal(options.signature, undefined);
+});
+
+test("a namespace merged across statements keeps one node and both statements' members", () => {
+  const result = extractFile(
+    "src/ns.ts",
+    `export namespace Config {
+  export function load(): void {}
+}
+
+export namespace Config {
+  export function save(): void {}
+}
+`,
+  );
+
+  const config = node(result, "Module", "Config");
+  assert.equal((config.declarations ?? []).length, 2);
+  // Members are unioned onto the one node, which is what it already did.
+  assert.ok(hasEdge(result, "DEFINES", "src/ns.ts", "Config.load"));
+  assert.ok(hasEdge(result, "DEFINES", "src/ns.ts", "Config.save"));
+});
+
+test("an overload set with no implementation takes its range from the first signature", () => {
+  const result = extractFile(
+    "src/ambient.ts",
+    `export function widen(value: string): string;
+export function widen(value: number): number;
+`,
+  );
+
+  const widen = node(result, "Function", "widen");
+  assert.equal((widen.declarations ?? []).length, 2);
+  assert.equal(widen.startLine, 0);
+  assert.equal(widen.signature, "widen(value: string): string");
+});
+
 test("flags syntax errors on a partially broken file without dropping what parsed", () => {
   const broken = `export function ok(): void {}
 

@@ -623,8 +623,9 @@ so ids survive edits elsewhere in the file), so all of them land on one node
 and everything but the first is discarded.
 
 Measured on a fixture with every shape of this (Node 20.6.1, TypeScript 5.9.3,
-`plugins/js-ts/src/extract.ts` at release 0.19.0), the damage is worse than
-"the first declaration wins":
+`plugins/js-ts/src/extract.ts` at release 0.19.0), the damage was worse than
+"the first declaration wins" — the first two below are what the extractor did
+before this design landed in it, kept as the measurement the design answers:
 
 - **Top-level overload signatures are dropped entirely.** `tree-sitter`
   parses `export function parse(input: string): string[];` as
@@ -752,18 +753,28 @@ at once, so `find_definition("Model")` returns an ambiguous pair. That is
 pre-existing and deliberate (the two declarations carry genuinely different
 information), and `tsserver`'s own outline lists them as two rows too.
 
-**Implementation follow-ups.** In `extract.ts`: add `function_signature` to the
-declaration switch so top-level overload signatures are seen at all; stop
-`methodNativeKind` returning `method_signature`, so a method's signatures and
-its implementation share one node (`getter`/`setter`/`constructor`/
-`abstract_method` keep splitting, and `navtree` agrees — it labels a
-signature-only interface method `method` as well). Two consequences of
-`nativeKind` being part of the id: the choice must be made when a declaration
-is first seen and can never be "upgraded" once the node exists, and dropping
-`method_signature` changes the id of every interface and overload-signature
-method — a one-time reindex, already paid for by the `schema_version` bump.
-Then the semantic pass fills `toDeclaration` from `definition` at each
-unresolved-or-overloaded call site.
+**Implementation follow-ups.** In `extract.ts`, **done**: `function_signature`
+is in the declaration switch, so a top-level overload signature is seen at all
+and lands on its implementation's node; `methodNativeKind` no longer returns
+`method_signature`, so a method's signatures and its implementation share one
+node (`getter`/`setter`/`constructor`/`abstract_method` keep splitting, and
+`navtree` agrees — it labels a signature-only interface method `method` as
+well). Two consequences of `nativeKind` being part of the id: the choice must
+be made when a declaration is first seen and can never be "upgraded" once the
+node exists, and dropping `method_signature` changed the id of every interface
+and overload-signature method — a one-time reindex, which `indexer_version`
+already forces from the rebuilt plugin's own digest. A node that has more than
+one declaration now carries the ordered list, and its primary range, signature
+and doc comment are filled from the group as described above.
+
+Still open, in this order: the storage half — the `DECLARATIONS` table, the
+`toDeclaration` edge column, `edgeIdFor` hashing it, `schema_version` 4 → 5 —
+which is also what puts `declarations` on the wire (`toWireNode` deliberately
+does not send a field core would drop, and `nodesEqual` deliberately does not
+compare one, which would otherwise churn a byte-identical node out of an edit
+to an overload); and then the semantic pass filling `toDeclaration` from
+`definition` at each unresolved-or-overloaded call site, for which the
+extractor's declaration ranges are the lookup table.
 
 <a id="generics"></a>
 ### Generic types: the written syntax is indexed, instantiation is not

@@ -141,6 +141,34 @@ export function pendingSymbolQualifiedName(targetFilePath: string, importedName:
 }
 
 /**
+ * One declaration of a symbol that has several - an overload signature next
+ * to its implementation, an interface or a namespace written across two
+ * statements. Mirrors the `DECLARATIONS` child table of "Overloads and merged
+ * declarations" in docs/architecture/g-mesh-v1.md: `ordinal` is the position
+ * in source order, and it is the ordinal a `CALLS` edge's `toDeclaration`
+ * names once the semantic pass can say which overload a call site bound
+ * (a separate ticket - nothing here decides that).
+ */
+export interface SymbolDeclaration {
+  /** Position in the owning node's declaration list, source-ordered from 0. */
+  ordinal: number;
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+  /** Absent for declarations that have no signature of their own at all - a merged interface or namespace. */
+  signature?: string;
+  /**
+   * Whether this declaration carries an implementation. It is the whole
+   * difference between an overload signature and the implementation
+   * TypeScript hides from every caller, so it decides which declaration the
+   * node's own range and `signature` are taken from - see
+   * [`Extractor.fillDeclarationLists`].
+   */
+  hasBody: boolean;
+}
+
+/**
  * Mirrors core's `NodeRecord`. Line/column are tree-sitter's native
  * zero-based row/column (same convention as LSP and the TS compiler API);
  * any 1-based presentation happens at the MCP layer.
@@ -161,6 +189,21 @@ export interface ExtractedNode {
   language: string;
   nativeKind?: string;
   hasSyntaxErrors: boolean;
+  /**
+   * Every declaration of this symbol, in source order - present **only** when
+   * there is more than one, so an ordinary symbol carries nothing extra and
+   * costs nothing. The fields above stay primary and describe the symbol as a
+   * whole; this says what it is actually made of.
+   *
+   * Deliberately not part of `toWireNode` (bulkIndex.ts) yet: core has no
+   * `DECLARATIONS` table to put it in, and shipping a field it would drop on
+   * the floor would also make an edit to one overload look like a changed
+   * node to `nodesEqual` (incremental.ts), re-writing a byte-identical wire
+   * node and evicting its embedding for nothing. The consumer this is for is
+   * in-process - the semantic pass, which matches a `tsserver` definition
+   * location against these ranges to learn the ordinal a call site bound.
+   */
+  declarations?: SymbolDeclaration[];
 }
 
 /** Mirrors core's `EdgeRecord`. */
@@ -651,9 +694,45 @@ function isPathArithmeticShape(node: SyntaxNode): boolean {
   );
 }
 
+/** What one declaration contributes to a node - see [`Extractor.addNode`]. */
+interface NodeParams {
+  kind: NodeKind;
+  name: string;
+  qualifiedName: string;
+  /** The syntax node the declaration spans, and the source of its range. */
+  at: SyntaxNode;
+  nativeKind?: string;
+  signature?: string;
+  docComment?: string;
+  exported?: boolean;
+}
+
+/**
+ * A declaration as it was seen, before the node it belongs to is known to
+ * have more than one. `docComment` is kept here rather than on
+ * [`SymbolDeclaration`] because it never reaches the declaration list: it
+ * only decides which declaration's doc the node itself ends up with.
+ */
+interface DeclarationDraft {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+  signature?: string;
+  docComment?: string;
+  hasBody: boolean;
+}
+
 class Extractor {
   private readonly nodes = new Map<string, ExtractedNode>();
   private readonly edges = new Map<string, ExtractedEdge>();
+  /**
+   * Node id -> every declaration written for it, in the order the walk met
+   * them. Kept beside the nodes rather than on them because the overwhelming
+   * majority of symbols have exactly one declaration and must stay exactly as
+   * they are built (see [`Extractor.fillDeclarationLists`]).
+   */
+  private readonly declarationsById = new Map<string, DeclarationDraft[]>();
   /** Declared symbols only - import placeholders must not shadow real names. */
   private readonly byQualifiedName = new Map<string, ExtractedNode>();
   /** Local name -> the imported symbol it stands for, for names this file
@@ -721,6 +800,7 @@ class Extractor {
     };
     this.visitChildren(root, scope);
     this.resolvePending();
+    this.fillDeclarationLists();
 
     return {
       nodes: [...this.nodes.values()],
@@ -732,18 +812,10 @@ class Extractor {
 
   // --- node/edge construction ----------------------------------------
 
-  private addNode(params: {
-    kind: NodeKind;
-    name: string;
-    qualifiedName: string;
-    at: SyntaxNode;
-    nativeKind?: string;
-    signature?: string;
-    docComment?: string;
-    exported?: boolean;
-  }): ExtractedNode {
+  private addNode(params: NodeParams): ExtractedNode {
     const id = nodeIdFor(this.filePath, params.kind, params.qualifiedName, params.nativeKind);
     const existing = this.nodes.get(id);
+    this.recordDeclaration(id, params);
     // Same id twice means the same symbol declared twice - overload
     // signatures, or a namespace/interface merged across statements. Both are
     // one symbol with several declarations, and agreeing on
@@ -754,13 +826,12 @@ class Extractor {
     // function vs namespace). See "Overloads and merged declarations" in
     // docs/architecture/g-mesh-v1.md.
     //
-    // What is missing is not the grouping but the group's *contents*: the
-    // first declaration wins outright, so a function's node reports the
-    // implementation signature TypeScript never shows a caller, and later
-    // overloads are lost. The design calls for an ordered declaration list
-    // here and a `toDeclaration` ordinal on the CALLS edge the semantic pass
-    // writes; building it is a separate ticket, and until then this stays
-    // first-declaration-wins.
+    // The node stays one node, then, and the second declaration adds no fields
+    // to it here: what each declaration says for itself is collected above and
+    // hung off the node as a list once the walk is over
+    // ([`fillDeclarationLists`]), which is also where the node's own primary
+    // fields are settled - they cannot be decided from the first declaration
+    // alone when the implementation is still three statements away.
     if (existing) {
       if (params.exported) existing.exported = true;
       return existing;
@@ -788,17 +859,99 @@ class Extractor {
     return node;
   }
 
+  /**
+   * Files one declaration under the node it belongs to. Placeholders are
+   * skipped: they stand in for something another file declares, and the
+   * several sites that ask for one (every use of an imported name) are uses,
+   * not declarations - counting them as such would hang a declaration list
+   * off an import.
+   */
+  private recordDeclaration(id: string, params: NodeParams): void {
+    if (params.nativeKind !== undefined && PLACEHOLDER_NATIVE_KINDS.has(params.nativeKind)) return;
+
+    const draft: DeclarationDraft = {
+      startLine: params.at.startPosition.row,
+      startCol: params.at.startPosition.column,
+      endLine: params.at.endPosition.row,
+      endCol: params.at.endPosition.column,
+      hasBody: hasBody(params.at),
+    };
+    if (params.signature !== undefined) draft.signature = params.signature;
+    if (params.docComment !== undefined) draft.docComment = params.docComment;
+
+    const drafts = this.declarationsById.get(id);
+    if (drafts === undefined) {
+      this.declarationsById.set(id, [draft]);
+      return;
+    }
+    drafts.push(draft);
+  }
+
+  /**
+   * Hangs the declaration list off every node that turned out to have more
+   * than one declaration, and settles that node's own primary fields the way
+   * TypeScript's own tools do (measured against `tsserver` - see "Overloads
+   * and merged declarations" in docs/architecture/g-mesh-v1.md).
+   *
+   * A node with a single declaration is not touched at all, which is the
+   * point: it is what keeps almost every node in a real file exactly what it
+   * was, list-free and unchanged.
+   */
+  private fillDeclarationLists(): void {
+    for (const [id, drafts] of this.declarationsById) {
+      const node = this.nodes.get(id);
+      if (node === undefined || drafts.length < 2) continue;
+
+      // The walk meets top-level statements and class/interface members in
+      // source order already; sorting says so rather than relying on it,
+      // because `ordinal` is what a call site's binding will be recorded as.
+      const ordered = [...drafts].sort(
+        (a, b) => a.startLine - b.startLine || a.startCol - b.startCol,
+      );
+      node.declarations = ordered.map((draft, ordinal) => {
+        const declaration: SymbolDeclaration = {
+          ordinal,
+          startLine: draft.startLine,
+          startCol: draft.startCol,
+          endLine: draft.endLine,
+          endCol: draft.endCol,
+          hasBody: draft.hasBody,
+        };
+        if (draft.signature !== undefined) declaration.signature = draft.signature;
+        return declaration;
+      });
+
+      // Range: the implementation, which is where `navto` points and the only
+      // declaration whose span covers the code a reader wants; the first
+      // declaration when there is no implementation (a merge, an ambient
+      // overload set).
+      const primary = ordered.find((draft) => draft.hasBody) ?? ordered[0];
+      node.startLine = primary.startLine;
+      node.startCol = primary.startCol;
+      node.endLine = primary.endLine;
+      node.endCol = primary.endCol;
+
+      // Signature: the first *call* signature, never the implementation's -
+      // the implementation's is the one TypeScript deliberately never shows a
+      // caller, and it was what this node used to report. Falls back to the
+      // first declaration for a group that has no signature-only member,
+      // which is every merge and any redeclaration in plain JS.
+      const callSignature = ordered.find(
+        (draft) => !draft.hasBody && draft.signature !== undefined,
+      );
+      const signature = (callSignature ?? ordered[0]).signature;
+      if (signature !== undefined) node.signature = signature;
+
+      // Doc comment: the first declaration that carries one. On an overload
+      // set that is normally an overload rather than the implementation,
+      // which is exactly where TypeScript itself reads it from.
+      const documented = ordered.find((draft) => draft.docComment !== undefined);
+      if (documented !== undefined) node.docComment = documented.docComment;
+    }
+  }
+
   /** Adds a symbol declared in this file: indexed for name resolution, plus DEFINES/EXPORTS edges. */
-  private declareSymbol(params: {
-    kind: NodeKind;
-    name: string;
-    qualifiedName: string;
-    at: SyntaxNode;
-    nativeKind?: string;
-    signature?: string;
-    docComment?: string;
-    exported?: boolean;
-  }): ExtractedNode {
+  private declareSymbol(params: NodeParams): ExtractedNode {
     const node = this.addNode(params);
 
     if (!this.byQualifiedName.has(node.qualifiedName)) {
@@ -870,6 +1023,7 @@ class Extractor {
       case "enum_declaration":
       case "function_declaration":
       case "generator_function_declaration":
+      case "function_signature":
       case "lexical_declaration":
       case "variable_declaration":
       case "internal_module":
@@ -930,15 +1084,20 @@ class Extractor {
         this.handleMemberExpression(node, scope);
         return;
       // Anonymous forms carrying type parameters of their own - `type Map =
-      // <T>(x: T) => T`, an object type's call/construct signature, an ambient
-      // `declare function f<T>()`. No handler claims them, so this is the only
-      // place their `<T, ...>` can be brought into scope; the children are
-      // walked exactly as the default branch walks them.
+      // <T>(x: T) => T`, an object type's call/construct signature. No
+      // handler claims them, so this is the only place their `<T, ...>` can
+      // be brought into scope; the children are walked exactly as the
+      // default branch walks them. `function_signature` (an ambient
+      // `declare function f<T>()`, or a top-level overload signature) is not
+      // one of these: it is claimed by the `visitDeclaration` case above,
+      // whose `handleFunctionDeclaration` path already threads type
+      // parameters through `visitFunctionParts` - a second case here would be
+      // unreachable dead code, since a `switch` only ever runs the first
+      // matching label.
       case "function_type":
       case "constructor_type":
       case "call_signature":
       case "construct_signature":
-      case "function_signature":
         this.visitChildren(node, typeParameterScope(node, scope));
         return;
       case "identifier":
@@ -980,6 +1139,12 @@ class Extractor {
         return;
       case "function_declaration":
       case "generator_function_declaration":
+      // A body-less `function f(x: string): void;` - a top-level overload
+      // signature, or an ambient declaration. It declares the same symbol its
+      // implementation does and lands on the same node; without this case it
+      // fell through to a plain child walk and was dropped outright, leaving
+      // the node to be built from the implementation alone.
+      case "function_signature":
         this.handleFunctionDeclaration(node, scope, exported, outer);
         return;
       case "lexical_declaration":
@@ -2693,9 +2858,29 @@ function heritageNames(clause: SyntaxNode): string[] {
   return names;
 }
 
+/**
+ * Whether a declaration carries an implementation rather than only a
+ * signature. A `const`/class-field declarator holds its function one level
+ * down, in `value`, so the body is looked for there too - the declarator
+ * itself never has one.
+ */
+function hasBody(node: SyntaxNode): boolean {
+  if (node.childForFieldName("body") !== null) return true;
+  const value = node.childForFieldName("value");
+  return value !== null && value.childForFieldName("body") !== null;
+}
+
+/**
+ * A signature-only method is a `method`, exactly as `tsserver`'s own outline
+ * labels it: `nativeKind` is part of the node id, so returning anything else
+ * would split an overloaded method's signatures away from its implementation
+ * into two nodes for one symbol (and give every interface method a kind of
+ * its own). `getter`/`setter`/`constructor`/`abstract_method` do keep their
+ * own kinds - those are genuinely different symbols, and `navtree` lists them
+ * separately too.
+ */
 function methodNativeKind(node: SyntaxNode, name: string, isStatic: boolean): string {
   if (node.type === "abstract_method_signature") return "abstract_method";
-  if (node.type === "method_signature") return "method_signature";
   if (node.children.some((child) => child.type === "get")) return "getter";
   if (node.children.some((child) => child.type === "set")) return "setter";
   if (!isStatic && name === "constructor") return "constructor";
