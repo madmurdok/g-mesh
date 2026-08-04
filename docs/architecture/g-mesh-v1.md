@@ -1627,3 +1627,43 @@ to expose composable primitive tools plus byte-budget pagination
 (`pagination::longest_prefix_fitting`) and let the calling agent orchestrate,
 rather than a tiered-budget or server-side-routed API. Noted here so that
 choice reads as considered, not overlooked.
+
+### Ideas surfaced while comparing Serena (external tool)
+
+g-mesh-bench added [Serena](https://github.com/oraios/serena) (an LSP-wrapper
+coding-agent MCP server, `oraios/serena`) as a second external comparison arm
+alongside kungfu. Curating its tool allowlist (`customArms.serena` in
+g-mesh-bench's `g-mesh-bench.config.json`) meant probing its full surface live
+(`serena tools list -a`, 52 tools) and mapping each to a g-mesh capability, the
+same exercise kungfu's `KUNGFU_TOOLS`/`KUNGFU_DENIED_TOOLS` went through. One
+thing surfaced there is worth recording here:
+
+- **`get_diagnostics_for_file`/`get_diagnostics_for_symbol` have no g-mesh
+  analog at all.** Everything else in Serena's LSP-navigation family maps
+  cleanly onto an existing g-mesh tool — `find_symbol`/`find_declaration` onto
+  `find_definition`, `find_referencing_symbols` onto `find_references`,
+  `find_implementations` onto `find_implementations`,
+  `get_symbols_overview` onto `get_file_outline` — so diagnostics is the one
+  read-only, structurally-adjacent capability g-mesh genuinely lacks. It is
+  also not a new integration problem: the semantic layer (0.19.0,
+  `plugins/js-ts/src/semantic.ts`'s `SemanticProject`) already keeps a live
+  `tsserver` child open per project for `definition` queries, and tsserver
+  natively answers a diagnostics request over that same connection — an
+  `get_diagnostics`-shaped MCP tool would be new surface area (a command, a
+  result shape, pagination) but not a new *connection*. Not implemented, not
+  scoped further here — recorded as a candidate for a future release.
+
+The rest of Serena's 52 tools were looked at and not carried forward, for
+reasons distinct enough to note rather than lump together: ~13 `jet_brains_*`
+tools are a second backend for the *same* 5 LSP tools above (a duplication
+question, not a new capability); ~10 are symbolic code editing
+(insert/replace/rename/delete by symbol) and ~1 is shell execution, both
+outside g-mesh's deliberately read-only, structural-index-only scope; ~6 are a
+project-memory system (`write_memory`/`read_memory`/…) — a genuinely different
+kind of feature (persistent agent notes, not code-graph retrieval) and a much
+larger scope change than this section's diagnostics idea; ~5 are generic file
+I/O (`read_file`/`list_dir`/`find_file`) already covered by Read/Grep/Glob in
+every g-mesh-bench arm; the remainder is project/session lifecycle management
+(`activate_project`, `remove_project`, …) that g-mesh's zero-config
+per-directory auto-bootstrap has no equivalent need for. Noted here so that
+scope reads as considered, not overlooked.
