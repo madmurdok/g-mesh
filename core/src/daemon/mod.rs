@@ -355,6 +355,28 @@ pub fn run(root: &Path) -> Result<()> {
                 summary.skipped_lines
             );
         }
+
+        // The walk's edges are in and linked, so the graph is complete enough
+        // to be worth asking the type checker about - and the daemon is
+        // already answering off it (`mark_ready` above), which is why this
+        // sits *after* that call rather than in front of it: the semantic
+        // layer's job is to make existing answers better, never to delay the
+        // first one. An empty file list is what "the whole project" looks
+        // like on the wire (see `ControlMessage::SemanticPass`); no single
+        // file changed here, the project simply became resolvable at once.
+        //
+        // Best-effort, like every other semantic pass: a project whose
+        // checker cannot start is a project served by its structural graph,
+        // which is the state it was in a moment ago anyway. Failing daemon
+        // startup over it would throw away a perfectly good index.
+        match plugin.semantic_pass(&conn, Vec::new()) {
+            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "g-mesh daemon: the semantic pass over the freshly built index failed ({err:#}) - \
+                 its edges keep whatever the structural pass resolved"
+            ),
+        }
     }
 
     let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;

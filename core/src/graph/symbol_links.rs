@@ -62,6 +62,44 @@
 //!    under a declared name (`export default class Foo {}` is a node called
 //!    `Foo`), which only a semantic layer can tie together.
 //!
+//! "Unresolved" is not always the last word on these. The JS/TS plugin's
+//! semantic pass re-asks the ones whose target file does not declare the name
+//! of the compiler itself and re-sends the edge with `source: "ts-compiler"`
+//! when it gets a single answer (`plugins/js-ts/src/semanticPass.ts`). Both of
+//! the last two bullets are that shape:
+//!
+//!  - two `export *` branches offering one name are ambiguous *here*, where
+//!    all a name-matching walk can see is two equally good candidates, and
+//!    settled in the language, which hands a consumer the first branch to
+//!    offer it;
+//!  - `default` is a name no file ever declares, so the walk above has nothing
+//!    to match however far it follows the chain - while `definition` at the
+//!    importer's own binding lands straight on `Foo`, whatever that importer
+//!    called it locally (the local name never reaches this index at all).
+//!
+//! That upgrade arrives as an ordinary diff through [`link_diff`]'s own caller
+//! and needs nothing from this pass but that it left the edge alone.
+//!
+//! ## Placeholders the semantic pass sends
+//!
+//! Not every placeholder comes from the name-matching layer. `import * as ns
+//! from "./mod"` followed by `ns.someExport()` is the one shape that layer
+//! cannot produce one for at all: it never sees the bare name `someExport` at
+//! the use site, only the receiver and a property access, so it deliberately
+//! emits nothing (`recordImportBindings` in extract.ts). The JS/TS plugin's
+//! semantic pass fills that in - it asks `tsserver` where the member is
+//! declared and sends a placeholder addressed at *that* answer, with the usage
+//! edge marked `source: "ts-compiler"`.
+//!
+//! Nothing here treats one differently, and nothing here needed to change for
+//! it. The address is the entire contract; who worked it out is the plugin's
+//! business, and `source` says so untouched - repointing settles what an edge
+//! points at, never who answered it. A checker's address is simply a better
+//! one: it has already followed the alias chain, so it names the file that
+//! really declares the symbol even when an alias renamed it on the way. Where
+//! it stops at a re-export statement instead, that is an ordinary barrel
+//! address and the walk above finishes the job.
+//!
 //! ## Why the placeholder is kept
 //!
 //! Unlike `graph::imports`, a linked-away placeholder is *not* deleted, even
@@ -654,12 +692,21 @@ mod tests {
     }
 
     fn usage_edge(from: &str, kind: &str, placeholder: &NodeRecord) -> EdgeRecord {
+        usage_edge_from(from, kind, placeholder, "tree-sitter")
+    }
+
+    fn usage_edge_from(
+        from: &str,
+        kind: &str,
+        placeholder: &NodeRecord,
+        source: &str,
+    ) -> EdgeRecord {
         EdgeRecord::new(
             format!("edge:{from}:{kind}:{}", placeholder.id),
             from,
             placeholder.id.clone(),
             kind,
-            "tree-sitter",
+            source,
             false,
         )
     }
@@ -686,6 +733,13 @@ mod tests {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap()
+    }
+
+    /// Which layer last answered for an edge - the other half of what a
+    /// semantic upgrade changes about a row.
+    fn edge_source(conn: &Connection, edge_id: &str) -> String {
+        conn.query_row("SELECT source FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0))
+            .unwrap()
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
@@ -1144,9 +1198,15 @@ mod tests {
         assert_eq!(edge_target(&conn, &edge).0, "Function:index.ts:mutate");
     }
 
-    /// Two `export *` branches offering the same name: the language calls that
-    /// an error, and this pass calls it ambiguous - a missing edge beats a
-    /// wrong one, exactly as for a name one file exports twice.
+    /// Two `export *` branches offering the same name: this pass calls it
+    /// ambiguous - a missing edge beats a wrong one, exactly as for a name one
+    /// file exports twice - and the semantic layer, which has the compiler's
+    /// own module resolution, settles it afterwards.
+    ///
+    /// The two halves are asserted in order on purpose. The first is the
+    /// contract of the fast layer, which has to keep behaving exactly as it
+    /// did: whatever the checker later says, an index that has only been
+    /// through the structural pass must not claim to know which branch won.
     #[test]
     fn two_reexport_branches_offering_one_name_leave_the_edge_unresolved() {
         let mut conn = setup();
@@ -1168,6 +1228,38 @@ mod tests {
 
         assert_eq!(link_all(&mut conn).unwrap(), LinkSummary::default());
         assert!(!edge_target(&conn, &edge).1);
+        assert_eq!(edge_source(&conn, &edge), "tree-sitter");
+
+        // What the semantic pass answers, in the shape it answers it: the edge
+        // re-sent under its own id (`plugins/js-ts/src/semanticPass.ts`), which
+        // is why this needed no storage path of its own - `apply_diff`'s
+        // ON CONFLICT rewrites the row in place.
+        //
+        // `a.ts` and not `b.ts` because that is what TypeScript's own module
+        // resolution hands a consumer, measured rather than assumed (tsc /
+        // tsserver 5.9.3 on exactly this fixture): `tsc --noEmit` reports the
+        // TS2308 ambiguity against the *second* `export *`, a barrel-level
+        // diagnostic, while `definition` at the importer's `mutate` returns
+        // exactly one location - the first branch's - and swapping the two
+        // statements swaps the answer. See semanticPass.ts's module comment.
+        let upgrade = Diff {
+            upsert_edges: vec![EdgeRecord::new(
+                edge.clone(),
+                "Function:caller.ts:run",
+                "Function:a.ts:mutate",
+                "CALLS",
+                "ts-compiler",
+                true,
+            )],
+            ..Default::default()
+        };
+        apply_diff(&mut conn, &upgrade).unwrap();
+
+        // Nothing left for this pass to link: the edge no longer hangs on the
+        // placeholder, so the two layers cannot fight over it.
+        assert_eq!(link_diff(&mut conn, &upgrade).unwrap(), LinkSummary::default());
+        assert_eq!(edge_target(&conn, &edge), ("Function:a.ts:mutate".to_string(), true));
+        assert_eq!(edge_source(&conn, &edge), "ts-compiler");
     }
 
     /// `export * from "./x"` republishes every *named* export of `./x` and
@@ -1374,6 +1466,85 @@ mod tests {
 
         assert_eq!(link_all(&mut conn).unwrap(), LinkSummary::default());
         assert_eq!(edge_target(&conn, "e_imports"), ("mod:a.ts:b.ts".to_string(), false));
+    }
+
+    // --- placeholders the semantic pass sends ------------------------------
+
+    /// `import * as ns from "./mod"` then `ns.someExport()`. The structural
+    /// pass emits nothing at all for that site - it never sees the bare name
+    /// `someExport`, only a property access - so the placeholder and its edge
+    /// arrive from the semantic pass instead, addressed at the declaration
+    /// `tsserver` bound. Nothing here treats them differently: the address is
+    /// the whole contract, and `source` is the plugin's to set.
+    #[test]
+    fn a_namespace_import_usage_from_the_semantic_pass_is_linked_like_any_other() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    symbol("app.ts", "run", "Function", true),
+                    symbol("mod.ts", "someExport", "Function", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let placeholder = placeholder_node("app.ts", "mod.ts", "someExport");
+        let edge = usage_edge_from("Function:app.ts:run", "CALLS", &placeholder, "ts-compiler");
+        let edge_id = edge.id.clone();
+        let diff = Diff {
+            upsert_nodes: vec![placeholder],
+            upsert_edges: vec![edge],
+            ..Default::default()
+        };
+        apply_diff(&mut conn, &diff).unwrap();
+
+        assert_eq!(link_diff(&mut conn, &diff).unwrap(), LinkSummary { linked_edges: 1 });
+        assert_eq!(
+            edge_target(&conn, &edge_id),
+            ("Function:mod.ts:someExport".to_string(), true),
+            "the call must land on the real declaration, and say so"
+        );
+        // Repointing settles *what* the edge points at; it never overwrites who
+        // worked it out. An edge a checker answered must keep saying so.
+        assert_eq!(edge_source(&conn, &edge_id), "ts-compiler");
+    }
+
+    /// The same usage where the module `ns` names is a barrel: the semantic
+    /// pass addresses whatever declaration site the checker reported, so a
+    /// re-export statement is a legitimate address and the chain walk finishes
+    /// from there exactly as it does for a named import.
+    #[test]
+    fn a_semantic_placeholder_addressed_at_a_barrel_is_followed_to_the_declaration() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    symbol("app.ts", "run", "Function", true),
+                    reexport_node("barrel.ts", "someExport", "impl.ts", "realName"),
+                    symbol("impl.ts", "realName", "Function", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let placeholder = placeholder_node("app.ts", "barrel.ts", "someExport");
+        let edge = usage_edge_from("Function:app.ts:run", "CALLS", &placeholder, "ts-compiler");
+        let edge_id = edge.id.clone();
+        let diff = Diff {
+            upsert_nodes: vec![placeholder],
+            upsert_edges: vec![edge],
+            ..Default::default()
+        };
+        apply_diff(&mut conn, &diff).unwrap();
+
+        assert_eq!(link_diff(&mut conn, &diff).unwrap(), LinkSummary { linked_edges: 1 });
+        assert_eq!(edge_target(&conn, &edge_id).0, "Function:impl.ts:realName");
+        assert_eq!(edge_source(&conn, &edge_id), "ts-compiler");
     }
 
     #[test]

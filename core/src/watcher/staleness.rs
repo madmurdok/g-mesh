@@ -303,6 +303,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            declarations: None,
         }
     }
 
@@ -311,6 +312,12 @@ mod tests {
     /// Sends `()` down `invoked_tx` right before replying so a test can
     /// assert on the *number* of times the plugin transport was actually
     /// used (the mechanism for proving the fast/skip paths never invoke it).
+    ///
+    /// It then answers the semantic pass `apply_file_change` sends once the
+    /// reparse has settled - a query-time catch-up is a reparse settling
+    /// like any other, so this transport carries both round trips. The
+    /// empty diff keeps these tests about staleness: what a real pass would
+    /// answer is `watcher::apply`'s subject, not this module's.
     fn spawn_stub_plugin(
         mut reader: std::io::PipeReader,
         mut writer: std::io::PipeWriter,
@@ -329,6 +336,24 @@ mod tests {
             }
             invoked_tx.send(()).unwrap();
             write_message(&mut writer, &response).unwrap();
+
+            let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
+            let id = request.id.clone().expect("the semantic pass carries an id");
+            match request.message {
+                ControlMessage::SemanticPass { file_paths } => {
+                    assert_eq!(file_paths, vec![expected_file_path.to_string()])
+                }
+                other => panic!("expected SemanticPass after the reparse, got {other:?}"),
+            }
+            write_message(
+                &mut writer,
+                &FileChangeResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id,
+                    result: FileChangeDiff::default(),
+                },
+            )
+            .unwrap();
         })
     }
 

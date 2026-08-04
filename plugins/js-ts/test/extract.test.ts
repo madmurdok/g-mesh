@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  edgeIdFor,
   extractFile,
   isSupportedFile,
   nodeIdFor,
@@ -14,6 +15,7 @@ import {
   type ExtractOptions,
   type ExtractResult,
   type ExtractedNode,
+  type NamespaceMemberUse,
   type NodeKind,
 } from "../src/extract";
 
@@ -234,6 +236,228 @@ test("a getter and a setter sharing a name stay distinct nodes", () => {
   assert.equal(node(result, "Function", "Box.of").nativeKind, "method");
 });
 
+// --- overloads and merged declarations -----------------------------------
+// One symbol written as several declarations: TypeScript treats an overload
+// set and a merge as the same fact, and so does the node id - what the node
+// gains is the group's contents. See "Overloads and merged declarations" in
+// docs/architecture/g-mesh-v1.md.
+
+const OVERLOADED_PARSE_TS = `/** Turns text into whatever it names. */
+export function parse(input: string): string[];
+export function parse(input: number, radix?: number): number;
+export function parse(input: string | number, radix?: number): any {
+  return input;
+}
+`;
+
+test("two overload signatures and their implementation are one node with a declaration each", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+
+  // `node` fails on a second match, so this already asserts they did not split.
+  const parse = node(result, "Function", "parse");
+  const declarations = parse.declarations ?? [];
+
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.signature),
+    [
+      "parse(input: string): string[]",
+      "parse(input: number, radix?: number): number",
+      "parse(input: string | number, radix?: number): any",
+    ],
+    "every signature is kept, not just the first one seen",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.ordinal),
+    [0, 1, 2],
+    "ordinals number the declarations in source order",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.hasBody),
+    [false, false, true],
+    "only the implementation has a body",
+  );
+  assert.deepEqual(
+    declarations.map((declaration) => declaration.startLine),
+    [1, 2, 3],
+    "each declaration keeps its own range",
+  );
+});
+
+test("an overloaded function reports the first call signature, not the implementation's", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+  const parse = node(result, "Function", "parse");
+
+  // `parse(input: string | number, ...)` is the signature TypeScript never
+  // shows a caller, and it is what this node used to report.
+  assert.equal(parse.signature, "parse(input: string): string[]");
+  // The range stays the implementation's, which is where `navto` points.
+  assert.equal(parse.startLine, 3);
+  assert.equal(parse.endLine, 5);
+  // The doc comment sits on the first overload, not on the implementation.
+  assert.equal(parse.docComment, "Turns text into whatever it names.");
+  assert.equal(parse.exported, true);
+  assert.equal(parse.nativeKind, "function");
+  assert.equal(parse.id, nodeIdFor("src/parse.ts", "Function", "parse", "function"));
+});
+
+/**
+ * What `edgeIdFor("from-node", "CALLS", "to-node")` hashed to before
+ * `toDeclaration` existed, pinned rather than recomputed: "an edge that binds
+ * no particular declaration keeps exactly the id it always had" is a promise
+ * about a *previous* release, and only a literal can hold the current code to
+ * it. (Nothing breaks visibly if it slips - a schema bump rebuilds every
+ * index - but every stored id would silently be a different one, and the
+ * semantic pass upgrades edges by re-sending them under the id the structural
+ * pass gave them.)
+ */
+const UNBOUND_CALL_EDGE_ID = "271ad00f31b2f4a8d240120d5e5104a2";
+
+test("an edge that binds no declaration keeps the id it has always had", () => {
+  assert.equal(edgeIdFor("from-node", "CALLS", "to-node"), UNBOUND_CALL_EDGE_ID);
+  assert.equal(
+    edgeIdFor("from-node", "CALLS", "to-node", undefined),
+    UNBOUND_CALL_EDGE_ID,
+    "passing the new argument as absent must be the same thing as not passing it",
+  );
+});
+
+test("a call bound to one overload gets an id of its own", () => {
+  const zero = edgeIdFor("from-node", "CALLS", "to-node", 0);
+  const two = edgeIdFor("from-node", "CALLS", "to-node", 2);
+
+  // Ordinal 0 is a real binding, not a stand-in for "none": a caller that
+  // binds the first overload and one that binds no particular declaration are
+  // different facts and must not share a row.
+  assert.notEqual(zero, UNBOUND_CALL_EDGE_ID);
+  assert.notEqual(zero, two);
+  // The point of putting it in the id: one caller calling two overloads of the
+  // same function stores both bindings instead of one overwriting the other.
+  assert.equal(new Set([UNBOUND_CALL_EDGE_ID, zero, two]).size, 3);
+});
+
+test("the structural pass never binds a declaration on its own", () => {
+  const result = extractFile("src/parse.ts", OVERLOADED_PARSE_TS);
+
+  // Which overload a call site resolves to is a checker's answer; tree-sitter
+  // matches names. Every edge here must therefore leave `toDeclaration` alone
+  // - including its id, or a later upgrade could not find the edge to upgrade.
+  assert.deepEqual(
+    result.edges.filter((edge) => edge.toDeclaration !== undefined),
+    [],
+  );
+  for (const edge of result.edges) {
+    assert.equal(edge.id, edgeIdFor(edge.fromId, edge.kind, edge.toId));
+  }
+});
+
+test("a symbol declared once carries no declaration list at all", () => {
+  const result = extractFile("src/single.ts", `export function once(a: string): void {}\n`);
+
+  assert.equal(node(result, "Function", "once").declarations, undefined);
+  assert.deepEqual(
+    result.nodes.filter((n) => n.declarations !== undefined),
+    [],
+    "an ordinary file pays nothing for the overload model",
+  );
+});
+
+test("an overloaded method and its implementation stay one node, as tsserver's outline has it", () => {
+  const result = extractFile(
+    "src/repo.ts",
+    `export class Repo {
+  find(id: string): void;
+  find(id: number): void;
+  find(id: string | number): void {}
+}
+`,
+  );
+
+  const find = node(result, "Function", "Repo#find");
+  assert.equal(find.nativeKind, "method", "a signature-only method is a method like any other");
+  assert.equal(find.id, nodeIdFor("src/repo.ts", "Function", "Repo#find", "method"));
+  assert.deepEqual(
+    (find.declarations ?? []).map((declaration) => declaration.signature),
+    ["find(id: string): void", "find(id: number): void", "find(id: string | number): void"],
+  );
+});
+
+test("an interface method is a method too, so it cannot collide with an implementing class's", () => {
+  const result = extractFile(
+    "src/shape.ts",
+    `export interface Shape {
+  draw(): void;
+  get size(): number;
+}
+`,
+  );
+
+  assert.equal(node(result, "Function", "Shape#draw").nativeKind, "method");
+  assert.equal(node(result, "Function", "Shape#size").nativeKind, "getter");
+  assert.equal(node(result, "Function", "Shape#draw").declarations, undefined);
+});
+
+test("a merged interface stays one node whose range is its first declaration", () => {
+  const result = extractFile(
+    "src/options.ts",
+    `export interface Options {
+  retries: number;
+}
+
+export interface Options {
+  timeout: number;
+}
+`,
+  );
+
+  const options = node(result, "Type", "Options");
+  assert.deepEqual(
+    (options.declarations ?? []).map((declaration) => [declaration.startLine, declaration.hasBody]),
+    [
+      [0, true],
+      [4, true],
+    ],
+    "a merge is the same fact as an overload set: both declarations are kept",
+  );
+  // No implementation to prefer, so the first declaration keeps the range -
+  // unchanged from before there was a declaration list at all.
+  assert.equal(options.startLine, 0);
+  assert.equal(options.signature, undefined);
+});
+
+test("a namespace merged across statements keeps one node and both statements' members", () => {
+  const result = extractFile(
+    "src/ns.ts",
+    `export namespace Config {
+  export function load(): void {}
+}
+
+export namespace Config {
+  export function save(): void {}
+}
+`,
+  );
+
+  const config = node(result, "Module", "Config");
+  assert.equal((config.declarations ?? []).length, 2);
+  // Members are unioned onto the one node, which is what it already did.
+  assert.ok(hasEdge(result, "DEFINES", "src/ns.ts", "Config.load"));
+  assert.ok(hasEdge(result, "DEFINES", "src/ns.ts", "Config.save"));
+});
+
+test("an overload set with no implementation takes its range from the first signature", () => {
+  const result = extractFile(
+    "src/ambient.ts",
+    `export function widen(value: string): string;
+export function widen(value: number): number;
+`,
+  );
+
+  const widen = node(result, "Function", "widen");
+  assert.equal((widen.declarations ?? []).length, 2);
+  assert.equal(widen.startLine, 0);
+  assert.equal(widen.signature, "widen(value: string): string");
+});
+
 test("flags syntax errors on a partially broken file without dropping what parsed", () => {
   const broken = `export function ok(): void {}
 
@@ -376,6 +600,236 @@ test("specifier resolution never claims an IMPORTS edge is resolved - that is co
     assert.equal(edge.source, "tree-sitter");
     assert.equal(edge.resolved, false, "the target node is still a placeholder until core links it");
   }
+});
+
+// --- computed import specifiers ------------------------------------------
+//
+// Scoped in docs/architecture/g-mesh-v1.md ("Computed import specifiers"):
+// what folds without running anything is resolved, everything else produces no
+// edge at all - never a wrong one.
+
+/** Every specifier this file imports, by the qualifiedName of the placeholder
+ * it landed on, sorted - so "no edge at all" is assertable as `[]`. */
+function importedModules(result: ExtractResult): string[] {
+  const byId = new Map(result.nodes.map((n) => [n.id, n]));
+  return result.edges
+    .filter((edge) => edge.kind === "IMPORTS")
+    .map((edge) => byId.get(edge.toId)?.qualifiedName ?? "<dangling>")
+    .sort();
+}
+
+test("a template specifier folds through the same-file constants it interpolates", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(): Promise<void> {
+  await import(\`./plugins/\${NAME}/index\`);
+  await import(\`./p/\${DEEP}.js\`);
+}
+
+const NAME = "alpha";
+const DEEP = \`\${NAME}/deep\`;
+`,
+  );
+
+  // Both constants are declared *below* the call that reads them, which is the
+  // whole reason the fold is deferred past the walk.
+  assert.deepEqual(importedModules(result), ["./p/alpha/deep.js", "./plugins/alpha/index"]);
+});
+
+test("a named string enum member folds; nothing else about an enum does", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `enum Plugin {
+  Foo = "foo",
+  Count = 2,
+}
+
+export async function boot(which: Plugin): Promise<void> {
+  await import(\`./p/\${Plugin.Foo}.js\`);
+  // Not a member named outright, a value of enum type: which one it holds is
+  // the checker's question, and only ever answerable as a union.
+  await import(\`./p/\${which}.js\`);
+  // A number is not a specifier.
+  await import(\`./p/\${Plugin.Count}.js\`);
+}
+`,
+  );
+
+  assert.deepEqual(importedModules(result), ["./p/foo.js"]);
+});
+
+test("a conditional specifier records one import per branch", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(dev: boolean, alt: boolean): Promise<void> {
+  await import(dev ? "./dev" : alt ? "./alt" : "./prod");
+}
+`,
+  );
+
+  // A File node already carries several outgoing IMPORTS edges in the
+  // ordinary multi-import case, so a fan-out is not a new edge shape.
+  assert.deepEqual(importedModules(result), ["./alt", "./dev", "./prod"]);
+});
+
+test("a conditional with one dynamic branch records neither branch", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `export async function boot(dev: boolean): Promise<void> {
+  await import(dev ? "./dev" : getPath());
+}
+`,
+  );
+
+  // "./dev" is real, but recording it alone reads as the complete answer to
+  // what this call site imports, and it is not one.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("path.join(__dirname, ...) is a relative specifier spelled the long way", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `import * as path from "node:path";
+
+const NAME = "alpha";
+
+export async function boot(): Promise<void> {
+  await import(path.join(__dirname, "./plugins", \`\${NAME}.js\`));
+  await import(path.resolve(__dirname, "..", "shared.js"));
+}
+`,
+  );
+
+  assert.deepEqual(importedModules(result), ["../shared.js", "./plugins/alpha.js", "node:path"]);
+});
+
+test("the path module is recognised however it was bound, and only it", () => {
+  const cjs = extractFile(
+    "src/index.js",
+    `const path = require("node:path");
+
+module.exports = () => import(path.join(__dirname, "plugins", "index.js"));
+`,
+  );
+  assert.deepEqual(importedModules(cjs), ["./plugins/index.js", "node:path"]);
+
+  const aliased = extractFile(
+    "src/index.ts",
+    `import nodePath from "path";
+
+export const boot = () => import(nodePath.join(__dirname, "boot.js"));
+`,
+  );
+  assert.deepEqual(importedModules(aliased), ["./boot.js", "path"]);
+
+  // Same call shape, receiver bound to something else entirely.
+  const impostor = extractFile(
+    "src/index.ts",
+    `import * as path from "./mypath";
+
+export const boot = () => import(path.join(__dirname, "boot.js"));
+`,
+  );
+  assert.deepEqual(importedModules(impostor), ["./mypath"]);
+});
+
+test("a computed specifier that is not statically known records no edge at all", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `import * as path from "node:path";
+import { REMOTE } from "./names";
+
+let mutable = "alpha";
+
+export async function boot(which: string): Promise<void> {
+  // The regression this whole feature had to close: a truncated first
+  // fragment ("./plugins/") used to be recorded as the specifier.
+  await import(\`./plugins/\${which}/index\`);
+  // Another file's constant - this pass sees one file.
+  await import(\`./p/\${REMOTE}.js\`);
+  // Not a constant at all.
+  await import(\`./p/\${mutable}.js\`);
+  await import(\`./p/\${process.env.PLUGIN}.js\`);
+  await import(getPath());
+  // Resolvable only down to a directory, which is a different feature.
+  await import(path.join(__dirname, "./plugins", which));
+}
+`,
+  );
+
+  // Only the two static imports at the top, and nothing shaped like
+  // "./plugins/" or "./p/" anywhere.
+  assert.deepEqual(importedModules(result), ["./names", "node:path"]);
+});
+
+test("a literal made of parts is never truncated into a specifier", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `declare const suffix: string;
+
+enum Plugin {
+  Foo = \`foo-\${suffix}\`,
+}
+
+export const boot = () => import(\`./p/\${Plugin.Foo}.js\`);
+export const legacy = () => import(\`./p/a\\tb\`);
+`,
+  );
+
+  // Reading the first fragment of a multi-part literal and calling it the
+  // value - "foo-" here, "./p/a" there - is what recorded a *wrong* import
+  // rather than none at all. Both are unreadable, so both name nothing.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("a local binding shadows the constant a specifier would otherwise fold to", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `const NAME = "alpha";
+
+export async function boot(NAME: string): Promise<void> {
+  await import(\`./p/\${NAME}.js\`);
+}
+`,
+  );
+
+  // The parameter is what the call site reads, and what a local holds is not
+  // tracked - the same rule every other name resolution here follows.
+  assert.deepEqual(importedModules(result), []);
+});
+
+test("a folded specifier is an ordinary import edge, resolved by the same handshake", () => {
+  const result = extractFile(
+    "src/index.ts",
+    `const NAME = "alpha";
+export const boot = () => import(\`./plugins/\${NAME}.js\`);
+`,
+    { resolveSpecifier: (specifier) => (specifier === "./plugins/alpha.js" ? "src/plugins/alpha.ts" : null) },
+  );
+
+  // Folding happens in the structural pass - no compiler is asked anything -
+  // so the edge is a `tree-sitter` one, and `resolved` stays core's call
+  // exactly as for a static `import "./plugins/alpha.js"`.
+  const placeholder = node(result, "Module", "src/plugins/alpha.ts");
+  assert.equal(placeholder.nativeKind, RESOLVED_MODULE_NATIVE_KIND);
+  assert.equal(placeholder.name, "./plugins/alpha.js", "the computed specifier is what it names");
+  const imports = result.edges.filter((e) => e.kind === "IMPORTS");
+  assert.equal(imports.length, 1);
+  assert.equal(imports[0].source, "tree-sitter");
+  assert.equal(imports[0].resolved, false, "the target node is still a placeholder until core links it");
+});
+
+test("a require() that is no import is still a call of a name this file may declare", () => {
+  const result = extractFile(
+    "src/index.js",
+    `function require(id) { return id; }
+
+function boot() { return require(getPath()); }
+`,
+  );
+
+  assert.deepEqual(importedModules(result), []);
+  assert.ok(hasEdge(result, "CALLS", "boot", "require"));
 });
 
 test("two specifiers naming the same file collapse into one placeholder", () => {
@@ -992,4 +1446,294 @@ export function run(): void {
     false,
     "whether that file exports it is a fact about the index, which only core has",
   );
+});
+
+// --- namespace imports ----------------------------------------------------
+//
+// `import * as ns` still binds no symbol here, and still emits no edge of its
+// own - what is new is that the sites written against it are *recorded* rather
+// than dropped, so semanticPass.ts can ask a checker which export each names.
+
+function uses(result: ExtractResult): NamespaceMemberUse[] {
+  return result.namespaceMemberUses;
+}
+
+test("a namespace import emits no edge of its own, but records the member sites", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export function run(): void {
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // The gap this exists to close: nothing here names `mutate`, so the
+  // structural pass has nothing to point an edge at and emits none.
+  assert.deepEqual(
+    result.nodes.filter((n) => n.nativeKind === PENDING_SYMBOL_NATIVE_KIND),
+    [],
+    "the extractor must not guess which export `lib.mutate` names",
+  );
+  assert.deepEqual(
+    result.edges.filter((e) => e.kind === "CALLS"),
+    [],
+    "and must not invent a call edge either",
+  );
+
+  assert.equal(uses(result).length, 1);
+  const [use] = uses(result);
+  assert.equal(use.memberName, "mutate");
+  assert.equal(use.namespaceName, "lib");
+  assert.equal(use.modulePath, "src/lib.ts");
+  assert.equal(use.edgeKind, "CALLS");
+  assert.equal(use.fromId, node(result, "Function", "run").id);
+  // The recorded position is the member name itself - what a point query is
+  // aimed at - not the receiver and not the whole expression.
+  assert.equal(use.line, 3);
+  assert.equal(use.col, "  lib.".length);
+});
+
+test("a namespace member read outside a call is recorded as a reference", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export const answer = lib.value;
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.equal(uses(result).length, 1);
+  assert.equal(uses(result)[0].edgeKind, "REFERENCES");
+  assert.equal(uses(result)[0].memberName, "value");
+  assert.equal(uses(result)[0].fromId, node(result, "Variable", "answer").id);
+});
+
+test("a namespace call at module top level degrades to a reference from the file", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+lib.boot();
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  // Same rule an ordinary imported call follows: a CALLS edge is made by some
+  // function, and a call written at module top level is made by none.
+  assert.equal(uses(result)[0].edgeKind, "REFERENCES");
+  assert.equal(uses(result)[0].fromId, node(result, "File", "src/app.ts").id);
+});
+
+test("a namespace import of a specifier outside this project records nothing", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as p from "node:path";
+
+export function run(): string {
+  return p.join("a", "b");
+}
+`,
+    { resolveSpecifier: () => null },
+  );
+
+  // Nothing of `node:path` is in this index, so no placeholder addressed at it
+  // could ever be linked - and asking a checker about it would be pure cost.
+  assert.deepEqual(uses(result), []);
+});
+
+test("a local binding shadowing a namespace import is not a namespace member access", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+
+export function run(lib: { mutate(): void }): void {
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.deepEqual(uses(result), [], "the parameter shadows the import, as it does in the language");
+});
+
+test("an ordinary property access on a value is not mistaken for a namespace member", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `const config = { mutate(): void {} };
+
+export function run(): void {
+  config.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.deepEqual(uses(result), []);
+});
+
+test("recording namespace sites leaves the edges a named import already resolved alone", () => {
+  const result = extractFile(
+    "src/app.ts",
+    `import * as lib from "./lib";
+import { helper } from "./lib";
+
+export function run(): void {
+  helper();
+  lib.mutate();
+}
+`,
+    RESOLVES_TO_LIB,
+  );
+
+  assert.ok(hasEdge(result, "CALLS", "run", "src/lib.ts#helper"));
+  assert.equal(uses(result).length, 1);
+});
+
+// --- generic types ---------------------------------------------------------
+//
+// A name someone wrote down is a reference; an instantiation is not a symbol.
+// `Box<Widget>` mentions two types and both are recorded - `Box<Widget>` itself
+// never becomes a node. The three sites below each used to drop an explicitly
+// written name, and the fourth test guards the prerequisite that makes them
+// safe: a declaration's own `<T, ...>` must not name-match a file-level type.
+// See "Generic types" in docs/architecture/g-mesh-v1.md.
+
+test("a generic type's head is a reference, exactly as the same name written bare is", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+
+export const held: Box<Widget> = null!;
+export const plain: Box = null!;
+export type Held = Box<Widget>;
+`,
+  );
+
+  // `Box` used to be discarded here and only kept in `plain`, because a
+  // generic type holds its head in a field called `name` - the field every
+  // other declaration binds through.
+  assert.deepEqual(usageEdges(result), [
+    "REFERENCES Held -> Box",
+    "REFERENCES Held -> Widget",
+    "REFERENCES held -> Box",
+    "REFERENCES held -> Widget",
+    "REFERENCES plain -> Box",
+  ]);
+
+  // Nothing here needs a checker: these are ordinary structural edges onto
+  // declarations of this very file.
+  for (const edge of result.edges) {
+    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.resolved, true);
+  }
+});
+
+test("type arguments in a heritage clause are references, and the head stays only a supertype", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+export interface Reg<T> {}
+
+export class WidgetBox extends Box<Widget> implements Reg<Widget> {}
+export interface WidgetReg extends Reg<Widget> {}
+`,
+  );
+
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetBox", "Box"));
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetBox", "Reg"));
+  assert.ok(hasEdge(result, "SUPERTYPE_OF", "WidgetReg", "Reg"));
+
+  // `Widget` was dropped entirely; `Box`/`Reg` must stay SUPERTYPE_OF *only*,
+  // because find_references unions the two kinds and would otherwise report
+  // one written name twice.
+  assert.deepEqual(usageEdges(result), [
+    "REFERENCES WidgetBox -> Widget",
+    "REFERENCES WidgetReg -> Widget",
+  ]);
+});
+
+test("type arguments at a call and a `new` site are references", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export class Widget {}
+export class Box<T> {}
+export function identity<V>(value: V): V {
+  return value;
+}
+
+export function build() {
+  return new Box<Widget>();
+}
+
+export function pick() {
+  return identity<Widget>(null!);
+}
+`,
+  );
+
+  // Neither function annotates a type, so `Widget` can only have come from the
+  // `type_arguments` field - the third field beside `function`/`constructor`
+  // and `arguments`, which neither handler used to read.
+  assert.deepEqual(usageEdges(result), [
+    "CALLS pick -> identity",
+    "REFERENCES build -> Box",
+    "REFERENCES build -> Widget",
+    "REFERENCES pick -> Widget",
+  ]);
+});
+
+test("a type parameter shadows a file-level type of the same name", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export interface T { tag: string }
+
+export class Holder<T> {
+  item: T;
+  wrap<T>(value: T): T {
+    return value;
+  }
+}
+
+export type Held<T> = Holder<T>;
+export type Mapper = <T>(x: T) => T;
+export interface Factory {
+  <T>(x: T): T;
+}
+export function keep<T>(value: T): T {
+  return value;
+}
+
+export const real: T = { tag: "" };
+`,
+  );
+
+  // Every `T` above but the last is a type parameter, i.e. a type this
+  // declaration itself declares - matching it onto the interface is the
+  // wrong-edge case, and the generic fixes above multiply how often a bare
+  // type-parameter name is walked. `real` proves the shadowing is scoped to
+  // the declaration rather than suppressing the name file-wide.
+  assert.deepEqual(usageEdges(result), ["REFERENCES Held -> Holder", "REFERENCES real -> T"]);
+});
+
+test("a type parameter shadows a type of that name and nothing else", () => {
+  const result = extractFile(
+    "src/p.ts",
+    `export function make(): void {}
+
+export function run<make>(value: make): void {
+  make();
+}
+`,
+  );
+
+  // Contrived - nobody names a type parameter after a function - but it pins
+  // the rule the shadowing is written to: `<T>` binds in the type namespace
+  // only, so the call still names this file's function.
+  assert.deepEqual(usageEdges(result), ["CALLS run -> make"]);
 });

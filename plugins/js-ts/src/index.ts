@@ -2,6 +2,8 @@ import { FrameReader, writeMessage } from "./jsonrpc";
 import { parseControlEnvelope, ControlEnvelope, PROTOCOL_VERSION, JSONRPC_VERSION } from "./protocol";
 import { reparseChangedFile, type FileDiff } from "./incremental";
 import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
+import { stopSemanticProjects } from "./semantic";
+import { runSemanticPass } from "./semanticPass";
 
 const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
 
@@ -78,6 +80,65 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
   }
 }
 
+/**
+ * Answers a semantic pass: asks semanticPass.ts what TypeScript's own checker
+ * can resolve that the structural pass could not, and sends it back as the
+ * same diff shape `fileChanged` answers with.
+ *
+ * An empty `filePaths` means the whole project - the wire's own convention,
+ * sent once the cold-start walk lands - and a one-entry list a reparse that
+ * just settled. The pass itself distinguishes them; everything else here is
+ * the same contract `handleFileChanged` has.
+ *
+ * A pass that fails answers with an empty diff rather than with an error. Core
+ * drops a failing semantic pass on the floor by design (it is an upgrade over a
+ * graph that is already committed and serviceable), and an empty diff is the
+ * same outcome reached without making core parse a failure first: the index
+ * keeps whatever the structural layer already resolved, which is the state it
+ * was in anyway. A *partial* answer, which is what a per-question failure
+ * inside the pass degrades to, still gets through.
+ */
+async function handleSemanticPass(
+  projectRoot: string,
+  filePaths: string[],
+  id: ControlEnvelope["id"],
+): Promise<void> {
+  log(
+    filePaths.length === 0
+      ? "semantic pass requested for the whole project"
+      : `semantic pass requested for: ${filePaths.join(", ")}`,
+  );
+
+  let result = EMPTY_WIRE_DIFF;
+  try {
+    const pass = await runSemanticPass(projectRoot, filePaths, { onLog: log });
+    result = {
+      upsertNodes: pass.upsertNodes.map(toWireNode),
+      // Placeholders are never deleted, for the reason core's
+      // `graph::symbol_links` spells out: a later edit can hang a new edge on
+      // one this pass did not re-send, and a deleted node would leave that
+      // edge pointing at nothing.
+      deleteNodeIds: [],
+      upsertEdges: pass.upsertEdges,
+      deleteEdgeIds: pass.deleteEdgeIds,
+    };
+    log(
+      `semantic pass over ${pass.filesScanned} file(s): ${pass.upsertEdges.length} edge(s) answered, ` +
+        `${pass.deleteEdgeIds.length} retracted, ${pass.unresolvedUses} left unresolved`,
+    );
+  } catch (err) {
+    log(`semantic pass failed: ${(err as Error).message}`);
+  }
+
+  // Same contract as handleFileChanged: core blocks on a response to any
+  // request it sent, so a request must always be answered with a diff -
+  // never with the `{ acknowledged: true }` shape the no-op methods use,
+  // which core would fail to deserialize as one.
+  if (id !== undefined) {
+    writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result });
+  }
+}
+
 async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): Promise<void> {
   switch (envelope.method) {
     case "reindex":
@@ -92,6 +153,12 @@ async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): P
     case "fileChanged":
       await handleFileChanged(projectRoot, envelope.params?.filePath ?? "", envelope.id);
       return; // handleFileChanged already sent the (only) response, if any
+    case "semanticPass":
+      // parseControlEnvelope has already established filePaths is a real
+      // string[] for this method; the `?? []` is for the type, not a case
+      // that can happen.
+      await handleSemanticPass(projectRoot, envelope.params?.filePaths ?? [], envelope.id);
+      return; // answered with a diff, not the acknowledgement below
     case "status":
       log("status requested");
       break;
@@ -190,7 +257,16 @@ function main(): void {
     }
   });
 
-  process.stdin.on("end", () => process.exit(0));
+  // Core ends a plugin by closing its stdin (daemon::plugin::shutdown), so
+  // this is the plugin's whole shutdown path - and the only place a semantic
+  // child, which is many times this process's own size, gets to be released
+  // deliberately rather than by a backstop. Nothing here starts one: the
+  // checker is spawned by the first semantic question asked of it and this
+  // is a no-op for the (common) run where none ever is.
+  process.stdin.on("end", () => {
+    stopSemanticProjects();
+    process.exit(0);
+  });
 }
 
 main();

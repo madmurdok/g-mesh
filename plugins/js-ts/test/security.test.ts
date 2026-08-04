@@ -13,6 +13,7 @@ import https = require("node:https");
 
 import { bulkIndexProject, type WireNode } from "../src/bulkIndex";
 import { isSupportedFile } from "../src/extract";
+import { SemanticProject } from "../src/semantic";
 
 // Regression tests for the three mitigations documented in
 // docs/architecture/g-mesh-v1.md's Security Model section: (1) a project's
@@ -115,6 +116,84 @@ test("a malicious tsconfig.json `plugins` entry is never loaded/executed during 
   }
 });
 
+/**
+ * The same fixture in the shape tsserver can actually be made to execute: a
+ * plugin *package* under the project's own `node_modules`, which is how a
+ * real `compilerOptions.plugins` entry is written (a package name, not a
+ * relative path) and how a compromised dependency would arrive.
+ *
+ * The distinction is what gives the test below teeth, and it was measured,
+ * not assumed: the relative-path form used above is not loaded even *with*
+ * `--allowLocalPluginLoads` (tsserver resolves plugin names out of
+ * `node_modules`, so it never finds it), while this form is executed the
+ * moment that flag is passed - and is not, without it. Asserting on a form
+ * that cannot execute either way would pass forever and prove nothing.
+ */
+function tsserverPluginFixtureFiles(): Record<string, string> {
+  return {
+    "tsconfig.json": JSON.stringify(
+      { compilerOptions: { strict: true, plugins: [{ name: "evil-ts-plugin" }] }, include: ["src"] },
+      null,
+      2,
+    ) + "\n",
+    "node_modules/evil-ts-plugin/package.json": JSON.stringify({
+      name: "evil-ts-plugin",
+      version: "1.0.0",
+      main: "index.js",
+    }) + "\n",
+    // The side effect runs at require() time, before any language-service
+    // hook - being loaded at all is the compromise, whatever it returns.
+    "node_modules/evil-ts-plugin/index.js": `const fs = require("node:fs");
+const path = require("node:path");
+fs.writeFileSync(path.join(__dirname, "..", "..", "${EVIL_MARKER}"), String(Date.now()));
+module.exports = function init() {
+  return { create: (info) => info.languageService };
+};
+`,
+    "src/good.ts": `export function double(n: number): number {\n  return n * 2;\n}\n`,
+  };
+}
+
+/**
+ * The same mitigation, one layer deeper. The test above covers the indexing
+ * walk, which never opens a tsconfig at all; this one covers the semantic
+ * pass, which hands the *whole project* - malicious `plugins` entry included -
+ * to a real tsserver that genuinely knows how to load such a plugin. The
+ * source-level assertions further down pin that `--allowLocalPluginLoads` is
+ * absent from the spawn; this pins the consequence, by running the thing.
+ */
+test("the tsserver child does not execute a malicious tsconfig.json `plugins` entry either", async () => {
+  const root = await makeProject(tsserverPluginFixtureFiles());
+  const project = new SemanticProject(root);
+  try {
+    const file = path.join(root, "src", "good.ts");
+
+    // A real semantic answer, so this cannot pass by tsserver having failed
+    // to load the project (which would also have skipped the plugin).
+    const definitions = await project.definition(file, { line: 1, offset: 17 });
+    assert.equal(definitions.length, 1, "sanity: the fixture must still answer semantic queries");
+    assert.equal(definitions[0].file, file);
+
+    // And it must have read the very tsconfig.json carrying the plugins entry
+    // - otherwise "the plugin did not run" would only mean "the config never
+    // reached the compiler".
+    assert.equal(
+      await project.configuredProjectFor(file),
+      path.join(root, "tsconfig.json"),
+      "sanity: the malicious tsconfig must be the config actually in force",
+    );
+
+    assert.equal(
+      existsSync(path.join(root, EVIL_MARKER)),
+      false,
+      "tsserver must never require() a project's compilerOptions.plugins entry",
+    );
+  } finally {
+    project.stop();
+    await cleanup(root);
+  }
+});
+
 // --- (2) no outbound network calls -----------------------------------------
 
 // __dirname is dist/test at runtime (this file is compiled by `tsc` before
@@ -133,16 +212,82 @@ const FORBIDDEN_SOURCE_PATTERNS: RegExp[] = [
   /from\s+["'](?:node:)?(?:http|https|net|dgram|dns|tls)["']/,
 ];
 
+/**
+ * `child_process` is on the forbidden list as a shell-out proxy for network
+ * access, and exactly one module is allowed to break that: semantic.ts spawns
+ * `tsserver`, which is the whole point of the subprocess decision recorded in
+ * docs/architecture/g-mesh-v1.md ("TS semantic layer"). The exemption is
+ * narrow by design - it covers only that one pattern in only that one file,
+ * and the two tests below pin *what* it is allowed to spawn - so a second
+ * module growing a subprocess, or this one growing a `fetch`, still fails.
+ */
+const SUBPROCESS_EXEMPT: ReadonlyMap<string, RegExp> = new Map([
+  ["semantic.ts", /\bchild_process\b/],
+]);
+
 test("no source file imports or invokes a networking API", async () => {
   const entries = await fs.readdir(SRC_DIR);
   const tsFiles = entries.filter((f) => f.endsWith(".ts"));
   assert.ok(tsFiles.length > 0, "sanity: expected to find .ts files under src/");
   for (const file of tsFiles) {
     const contents = await fs.readFile(path.join(SRC_DIR, file), "utf8");
+    const exempt = SUBPROCESS_EXEMPT.get(file);
     for (const pattern of FORBIDDEN_SOURCE_PATTERNS) {
+      if (exempt !== undefined && exempt.source === pattern.source) continue;
       assert.ok(!pattern.test(contents), `src/${file} matches forbidden network pattern ${pattern}`);
     }
   }
+});
+
+test("semantic.ts spawns only a tsserver, never a shell", async () => {
+  const contents = await fs.readFile(path.join(SRC_DIR, "semantic.ts"), "utf8");
+  // `exec`/`execSync`/`spawnSync` with a shell string is the dangerous shape;
+  // `spawn(process.execPath, [...])` with an argv array is not.
+  for (const forbidden of [/\bexecSync\s*\(/, /\bexec\s*\(/, /\bspawnSync\s*\(/, /\bshell\s*:/]) {
+    assert.ok(!forbidden.test(contents), `semantic.ts must not use ${forbidden}`);
+  }
+  assert.ok(/spawn\(\s*process\.execPath/.test(contents), "the only spawn must be of Node itself");
+});
+
+/**
+ * Comments stripped, so a flag *named* in a doc comment explaining why it is
+ * forbidden does not read as the flag being used. Deliberately naive - it
+ * would also cut a `//` inside a string literal - which is why the caller
+ * asserts a known code landmark survived.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+test("tsserver is never spawned with plugin loading or typings acquisition enabled", async () => {
+  const raw = await fs.readFile(path.join(SRC_DIR, "semantic.ts"), "utf8");
+  const contents = stripComments(raw);
+  assert.ok(
+    /const DEFAULT_ARGS = \[/.test(contents),
+    "sanity: comment stripping must not have eaten the spawn arguments",
+  );
+
+  // Measured, not assumed (see the architecture note): with
+  // `--allowLocalPluginLoads`, tsserver *does* require() a malicious
+  // `compilerOptions.plugins` entry out of the project's own node_modules -
+  // the exact code-execution vector mitigation (1) above exists to close.
+  // Without the flag it does not, and still answers semantics normally. That
+  // default is load-bearing, so pin it.
+  assert.ok(
+    !/allowLocalPluginLoads/.test(contents),
+    "--allowLocalPluginLoads re-opens the malicious-tsconfig-plugin vector",
+  );
+  assert.ok(
+    !/globalPlugins|pluginProbeLocations/.test(contents),
+    "plugin probe locations would let tsserver load extension code g-mesh does not need",
+  );
+  // Automatic typings acquisition is the one genuinely networked thing in the
+  // `typescript` package: it npm-installs `@types/*` for the project. g-mesh
+  // indexes what is on disk, so it must always be off.
+  assert.ok(
+    /--disableAutomaticTypingAcquisition/.test(contents),
+    "ATA is the typescript package's network path and must be disabled",
+  );
 });
 
 test("package.json declares no networking-capable runtime dependency", async () => {
@@ -152,7 +297,18 @@ test("package.json declares no networking-capable runtime dependency", async () 
   // runtime dependency must be a deliberate, reviewed edit to this set -
   // never a silent side effect of `npm install` introducing something with
   // network capability the static scan above doesn't know to look for.
-  const ALLOWED_RUNTIME_DEPS = new Set(["ignore", "tree-sitter", "tree-sitter-javascript", "tree-sitter-typescript"]);
+  // `typescript` is a runtime dependency because `tsserver` ships inside it
+  // (see the "TS semantic layer" note in docs/architecture/g-mesh-v1.md - it
+  // would be a runtime dependency under the in-process shape too). Its one
+  // network path is automatic typings acquisition, which the test above pins
+  // as always disabled.
+  const ALLOWED_RUNTIME_DEPS = new Set([
+    "ignore",
+    "tree-sitter",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "typescript",
+  ]);
   for (const dep of Object.keys(pkg.dependencies ?? {})) {
     assert.ok(
       ALLOWED_RUNTIME_DEPS.has(dep),

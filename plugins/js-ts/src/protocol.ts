@@ -15,16 +15,24 @@ export interface Handshake {
 
 export type RequestId = number | string;
 
-export type ControlMethod = "reindex" | "fileChanged" | "status";
+export type ControlMethod = "reindex" | "fileChanged" | "status" | "semanticPass";
 
 // Mirrors ControlMessage: Reindex/FileChanged carry `params: { filePath }`,
-// Status carries no `params` field at all (serde's adjacently-tagged
-// encoding omits `content` entirely for a unit variant).
+// SemanticPass carries `params: { filePaths }` (plural - it can be asked
+// about the whole project at once, where an empty array means "everything
+// indexed so far", not "nothing"), and Status carries no `params` field at
+// all (serde's adjacently-tagged encoding omits `content` entirely for a
+// unit variant).
+//
+// The two params shapes are one optional-field object rather than a union
+// so that reading `params?.filePath` stays legal for the callers that only
+// ever see a singular method; which field is actually required is decided
+// per method by parseControlEnvelope, which is where the guarantee belongs.
 export interface ControlEnvelope {
   jsonrpc: "2.0";
   id?: RequestId;
   method: ControlMethod;
-  params?: { filePath: string };
+  params?: { filePath?: string; filePaths?: string[] };
 }
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -49,7 +57,12 @@ export function parseControlEnvelope(value: unknown): ParseResult<ControlEnvelop
     return { ok: false, error: "id must be a number or string when present" };
   }
 
-  if (obj.method !== "reindex" && obj.method !== "fileChanged" && obj.method !== "status") {
+  if (
+    obj.method !== "reindex" &&
+    obj.method !== "fileChanged" &&
+    obj.method !== "status" &&
+    obj.method !== "semanticPass"
+  ) {
     return { ok: false, error: `unknown method: ${JSON.stringify(obj.method)}` };
   }
 
@@ -65,6 +78,31 @@ export function parseControlEnvelope(value: unknown): ParseResult<ControlEnvelop
         id: obj.id as RequestId | undefined,
         method: obj.method,
         params: { filePath: params.filePath },
+      },
+    };
+  }
+
+  if (obj.method === "semanticPass") {
+    const params = obj.params as Record<string, unknown> | undefined;
+    // An *absent* filePaths is rejected even though an empty one is fine:
+    // "the whole project" is a deliberate instruction, and core always
+    // spells it out (serde serializes the Vec either way), so a missing
+    // field is a malformed request, not a shorthand for it.
+    if (
+      typeof params !== "object" ||
+      params === null ||
+      !Array.isArray(params.filePaths) ||
+      !params.filePaths.every((entry) => typeof entry === "string")
+    ) {
+      return { ok: false, error: "semanticPass requires params.filePaths: string[]" };
+    }
+    return {
+      ok: true,
+      value: {
+        jsonrpc: JSONRPC_VERSION,
+        id: obj.id as RequestId | undefined,
+        method: "semanticPass",
+        params: { filePaths: params.filePaths as string[] },
       },
     };
   }

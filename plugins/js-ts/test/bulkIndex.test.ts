@@ -6,7 +6,13 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { bulkIndexProject, toWireNode, walkProjectFiles, type WireNode, type WireEdge } from "../src/bulkIndex";
-import type { EdgeKind, EdgeSource, NodeKind } from "../src/extract";
+import type {
+  EdgeKind,
+  EdgeSource,
+  ExtractedNode,
+  NodeKind,
+  SymbolDeclaration,
+} from "../src/extract";
 
 const NODE_KINDS: ReadonlySet<NodeKind> = new Set(["File", "Module", "Type", "Function", "Variable"]);
 const EDGE_KINDS: ReadonlySet<EdgeKind> = new Set([
@@ -153,6 +159,83 @@ test("toWireNode nests flat range fields", () => {
   assert.equal(wire.signature, null);
   assert.equal(wire.docComment, null);
   assert.equal(wire.nativeKind, null);
+});
+
+/** The node `toWireNode` is handed for the two declaration tests below - an
+ * ordinary single-declaration symbol until one is given a list. */
+function extractedNode(declarations?: SymbolDeclaration[]): ExtractedNode {
+  const node: ExtractedNode = {
+    id: "n1",
+    kind: "Function",
+    name: "parse",
+    qualifiedName: "parse",
+    filePath: "a.ts",
+    startLine: 3,
+    startCol: 7,
+    endLine: 5,
+    endCol: 1,
+    signature: "parse(input: string): string[]",
+    exported: true,
+    language: "typescript",
+    nativeKind: "function",
+    hasSyntaxErrors: false,
+  };
+  if (declarations !== undefined) node.declarations = declarations;
+  return node;
+}
+
+test("toWireNode carries a multi-declaration node's list across unchanged", () => {
+  const declarations: SymbolDeclaration[] = [
+    {
+      ordinal: 0,
+      startLine: 1,
+      startCol: 7,
+      endLine: 1,
+      endCol: 47,
+      signature: "parse(input: string): string[]",
+      hasBody: false,
+    },
+    { ordinal: 1, startLine: 3, startCol: 7, endLine: 5, endCol: 1, hasBody: true },
+  ];
+
+  const wire = toWireNode(extractedNode(declarations));
+
+  // Same list, field for field: core's `WireDeclaration` is this exact shape,
+  // so anything a translation step could get wrong here is a bug it does not
+  // have to be able to have.
+  assert.deepEqual(wire.declarations, declarations);
+  assert.deepEqual(JSON.parse(JSON.stringify(wire)).declarations, declarations);
+});
+
+/**
+ * The design's central promise, and the one worth a test of its own: giving
+ * declarations a place on the wire must cost the 99% case nothing at all. Not
+ * "an empty array", not "null" - the key has to be absent, byte for byte what
+ * this function emitted before the field existed.
+ */
+test("toWireNode leaves an ordinary node's wire line exactly as it was", () => {
+  const wire = toWireNode(extractedNode());
+
+  assert.equal("declarations" in wire, false, "a single-declaration node must not carry the key");
+  assert.equal(
+    JSON.stringify(wire).includes("declarations"),
+    false,
+    `the wire line must not mention declarations: ${JSON.stringify(wire)}`,
+  );
+  assert.deepEqual(Object.keys(wire), [
+    "id",
+    "kind",
+    "name",
+    "qualifiedName",
+    "filePath",
+    "range",
+    "signature",
+    "exported",
+    "docComment",
+    "language",
+    "nativeKind",
+    "hasSyntaxErrors",
+  ]);
 });
 
 test("always skips node_modules, dist, .git, and .claude regardless of .gitignore", async () => {

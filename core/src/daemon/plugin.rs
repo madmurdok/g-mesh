@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use crate::protocol::handshake;
 use crate::protocol::types::RequestId;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
-use crate::watcher::apply::apply_file_change as apply_file_change_diff;
+use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Overrides where the plugin's compiled entry point lives. Real installs
@@ -464,6 +464,27 @@ impl PluginProcess {
         let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
         let mut conn = conn.lock().unwrap();
         staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id)
+    }
+
+    /// Asks the plugin's semantic layer to upgrade what the structural pass
+    /// could only guess at, and commits its answer - see
+    /// `watcher::apply::apply_semantic_pass`.
+    ///
+    /// This is the *whole-project* entry point, used once the cold-start
+    /// bulk walk is done (`daemon::run`); the per-file pass that follows an
+    /// incremental reparse needs no call of its own, because
+    /// `apply_file_change` already sends it on the same locked round trip.
+    ///
+    /// Unlike [`Self::apply_file_change`], a dead plugin surfaces here as an
+    /// ordinary `Err` rather than a relaunch: there is nothing pending to
+    /// replay (a semantic pass owns no file the index is missing), and the
+    /// caller treats a missing upgrade as best-effort.
+    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<()> {
+        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let mut state = self.state.lock().unwrap();
+        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
+        let mut conn = conn.lock().unwrap();
+        apply_semantic_pass(reader, writer, &mut conn, file_paths, id)
     }
 
     fn send_one(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<()> {

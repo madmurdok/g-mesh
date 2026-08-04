@@ -140,7 +140,8 @@ graph TD
     Core --- ToolLogic
     Core --- SockListener
 
-    Core -->|JSON-RPC (control)<br/>NDJSON (bulk graph)| Plugin["Language plugin process<br/>(JS/TS: tree-sitter + TS compiler API)"]
+    Core -->|JSON-RPC (control)<br/>NDJSON (bulk graph)| Plugin["Language plugin process<br/>(JS/TS: tree-sitter)"]
+    Plugin -->|tsserver protocol| TsServer["tsserver child<br/>(semantic pass, killable)"]
     Core -->|rusqlite, WAL mode| DB[("SQLite + sqlite-vec<br/>~/.g-mesh/projects/&lt;hash&gt;/index.db")]
 
     Config[("~/.g-mesh/projects/&lt;hash&gt;/config.toml<br/>~/.g-mesh/config.toml (global)")] -.-> Core
@@ -156,9 +157,12 @@ graph TD
   [MCP transport & lifecycle](#lifecycle).
 - **Language plugin process**: one per active language per project, spawned
   and owned by the core. For JS/TS: tree-sitter for the fast structural
-  layer, TypeScript compiler API for point semantic resolution. Read-only
-  access to project source; never writes to the index directly — all writes
-  go through the core.
+  layer, and for point semantic resolution a `tsserver` child of its own
+  (see [TS semantic layer](#ts-semantic-layer) — the compiler is
+  deliberately *not* loaded in-process, because it is synchronous and would
+  stall the plugin's event loop for seconds at a time). Read-only access to
+  project source; never writes to the index directly — all writes go
+  through the core.
 - **Storage**: single SQLite file per project, WAL mode, holding both graph
   tables and the `sqlite-vec` vector index.
 
@@ -192,7 +196,7 @@ sequenceDiagram
     Core->>Core: mark indexing complete
     Core-->>Agent: index available (tree-sitter layer)
     par async, non-blocking
-        Plugin->>Plugin: TS compiler API semantic pass
+        Plugin->>Plugin: semantic pass (tsserver child)
         Plugin-->>Core: diff (resolved edges, upgraded `source`)
         Core->>DB: batched transaction
     end
@@ -201,6 +205,15 @@ sequenceDiagram
 Structural graph is available almost immediately; semantic resolution
 (`source: 'ts-compiler'`, `resolved: true`) fills in asynchronously without
 blocking tool availability.
+
+"Asynchronously" is a statement about *answers*, not about the wire. The
+pass is requested over the ordinary synchronous control plane
+(`semanticPass`, below): core sends one request and waits for its diff, the
+same way it waits for a `fileChanged` diff. What makes it non-blocking is
+where it sits — the walk's index is committed and the daemon is already
+serving off it before the request goes out, so no tool call waits on the
+checker, and a pass that fails or never answers costs the graph nothing it
+had.
 
 <a id="bind-before-walk"></a>The socket is bound **before** the cold-start
 walk, not after it. The invariant is unchanged — *no caller is ever served off
@@ -289,6 +302,122 @@ unresolved `IMPORTS` edge into it. That covers off-workspace packages
 at nothing is reported as pointing at nothing, never quietly dropped and
 never invented.
 
+#### Computed import specifiers
+
+Everything above assumes the specifier is a string literal — what
+`stringLiteralValue` extracts from a `string` or `template_string` node in
+`plugins/js-ts/src/extract.ts`. `import()`/`require()` do not require that:
+`import(\`./plugins/${name}\`)`, `import(getPath())`,
+`import(path.join(__dirname, name))` are all legal, and none of them is a
+literal.
+
+`recordCallImport` used to only ask whether the first argument node was a
+literal at all, and — a real bug the scoping pass surfaced, not a
+hypothetical — it was *not* consistent about it. A plain literal or a
+template string with no interpolation resolved correctly. A template string
+that *did* interpolate did not fail cleanly: `stringLiteralValue` returned
+the first `string_fragment` child of the `template_string` node,
+unconditionally, rather than checking whether a `template_substitution`
+sibling existed at all. So `import(\`./plugins/${name}/index\`)` was recorded
+as an IMPORTS edge to the literal path `./plugins/` — a silently *wrong*
+resolution, not an honestly missing one, which is worse than the gap the
+scoping set out to describe. That is closed: `stringLiteralValue` now answers
+only for a literal that really is its own text (one plain run of characters —
+an escape sequence splits a literal into parts the same way an interpolation
+does, and truncated the same way), and a specifier made of parts is either
+folded whole or not resolved at all.
+
+Drawing the line meant separating what a static pass — tree-sitter alone, or
+the TS-compiler-backed semantic pass (`plugins/js-ts/src/semantic.ts`) — can
+honestly answer from what only running the program answers. Concretely:
+
+**Resolvable without running anything (implemented in `recordCallImport` /
+`foldSpecifiers`):**
+
+- A template literal whose every interpolated part is itself statically
+  known *within the same file*: a reference to a `const` bound to a string
+  literal (or to another such fully-static template), or a qualified
+  reference to an enum member (`Plugin.Foo`) whose own initializer is a
+  string literal, declared in the file the pass is already walking. The
+  scope/binding machinery this needs — resolving a name to its declaration
+  and asking what that declaration is — already exists for exactly this kind
+  of same-file question (`LocalBindings`, `lookupByName`, `lookupType`), and
+  is what the fold reuses. `recordCallImport` no longer decides at the call
+  site: a specifier *shaped* like one of these is deferred as a
+  `PendingCallImport` and folded in `resolvePending`, the way
+  `pendingCalls`/`pendingSupertypes` already are, because the constant a call
+  reads is often declared below it. A bare `import(SPECIFIER)` naming such a
+  constant is the same fold with no template around it, and resolves too.
+- A short conditional of literal branches — `import(cond ? "./a" : "./b")` —
+  resolved by recording one IMPORTS edge per branch from the same call site. A
+  File node already carries more than one outgoing IMPORTS edge in the
+  ordinary multi-import case, so this is not a new edge shape, just more than
+  one `recordSpecifier` call attributed to one AST node. All or nothing: one
+  branch that does not fold drops the whole site, because recording the branch
+  that did fold reads as the complete answer to what the call site imports and
+  is not one.
+- `path.join(__dirname, ...)` / `path.resolve(__dirname, ...)` where the
+  receiver is a bare identifier known to be `node:path` — bound by
+  `import * as path` / `import path from` / `const path = require("node:path")`,
+  which `recordPathModuleBinding` tracks separately from the two import maps
+  because `node:path` resolves to no file of this project — and every segment
+  after the `__dirname` anchor folds: plain path arithmetic against this
+  file's own directory, no different in kind from the relative-specifier
+  resolution `recordImport` already does. An absolute segment is refused
+  rather than joined, since `resolve` would discard everything before it.
+
+**Theoretically resolvable, not worth this release:**
+
+- Any of the above where the constant lives in *another* file. The pass sees
+  one file at a time, so folding it needs either a new tsserver query that
+  returns a symbol's literal value directly, or chaining the semantic pass's
+  existing `definition` request (`SemanticProject.definition` in
+  `plugins/js-ts/src/semantic.ts`) to the declaration site and re-running the
+  same structural fold there. That is real plumbing, not a shape decision,
+  and deserves its own ticket.
+- A specifier whose interpolated part is not one known literal but a value
+  the checker can only *type* as a finite union of literals (a
+  `"a" | "b" | "c"` parameter, or a plain value of enum type rather than one
+  named member). `semantic.ts`/`semanticPass.ts` only ever ask
+  `definition`/`projectInfo` today — nothing asks the checker for a type at
+  all — so this needs both a new query and a real decision about what "one
+  call site, N candidate files" should mean as an edge set. Guessing across N
+  files starts to look more like a lint hint than an index edge, and that
+  tradeoff deserves its own discussion rather than riding in on this ticket.
+- `path.join`/`path.resolve` where the *last* segment, not the whole
+  specifier, is dynamic (`path.join(__dirname, "./plugins", name)`).
+  Resolvable only down to "somewhere under `./plugins`" — turning that into
+  edges means enumerating a directory's contents as fan-out candidates, a
+  materially different feature (directory-level fan-out) than resolving a
+  specifier, and out of scope here.
+
+**Not resolvable, by construction — a hard limit to document, not a gap to
+close later:**
+
+- `import(getPath())` / `import(computeSpecifier())`: the specifier is the
+  return value of an arbitrary function call. Nothing about a function's
+  return value is knowable without running it — it may read a file, hit the
+  network, branch on an argument — and no amount of static analysis,
+  tree-sitter or the full checker alike, changes that.
+- A specifier built from `process.env.*`, `process.argv`, or any other
+  environment/I-O-sourced value — its value is only ever known at runtime, by
+  definition of what those are.
+- A specifier fed from a variable TypeScript's own checker widens to plain
+  `string` (reassigned in a loop, mutated across branches, etc.) — if the
+  checker itself cannot narrow it to a literal, nothing built on top of the
+  checker has a better answer than the checker does.
+
+Everything in the second and third buckets produces no edge — not a guess, not
+a partial one — and the extractor's tests pin that boundary as deliberately as
+they pin the first bucket's resolutions. Note what the first bucket's edges
+are *not*: folding is arithmetic on this file's own syntax, no compiler is
+asked anything, so a folded specifier lands on the same
+`source: "tree-sitter"` IMPORTS edge into the same placeholder `Module` node
+as the static `import "./x"` two lines above it, and stays `resolved: false`
+until core confirms the target is in the index. There is no separate kind of
+edge for "computed, then resolved" — by the time the edge exists, the
+specifier is just a specifier.
+
 #### Cross-file symbol resolution
 
 A resolved import is also what makes the *symbols* behind it resolvable. The
@@ -329,6 +458,38 @@ of them. Shallowest wins, so a file that declares a name shadows what it
 re-exports under the same one, as it does in the language; a cycle terminates
 on the walk's visited set rather than hanging the index; and a chain that ends
 nowhere leaves the edge exactly as unresolved as before, never guessed at.
+
+What that walk cannot settle is a name **two** branches offer at the same
+depth — `export * from "./a"; export * from "./b"` where both declare
+`mutate`. All a name-matching walk sees is two equally good candidates, so it
+leaves the edge alone. The language does have an answer, and the semantic pass
+(`plugins/js-ts/src/semanticPass.ts`) asks the compiler for it rather than
+reimplementing it. Measured against TypeScript 5.9.3 on exactly that fixture:
+
+| asked | answer |
+| --- | --- |
+| `tsc --noEmit` | `TS2308: Module "./a" has already exported a member named 'mutate'`, reported on the **second** `export *` — a diagnostic about the barrel, not one that removes the name from a consumer's view |
+| `definition` at a consumer's `import { mutate } from "./index"` | exactly **one** location, in `a.ts` |
+| `quickinfo` at the call site | `(alias) mutate(): "a"` |
+| the same, with the two `export *` statements swapped | `b.ts` |
+
+So the rule is *the first `export *` in the barrel's own source order that
+offers the name* — not the first file alphabetically, not the shortest chain —
+which is `extendExportSymbols` in the checker: the first star export to
+contribute a name keeps it, and later ones only add to the TS2308 collision
+list. The pass re-sends the edge under its own id with `source: "ts-compiler"`,
+`resolved: true` and the declaration it landed on, and core's `apply_diff`
+rewrites the row in place.
+
+To keep that cheap, the pass only ever asks about a placeholder whose target
+file does **not** itself declare the name: where it does, core's own walk
+reaches the same node in a lookup instead of a subprocess round trip, so the
+questions actually put to the checker are barrel questions — a small fraction
+of a project's imports. An answer is dropped, leaving the edge exactly as the
+structural pass left it, when the checker returns anything but a single
+location, when that location is outside what this index holds (a
+`node_modules` or gitignored declaration), or when the declaration is of the
+wrong kind for the edge.
 
 Unlike an import placeholder, a linked-away symbol placeholder is kept rather
 than deleted: it carries one edge per usage, so a later edit to the same file
@@ -411,6 +572,13 @@ erDiagram
         string nativeKind "language-specific detail, e.g. trait_impl"
         bool hasSyntaxErrors "on File nodes"
     }
+    DECLARATIONS {
+        string nodeId FK
+        int ordinal PK "source order, what toDeclaration names"
+        string range "start/end line-col of this declaration"
+        string signature "this declaration's own"
+        bool hasBody "implementation, not an overload signature"
+    }
     EDGES {
         string id PK
         string fromId FK
@@ -418,6 +586,7 @@ erDiagram
         string kind "DEFINES, IMPORTS, CALLS, SUPERTYPE_OF, REFERENCES, EXPORTS"
         string source "tree-sitter | ts-compiler"
         bool resolved
+        int toDeclaration "which overload this call bound; NULL for all but"
     }
     VECTORS {
         string nodeId FK
@@ -433,6 +602,7 @@ erDiagram
     NODES ||--o{ EDGES : "fromId"
     NODES ||--o{ EDGES : "toId"
     NODES ||--o| VECTORS : "has"
+    NODES ||--o{ DECLARATIONS : "written as (none unless several)"
 ```
 
 Granularity is symbol-level: `File`, `Module` (namespace/package/crate),
@@ -450,6 +620,371 @@ for it, so the `IMPORTS` edge has somewhere to point (see
 [Import resolution](#import-resolution)). Such a node's `filePath` is the
 file the specifier is *written in*, not a file it names — nothing else in the
 model works that way, and the query layer accounts for it.
+
+<a id="overloads"></a>
+### Overloads and merged declarations: one node per declaration group
+
+One symbol can be written as several declarations — TypeScript overloads, an
+interface or namespace merged across statements, a function that also carries
+a namespace. A node's identity does not mention position or signature
+(`nodeIdFor` = `hash(filePath, kind, qualifiedName, nativeKind)`, deliberately,
+so ids survive edits elsewhere in the file), so all of them land on one node
+and everything but the first is discarded.
+
+Measured on a fixture with every shape of this (Node 20.6.1, TypeScript 5.9.3,
+`plugins/js-ts/src/extract.ts` at release 0.19.0), the damage was worse than
+"the first declaration wins" — the first two below are what the extractor did
+before this design landed in it, kept as the measurement the design answers:
+
+- **Top-level overload signatures are dropped entirely.** `tree-sitter`
+  parses `export function parse(input: string): string[];` as
+  `function_signature`, a type `Extractor.visit` has no case for, so it falls
+  through to a plain child walk. `parse` gets exactly one node, built from the
+  implementation, and its `signature` is
+  `parse(input: string | number, radix?: number): any` — the one signature
+  TypeScript deliberately never shows a caller.
+- **A class method's overloads split the method in two.** `methodNativeKind`
+  maps `method_signature` → `"method_signature"` and `method_definition` →
+  `"method"`, and `nativeKind` is part of the id, so `Repo#find` with two
+  overloads and an implementation becomes **two** nodes — one holding the
+  first signature, one holding the implementation — and the second overload is
+  lost. `get_file_outline` already answers that file with a confusing extra
+  row today.
+- **Nothing anywhere records which overload a call site binds to**, which is
+  the question the semantic layer exists to answer.
+
+**TypeScript's own model, measured rather than assumed.** Every row below is
+a real `tsserver` answer against that fixture, through
+`plugins/js-ts/src/semantic.ts`'s live child:
+
+| asked of `tsserver` | overloaded `parse` (2 sigs + impl) | merged `interface Options` (2 decls) | `class Model` + `interface Model` |
+| --- | --- | --- | --- |
+| `navtree` (its own file outline) | **one** row, `spans: 3` | **one** row, `spans: 2`, members unioned | **two** rows, `spans: 1` each |
+| `definition` at a use | **1** location — the overload actually bound | 2 locations | 2 locations |
+| `definition` at the import specifier | 3 locations | 2 locations | 2 locations |
+| `navto` (search by name) | 1 row, at the implementation | 2 rows | 2 rows |
+| `quickinfo` | first *call* signature + `(+1 overload)` | `interface Options` | — |
+| `references` from any one declaration | the same whole-symbol answer from all three | — | — |
+
+Two facts decide the design. First, `definition` at a call site really does
+return the single bound overload (`parse("x")` → the `string` signature,
+`parse(10, 16)` → the `number` one; likewise for class and interface methods),
+so the call-site question is answerable. Second, `tsserver` does **not**
+distinguish "overload" from "merge" anywhere: both are one symbol with N
+declarations, and what separates a merge from a genuinely separate symbol is
+the *declaration kind*, not the number of declarations. Its outline groups by
+(name, kind) and hangs N spans off the row — which is precisely what
+`nodeIdFor` already keys on:
+
+| declarations in one file | `tsserver` `navtree` | g-mesh nodes today | agree? |
+| --- | --- | --- | --- |
+| `function parse` ×3 (2 sigs + impl) | 1 row, 3 spans | 1 node | yes |
+| `interface Options` ×2 | 1 row, 2 spans | 1 node | yes |
+| `namespace NS` ×2 | 1 row, 2 spans, members unioned | 1 node, members unioned | yes |
+| `function widget` + `namespace widget` | 2 rows | 2 nodes | yes |
+| `class Model` + `interface Model` | 2 rows | 2 nodes | yes |
+| `get value` + `set value` | 2 rows (`getter`, `setter`) | 2 nodes | yes |
+| `find` ×3 in a class body | 1 row, 3 spans | **2 nodes** | **no** |
+
+So the node id scheme is already isomorphic to TypeScript's own grouping, in
+every case but the last. **The identity scheme is kept; what it was missing is
+that a node holds only one declaration's worth of data.**
+
+**The rule.** Two declarations in one file belong to the same node **iff they
+agree on `(filePath, kind, qualifiedName, nativeKind)`**. Overloads and merges
+are the same fact under this rule, deliberately — TypeScript treats them the
+same way, and the existing merged-namespace behaviour (one `Module` node,
+members unioned from both statements) is already right and stays untouched.
+What distinguishes an overload set is not identity but whether its
+declarations carry *distinct call signatures*, which is a property of the
+declaration list; and *which* one a given use binds to is a property of a call
+site, which is why it belongs on an edge and not in a node.
+
+**The shape.**
+
+- A node gains an ordered **declaration list** — one entry per declaration in
+  source order, each with its own range, its own `signature`, and whether it
+  has a body. Stored as a `DECLARATIONS` child table (`nodeId` FK, `ordinal`,
+  range, `signature`, `hasBody`), written only for nodes with more than one
+  declaration, so an ordinary symbol costs zero extra rows and its NDJSON wire
+  shape is byte-identical to today's.
+- The node's own flat fields stay, and stay primary — which is what keeps
+  every single-declaration node bit-for-bit unchanged. For a multi-declaration
+  node they are filled the way TypeScript's own tools fill them: **range** from
+  the implementation if there is one, else the first declaration (what `navto`
+  points at); **`signature`** from the first *call* signature, never the
+  implementation's (what `quickinfo` displays); **`docComment`** from the first
+  declaration that has one; **`exported`** OR'd across all of them, as today.
+- An edge gains **`toDeclaration`** — an ordinal into the target node's
+  declaration list, set only by the semantic pass, only on `CALLS`, and only
+  when the target really has more than one call signature. It participates in
+  edge identity, via `edgeIdFor(from, kind, to, toDeclaration?)` appending it
+  to the hashed string when it is there and appending *nothing* when it is
+  not — deliberately unlike `nodeIdFor`, which always hashes a field for
+  `nativeKind ?? ""`; a trailing separator would be enough to move every
+  existing edge id, and the point is that **no existing edge id changes**.
+  Participating in identity is what lets one function calling two overloads
+  store both bindings instead of one overwriting the other. Ordinal `0` is a
+  real binding and hashes differently from an absent one.
+- `schema_version` 4 → 5. A mismatch wipes and rebuilds, so there is no
+  migration to write.
+
+**What each MCP tool answers for a multi-declaration symbol.**
+
+| tool | behaviour |
+| --- | --- |
+| `get_file_outline` | One row per node, as today — an overloaded function is listed **once**, matching `navtree`. Rows for multi-declaration symbols carry `declarationCount` and, for functions, `signatures` (all call signatures, implementation excluded). The only row-count change on any real file is that `Repo#find`'s spurious second row disappears. |
+| `find_definition(symbolName)` | One node. An overloaded or merged name is **not** `ambiguous` — it is one symbol, so no candidate page is returned and no extra round trip is forced. The node carries `signatures` and `declarations` when there is more than one; its `signature`/range are the primary ones above, which is a straight fix to today's answer for `parse`. |
+| `find_definition(file, position)` | Same node as by name. At a call site the semantic pass annotated, the response also carries `boundDeclaration` (the ordinal) so the caller learns which overload that position binds — the direct mirror of `tsserver`'s own single-location `definition`. |
+| `find_callers` | Unchanged row set: inbound `CALLS` **grouped back to one row per caller**, so page sizes, `limit` and pagination behave exactly as today even though storage now holds one edge per bound overload. A row additionally carries `boundSignatures` naming which overloads that caller binds. Anchoring by `symbolId` means the whole symbol; there is no per-overload anchor, and none is offered. |
+| `find_callees` | Mirror image: one row per callee symbol, with `boundSignatures` when the callee is overloaded. |
+| `find_references` | Symbol-wide, unpartitioned — which is what `tsserver` itself does: asked from any one of `over`'s three declarations it returned the same whole-symbol answer, three times identically. Other declarations of the same symbol are declarations, not usages, so they do not appear as reference rows (unchanged from today). |
+| `find_implementations` | Unaffected. `SUPERTYPE_OF` is type-level and has no per-declaration variant; a merged interface is one node, so it keeps giving one answer rather than one per merged statement. |
+| `get_dependencies` | Unaffected — `File`/`Module` granularity. |
+| `search_code` | Unaffected: still one vector per node (`VECTORS.nodeId`), with all call signatures available as embedding input. |
+
+**Why not a node per overload declaration.** It is the obvious shape and it was
+rejected on three counts. (1) A per-overload id cannot use position — ids must
+survive edits elsewhere in the file — so it would have to hash the signature
+text, which makes *renaming a parameter* a delete-plus-insert: every inbound
+edge is destroyed and rebuilt and the node's embedding vector is evicted, on an
+edit that changed nothing semantic. (2) `find_definition("parse")` would start
+answering with an `ambiguous: true` candidate page for a name that is not
+ambiguous at all, forcing a second round trip on the single most common lookup
+— the exact cost the `symbolName` anchor was added to remove. (3) It gives no
+account of merges, so it needs the merge rule as a *second*, separate
+mechanism anyway; the shape above needs one rule for both because TypeScript
+has one. Its genuine advantage — an inbound edge onto a specific overload is
+addressable by plain node id, with no new edge column — is real but small
+against those.
+
+**Known limitation, unchanged by this.** `class Model` + `interface Model` are
+one symbol to TypeScript but two nodes here, since a `Type` node cannot be both
+at once, so `find_definition("Model")` returns an ambiguous pair. That is
+pre-existing and deliberate (the two declarations carry genuinely different
+information), and `tsserver`'s own outline lists them as two rows too.
+
+**Implementation follow-ups.** In `extract.ts`, **done**: `function_signature`
+is in the declaration switch, so a top-level overload signature is seen at all
+and lands on its implementation's node; `methodNativeKind` no longer returns
+`method_signature`, so a method's signatures and its implementation share one
+node (`getter`/`setter`/`constructor`/`abstract_method` keep splitting, and
+`navtree` agrees — it labels a signature-only interface method `method` as
+well). Two consequences of `nativeKind` being part of the id: the choice must
+be made when a declaration is first seen and can never be "upgraded" once the
+node exists, and dropping `method_signature` changed the id of every interface
+and overload-signature method — a one-time reindex, which `indexer_version`
+already forces from the rebuilt plugin's own digest. A node that has more than
+one declaration now carries the ordered list, and its primary range, signature
+and doc comment are filled from the group as described above.
+
+The storage half is **done**: the `DECLARATIONS` table, the `toDeclaration`
+edge column, `edgeIdFor` hashing it, `schema_version` 4 → 5 — which is also
+what puts `declarations` on the wire (`toWireNode` deliberately does not send a
+field core would drop, and `nodesEqual` deliberately does not compare one,
+which would otherwise churn a byte-identical node out of an edit to an
+overload).
+
+The semantic pass filling `toDeclaration` is **done** too, as a third question
+in `semanticPass.ts` beside the namespace and re-export ones. `definition`
+asked at the *callee token* is the whole mechanism, and the measurement that
+settles it is the row above: at a call site it returns **one** location, the
+overload TypeScript's own resolution picked (`parse("x")` → ordinal 0,
+`parse(10, 16)` → ordinal 1; class methods likewise), where the same request at
+an import specifier returns all three declarations unranked. `quickinfo` was
+the alternative — it does put the resolved signature first — but it answers in
+prose that would have to be matched back against a declaration's `signature`
+string, whereas a position matches a declaration's own range exactly. So the
+ordinal is read by containment against the extractor's declaration ranges, not
+by comparing signature text.
+
+Three things that fell out of building it, none of them obvious from the design
+above:
+
+- **The extractor had to start recording call-site positions** — an edge
+  carries none (identity is `(from, kind, to)`), so by the end of the walk
+  *where* a call was written is simply gone. `ExtractResult.overloadCallSites`
+  is that record, kept only where an answer could differ from what is already
+  stored: a target this file declares with more than one declaration, or one in
+  another file the walk must not read. The pass then drops the second group
+  against the target file's own extraction, so the round trips actually spent
+  are the calls to things really written more than once.
+- **A node's own range does not cover its overload signatures.** For a
+  multi-declaration node the primary range is the *implementation's* (see
+  above), so a `definition` landing on a signature three lines up falls outside
+  the very node it belongs to. Matching has to go through the declaration list,
+  which is also what makes it yield the node and the ordinal in one step.
+- **The collapsed edge has to be retracted, not merely superseded.** The bound
+  edges have ids the structural pass never emits (`edgeIdFor` hashes the
+  ordinal in), so adding them would leave the unbound edge to be linked
+  alongside — three `CALLS` edges for a caller of two overloads, one of them
+  saying strictly less. It goes out for deletion in the same diff, and only
+  when *every* call site behind it resolved; a partial answer leaves it exactly
+  as the structural pass wrote it. For the same reason the bound edges are
+  booked for retraction like the namespace half's: nothing else can retract an
+  id nothing else emits.
+
+Not reached, and deliberately: a call whose target arrives through a re-export
+is bound to the symbol but not to an overload (the barrel does not declare it,
+and following the chain is the second question's job), and a method called
+through a variable receiver (`r.find("a")`) has no `CALLS` edge to bind in the
+first place. Both leave the structural layer's own answer standing, which is
+the standing rule — a missing refinement beats a wrong one.
+
+<a id="generics"></a>
+### Generic types: the written syntax is indexed, instantiation is not
+
+The graph is symbol-level and its edges answer one question: *which symbol
+mentions which*. A generic type is a symbol like any other, and a type
+argument is a mention like any other — but an **instantiation** is not a
+symbol at all. `Box<Widget>` will never be a node: it has no declaration site,
+there is one of it per use, and nothing in the data model could carry it.
+That is the line, and everything below follows from where it falls.
+
+Unlike the release's other three sub-problems, generics arrived with no
+failing test to anchor on — so the first job was finding out what is actually
+lost. Measured against the `tree-sitter-typescript` 0.23 grammar and
+`plugins/js-ts/src/extract.ts` at release 0.19.0, it is three drops, all of
+them of *explicitly written* names, none of them requiring a type checker to
+see:
+
+| written | recorded before this landed | why |
+| --- | --- | --- |
+| `x: Box<Widget>` | `Widget` only | `generic_type` holds its head in a field called `name`, and `isBindingPosition` read *every* `name` field as a declaration — so the head was discarded as if it were being bound. The plain `x: Box` in the same position was recorded. |
+| `class W extends Box<Widget>`, `implements Reg<Widget>`, `interface I extends Base<Widget>` | `Box`/`Reg`/`Base` only, as `SUPERTYPE_OF` | `heritageNames` returns the head and never descends into `type_arguments`; the clause itself was never walked, so nothing else saw them either. |
+| `new Box<Widget>()`, `make<Widget>()` | neither | `handleCall`/`handleNew` read the `function`/`constructor` and `arguments` fields. `type_arguments` is a third field on those nodes, and nothing read it. |
+
+How much that costs depends entirely on whether a project declares generic
+types of its own, so it was counted on the bench corpora rather than guessed
+(non-`.d.ts` `.ts`/`.tsx`, `node_modules` and build output excluded):
+
+| corpus | files | generic types declared | `X<…>` head uses dropped | bare `X` uses kept | heritage type args dropped | call/`new` type args dropped |
+| --- | --- | --- | --- | --- | --- | --- |
+| excalidraw | 614 | 81 of 689 | 665 | 108 | 10 of 12 | 610 of 801 |
+| task-tracker-mcp | 46 | 0 of 51 | 0 | 0 | 0 | 0 of 8 |
+| g-mesh `plugins/js-ts/src` | 13 | 1 of 74 | 1 | 0 | 0 | 16 of 53 |
+
+(The last two columns count only arguments naming a type the project itself
+declares; a `Map<string, number>` loses nothing, because neither `Map` nor
+`string` is a node here.)
+
+Two numbers decide it. First, **68 of excalidraw's 81 project-declared generic
+types are never once written bare** — every use is `X<…>` — so
+`find_references` on them returned nothing at all beyond whatever a
+heritage clause happened to contribute. A generic type is written with its
+arguments essentially always; that is what makes it generic. Second, this was
+not only other people's code: `find_references("ExtractedEdge")` in *this*
+repo listed neither `Extractor` nor `PassOutput`, the only two symbols that
+hold one, because both hold it as `new Map<string, ExtractedEdge>()`. Same
+for `ExtractResult` and `ProjectIndex`, and for `ImportBinding` and
+`Extractor`.
+
+**What is built.** Three changes in the structural pass, no schema change,
+no new node or edge kind, no checker:
+
+1. **A generic type's own name is a reference.** `isBindingPosition` no longer
+   claims `generic_type`'s `name` field, so `Box<Widget>` records `Box`
+   exactly as `Box` alone already does. This is the one that matters; the
+   other two are the same principle at the sites a special-cased handler
+   skips.
+2. **Explicit type arguments are references.** The `type_arguments` of a
+   heritage clause, a call expression and a `new` expression are walked like
+   any other type position. The heritage case walks *only* the
+   `type_arguments` subtree, never the clause (`visitHeritageTypeArguments`):
+   the head is already a `SUPERTYPE_OF` edge, and `find_references` unions
+   `SUPERTYPE_OF` with `REFERENCES`, so walking the whole clause would report
+   one referencing symbol twice.
+3. **Type parameters are scoped bindings.** A declaration's own `<T, …>`
+   names shadow file-level types inside it (`typeParameterScope`), tracked the
+   way `LocalBindings` already tracks value locals — in a chain of their own,
+   because the shadowing is one-way: a type parameter hides a *type* of that
+   name and nothing else, so only a type-position reference consults it.
+   Untracked, `interface T {…}` plus `class Box<T> { item: T }` in one file
+   emits a wrong `REFERENCES Box -> T` onto the interface. That was
+   pre-existing, and it is the reason this landed *with* (1) and (2) rather
+   than after: those multiply the names resolved out of type positions by
+   roughly seven, and a type argument written inside a generic function is
+   usually a type parameter. Measured, the collision is rare — across
+   excalidraw's 449 type parameters, no file uses one whose name it also
+   declares or imports — but "a missing edge beats a wrong one" is the
+   standing rule, and the guard is cheap.
+
+Fixtures (one file each, asserted through `extractFile` exactly as
+`plugins/js-ts/test/extract.test.ts` already asserts `SUPERTYPE_OF`):
+
+```ts
+// (1) the head of a generic type
+export class Widget {}
+export class Box<T> {}
+export const held: Box<Widget> = null!;   // REFERENCES held -> Box  AND  held -> Widget
+export type Held = Box<Widget>;           // REFERENCES Held -> Box  AND  Held -> Widget
+
+// (2) explicit type arguments
+export interface Reg<T> {}
+export class WidgetBox extends Box<Widget> implements Reg<Widget> {}
+//   SUPERTYPE_OF WidgetBox -> Box, -> Reg   (unchanged, and NOT duplicated as REFERENCES)
+//   REFERENCES   WidgetBox -> Widget        (new, once, not twice)
+export function build() {
+  return new Box<Widget>();               // REFERENCES build -> Widget
+}
+
+// (3) a type parameter is not a reference to the type of the same name
+export interface T { tag: string }
+export class Holder<T> { item: T }        // NO edge Holder -> T
+```
+
+**Deliberately out of scope.** Each of these was investigated against real
+code rather than waved off, and each is out for a different reason:
+
+- **Instantiating a type parameter at a use site** — `box.get().spin()`
+  resolving to `Widget#spin` when `box: Box<Widget>`. Not out because it is
+  hard: asked through the existing plumbing
+  (`SemanticProject.definition`, a plain point query), `tsserver` answers it
+  correctly and with no generics-specific code — `box.get().spin()` lands on
+  `Widget#spin` and `other.get().spin()` on `Gadget#spin` in the same file.
+  It is out because **generics is not what blocks it**. The structural pass
+  emits no edge for *any* method call on a variable receiver, generic or not:
+  `box.get()` itself produces nothing, since `resolveCall` drops a call whose
+  receiver is a local binding, and `.spin()` on the result of a call is not
+  even recorded. Until typed-receiver resolution exists as a
+  feature of its own, instantiating `T` buys exactly nothing; once it exists,
+  the checker instantiates `T` for free. Either way it is not generics work.
+- **A concrete return type in `signature`** — `Box<T>.get(): T` rendered as
+  `get(): Widget`. There is no such thing to store: a generic method has one
+  concrete return type *per use site*, and `signature` is one string per
+  declaration. Writing any one of them into the node would be a claim the
+  language does not make. (`definition` cannot answer it either — asked at
+  `identity(1)` it returns the declaration of `identity`, not an
+  instantiation. It would need `quickinfo`, which is not in the plumbing.)
+- **Mixin base classes** — `function Loud<TB extends Ctor<Base>>(B: TB) {
+  return class extends B {…} }`. Recovering `Base` means resolving a type
+  parameter's constraint to a construct signature and taking its instance
+  type: real instantiation, and the head of the rabbit hole this section
+  exists to stay out of. It is also vanishingly rare — excalidraw contains
+  two anonymous `class extends` sites and both extend a concrete class.
+- **`find_implementations` through a constraint bound** — the candidate this
+  scope started from, and measured to be **not a gap**.
+  `class NumberBox implements Container<Comparable>` already produces
+  `SUPERTYPE_OF NumberBox -> Container`, because heritage matching strips the
+  arguments and matches the head by name; and `T extends Comparable` is a
+  constraint, not a subtype relation of the declaring type, so it correctly
+  becomes an ordinary `REFERENCES`. Nothing to build.
+- **Type alias transparency** — `type Handler<T> = BaseHandler<T>` then
+  `implements Handler<string>` points `SUPERTYPE_OF` at the alias, so
+  `find_implementations(BaseHandler)` misses the class. A real gap, but not a
+  generic one: a non-generic alias behaves identically. It is also not
+  reachable through this plumbing — `definition` at `Handler` in the
+  implements clause returns the *alias* declaration, exactly where the
+  name-matching walk already stops, so it would need `typeDefinition` or a
+  checker-side walk. Its own ticket.
+- **Full bidirectional type inference** — the standing no. g-mesh does not
+  and will not compute types; where a type is needed, it asks the compiler
+  that already computed it.
+
+The through-line: **the generics gap in g-mesh is a syntax-visibility gap,
+not a type-inference gap.** Everything worth building is a name someone
+wrote down and the walker skipped; everything that needs a type computed is
+either already the checker's job or has no consumer among the MCP tools.
 
 ## Interfaces
 
@@ -567,9 +1102,19 @@ tighter default.
 
 ### Core ↔ language plugin protocol
 
-- **Control plane** (reindex requests, file-changed notifications, status):
+- **Control plane** (reindex requests, file-changed notifications, status,
+  semantic-pass requests):
   JSON-RPC 2.0 with LSP-style framing (`Content-Length` header + JSON body)
-  — chosen so a `tsserver`-based plugin needs almost no adapter.
+  — chosen partly so a `tsserver`-based plugin needs little adapter code.
+  Measured against a real `tsserver` (see [TS semantic layer](#ts-semantic-layer)),
+  that holds for half the wire and not the other: `tsserver`'s *output* is
+  byte-identical `Content-Length: N\r\n\r\n{body}` framing, which
+  `plugins/js-ts/src/jsonrpc.ts`'s `FrameReader` parses verbatim, but its
+  *input* is newline-delimited JSON and it rejects a `Content-Length` frame
+  outright (`Unexpected token 'C', "Content-Length: 45" is not valid JSON`),
+  with a `{seq, type: "request", command, arguments}` envelope rather than
+  JSON-RPC 2.0's `{jsonrpc, id, method, params}`. "Almost no adapter" was
+  optimistic; ~40 lines is the real figure.
 - **Bulk graph transfer** (initial full index): NDJSON, one compact JSON
   object per line, streamed rather than buffered. Producer must emit
   single-line compact JSON; core's parser strips trailing `\r` (Windows)
@@ -582,6 +1127,217 @@ tighter default.
   (first-party or third-party) against the protocol — correct edge
   kinds/types, valid NDJSON framing — independent of how complete that
   plugin's language coverage is.
+- **`semanticPass`**: core asks for the semantic layer's answer with a
+  control-plane request like any other — core-initiated, one round trip,
+  answered with the *same* diff shape `fileChanged` answers with. It is sent
+  at two moments: once the cold-start walk has committed and the daemon has
+  begun serving off it, and again after each incremental reparse settles.
+  Its `params.filePaths` is a list rather than a single path because those
+  two moments differ in kind; an **empty** list is the cold-start case and
+  means "everything indexed so far", not "nothing".
+
+  The diff it answers with goes through the pipeline an ordinary reparse
+  already runs (`apply_diff` → `imports::link_diff` →
+  `symbol_links::link_diff`) and needs no storage or schema work of its own:
+  an edge id is derived from the edge's content, so a re-sent edge is
+  upserted onto its existing row, flipping exactly its `source`
+  (`tree-sitter` → `ts-compiler`) and `resolved` (`false` → `true`) and
+  leaving every edge the pass did not answer for untouched.
+
+  **Not every answer is an upgrade.** `import * as ns from "./mod"` followed
+  by `ns.someExport()` has no edge to upgrade at all: the structural pass
+  never sees the bare name `someExport` at the use site, only a property
+  access on a module object, so it emits nothing for it — deliberately, since
+  telling that apart from an ordinary property access needs a checker. The
+  pass therefore *adds* an edge, and adds the pending-symbol placeholder it
+  hangs on, addressed at the declaration `tsserver`'s `definition` reported
+  rather than at the module the namespace names. Addressing it that way is
+  the point: the checker has already followed the alias chain, so a member
+  republished by a barrel and renamed on the way lands on the file that
+  really declares it. From there `symbol_links::link_diff` links it exactly
+  as it links a named import's placeholder — the address is the whole
+  contract, and `source` is the plugin's to set, so a repointed edge keeps
+  saying `ts-compiler`. Retracting an edge whose call site an edit deleted is
+  the pass's own job (the reparse diff never knew about it), which is why the
+  plugin remembers what it last emitted per file
+  (`plugins/js-ts/src/semanticPass.ts`).
+
+  **Which unresolved edges are re-asked**: only those whose target file does
+  not itself declare the name. Where it does, core's own walk reaches the same
+  node in a lookup and a round trip would buy nothing; where it does not, the
+  name comes through a re-export chain, which is the family that walk
+  documents as beyond it. Two shapes fall in it. One is a barrel with two
+  `export *` branches offering a name — ambiguous to a name-matching walk,
+  settled in the language, which hands a consumer the first branch to offer
+  it. The other is `export default class Foo {}` imported as
+  `import Bar from "./x"`: the edge is addressed at `x.ts#default`, a name no
+  file ever declares, so no chain will ever produce it — while `definition` at
+  the importer's own binding lands straight on `Foo`. The local name (`Bar`)
+  is not the difficulty and never reaches the index at all, which is also why
+  every importer of that default is answered the same way whatever each of
+  them called it (`core/tests/default_export_linking.rs` follows one through
+  to a `find_references` answer).
+
+  A failed pass is logged and dropped, never propagated. It improves a graph
+  that is already committed and serviceable, so failing the reparse (or
+  daemon startup) because the checker was unavailable would trade a better
+  answer that did not arrive for a worse one that did.
+
+<a id="ts-semantic-layer"></a>
+### TS semantic layer: `tsserver` subprocess, not the in-process compiler API
+
+The JS/TS plugin's semantic pass drives TypeScript's own type checker
+through a **`tsserver` child process**, not through `ts.createProgram` /
+`ts.createLanguageService` inside the plugin process.
+
+Both shapes give *identical answers* — same compiler, same checker, and the
+prototypes agreed symbol-for-symbol on every probe (136 of 200 identifier
+probes resolved, same 136 under both). So the choice is not about
+correctness; it is about where the compiler's cost and its failure modes
+land. Numbers below are measured, not estimated: Node 20.6.1, TypeScript
+5.9.3, macOS/arm64, against `task-tracker-mcp` (46 root files, ~7.3k LOC,
+`node_modules` present) and `excalidraw` (618 root files, a real
+multi-package monorepo with `paths` aliases — measured *without* its
+`node_modules`, so its figures are a floor, not a real-world number).
+
+| | in-process (`LanguageService`) | `tsserver` subprocess |
+| --- | --- | --- |
+| First semantic answer, 46 files (median of 5) | **1686 ms** (1466–1825) | 2527 ms (2328–2643) |
+| First semantic answer, 618 files | **2626–2738 ms** | 2447–2469 ms |
+| Worst event-loop stall reaching it, 46 files | 1677 ms (1456–1815) | **26 ms** (3–44) |
+| Worst event-loop stall reaching it, 618 files | 2618–2729 ms | **8–41 ms** |
+| Plugin-process RSS once warm, 46 files | 243.6 MB | **24.9 MB** (+265 MB in the child) |
+| Plugin-process RSS once warm, 618 files | 359–369 MB | **25.7–26.0 MB** (+314–316 MB in the child) |
+| Re-query after one edit | 84 ms | **44 ms** |
+| Per-edge cost over 200 probes, cold | 3.20 ms | **3.06 ms** |
+| Per-edge cost over 200 probes, warm | ~1 ms (direct call) | 0.47 ms incl. round trip |
+
+Four things decided it, in order of weight.
+
+**1. The compiler API is synchronous, and the pass is specified as async.**
+The [cold-start diagram](#1-cold-start--initial-index) already draws the
+semantic pass as `par, async, non-blocking` alongside the plugin's other
+work. In-process that drawing is false: the plugin is one Node event loop
+that also carries the control plane and the tree-sitter reparse path
+(`plugins/js-ts/src/incremental.ts`), and building a `Program` stalls it in
+one unbroken block — **1677 ms** on a 46-file project, **2729 ms** on 618
+files, versus **26 ms** worst-case with the subprocess. A `fileChanged`
+notification arriving in that window simply is not served. Recovering async
+in-process means a `worker_thread`, which is a subprocess with extra steps,
+worse isolation, and no version fidelity (point 4).
+
+**2. Blast radius.** The semantic pass is an *optional upgrade* over an
+index that already works without it, so it must not be able to take that
+index down. Capping the heap at 80 MB to force the compiler to OOM: the
+in-process plugin died outright (`SIGABRT`, exit 134), which under
+[plugin-crash handling](#failure-modes--edge-cases) costs a relaunch and a
+dirty-file replay of the *structural* layer too. The same cap applied to
+the child left the plugin alive at 24.9 MB with an uninterrupted heartbeat,
+free to report the failure and keep serving tree-sitter queries. g-mesh
+targets repos where the compiler OOMing is a real outcome, not a
+hypothetical.
+
+**3. The memory is reclaimable, and it is only paid when used.** Killing
+the child returns all ~265 MB to the OS. In-process it does not come back:
+after `service.dispose()` plus two forced GCs (which needs `--expose-gc`,
+so the real plugin would do worse) RSS settled at 146.4 MB, against a
+30.8 MB tree-sitter-only baseline. Worse, merely `require`ing the compiler
+— zero compiler work done — costs **+61.5 MB permanently** (21.6 MB bare
+Node → 92.3 MB), a tax paid on every plugin process including plain-JS
+projects with no `tsconfig.json` that will never run a semantic pass. Both
+shapes need `typescript` as a runtime `dependencies` entry either way
+(`tsserver` ships *inside* that package), so promoting it is not a cost
+unique to the in-process shape — but only the subprocess shape gets to not
+*load* it.
+
+**4. Version fidelity.** The subprocess can be spawned from the *target
+project's own* `node_modules/typescript/lib/tsserver.js` (verified present
+and independently spawnable), falling back to the bundled copy — so a
+project pinned to an older TypeScript is analyzed by the compiler it
+actually builds with. The in-process equivalent is `require`ing an
+arbitrary-version 9.1 MB compiler into the plugin's own heap: API drift on
+every version, and arbitrary project code executing in-process.
+
+**The one real cost on the security side, and how it is paid.** This is
+the single axis where the in-process shape is genuinely better, and it was
+nearly missed: the plugin's `security.test.ts` encodes the [Security
+Model](#security-model)'s first mitigation as an executable invariant, and
+the prototype tripped it. All three results below come from that file's own
+malicious-plugin fixture, pointed at each shape in turn.
+
+A bare in-process `LanguageService` never loads a project's
+`compilerOptions.plugins`: the config parser does surface them
+(`options.plugins` came back as `[{name: "evil-ts-plugin"}]`), but nothing
+acts on them — plugin loading lives in tsserver's `Project`, not in
+`createLanguageService` — so the fixture answered semantics normally and
+never executed. The mitigation holds structurally, for free. tsserver *does*
+know how to load them, so the subprocess turns that structural guarantee
+into a default: with `--allowLocalPluginLoads` it **does** `require()` an
+attacker-controlled plugin out of the project's own `node_modules`; without
+it, it **does not**, and still answers semantic queries normally. The flag is off unless passed, so the mitigation survives
+— and `security.test.ts` now pins that neither it nor
+`--globalPlugins`/`--pluginProbeLocations` ever reaches the spawn, alongside
+`--disableAutomaticTypingAcquisition` (ATA npm-installs `@types/*`, and is
+the only network path in the `typescript` package). That is the same
+assurance shape the other mitigations already have — true by construction,
+pinned by a test that fails loudly — not a weakening of it. `child_process`
+is on that file's forbidden-pattern list as a shell-out proxy; the
+exemption is scoped to `semantic.ts` alone and bounded by a test asserting
+the only thing it ever spawns is Node itself with an argv array, never a
+shell. Running the checker out-of-process also *contains* any future
+compiler-side execution bug in a child rather than in the process holding
+the index.
+
+What (b) costs, and why it is affordable: **+841 ms** to the first answer
+on the small project (the child pays its own Node boot and module load
+serially). That lands entirely off the critical path — the pass is async by
+construction and the structural index is already queryable — and it
+*inverts* on the larger project, where the child is already ahead
+(2447–2469 ms vs 2626–2738 ms). Protocol overhead is **under 0.5 ms per
+edge** warm, far below the ~3 ms the checking itself costs, so a backlog of
+10k unresolved edges pays a few seconds of framing against minutes of real
+work. The adapter is ~40 lines.
+
+**`ts.createProgram` is ruled out explicitly**, separately from the
+in-process/subprocess axis: it is the worst option on every measured axis,
+including against the in-process `LanguageService`. Re-querying after a
+single edit took **715 ms** (570 ms rebuild with `oldProgram` reuse + 145 ms
+to answer) versus 84 ms, and RSS grew 235 → 338 MB across that one edit
+because the superseded `Program` stays reachable. Anything in-process would
+have to be `LanguageService`-shaped anyway.
+
+The incremental fit is the one place the two shapes are close, and it
+favours the subprocess for a reason worth recording: `tsserver`'s `change`
+command takes `{line, offset, endLine, endOffset, insertString}`, which is
+the shape `incremental.ts`'s `computeSourceEdit` **already derives** from
+its old/new text diff. The existing edit derivation feeds `tsserver`
+directly modulo 0-based-row → 1-based-line conversion, and the invalidation
+itself is `tsserver`'s problem rather than ours. Point queries are also
+per-*project*, not per-file: an unopened file answers in 2.2 ms — but only
+once some file in its project has been opened. Asked of a freshly spawned
+child, a `definition` on an unopened file fails outright with `No Project`,
+so the pass does keep one piece of open-file state after all (which files it
+has sent an `open` for, one notification each, no round trip), rather than
+none at all.
+
+The client is `plugins/js-ts/src/semantic.ts`: `SemanticServer` is the
+~40-line wire adapter over one child, `SemanticProject` its lifecycle — one
+child per project root, spawned by the first semantic question actually asked
+(never at plugin startup), replaced lazily if it dies, and stopped with the
+plugin on its stdin's `end`, with a `process.on("exit")` hook as the backstop
+against orphaning one. Under a `SIGKILL` neither can run, and there the
+backstop is `tsserver`'s own: it exits when its stdin closes. The project's
+`tsconfig.json` — `paths` aliases included — is applied by `tsserver`
+natively, from the file's own location upward, so nothing of
+`tsconfigPaths.ts` is reused here; `projectInfo` reports which config was
+actually in force, which is what the tests assert on rather than assuming.
+Turning answers into edges lives one file over, in
+`plugins/js-ts/src/semanticPass.ts`, so this one knows no g-mesh vocabulary at
+all: it decides which sites are worth a question and what an answer becomes in
+the graph (today, namespace-import member accesses — see
+[`semanticPass`](#core--language-plugin-protocol) above). The node and edge
+shape overloads resolve *into* is decided in
+[Overloads and merged declarations](#overloads).
 
 ### Shim ↔ daemon
 
@@ -732,13 +1488,20 @@ Cheap, targeted mitigations instead:
 - Plugins never load tsconfig-style `plugins` extension points that execute
   code at language-server startup (a known attack vector via a malicious
   `tsconfig.json`) — not needed for indexing, so skipping it removes the
-  vector for free.
+  vector for free. The structural layer never opens `tsconfig.json` at all;
+  the [semantic layer](#ts-semantic-layer) drives a `tsserver`, which *can*
+  load them, so it is spawned without `--allowLocalPluginLoads` (verified:
+  with the flag a plugin in the project's `node_modules` executes, without
+  it it does not) and without `--globalPlugins`/`--pluginProbeLocations`.
 - Plugins have no write access to the index at all — writes are core-only;
   the protocol only carries plugin → core diffs over stdio. Plugin file
   access is read-only on project source; write access, if any, is limited
   to the plugin's own temp/log files.
 - Plugins get no network access beyond what analysis strictly needs,
-  reinforcing "project content doesn't leave the machine".
+  reinforcing "project content doesn't leave the machine". For JS/TS that
+  means `tsserver` always runs with `--disableAutomaticTypingAcquisition`:
+  typings acquisition npm-installs `@types/*` for the project and is the
+  only network path the `typescript` package has.
 - The trust model is documented plainly: a plugin runs in the same trust
   zone as an editor's language server — no stronger guarantee is implied.
 
