@@ -54,6 +54,7 @@ use rusqlite::Connection;
 
 use crate::config::ProjectConfig;
 use crate::daemon::plugin::PluginProcess;
+use crate::embedding::EmbeddingPipeline;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
@@ -230,6 +231,14 @@ pub struct PluginSupervisor {
     /// the pid of a plugin that deliberately exited.
     pid_file: PathBuf,
     idle_timeout: Option<Duration>,
+    /// Loaded once at daemon startup and held for the supervisor's whole
+    /// life, the same way the plugin process itself is held across its own
+    /// sleep/wake cycles below - see `embedding::pipeline`'s doc comment for
+    /// why the model is too expensive to load per file or per node. `Arc`'d
+    /// because `daemon::run` shares the very same loaded model with the
+    /// cold-start bulk walk (`daemon::bulk_index::run`), which this
+    /// supervisor knows nothing about.
+    embedding: Arc<EmbeddingPipeline>,
     inner: Mutex<SupervisedPlugin>,
     last_activity: Mutex<Instant>,
     /// Mirrors `inner.dirty.is_empty()`, purely so the overwhelmingly common
@@ -247,6 +256,7 @@ impl PluginSupervisor {
         project_root: &Path,
         pid_file: PathBuf,
         idle_timeout: Option<Duration>,
+        embedding: Arc<EmbeddingPipeline>,
     ) -> Result<Arc<Self>> {
         let process = PluginProcess::spawn(project_root).context("failed to start the JS/TS plugin")?;
         write_pid_file(&pid_file, process.pid());
@@ -255,6 +265,7 @@ impl PluginSupervisor {
             project_root: project_root.to_path_buf(),
             pid_file,
             idle_timeout,
+            embedding,
             inner: Mutex::new(SupervisedPlugin { process: Some(process), dirty: DirtyQueue::default() }),
             last_activity: Mutex::new(Instant::now()),
             pending: AtomicBool::new(false),
@@ -284,7 +295,7 @@ impl PluginSupervisor {
         // while is the plugin being *used*, and an idle check that fired in
         // the middle of one would be measuring from the wrong end of it.
         self.touch();
-        if let Err(err) = process.apply_file_change(conn, file_path) {
+        if let Err(err) = process.apply_file_change(conn, file_path, &self.embedding) {
             eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
         }
     }
@@ -331,7 +342,7 @@ impl PluginSupervisor {
         self.touch();
         let mut replayed = 0;
         for file_path in &queued {
-            match process.apply_file_change(conn, file_path.clone()) {
+            match process.apply_file_change(conn, file_path.clone(), &self.embedding) {
                 Ok(()) => replayed += 1,
                 // One unreadable file must not cost the rest of the queue its
                 // replay; it is reported and the walk carries on, matching how
@@ -364,7 +375,7 @@ impl PluginSupervisor {
         let inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return Ok(false) };
         self.touch();
-        process.semantic_pass(conn, file_paths)?;
+        process.semantic_pass(conn, file_paths, &self.embedding)?;
         Ok(true)
     }
 
@@ -412,7 +423,7 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        process.ensure_fresh(conn, file_path)
+        process.ensure_fresh(conn, file_path, &self.embedding)
     }
 
     /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work.

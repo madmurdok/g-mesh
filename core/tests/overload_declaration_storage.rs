@@ -22,6 +22,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use g_mesh::daemon::bulk_index;
+use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -64,7 +65,8 @@ impl Project {
         schema::ensure_current(&conn, "overload-declaration-storage-test")
             .expect("failed to prepare the index");
         let conn = Mutex::new(conn);
-        let summary = bulk_index::run(self.root(), &conn).expect("the bulk walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &EmbeddingPipeline::disabled())
+            .expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()

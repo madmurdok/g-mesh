@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::plugin::plugin_entry_path;
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::write::{apply_diff, Diff};
@@ -93,7 +94,7 @@ pub struct BulkIndexSummary {
 /// `graph::symbol_links` its pending-symbol ones - by then every node either
 /// exists or never will, which is precisely why those steps cannot be folded
 /// into the stream.
-pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
+pub fn run(project_root: &Path, conn: &Mutex<Connection>, embedding: &EmbeddingPipeline) -> Result<BulkIndexSummary> {
     let entry = plugin_entry_path();
     let mut child = Command::new("node")
         .arg(&entry)
@@ -110,7 +111,7 @@ pub fn run(project_root: &Path, conn: &Mutex<Connection>) -> Result<BulkIndexSum
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
     let mut summary = BulkIndexSummary::default();
-    if let Err(err) = ingest(BufReader::new(stdout), conn, &mut summary) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, &mut summary, embedding) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -147,6 +148,7 @@ fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
+    embedding: &EmbeddingPipeline,
 ) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
@@ -177,12 +179,12 @@ fn ingest<R: BufRead>(
 
         batched += 1;
         if batched >= BATCH_ITEMS {
-            commit(conn, &mut batch)?;
+            commit(conn, &mut batch, embedding)?;
             batched = 0;
         }
     }
 
-    commit(conn, &mut batch)?;
+    commit(conn, &mut batch, embedding)?;
 
     // Only now, with the stream over: an import can only be linked to a file
     // that is already a node, and until the last batch is in there is no
@@ -203,12 +205,18 @@ fn ingest<R: BufRead>(
 
 /// Commits one batch and empties it, holding the connection only for as long
 /// as the transaction takes - the walk itself must not keep other readers out.
-fn commit(conn: &Mutex<Connection>, batch: &mut Diff) -> Result<()> {
+fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipeline) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
     let mut conn = conn.lock().unwrap();
     apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
+    // Best-effort, like every other embedding call - see
+    // `watcher::apply::round_trip`'s identical handling for why a failure
+    // here must not undo (or fail) a batch that is already durable.
+    if let Err(err) = embedding.apply(&conn, batch) {
+        eprintln!("g-mesh daemon: failed to embed a bulk-index batch: {err:#}");
+    }
     *batch = Diff::default();
     Ok(())
 }
@@ -272,7 +280,7 @@ mod tests {
 
     fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
-        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary)?;
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, &EmbeddingPipeline::disabled())?;
         Ok(summary)
     }
 

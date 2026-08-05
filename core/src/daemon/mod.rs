@@ -262,6 +262,16 @@ pub fn run(root: &Path) -> Result<()> {
         .context("failed to read the project's config.toml")?;
     let timeouts = IdleTimeouts::from_config(&project_config);
 
+    // Loaded once, here, for the same reason the idle timeouts are resolved
+    // once: everything downstream (the bulk walk, the plugin supervisor's
+    // whole lifetime) shares this one instance rather than paying to load
+    // ~600MiB of ONNX weights again per file or per node. A model that is not
+    // available on this machine does not stop the daemon - see
+    // `EmbeddingPipeline::load`'s doc comment - it just means nothing gets
+    // embedded until `core/scripts/fetch-embedding-model.sh` has been run.
+    let embedding_pipeline =
+        Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
+
     // A protocol mismatch (or the plugin failing to start at all) is a hard
     // daemon-startup failure, matching handshake::verify's philosophy - there
     // is nothing useful this daemon can do without its plugin.
@@ -273,7 +283,12 @@ pub fn run(root: &Path) -> Result<()> {
     // exists, not at the end of startup: a daemon that dies during its bulk
     // walk would otherwise leave a running plugin behind that nothing outside
     // this process could name (see `cli::stop`).
-    let plugin = PluginSupervisor::start(&canonical_root, dir.join(PLUGIN_PID_FILE), timeouts.plugin)?;
+    let plugin = PluginSupervisor::start(
+        &canonical_root,
+        dir.join(PLUGIN_PID_FILE),
+        timeouts.plugin,
+        Arc::clone(&embedding_pipeline),
+    )?;
 
     // Starts ticking at startup, so a daemon nobody ever connects to still
     // goes away on its own eventually rather than living until the machine
@@ -322,7 +337,7 @@ pub fn run(root: &Path) -> Result<()> {
     // serving nothing, and every later shim would find it listening, current,
     // and reuse it forever.
     if needs_bulk_index {
-        let summary = bulk_index::run(&canonical_root, &conn)
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
             .context("failed to build the project's initial index")?;
         // Flipped *before* the completion marker is written, and the order
         // matters. The two facts become true at the same moment - the walk is

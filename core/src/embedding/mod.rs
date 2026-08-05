@@ -17,5 +17,7 @@
 //! [`model`] on where weights are expected to already be.
 
 pub mod model;
+pub mod pipeline;
 
 pub use model::{cosine_similarity, default_model_dir, EmbeddingModel, EMBEDDING_DIM};
+pub use pipeline::EmbeddingPipeline;
