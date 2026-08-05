@@ -57,14 +57,11 @@ use crate::storage::write::Diff;
 /// A lazily-resolved embedding model plus the version string stored rows are
 /// tagged with, held for as long as the daemon runs.
 ///
-/// `version` is `config.embedding.model` - the project's *configured* choice,
-/// which is also what `EmbeddingConfig` documents as the source
-/// `meta.embedding_model` is meant to mirror. `meta.embedding_model` itself is
-/// not read here: nothing in this codebase populates it yet (see
-/// `storage::schema::record_version`), so it is not the live value today -
-/// task #51 is what makes the two agree. Reading the config directly, the way
-/// this and `EmbeddingModel::load` already do, is what stays correct once
-/// that lands too.
+/// `version` is `config.embedding.model` - the project's *configured* choice.
+/// [`apply`](Self::apply) keeps `meta.embedding_model` mirroring this same
+/// value on every call (see `storage::schema::set_embedding_model`), so a
+/// project's vector rows and its `meta` row always agree on which model
+/// produced them.
 pub struct EmbeddingPipeline {
     config: EmbeddingConfig,
     model: OnceLock<Option<EmbeddingModel>>,
@@ -121,6 +118,9 @@ impl EmbeddingPipeline {
     /// rows.
     pub fn apply(&self, conn: &Connection, diff: &Diff) -> Result<()> {
         let Some(model) = self.model() else { return Ok(()) };
+        if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.config.model) {
+            eprintln!("g-mesh daemon: failed to record the active embedding model ({err:#})");
+        }
         for node in &diff.upsert_nodes {
             if let Err(err) = embed_node(
                 model,
@@ -227,7 +227,7 @@ mod tests {
     fn a_disabled_pipeline_applies_as_a_no_op() {
         crate::storage::vectors::register_extension();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::storage::schema::apply(&conn).unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
 
         let pipeline = EmbeddingPipeline::disabled();
         let diff = Diff {
@@ -245,5 +245,9 @@ mod tests {
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 0, "a disabled pipeline must never write a vector row");
+
+        let recorded: Option<String> =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(recorded, None, "a disabled pipeline must never claim an active model either");
     }
 }
