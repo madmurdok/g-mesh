@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod embedding;
 pub mod gc;
 pub mod graph;
 pub mod mcp;

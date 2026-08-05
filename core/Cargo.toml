@@ -20,6 +20,29 @@ flate2 = "1"
 ignore = "0.4"
 libc = "0.2"
 notify = "6"
+# ONNX Runtime bindings for the local embedding model (see src/embedding).
+#
+# Pinned to rc.9 on purpose, not "latest rc":
+# - rc.9's prebuilt distribution still covers `x86_64-apple-darwin` (Intel
+#   Macs), and links ONNX Runtime *statically*. Both matter here: rc.10+
+#   dropped Intel macOS from its prebuilt matrix entirely, so `cargo build`
+#   fails outright on those machines, and static linking is what keeps the
+#   promise of "core is one binary with no runtime dependency for the user"
+#   (REQUIREMENTS.md) instead of shipping a loose libonnxruntime.
+# - rc.9's `Session::run` takes `&self` and `Session` is `Send + Sync`, so
+#   `EmbeddingModel` can hand out `&self` inference to a multi-threaded daemon
+#   without a mutex. rc.13 changed `run` to `&mut self`.
+#
+# No execution-provider feature is enabled on purpose: CPU-only, per
+# REQUIREMENTS.md ("работает на CPU без GPU").
+ort = "=2.0.0-rc.9"
+# Not used directly - pinned only to hold `ort`'s own `ort-sys` dependency down.
+# `ort` rc.9 asks for `ort-sys = "2.0.0-rc.9"`, and because that is a caret
+# requirement on a pre-release, Cargo happily resolves it to rc.13, whose build
+# script does not compile against current `ureq` and whose binary distribution
+# has no Intel macOS entry. Without this pin the build breaks the first time
+# anyone runs `cargo update`.
+ort-sys = "=2.0.0-rc.9"
 rmcp = { version = "2.2.0", features = ["server", "macros"] }
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 schemars = "1"
@@ -27,6 +50,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlite-vec = "0.1.9"
+# Hugging Face tokenizers, for the BPE `tokenizer.json` that ships with the
+# embedding model. `progressbar`/`esaxx_fast` are training-side extras we never
+# use; `onig` is kept because the model's ByteLevel pre-tokenizer is regex-based.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 toml = "0.8"
 
