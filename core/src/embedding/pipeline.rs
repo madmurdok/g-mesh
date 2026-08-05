@@ -17,12 +17,23 @@
 //!
 //! # Where the model lives
 //!
-//! Loading the ONNX model is expensive (hundreds of MiB, roughly a second),
-//! so [`EmbeddingPipeline`] loads it once and is meant to be held for a
-//! whole daemon's lifetime - the same shape `daemon::lifecycle::PluginSupervisor`
-//! already holds its plugin process handle in, and for the same reason: the
-//! caller that has one is expected to share it, not construct one per node or
-//! per file.
+//! Loading the ONNX model is expensive - hundreds of MiB, measured at several
+//! seconds on real hardware - so [`EmbeddingPipeline::load`] does not load it
+//! at all. It only stores `config` behind an [`OnceLock`]; the first real
+//! [`apply`](Self::apply) call is what resolves it, synchronously, on
+//! whichever thread that call happens to run on. This is deliberate, not an
+//! optimization applied for its own sake: an earlier version loaded the model
+//! on a background thread kicked off from `daemon::run`, and even that -
+//! never blocking, just *existing* - measurably cost daemon startup enough to
+//! blow through `serving_while_indexing`'s 1-second "an already-walked
+//! project restarts fast" budget and `cli::clean`'s 10-second "the daemon is
+//! listening" wait under load, because a bare `thread::spawn` still competes
+//! with the plugin spawn and the accept loop for scheduling. Nothing about
+//! daemon startup may cost more than it did before this feature existed;
+//! [`EmbeddingPipeline`] is still loaded once and held for a whole daemon's
+//! lifetime - the same shape `daemon::lifecycle::PluginSupervisor` already
+//! holds its plugin process handle in - it just does not pay for that load
+//! until something has actually asked to embed.
 //!
 //! A model that fails to load (not fetched yet, wrong directory, corrupt
 //! files) does not fail the pipeline - it disables it. Indexing without
@@ -33,6 +44,8 @@
 //! the reparse down with it (`watcher::apply::apply_file_change`'s doc
 //! comment argues the identical trade-off for the type checker).
 
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -41,8 +54,8 @@ use crate::embedding::model::{default_model_dir, EmbeddingModel};
 use crate::storage::vectors;
 use crate::storage::write::Diff;
 
-/// A loaded (or deliberately absent) embedding model plus the version string
-/// stored rows are tagged with, held for as long as the daemon runs.
+/// A lazily-resolved embedding model plus the version string stored rows are
+/// tagged with, held for as long as the daemon runs.
 ///
 /// `version` is `config.embedding.model` - the project's *configured* choice,
 /// which is also what `EmbeddingConfig` documents as the source
@@ -53,40 +66,52 @@ use crate::storage::write::Diff;
 /// this and `EmbeddingModel::load` already do, is what stays correct once
 /// that lands too.
 pub struct EmbeddingPipeline {
-    model: Option<EmbeddingModel>,
-    version: String,
+    config: EmbeddingConfig,
+    model: OnceLock<Option<EmbeddingModel>>,
 }
 
 impl EmbeddingPipeline {
-    /// Resolves `config`'s model directory and loads it. A missing or
-    /// unreadable model does not fail this call - see the module doc for why
-    /// - it is reported to stderr once and [`apply`](Self::apply) becomes a
-    /// no-op from then on.
+    /// Stores `config` for a later load - see the module doc's "Where the
+    /// model lives" section for why this does no I/O and returns instantly.
     pub fn load(config: &EmbeddingConfig) -> Self {
-        let version = config.model.clone();
-        let model = match default_model_dir(&config.model).and_then(|dir| EmbeddingModel::load(&dir)) {
-            Ok(model) => Some(model),
-            Err(err) => {
-                eprintln!(
-                    "g-mesh daemon: embedding model {:?} is not available ({err:#}) - \
-                     indexing will continue without semantic search",
-                    config.model
-                );
-                None
-            }
-        };
-        Self { model, version }
+        Self { config: config.clone(), model: OnceLock::new() }
     }
 
     /// A pipeline with no model at all - what every caller that does not
     /// care about embeddings (most of the test suite) constructs instead of
-    /// depending on real weights being present on disk.
+    /// depending on real weights being present on disk. Resolves instantly,
+    /// same as [`load`](Self::load): nothing is loaded either way until
+    /// [`apply`](Self::apply) is actually called, and this pre-fills that
+    /// result with "no model" so a disabled pipeline never tries.
     pub fn disabled() -> Self {
-        Self { model: None, version: String::new() }
+        Self { config: EmbeddingConfig::default(), model: OnceLock::from(None) }
+    }
+
+    /// The loaded model, resolving `config`'s model directory and loading it
+    /// the first time this is called. A missing or unreadable model does not
+    /// panic or propagate an error - see the module doc for why - it is
+    /// reported to stderr once and every call after the first (loaded or not)
+    /// returns instantly from the cached result.
+    fn model(&self) -> Option<&EmbeddingModel> {
+        self.model
+            .get_or_init(|| {
+                match default_model_dir(&self.config.model).and_then(|dir| EmbeddingModel::load(&dir)) {
+                    Ok(model) => Some(model),
+                    Err(err) => {
+                        eprintln!(
+                            "g-mesh daemon: embedding model {:?} is not available ({err:#}) - \
+                             indexing will continue without semantic search",
+                            self.config.model
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 
     /// Embeds and stores every upserted node in `diff` that has embeddable
-    /// text. A no-op, quickly, if no model is loaded.
+    /// text. A no-op, quickly, if no model is loaded (or loadable).
     ///
     /// Best-effort per node, matching how a bulk walk treats one unreadable
     /// line (`daemon::bulk_index::ingest`) and how a reparse treats a failed
@@ -95,7 +120,7 @@ impl EmbeddingPipeline {
     /// rest of the diff's embeddings or - worse - the diff's already-committed
     /// rows.
     pub fn apply(&self, conn: &Connection, diff: &Diff) -> Result<()> {
-        let Some(model) = &self.model else { return Ok(()) };
+        let Some(model) = self.model() else { return Ok(()) };
         for node in &diff.upsert_nodes {
             if let Err(err) = embed_node(
                 model,
@@ -103,7 +128,7 @@ impl EmbeddingPipeline {
                 &node.id,
                 node.doc_comment.as_deref(),
                 node.signature.as_deref(),
-                &self.version,
+                &self.config.model,
             ) {
                 eprintln!("g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded", node.id);
             }

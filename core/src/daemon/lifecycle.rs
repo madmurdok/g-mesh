@@ -231,13 +231,16 @@ pub struct PluginSupervisor {
     /// the pid of a plugin that deliberately exited.
     pid_file: PathBuf,
     idle_timeout: Option<Duration>,
-    /// Loaded once at daemon startup and held for the supervisor's whole
-    /// life, the same way the plugin process itself is held across its own
-    /// sleep/wake cycles below - see `embedding::pipeline`'s doc comment for
-    /// why the model is too expensive to load per file or per node. `Arc`'d
-    /// because `daemon::run` shares the very same loaded model with the
+    /// Handed in by `daemon::run` at construction time and shared with the
     /// cold-start bulk walk (`daemon::bulk_index::run`), which this
-    /// supervisor knows nothing about.
+    /// supervisor knows nothing about - both hold the same `Arc`.
+    /// Constructing an [`EmbeddingPipeline`] does no I/O and spawns no
+    /// thread, so sharing it here costs `daemon::run`'s startup nothing;
+    /// whichever of this supervisor or the bulk walk calls
+    /// [`apply`](EmbeddingPipeline::apply) first is the one that pays to
+    /// actually load the model, lazily, on its own thread - see
+    /// `embedding::pipeline`'s module doc for why that must not happen any
+    /// earlier.
     embedding: Arc<EmbeddingPipeline>,
     inner: Mutex<SupervisedPlugin>,
     last_activity: Mutex<Instant>,

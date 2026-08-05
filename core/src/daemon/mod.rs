@@ -262,15 +262,23 @@ pub fn run(root: &Path) -> Result<()> {
         .context("failed to read the project's config.toml")?;
     let timeouts = IdleTimeouts::from_config(&project_config);
 
-    // Loaded once, here, for the same reason the idle timeouts are resolved
-    // once: everything downstream (the bulk walk, the plugin supervisor's
-    // whole lifetime) shares this one instance rather than paying to load
-    // ~600MiB of ONNX weights again per file or per node. A model that is not
-    // available on this machine does not stop the daemon - see
-    // `EmbeddingPipeline::load`'s doc comment - it just means nothing gets
-    // embedded until `core/scripts/fetch-embedding-model.sh` has been run.
-    let embedding_pipeline =
-        Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
+    // Not loaded here, not even in the background: `EmbeddingPipeline::load`
+    // does no I/O and spawns no thread, it only stores the config behind an
+    // `OnceLock` that resolves on the first real `apply` call - see
+    // `embedding::pipeline`'s module doc. A background `thread::spawn` here
+    // was tried and measured to still cost daemon startup enough to fail
+    // `serving_while_indexing`'s 1s "already-walked restart" budget and
+    // `cli::clean`'s 10s "daemon is listening" wait under load - a bare
+    // thread spawn competing with the plugin spawn and the accept loop for
+    // scheduling, on top of the ~600MiB ONNX load itself once it actually
+    // runs. Whichever of the bulk walk below or the plugin supervisor's first
+    // incremental write asks first pays the real load cost, synchronously, on
+    // its own thread - never this one, and never before something has
+    // actually asked to embed. A model that is not available on this machine
+    // does not stop the daemon - see `EmbeddingPipeline::load`'s doc comment -
+    // it just means nothing gets embedded until
+    // `core/scripts/fetch-embedding-model.sh` has been run.
+    let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
 
     // A protocol mismatch (or the plugin failing to start at all) is a hard
     // daemon-startup failure, matching handshake::verify's philosophy - there
@@ -287,7 +295,7 @@ pub fn run(root: &Path) -> Result<()> {
         &canonical_root,
         dir.join(PLUGIN_PID_FILE),
         timeouts.plugin,
-        Arc::clone(&embedding_pipeline),
+        Arc::clone(&embedding),
     )?;
 
     // Starts ticking at startup, so a daemon nobody ever connects to still
@@ -337,7 +345,7 @@ pub fn run(root: &Path) -> Result<()> {
     // serving nothing, and every later shim would find it listening, current,
     // and reuse it forever.
     if needs_bulk_index {
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding)
             .context("failed to build the project's initial index")?;
         // Flipped *before* the completion marker is written, and the order
         // matters. The two facts become true at the same moment - the walk is

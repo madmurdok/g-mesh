@@ -175,7 +175,18 @@ async fn connect_with(
         cmd.arg("mcp-shim")
             .current_dir(&root)
             .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", BOOTSTRAP_BUDGET.as_millis().to_string())
-            .env(WALK_DELAY_ENV, hold_the_walk_open.as_millis().to_string());
+            .env(WALK_DELAY_ENV, hold_the_walk_open.as_millis().to_string())
+            // This suite is about grace-window/bootstrap timing, not
+            // embeddings - the fixture's one function has a signature, which
+            // is embeddable text, so without this the walk would pay a real
+            // (multi-second, machine-dependent) model load on whichever
+            // machine happens to have the weights fetched, blowing through
+            // every millisecond-scale budget below. Pointing at a directory
+            // with no model files makes `EmbeddingModel::load` fail its
+            // `Path::exists()` check immediately - see its doc comment - so
+            // embedding is skipped exactly like it would be for any
+            // contributor who has not run `fetch-embedding-model.sh`.
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
     }))
     .expect("failed to spawn the shim");
 
