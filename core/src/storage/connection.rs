@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::identity::project_hash;
+use crate::storage::vectors;
 
 /// `~/.g-mesh/projects/`, the one directory every project's state lives
 /// under. Public because `cli::clean` enumerates it rather than deriving a
@@ -21,8 +22,13 @@ pub fn project_dir(root: &Path) -> Result<PathBuf> {
     Ok(projects_root()?.join(project_hash(root)?))
 }
 
-/// Opens (creating if absent) the project's SQLite index in WAL mode.
+/// Opens (creating if absent) the project's SQLite index in WAL mode, with
+/// the sqlite-vec extension available on the returned connection (see
+/// `storage::vectors` for what that unlocks and why registering it here is
+/// enough for every connection, not just this one).
 pub fn open(root: &Path) -> Result<Connection> {
+    vectors::register_extension();
+
     let dir = project_dir(root)?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create project directory {}", dir.display()))?;
