@@ -180,6 +180,22 @@ fn indexing_a_fixture_file_embeds_its_documented_symbols() {
     assert_eq!(version, g_mesh::config::EmbeddingConfig::default().model);
 }
 
+/// Task #51's acceptance criterion: after a walk embeds anything at all,
+/// `meta.embedding_model` names the model that actually produced those rows -
+/// not left `NULL` forever the way it was before `EmbeddingPipeline::apply`
+/// started stamping it (see `storage::schema::set_embedding_model`).
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let conn = project.walk(&pipeline);
+
+    let recorded: Option<String> =
+        conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+    assert_eq!(recorded.as_deref(), Some(g_mesh::config::EmbeddingConfig::default().model.as_str()));
+}
+
 /// The acceptance criterion's other half: a node with neither a doc comment
 /// nor a signature is skipped rather than embedding an empty string. The
 /// `File` node the walk produces for `src/lib.ts` is exactly that node - see

@@ -292,6 +292,19 @@ pub fn record_bulk_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Records the project's current active embedding model, so `meta` reflects
+/// what `embedding::EmbeddingPipeline` actually tagged its rows with rather
+/// than staying `NULL` forever (see the DDL comment on `vectors` for why the
+/// two columns are a distinct fact from each other, and `EmbeddingPipeline`'s
+/// module doc for why this is written on every `apply`, not once). A plain
+/// `UPDATE` rather than a schema column type built for a fixed set of models:
+/// a future model switch is a data change to this one row, never a migration.
+pub fn set_embedding_model(conn: &Connection, model: &str) -> Result<()> {
+    conn.execute("UPDATE meta SET embedding_model = ?1 WHERE id = 1", rusqlite::params![model])
+        .context("failed to record the active embedding model")?;
+    Ok(())
+}
+
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         // Children before parents: with `foreign_keys` on, dropping `nodes`
@@ -568,6 +581,36 @@ mod tests {
         // index must not ask for the walk again.
         assert!(!ensure_current(&conn, GENERATION).unwrap());
         assert!(bulk_index_completed(&conn).unwrap());
+    }
+
+    #[test]
+    fn the_active_embedding_model_starts_unset_and_can_be_recorded() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+
+        let before: Option<String> =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, None, "a fresh index has no active model recorded yet");
+
+        set_embedding_model(&conn, "jina-embeddings-v2-base-code").unwrap();
+        let after: String =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(after, "jina-embeddings-v2-base-code");
+    }
+
+    /// The acceptance criterion behind the column's whole design: a future
+    /// model switch is a data change to this one row, not a schema migration.
+    #[test]
+    fn recording_a_different_model_overwrites_the_previous_one_with_no_schema_change() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+
+        set_embedding_model(&conn, "jina-embeddings-v2-base-code").unwrap();
+        set_embedding_model(&conn, "some-future-model-v2").unwrap();
+
+        let model: String =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(model, "some-future-model-v2");
     }
 
     #[test]
