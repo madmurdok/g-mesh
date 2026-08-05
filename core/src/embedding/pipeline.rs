@@ -107,6 +107,25 @@ impl EmbeddingPipeline {
             .as_ref()
     }
 
+    /// Embeds a free-text query (`search_code`'s input) with the same model
+    /// and pooling `apply` embeds node text with, so a query vector and a
+    /// stored node vector live in the same space and are comparable by cosine
+    /// distance. `None` when no model is loaded (see [`model`](Self::model))
+    /// or the model itself fails on this input - `search_code` reports either
+    /// as "semantic search is unavailable" rather than a tool-level crash, the
+    /// same best-effort posture [`apply`](Self::apply) already takes with node
+    /// text.
+    pub fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
+        let model = self.model()?;
+        match model.embed(text) {
+            Ok(embedding) => Some(embedding),
+            Err(err) => {
+                eprintln!("g-mesh daemon: failed to embed search query ({err:#})");
+                None
+            }
+        }
+    }
+
     /// Embeds and stores every upserted node in `diff` that has embeddable
     /// text. A no-op, quickly, if no model is loaded (or loadable).
     ///
@@ -221,6 +240,12 @@ mod tests {
         // compile without real weights. That it compiles and passes without
         // one is the proof.
         assert_eq!(text_to_embed(None, None), None);
+    }
+
+    #[test]
+    fn a_disabled_pipeline_has_no_query_embedding() {
+        let pipeline = EmbeddingPipeline::disabled();
+        assert_eq!(pipeline.embed_query("find a function that reads a file"), None);
     }
 
     #[test]

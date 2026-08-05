@@ -51,8 +51,11 @@ pub fn register_extension() {
     });
 }
 
-/// Packs a vector into sqlite-vec's compact float32 blob format.
-fn pack(vector: &[f32]) -> Vec<u8> {
+/// Packs a vector into sqlite-vec's compact float32 blob format. `pub(crate)`
+/// rather than private: `mcp::search_code` packs its query vector with this
+/// same routine so a query and a stored `vectors.embedding` row are encoded
+/// identically for `vec_distance_cosine` to compare.
+pub(crate) fn pack(vector: &[f32]) -> Vec<u8> {
     vector.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
