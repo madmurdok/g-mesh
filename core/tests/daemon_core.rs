@@ -28,7 +28,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Every tool the MVP promises, whatever order the router lists them in.
-const EXPECTED_TOOLS: [&str; 7] = [
+const EXPECTED_TOOLS: [&str; 8] = [
     "find_callees",
     "find_callers",
     "find_definition",
@@ -36,6 +36,7 @@ const EXPECTED_TOOLS: [&str; 7] = [
     "find_references",
     "get_dependencies",
     "get_file_outline",
+    "search_code",
 ];
 
 struct Project {

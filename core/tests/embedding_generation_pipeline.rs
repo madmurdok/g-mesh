@@ -230,6 +230,20 @@ fn the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded() {
     assert_eq!(embedded_names, vec!["bare".to_string(), "readFileAsString".to_string()]);
 }
 
+/// `search_code`'s query embedding must land in the same vector space as node
+/// embeddings - i.e. must go through the identical model and pooling, not a
+/// separately loaded instance that happens to use the same weights file.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn embed_query_matches_embedding_the_same_text_directly() {
+    let pipeline = load_real_pipeline();
+    let model = EmbeddingModel::load(&model_dir()).expect("failed to load the real model");
+
+    let expected = model.embed("find a function that reads a file from disk").unwrap();
+    let actual = pipeline.embed_query("find a function that reads a file from disk").unwrap();
+    assert_eq!(actual, expected);
+}
+
 /// Loading a real model directly (not through the pipeline) and comparing
 /// its output to what the pipeline actually stored - proof the pipeline
 /// embeds the doc comment plus signature, not some other text, and that what

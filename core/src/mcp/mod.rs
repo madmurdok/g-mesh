@@ -29,6 +29,7 @@ use tokio::net::UnixStream;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::{CoreActivity, PluginSupervisor};
+use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
 use crate::protocol::types::Position;
@@ -40,6 +41,7 @@ mod find_implementations;
 mod find_references;
 mod get_dependencies;
 mod get_file_outline;
+mod search_code;
 mod tool_result;
 
 /// What every tool answers while the daemon's cold-start bulk walk is still
@@ -109,8 +111,9 @@ pub async fn serve_connection(
     plugin: Arc<PluginSupervisor>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
+    embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, plugin, core_activity, indexing)
+    let service = GMeshMcpServer::new(conn, plugin, core_activity, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -132,6 +135,7 @@ pub struct GMeshMcpServer {
     plugin: Arc<PluginSupervisor>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
+    embedding: Arc<EmbeddingPipeline>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -142,8 +146,9 @@ impl GMeshMcpServer {
         plugin: Arc<PluginSupervisor>,
         core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,
+        embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        Self { conn, plugin, core_activity, indexing, tool_router: Self::tool_router() }
+        Self { conn, plugin, core_activity, indexing, embedding, tool_router: Self::tool_router() }
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -393,6 +398,17 @@ impl GMeshMcpServer {
         }
         get_dependencies::handle(&self.conn, params.0)
     }
+
+    #[tool(
+        name = "search_code",
+        description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Results are ranked by similarity, most relevant first. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
+    )]
+    async fn search_code(&self, params: Parameters<SearchCodeParams>) -> Result<CallToolResult, ErrorData> {
+        if let Some(not_ready) = self.prepare().await {
+            return not_ready;
+        }
+        search_code::handle(&self.conn, &self.embedding, params.0)
+    }
 }
 
 // `router = self.tool_router` on purpose: the attribute's default is
@@ -573,4 +589,21 @@ pub struct GetDependenciesParams {
     pub max_fanout: Option<u32>,
     /// Opaque token from a previous, truncated traversal.
     pub resume_token: Option<String>,
+}
+
+/// `Default` is for tests that construct this by hand - see
+/// `SymbolQueryParams`'s doc comment for why.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SearchCodeParams {
+    /// Free-text description of what you're looking for (e.g. "parses a
+    /// config file", "retries a failed network request"). Matched by
+    /// semantic similarity against each symbol's doc comment and signature,
+    /// not by keyword - different wording for the same idea still ranks
+    /// well.
+    pub query: String,
+    /// Opaque cursor from a previous page of results.
+    pub cursor: Option<String>,
+    /// Maximum results (default 20, capped at 200) - raise for a wide result
+    /// set instead of paging via `cursor`.
+    pub limit: Option<u32>,
 }

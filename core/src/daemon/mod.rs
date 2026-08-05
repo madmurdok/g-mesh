@@ -324,8 +324,10 @@ pub fn run(root: &Path) -> Result<()> {
         let plugin = Arc::clone(&plugin);
         let core_activity = Arc::clone(&core_activity);
         let indexing = indexing.clone();
+        let embedding = Arc::clone(&embedding);
         thread::spawn(move || {
-            let _ = accept_result.send(serve_forever(listener, conn, plugin, core_activity, indexing));
+            let _ = accept_result
+                .send(serve_forever(listener, conn, plugin, core_activity, indexing, embedding));
         });
     }
 
@@ -471,6 +473,7 @@ fn serve_forever(
     plugin: Arc<PluginSupervisor>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
+    embedding: Arc<crate::embedding::EmbeddingPipeline>,
 ) -> Result<()> {
     // Two workers: connections are few (one per MCP client) and their work is
     // dominated by a mutex-guarded SQLite handle, so more threads would only
@@ -496,6 +499,7 @@ fn serve_forever(
             let conn = Arc::clone(&conn);
             let plugin = Arc::clone(&plugin);
             let indexing = indexing.clone();
+            let embedding = Arc::clone(&embedding);
             // Taken here rather than inside the task, so the count rises
             // before this loop can come back round and consider the core
             // unattended.
@@ -505,8 +509,15 @@ fn serve_forever(
                 // Dropped when this session ends, whichever way it ends, which
                 // is also what restarts the core's idle clock.
                 let _attached = attached;
-                if let Err(err) =
-                    mcp::serve_connection(stream, conn, plugin, core_activity, indexing).await
+                if let Err(err) = mcp::serve_connection(
+                    stream,
+                    conn,
+                    plugin,
+                    core_activity,
+                    indexing,
+                    embedding,
+                )
+                .await
                 {
                     eprintln!("g-mesh daemon: connection ended: {err:#}");
                 }
