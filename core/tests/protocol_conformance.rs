@@ -1,5 +1,6 @@
 use std::io::{BufReader, Cursor};
 
+use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::protocol::conformance::{check_bulk_output, check_control_plane_output};
 use g_mesh::protocol::jsonrpc::read_message;
 use g_mesh::protocol::types::{ControlEnvelope, ControlMessage, RequestId};
@@ -110,6 +111,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         vec!["src/a.ts".to_string()],
         // Matches the id both fixtures carry; a mismatch is refused outright.
         RequestId::Number(7),
+        &EmbeddingPipeline::disabled(),
     )
     .unwrap();
 

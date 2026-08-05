@@ -65,6 +65,7 @@ use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::plugin;
+use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
 /// What a single `init` actually did.
@@ -135,7 +136,14 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             format!("failed to canonicalize project root {}", project_root.display())
         })?;
         let conn = Arc::new(Mutex::new(conn));
-        let summary = bulk_index::run(&canonical_root, &conn)
+        // Read back rather than assumed from `ProjectConfig::default()`: a
+        // pre-existing config.toml (the `!config_written` case) may name a
+        // different model, and this walk has to honor whatever is actually
+        // configured, exactly like `daemon::run`'s own cold start.
+        let project_config = config::read_project_config(project_root)
+            .context("failed to read the project's config.toml")?;
+        let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
             .context("failed to build the project's initial index")?;
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;

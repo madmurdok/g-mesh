@@ -34,6 +34,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
 use crate::protocol::types::RequestId;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
@@ -369,11 +370,16 @@ impl PluginProcess {
     /// including `file_path` itself - against it before returning, rather
     /// than surfacing the crash to the caller. See this module's doc comment
     /// for why that distinction (crash vs. a deliberate stop) matters.
-    pub fn apply_file_change(&self, conn: &Mutex<Connection>, file_path: impl Into<String>) -> Result<()> {
+    pub fn apply_file_change(
+        &self,
+        conn: &Mutex<Connection>,
+        file_path: impl Into<String>,
+        embedding: &EmbeddingPipeline,
+    ) -> Result<()> {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
 
-        if let Err(first_err) = self.send_one(conn, &file_path) {
+        if let Err(first_err) = self.send_one(conn, &file_path, embedding) {
             // The plugin's pipes only fail like this when the process behind
             // them is gone. Confirm that before replacing a merely-slow
             // process's live handle out from under it - `process_has_exited`
@@ -385,7 +391,7 @@ impl PluginProcess {
                 self.relaunch(&first_err)
                     .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
             }
-            return self.replay_pending(conn).with_context(|| {
+            return self.replay_pending(conn, embedding).with_context(|| {
                 format!(
                     "JS/TS plugin process exited unexpectedly and could not be recovered while applying a change to {file_path}"
                 )
@@ -424,11 +430,11 @@ impl PluginProcess {
     /// file that triggered this replay, still queued behind whatever an
     /// earlier crash may have left too) and picks up exactly where it left
     /// off.
-    fn replay_pending(&self, conn: &Mutex<Connection>) -> Result<()> {
+    fn replay_pending(&self, conn: &Mutex<Connection>, embedding: &EmbeddingPipeline) -> Result<()> {
         loop {
             let next = { self.pending.lock().unwrap().first().cloned() };
             let Some(file_path) = next else { return Ok(()) };
-            self.send_one(conn, &file_path)?;
+            self.send_one(conn, &file_path, embedding)?;
             self.remove_pending(&file_path);
         }
     }
@@ -451,7 +457,12 @@ impl PluginProcess {
     /// layer logs and treats as best-effort (see `mcp::GMeshMcpServer::
     /// ensure_file_fresh`) rather than something worth relaunching a process
     /// over on a mere freshness check.
-    pub fn ensure_fresh(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<StalenessOutcome> {
+    pub fn ensure_fresh(
+        &self,
+        conn: &Mutex<Connection>,
+        file_path: &str,
+        embedding: &EmbeddingPipeline,
+    ) -> Result<StalenessOutcome> {
         {
             let guard = conn.lock().unwrap();
             if !staleness::is_stale(&guard, &self.project_root, file_path)? {
@@ -463,7 +474,7 @@ impl PluginProcess {
         let mut state = self.state.lock().unwrap();
         let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
         let mut conn = conn.lock().unwrap();
-        staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id)
+        staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id, embedding)
     }
 
     /// Asks the plugin's semantic layer to upgrade what the structural pass
@@ -479,15 +490,20 @@ impl PluginProcess {
     /// ordinary `Err` rather than a relaunch: there is nothing pending to
     /// replay (a semantic pass owns no file the index is missing), and the
     /// caller treats a missing upgrade as best-effort.
-    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<()> {
+    pub fn semantic_pass(
+        &self,
+        conn: &Mutex<Connection>,
+        file_paths: Vec<String>,
+        embedding: &EmbeddingPipeline,
+    ) -> Result<()> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let mut state = self.state.lock().unwrap();
         let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
         let mut conn = conn.lock().unwrap();
-        apply_semantic_pass(reader, writer, &mut conn, file_paths, id)
+        apply_semantic_pass(reader, writer, &mut conn, file_paths, id, embedding)
     }
 
-    fn send_one(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<()> {
+    fn send_one(&self, conn: &Mutex<Connection>, file_path: &str, embedding: &EmbeddingPipeline) -> Result<()> {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
         // response answering the wrong request, not a globally unique one.
@@ -500,7 +516,7 @@ impl PluginProcess {
         // typecheck through the `MutexGuard`'s `DerefMut`.
         let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
         let mut conn = conn.lock().unwrap();
-        apply_file_change_diff(reader, writer, &mut conn, file_path, id)
+        apply_file_change_diff(reader, writer, &mut conn, file_path, id, embedding)
     }
 
     /// Whether the process backing the *current* state has exited.

@@ -22,6 +22,7 @@ use std::io::{BufRead, Write};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::jsonrpc::{read_message, write_message};
 use crate::protocol::types::{
@@ -63,6 +64,7 @@ pub fn apply_file_change<R: BufRead, W: Write>(
     conn: &mut Connection,
     file_path: impl Into<String>,
     request_id: RequestId,
+    embedding: &EmbeddingPipeline,
 ) -> Result<()> {
     let file_path = file_path.into();
     round_trip(
@@ -71,6 +73,7 @@ pub fn apply_file_change<R: BufRead, W: Write>(
         conn,
         ControlMessage::FileChanged { file_path: file_path.clone() },
         request_id.clone(),
+        embedding,
     )?;
 
     if let Err(err) = apply_semantic_pass(
@@ -79,6 +82,7 @@ pub fn apply_file_change<R: BufRead, W: Write>(
         conn,
         vec![file_path.clone()],
         semantic_pass_id(&request_id),
+        embedding,
     ) {
         eprintln!(
             "g-mesh: the semantic pass over {file_path} failed after its reparse ({err:#}) - \
@@ -107,8 +111,9 @@ pub fn apply_semantic_pass<R: BufRead, W: Write>(
     conn: &mut Connection,
     file_paths: Vec<String>,
     request_id: RequestId,
+    embedding: &EmbeddingPipeline,
 ) -> Result<()> {
-    round_trip(reader, writer, conn, ControlMessage::SemanticPass { file_paths }, request_id)
+    round_trip(reader, writer, conn, ControlMessage::SemanticPass { file_paths }, request_id, embedding)
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -148,6 +153,7 @@ fn round_trip<R: BufRead, W: Write>(
     conn: &mut Connection,
     message: ControlMessage,
     request_id: RequestId,
+    embedding: &EmbeddingPipeline,
 ) -> Result<()> {
     let method = method_name(&message);
     let request =
@@ -176,6 +182,14 @@ fn round_trip<R: BufRead, W: Write>(
     // repointed at an export that is already committed - including the ones
     // this very diff added, which other files may have been waiting for.
     symbol_links::link_diff(conn, &diff).context("failed to link the file's cross-file symbol usages")?;
+    // Embedding is best-effort and reported rather than propagated
+    // (`EmbeddingPipeline::apply`'s own doc comment), for the same reason a
+    // failed semantic pass does not fail this round trip: a diff that is
+    // already committed and linked must not be undone by an optional layer
+    // on top of it.
+    if let Err(err) = embedding.apply(conn, &diff) {
+        eprintln!("g-mesh daemon: failed to embed the {method} diff: {err:#}");
+    }
     Ok(())
 }
 
@@ -498,8 +512,15 @@ mod tests {
         );
 
         let mut buf_reader = BufReader::new(core_reader);
-        apply_file_change(&mut buf_reader, &mut core_writer, &mut conn, "src/lib.rs", request_id)
-            .unwrap();
+        apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
 
         assert_eq!(count(&conn, "nodes"), 2);
@@ -552,8 +573,15 @@ mod tests {
         );
 
         let mut buf_reader = BufReader::new(core_reader);
-        apply_file_change(&mut buf_reader, &mut core_writer, &mut conn, "src/lib.rs", request_id)
-            .unwrap();
+        apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
 
         assert_eq!(count(&conn, "nodes"), 0);
@@ -584,8 +612,14 @@ mod tests {
         );
 
         let mut buf_reader = BufReader::new(core_reader);
-        let result =
-            apply_file_change(&mut buf_reader, &mut core_writer, &mut conn, "src/lib.rs", request_id);
+        let result = apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        );
         plugin.join().unwrap();
 
         assert!(result.is_err(), "a response for a different request id must not be applied");
@@ -621,6 +655,7 @@ mod tests {
             &mut conn,
             "src/unchanged.rs",
             request_id,
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
         plugin.join().unwrap();
@@ -699,6 +734,7 @@ mod tests {
             &mut conn,
             vec!["src/lib.rs".to_string()],
             RequestId::Number(9),
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
         plugin.join().unwrap();
@@ -750,8 +786,15 @@ mod tests {
         );
 
         let mut buf_reader = BufReader::new(core_reader);
-        apply_file_change(&mut buf_reader, &mut core_writer, &mut conn, "src/lib.rs", request_id)
-            .unwrap();
+        apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
 
         assert_eq!(
@@ -787,8 +830,14 @@ mod tests {
             spawn_stub_plugin(plugin_reader, plugin_writer, "src/lib.rs", request_id.clone(), structural, None);
 
         let mut buf_reader = BufReader::new(core_reader);
-        let outcome =
-            apply_file_change(&mut buf_reader, &mut core_writer, &mut conn, "src/lib.rs", request_id);
+        let outcome = apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        );
         plugin.join().unwrap();
 
         assert!(outcome.is_ok(), "a lost upgrade must not undo a committed reparse: {outcome:?}");
@@ -813,6 +862,7 @@ mod tests {
             &mut conn,
             Vec::new(),
             RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
         plugin.join().unwrap();

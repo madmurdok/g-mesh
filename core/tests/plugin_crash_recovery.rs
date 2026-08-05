@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use g_mesh::daemon::is_process_alive;
 use g_mesh::daemon::plugin::PluginProcess;
+use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
@@ -69,7 +70,7 @@ fn a_killed_plugin_process_is_transparently_relaunched_and_its_pending_queue_rep
     // Establish the happy path first, so a failure below can only be about
     // crash recovery, not about the plugin bridge in general.
     plugin
-        .apply_file_change(&conn, "alpha.ts")
+        .apply_file_change(&conn, "alpha.ts", &EmbeddingPipeline::disabled())
         .expect("the first, uneventful file change must apply cleanly");
     assert_eq!(node_named(&conn, "alpha"), 1, "alpha.ts's diff must be committed before anything is killed");
 
@@ -81,7 +82,7 @@ fn a_killed_plugin_process_is_transparently_relaunched_and_its_pending_queue_rep
     // (which is exactly what was left in the pending queue when the old
     // process died) replayed against it.
     plugin
-        .apply_file_change(&conn, "beta.ts")
+        .apply_file_change(&conn, "beta.ts", &EmbeddingPipeline::disabled())
         .expect("apply_file_change must transparently recover from a plugin killed out-of-band");
 
     assert_eq!(
@@ -98,7 +99,7 @@ fn a_killed_plugin_process_is_transparently_relaunched_and_its_pending_queue_rep
     // more call - a third, ordinary change against the recovered process.
     fs::write(root.join("gamma.ts"), "export function gamma() {}\n").expect("failed to write gamma.ts");
     plugin
-        .apply_file_change(&conn, "gamma.ts")
+        .apply_file_change(&conn, "gamma.ts", &EmbeddingPipeline::disabled())
         .expect("the recovered plugin process must keep serving ordinary requests");
     assert_eq!(node_named(&conn, "gamma"), 1);
 }

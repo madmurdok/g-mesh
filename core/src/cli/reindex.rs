@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::plugin;
+use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
 /// What a `reindex` actually did.
@@ -71,7 +72,12 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
         format!("failed to canonicalize project root {}", project_root.display())
     })?;
     let conn = Arc::new(Mutex::new(conn));
-    let summary = bulk_index::run(&canonical_root, &conn)
+    // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
+    // for a cold start - a reindex is that same walk, run early.
+    let project_config = crate::config::read_project_config(project_root)
+        .context("failed to read the project's config.toml")?;
+    let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+    let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
         .context("failed to rebuild the project's index")?;
     schema::record_bulk_index(&conn.lock().unwrap())
         .context("failed to record that the project was fully reindexed")?;
