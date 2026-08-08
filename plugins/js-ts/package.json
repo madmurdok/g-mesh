@@ -1,6 +1,6 @@
 {
   "name": "@g-mesh/plugin-js-ts",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "g-mesh language plugin process for JavaScript/TypeScript (control-plane skeleton)",
   "main": "dist/src/index.js",
