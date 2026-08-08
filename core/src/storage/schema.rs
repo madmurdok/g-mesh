@@ -23,7 +23,14 @@ use rusqlite::{Connection, OptionalExtension};
 /// implementation, an interface or namespace merged across statements) used to
 /// keep only one of them; the child table is where the rest now live, and the
 /// edge column is where a call site's binding to one of them goes.
-pub const CURRENT_SCHEMA_VERSION: &str = "5";
+///
+/// Bumped to "6" when `vectors` was added - see `storage::vectors`. It was
+/// deliberately left out of every schema before this one (see the comment on
+/// `DDL` below); the Embeddings epic is what wires sqlite-vec in, and a
+/// version bump is how every existing index picks up the new table the same
+/// way it has picked up every table before it - a wipe and a full reindex,
+/// not a hand-written migration.
+pub const CURRENT_SCHEMA_VERSION: &str = "6";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -76,8 +83,7 @@ pub const CURRENT_SCHEMA_VERSION: &str = "5";
 pub const CURRENT_INDEXER_VERSION: &str = "1";
 
 /// DDL per the architecture doc's Data Model erDiagram
-/// (docs/architecture/g-mesh-v1.md). `vectors` is deliberately not created
-/// here - it's added by the Embeddings epic when sqlite-vec is wired in.
+/// (docs/architecture/g-mesh-v1.md).
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
     id              TEXT PRIMARY KEY,
@@ -171,6 +177,30 @@ CREATE TABLE IF NOT EXISTS indexed_files (
     mtimeMillis INTEGER NOT NULL,
     contentHash TEXT NOT NULL
 );
+
+-- One row per node that has been embedded. The relation is 1:0-or-1 (see the
+-- architecture doc's Data Model erDiagram: `NODES ||--o| VECTORS`), so
+-- nodeId is the primary key rather than an ordinary indexed FK column - a
+-- re-embed overwrites the row instead of accumulating one. ON DELETE CASCADE
+-- so a node going away (a file edit, a deletion) drops its stale embedding
+-- with it instead of leaving an orphan a later similarity search could still
+-- surface - the same reasoning `declarations` and `edges` already follow for
+-- their own FKs into `nodes`.
+--
+-- embedding is sqlite-vec's compact vector format: each dimension as a
+-- 4-byte little-endian float32, back to back, no header - see
+-- `storage::vectors::pack`. embeddingVersion names the model (+ version)
+-- that produced *this row*, which is not the same fact as `meta`'s
+-- `embedding_model` (the project's current choice): the two only agree once
+-- every row has been re-embedded after a model switch. Carrying it per row
+-- from the start means a future model switch costs a background re-embed,
+-- not a schema migration - see REQUIREMENTS.md's "Инвалидация эмбеддингов
+-- при смене embedding-модели".
+CREATE TABLE IF NOT EXISTS vectors (
+    nodeId          TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    embedding       BLOB NOT NULL,
+    embeddingVersion TEXT NOT NULL
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -262,12 +292,25 @@ pub fn record_bulk_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Records the project's current active embedding model, so `meta` reflects
+/// what `embedding::EmbeddingPipeline` actually tagged its rows with rather
+/// than staying `NULL` forever (see the DDL comment on `vectors` for why the
+/// two columns are a distinct fact from each other, and `EmbeddingPipeline`'s
+/// module doc for why this is written on every `apply`, not once). A plain
+/// `UPDATE` rather than a schema column type built for a fixed set of models:
+/// a future model switch is a data change to this one row, never a migration.
+pub fn set_embedding_model(conn: &Connection, model: &str) -> Result<()> {
+    conn.execute("UPDATE meta SET embedding_model = ?1 WHERE id = 1", rusqlite::params![model])
+        .context("failed to record the active embedding model")?;
+    Ok(())
+}
+
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         // Children before parents: with `foreign_keys` on, dropping `nodes`
-        // while `declarations`/`edges` still reference it is an error rather
-        // than a cascade.
-        "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
+        // while `declarations`/`edges`/`vectors` still reference it is an
+        // error rather than a cascade.
+        "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
     )
     .context("failed to wipe schema")
 }
@@ -310,7 +353,10 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables.sort();
-        assert_eq!(tables, vec!["declarations", "edges", "indexed_files", "meta", "nodes"]);
+        assert_eq!(
+            tables,
+            vec!["declarations", "edges", "indexed_files", "meta", "nodes", "vectors"]
+        );
 
         let indexes: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
@@ -535,6 +581,36 @@ mod tests {
         // index must not ask for the walk again.
         assert!(!ensure_current(&conn, GENERATION).unwrap());
         assert!(bulk_index_completed(&conn).unwrap());
+    }
+
+    #[test]
+    fn the_active_embedding_model_starts_unset_and_can_be_recorded() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+
+        let before: Option<String> =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, None, "a fresh index has no active model recorded yet");
+
+        set_embedding_model(&conn, "jina-embeddings-v2-base-code").unwrap();
+        let after: String =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(after, "jina-embeddings-v2-base-code");
+    }
+
+    /// The acceptance criterion behind the column's whole design: a future
+    /// model switch is a data change to this one row, not a schema migration.
+    #[test]
+    fn recording_a_different_model_overwrites_the_previous_one_with_no_schema_change() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+
+        set_embedding_model(&conn, "jina-embeddings-v2-base-code").unwrap();
+        set_embedding_model(&conn, "some-future-model-v2").unwrap();
+
+        let model: String =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(model, "some-future-model-v2");
     }
 
     #[test]

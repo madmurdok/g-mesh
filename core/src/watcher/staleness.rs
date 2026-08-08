@@ -66,6 +66,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use crate::embedding::EmbeddingPipeline;
 use crate::protocol::types::RequestId;
 use crate::watcher::apply::apply_file_change;
 
@@ -115,6 +116,7 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
     project_root: &Path,
     file_path: &str,
     request_id: RequestId,
+    embedding: &EmbeddingPipeline,
 ) -> Result<StalenessOutcome> {
     match decide(conn, project_root, file_path)? {
         Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
@@ -128,7 +130,7 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
         Decision::NeedsReindex { mtime, hash, had_prior_record } => {
             // Genuinely stale (or never indexed) - synchronously reindex
             // before recording the new baseline.
-            apply_file_change(reader, writer, conn, file_path, request_id)
+            apply_file_change(reader, writer, conn, file_path, request_id, embedding)
                 .context("failed to synchronously reindex stale file")?;
             upsert_indexed_file(conn, file_path, mtime, &hash)?;
             Ok(if had_prior_record {
@@ -400,6 +402,7 @@ mod tests {
             tmp.path(),
             "src/lib.rs",
             request_id,
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
         plugin.join().unwrap();
@@ -438,9 +441,16 @@ mod tests {
             invoked_tx,
         );
         let mut buf_reader = BufReader::new(core_reader);
-        let outcome =
-            ensure_fresh(&mut buf_reader, &mut core_writer, &mut conn, tmp.path(), "lib.rs", request_id)
-                .unwrap();
+        let outcome = ensure_fresh(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            tmp.path(),
+            "lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
         assert_eq!(outcome, StalenessOutcome::ReindexedNoPriorRecord);
         invoked_rx.try_recv().unwrap();
@@ -476,6 +486,7 @@ mod tests {
             tmp.path(),
             "lib.rs",
             request_id2,
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
         plugin2.join().unwrap();
@@ -510,8 +521,16 @@ mod tests {
             invoked_tx,
         );
         let mut buf_reader = BufReader::new(core_reader);
-        ensure_fresh(&mut buf_reader, &mut core_writer, &mut conn, tmp.path(), "lib.rs", request_id)
-            .unwrap();
+        ensure_fresh(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            tmp.path(),
+            "lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
         invoked_rx.try_recv().unwrap();
 
@@ -543,6 +562,7 @@ mod tests {
             tmp.path(),
             "lib.rs",
             RequestId::Number(2),
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
 
@@ -582,8 +602,16 @@ mod tests {
             invoked_tx,
         );
         let mut buf_reader = BufReader::new(core_reader);
-        ensure_fresh(&mut buf_reader, &mut core_writer, &mut conn, tmp.path(), "lib.rs", request_id)
-            .unwrap();
+        ensure_fresh(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            tmp.path(),
+            "lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
         plugin.join().unwrap();
         invoked_rx.try_recv().unwrap();
 
@@ -619,6 +647,7 @@ mod tests {
             tmp.path(),
             "lib.rs",
             RequestId::Number(2),
+            &EmbeddingPipeline::disabled(),
         )
         .unwrap();
 

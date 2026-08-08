@@ -22,6 +22,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use g_mesh::daemon::bulk_index;
+use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -64,7 +65,8 @@ impl Project {
         schema::ensure_current(&conn, "overload-declaration-storage-test")
             .expect("failed to prepare the index");
         let conn = Mutex::new(conn);
-        let summary = bulk_index::run(self.root(), &conn).expect("the bulk walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &EmbeddingPipeline::disabled())
+            .expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()
@@ -176,14 +178,14 @@ fn an_ordinary_symbol_in_the_same_walk_costs_no_declaration_rows() {
 }
 
 #[test]
-fn a_freshly_built_index_reads_schema_version_5() {
+fn a_freshly_built_index_reads_schema_version_6() {
     let project = Project::new();
     let conn = project.walk();
 
     let version: String = conn
         .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
 
