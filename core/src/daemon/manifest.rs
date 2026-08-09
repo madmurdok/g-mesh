@@ -32,6 +32,7 @@
 //! already-absolute value (it replaces the base entirely), so no separate
 //! "is it absolute" branch is needed.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -132,6 +133,96 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     })
 }
 
+/// Discovery's output: every plugin found, keyed by language, plus the
+/// extension routing table derived from them - see the architecture doc's
+/// Interfaces section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredPlugins {
+    /// language -> manifest.
+    pub manifests: HashMap<String, PluginManifest>,
+    /// lowercase, leading-dot extension -> language.
+    pub routing: HashMap<String, String>,
+}
+
+/// Scans `roots` in order for `<root>/<language-dir>/plugin.toml`, calling
+/// [`read_manifest`] on each one found, then builds the extension routing
+/// table from the results.
+///
+/// A language found in an earlier root shadows the same language name found
+/// in a later root - logged, not an error (the deliberate override path: a
+/// higher-precedence root, e.g. `~/.g-mesh/plugins/`, is scanned before the
+/// bundled root, so a user-installed plugin can intentionally replace a
+/// bundled one). A root that does not exist, or exists but is empty,
+/// contributes nothing - also not an error.
+///
+/// Two *different* languages claiming the same file extension while
+/// building the routing table is a hard error naming both languages and
+/// both manifest paths, matching this module's "validation is a hard
+/// failure" philosophy (see the module doc comment).
+pub fn discover(roots: &[PathBuf]) -> Result<DiscoveredPlugins> {
+    let mut manifests: HashMap<String, PluginManifest> = HashMap::new();
+
+    for root in roots {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            // A missing (or otherwise unreadable) root contributes nothing -
+            // not an error; see this function's doc comment.
+            Err(_) => continue,
+        };
+
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("failed to read plugin discovery root {}", root.display())
+            })?;
+            let dir = entry.path();
+            if !dir.is_dir() || !dir.join(MANIFEST_FILE_NAME).is_file() {
+                continue;
+            }
+
+            let manifest = read_manifest(&dir)?;
+
+            if let Some(existing) = manifests.get(&manifest.language) {
+                eprintln!(
+                    "g-mesh daemon: plugin \"{}\" at {} shadows the same language already \
+                     found at {} - the earlier one wins",
+                    manifest.language,
+                    manifest.manifest_dir.display(),
+                    existing.manifest_dir.display(),
+                );
+                continue;
+            }
+
+            manifests.insert(manifest.language.clone(), manifest);
+        }
+    }
+
+    let mut routing: HashMap<String, String> = HashMap::new();
+    for manifest in manifests.values() {
+        for extension in &manifest.extensions {
+            match routing.get(extension) {
+                Some(existing_language) if existing_language != &manifest.language => {
+                    let existing = &manifests[existing_language];
+                    bail!(
+                        "extension \"{extension}\" is claimed by both plugin \"{}\" ({}) and \
+                         plugin \"{}\" ({}) - two different languages cannot claim the same \
+                         file extension",
+                        existing_language,
+                        existing.manifest_dir.join(MANIFEST_FILE_NAME).display(),
+                        manifest.language,
+                        manifest.manifest_dir.join(MANIFEST_FILE_NAME).display(),
+                    );
+                }
+                Some(_) => {} // same language already claims it; nothing to do
+                None => {
+                    routing.insert(extension.clone(), manifest.language.clone());
+                }
+            }
+        }
+    }
+
+    Ok(DiscoveredPlugins { manifests, routing })
+}
+
 /// `true` if `value` contains a platform path separator - the signal this
 /// module uses (mirroring the architecture doc's schema comment) to decide
 /// between "look this up on `$PATH`" and "resolve this relative to the
@@ -217,6 +308,121 @@ mod tests {
         fs::create_dir_all(&plugin_dir).unwrap();
         fs::write(plugin_dir.join(MANIFEST_FILE_NAME), body).unwrap();
         (root, plugin_dir)
+    }
+
+    /// Builds a fresh tempdir root containing one `<dir_name>/plugin.toml`
+    /// per entry in `plugins` - the multi-language, single-root analog of
+    /// [`plugin_dir`], for `discover()` tests that need more than one
+    /// language directory under a root. Returns the root path itself
+    /// (unlike `plugin_dir`, which returns a plugin subdirectory).
+    fn discovery_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        for (dir_name, body) in plugins {
+            let plugin_dir = root.path().join(dir_name);
+            fs::create_dir_all(&plugin_dir).unwrap();
+            fs::write(plugin_dir.join(MANIFEST_FILE_NAME), body).unwrap();
+        }
+        let path = root.path().to_path_buf();
+        (root, path)
+    }
+
+    /// A well-formed `plugin.toml` body for `discover()` tests, parameterized
+    /// over the fields those tests actually vary - `language` (must match
+    /// its containing directory name, same as [`well_formed_toml`]),
+    /// `plugin_version` (used to tell two same-language manifests apart),
+    /// and `extensions` (used to construct routing conflicts).
+    fn manifest_toml(language: &str, plugin_version: &str, extensions: &[&str]) -> String {
+        let extensions =
+            extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+        format!(
+            r#"
+[plugin]
+language = "{language}"
+protocol_version = {version}
+plugin_version = "{plugin_version}"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [{extensions}]
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        )
+    }
+
+    #[test]
+    fn a_language_in_an_earlier_root_shadows_the_same_language_in_a_later_root() {
+        let (_root1, root1) =
+            discovery_root(&[("python", &manifest_toml("python", "1.0.0", &[".py"]))]);
+        let (_root2, root2) =
+            discovery_root(&[("python", &manifest_toml("python", "2.0.0", &[".py"]))]);
+
+        let discovered = discover(&[root1, root2]).unwrap();
+
+        assert_eq!(discovered.manifests.len(), 1);
+        assert_eq!(discovered.manifests["python"].plugin_version, "1.0.0");
+        assert_eq!(discovered.routing.get(".py"), Some(&"python".to_string()));
+    }
+
+    #[test]
+    fn two_different_languages_claiming_the_same_extension_is_a_hard_error() {
+        let (_root, root) = discovery_root(&[
+            ("python", &manifest_toml("python", "1.0.0", &[".foo"])),
+            ("go", &manifest_toml("go", "1.0.0", &[".foo"])),
+        ]);
+
+        let err = discover(&[root.clone()]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("python"), "{message}");
+        assert!(message.contains("go"), "{message}");
+        assert!(
+            message.contains(&root.join("python").join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&root.join("go").join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_contributes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_root = root.path().join("does-not-exist");
+
+        let discovered = discover(&[missing_root]).unwrap();
+
+        assert!(discovered.manifests.is_empty());
+        assert!(discovered.routing.is_empty());
+    }
+
+    #[test]
+    fn an_empty_root_directory_contributes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+
+        let discovered = discover(&[root.path().to_path_buf()]).unwrap();
+
+        assert!(discovered.manifests.is_empty());
+        assert!(discovered.routing.is_empty());
+    }
+
+    #[test]
+    fn discovery_with_two_languages_and_no_conflicts_populates_manifests_and_routing() {
+        let (_root, root) = discovery_root(&[
+            ("python", &manifest_toml("python", "1.0.0", &[".py", ".pyi"])),
+            ("go", &manifest_toml("go", "1.0.0", &[".go"])),
+        ]);
+
+        let discovered = discover(&[root]).unwrap();
+
+        assert_eq!(discovered.manifests.len(), 2);
+        assert!(discovered.manifests.contains_key("python"));
+        assert!(discovered.manifests.contains_key("go"));
+        assert_eq!(discovered.routing.get(".py"), Some(&"python".to_string()));
+        assert_eq!(discovered.routing.get(".pyi"), Some(&"python".to_string()));
+        assert_eq!(discovered.routing.get(".go"), Some(&"go".to_string()));
     }
 
     fn well_formed_toml() -> String {
