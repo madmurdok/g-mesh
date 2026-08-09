@@ -1,12 +1,24 @@
-//! Spawns the bundled JS/TS language plugin as a child process, performs its
-//! handshake, and gives the rest of the daemon a way to route `FileChanged`
-//! requests to it and apply the diff it answers with - the missing link
-//! between the daemon (Rust) and the plugin (Node.js) process.
+//! Spawns a language plugin as a child process from its manifest, performs
+//! its handshake, and gives the rest of the daemon a way to route
+//! `FileChanged` requests to it and apply the diff it answers with - the
+//! missing link between the daemon (Rust) and a plugin process (Node.js for
+//! the bundled one; whatever a discovered manifest's `command`/`args` name,
+//! for any other).
 //!
-//! Only the one bundled JS/TS plugin is spawned here, unconditionally. The
-//! general `~/.g-mesh/plugins/<language>/` discovery/manifest scheme
-//! documented in the v1 architecture doc is deliberately not built: this MVP
-//! release bundles exactly one plugin, so there is nothing to discover.
+//! [`PluginProcess`]/[`PluginState`] here are generic over any one plugin;
+//! discovery and per-language routing live in `daemon::manifest`
+//! (`~/.g-mesh/plugins/<language>/plugin.toml` + the bundled root) and
+//! `daemon::registry::PluginRegistry`, which spawns one `PluginProcess` per
+//! discovered language, lazily, the first time anything needs it. This
+//! module keeps a narrower "the bundled JS/TS plugin specifically" surface
+//! too - [`bundled_manifest`], [`plugin_entry_path`], [`PLUGIN_PATH_ENV`],
+//! [`bundled_fingerprint`] - for the handful of callers that genuinely mean
+//! that one plugin rather than whatever the registry has discovered:
+//! `daemon::build_stamp` compares one *running daemon's* JS/TS build against
+//! another's (a question about this install, not about what filled any one
+//! project's index), and a couple of tests want a bare manifest without a
+//! `plugin.toml` fixture. See each item's own doc comment for why it is not
+//! dead code.
 //!
 //! # Crash detection and lazy relaunch
 //!
