@@ -5,6 +5,13 @@ pub mod indexing_status;
 pub mod lifecycle;
 pub mod manifest;
 pub mod plugin;
+pub mod registry;
+/// A fake, protocol-speaking plugin for the unit tests in this module tree -
+/// the only way to exercise *two* languages without a second real plugin
+/// existing. Compiled only under `cfg(test)`, and never referenced by
+/// anything that ships.
+#[cfg(test)]
+pub(crate) mod test_plugin;
 
 use std::fs::{self, File, TryLockError};
 use std::os::unix::net::UnixListener;
@@ -292,8 +299,17 @@ pub fn run(root: &Path) -> Result<()> {
     // exists, not at the end of startup: a daemon that dies during its bulk
     // walk would otherwise leave a running plugin behind that nothing outside
     // this process could name (see `cli::stop`).
+    //
+    // Still the bundled JS/TS plugin specifically, named by
+    // `plugin::bundled_manifest()` rather than looked up from discovery:
+    // replacing this single supervisor with a `daemon::registry
+    // ::PluginRegistry` (one lazily-spawned supervisor per discovered
+    // language) is the next task in this release, and the supervisor now
+    // takes the manifest it owns as an argument precisely so that swap is a
+    // change of *caller*, not of this type.
     let plugin = PluginSupervisor::start(
         &canonical_root,
+        plugin::bundled_manifest(),
         dir.join(PLUGIN_PID_FILE),
         timeouts.plugin,
         Arc::clone(&embedding),
