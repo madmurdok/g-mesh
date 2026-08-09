@@ -43,6 +43,50 @@ use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 
+/// Overrides [`default_roots`]'s entire return value with a single directory.
+/// Generalizes `daemon::plugin::PLUGIN_PATH_ENV` (the JS/TS-only, test-only
+/// entry-point override that predates this module): a test drops whatever
+/// `<language>/plugin.toml` fixtures it needs under one directory and points
+/// discovery at just that, rather than needing one override variable per
+/// language. Real installs never set this - the default already resolves to
+/// the user and bundled roots.
+pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = "G_MESH_PLUGIN_ROOTS_OVERRIDE";
+
+/// The roots [`discover`] scans, in precedence order, honoring
+/// [`PLUGIN_ROOTS_OVERRIDE_ENV`].
+///
+/// With no override set, returns up to two roots:
+/// 1. `~/.g-mesh/plugins/` - user-installed, global (not per-project),
+///    resolved the same way `config::global_config_path` resolves everything
+///    else under `~/.g-mesh/...`. Skipped (not an error - matches this
+///    module's "a root that does not exist contributes nothing" philosophy
+///    in [`discover`]) if the home directory cannot be resolved at all.
+/// 2. The bundled root. In a repo checkout this resolves the same way
+///    `daemon::plugin::plugin_entry_path`'s dev-checkout fallback does today:
+///    relative to this crate's own source tree
+///    (`CARGO_MANIFEST_DIR/../plugins/`), since `core/` and `plugins/` are
+///    sibling directories with no distribution pipeline yet. TODO: a real
+///    install has no `CARGO_MANIFEST_DIR` - that case needs resolving
+///    relative to `std::env::current_exe()` instead, matching the "JS/TS
+///    plugin ships in the same release archive" line in the v1 architecture
+///    doc's Distribution section; not implemented yet because there is no
+///    installed release to test it against.
+///
+/// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, both standard roots are replaced
+/// entirely by a single-element vec of just that one path.
+pub fn default_roots() -> Vec<PathBuf> {
+    if let Ok(over) = std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV) {
+        return vec![PathBuf::from(over)];
+    }
+
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".g-mesh").join("plugins"));
+    }
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins"));
+    roots
+}
+
 /// One plugin directory's fully-resolved manifest - see this module's doc
 /// comment and the architecture doc's Interfaces section for what each field
 /// means and how `command`/`args` got resolved.
@@ -297,6 +341,42 @@ struct RawFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Guards every test below that touches [`PLUGIN_ROOTS_OVERRIDE_ENV`]: it
+    /// is process-wide state, and `cargo test` runs this module's tests on
+    /// multiple threads by default, so two of them setting/clearing the same
+    /// variable at once would be a genuine race - same reasoning as
+    /// `daemon::lifecycle`'s `ENV_LOCK` for its own env-var tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_roots_bundled_entry_resolves_to_the_sibling_plugins_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(PLUGIN_ROOTS_OVERRIDE_ENV);
+
+        let roots = default_roots();
+        let bundled = roots.last().expect("default_roots must return at least the bundled root");
+
+        assert!(
+            bundled.join("js-ts").join(MANIFEST_FILE_NAME).is_file(),
+            "expected {} to contain js-ts/plugin.toml",
+            bundled.display()
+        );
+    }
+
+    #[test]
+    fn the_override_env_var_replaces_the_entire_default_roots_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let override_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(PLUGIN_ROOTS_OVERRIDE_ENV, override_dir.path());
+
+        let roots = default_roots();
+
+        std::env::remove_var(PLUGIN_ROOTS_OVERRIDE_ENV);
+
+        assert_eq!(roots, vec![override_dir.path().to_path_buf()]);
+    }
 
     /// Writes `plugin.toml` under a directory named `dir_name` (inside a
     /// fresh tempdir) with `body` as its contents, and returns that
