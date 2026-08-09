@@ -53,7 +53,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::config::ProjectConfig;
-use crate::daemon::plugin::PluginProcess;
+use crate::daemon::plugin::{bundled_manifest, PluginProcess};
 use crate::embedding::EmbeddingPipeline;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -261,7 +261,12 @@ impl PluginSupervisor {
         idle_timeout: Option<Duration>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Result<Arc<Self>> {
-        let process = PluginProcess::spawn(project_root).context("failed to start the JS/TS plugin")?;
+        // `bundled_manifest()` bridges this to the JS/TS plugin exactly as
+        // spawned before `PluginProcess::spawn` took a manifest - real
+        // per-language discovery (`daemon::manifest::discover`) is a later
+        // task in this release.
+        let process = PluginProcess::spawn(project_root, &bundled_manifest())
+            .context("failed to start the JS/TS plugin")?;
         write_pid_file(&pid_file, process.pid());
 
         Ok(Arc::new(Self {
@@ -323,7 +328,7 @@ impl PluginSupervisor {
         // leaves the queue intact for the next request to retry rather than
         // swallowing the changes it was about to replay.
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root)
+            let process = PluginProcess::spawn(&self.project_root, &bundled_manifest())
                 .context("failed to wake the JS/TS plugin")?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
@@ -419,7 +424,7 @@ impl PluginSupervisor {
 
         let mut inner = self.inner.lock().unwrap();
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root)
+            let process = PluginProcess::spawn(&self.project_root, &bundled_manifest())
                 .context("failed to wake the JS/TS plugin for a query-time staleness check")?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
