@@ -154,7 +154,7 @@ pub fn of_running_process() -> Result<BuildStamp> {
     // to the same answer from anyone else, so an install with no readable
     // plugin behaves exactly as it did before this field existed instead of
     // making every process look like a change.
-    let plugin = plugin::fingerprint().to_string();
+    let plugin = plugin::bundled_fingerprint().to_string();
     Ok(BuildStamp { exe, exe_mtime_millis, plugin })
 }
 
