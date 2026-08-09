@@ -34,9 +34,10 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
-use crate::protocol::types::RequestId;
+use crate::protocol::types::{RequestId, CURRENT_PROTOCOL_VERSION};
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
@@ -74,6 +75,32 @@ pub(crate) fn plugin_entry_path() -> PathBuf {
     // resolving relative to this crate's own source tree, baked in at
     // compile time, is the pragmatic MVP answer.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/js-ts/dist/src/index.js")
+}
+
+/// A [`PluginManifest`] describing the bundled JS/TS plugin exactly as it was
+/// spawned before this module took a manifest as an argument: `node` plus
+/// [`plugin_entry_path`]'s resolved entry point, honoring the same
+/// [`PLUGIN_PATH_ENV`] override - nothing read from an actual `plugin.toml`.
+///
+/// This bridges [`PluginState::spawn`]/[`PluginProcess::spawn`]'s new
+/// manifest-driven signature with callers that predate real plugin discovery
+/// (`daemon::manifest::discover`, not built yet - a later task in this
+/// release, per `docs/architecture/plugin-modularity.md`). Once that
+/// discovery ships, this function's callers are expected to look the
+/// manifest up from a `PluginRegistry` instead, and this helper retired.
+pub fn bundled_manifest() -> PluginManifest {
+    let entry = plugin_entry_path();
+    let manifest_dir = entry.parent().map(Path::to_path_buf).unwrap_or_default();
+    PluginManifest {
+        language: "typescript".to_string(),
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        plugin_version: String::new(),
+        command: PathBuf::from("node"),
+        args: vec![entry.to_string_lossy().into_owned()],
+        extensions: Vec::new(),
+        fingerprint_ignore: Vec::new(),
+        manifest_dir,
+    }
 }
 
 /// Identifies the plugin *logic* this process would run, as a short hex
@@ -242,16 +269,16 @@ struct PluginState {
 }
 
 impl PluginState {
-    /// Spawns the plugin for `project_root` and reads its handshake off
-    /// stdout, hard-failing - matching `handshake::verify`'s "a protocol
+    /// Spawns `manifest`'s plugin for `project_root` and reads its handshake
+    /// off stdout, hard-failing - matching `handshake::verify`'s "a protocol
     /// mismatch is a hard load failure" philosophy - if it doesn't check
-    /// out. Shared by the first spawn (`PluginProcess::spawn`) and every
-    /// crash relaunch (`PluginProcess::relaunch`): both need exactly the
-    /// same startup sequence.
-    fn spawn(project_root: &Path) -> Result<Self> {
-        let entry = plugin_entry_path();
-        let mut child = Command::new("node")
-            .arg(&entry)
+    /// out, or if the live handshake's language disagrees with what the
+    /// manifest declared. Shared by the first spawn (`PluginProcess::spawn`)
+    /// and every crash relaunch (`PluginProcess::relaunch`): both need
+    /// exactly the same startup sequence.
+    fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
+        let mut child = Command::new(&manifest.command)
+            .args(&manifest.args)
             .arg(project_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -261,7 +288,13 @@ impl PluginState {
             // goes (or /dev/null in tests that don't care).
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to spawn JS/TS plugin at {}", entry.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn {} plugin ({})",
+                    manifest.language,
+                    manifest.command.display()
+                )
+            })?;
 
         let stdout = child
             .stdout
@@ -273,7 +306,23 @@ impl PluginState {
             .context("plugin child process has no stdin")?;
 
         let mut reader = BufReader::new(stdout);
-        handshake::perform(&mut reader).context("JS/TS plugin handshake failed")?;
+        let handshake =
+            handshake::perform(&mut reader).context("plugin handshake failed")?;
+
+        // No precedent before N plugins existed to compare against - see
+        // `docs/architecture/plugin-modularity.md`'s Interfaces section.
+        // Same "protocol is code, a mismatch is a hard load failure"
+        // philosophy `handshake::verify` already applies to protocol version
+        // mismatches, just for the manifest's declared language instead.
+        if handshake.language != manifest.language {
+            bail!(
+                "plugin at {} declares language \"{}\" in its manifest but its \
+                 handshake reports \"{}\" - refusing to load",
+                manifest.manifest_dir.display(),
+                manifest.language,
+                handshake.language,
+            );
+        }
 
         Ok(Self { child, io: PluginIo { reader, writer: stdin } })
     }
@@ -287,6 +336,10 @@ pub struct PluginProcess {
     /// Kept so a crash relaunch can spawn a replacement for exactly the same
     /// project without any caller having to remember and pass it back in.
     project_root: PathBuf,
+    /// Kept for the same reason as `project_root`: a crash relaunch
+    /// (`Self::relaunch`) needs the exact command/language this process was
+    /// spawned with, and no caller re-supplies it on that path.
+    manifest: PluginManifest,
     state: Mutex<PluginState>,
     next_id: AtomicI64,
     /// File paths handed to [`Self::apply_file_change`] whose diff has not
@@ -298,11 +351,13 @@ pub struct PluginProcess {
 }
 
 impl PluginProcess {
-    /// Spawns the plugin for `project_root` - see [`PluginState::spawn`].
-    pub fn spawn(project_root: &Path) -> Result<Self> {
-        let state = PluginState::spawn(project_root)?;
+    /// Spawns `manifest`'s plugin for `project_root` - see
+    /// [`PluginState::spawn`].
+    pub fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
+        let state = PluginState::spawn(project_root, manifest)?;
         Ok(Self {
             project_root: project_root.to_path_buf(),
+            manifest: manifest.clone(),
             state: Mutex::new(state),
             next_id: AtomicI64::new(1),
             pending: Mutex::new(Vec::new()),
@@ -555,10 +610,11 @@ impl PluginProcess {
     /// now belongs to.
     fn relaunch(&self, cause: &anyhow::Error) -> Result<()> {
         eprintln!(
-            "g-mesh daemon: JS/TS plugin process exited unexpectedly ({cause:#}) - \
-             relaunching and replaying pending file changes"
+            "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - \
+             relaunching and replaying pending file changes",
+            self.manifest.language
         );
-        let fresh = PluginState::spawn(&self.project_root)?;
+        let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         *self.state.lock().unwrap() = fresh;
         match crate::daemon::plugin_pid_path(&self.project_root) {
@@ -689,5 +745,27 @@ mod tests {
             plugin, FINGERPRINT_UNAVAILABLE,
             "the test binary's own plugin build must be readable - `cargo test` builds it"
         );
+    }
+
+    /// The check `docs/architecture/plugin-modularity.md`'s Interfaces
+    /// section adds right after `handshake::perform` succeeds: a manifest
+    /// whose declared `language` disagrees with what the live plugin's
+    /// handshake actually reports is a hard-fail, naming both values - the
+    /// bundled JS/TS plugin's handshake reports `"typescript"` (see
+    /// `protocol::types`'s handshake test), so declaring anything else in
+    /// the manifest must be refused.
+    #[test]
+    fn spawning_a_manifest_whose_language_disagrees_with_the_live_handshake_hard_fails_naming_both() {
+        let manifest = PluginManifest { language: "python".to_string(), ..bundled_manifest() };
+        let project = tempfile::tempdir().unwrap();
+
+        let err = match PluginProcess::spawn(project.path(), &manifest) {
+            Ok(_) => panic!("spawning against a manifest declaring the wrong language must fail"),
+            Err(err) => err,
+        };
+
+        let message = format!("{err:#}");
+        assert!(message.contains("python"), "{message}");
+        assert!(message.contains("typescript"), "{message}");
     }
 }
