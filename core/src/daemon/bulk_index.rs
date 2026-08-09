@@ -32,7 +32,7 @@ use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
-/// `BULK_INDEX_FLAG` in plugins/js-ts/src/index.ts.
+/// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
 const BULK_INDEX_FLAG: &str = "--bulk-index";
 
 /// Nodes plus edges accumulated before a batch is committed. One `Diff` for

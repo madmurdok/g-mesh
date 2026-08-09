@@ -284,12 +284,15 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
 }
 
 /// Whether anything is still running for this state directory - the core, or
-/// a plugin that outlived it.
+/// any language's plugin that outlived it. Lists every `plugin-<language>.pid`
+/// file actually present (`daemon::registry::discovered_pid_files`) rather
+/// than assuming one hardcoded plugin - a live Python plugin orphaned by a
+/// dead core must stop this project from being cleaned up exactly as much as
+/// a live JS/TS one always has.
 fn daemon_is_running(state_dir: &Path) -> bool {
-    [daemon::pid_path_in(state_dir), daemon::plugin_pid_path_in(state_dir)]
-        .iter()
-        .filter_map(|path| daemon::read_pid_file(path))
-        .any(daemon::is_process_alive)
+    let mut pid_files = vec![daemon::pid_path_in(state_dir)];
+    pid_files.extend(daemon::registry::discovered_pid_files(state_dir).into_iter().map(|(_, path)| path));
+    pid_files.iter().filter_map(|path| daemon::read_pid_file(path)).any(daemon::is_process_alive)
 }
 
 fn delete(path: &Path) -> Result<()> {

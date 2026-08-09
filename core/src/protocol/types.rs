@@ -58,7 +58,7 @@ pub enum EdgeSource {
 /// One declaration of a symbol written as several - an overload signature
 /// beside its implementation, an interface or a namespace merged across
 /// statements. Mirrors the plugin's `SymbolDeclaration`
-/// (plugins/js-ts/src/extract.ts) exactly, flat line/col fields and all,
+/// (plugins/typescript/src/extract.ts) exactly, flat line/col fields and all,
 /// rather than nesting a [`Range`] the way [`WireNode`] does: this shape
 /// crosses the wire as the plugin already builds it in process, and a
 /// transformation on the way out would be one more thing for the two sides to
@@ -105,7 +105,7 @@ pub struct WireNode {
     /// `skip_serializing_if` is load-bearing rather than tidiness: the design
     /// promises an ordinary single-declaration node stays byte-identical on
     /// the wire, and the plugin holds up its half by omitting the key
-    /// entirely (`toWireNode` in plugins/js-ts/src/bulkIndex.ts). An empty
+    /// entirely (`toWireNode` in plugins/typescript/src/bulkIndex.ts). An empty
     /// list would be a different, and equally wrong, way to say "one
     /// declaration" - hence `Option`, not `Vec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,7 +130,7 @@ pub struct WireEdge {
     /// [`WireNode::declarations`] is.
     ///
     /// It is part of the edge's identity (`edgeIdFor` in
-    /// plugins/js-ts/src/extract.ts), which is what lets one caller that calls
+    /// plugins/typescript/src/extract.ts), which is what lets one caller that calls
     /// two overloads of the same function record both bindings instead of one
     /// overwriting the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(edge, round_tripped);
     }
 
-    /// Exactly what `toWireNode` (plugins/js-ts/src/bulkIndex.ts) emits for an
+    /// Exactly what `toWireNode` (plugins/typescript/src/bulkIndex.ts) emits for an
     /// overloaded `parse` - copied from that plugin's own output rather than
     /// hand-written, so this asserts against the real wire bytes and not
     /// against what serde would have produced from the Rust struct.

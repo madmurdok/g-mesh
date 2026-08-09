@@ -359,8 +359,8 @@ mod tests {
         let bundled = roots.last().expect("default_roots must return at least the bundled root");
 
         assert!(
-            bundled.join("js-ts").join(MANIFEST_FILE_NAME).is_file(),
-            "expected {} to contain js-ts/plugin.toml",
+            bundled.join("typescript").join(MANIFEST_FILE_NAME).is_file(),
+            "expected {} to contain typescript/plugin.toml",
             bundled.display()
         );
     }
@@ -667,19 +667,18 @@ extensions = [".py"]
         assert_eq!(resolve_arg("--verbose", Path::new("/plugins/python")), "--verbose");
     }
 
-    /// The bundled JS/TS plugin's own `plugin.toml` (`plugins/js-ts/plugin.toml`,
+    /// The bundled JS/TS plugin's own `plugin.toml` (`plugins/typescript/plugin.toml`,
     /// embedded at compile time so this test tracks the committed file, not a
-    /// copy) must itself satisfy `read_manifest`. Its directory on disk is
-    /// named `js-ts`, not `typescript` - a known, tracked mismatch (see that
-    /// file's own header comment and the architecture doc) still open for a
-    /// later discovery-wiring task to resolve - so this test cannot point
-    /// `read_manifest` at the real path directly; instead it copies the exact
-    /// file contents into a tempdir named `typescript`, which is the name
-    /// `read_manifest` requires today, and confirms the content itself is
-    /// well-formed and matches the plugin's real handshake/version values.
+    /// copy) must itself satisfy `read_manifest`. Its directory on disk used
+    /// to be named `js-ts`, not `typescript` - a mismatch this module's own
+    /// (now resolved) header used to flag - so this still copies the exact
+    /// file contents into a tempdir rather than trusting any particular path,
+    /// which is what lets it confirm the content itself is well-formed and
+    /// matches the plugin's real handshake/version values independent of
+    /// where the repo happens to keep the file.
     #[test]
     fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
-        const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/js-ts/plugin.toml");
+        const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
 
         let (_root, dir) = plugin_dir("typescript", BUNDLED_JS_TS_MANIFEST);
 
@@ -692,5 +691,22 @@ extensions = [".py"]
         assert!(manifest.extensions.contains(&".ts".to_string()));
         assert!(manifest.extensions.contains(&".tsx".to_string()));
         assert!(manifest.extensions.contains(&".js".to_string()));
+    }
+
+    /// Task 155's actual acceptance criterion for the rename: discovery must
+    /// find the bundled plugin at its *real* on-disk location, not just at a
+    /// copy under a conveniently-named tempdir - `default_roots()`'s bundled
+    /// entry (`CARGO_MANIFEST_DIR/../plugins`) really does contain a
+    /// `typescript/plugin.toml` today, where before task 155 it contained
+    /// `js-ts/plugin.toml` and could not satisfy `read_manifest`'s
+    /// language-equals-directory-name rule at all.
+    #[test]
+    fn the_real_bundled_plugin_directory_satisfies_read_manifest_directly() {
+        let bundled_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+
+        let manifest = read_manifest(&bundled_root.join("typescript"))
+            .expect("the real bundled plugin directory must satisfy read_manifest");
+
+        assert_eq!(manifest.language, "typescript");
     }
 }

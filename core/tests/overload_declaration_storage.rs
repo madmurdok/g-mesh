@@ -197,7 +197,7 @@ fn a_freshly_built_index_reads_schema_version_6() {
 #[test]
 fn the_plugins_own_ndjson_mentions_declarations_only_for_the_overloaded_node() {
     let project = Project::new();
-    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/js-ts/dist/src/index.js");
+    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js");
     let output = Command::new("node")
         .arg(&entry)
         .arg("--bulk-index")

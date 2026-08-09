@@ -26,7 +26,7 @@
 //! detached daemon, a real plugin walk, and a real `rmcp` client asking real
 //! questions over the socket.
 //!
-//! Requires `plugins/js-ts/dist/` to be up to date; `core/build.rs` runs
+//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
 //! `npm run build` there whenever this crate is built.
 
 use std::path::Path;

@@ -64,8 +64,8 @@ fn a_killed_plugin_process_is_transparently_relaunched_and_its_pending_queue_rep
     fs::write(root.join("alpha.ts"), "export function alpha() {}\n").expect("failed to write alpha.ts");
     fs::write(root.join("beta.ts"), "export function beta() {}\n").expect("failed to write beta.ts");
 
-    let plugin =
-        PluginProcess::spawn(root, &bundled_manifest()).expect("failed to spawn the JS/TS plugin");
+    let plugin = PluginProcess::spawn(root, &bundled_manifest(), root.join("plugin.pid"))
+        .expect("failed to spawn the JS/TS plugin");
     let conn = setup_conn();
 
     // Establish the happy path first, so a failure below can only be about

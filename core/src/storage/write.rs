@@ -3,7 +3,7 @@ use rusqlite::{params, Connection};
 
 /// One declaration of a symbol that has several - a row of the `declarations`
 /// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
-/// (plugins/js-ts/src/extract.ts) field for field, which is also the wire
+/// (plugins/typescript/src/extract.ts) field for field, which is also the wire
 /// shape (`protocol::types::WireDeclaration`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationRecord {

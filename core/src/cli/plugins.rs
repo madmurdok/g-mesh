@@ -194,13 +194,11 @@ mod tests {
     /// time so this test tracks the committed file, not a copy - same
     /// approach `daemon::manifest`'s own
     /// `the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly`
-    /// test uses. Its containing directory on disk is named `js-ts`, not
-    /// `typescript` (a known, tracked mismatch - see that file's own header
-    /// comment), so a fixture root here must place it under a directory
-    /// named `typescript` to satisfy `read_manifest`'s
-    /// language-equals-directory-name rule; fixing the real bundled layout
-    /// is out of scope for this command.
-    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/js-ts/plugin.toml");
+    /// test uses. Its containing directory on disk is named `typescript`
+    /// (task 155 renamed it from `js-ts` precisely so it would satisfy
+    /// `read_manifest`'s language-equals-directory-name rule directly), which
+    /// is also the name a fixture root here has to use for the same reason.
+    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
 
     /// Builds a fresh tempdir root containing one `<dir_name>/plugin.toml`
     /// per entry in `plugins`.

@@ -39,19 +39,31 @@
 //! inside it) continues below this one and nothing ever reaches back up:
 //! a supervisor knows nothing about the registry that owns it.
 //!
-//! # What still assumes a single plugin
+//! # Wired into `daemon::run` (task 155)
 //!
-//! `PluginProcess::relaunch` writes the legacy single `plugin.pid`, and
-//! `cli::status`/`cli::stop`/`lifecycle::release_state_files` read exactly
-//! that one file, while this registry gives each language a pid file of its
-//! own (see [`pid_file_for`](PluginRegistry::pid_file_for)). Reconciling
-//! them belongs with the task that actually wires this registry into
-//! `daemon::run` - until then `daemon::run` still holds one supervisor and
-//! those paths remain correct for it. What is *not* deferred is the harmful
-//! half: two supervisors sharing one pid file would delete each other's
-//! records on every sleep, and that cannot happen here.
+//! `daemon::run` holds one `Arc<PluginRegistry>` where it used to hold one
+//! `Arc<PluginSupervisor>`: `discover(default_roots())`'s result becomes this
+//! registry at startup (a `discover()` failure is a hard daemon-startup
+//! failure, same as a bad manifest always was), the watcher loop calls
+//! [`file_changed`](PluginRegistry::file_changed) instead of reaching a
+//! single supervisor directly, `daemon::lifecycle::supervise` drives every
+//! active supervisor's idle timer through
+//! [`sleep_if_idle_all`](PluginRegistry::sleep_if_idle_all) /
+//! [`sleep_all_now`](PluginRegistry::sleep_all_now), and the MCP layer wakes
+//! and queries plugins through
+//! [`replay_pending`](PluginRegistry::replay_pending) /
+//! [`ensure_fresh`](PluginRegistry::ensure_fresh) instead of a bare
+//! `Arc<PluginSupervisor>` field. `PluginProcess::relaunch` was the one
+//! remaining spot that wrote the legacy single `plugin.pid` regardless of
+//! which language actually crashed - it now rewrites its own supervisor's
+//! pid file (see [`pid_file_for`](PluginRegistry::pid_file_for)), so two
+//! languages can never step on each other's record, on a crash relaunch any
+//! more than on an ordinary sleep. `cli::status`/`cli::stop`/`cli::clean`
+//! read every `plugin-<language>.pid` file present
+//! ([`discovered_pid_files`]) rather than assuming exactly one.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,12 +74,45 @@ use rusqlite::Connection;
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::DiscoveredPlugins;
 use crate::embedding::EmbeddingPipeline;
+use crate::watcher::staleness::StalenessOutcome;
 
 /// Where a language's plugin pid is recorded, relative to the project's state
-/// directory: one file per language, unlike the single `plugin.pid` the
-/// pre-registry daemon writes (see this module's doc comment).
-fn plugin_pid_file_name(language: &str) -> String {
+/// directory: one file per language, unlike the single legacy `plugin.pid`
+/// (see `daemon::plugin_pid_path_in`'s doc comment for what still uses that
+/// name). `pub(crate)` rather than private so `daemon::mod`'s own
+/// bundled-plugin pid-path alias can build the same filename instead of
+/// duplicating the `"plugin-<language>.pid"` convention as a second literal.
+pub(crate) fn plugin_pid_file_name(language: &str) -> String {
     format!("plugin-{language}.pid")
+}
+
+/// Every `plugin-<language>.pid` file currently present in `state_dir`,
+/// paired with the language its name encodes - [`PluginRegistry::pid_file_for`]'s
+/// naming convention, reversed.
+///
+/// For tooling that has no running daemon (or `PluginRegistry`) to ask:
+/// `cli::status`, `cli::stop` and `cli::clean` all run *after* the fact,
+/// against a project whose daemon may or may not still be alive, so "list
+/// what is on disk" is the only source of truth available to them - unlike
+/// `daemon::lifecycle::supervise`, which asks a live registry directly for
+/// exactly this reason wherever one exists (see
+/// [`PluginRegistry::active_supervisors`]).
+///
+/// Empty - not an error - for a state directory that does not exist or
+/// cannot be listed, matching every other pid-file helper in this daemon's
+/// "unreadable means nothing recorded" convention.
+pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir) else { return files };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".pid")) {
+            files.push((language.to_string(), entry.path()));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 /// The daemon's plugins: what was discovered, and which of them are running.
@@ -273,6 +318,88 @@ impl PluginRegistry {
             return "none".to_string();
         }
         languages.join(", ")
+    }
+
+    /// A snapshot of every supervisor spawned so far - the languages this
+    /// daemon has actually needed, not every language discovery found. A
+    /// language nothing has touched yet has no process to sleep and no queue
+    /// to replay, so [`daemon::lifecycle::supervise`](crate::daemon::lifecycle::supervise)
+    /// and the MCP layer's wake/replay path both act on this set rather than
+    /// on every discovered manifest.
+    pub fn active_supervisors(&self) -> Vec<Arc<PluginSupervisor>> {
+        self.supervisors.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Puts every active, idle-enough supervisor to sleep - one call to
+    /// [`PluginSupervisor::sleep_if_idle`] per spawned language, run
+    /// independently: one language falling asleep (or not) never affects
+    /// another's own timer. A language that was never spawned is not in
+    /// [`active_supervisors`](Self::active_supervisors) at all, so this never
+    /// spawns anything new.
+    pub fn sleep_if_idle_all(&self) {
+        for supervisor in self.active_supervisors() {
+            supervisor.sleep_if_idle();
+        }
+    }
+
+    /// Stops every active supervisor's plugin regardless of idleness - what
+    /// the daemon does on its own way out, applied to every language that
+    /// has ever been spawned rather than to one hardcoded supervisor.
+    pub fn sleep_all_now(&self, reason: &str) {
+        for supervisor in self.active_supervisors() {
+            supervisor.sleep_now(reason);
+        }
+    }
+
+    /// Whether any active supervisor has something queued for its next wake -
+    /// the registry's analog of [`PluginSupervisor::has_pending`], cheap
+    /// enough to ask on every MCP tool call the same way that one already is.
+    pub fn has_pending(&self) -> bool {
+        self.active_supervisors().iter().any(|supervisor| supervisor.has_pending())
+    }
+
+    /// Replays every active supervisor's queued changes, one language at a
+    /// time. Best-effort per language, matching [`file_changed`](Self::file_changed)'s
+    /// contract: one language's replay failing (or waking a plugin that
+    /// fails to start) is reported and must not stop another language's
+    /// replay from running. Returns how many files were replayed in total,
+    /// across every language, for a caller that only cares whether anything
+    /// happened.
+    pub fn replay_pending(&self, conn: &Mutex<Connection>) -> usize {
+        let mut replayed = 0;
+        for supervisor in self.active_supervisors() {
+            match supervisor.replay_pending(conn) {
+                Ok(count) => replayed += count,
+                Err(err) => eprintln!(
+                    "g-mesh daemon: could not replay the changes queued while the {} plugin \
+                     slept: {err:#}",
+                    supervisor.language()
+                ),
+            }
+        }
+        replayed
+    }
+
+    /// Query-time staleness check (see `PluginSupervisor::ensure_fresh`) for
+    /// `file_path`, routed to whichever language's plugin claims its
+    /// extension - spawning that plugin if this is the first time anything
+    /// has needed it, exactly like [`file_changed`](Self::file_changed).
+    ///
+    /// `Ok(None)` - not an error - for a file no discovered plugin claims:
+    /// there is no plugin to ask, and therefore nothing this check could ever
+    /// have caught for it, the same "skip, do not fail" contract
+    /// [`file_changed`](Self::file_changed) already has for an unroutable
+    /// file.
+    pub fn ensure_fresh(
+        &self,
+        conn: &Mutex<Connection>,
+        file_path: &str,
+    ) -> Result<Option<StalenessOutcome>> {
+        let Some(language) = self.language_for(file_path).map(str::to_string) else {
+            return Ok(None);
+        };
+        let supervisor = self.get_or_spawn(&language)?;
+        supervisor.ensure_fresh(conn, file_path).map(Some)
     }
 }
 

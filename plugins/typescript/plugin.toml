@@ -1,0 +1,26 @@
+# Bundled JS/TS plugin manifest. See docs/architecture/plugin-modularity.md
+# (Data Model section) for the schema this file follows, and
+# core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# rules it must satisfy.
+#
+# `language` below is "typescript" - the plugin's actual wire identifier, per
+# its handshake (plugins/typescript/src/index.ts: `language: "typescript"`)
+# and core/src/protocol/types.rs's `handshake_payload_round_trips` test.
+# `read_manifest` requires `language` to equal this manifest's *containing
+# directory* name, which is why this directory (formerly `plugins/js-ts`) is
+# named `typescript` rather than describing the toolchain that builds it -
+# task 155 (the discovery-wiring task) renamed it to close that gap, so the
+# bundled plugin goes through the exact same directory-name-is-the-manifest's-
+# language rule as any other discovered plugin, no special case retained.
+
+[plugin]
+language = "typescript"
+protocol_version = 1
+plugin_version = "2.0.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]

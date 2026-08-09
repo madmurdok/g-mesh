@@ -22,15 +22,20 @@
 //!   own. A daemon that outlived an upgrade answers every query correctly
 //!   *for the build it is*, so nothing else in this report can show it up -
 //!   which is precisely why it gets a line of its own.
-//! - **Plugin**: the pid in `plugin.pid`, checked the same way, and then read
-//!   against the core's own state. The two-tier idle model is built
-//!   (`daemon::lifecycle`), so a plugin can legitimately be *absent* while its
-//!   core runs on: the core writes that pid file on every wake and clears it
-//!   on every sleep, which is what lets "no plugin, but a live core" be
-//!   reported as a plugin asleep on its idle timeout rather than as one that
-//!   never started. The remaining states are "active", the failure case worth
-//!   naming - a plugin still alive with no core left to serve - and "not
-//!   running", which now means neither of them is there.
+//! - **Plugins**: every `plugin-<language>.pid` file present in the state
+//!   directory (`daemon::registry::discovered_pid_files`), checked the same
+//!   way as the core's own pid and then read against the core's state - one
+//!   line per language, since `daemon::registry::PluginRegistry` gives each
+//!   language its own pid file rather than the single one a pre-registry
+//!   daemon wrote. A language with no pid file at all is not reported by
+//!   name: under the registry's lazy-spawn model that is the ordinary state
+//!   for a language nothing has touched yet *and* for one that was spawned
+//!   and has since gone idle (`daemon::lifecycle`'s two-tier sleep model
+//!   removes the pid file on every sleep, same as before) - the two are
+//!   indistinguishable from outside a running daemon, so this reports what it
+//!   can honestly tell apart: "active" for a live pid, "orphaned" for one
+//!   whose core is gone, and a single summary line when no language has a pid
+//!   file at all.
 //! - **Dirty files / index coverage**: a gitignore-aware walk of the project,
 //!   cross-referenced against the `File` nodes and `indexed_files` baselines
 //!   in the index. See [`IndexStatus`] for exactly what each number counts.
@@ -55,14 +60,14 @@ use crate::storage::connection::project_dir;
 use crate::watcher::staleness::mtime_millis;
 
 /// Extensions the bundled JS/TS plugin will index, mirroring `grammarFor` in
-/// plugins/js-ts/src/extract.ts. Anything else on disk is not a file this
+/// plugins/typescript/src/extract.ts. Anything else on disk is not a file this
 /// project's index is ever expected to cover, so counting it would make
 /// coverage look permanently broken.
 const SOURCE_EXTENSIONS: [&str; 8] =
     ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"];
 
 /// Directory names excluded whatever `.gitignore` says, mirroring
-/// `HARD_EXCLUDED_DIRS` in plugins/js-ts/src/ignorePolicy.ts - the walk here
+/// `HARD_EXCLUDED_DIRS` in plugins/typescript/src/ignorePolicy.ts - the walk here
 /// has to agree with the walk that built the index, or every file the plugin
 /// skipped would read as a coverage gap.
 const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"];
@@ -111,29 +116,37 @@ pub enum BuildState {
     Unknown,
 }
 
-/// Whether the language plugin process is up.
+/// Whether one language's plugin process is up - reported per language, in
+/// [`PluginReport`], rather than once for "the" plugin: since
+/// `daemon::registry::PluginRegistry` replaced the daemon's single
+/// `Arc<PluginSupervisor>`, there can be any number of these at once.
+///
+/// No `Asleep`/`NotRunning` variant here, unlike the pre-registry version of
+/// this type: those meant "a live core with no plugin pid on record has
+/// exactly one explanation" - true when the daemon spawned its one plugin
+/// unconditionally at startup, but no longer true under lazy per-language
+/// spawning, where "no pid file for this language" now covers two states
+/// this command cannot tell apart from outside a running daemon: a language
+/// nothing has touched yet, and one that was spawned and has since gone
+/// idle. [`plugin_reports`] only ever constructs a [`PluginReport`] for a
+/// language that *does* have a pid file, and [`render`] prints a single
+/// summary line, not a per-language guess, when none do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginState {
     /// Running under a live core.
     Active { pid: u32 },
-    /// No plugin, but a live core that would have one if it needed it: the
-    /// healthy other half of the two-tier idle model, not a fault. The core is
-    /// queueing file changes and will replay them into a plugin it spawns on
-    /// the next request that needs one (`daemon::lifecycle`).
-    ///
-    /// Inferred rather than recorded, because a fact this transient does not
-    /// deserve a state file of its own: the core spawns a plugin at startup
-    /// and only ever stops one deliberately, so a running core with no plugin
-    /// pid on record has exactly one explanation. The window in which that is
-    /// wrong - the few milliseconds of a starting core that has bound its
-    /// socket and not yet spawned its plugin - reports "asleep" a moment
-    /// early, which is a better answer than "not running" is in the case that
-    /// actually lasts.
-    Asleep,
     /// Alive with no core serving this project: a leaked child of a daemon
     /// that died without closing its stdin. `g-mesh stop` clears it.
     Orphaned { pid: u32 },
-    NotRunning,
+}
+
+/// One language's plugin, as `status` reports it - `daemon::registry
+/// ::PluginRegistry` gives each language its own pid file, so there is one of
+/// these per `plugin-<language>.pid` file found, not one per daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginReport {
+    pub language: String,
+    pub state: PluginState,
 }
 
 /// What the index covers, and what it still owes.
@@ -176,7 +189,10 @@ pub struct Report {
     pub state_dir: PathBuf,
     pub core: CoreState,
     pub build: BuildState,
-    pub plugin: PluginState,
+    /// Every language with a pid file on disk right now, sorted by language -
+    /// see [`PluginState`]'s doc comment for what "no pid file" now means
+    /// under lazy per-language spawning.
+    pub plugins: Vec<PluginReport>,
     pub last_used: Option<LastUsed>,
     pub index: IndexStatus,
 }
@@ -210,7 +226,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         project_id,
         core,
         build: build_state(core, &state_dir),
-        plugin: plugin_state(project_root, core)?,
+        plugins: plugin_reports(&state_dir, core),
         last_used: last_used::read_from_project_dir(&state_dir)
             .context("failed to read the project's lastUsed")?,
         index: index_status(project_root, &state_dir.join("index.db"))?,
@@ -262,23 +278,28 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     }
 }
 
-fn plugin_state(project_root: &Path, core: CoreState) -> Result<PluginState> {
-    let live_pid = daemon::read_pid_file(&daemon::plugin_pid_path(project_root)?)
-        .filter(|&pid| daemon::is_process_alive(pid));
-    Ok(classify_plugin(live_pid, core))
+/// Every language with a live pid file in `state_dir` right now, sorted by
+/// language (`daemon::registry::discovered_pid_files` already sorts, so this
+/// just carries that order through). A pid file naming a dead process is
+/// dropped rather than reported - same "unreadable/stale means nothing
+/// recorded" convention every pid-file read in this daemon uses.
+fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
+    crate::daemon::registry::discovered_pid_files(state_dir)
+        .into_iter()
+        .filter_map(|(language, path)| {
+            let pid = daemon::read_pid_file(&path).filter(|&pid| daemon::is_process_alive(pid))?;
+            Some(PluginReport { language, state: classify_plugin(pid, core) })
+        })
+        .collect()
 }
 
-/// The judgement itself, split from the two lookups that feed it so it can be
+/// The judgement itself, split from the lookup that feeds it so it can be
 /// exercised over its whole table without conjuring a live process (and a
 /// dead core to go with it) for every row.
-fn classify_plugin(live_pid: Option<u32>, core: CoreState) -> PluginState {
-    match (live_pid, core) {
-        (Some(pid), CoreState::NotRunning) => PluginState::Orphaned { pid },
-        (Some(pid), _) => PluginState::Active { pid },
-        // No plugin under a live core is the idle-sleep state, not a fault -
-        // see `PluginState::Asleep` for why this is inferred rather than read.
-        (None, CoreState::Running { .. } | CoreState::NotAccepting { .. }) => PluginState::Asleep,
-        (None, CoreState::NotRunning) => PluginState::NotRunning,
+fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
+    match core {
+        CoreState::NotRunning => PluginState::Orphaned { pid },
+        CoreState::Running { .. } | CoreState::NotAccepting { .. } => PluginState::Active { pid },
     }
 }
 
@@ -468,7 +489,22 @@ pub fn render(report: &Report) -> String {
     if let Some(build) = describe_build(report.build) {
         let _ = writeln!(out, "  daemon build:    {build}");
     }
-    let _ = writeln!(out, "  plugin:          {}", describe_plugin(report.plugin));
+    if report.plugins.is_empty() {
+        let _ = writeln!(
+            out,
+            "  plugins:         none active - languages are spawned lazily on first use and \
+             sleep when idle, so this is normal on a quiet project"
+        );
+    } else {
+        for plugin in &report.plugins {
+            let _ = writeln!(
+                out,
+                "  plugin ({}):     {}",
+                plugin.language,
+                describe_plugin(plugin.state)
+            );
+        }
+    }
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
 
     let index = &report.index;
@@ -550,16 +586,9 @@ fn describe_build(build: BuildState) -> Option<&'static str> {
 fn describe_plugin(plugin: PluginState) -> String {
     match plugin {
         PluginState::Active { pid } => format!("active (pid {pid})"),
-        // Says what it costs and what undoes it, because "asleep" on its own
-        // reads like something to fix: nothing has to be restarted, and the
-        // next query does it anyway.
-        PluginState::Asleep => {
-            "asleep (idle timeout) - file changes are queued; the next query wakes it".to_string()
-        }
         PluginState::Orphaned { pid } => {
             format!("orphaned (pid {pid}) - no core is serving this project; run `g-mesh stop`")
         }
-        PluginState::NotRunning => "not running".to_string(),
     }
 }
 
@@ -776,7 +805,10 @@ mod tests {
             state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
             core: CoreState::Running { pid: 4242 },
             build: BuildState::Current,
-            plugin: PluginState::Active { pid: 4243 },
+            plugins: vec![PluginReport {
+                language: "typescript".to_string(),
+                state: PluginState::Active { pid: 4243 },
+            }],
             last_used: Some(LastUsed {
                 timestamp: "2026-07-31 00:00:00.000".to_string(),
                 idle: Duration::from_secs(3 * 60 * 60),
@@ -814,7 +846,10 @@ mod tests {
             state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
             core: CoreState::Running { pid: 4242 },
             build: BuildState::Current,
-            plugin: PluginState::Active { pid: 4243 },
+            plugins: vec![PluginReport {
+                language: "typescript".to_string(),
+                state: PluginState::Active { pid: 4243 },
+            }],
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
@@ -847,7 +882,10 @@ mod tests {
             state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
             core: CoreState::NotRunning,
             build: BuildState::NotRunning,
-            plugin: PluginState::Orphaned { pid: 99 },
+            plugins: vec![PluginReport {
+                language: "typescript".to_string(),
+                state: PluginState::Orphaned { pid: 99 },
+            }],
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
@@ -871,37 +909,85 @@ mod tests {
         assert!(rendered.contains("syntax errors:   none"), "{rendered}");
     }
 
-    /// The state the two-tier idle model introduced: a plugin that is missing
-    /// on purpose. Reported as a healthy, self-correcting condition rather
-    /// than as the "not running" it is indistinguishable from on disk.
+    /// A pid file naming a live process under a live core reads as active;
+    /// under no core at all it reads as orphaned - `classify_plugin` only
+    /// ever runs on a pid `plugin_reports` has already confirmed is alive, so
+    /// there is no "nothing recorded" case left for it to classify (see
+    /// [`PluginState`]'s doc comment for where that case went).
     #[test]
-    fn a_plugin_asleep_under_a_live_core_is_reported_as_asleep_rather_than_missing() {
+    fn a_live_pid_reads_as_active_under_a_core_and_orphaned_without_one() {
+        assert_eq!(classify_plugin(7, CoreState::Running { pid: 1 }), PluginState::Active { pid: 7 });
         assert_eq!(
-            classify_plugin(None, CoreState::Running { pid: 1 }),
-            PluginState::Asleep,
-            "a live core with no plugin recorded has put it to sleep"
+            classify_plugin(7, CoreState::NotAccepting { pid: 1 }),
+            PluginState::Active { pid: 7 },
+            "a core that is up but not yet accepting connections still counts as serving it"
         );
-        assert_eq!(
-            classify_plugin(None, CoreState::NotRunning),
-            PluginState::NotRunning,
-            "with no core either, there is nothing asleep - there is nothing at all"
-        );
-        // The states that predate the sleeping tier must read exactly as they
-        // always did.
-        assert_eq!(
-            classify_plugin(Some(7), CoreState::Running { pid: 1 }),
-            PluginState::Active { pid: 7 }
-        );
-        assert_eq!(
-            classify_plugin(Some(7), CoreState::NotRunning),
-            PluginState::Orphaned { pid: 7 }
-        );
+        assert_eq!(classify_plugin(7, CoreState::NotRunning), PluginState::Orphaned { pid: 7 });
 
-        let described = describe_plugin(PluginState::Asleep);
-        assert!(described.contains("asleep"), "{described}");
+        let described = describe_plugin(PluginState::Orphaned { pid: 7 });
+        assert!(described.contains("orphaned"), "{described}");
+        assert!(described.contains("g-mesh stop"), "{described}");
+    }
+
+    /// [`plugin_reports`]'s own acceptance criterion: one entry per
+    /// `plugin-<language>.pid` file actually present, sorted, a dead pid file
+    /// dropped rather than reported, and a project with none at all reads as
+    /// an empty list rather than an error - `status` must never panic or fail
+    /// just because no language has ever been touched yet.
+    #[test]
+    fn plugin_reports_lists_one_entry_per_live_pid_file_sorted_by_language() {
+        let state = tempfile::tempdir().unwrap();
+        let live = std::process::id();
+        fs::write(state.path().join("plugin-typescript.pid"), live.to_string()).unwrap();
+        fs::write(state.path().join("plugin-python.pid"), live.to_string()).unwrap();
+        // A pid nothing alive holds - large, and vanishingly unlikely to
+        // collide with a real process on the machine running this test.
+        fs::write(state.path().join("plugin-go.pid"), "999999999").unwrap();
+
+        let reports = plugin_reports(state.path(), CoreState::Running { pid: 1 });
+
+        assert_eq!(
+            reports,
+            vec![
+                PluginReport { language: "python".to_string(), state: PluginState::Active { pid: live } },
+                PluginReport {
+                    language: "typescript".to_string(),
+                    state: PluginState::Active { pid: live }
+                },
+            ],
+            "sorted by language, and the dead go.pid dropped rather than reported: {reports:?}"
+        );
+    }
+
+    /// A project nothing has ever spawned a plugin for (or one where every
+    /// language has since gone idle - the registry removes a language's pid
+    /// file on every sleep, same as before) renders one summary line, not a
+    /// per-language guess this command cannot actually back up.
+    #[test]
+    fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
+        let report = Report {
+            project_root: PathBuf::from("/tmp/project"),
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            core: CoreState::Running { pid: 4242 },
+            build: BuildState::Current,
+            plugins: Vec::new(),
+            last_used: None,
+            index: IndexStatus {
+                bulk_indexed: true,
+                discovered: 0,
+                indexed: 0,
+                dirty: 0,
+                syntax_error_files: Vec::new(),
+            },
+        };
+
+        let rendered = render(&report);
+
+        assert!(rendered.contains("none active"), "{rendered}");
         assert!(
-            described.contains("wakes it"),
-            "an asleep plugin needs no intervention, and the report has to say so: {described}"
+            !rendered.contains("plugin ("),
+            "no per-language line may be printed when nothing has a pid file:\n{rendered}"
         );
     }
 
