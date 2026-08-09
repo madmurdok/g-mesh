@@ -64,6 +64,13 @@ const FINGERPRINT_HEX_CHARS: usize = 16;
 /// look like a change. It cannot collide with a real answer, which is hex.
 pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 
+/// Directory names skipped while fingerprinting *every* plugin, regardless of
+/// what its own manifest says - see `docs/architecture/plugin-modularity.md`'s
+/// Data Model section ("Built-in baseline ignore"). A manifest's own
+/// `fingerprint_ignore` extends this list; it never replaces it.
+const BASELINE_FINGERPRINT_IGNORE: &[&str] =
+    &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
+
 /// Shared with `daemon::bulk_index`, which spawns the same entry point in
 /// its one-shot mode - both must honor the same override.
 pub(crate) fn plugin_entry_path() -> PathBuf {
@@ -136,30 +143,42 @@ pub fn bundled_manifest() -> PluginManifest {
 ///
 /// # What it does not cover
 ///
-/// The plugin's *dependencies* - the tree-sitter grammars in `node_modules` -
-/// are not hashed: they are large, they are not part of what `npm run build`
-/// emits, and walking them on every shim start would turn a sub-millisecond
-/// check into a directory crawl. A grammar upgrade that changes extraction is
-/// therefore still a manual [`CURRENT_INDEXER_VERSION`] bump, which is exactly
-/// what that constant remains for - the two halves are complementary, not
+/// A plugin's dependency/VCS junk - `node_modules`, `.git`, and the rest of
+/// [`BASELINE_FINGERPRINT_IGNORE`] (plus anything a manifest's own
+/// `fingerprint_ignore` adds) - is walked but skipped by name, not hashed:
+/// those directories are large, are not what a plugin's own build emits, and
+/// walking them on every shim start would turn a sub-millisecond check into a
+/// directory crawl. A dependency upgrade that changes extraction is therefore
+/// still a manual [`CURRENT_INDEXER_VERSION`] bump, which is exactly what
+/// that constant remains for - the two halves are complementary, not
 /// redundant.
-///
-/// Computed once per process: the shim asks for it on every call it makes, and
-/// the answer cannot change under a running process in any way that would
-/// matter (the plugin a daemon already spawned is the one it keeps).
-pub fn fingerprint() -> &'static str {
-    static FINGERPRINT: OnceLock<String> = OnceLock::new();
-    FINGERPRINT.get_or_init(|| {
-        let entry = plugin_entry_path();
-        digest_of_plugin_build(&entry).unwrap_or_else(|err| {
+pub fn fingerprint(manifest: &PluginManifest) -> String {
+    digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(
+        |err| {
             eprintln!(
-                "g-mesh: could not fingerprint the JS/TS plugin at {}: {err:#} - \
+                "g-mesh: could not fingerprint the {} plugin at {}: {err:#} - \
                  a change to its extraction logic will not be noticed",
-                entry.display()
+                manifest.language,
+                manifest.manifest_dir.display()
             );
             FINGERPRINT_UNAVAILABLE.to_string()
-        })
-    })
+        },
+    )
+}
+
+/// [`fingerprint`] for [`bundled_manifest`], memoized for the process's
+/// lifetime - the shape every existing single-bundled-plugin caller
+/// (`indexer_version`, `build_stamp::of_running_process`) still needs.
+/// [`fingerprint`] itself does not cache: a future `PluginRegistry` computing
+/// one fingerprint per discovered plugin owns that concern for its own set of
+/// manifests, not this function.
+///
+/// Computed once per process: the shim asks for it on every call it makes,
+/// and the answer cannot change under a running process in any way that
+/// would matter (the plugin a daemon already spawned is the one it keeps).
+pub fn bundled_fingerprint() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(|| fingerprint(&bundled_manifest()))
 }
 
 /// The generation string an index is stamped with, and the thing
@@ -170,26 +189,27 @@ pub fn fingerprint() -> &'static str {
 /// change (the failure task 116 fixes); the fingerprint alone would miss every
 /// change in `graph::imports` / `graph::symbol_links`, which run in core and
 /// leave the plugin's bytes untouched.
+///
+/// Still keyed off the one bundled plugin - moving this to a hash over every
+/// discovered plugin's fingerprint is `PluginRegistry::indexer_version`'s job
+/// (see `docs/architecture/plugin-modularity.md`), a later task.
 pub fn indexer_version() -> String {
-    format!("{CURRENT_INDEXER_VERSION}+{}", fingerprint())
+    format!("{CURRENT_INDEXER_VERSION}+{}", bundled_fingerprint())
 }
 
-/// Digests every compiled file the plugin ships, in a stable order.
+/// Digests every regular file under `dir`, skipping any subdirectory whose
+/// name is in [`BASELINE_FINGERPRINT_IGNORE`] or `ignore`, in a stable order.
 ///
-/// The whole emitted tree rather than just the entry point: `dist/src` is one
-/// `tsc` output split across modules, and the extractor - the part most likely
-/// to change what the graph looks like - is not the entry file. Each file's
-/// path and length go into the digest alongside its bytes, so moving code
-/// between two files cannot leave the concatenation unchanged.
-fn digest_of_plugin_build(entry: &Path) -> Result<String> {
-    let dir = entry
-        .parent()
-        .with_context(|| format!("{} has no parent directory", entry.display()))?;
-
+/// The whole directory rather than just an entry point's siblings: a plugin's
+/// own build output can be laid out however it likes, and the file most
+/// likely to change what the graph looks like is not necessarily the entry
+/// file. Each file's path and length go into the digest alongside its bytes,
+/// so moving code between two files cannot leave the concatenation unchanged.
+fn digest_of_plugin_build(dir: &Path, ignore: &[String]) -> Result<String> {
     let mut files = Vec::new();
-    collect_emitted_files(dir, dir, &mut files)?;
+    collect_fingerprinted_files(dir, dir, ignore, &mut files)?;
     if files.is_empty() {
-        bail!("no compiled plugin files found under {}", dir.display());
+        bail!("no plugin files found under {}", dir.display());
     }
     // Directory iteration order is whatever the filesystem feels like, and a
     // fingerprint that depends on it would differ between two identical
@@ -215,12 +235,18 @@ fn digest_of_plugin_build(entry: &Path) -> Result<String> {
         .collect())
 }
 
-/// Gathers every `.js` file under `dir` as a pair of its path relative to
-/// `root` and its full path. Recursive rather than one flat `read_dir` so a
-/// future plugin laid out in subdirectories does not silently fall outside
-/// the fingerprint - a blind spot in this function is a wrong answer served
-/// later, which is the exact failure it exists to prevent.
-fn collect_emitted_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+/// Gathers every regular file under `dir` as a pair of its path relative to
+/// `root` and its full path, recursing into subdirectories except those named
+/// in [`BASELINE_FINGERPRINT_IGNORE`] or `ignore`. Recursive rather than one
+/// flat `read_dir` so a plugin laid out in subdirectories does not silently
+/// fall outside the fingerprint - a blind spot in this function is a wrong
+/// answer served later, which is the exact failure it exists to prevent.
+fn collect_fingerprinted_files(
+    root: &Path,
+    dir: &Path,
+    ignore: &[String],
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
     let entries =
         fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?;
     for entry in entries {
@@ -230,10 +256,19 @@ fn collect_emitted_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf
             .file_type()
             .with_context(|| format!("failed to stat {}", path.display()))?;
         if file_type.is_dir() {
-            collect_emitted_files(root, &path, out)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if BASELINE_FINGERPRINT_IGNORE.contains(&name.as_ref())
+                || ignore.iter().any(|ignored| ignored == name.as_ref())
+            {
+                continue;
+            }
+            collect_fingerprinted_files(root, &path, ignore, out)?;
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+        if !file_type.is_file() {
+            // Symlinks, sockets, etc. - not a regular file this plugin's
+            // build emitted.
             continue;
         }
         let relative = path
@@ -637,24 +672,42 @@ impl PluginProcess {
 mod tests {
     use super::*;
 
-    /// Builds a throwaway `dist/`-shaped directory and returns its entry
-    /// point, so the digest can be exercised without a real plugin build.
-    fn emitted(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+    /// Writes `files` (relative-path, contents pairs) under `dir`, creating
+    /// whatever subdirectories they need - the fixture every digest test in
+    /// this module builds on, whether or not it goes through a
+    /// [`PluginManifest`].
+    fn emit(dir: &Path, files: &[(&str, &str)]) {
         for (relative, contents) in files {
             let path = dir.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, contents).unwrap();
         }
-        dir.join("index.js")
+    }
+
+    /// A minimal fixture [`PluginManifest`] pointing at `dir`, with `ignore`
+    /// as its `fingerprint_ignore` - everything else is irrelevant to
+    /// [`fingerprint`], which only reads `manifest_dir` and
+    /// `fingerprint_ignore`.
+    fn manifest_for(dir: &Path, ignore: &[&str]) -> PluginManifest {
+        PluginManifest {
+            language: "fixture".to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            plugin_version: String::new(),
+            command: PathBuf::from("true"),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            fingerprint_ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            manifest_dir: dir.to_path_buf(),
+        }
     }
 
     #[test]
     fn the_same_build_fingerprints_the_same_way_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = emitted(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
+        emit(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
 
-        let first = digest_of_plugin_build(&entry).unwrap();
-        assert_eq!(digest_of_plugin_build(&entry).unwrap(), first);
+        let first = digest_of_plugin_build(dir.path(), &[]).unwrap();
+        assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), first);
         assert_eq!(first.len(), FINGERPRINT_HEX_CHARS);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first} must be hex");
     }
@@ -664,12 +717,12 @@ mod tests {
     #[test]
     fn changing_one_emitted_file_changes_the_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = emitted(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
-        let before = digest_of_plugin_build(&entry).unwrap();
+        emit(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
+        let before = digest_of_plugin_build(dir.path(), &[]).unwrap();
 
         fs::write(dir.path().join("extract.js"), "parse(); resolveLexically();").unwrap();
 
-        assert_ne!(digest_of_plugin_build(&entry).unwrap(), before);
+        assert_ne!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
     }
 
     /// `npm run build` rewrites every file on every invocation. A rebuild
@@ -678,13 +731,13 @@ mod tests {
     #[test]
     fn re_emitting_identical_bytes_leaves_the_fingerprint_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = emitted(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
-        let before = digest_of_plugin_build(&entry).unwrap();
+        emit(dir.path(), &[("index.js", "run();"), ("extract.js", "parse();")]);
+        let before = digest_of_plugin_build(dir.path(), &[]).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(dir.path().join("extract.js"), "parse();").unwrap();
 
-        assert_eq!(digest_of_plugin_build(&entry).unwrap(), before);
+        assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
     }
 
     /// Moving a line from one module to another leaves the concatenated
@@ -694,16 +747,11 @@ mod tests {
     fn moving_code_between_two_files_still_changes_the_fingerprint() {
         let one = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let before = digest_of_plugin_build(&emitted(
-            one.path(),
-            &[("index.js", "ab"), ("extract.js", "c")],
-        ))
-        .unwrap();
-        let after = digest_of_plugin_build(&emitted(
-            other.path(),
-            &[("index.js", "a"), ("extract.js", "bc")],
-        ))
-        .unwrap();
+        emit(one.path(), &[("index.js", "ab"), ("extract.js", "c")]);
+        emit(other.path(), &[("index.js", "a"), ("extract.js", "bc")]);
+
+        let before = digest_of_plugin_build(one.path(), &[]).unwrap();
+        let after = digest_of_plugin_build(other.path(), &[]).unwrap();
 
         assert_ne!(after, before);
     }
@@ -711,12 +759,12 @@ mod tests {
     #[test]
     fn a_file_in_a_subdirectory_is_part_of_the_build_too() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = emitted(dir.path(), &[("index.js", "run();"), ("lang/ts.js", "grammar();")]);
-        let before = digest_of_plugin_build(&entry).unwrap();
+        emit(dir.path(), &[("index.js", "run();"), ("lang/ts.js", "grammar();")]);
+        let before = digest_of_plugin_build(dir.path(), &[]).unwrap();
 
         fs::write(dir.path().join("lang/ts.js"), "grammar(2);").unwrap();
 
-        assert_ne!(digest_of_plugin_build(&entry).unwrap(), before);
+        assert_ne!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
     }
 
     /// An absent or unbuilt plugin is not a fingerprint of zero files - that
@@ -725,10 +773,63 @@ mod tests {
     #[test]
     fn an_unbuilt_plugin_has_no_fingerprint_at_all() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(digest_of_plugin_build(&dir.path().join("index.js")).is_err());
+        assert!(digest_of_plugin_build(dir.path(), &[]).is_err());
+    }
 
-        fs::write(dir.path().join("README.md"), "not a build").unwrap();
-        assert!(digest_of_plugin_build(&dir.path().join("index.js")).is_err());
+    /// A change inside a directory on the built-in baseline ignore list (see
+    /// `docs/architecture/plugin-modularity.md`'s "Built-in baseline ignore")
+    /// must not move the fingerprint - the whole point of walking every file
+    /// by default is that known dependency/VCS junk is the one thing that
+    /// still has to be carved out by name.
+    #[test]
+    fn a_change_inside_a_baseline_ignored_directory_does_not_change_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), &[("index.js", "run();")]);
+        let before = digest_of_plugin_build(dir.path(), &[]).unwrap();
+
+        emit(dir.path(), &[("node_modules/pkg/index.js", "module.exports = {};")]);
+        assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
+
+        fs::write(
+            dir.path().join("node_modules/pkg/index.js"),
+            "module.exports = { changed: true };",
+        )
+        .unwrap();
+        assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
+    }
+
+    /// The same, but for a directory named in a manifest's own
+    /// `fingerprint_ignore` rather than the built-in baseline list -
+    /// `[plugin.fingerprint].ignore` extends the baseline, it does not
+    /// replace it.
+    #[test]
+    fn a_change_inside_a_manifest_declared_ignore_directory_does_not_change_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), &[("index.js", "run();")]);
+        let manifest = manifest_for(dir.path(), &["vendor"]);
+        let before = fingerprint(&manifest);
+        assert_ne!(before, FINGERPRINT_UNAVAILABLE);
+
+        emit(dir.path(), &[("vendor/lib.js", "var x = 1;")]);
+        assert_eq!(fingerprint(&manifest), before);
+
+        fs::write(dir.path().join("vendor/lib.js"), "var x = 2;").unwrap();
+        assert_eq!(fingerprint(&manifest), before);
+    }
+
+    /// The critical correctness property behind both ignore-list tests above:
+    /// ignoring specific directories must not accidentally ignore everything
+    /// else too.
+    #[test]
+    fn a_change_to_a_non_ignored_file_still_changes_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), &[("index.js", "run();"), ("vendor/lib.js", "var x = 1;")]);
+        let manifest = manifest_for(dir.path(), &["vendor"]);
+        let before = fingerprint(&manifest);
+
+        fs::write(dir.path().join("index.js"), "run(2);").unwrap();
+
+        assert_ne!(fingerprint(&manifest), before);
     }
 
     /// The two halves of the generation string are both there, and the one
@@ -740,7 +841,7 @@ mod tests {
         let (core, plugin) = version.split_once('+').expect("both halves must be present");
 
         assert_eq!(core, CURRENT_INDEXER_VERSION);
-        assert_eq!(plugin, fingerprint());
+        assert_eq!(plugin, bundled_fingerprint());
         assert_ne!(
             plugin, FINGERPRINT_UNAVAILABLE,
             "the test binary's own plugin build must be readable - `cargo test` builds it"
