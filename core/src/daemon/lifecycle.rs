@@ -53,7 +53,8 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::config::ProjectConfig;
-use crate::daemon::plugin::{bundled_manifest, PluginProcess};
+use crate::daemon::manifest::PluginManifest;
+use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -222,10 +223,24 @@ struct SupervisedPlugin {
 /// reference, and the two facts that decide what to do with a file change -
 /// "is it awake" and "what is already queued" - have to be read together or
 /// an event can be applied and queued, or neither.
+///
+/// One of these per *language*, not one per daemon: `daemon::registry
+/// ::PluginRegistry` creates them lazily, and every instance owns exactly the
+/// one plugin its [`manifest`](Self::manifest) names, for its whole lifetime.
 pub struct PluginSupervisor {
     /// Canonicalized, because that is what the plugin is spawned against and
     /// what `daemon::run` resolves its wire paths from.
     project_root: PathBuf,
+    /// Which plugin this supervisor is *the* supervisor for - handed in once
+    /// at construction and never replaced, because every one of this type's
+    /// three spawn points (the first start, the wake inside
+    /// [`replay_pending`](Self::replay_pending), the wake inside
+    /// [`ensure_fresh`](Self::ensure_fresh)) has to produce the same plugin.
+    /// A supervisor that could spawn a *different* language after a sleep
+    /// than it did at startup would silently reindex a project's files with
+    /// the wrong extractor, which is why this is a field rather than an
+    /// argument to whichever call happens to do the spawning.
+    manifest: PluginManifest,
     /// Rewritten on every wake and removed on every sleep, so tooling outside
     /// this process (`cli::status`, `cli::stop`) reads the truth rather than
     /// the pid of a plugin that deliberately exited.
@@ -252,25 +267,35 @@ pub struct PluginSupervisor {
 }
 
 impl PluginSupervisor {
-    /// Spawns the plugin and records its pid, exactly as `daemon::run` did
-    /// before this module existed - a daemon with no plugin has nothing useful
-    /// to do, so a failure here is still a hard startup failure.
+    /// Spawns `manifest`'s plugin and records its pid.
+    ///
+    /// The manifest is taken by value and kept: it is what every later spawn
+    /// this supervisor performs - a wake from sleep, and (inside
+    /// `PluginProcess`) a crash relaunch - goes back to, so the plugin a
+    /// supervisor owns can never change under it. Callers that still mean
+    /// "the bundled JS/TS plugin" specifically pass
+    /// `daemon::plugin::bundled_manifest()`; `daemon::registry
+    /// ::PluginRegistry` passes whichever discovered manifest the language it
+    /// is spawning claims.
+    ///
+    /// A failure here is still a hard failure for whoever asked: `daemon::run`
+    /// has nothing useful to do without its plugin, and the registry reports
+    /// the failure to the one file change that provoked the spawn rather than
+    /// memoizing a supervisor that does not exist.
     pub fn start(
         project_root: &Path,
+        manifest: PluginManifest,
         pid_file: PathBuf,
         idle_timeout: Option<Duration>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Result<Arc<Self>> {
-        // `bundled_manifest()` bridges this to the JS/TS plugin exactly as
-        // spawned before `PluginProcess::spawn` took a manifest - real
-        // per-language discovery (`daemon::manifest::discover`) is a later
-        // task in this release.
-        let process = PluginProcess::spawn(project_root, &bundled_manifest())
-            .context("failed to start the JS/TS plugin")?;
+        let process = PluginProcess::spawn(project_root, &manifest)
+            .with_context(|| format!("failed to start the {} plugin", manifest.language))?;
         write_pid_file(&pid_file, process.pid());
 
         Ok(Arc::new(Self {
             project_root: project_root.to_path_buf(),
+            manifest,
             pid_file,
             idle_timeout,
             embedding,
@@ -278,6 +303,24 @@ impl PluginSupervisor {
             last_activity: Mutex::new(Instant::now()),
             pending: AtomicBool::new(false),
         }))
+    }
+
+    /// The language this supervisor's plugin speaks - its manifest's
+    /// `language`, which `PluginProcess::spawn` has already checked against
+    /// the live handshake, so it names the process actually running.
+    pub fn language(&self) -> &str {
+        &self.manifest.language
+    }
+
+    /// The pid of the plugin process right now, or `None` while it is asleep.
+    ///
+    /// Changes across a crash relaunch and across a sleep/wake cycle, which is
+    /// exactly what makes it worth asking for: it is the one externally
+    /// observable fact about *which* process a supervisor is currently
+    /// serving from, and the only way anything outside this module can tell a
+    /// recovered plugin from an untouched one.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.lock().unwrap().process.as_ref().map(PluginProcess::pid)
     }
 
     /// Whether anything is queued for the next wake. Cheap enough to ask on
@@ -328,8 +371,8 @@ impl PluginSupervisor {
         // leaves the queue intact for the next request to retry rather than
         // swallowing the changes it was about to replay.
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root, &bundled_manifest())
-                .context("failed to wake the JS/TS plugin")?;
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest)
+                .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
@@ -341,7 +384,8 @@ impl PluginSupervisor {
         // indistinguishable from a count, and the difference between them is
         // the whole reason the queue exists.
         eprintln!(
-            "g-mesh daemon: waking the plugin to replay {} queued file change(s): {}",
+            "g-mesh daemon: waking the {} plugin to replay {} queued file change(s): {}",
+            self.manifest.language,
             queued.len(),
             queued.join(", ")
         );
@@ -424,8 +468,14 @@ impl PluginSupervisor {
 
         let mut inner = self.inner.lock().unwrap();
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root, &bundled_manifest())
-                .context("failed to wake the JS/TS plugin for a query-time staleness check")?;
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest).with_context(
+                || {
+                    format!(
+                        "failed to wake the {} plugin for a query-time staleness check",
+                        self.manifest.language
+                    )
+                },
+            )?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
@@ -478,8 +528,9 @@ impl PluginSupervisor {
         // and `cli::status` read it as.
         let _ = fs::remove_file(&self.pid_file);
         eprintln!(
-            "g-mesh daemon: plugin (pid {pid}) put to sleep - {reason}; file changes will be \
-             queued until a request needs it again"
+            "g-mesh daemon: {} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
+             queued until a request needs it again",
+            self.manifest.language
         );
     }
 
@@ -635,6 +686,59 @@ fn write_pid_file(path: &Path, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::daemon::manifest::read_manifest;
+    use crate::daemon::test_plugin;
+
+    /// The reason [`PluginSupervisor::manifest`] is a field and not an
+    /// argument: a supervisor spawns *its own* plugin at every one of its
+    /// spawn points, including the wake that follows a sleep. Asserted on
+    /// processes, not on a return value - the fake plugin records every
+    /// process it is ever started as, so a wake that went to the wrong
+    /// manifest would leave this one's spawn count at 1 (and, with the
+    /// pre-registry hardcoded bridge, would have started the bundled JS/TS
+    /// plugin instead).
+    #[test]
+    fn a_supervisor_wakes_the_plugin_its_own_manifest_names() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let plugin_dir = test_plugin::install(plugins.path(), "python", &[".python-src"]);
+        let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+        let conn = test_plugin::empty_index();
+
+        let supervisor = PluginSupervisor::start(
+            project.path(),
+            manifest,
+            plugins.path().join("plugin.pid"),
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the fixture plugin must start");
+
+        assert_eq!(supervisor.language(), "python");
+        let first_pid = supervisor.pid().expect("a freshly started plugin is awake");
+        assert_eq!(test_plugin::spawns(&plugin_dir), vec![first_pid]);
+
+        supervisor.sleep_now("the test asked it to");
+        assert_eq!(supervisor.pid(), None, "a sleeping supervisor has no process");
+
+        // Queued rather than applied, exactly as the watcher's events are
+        // while the plugin sleeps...
+        supervisor.file_changed(&conn, "app.python-src".to_string());
+        assert!(supervisor.has_pending());
+        assert_eq!(test_plugin::spawns(&plugin_dir).len(), 1, "queueing must not wake anything");
+
+        // ...and the wake that replays them goes back to this supervisor's
+        // own manifest.
+        assert_eq!(supervisor.replay_pending(&conn).expect("the wake must succeed"), 1);
+        let woken_pid = supervisor.pid().expect("replaying wakes the plugin");
+        assert_ne!(woken_pid, first_pid);
+        assert_eq!(
+            test_plugin::spawns(&plugin_dir),
+            vec![first_pid, woken_pid],
+            "the wake must have spawned this manifest's plugin, not some other one"
+        );
+    }
 
     #[test]
     fn an_unset_timeout_reads_as_its_documented_default() {
