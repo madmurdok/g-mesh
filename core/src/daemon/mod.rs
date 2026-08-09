@@ -3,6 +3,7 @@ pub mod bulk_index;
 pub mod identity;
 pub mod indexing_status;
 pub mod lifecycle;
+pub mod manifest;
 pub mod plugin;
 
 use std::fs::{self, File, TryLockError};
