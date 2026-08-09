@@ -143,13 +143,16 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
          section: {stderr}"
     );
 
-    // Nothing is left accepting connections: `daemon::run` binds its socket
-    // deliberately early (ahead of even the plugin spawn, so a shim's
-    // bootstrap race is decided by the bind alone - see that function's own
-    // doc comment), the same ordering a plugin spawn failure already lived
-    // with before this task, so a `discover()` failure this much later can
-    // leave a socket *file* behind - what matters is that the exited process
-    // is not still serving off it.
+    // Nothing is left accepting connections. Since task 163 discovery runs
+    // *before* the bind (the index's generation string is derived from it and
+    // has to be checked before anything trusts the index - see
+    // `daemon::registry::indexer_version`), so this failure now happens with
+    // no socket bound at all. The assertion is deliberately still the weaker
+    // "nothing is serving" rather than "no socket file exists": what a caller
+    // can observe is whether it gets answered, and `daemon::run` binds early
+    // enough (ahead of even the plugin spawn, so a shim's bootstrap race is
+    // decided by the bind alone - see that function's own doc comment) that
+    // other startup failures can still leave a socket *file* behind.
     assert!(
         !daemon::is_listening(project.root()).unwrap(),
         "a daemon that failed to start must not be answering connections"

@@ -211,14 +211,39 @@ pub fn run(root: &Path) -> Result<()> {
         Err(err) => eprintln!("g-mesh daemon: could not describe its own build: {err:#}"),
     }
 
+    // Discovery runs here - ahead of the index, the socket and everything
+    // else this daemon owns - because the generation check below cannot be
+    // made without it (see `registry::indexer_version`), and that check has to
+    // happen before anything trusts what is in the index. Nothing it needs
+    // exists yet or has to: it reads `plugin.toml` files off two fixed roots
+    // and touches no per-project state, so the only ordering constraint it
+    // carries is the singleton lock above, already taken. Moving it in front
+    // of the bind costs the shim's bootstrap budget a couple of small file
+    // reads, and buys a hard startup failure (a malformed manifest, two
+    // plugins claiming one extension) that happens before a socket and pid
+    // file are published for a daemon that is about to give up on them.
+    //
+    // Malformed manifest, or two plugins claiming the same extension, is a
+    // hard daemon-startup failure naming the manifest path and the specific
+    // problem (`daemon::manifest::discover`'s own contract) - the same
+    // "protocol is code, a mismatch is a hard load failure" philosophy
+    // `handshake::verify` already applies, just at discovery time instead of
+    // at a live handshake. `default_roots()` is what makes this test-safe:
+    // `G_MESH_PLUGIN_ROOTS_OVERRIDE` replaces both standard roots wholesale,
+    // so a test can hand this a fixture directory instead of touching the
+    // real `~/.g-mesh/plugins/`.
+    let discovered = manifest::discover(&manifest::default_roots())
+        .context("failed to discover language plugins")?;
+
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
-    // The generation names the plugin build this daemon is about to spawn as
-    // well as core's own pipeline (`plugin::indexer_version`), so an index
-    // filled by a plugin that has since been rebuilt is thrown away here -
-    // which is what makes the walk below happen at all. Before task 116 only
-    // core's half was compared, and a plugin-only change left every existing
-    // index intact and wrong.
-    if schema::ensure_current(&conn, &plugin::indexer_version())
+    // The generation names every discovered plugin's build as well as core's
+    // own pipeline (`registry::indexer_version`), so an index filled by a
+    // plugin that has since been rebuilt is thrown away here - which is what
+    // makes the walk below happen at all. Before task 116 only core's half was
+    // compared, and a plugin-only change left every existing index intact and
+    // wrong; before task 163 only the *bundled* plugin's half was, which said
+    // the same thing about every other language.
+    if schema::ensure_current(&conn, &registry::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?
     {
         eprintln!("g-mesh daemon: index (re)initialized - a full reindex is needed");
@@ -291,18 +316,6 @@ pub fn run(root: &Path) -> Result<()> {
     // it just means nothing gets embedded until
     // `core/scripts/fetch-embedding-model.sh` has been run.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
-
-    // Malformed manifest, or two plugins claiming the same extension, is a
-    // hard daemon-startup failure naming the manifest path and the specific
-    // problem (`daemon::manifest::discover`'s own contract) - the same
-    // "protocol is code, a mismatch is a hard load failure" philosophy
-    // `handshake::verify` already applies, just at discovery time instead of
-    // at a live handshake. `default_roots()` is what makes this test-safe:
-    // `G_MESH_PLUGIN_ROOTS_OVERRIDE` replaces both standard roots wholesale,
-    // so a test can hand this a fixture directory instead of touching the
-    // real `~/.g-mesh/plugins/`.
-    let discovered = manifest::discover(&manifest::default_roots())
-        .context("failed to discover language plugins")?;
 
     // The cold-start bulk walk below (`daemon::bulk_index::run`) needs its
     // own view of what was discovered: it spawns one one-shot `--bulk-index`

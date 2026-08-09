@@ -353,12 +353,21 @@ impl PluginRegistry {
     /// dropped" contract, just with routing in front of it.
     pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String);
 
-    /// Core generation + every discovered manifest's fingerprint, sorted by
-    /// language before hashing so scan order can't change the result.
-    /// Computed from files on disk only — no plugin needs to be spawned to
-    /// answer this, consistent with lazy spawn.
-    pub fn indexer_version(&self) -> String;
 }
+
+/// Core generation + every discovered manifest's fingerprint, sorted by
+/// language before hashing so scan order can't change the result. Computed
+/// from files on disk only — no plugin needs to be spawned to answer this,
+/// consistent with lazy spawn.
+///
+/// A free function over `DiscoveredPlugins`, not a `PluginRegistry` method
+/// as this doc originally sketched it: no caller has a registry when it needs
+/// the answer. `daemon::run` has to validate/stamp the index *before* it can
+/// build one (a registry needs the canonicalized root, the project config and
+/// the embedding pipeline, none of which the version check should have to wait
+/// for), and `cli::init`/`cli::reindex` never build a registry at all. Same
+/// shape, for the same reason, as `registry::discovered_pid_files`.
+pub fn indexer_version(discovered: &DiscoveredPlugins) -> String;
 ```
 
 `PluginProcess::spawn` (existing, `core/src/daemon/plugin.rs`) changes from:
@@ -393,8 +402,13 @@ files under the entry's parent" to "walk every regular file under
 ["node_modules"]` to match today's behavior (which never touched
 `node_modules` because it wasn't inside `dist/`, but a whole-directory walk
 now would reach it). `indexer_version()` moves from `daemon::plugin` to
-`PluginRegistry` and becomes core-constant + a single re-hashed digest over
-every manifest's `(language, fingerprint)` pair, sorted by language.
+`daemon::registry` and becomes core-constant + a single re-hashed digest over
+every manifest's `(language, fingerprint)` pair, sorted by language. Because
+the daemon has to compute it before it opens the index, `daemon::run`'s
+`manifest::discover()` call moves ahead of `storage::schema::ensure_current`
+(it needs nothing but the singleton lock, already taken). The old
+`daemon::plugin::indexer_version()` goes; `bundled_fingerprint()` stays, as
+`daemon::build_stamp`'s own — and now only — caller.
 
 `core/src/cli/plugins.rs::list()` replaces its `include_str!(package.json)`
 read with `daemon::manifest::discover(roots)?.manifests`, one `PluginInfo`
@@ -504,7 +518,7 @@ permanent hardcoded fallback survives it.
   `indexer_version()`) all need code changes — this is not additive-only;
   see Interfaces above for the concrete diffs each takes.
 - `indexer_version()` moves ownership from `daemon::plugin` to the new
-  `PluginRegistry`, and its output format changes shape (now a hash over N
+  `daemon::registry`, and its output format changes shape (now a hash over N
   manifests' fingerprints, not one plugin's) — every existing project's
   index goes stale on first upgrade and gets a one-time reindex, the same
   kind of transition `CURRENT_INDEXER_VERSION` bumps already cause today.
