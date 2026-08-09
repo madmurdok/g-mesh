@@ -74,7 +74,7 @@ use rusqlite::Connection;
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::DiscoveredPlugins;
 use crate::embedding::EmbeddingPipeline;
-use crate::watcher::staleness::StalenessOutcome;
+use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Where a language's plugin pid is recorded, relative to the project's state
 /// directory: one file per language, unlike the single legacy `plugin.pid`
@@ -120,6 +120,23 @@ pub struct PluginRegistry {
     /// Canonicalized, exactly as [`PluginSupervisor`] wants it - every
     /// supervisor this registry creates is spawned against the same root.
     project_root: PathBuf,
+    /// The project's state directory - `~/.g-mesh/projects/<hash>/` - taken
+    /// as an explicit argument rather than recomputed from `project_root`
+    /// via `storage::connection::project_dir`. Those two must not be
+    /// conflated: `daemon::run` hashes its state directory from the *raw*
+    /// root it was given (`dir`), matching the socket, the main pid file,
+    /// and the index it already opened, but passes this registry the
+    /// *canonicalized* root (`canonical_root`) for spawning plugins against,
+    /// because that is what lets `relative_wire_path` turn a
+    /// `ProjectWatcher`-reported path back into a project-relative one (see
+    /// `daemon::run`'s own comment on `canonical_root`). On a filesystem
+    /// where the two differ as strings - `/var` vs. `/private/var` on macOS,
+    /// which is exactly what `tempfile::tempdir()` returns there - hashing
+    /// the canonicalized root instead of reusing `dir` would put every
+    /// `plugin-<language>.pid` file in a *different* directory than every
+    /// other piece of this project's state, and `cli::status`/`cli::stop`
+    /// (which read `dir`, not this type) would never find them.
+    state_dir: PathBuf,
     /// Discovery's output, taken as a finished value rather than produced
     /// here: scanning roots and validating manifests is `daemon::manifest`'s
     /// job and happens once at startup, before this registry (or the schema
@@ -150,12 +167,14 @@ impl PluginRegistry {
     /// module's doc comment.
     pub fn new(
         project_root: &Path,
+        state_dir: PathBuf,
         discovered: DiscoveredPlugins,
         idle_timeout: Option<Duration>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            state_dir,
             discovered,
             idle_timeout,
             embedding,
@@ -229,7 +248,7 @@ impl PluginRegistry {
         let supervisor = PluginSupervisor::start(
             &self.project_root,
             manifest.clone(),
-            self.pid_file_for(language)?,
+            self.pid_file_for(language),
             self.idle_timeout,
             Arc::clone(&self.embedding),
         )?;
@@ -299,13 +318,12 @@ impl PluginRegistry {
 
     /// Where `language`'s plugin pid is recorded - one file per language, so
     /// two supervisors can never overwrite (or, on sleep, delete) each
-    /// other's record. Resolved at spawn time rather than in
-    /// [`new`](Self::new) because that is where its failure has somewhere to
-    /// go, and where the state directory is guaranteed to already exist.
-    fn pid_file_for(&self, language: &str) -> Result<PathBuf> {
-        let state_dir = crate::storage::connection::project_dir(&self.project_root)
-            .context("failed to resolve the project's state directory")?;
-        Ok(state_dir.join(plugin_pid_file_name(language)))
+    /// other's record. Joined against `self.state_dir` - the same directory
+    /// `daemon::run` already resolved everything else in - not recomputed
+    /// from `self.project_root`; see this type's doc comment on `state_dir`
+    /// for why those must not be conflated.
+    fn pid_file_for(&self, language: &str) -> PathBuf {
+        self.state_dir.join(plugin_pid_file_name(language))
     }
 
     /// Every discovered language, sorted - for error messages only, where a
@@ -382,8 +400,19 @@ impl PluginRegistry {
 
     /// Query-time staleness check (see `PluginSupervisor::ensure_fresh`) for
     /// `file_path`, routed to whichever language's plugin claims its
-    /// extension - spawning that plugin if this is the first time anything
-    /// has needed it, exactly like [`file_changed`](Self::file_changed).
+    /// extension.
+    ///
+    /// The cheap mtime/hash comparison runs first, here, against
+    /// `self.project_root` directly - before any supervisor is involved, not
+    /// after - so the overwhelmingly common case (nothing changed) never
+    /// spawns a plugin it does not need: a language nobody has touched yet
+    /// stays unspawned for every fresh file anchoring a query, exactly the
+    /// property [`PluginSupervisor::ensure_fresh`] documents for its own
+    /// already-live process and that this method would otherwise silently
+    /// give up the moment nothing has spawned that language yet - which,
+    /// under lazy per-language spawn, is the common startup state, not an
+    /// edge case. `get_or_spawn` - and therefore an actual plugin process -
+    /// is only reached once the file is confirmed genuinely stale.
     ///
     /// `Ok(None)` - not an error - for a file no discovered plugin claims:
     /// there is no plugin to ask, and therefore nothing this check could ever
@@ -398,6 +427,14 @@ impl PluginRegistry {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };
+
+        {
+            let guard = conn.lock().unwrap();
+            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
+                return Ok(Some(StalenessOutcome::AlreadyFresh));
+            }
+        }
+
         let supervisor = self.get_or_spawn(&language)?;
         supervisor.ensure_fresh(conn, file_path).map(Some)
     }
@@ -440,8 +477,12 @@ mod tests {
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
             project.path(),
+            state_dir,
             discovered,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
@@ -634,8 +675,8 @@ mod tests {
     fn each_language_records_its_pid_in_a_file_of_its_own() {
         let (_project, _plugins, _dirs, registry) = registry_over(&["python", "go"]);
 
-        let python = registry.pid_file_for("python").unwrap();
-        let go = registry.pid_file_for("go").unwrap();
+        let python = registry.pid_file_for("python");
+        let go = registry.pid_file_for("go");
         assert_ne!(python, go);
         assert_eq!(python.file_name().unwrap().to_str().unwrap(), "plugin-python.pid");
         assert_eq!(python.parent(), go.parent(), "both live in the project's state directory");

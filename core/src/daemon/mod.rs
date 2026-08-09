@@ -316,6 +316,7 @@ pub fn run(root: &Path) -> Result<()> {
     // `docs/architecture/plugin-modularity.md`'s Options Considered #1).
     let registry = Arc::new(PluginRegistry::new(
         &canonical_root,
+        dir.clone(),
         discovered,
         timeouts.plugin,
         Arc::clone(&embedding),
@@ -417,6 +418,28 @@ pub fn run(root: &Path) -> Result<()> {
         // checker cannot start is a project served by its structural graph,
         // which is the state it was in a moment ago anyway. Failing daemon
         // startup over it would throw away a perfectly good index.
+        //
+        // Run inline, not backgrounded, deliberately - a background thread
+        // was tried here and reverted. `get_or_spawn` now has to spawn the
+        // plugin process itself the first time anything needs it (this call
+        // used to be the one exception, running against a supervisor the
+        // daemon had already spawned unconditionally before this point), so
+        // running it inline does cost the first post-cold-start query some
+        // real latency it did not pay before - see task 164, which owns
+        // fixing that properly (finer-grained locking in `PluginRegistry` so
+        // an unrelated reader is never held up by someone else's spawn).
+        // Backgrounding this call instead is the wrong fix for it: this pass
+        // and the watcher's own incremental per-file semantic passes both
+        // ultimately serialize on the same plugin process, but nothing
+        // orders *which* of two independently-triggered passes commits last,
+        // and a whole-project pass that lands after a newer incremental one
+        // can overwrite its correct, fresher edges with stale ones - exactly
+        // the failure `core/tests/overload_call_binding.rs` caught when this
+        // was tried backgrounded (a collapsed edge the incremental pass had
+        // already cleaned up came back). Inline keeps this pass strictly
+        // before the watcher (registered further down) can trigger any of
+        // its own, which is what baseline's eager, pre-registry spawn timing
+        // gave for free and this daemon still needs.
         //
         // Still the bundled JS/TS plugin specifically: `daemon::bulk_index`
         // only ever walks the one bundled plugin today (task 156's job to

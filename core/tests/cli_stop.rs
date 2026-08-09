@@ -51,9 +51,15 @@ impl Project {
         daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
     }
 
-    /// Bootstraps a detached daemon through the shim and returns the core and
-    /// plugin pids it recorded.
-    fn bootstrap_daemon(&self) -> (u32, u32) {
+    /// Bootstraps a detached daemon through the shim and returns its core
+    /// pid, waiting only for the daemon's own pid file - not for any plugin.
+    /// Under `daemon::registry::PluginRegistry`'s lazy per-language spawn, a
+    /// plugin only comes up once something actually needs it (a fresh
+    /// project's cold-start semantic pass, or a file changing under a
+    /// running daemon); a daemon that starts against a project whose index
+    /// is already complete legitimately spawns none at all, so waiting on a
+    /// plugin pid file here would hang forever in exactly that case.
+    fn bootstrap_core(&self) -> u32 {
         let mut shim = Command::new(BIN)
             .arg("mcp-shim")
             .current_dir(self.root())
@@ -63,13 +69,7 @@ impl Project {
             .spawn()
             .expect("failed to spawn the shim");
 
-        // The *plugin's* pid file, not the daemon's: since task 105 the
-        // daemon's appears at the socket bind, which now happens before the
-        // plugin is spawned, so it no longer implies there is a plugin for
-        // `stop` to shut down. The plugin's is written immediately after that
-        // spawn, and `stop` clears both, so it can never be a previous
-        // daemon's leftover.
-        wait_for("the daemon to spawn its plugin", || self.plugin_pid_file().exists());
+        wait_for("the daemon to bind its socket", || self.pid_file().exists());
 
         // The shim was only the vehicle: the daemon it spawned is detached
         // and outlives it, which is what the `stop` under test has to reach.
@@ -77,9 +77,22 @@ impl Project {
         let _ = shim.wait();
 
         let core = read_pid(&self.pid_file());
+        assert!(daemon::is_process_alive(core), "the daemon must be running before it is stopped");
+        core
+    }
+
+    /// Like [`bootstrap_core`](Self::bootstrap_core), but also waits for the
+    /// bundled plugin to come up and returns its pid too - only valid
+    /// against a project that still owes a bulk index (i.e. a fresh one),
+    /// since that is the only startup path that spawns a plugin without a
+    /// file change first landing on an already-running daemon (see
+    /// `daemon::registry::PluginRegistry`'s lazy per-language spawn).
+    fn bootstrap_daemon(&self) -> (u32, u32) {
+        let core = self.bootstrap_core();
+
+        wait_for("the daemon to spawn its plugin", || self.plugin_pid_file().exists());
         let plugin = read_pid(&self.plugin_pid_file());
         assert_ne!(core, plugin, "the plugin runs in a process of its own");
-        assert!(daemon::is_process_alive(core), "the daemon must be running before it is stopped");
         assert!(daemon::is_process_alive(plugin), "the plugin must be running before it is stopped");
         (core, plugin)
     }
@@ -142,7 +155,7 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
     let output = project.stop();
 
     assert!(output.contains(&format!("daemon core: pid {core}")), "{output}");
-    assert!(output.contains(&format!("plugin:      pid {plugin}")), "{output}");
+    assert!(output.contains(&format!("plugin (typescript): pid {plugin}")), "{output}");
     assert!(
         !daemon::is_process_alive(core),
         "the daemon core (pid {core}) is still running after stop"
@@ -158,17 +171,24 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
 
 /// "Socket released" means the next daemon can have it - which is a stronger
 /// claim than the file being gone, and the one that actually matters.
+///
+/// The second bootstrap is against a project whose index the first daemon
+/// already completed, so under `daemon::registry::PluginRegistry`'s lazy
+/// per-language spawn no plugin comes up on its own this time - only the
+/// core does. That is the behavior this test exists to confirm still works,
+/// not a gap in what it checks: asserting a plugin here would mean waiting
+/// on something this daemon correctly never does without a file changing
+/// under it first.
 #[test]
 fn a_stopped_project_can_be_bootstrapped_again_immediately() {
     let project = Project::new();
     let (first_core, _) = project.bootstrap_daemon();
     project.stop();
 
-    let (second_core, second_plugin) = project.bootstrap_daemon();
+    let second_core = project.bootstrap_core();
 
     assert_ne!(second_core, first_core, "a genuinely new daemon must have taken over");
     assert!(daemon::is_process_alive(second_core));
-    assert!(daemon::is_process_alive(second_plugin));
     assert!(project.socket().exists(), "the new daemon must have bound the socket");
 }
 
