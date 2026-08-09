@@ -116,17 +116,17 @@ impl Harness {
         // As of task 156, `daemon::bulk_index` no longer resolves the plugin
         // via `plugin::PLUGIN_PATH_ENV` at all - it walks whatever
         // `daemon::manifest::discover` found, exactly like the interactive
-        // supervisor a semantic pass runs against always has. Setting
-        // `G_MESH_JS_TS_PLUGIN_PATH` below still matters for a different
-        // reason: `plugin::indexer_version()`, computed during daemon
-        // startup before either the walk or a supervisor spawns, still
-        // fingerprints only the one bundled-plugin view
-        // `plugin::bundled_manifest` resolves from that env var - moving it
-        // onto the registry's discovered set is a separate, later task (see
-        // `plugin::bundled_manifest`'s own doc comment). A manifest under
-        // `G_MESH_PLUGIN_ROOTS_OVERRIDE` - `daemon::manifest`'s own
-        // generalized discovery override - is what actually points both the
-        // bulk walk and the interactive supervisor at this stub.
+        // supervisor a semantic pass runs against always has; and as of task
+        // 163, `registry::indexer_version` fingerprints every *discovered*
+        // manifest rather than the one bundled-plugin view
+        // `plugin::bundled_manifest` resolves from `PLUGIN_PATH_ENV`. Nothing
+        // this test exercises reads that env var any more - only
+        // `daemon::build_stamp` still does, for a question (is this running
+        // daemon's JS/TS build still mine?) this test has no reason to ask -
+        // so it is not set here. A manifest under `G_MESH_PLUGIN_ROOTS_OVERRIDE`
+        // - `daemon::manifest`'s own generalized discovery override - is what
+        // points both the bulk walk and the interactive supervisor at this
+        // stub.
         let plugins_root = harness.aux.path().join("plugins");
         let language_dir = plugins_root.join("typescript");
         fs::create_dir_all(&language_dir).unwrap();
@@ -165,7 +165,6 @@ impl Harness {
             .arg("daemon")
             .arg("--project-root")
             .arg(self.root())
-            .env(daemon::plugin::PLUGIN_PATH_ENV, self.plugin_path())
             .env(daemon::manifest::PLUGIN_ROOTS_OVERRIDE_ENV, self.plugins_root())
             .env(METHOD_LOG_ENV, self.method_log())
             .stdin(Stdio::null())
