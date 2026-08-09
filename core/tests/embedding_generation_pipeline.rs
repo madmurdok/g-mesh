@@ -20,14 +20,30 @@
 //!     core/scripts/fetch-embedding-model.sh
 //!     cd core && cargo test --test embedding_generation_pipeline -- --ignored
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use g_mesh::daemon::bulk_index;
+use g_mesh::daemon::manifest::DiscoveredPlugins;
+use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
 use g_mesh::embedding::{default_model_dir, EmbeddingModel, EmbeddingPipeline};
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::schema;
 use rusqlite::Connection;
+
+/// The single-language discovery every test in this file walks with - just
+/// the bundled JS/TS plugin, built by hand from [`bundled_manifest`] rather
+/// than through `daemon::manifest::discover`, so this suite's isolation from
+/// whatever else happens to live under `~/.g-mesh/plugins/` on the machine
+/// running it is unchanged from before task 156 generalized
+/// `daemon::bulk_index::run` to take a discovery result at all.
+fn only_the_bundled_plugin() -> DiscoveredPlugins {
+    DiscoveredPlugins {
+        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), bundled_manifest())]),
+        routing: HashMap::new(),
+    }
+}
 
 /// Two functions - one with a doc comment, one without - plus whatever
 /// structural nodes the plugin always emits alongside them (a `File` node
@@ -74,7 +90,9 @@ impl Project {
         schema::ensure_current(&conn, "embedding-generation-pipeline-test")
             .expect("failed to prepare the index");
         let conn = Mutex::new(conn);
-        let summary = bulk_index::run(self.root(), &conn, embedding).expect("the bulk walk failed");
+        let discovered = only_the_bundled_plugin();
+        let summary =
+            bulk_index::run(self.root(), &conn, embedding, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()

@@ -64,7 +64,7 @@ use anyhow::{Context, Result};
 use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::plugin;
+use crate::daemon::{manifest, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -143,7 +143,12 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let project_config = config::read_project_config(project_root)
             .context("failed to read the project's config.toml")?;
         let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
+        // Same discovery `daemon::run`'s own cold start uses - see
+        // `daemon::bulk_index::run`'s doc comment for why it takes
+        // discovery's result directly rather than a `PluginRegistry`.
+        let discovered = manifest::discover(&manifest::default_roots())
+            .context("failed to discover language plugins")?;
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline, &discovered)
             .context("failed to build the project's initial index")?;
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;

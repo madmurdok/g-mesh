@@ -7,14 +7,29 @@
 //! this, a freshly cloned project stays invisible to every tool until each of
 //! its files happens to be edited.
 //!
-//! The plugin is spawned a *second* time for this, in its one-shot
-//! `--bulk-index` mode, rather than asked over the long-lived control-plane
-//! pipe (`daemon::plugin::PluginProcess`). A whole-project walk is an
-//! open-ended stream of nodes and edges, not one request/response frame:
-//! given a process of its own, its stdout is precisely the self-contained,
-//! EOF-terminated NDJSON stream `protocol::ndjson::NdjsonReader` was written
-//! to consume - nothing interleaved with `FileChanged` traffic, and no
-//! end-of-bulk marker to invent.
+//! Each discovered language's plugin is spawned a *second* time for this, in
+//! its one-shot `--bulk-index` mode, rather than asked over the long-lived
+//! control-plane pipe (`daemon::plugin::PluginProcess`/`daemon::registry
+//! ::PluginRegistry`). A whole-project walk is an open-ended stream of nodes
+//! and edges, not one request/response frame: given a process of its own, its
+//! stdout is precisely the self-contained, EOF-terminated NDJSON stream
+//! `protocol::ndjson::NdjsonReader` was written to consume - nothing
+//! interleaved with `FileChanged` traffic, and no end-of-bulk marker to
+//! invent. A one-shot process per language, not one process asked to walk
+//! every language, because that is exactly what each manifest's `command`/
+//! `args` already spawn on the interactive path - see `daemon::manifest`'s
+//! `PluginManifest` - and a language with zero files in the project still
+//! costs a spawned one-shot process, same as it does today for the bundled
+//! JS/TS plugin: teaching core to pre-scan file extensions before walking so
+//! it could skip an absent language is out of scope here.
+//!
+//! [`run`] takes [`DiscoveredPlugins`] rather than a live
+//! `daemon::registry::PluginRegistry`: this walk needs only the resolved
+//! `command`/`args` discovery already produced, never a long-lived,
+//! lazily-spawned supervisor - the registry's whole reason to exist. Every
+//! language is walked unconditionally and in one pass, not spawned on first
+//! touch, so threading the registry's lazy-spawn machinery through here would
+//! add a concept this code has no use for.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -24,7 +39,7 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
-use crate::daemon::plugin::plugin_entry_path;
+use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
@@ -79,25 +94,79 @@ pub struct BulkIndexSummary {
     pub linked_symbols: usize,
 }
 
-/// Walks `project_root` through the plugin and commits everything it emits,
-/// returning only once the child has exited and the last batch is durable.
-/// `daemon::run` turns that return into the moment its `IndexingStatus` flips
-/// and tools start answering for real, so "returned" has to mean "complete",
-/// not "nearly".
+/// Walks `project_root` through every plugin `discovered` names - one
+/// one-shot `--bulk-index` process per language, run one after another - and
+/// commits everything each of them emits, returning only once every child has
+/// exited and the last batch is durable. `daemon::run` turns that return into
+/// the moment its `IndexingStatus` flips and tools start answering for real,
+/// so "returned" has to mean "complete", not "nearly".
 ///
-/// Batching is safe to cut anywhere in the stream even though edges are
-/// foreign keys onto nodes: the plugin emits a file's nodes before that same
-/// file's edges, and never an edge between files (see the dangling-edge guard
-/// in extract.ts), so an edge's endpoints are always committed by an earlier
-/// batch or its own. Every cross-file edge appears only afterwards, when
+/// Batching is safe to cut anywhere in one language's stream even though
+/// edges are foreign keys onto nodes: a plugin emits a file's nodes before
+/// that same file's edges, and never an edge between files (see the
+/// dangling-edge guard in extract.ts), so an edge's endpoints are always
+/// committed by an earlier batch or its own. Every cross-file edge appears
+/// only afterwards, once every language's ingest loop is done, when
 /// `graph::imports` links the walk's resolved module placeholders and
-/// `graph::symbol_links` its pending-symbol ones - by then every node either
-/// exists or never will, which is precisely why those steps cannot be folded
-/// into the stream.
-pub fn run(project_root: &Path, conn: &Mutex<Connection>, embedding: &EmbeddingPipeline) -> Result<BulkIndexSummary> {
-    let entry = plugin_entry_path();
-    let mut child = Command::new("node")
-        .arg(&entry)
+/// `graph::symbol_links` its pending-symbol ones - by then every node from
+/// every language either exists or never will, which is precisely why those
+/// steps cannot be folded into any one language's stream, and why they run
+/// exactly once, project-wide, rather than once per language.
+pub fn run(
+    project_root: &Path,
+    conn: &Mutex<Connection>,
+    embedding: &EmbeddingPipeline,
+    discovered: &DiscoveredPlugins,
+) -> Result<BulkIndexSummary> {
+    let mut summary = BulkIndexSummary::default();
+
+    // Sorted so a run over N languages walks them - and, if one fails, names
+    // which - in a deterministic order. Ingestion order does not change the
+    // result (see the doc comment above), but a nondeterministic spawn order
+    // would make a real failure impossible to reproduce from one run to the
+    // next.
+    let mut manifests: Vec<&PluginManifest> = discovered.manifests.values().collect();
+    manifests.sort_by(|a, b| a.language.cmp(&b.language));
+
+    for manifest in manifests {
+        walk_one_language(project_root, manifest, conn, &mut summary, embedding)?;
+    }
+
+    // Only now, with every language's stream over: an import can only be
+    // linked to a file that is already a node, and a cross-file symbol usage
+    // can only be linked once every language that might define it has had its
+    // own chance to run - so this runs once, project-wide, after every
+    // language's ingest loop, not per language.
+    {
+        let mut conn = conn.lock().unwrap();
+        summary.linked_imports = imports::link_all(&mut conn)
+            .context("failed to link the walk's resolved imports")?
+            .linked_edges;
+        summary.linked_symbols = symbol_links::link_all(&mut conn)
+            .context("failed to link the walk's cross-file symbol usages")?
+            .linked_edges;
+    }
+
+    hold_the_walk_open_for_tests();
+    Ok(summary)
+}
+
+/// Spawns `manifest`'s plugin in its one-shot `--bulk-index` mode for
+/// `project_root` and folds everything it emits into `summary`, returning
+/// only once the child has exited and every batch it produced is durable.
+/// Split out of [`run`] so each language's spawn/ingest/wait cycle is
+/// independently readable, and so a failure partway through one language's
+/// walk (an unreadable line, a spawn failure, a nonzero exit) can name that
+/// language directly.
+fn walk_one_language(
+    project_root: &Path,
+    manifest: &PluginManifest,
+    conn: &Mutex<Connection>,
+    summary: &mut BulkIndexSummary,
+    embedding: &EmbeddingPipeline,
+) -> Result<()> {
+    let mut child = Command::new(&manifest.command)
+        .args(&manifest.args)
         .arg(BULK_INDEX_FLAG)
         .arg(project_root)
         .stdin(Stdio::null())
@@ -106,12 +175,17 @@ pub fn run(project_root: &Path, conn: &Mutex<Connection>, embedding: &EmbeddingP
         // only, so they go wherever the daemon's own stderr goes.
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to spawn the JS/TS plugin's bulk index at {}", entry.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to spawn the {} plugin's bulk index ({})",
+                manifest.language,
+                manifest.command.display()
+            )
+        })?;
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    let mut summary = BulkIndexSummary::default();
-    if let Err(err) = ingest(BufReader::new(stdout), conn, &mut summary, embedding) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -122,11 +196,10 @@ pub fn run(project_root: &Path, conn: &Mutex<Connection>, embedding: &EmbeddingP
 
     let status = child.wait().context("failed to wait for the bulk-index plugin process")?;
     if !status.success() {
-        bail!("the JS/TS plugin's bulk index exited with {status}");
+        bail!("the {} plugin's bulk index exited with {status}", manifest.language);
     }
 
-    hold_the_walk_open_for_tests();
-    Ok(summary)
+    Ok(())
 }
 
 /// Honors [`WALK_DELAY_ENV`]. A no-op unless it is set to a number, which is
@@ -140,10 +213,15 @@ fn hold_the_walk_open_for_tests() {
     std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
-/// Reads a whole NDJSON bulk stream to EOF, committing it in batches. Split
-/// out from [`run`] so every way of failing part way through has one place to
-/// clean up after the child process - and so the ingestion rules can be
-/// tested without a plugin on the other end.
+/// Reads one language's whole NDJSON bulk stream to EOF, committing it in
+/// batches. Split out from [`walk_one_language`] so every way of failing part
+/// way through has one place to clean up after the child process - and so the
+/// ingestion rules can be tested without a plugin on the other end.
+///
+/// Adds only to `nodes`/`edges`/`skipped_lines` - never `linked_imports`/
+/// `linked_symbols`, which [`run`] computes once, project-wide, after every
+/// language's ingest loop like this one has run, not per language (see
+/// [`run`]'s doc comment for why).
 fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
@@ -185,21 +263,6 @@ fn ingest<R: BufRead>(
     }
 
     commit(conn, &mut batch, embedding)?;
-
-    // Only now, with the stream over: an import can only be linked to a file
-    // that is already a node, and until the last batch is in there is no
-    // telling whether a still-unresolved specifier names a file the walk had
-    // simply not reached yet (see `graph::imports`).
-    let mut conn = conn.lock().unwrap();
-    summary.linked_imports = imports::link_all(&mut conn)
-        .context("failed to link the walk's resolved imports")?
-        .linked_edges;
-    // Same argument one level finer: until the walk is over there is no
-    // telling whether the file a usage is waiting on simply had not been
-    // reached yet (see `graph::symbol_links`).
-    summary.linked_symbols = symbol_links::link_all(&mut conn)
-        .context("failed to link the walk's cross-file symbol usages")?
-        .linked_edges;
     Ok(())
 }
 
@@ -349,6 +412,77 @@ mod tests {
     fn an_empty_stream_is_a_no_op() {
         let conn = setup_conn();
         let summary = ingest_str("", &conn).unwrap();
+        assert_eq!(summary, BulkIndexSummary::default());
+        assert_eq!(count(&conn, "nodes"), 0);
+    }
+
+    /// Task 156's acceptance criterion: discovering two languages must spawn
+    /// *both* plugins' one-shot `--bulk-index` mode and add their
+    /// contributions together into one summary, not just walk the first (or
+    /// only) one found. Each fake plugin (`daemon::test_plugin`) emits a
+    /// fixed two nodes and one edge in bulk-index mode, so two languages
+    /// summing to four nodes and two edges is only possible if both were
+    /// actually spawned and both streams actually landed in the same index.
+    #[test]
+    fn discovering_two_languages_walks_both_and_sums_their_contributions() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        crate::daemon::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        crate::daemon::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+            .expect("the fixture plugins must discover cleanly");
+        assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
+
+        let conn = setup_conn();
+        let embedding = EmbeddingPipeline::disabled();
+
+        let summary =
+            run(project.path(), &conn, &embedding, &discovered).expect("the multi-language walk failed");
+
+        assert_eq!(summary.nodes, 4, "both languages' nodes must be counted, not just one's");
+        assert_eq!(summary.edges, 2, "both languages' edges must be counted, not just one's");
+        assert_eq!(summary.skipped_lines, 0);
+        assert_eq!(count(&conn, "nodes"), 4, "both languages' nodes must have actually been committed");
+        assert_eq!(count(&conn, "edges"), 2, "both languages' edges must have actually been committed");
+    }
+
+    /// A discovery naming only one language - today's real-world shape,
+    /// before any second plugin exists - must still walk it: the loop over
+    /// `discovered.manifests` must not accidentally require more than one
+    /// entry to do anything.
+    #[test]
+    fn a_single_discovered_language_is_walked_same_as_before_the_registry_took_over() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        crate::daemon::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
+        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+            .expect("the fixture plugin must discover cleanly");
+
+        let conn = setup_conn();
+        let embedding = EmbeddingPipeline::disabled();
+
+        let summary =
+            run(project.path(), &conn, &embedding, &discovered).expect("the single-language walk failed");
+
+        assert_eq!(summary.nodes, 2);
+        assert_eq!(summary.edges, 1);
+        assert_eq!(count(&conn, "nodes"), 2);
+        assert_eq!(count(&conn, "edges"), 1);
+    }
+
+    /// An empty discovery (no plugins found at all) must not be an error -
+    /// same "not fatal" convention `PluginRegistry` documents for the same
+    /// case - it is simply a walk that finds nothing to spawn.
+    #[test]
+    fn an_empty_discovery_walks_nothing_and_is_not_an_error() {
+        let project = tempfile::tempdir().unwrap();
+        let conn = setup_conn();
+        let embedding = EmbeddingPipeline::disabled();
+        let discovered = DiscoveredPlugins::default();
+
+        let summary =
+            run(project.path(), &conn, &embedding, &discovered).expect("an empty discovery must not fail");
+
         assert_eq!(summary, BulkIndexSummary::default());
         assert_eq!(count(&conn, "nodes"), 0);
     }
