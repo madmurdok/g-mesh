@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::config::{self, CleanupConfig, GlobalConfig};
 use g_mesh::daemon;
+use g_mesh::daemon::{manifest, registry};
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -127,7 +128,14 @@ impl Project {
         std::fs::create_dir_all(self.state_dir()).expect("failed to create the state directory");
         let conn = Connection::open(self.state_dir().join("index.db"))
             .expect("failed to open index.db");
-        schema::ensure_current(&conn, &daemon::plugin::indexer_version())
+        // The same generation a daemon would stamp this index with (see
+        // `daemon::registry::indexer_version`), computed the same way from the
+        // plugins actually installed - so a daemon started against this
+        // project afterwards finds it current and leaves the backdated
+        // `lastUsed` this fixture is about alone, instead of wiping it.
+        let discovered = manifest::discover(&manifest::default_roots())
+            .expect("failed to discover language plugins");
+        schema::ensure_current(&conn, &registry::indexer_version(&discovered))
             .expect("failed to initialize the schema");
         conn.execute(
             "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",

@@ -61,6 +61,16 @@
 //! more than on an ordinary sleep. `cli::status`/`cli::stop`/`cli::clean`
 //! read every `plugin-<language>.pid` file present
 //! ([`discovered_pid_files`]) rather than assuming exactly one.
+//!
+//! # The index's generation string (task 163)
+//!
+//! [`indexer_version`] lives here too, beside the type that owns discovery's
+//! results, though it is a free function over [`DiscoveredPlugins`] rather
+//! than a method - see its own doc comment for both halves of that (what it
+//! hashes, and why no caller has a registry to ask it). It is why `daemon::run`
+//! now discovers plugins *before* it opens and validates the index: with N
+//! plugins, "is what is in this index still what today's pipeline would
+//! produce?" cannot be answered by looking at one of them.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -70,10 +80,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::DiscoveredPlugins;
+use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Where a language's plugin pid is recorded, relative to the project's state
@@ -113,6 +126,107 @@ pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
+}
+
+/// The generation string an index is stamped with, and the thing
+/// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
+/// generation ([`CURRENT_INDEXER_VERSION`]) and the plugin *builds* that
+/// filled the index, joined.
+///
+/// Both halves have to be in it. The constant alone misses every plugin-side
+/// change (the failure task 116 fixes); the plugin half alone would miss every
+/// change in `graph::imports` / `graph::symbol_links`, which run in core and
+/// leave every plugin's bytes untouched.
+///
+/// # Why every discovered plugin, and not just the one that was spawned
+///
+/// An index is a single artifact filled by whichever plugins had something to
+/// say about the project, so it is only as current as the *least* current of
+/// the builds behind it: a Python plugin rebuilt with a different extractor
+/// invalidates the same `index.db` a JS/TS rebuild does. Keying this off one
+/// bundled plugin (which is what `daemon::plugin::indexer_version` did until
+/// task 163) would reproduce task 116's exact failure for every language that
+/// is not the bundled one - a current schema, a current constant, and a graph
+/// nothing will ever refresh.
+///
+/// Discovered rather than *active*, for the same reason: which supervisors
+/// happen to have been spawned is a property of what the daemon has been asked
+/// so far, not of what filled the index, and reading it would make the answer
+/// change under a running daemon.
+///
+/// # Why this spawns nothing
+///
+/// [`plugin::fingerprint`] only reads files under a manifest's
+/// `manifest_dir`, so the whole answer comes off the filesystem. That is what
+/// lets this run at daemon startup - before the index is trusted for anything,
+/// and long before the first file of any language brings its plugin up - and
+/// keeps `PluginRegistry`'s lazy-spawn promise intact (see this module's doc
+/// comment).
+///
+/// # A free function, not a `PluginRegistry` method
+///
+/// The architecture doc sketches this as `PluginRegistry::indexer_version()`,
+/// but no caller has a registry when it needs the answer: `daemon::run` has to
+/// stamp/validate the index *before* it builds one (the registry needs the
+/// canonicalized root, the project's config and the embedding pipeline; the
+/// version check needs only discovery's output and has to run before anything
+/// trusts the index at all), and `cli::init`/`cli::reindex` never build a
+/// registry in the first place. Taking `&DiscoveredPlugins` directly removes
+/// that ordering problem rather than working around it - the same shape, and
+/// for the same reason, as [`discovered_pid_files`] above: a fact about
+/// plugins that callers with no live registry still have to be able to ask
+/// for.
+pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
+    format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
+}
+
+/// One digest over every discovered plugin's `(language, fingerprint)` pair.
+///
+/// Re-hashed rather than concatenated so the result stays one fixed-width
+/// value however many plugins are installed - `meta.indexer_version` is
+/// compared, printed and eyeballed, and a string that grows with the plugin
+/// count would make all three worse for no gain.
+///
+/// Sorted by language first. `DiscoveredPlugins::manifests` is a `HashMap`, so
+/// its iteration order varies between processes for reasons that have nothing
+/// to do with what any plugin contains; hashing in that order would make two
+/// daemons of the same install disagree about the index they share and wipe
+/// each other's work. Same hazard [`plugin::fingerprint`]'s own file sort
+/// exists for, one level up. The language is hashed alongside its fingerprint
+/// (and both are length-delimited by a NUL) so that renaming a plugin, or two
+/// languages swapping builds, cannot leave the concatenation unchanged.
+fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
+    let mut fingerprinted: Vec<(&str, String)> = discovered
+        .manifests
+        .iter()
+        .map(|(language, manifest)| (language.as_str(), plugin::fingerprint(manifest)))
+        .collect();
+    fingerprinted.sort_unstable_by(|(one, _), (other, _)| one.cmp(other));
+
+    let mut hasher = Sha256::new();
+    for (language, fingerprint) in &fingerprinted {
+        hasher.update(language.as_bytes());
+        hasher.update([0]);
+        hasher.update(fingerprint.as_bytes());
+        hasher.update([0]);
+    }
+    plugin::truncated_hex(hasher)
+}
+
+/// [`indexer_version`] for a discovery that found nothing - the generation
+/// string a *test* stamps a fixture index with when it needs `meta` to exist
+/// and nothing will ever compare that stamp against a live daemon's.
+///
+/// Shared (`gc::last_used`, `gc::warning`, `cli::clean`, `cli::status`) rather
+/// than repeated as a literal per test module, so those fixtures keep tracking
+/// the real shape of what `schema::ensure_current` stores instead of drifting
+/// into four hand-written strings. Deliberately over an empty
+/// [`DiscoveredPlugins`]: a real discovery would make every one of those
+/// fixtures walk and hash the installed plugins' whole build for a value none
+/// of them reads back.
+#[cfg(test)]
+pub(crate) fn fixture_indexer_version() -> String {
+    indexer_version(&DiscoveredPlugins::default())
 }
 
 /// The daemon's plugins: what was discovered, and which of them are running.
@@ -453,6 +567,7 @@ mod tests {
 
     use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
+    use crate::storage::schema;
 
     /// A registry over `languages`, each installed as a fake plugin claiming
     /// one extension named after it (`python` -> `.python-src`), deliberately
@@ -492,6 +607,221 @@ mod tests {
 
     fn extension_for(language: &str) -> String {
         format!(".{language}-src")
+    }
+
+    /// Discovery over `languages`, each installed as the same stub plugin
+    /// [`registry_over`] uses - what [`indexer_version`] takes, without the
+    /// registry it deliberately does not need. Returns the plugin root's
+    /// tempdir (dropping it would delete the very files being fingerprinted)
+    /// and each installed plugin's directory, so a test can edit one.
+    fn discovery_over(languages: &[&str]) -> (tempfile::TempDir, Vec<PathBuf>, DiscoveredPlugins) {
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let dirs = languages
+            .iter()
+            .map(|language| {
+                let extension = extension_for(language);
+                test_plugin::install(plugins.path(), language, &[extension.as_str()])
+            })
+            .collect();
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+        (plugins, dirs, discovered)
+    }
+
+    /// Rewrites a plugin's entry point with different bytes - a rebuild that
+    /// changed its extraction logic, which is the whole event
+    /// [`indexer_version`] exists to make visible.
+    fn rebuild_with_a_change(plugin_dir: &Path) {
+        let path = plugin_dir.join("plugin.js");
+        let mut source = fs::read_to_string(&path).expect("failed to read the stub plugin");
+        source.push_str("\n// rebuilt with different extraction logic\n");
+        fs::write(&path, source).expect("failed to rewrite the stub plugin");
+    }
+
+    #[test]
+    fn the_generation_names_the_core_pipeline_and_a_digest_of_every_plugin() {
+        let (_plugins, _dirs, discovered) = discovery_over(&["python", "go"]);
+
+        let version = indexer_version(&discovered);
+        let (core, plugins) = version.split_once('+').expect("both halves must be present");
+
+        assert_eq!(core, CURRENT_INDEXER_VERSION);
+        assert!(plugins.chars().all(|c| c.is_ascii_hexdigit()), "{plugins} must be hex");
+        assert!(!plugins.is_empty(), "the plugin half must be a real digest");
+        // Re-asked, it answers the same: nothing about this is derived from
+        // the process asking.
+        assert_eq!(indexer_version(&discovered), version);
+    }
+
+    /// The property the sort exists for, at the level a real install produces
+    /// it: the same two plugins, found by scanning their roots in either
+    /// order, are the same index generation. A daemon that hashed them in scan
+    /// order would wipe the index of a machine whose roots happened to be
+    /// listed the other way round.
+    #[test]
+    fn scanning_the_same_plugins_roots_in_either_order_is_the_same_generation() {
+        let one_root = tempfile::tempdir().expect("failed to create a plugin root");
+        let other_root = tempfile::tempdir().expect("failed to create a plugin root");
+        test_plugin::install(one_root.path(), "python", &[".python-src"]);
+        test_plugin::install(other_root.path(), "go", &[".go-src"]);
+        let (one, other) = (one_root.path().to_path_buf(), other_root.path().to_path_buf());
+
+        let forwards = discover(&[one.clone(), other.clone()]).unwrap();
+        let backwards = discover(&[other, one]).unwrap();
+
+        assert_eq!(forwards.manifests.len(), 2, "both roots must have contributed");
+        assert_eq!(indexer_version(&backwards), indexer_version(&forwards));
+    }
+
+    /// The same property against the other source of order this could have
+    /// picked up: `HashMap`'s own iteration, which is seeded per map and so
+    /// genuinely differs between two maps holding the same entries. Enough
+    /// languages that two maps iterating in the same order by chance is not
+    /// what makes this pass.
+    #[test]
+    fn the_generation_does_not_depend_on_hash_map_iteration_order() {
+        let languages = ["python", "go", "rust", "ruby", "elixir", "zig", "nim", "ocaml"];
+        let (_plugins, _dirs, discovered) = discovery_over(&languages);
+
+        let mut reversed = DiscoveredPlugins::default();
+        for language in languages.iter().rev() {
+            let manifest = discovered.manifests[*language].clone();
+            for extension in &manifest.extensions {
+                reversed.routing.insert(extension.clone(), language.to_string());
+            }
+            reversed.manifests.insert(language.to_string(), manifest);
+        }
+
+        assert_eq!(reversed.manifests, discovered.manifests, "the same set, differently built");
+        assert_eq!(indexer_version(&reversed), indexer_version(&discovered));
+    }
+
+    /// Task 116's failure, once per language: whichever plugin was rebuilt,
+    /// the index it filled is no longer what today's pipeline would produce.
+    #[test]
+    fn rebuilding_either_languages_plugin_changes_the_generation() {
+        let (_plugins, dirs, discovered) = discovery_over(&["python", "go"]);
+        let (python, go) = (&dirs[0], &dirs[1]);
+
+        let before = indexer_version(&discovered);
+
+        rebuild_with_a_change(python);
+        let after_python = indexer_version(&discovered);
+        assert_ne!(after_python, before, "a rebuilt python plugin must move the generation");
+
+        rebuild_with_a_change(go);
+        let after_go = indexer_version(&discovered);
+        assert_ne!(after_go, after_python, "and so must a rebuilt go plugin");
+        assert_ne!(after_go, before);
+    }
+
+    /// The control that keeps the test above about content rather than about
+    /// mtime - a plugin's build system re-emitting identical bytes must not
+    /// cost every project on the machine a full re-walk.
+    #[test]
+    fn re_emitting_a_plugin_unchanged_leaves_the_generation_alone() {
+        let (_plugins, dirs, discovered) = discovery_over(&["python", "go"]);
+        let before = indexer_version(&discovered);
+
+        let path = dirs[0].join("plugin.js");
+        let source = fs::read(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&path, source).unwrap();
+
+        assert_eq!(indexer_version(&discovered), before);
+    }
+
+    /// Installing (or removing) a plugin changes the generation, because it
+    /// changes what the index is a graph *of*: the languages an existing
+    /// index covers are exactly the ones that were installed when it was
+    /// filled. The languages that stayed put contribute the same thing
+    /// either way, which is what makes this a fact about the set and not
+    /// about one plugin having moved.
+    #[test]
+    fn adding_a_second_language_changes_the_generation_without_disturbing_the_first() {
+        let (_one_root, _one_dirs, only_python) = discovery_over(&["python"]);
+        let (_other_root, _other_dirs, both) = discovery_over(&["python", "go"]);
+        let (_third_root, _third_dirs, python_again) = discovery_over(&["python"]);
+
+        assert_ne!(indexer_version(&both), indexer_version(&only_python));
+        // Two separate installs of the same one plugin agree - the digest is
+        // over what the plugins *contain*, not over where they were found.
+        assert_eq!(indexer_version(&python_again), indexer_version(&only_python));
+    }
+
+    /// A machine with no plugins at all still gets a well-formed generation
+    /// rather than an empty half or a panic - and it is not the generation of
+    /// a machine that has one.
+    #[test]
+    fn a_discovery_that_found_nothing_still_produces_a_well_formed_generation() {
+        let empty = indexer_version(&DiscoveredPlugins::default());
+        let (_plugins, _dirs, discovered) = discovery_over(&["python"]);
+
+        let (core, plugins) = empty.split_once('+').expect("both halves must be present");
+        assert_eq!(core, CURRENT_INDEXER_VERSION);
+        assert!(plugins.chars().all(|c| c.is_ascii_hexdigit()), "{plugins} must be hex");
+        assert_ne!(empty, indexer_version(&discovered));
+    }
+
+    /// The acceptance criterion this whole value exists to serve, driven
+    /// through the check that really consumes it: `ensure_current` keeps an
+    /// index whose generation still matches and throws one away whose
+    /// plugin-derived half has moved - now for *any* discovered plugin, not
+    /// just the bundled one.
+    #[test]
+    fn ensure_current_reindexes_when_any_one_plugins_build_changes() {
+        let (_plugins, dirs, discovered) = discovery_over(&["python", "go"]);
+        let conn = Connection::open_in_memory().unwrap();
+
+        assert!(
+            schema::ensure_current(&conn, &indexer_version(&discovered)).unwrap(),
+            "a fresh index always owes a walk"
+        );
+        assert!(
+            !schema::ensure_current(&conn, &indexer_version(&discovered)).unwrap(),
+            "nothing has changed, so the index it just stamped must satisfy its own check"
+        );
+
+        // Only the *second* language's plugin is rebuilt - the one a
+        // single-bundled-plugin generation string would have said nothing
+        // about.
+        rebuild_with_a_change(&dirs[1]);
+
+        assert!(
+            schema::ensure_current(&conn, &indexer_version(&discovered)).unwrap(),
+            "a rebuilt plugin must cost the index it filled a full re-walk"
+        );
+        assert!(
+            !schema::ensure_current(&conn, &indexer_version(&discovered)).unwrap(),
+            "and the generation it re-stamped must be the rebuilt one"
+        );
+    }
+
+    /// Against the real bundled plugin rather than a stub: the generation a
+    /// daemon on this machine would actually compute names a readable build,
+    /// not [`plugin::FINGERPRINT_UNAVAILABLE`] - `core/build.rs` has just
+    /// built the plugin discovery finds.
+    #[test]
+    fn the_real_bundled_plugin_root_produces_a_readable_generation() {
+        let bundled_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        let discovered = discover(&[bundled_root]).expect("the bundled root must discover cleanly");
+
+        assert!(
+            discovered.manifests.contains_key(crate::daemon::plugin::BUNDLED_LANGUAGE),
+            "the bundled plugin must be among what was discovered"
+        );
+        for manifest in discovered.manifests.values() {
+            assert_ne!(
+                plugin::fingerprint(manifest),
+                plugin::FINGERPRINT_UNAVAILABLE,
+                "{} must be fingerprintable - `cargo test` builds it",
+                manifest.language
+            );
+        }
+        assert_eq!(
+            indexer_version(&discovered),
+            format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(&discovered))
+        );
     }
 
     /// Kills `pid` the way an OOM-killer would - the same out-of-band crash

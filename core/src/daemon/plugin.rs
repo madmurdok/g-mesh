@@ -38,7 +38,6 @@ use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
 use crate::protocol::types::{RequestId, CURRENT_PROTOCOL_VERSION};
-use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -110,10 +109,12 @@ pub const BUNDLED_LANGUAGE: &str = "typescript";
 /// [`PLUGIN_PATH_ENV`] override - nothing read from an actual `plugin.toml`.
 ///
 /// Still used after `daemon::run` moved to `daemon::registry::PluginRegistry`
-/// (task 155): [`bundled_fingerprint`]/[`indexer_version`] below are
-/// deliberately still keyed off this one bundled-plugin view rather than the
-/// registry's discovered set - moving them is `PluginRegistry
-/// ::indexer_version`'s job, a separate, later task - and a few tests
+/// (task 155) and after the index's generation string stopped being keyed off
+/// this one bundled-plugin view (task 163 - see
+/// `daemon::registry::indexer_version`): [`bundled_fingerprint`] below is what
+/// `daemon::build_stamp` compares one *running daemon's* JS/TS plugin against
+/// another's, which is a different question from "what filled this index" and
+/// is deliberately still asked of the bundled plugin alone; and a few tests
 /// (`plugin_crash_recovery.rs`) still want a bare [`PluginManifest`] for the
 /// bundled plugin without going through a `plugin.toml` fixture.
 pub fn bundled_manifest() -> PluginManifest {
@@ -170,9 +171,9 @@ pub fn bundled_manifest() -> PluginManifest {
 /// those directories are large, are not what a plugin's own build emits, and
 /// walking them on every shim start would turn a sub-millisecond check into a
 /// directory crawl. A dependency upgrade that changes extraction is therefore
-/// still a manual [`CURRENT_INDEXER_VERSION`] bump, which is exactly what
-/// that constant remains for - the two halves are complementary, not
-/// redundant.
+/// still a manual [`CURRENT_INDEXER_VERSION`](crate::storage::schema::CURRENT_INDEXER_VERSION)
+/// bump, which is exactly what that constant remains for - the two halves are
+/// complementary, not redundant.
 pub fn fingerprint(manifest: &PluginManifest) -> String {
     digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(
         |err| {
@@ -188,11 +189,23 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
 }
 
 /// [`fingerprint`] for [`bundled_manifest`], memoized for the process's
-/// lifetime - the shape every existing single-bundled-plugin caller
-/// (`indexer_version`, `build_stamp::of_running_process`) still needs.
-/// [`fingerprint`] itself does not cache: a future `PluginRegistry` computing
-/// one fingerprint per discovered plugin owns that concern for its own set of
-/// manifests, not this function.
+/// lifetime - what `build_stamp::of_running_process` needs, and since task 163
+/// its only caller.
+///
+/// It is deliberately *not* what stamps the index any more: that is
+/// `daemon::registry::indexer_version`, a digest over every *discovered*
+/// plugin's fingerprint, because with N plugins an index is only as current as
+/// the least current of the builds that filled it. The two questions differ in
+/// what they are for. A build stamp compares one running daemon against
+/// another so a shim can decide whether to retire the incumbent, and the
+/// bundled JS/TS plugin is the part of a daemon's build that
+/// [`PLUGIN_PATH_ENV`] can redirect out from under it; the index's generation
+/// is about content that is already stored.
+///
+/// [`fingerprint`] itself does not cache - `daemon::registry` computes one
+/// fingerprint per discovered plugin, and owns that concern for its own set of
+/// manifests rather than leaving a process-wide `OnceLock` to answer for all
+/// of them.
 ///
 /// Computed once per process: the shim asks for it on every call it makes,
 /// and the answer cannot change under a running process in any way that
@@ -200,22 +213,6 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
 pub fn bundled_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
     FINGERPRINT.get_or_init(|| fingerprint(&bundled_manifest()))
-}
-
-/// The generation string an index is stamped with, and the thing
-/// `storage::schema::ensure_current` compares: core's hand-maintained
-/// pipeline generation and the plugin build that filled the index, joined.
-///
-/// Both halves have to be in it. The constant alone misses every plugin-side
-/// change (the failure task 116 fixes); the fingerprint alone would miss every
-/// change in `graph::imports` / `graph::symbol_links`, which run in core and
-/// leave the plugin's bytes untouched.
-///
-/// Still keyed off the one bundled plugin - moving this to a hash over every
-/// discovered plugin's fingerprint is `PluginRegistry::indexer_version`'s job
-/// (see `docs/architecture/plugin-modularity.md`), a later task.
-pub fn indexer_version() -> String {
-    format!("{CURRENT_INDEXER_VERSION}+{}", bundled_fingerprint())
 }
 
 /// Digests every regular file under `dir`, skipping any subdirectory whose
@@ -246,14 +243,27 @@ fn digest_of_plugin_build(dir: &Path, ignore: &[String]) -> Result<String> {
         hasher.update(&bytes);
     }
 
-    Ok(hasher
+    Ok(truncated_hex(hasher))
+}
+
+/// Finishes `hasher` the one way this daemon renders a digest: lowercase hex,
+/// cut to [`FINGERPRINT_HEX_CHARS`].
+///
+/// Shared with `daemon::registry::indexer_version`, which hashes every
+/// discovered plugin's fingerprint into a single digest of its own. Two
+/// digests that mean different things may as well look alike - both are read
+/// by humans comparing a build stamp or a `meta.indexer_version` at a glance -
+/// and a second, subtly different truncation convention invented next door is
+/// exactly the kind of drift a shared helper costs nothing to rule out.
+pub(crate) fn truncated_hex(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
         .chars()
         .take(FINGERPRINT_HEX_CHARS)
-        .collect())
+        .collect()
 }
 
 /// Gathers every regular file under `dir` as a pair of its path relative to
@@ -864,20 +874,23 @@ mod tests {
         assert_ne!(fingerprint(&manifest), before);
     }
 
-    /// The two halves of the generation string are both there, and the one
-    /// the running test binary computes is a real one - `core/build.rs` has
-    /// just built the plugin it points at.
+    /// The bundled plugin's own build is readable from the running test
+    /// binary - `core/build.rs` has just built the plugin it points at - so
+    /// every build stamp this process publishes names a real fingerprint
+    /// rather than degrading to [`FINGERPRINT_UNAVAILABLE`].
+    ///
+    /// (What the *index* is stamped with is no longer this value - see
+    /// `daemon::registry::indexer_version` and its own tests.)
     #[test]
-    fn the_recorded_generation_names_the_core_pipeline_and_the_plugin_build() {
-        let version = indexer_version();
-        let (core, plugin) = version.split_once('+').expect("both halves must be present");
+    fn the_bundled_plugins_build_is_fingerprintable_from_the_test_binary() {
+        let bundled = bundled_fingerprint();
 
-        assert_eq!(core, CURRENT_INDEXER_VERSION);
-        assert_eq!(plugin, bundled_fingerprint());
         assert_ne!(
-            plugin, FINGERPRINT_UNAVAILABLE,
+            bundled, FINGERPRINT_UNAVAILABLE,
             "the test binary's own plugin build must be readable - `cargo test` builds it"
         );
+        assert_eq!(bundled.len(), FINGERPRINT_HEX_CHARS);
+        assert!(bundled.chars().all(|c| c.is_ascii_hexdigit()), "{bundled} must be hex");
     }
 
     /// The check `docs/architecture/plugin-modularity.md`'s Interfaces
