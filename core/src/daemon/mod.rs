@@ -304,6 +304,17 @@ pub fn run(root: &Path) -> Result<()> {
     let discovered = manifest::discover(&manifest::default_roots())
         .context("failed to discover language plugins")?;
 
+    // The cold-start bulk walk below (`daemon::bulk_index::run`) needs its
+    // own view of what was discovered: it spawns one one-shot `--bulk-index`
+    // process per language directly from each manifest's `command`/`args`,
+    // which is a different (and simpler) shape than `PluginRegistry`'s lazy,
+    // long-lived per-language supervisors below - so it takes a plain copy
+    // rather than reaching into the registry for one. Cloning here, before
+    // `discovered` is moved into the registry, is cheap (discovery runs once,
+    // at startup, over a small number of plugins) and leaves
+    // `PluginRegistry`'s own public API untouched.
+    let discovered_for_bulk_index = discovered.clone();
+
     // Nothing is spawned by this call - see `daemon::registry`'s module doc
     // for why lazy, per-language spawning is the whole point of this type.
     // The registry, not a bare supervisor, is what the rest of the daemon
@@ -371,7 +382,7 @@ pub fn run(root: &Path) -> Result<()> {
     // serving nothing, and every later shim would find it listening, current,
     // and reuse it forever.
     if needs_bulk_index {
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding)
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding, &discovered_for_bulk_index)
             .context("failed to build the project's initial index")?;
         // Flipped *before* the completion marker is written, and the order
         // matters. The two facts become true at the same moment - the walk is
@@ -441,11 +452,14 @@ pub fn run(root: &Path) -> Result<()> {
         // its own, which is what baseline's eager, pre-registry spawn timing
         // gave for free and this daemon still needs.
         //
-        // Still the bundled JS/TS plugin specifically: `daemon::bulk_index`
-        // only ever walks the one bundled plugin today (task 156's job to
-        // generalize, not this one - see this task's own scope notes), so
-        // there is only ever one language's semantic pass to run here. Spawns
-        // it if nothing has needed it yet, same as any other first touch.
+        // Still the bundled JS/TS plugin specifically, unlike the cold-start
+        // walk just above (which spawns one one-shot `--bulk-index` process
+        // per discovered language as of task 156): this semantic pass only
+        // ever asks the bundled plugin's own long-lived supervisor to upgrade
+        // what the structural pass could only guess at. Generalizing it to
+        // run once per discovered language is separate, later work, not this
+        // one's. Spawns it if nothing has needed it yet, same as any other
+        // first touch.
         match registry
             .get_or_spawn(plugin::BUNDLED_LANGUAGE)
             .and_then(|supervisor| supervisor.semantic_pass(&conn, Vec::new()))

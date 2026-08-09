@@ -14,9 +14,16 @@
 //! a `plugin.toml` that `read_manifest`/`discover` parse like any other, and
 //! a Node entry point that speaks the actual wire protocol (`Content-Length`
 //! framed JSON-RPC: a handshake first, then one `FileChangeResponse` per
-//! request) - and nothing more. It answers every request with an *empty*
-//! diff, which is the point: these tests are about which process gets asked,
-//! not about what a parser makes of a file.
+//! request). It answers every request with an *empty* diff, which is the
+//! point: these tests are about which process gets asked, not about what a
+//! parser makes of a file.
+//!
+//! It also answers a one-shot `--bulk-index` invocation
+//! (`daemon::bulk_index`'s own spawn shape - see that module's tests), the
+//! same way the real bundled plugin does: a fixed, deterministic NDJSON
+//! stream of two nodes and the edge between them, named after this fake
+//! plugin's own language so a test summing two languages' output can tell
+//! whose contribution is whose.
 //!
 //! Node, rather than a shell script, for the same reason the real plugin uses
 //! it: it is already a hard dependency of this crate's test suite
@@ -115,6 +122,45 @@ const fs = require("fs");
 const path = require("path");
 
 fs.appendFileSync(path.join(__dirname, "{SPAWN_LOG}"), process.pid + "\n");
+
+// One-shot bulk-index mode (`daemon::bulk_index::run`'s spawn shape:
+// "<command> <args...> --bulk-index <project_root>"): emit a fixed, small
+// NDJSON stream - two nodes and the edge between them, named after this
+// plugin's own language - and exit, rather than starting the interactive
+// framed-JSON-RPC loop below. Enough for a test to prove two plugins' output
+// both landed and summed, not just the first (or only) one's.
+if (process.argv[2] === "--bulk-index") {{
+  const line = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+  line({{
+    id: "{language}-n1",
+    kind: "Function",
+    name: "{language}-n1",
+    qualifiedName: "{language}-n1",
+    filePath: "src/{language}-a.src",
+    range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
+    exported: true,
+    language: "{language}",
+  }});
+  line({{
+    id: "{language}-n2",
+    kind: "Function",
+    name: "{language}-n2",
+    qualifiedName: "{language}-n2",
+    filePath: "src/{language}-b.src",
+    range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
+    exported: true,
+    language: "{language}",
+  }});
+  line({{
+    id: "{language}-e1",
+    fromId: "{language}-n1",
+    toId: "{language}-n2",
+    kind: "CALLS",
+    source: "tree-sitter",
+    resolved: true,
+  }});
+  process.exit(0);
+}}
 
 function writeFrame(message) {{
   const body = Buffer.from(JSON.stringify(message), "utf8");

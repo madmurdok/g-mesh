@@ -113,17 +113,20 @@ impl Harness {
         fs::write(harness.method_log(), "").unwrap();
         fs::write(harness.root().join("seed.ts"), "export const seed = 1;\n").unwrap();
 
-        // Since task 155, `daemon::bulk_index` still resolves the plugin via
-        // `plugin::PLUGIN_PATH_ENV` (task 156's job to generalize, not
-        // touched here), but the interactive supervisor a semantic pass runs
-        // against is spawned from `daemon::manifest::discover`'s result, not
-        // from that env var - `G_MESH_JS_TS_PLUGIN_PATH` alone now only
-        // redirects the bulk walk's one-shot process, leaving the daemon to
-        // discover (and spawn) the *real* bundled plugin for anything else,
-        // which never writes to this stub's method log. A manifest under
+        // As of task 156, `daemon::bulk_index` no longer resolves the plugin
+        // via `plugin::PLUGIN_PATH_ENV` at all - it walks whatever
+        // `daemon::manifest::discover` found, exactly like the interactive
+        // supervisor a semantic pass runs against always has. Setting
+        // `G_MESH_JS_TS_PLUGIN_PATH` below still matters for a different
+        // reason: `plugin::indexer_version()`, computed during daemon
+        // startup before either the walk or a supervisor spawns, still
+        // fingerprints only the one bundled-plugin view
+        // `plugin::bundled_manifest` resolves from that env var - moving it
+        // onto the registry's discovered set is a separate, later task (see
+        // `plugin::bundled_manifest`'s own doc comment). A manifest under
         // `G_MESH_PLUGIN_ROOTS_OVERRIDE` - `daemon::manifest`'s own
-        // generalized successor to the same env var - points discovery at
-        // the same stub instead.
+        // generalized discovery override - is what actually points both the
+        // bulk walk and the interactive supervisor at this stub.
         let plugins_root = harness.aux.path().join("plugins");
         let language_dir = plugins_root.join("typescript");
         fs::create_dir_all(&language_dir).unwrap();
