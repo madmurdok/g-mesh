@@ -40,7 +40,7 @@
 //!
 //! Half the pipeline is not in the executable. The JS/TS plugin is a separate
 //! process built by `npm`, and *everything* in the index is computed by it -
-//! so `cd plugins/js-ts && npm run build` after an extractor change leaves a
+//! so `cd plugins/typescript && npm run build` after an extractor change leaves a
 //! running daemon holding a plugin whose logic no longer exists anywhere on
 //! disk, with an untouched core binary vouching for it. Task 116 measured
 //! exactly that: task 115 changed how same-file edges resolve, and the daemon

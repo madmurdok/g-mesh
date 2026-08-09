@@ -13,7 +13,7 @@
 
 Today `g-mesh` runs exactly one language plugin (JS/TS), and it is wired in
 as a compile-time special case: `core/src/daemon/plugin.rs::plugin_entry_path()`
-resolves a path baked in at compile time (`CARGO_MANIFEST_DIR/../plugins/js-ts/dist/src/index.js`),
+resolves a path baked in at compile time (`CARGO_MANIFEST_DIR/../plugins/typescript/dist/src/index.js`),
 `core/src/cli/plugins.rs` `include_str!`s that one plugin's `package.json`,
 and nothing in the daemon routes a changed file to "which plugin" — there is
 only one, spawned unconditionally. Both modules say so directly in their own
@@ -268,8 +268,8 @@ Directory layout:
 ~/.g-mesh/plugins/python/plugin.toml   # user-installed, global (not per-project)
 ~/.g-mesh/plugins/python/dist/...      # whatever the manifest's command/args point at
 
-<g-mesh install dir>/plugins/js-ts/plugin.toml   # bundled, ships in the release archive
-<g-mesh install dir>/plugins/js-ts/dist/src/index.js
+<g-mesh install dir>/plugins/typescript/plugin.toml   # bundled, ships in the release archive
+<g-mesh install dir>/plugins/typescript/dist/src/index.js
 ```
 
 In a repo checkout (not an installed release), "`<g-mesh install dir>`"

@@ -25,7 +25,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts, PluginSupervisor};
+use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
+use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
 use crate::mcp;
 use crate::storage::connection::{self, project_dir};
@@ -34,11 +35,6 @@ use crate::watcher::ProjectWatcher;
 
 const SOCKET_FILE: &str = "daemon.sock";
 const PID_FILE: &str = "daemon.pid";
-/// The plugin is a child of the daemon and normally dies with it, but its pid
-/// is recorded anyway so tooling outside the daemon can tell "the plugin is
-/// running" from "the plugin is running with no core left to serve" - see
-/// `cli::status` and `cli::stop`.
-const PLUGIN_PID_FILE: &str = "plugin.pid";
 /// Which build the live daemon started from, so a shim (or `cli::status`) can
 /// tell an incumbent that is still this build from one that has been left
 /// behind by an upgrade - see `daemon::build_stamp`.
@@ -73,8 +69,16 @@ pub fn pid_path(root: &Path) -> Result<PathBuf> {
     Ok(pid_path_in(&project_dir(root)?))
 }
 
-/// Records the pid of the language plugin the live daemon spawned, next to
-/// the daemon's own.
+/// The bundled JS/TS (`plugin::BUNDLED_LANGUAGE`) plugin's own pid file -
+/// what this function named before task 155 replaced the daemon's single
+/// `Arc<PluginSupervisor>` with a `PluginRegistry` giving each language a pid
+/// file of its own (`plugin-<language>.pid`, see
+/// `daemon::registry::PluginRegistry::pid_file_for`). Kept, rather than
+/// removed, purely as a convenience alias for the test suite and the couple
+/// of other callers that predate per-language pid files and only ever meant
+/// "the bundled plugin's pid" - real multi-language-aware tooling
+/// (`cli::status`, `cli::stop`, `cli::clean`) does not call this; it lists
+/// every `plugin-*.pid` file instead (`daemon::registry::discovered_pid_files`).
 pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
     Ok(plugin_pid_path_in(&project_dir(root)?))
 }
@@ -88,7 +92,7 @@ pub fn pid_path_in(state_dir: &Path) -> PathBuf {
 }
 
 pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PLUGIN_PID_FILE)
+    state_dir.join(registry::plugin_pid_file_name(plugin::BUNDLED_LANGUAGE))
 }
 
 /// Where the live daemon records the build it started from, resolved from a
@@ -288,32 +292,35 @@ pub fn run(root: &Path) -> Result<()> {
     // `core/scripts/fetch-embedding-model.sh` has been run.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
 
-    // A protocol mismatch (or the plugin failing to start at all) is a hard
-    // daemon-startup failure, matching handshake::verify's philosophy - there
-    // is nothing useful this daemon can do without its plugin.
-    //
-    // The supervisor, not the process, is what the rest of the daemon gets:
-    // from here on the plugin is allowed to be *absent* (asleep on its idle
-    // timeout) with file changes queueing up behind it, which nothing holding
-    // a bare process handle could express. Its pid is recorded as soon as it
-    // exists, not at the end of startup: a daemon that dies during its bulk
-    // walk would otherwise leave a running plugin behind that nothing outside
-    // this process could name (see `cli::stop`).
-    //
-    // Still the bundled JS/TS plugin specifically, named by
-    // `plugin::bundled_manifest()` rather than looked up from discovery:
-    // replacing this single supervisor with a `daemon::registry
-    // ::PluginRegistry` (one lazily-spawned supervisor per discovered
-    // language) is the next task in this release, and the supervisor now
-    // takes the manifest it owns as an argument precisely so that swap is a
-    // change of *caller*, not of this type.
-    let plugin = PluginSupervisor::start(
+    // Malformed manifest, or two plugins claiming the same extension, is a
+    // hard daemon-startup failure naming the manifest path and the specific
+    // problem (`daemon::manifest::discover`'s own contract) - the same
+    // "protocol is code, a mismatch is a hard load failure" philosophy
+    // `handshake::verify` already applies, just at discovery time instead of
+    // at a live handshake. `default_roots()` is what makes this test-safe:
+    // `G_MESH_PLUGIN_ROOTS_OVERRIDE` replaces both standard roots wholesale,
+    // so a test can hand this a fixture directory instead of touching the
+    // real `~/.g-mesh/plugins/`.
+    let discovered = manifest::discover(&manifest::default_roots())
+        .context("failed to discover language plugins")?;
+
+    // Nothing is spawned by this call - see `daemon::registry`'s module doc
+    // for why lazy, per-language spawning is the whole point of this type.
+    // The registry, not a bare supervisor, is what the rest of the daemon
+    // gets: from here on *any* language's plugin is allowed to be absent
+    // (never yet needed, or asleep on its idle timeout) with file changes
+    // queueing up behind whichever supervisor eventually claims them, which
+    // nothing holding a single hardcoded supervisor could express. The
+    // bundled JS/TS plugin goes through this exact same discovered-manifest
+    // path now too - no permanent hardcoded fallback survives it (see
+    // `docs/architecture/plugin-modularity.md`'s Options Considered #1).
+    let registry = Arc::new(PluginRegistry::new(
         &canonical_root,
-        plugin::bundled_manifest(),
-        dir.join(PLUGIN_PID_FILE),
+        dir.clone(),
+        discovered,
         timeouts.plugin,
         Arc::clone(&embedding),
-    )?;
+    ));
 
     // Starts ticking at startup, so a daemon nobody ever connects to still
     // goes away on its own eventually rather than living until the machine
@@ -338,13 +345,13 @@ pub fn run(root: &Path) -> Result<()> {
     let (accept_result, accept_loop) = mpsc::channel();
     {
         let conn = Arc::clone(&conn);
-        let plugin = Arc::clone(&plugin);
+        let registry = Arc::clone(&registry);
         let core_activity = Arc::clone(&core_activity);
         let indexing = indexing.clone();
         let embedding = Arc::clone(&embedding);
         thread::spawn(move || {
             let _ = accept_result
-                .send(serve_forever(listener, conn, plugin, core_activity, indexing, embedding));
+                .send(serve_forever(listener, conn, registry, core_activity, indexing, embedding));
         });
     }
 
@@ -411,7 +418,38 @@ pub fn run(root: &Path) -> Result<()> {
         // checker cannot start is a project served by its structural graph,
         // which is the state it was in a moment ago anyway. Failing daemon
         // startup over it would throw away a perfectly good index.
-        match plugin.semantic_pass(&conn, Vec::new()) {
+        //
+        // Run inline, not backgrounded, deliberately - a background thread
+        // was tried here and reverted. `get_or_spawn` now has to spawn the
+        // plugin process itself the first time anything needs it (this call
+        // used to be the one exception, running against a supervisor the
+        // daemon had already spawned unconditionally before this point), so
+        // running it inline does cost the first post-cold-start query some
+        // real latency it did not pay before - see task 164, which owns
+        // fixing that properly (finer-grained locking in `PluginRegistry` so
+        // an unrelated reader is never held up by someone else's spawn).
+        // Backgrounding this call instead is the wrong fix for it: this pass
+        // and the watcher's own incremental per-file semantic passes both
+        // ultimately serialize on the same plugin process, but nothing
+        // orders *which* of two independently-triggered passes commits last,
+        // and a whole-project pass that lands after a newer incremental one
+        // can overwrite its correct, fresher edges with stale ones - exactly
+        // the failure `core/tests/overload_call_binding.rs` caught when this
+        // was tried backgrounded (a collapsed edge the incremental pass had
+        // already cleaned up came back). Inline keeps this pass strictly
+        // before the watcher (registered further down) can trigger any of
+        // its own, which is what baseline's eager, pre-registry spawn timing
+        // gave for free and this daemon still needs.
+        //
+        // Still the bundled JS/TS plugin specifically: `daemon::bulk_index`
+        // only ever walks the one bundled plugin today (task 156's job to
+        // generalize, not this one - see this task's own scope notes), so
+        // there is only ever one language's semantic pass to run here. Spawns
+        // it if nothing has needed it yet, same as any other first touch.
+        match registry
+            .get_or_spawn(plugin::BUNDLED_LANGUAGE)
+            .and_then(|supervisor| supervisor.semantic_pass(&conn, Vec::new()))
+        {
             Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
             Ok(false) => {}
             Err(err) => eprintln!(
@@ -424,7 +462,7 @@ pub fn run(root: &Path) -> Result<()> {
     let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
     {
         let conn = Arc::clone(&conn);
-        let plugin = Arc::clone(&plugin);
+        let registry = Arc::clone(&registry);
         let root = canonical_root.clone();
         // Debouncer/BurstBatcher (watcher::debounce, watcher::burst) would
         // coalesce a burst of saves into fewer plugin round trips, but
@@ -449,10 +487,14 @@ pub fn run(root: &Path) -> Result<()> {
                         // list a sleeping core builds.
                         continue;
                     }
-                    // Applied now if the plugin is awake, queued for the next
-                    // request if it is asleep - the supervisor owns that
-                    // decision because only it can read both facts at once.
-                    plugin.file_changed(&conn, file_path);
+                    // Routed to whichever language claims this file's
+                    // extension, spawning that plugin if this is the first
+                    // file of its kind (`daemon::registry::PluginRegistry
+                    // ::file_changed`); applied now if that plugin is awake,
+                    // queued for its next wake if it is asleep - the
+                    // supervisor it resolves to owns that decision because
+                    // only it can read both facts at once.
+                    registry.file_changed(&conn, file_path);
                 }
             }
         });
@@ -463,7 +505,7 @@ pub fn run(root: &Path) -> Result<()> {
     // this daemon deciding it has been unused long enough to go - `main`
     // returns and the OS reclaims the socket, the watchers and the SQLite
     // handle.
-    lifecycle::supervise(&dir, &plugin, &core_activity, timeouts, accept_loop)
+    lifecycle::supervise(&dir, &registry, &core_activity, timeouts, accept_loop)
 }
 
 /// Runs the MCP accept loop until the process is killed.
@@ -487,7 +529,7 @@ pub fn run(root: &Path) -> Result<()> {
 fn serve_forever(
     listener: UnixListener,
     conn: Arc<Mutex<Connection>>,
-    plugin: Arc<PluginSupervisor>,
+    registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<crate::embedding::EmbeddingPipeline>,
@@ -514,7 +556,7 @@ fn serve_forever(
                 .await
                 .context("failed to accept a daemon connection")?;
             let conn = Arc::clone(&conn);
-            let plugin = Arc::clone(&plugin);
+            let registry = Arc::clone(&registry);
             let indexing = indexing.clone();
             let embedding = Arc::clone(&embedding);
             // Taken here rather than inside the task, so the count rises
@@ -529,7 +571,7 @@ fn serve_forever(
                 if let Err(err) = mcp::serve_connection(
                     stream,
                     conn,
-                    plugin,
+                    registry,
                     core_activity,
                     indexing,
                     embedding,

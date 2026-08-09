@@ -7,16 +7,16 @@
 //! there is no semantic pass to wait on here: the generics-scope task
 //! (b25d0f4b) found this was a syntax-visibility gap in the tree-sitter
 //! extraction pass itself, not a type-inference problem, and the fix
-//! (`plugins/js-ts/src/extract.ts`, `// --- generic types ---`) is purely
+//! (`plugins/typescript/src/extract.ts`, `// --- generic types ---`) is purely
 //! structural. So the new edges are already in the index the moment
 //! `wait_until_indexed` returns, exactly like `reexport_linking.rs`.
 //!
-//! `plugins/js-ts/test/extract.test.ts`'s own `// --- generic types ---`
+//! `plugins/typescript/test/extract.test.ts`'s own `// --- generic types ---`
 //! section proves these facts at the extractor's unit level; this file proves
 //! the same facts are visible through the real MCP tool surface, which is the
 //! gap this test closes.
 //!
-//! Requires `plugins/js-ts/dist/` to be up to date; `core/build.rs` runs
+//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};

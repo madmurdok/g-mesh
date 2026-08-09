@@ -22,7 +22,7 @@ use super::{anchor, SymbolQueryParams};
 /// never duplicates it: a resolved call becomes a `CALLS` edge and `addUsage`
 /// then explicitly skips the `REFERENCES` one for that pair, and a
 /// supertype clause becomes only a `SUPERTYPE_OF` edge (see
-/// plugins/js-ts/src/extract.ts). So filtering on `REFERENCES` alone hides
+/// plugins/typescript/src/extract.ts). So filtering on `REFERENCES` alone hides
 /// exactly the usages the more specific kinds claimed - which made
 /// `find_references` return *fewer* results than `find_callers` on the same
 /// symbol. Matches the `('REFERENCES', 'CALLS')` set `find_definition`

@@ -6,7 +6,7 @@
 //! daemon needs the check at all. This file is about the half that argument
 //! left out. Everything in the index is computed by the plugin - a separate
 //! Node process, built by `npm`, that the core binary says nothing about - so
-//! `cd plugins/js-ts && npm run build` after an extractor change used to leave
+//! `cd plugins/typescript && npm run build` after an extractor change used to leave
 //! a running daemon holding logic that no longer existed on disk, with
 //! `g-mesh status` truthfully reporting "daemon build: this build" beside it.
 //!
@@ -25,7 +25,7 @@
 //! from is the same file throughout, which is precisely the condition under
 //! which the old check saw nothing.
 //!
-//! The copy lives *inside* `plugins/js-ts/dist/` rather than in a temp
+//! The copy lives *inside* `plugins/typescript/dist/` rather than in a temp
 //! directory, because Node resolves `require("tree-sitter")` by walking up
 //! from the file that asked - a plugin copied outside the package would fail
 //! to load its grammars for reasons that have nothing to do with what is
@@ -73,7 +73,7 @@ const REBUILT_FILE: &str = "extract.js";
 /// Where `core/build.rs` leaves the compiled plugin, resolved the same way
 /// `daemon::plugin::plugin_entry_path` resolves it.
 fn plugin_dist_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/js-ts/dist")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist")
 }
 
 /// A private copy of the compiled plugin, so a test can rebuild "the plugin"

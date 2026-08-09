@@ -22,7 +22,7 @@
 //! published build stamp is indistinguishable, to every consumer, from the
 //! real case of the executable having been rebuilt since it started.
 //!
-//! Requires `plugins/js-ts/dist/` to be up to date; `core/build.rs` runs
+//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};

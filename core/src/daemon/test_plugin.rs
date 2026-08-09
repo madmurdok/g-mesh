@@ -148,7 +148,7 @@ process.stdin.on("data", (chunk) => {{
   }}
 }});
 
-// Same exit condition as the real plugin's (plugins/js-ts/src/index.ts): the
+// Same exit condition as the real plugin's (plugins/typescript/src/index.ts): the
 // core closing its end of stdin is what a deliberate sleep looks like from
 // here.
 process.stdin.on("end", () => process.exit(0));

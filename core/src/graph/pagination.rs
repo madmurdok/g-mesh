@@ -45,7 +45,7 @@ pub const MAX_RESPONSE_BYTES: usize = 20_000;
 
 /// The `kind` value a `File` node carries. A `File` node's `qualifiedName`
 /// IS its own project-relative path by construction - see
-/// `plugins/js-ts/src/extract.ts`'s `run()`, which sets
+/// `plugins/typescript/src/extract.ts`'s `run()`, which sets
 /// `qualifiedName: this.filePath` for the node it emits for the file itself
 /// - so it is byte-identical to that same row's `filePath` in every case,
 /// never worth sending twice. Its `startLine`/`startCol` are likewise
@@ -225,7 +225,7 @@ pub struct ScoredEdge {
 ///
 /// `edge_kinds` is a set, not a single kind: the extractor records one usage
 /// under exactly one kind (a call is a `CALLS` edge *instead of* a
-/// `REFERENCES` one - see `addUsage` in plugins/js-ts/src/extract.ts), so a
+/// `REFERENCES` one - see `addUsage` in plugins/typescript/src/extract.ts), so a
 /// tool whose question spans several of those kinds has to ask for all of
 /// them at once. An empty slice means "every kind".
 ///

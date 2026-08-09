@@ -23,7 +23,7 @@
 //! at the storage layer.
 //!
 //! Structured after `namespace_import_resolution.rs`/`reexport_linking.rs`.
-//! Requires `plugins/js-ts/dist/` to be up to date, which `core/build.rs`
+//! Requires `plugins/typescript/dist/` to be up to date, which `core/build.rs`
 //! keeps so.
 
 use std::path::{Path, PathBuf};

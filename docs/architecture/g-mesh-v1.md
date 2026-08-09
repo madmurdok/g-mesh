@@ -275,7 +275,7 @@ the normal yarn/lerna layout, and how vendored shared code is linked into
 `packages/` — is walked and indexed like any other, rather than being silently
 absent because a `Dirent` reports a link as neither file nor directory. The file
 walk and the workspace-glob expansion share one guard module
-(`plugins/js-ts/src/symlinks.ts`), each building its own instance per traversal,
+(`plugins/typescript/src/symlinks.ts`), each building its own instance per traversal,
 so the two cannot disagree about which packages exist and which files are theirs.
 The guard's rules: identity for cycle and duplicate detection is the resolved
 real path, never the path used to reach it; a link onto one of its own ancestors
@@ -306,7 +306,7 @@ never invented.
 
 Everything above assumes the specifier is a string literal — what
 `stringLiteralValue` extracts from a `string` or `template_string` node in
-`plugins/js-ts/src/extract.ts`. `import()`/`require()` do not require that:
+`plugins/typescript/src/extract.ts`. `import()`/`require()` do not require that:
 `import(\`./plugins/${name}\`)`, `import(getPath())`,
 `import(path.join(__dirname, name))` are all legal, and none of them is a
 literal.
@@ -328,7 +328,7 @@ does, and truncated the same way), and a specifier made of parts is either
 folded whole or not resolved at all.
 
 Drawing the line meant separating what a static pass — tree-sitter alone, or
-the TS-compiler-backed semantic pass (`plugins/js-ts/src/semantic.ts`) — can
+the TS-compiler-backed semantic pass (`plugins/typescript/src/semantic.ts`) — can
 honestly answer from what only running the program answers. Concretely:
 
 **Resolvable without running anything (implemented in `recordCallImport` /
@@ -372,7 +372,7 @@ honestly answer from what only running the program answers. Concretely:
   one file at a time, so folding it needs either a new tsserver query that
   returns a symbol's literal value directly, or chaining the semantic pass's
   existing `definition` request (`SemanticProject.definition` in
-  `plugins/js-ts/src/semantic.ts`) to the declaration site and re-running the
+  `plugins/typescript/src/semantic.ts`) to the declaration site and re-running the
   same structural fold there. That is real plumbing, not a shape decision,
   and deserves its own ticket.
 - A specifier whose interpolated part is not one known literal but a value
@@ -463,7 +463,7 @@ What that walk cannot settle is a name **two** branches offer at the same
 depth — `export * from "./a"; export * from "./b"` where both declare
 `mutate`. All a name-matching walk sees is two equally good candidates, so it
 leaves the edge alone. The language does have an answer, and the semantic pass
-(`plugins/js-ts/src/semanticPass.ts`) asks the compiler for it rather than
+(`plugins/typescript/src/semanticPass.ts`) asks the compiler for it rather than
 reimplementing it. Measured against TypeScript 5.9.3 on exactly that fixture:
 
 | asked | answer |
@@ -632,7 +632,7 @@ so ids survive edits elsewhere in the file), so all of them land on one node
 and everything but the first is discarded.
 
 Measured on a fixture with every shape of this (Node 20.6.1, TypeScript 5.9.3,
-`plugins/js-ts/src/extract.ts` at release 0.19.0), the damage was worse than
+`plugins/typescript/src/extract.ts` at release 0.19.0), the damage was worse than
 "the first declaration wins" — the first two below are what the extractor did
 before this design landed in it, kept as the measurement the design answers:
 
@@ -655,7 +655,7 @@ before this design landed in it, kept as the measurement the design answers:
 
 **TypeScript's own model, measured rather than assumed.** Every row below is
 a real `tsserver` answer against that fixture, through
-`plugins/js-ts/src/semantic.ts`'s live child:
+`plugins/typescript/src/semantic.ts`'s live child:
 
 | asked of `tsserver` | overloaded `parse` (2 sigs + impl) | merged `interface Options` (2 decls) | `class Model` + `interface Model` |
 | --- | --- | --- | --- |
@@ -844,7 +844,7 @@ That is the line, and everything below follows from where it falls.
 Unlike the release's other three sub-problems, generics arrived with no
 failing test to anchor on — so the first job was finding out what is actually
 lost. Measured against the `tree-sitter-typescript` 0.23 grammar and
-`plugins/js-ts/src/extract.ts` at release 0.19.0, it is three drops, all of
+`plugins/typescript/src/extract.ts` at release 0.19.0, it is three drops, all of
 them of *explicitly written* names, none of them requiring a type checker to
 see:
 
@@ -862,7 +862,7 @@ types of its own, so it was counted on the bench corpora rather than guessed
 | --- | --- | --- | --- | --- | --- | --- |
 | excalidraw | 614 | 81 of 689 | 665 | 108 | 10 of 12 | 610 of 801 |
 | task-tracker-mcp | 46 | 0 of 51 | 0 | 0 | 0 | 0 of 8 |
-| g-mesh `plugins/js-ts/src` | 13 | 1 of 74 | 1 | 0 | 0 | 16 of 53 |
+| g-mesh `plugins/typescript/src` | 13 | 1 of 74 | 1 | 0 | 0 | 16 of 53 |
 
 (The last two columns count only arguments naming a type the project itself
 declares; a `Map<string, number>` loses nothing, because neither `Map` nor
@@ -910,7 +910,7 @@ no new node or edge kind, no checker:
    standing rule, and the guard is cheap.
 
 Fixtures (one file each, asserted through `extractFile` exactly as
-`plugins/js-ts/test/extract.test.ts` already asserts `SUPERTYPE_OF`):
+`plugins/typescript/test/extract.test.ts` already asserts `SUPERTYPE_OF`):
 
 ```ts
 // (1) the head of a generic type
@@ -1109,7 +1109,7 @@ tighter default.
   Measured against a real `tsserver` (see [TS semantic layer](#ts-semantic-layer)),
   that holds for half the wire and not the other: `tsserver`'s *output* is
   byte-identical `Content-Length: N\r\n\r\n{body}` framing, which
-  `plugins/js-ts/src/jsonrpc.ts`'s `FrameReader` parses verbatim, but its
+  `plugins/typescript/src/jsonrpc.ts`'s `FrameReader` parses verbatim, but its
   *input* is newline-delimited JSON and it rejects a `Content-Length` frame
   outright (`Unexpected token 'C', "Content-Length: 45" is not valid JSON`),
   with a `{seq, type: "request", command, arguments}` envelope rather than
@@ -1160,7 +1160,7 @@ tighter default.
   saying `ts-compiler`. Retracting an edge whose call site an edit deleted is
   the pass's own job (the reparse diff never knew about it), which is why the
   plugin remembers what it last emitted per file
-  (`plugins/js-ts/src/semanticPass.ts`).
+  (`plugins/typescript/src/semanticPass.ts`).
 
   **Which unresolved edges are re-asked**: only those whose target file does
   not itself declare the name. Where it does, core's own walk reaches the same
@@ -1219,7 +1219,7 @@ The [cold-start diagram](#1-cold-start--initial-index) already draws the
 semantic pass as `par, async, non-blocking` alongside the plugin's other
 work. In-process that drawing is false: the plugin is one Node event loop
 that also carries the control plane and the tree-sitter reparse path
-(`plugins/js-ts/src/incremental.ts`), and building a `Program` stalls it in
+(`plugins/typescript/src/incremental.ts`), and building a `Program` stalls it in
 one unbroken block — **1677 ms** on a 46-file project, **2729 ms** on 618
 files, versus **26 ms** worst-case with the subprocess. A `fileChanged`
 notification arriving in that window simply is not served. Recovering async
@@ -1320,7 +1320,7 @@ so the pass does keep one piece of open-file state after all (which files it
 has sent an `open` for, one notification each, no round trip), rather than
 none at all.
 
-The client is `plugins/js-ts/src/semantic.ts`: `SemanticServer` is the
+The client is `plugins/typescript/src/semantic.ts`: `SemanticServer` is the
 ~40-line wire adapter over one child, `SemanticProject` its lifecycle — one
 child per project root, spawned by the first semantic question actually asked
 (never at plugin startup), replaced lazily if it dies, and stopped with the
@@ -1332,7 +1332,7 @@ natively, from the file's own location upward, so nothing of
 `tsconfigPaths.ts` is reused here; `projectInfo` reports which config was
 actually in force, which is what the tests assert on rather than assuming.
 Turning answers into edges lives one file over, in
-`plugins/js-ts/src/semanticPass.ts`, so this one knows no g-mesh vocabulary at
+`plugins/typescript/src/semanticPass.ts`, so this one knows no g-mesh vocabulary at
 all: it decides which sites are worth a question and what an answer becomes in
 the graph (today, namespace-import member accesses — see
 [`semanticPass`](#core--language-plugin-protocol) above). The node and edge
@@ -1646,7 +1646,7 @@ thing surfaced there is worth recording here:
   `get_symbols_overview` onto `get_file_outline` — so diagnostics is the one
   read-only, structurally-adjacent capability g-mesh genuinely lacks. It is
   also not a new integration problem: the semantic layer (0.19.0,
-  `plugins/js-ts/src/semantic.ts`'s `SemanticProject`) already keeps a live
+  `plugins/typescript/src/semantic.ts`'s `SemanticProject`) already keeps a live
   `tsserver` child open per project for `definition` queries, and tsserver
   natively answers a diagnostics request over that same connection — an
   `get_diagnostics`-shaped MCP tool would be new surface area (a command, a

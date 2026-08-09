@@ -513,7 +513,7 @@ mod tests {
 
     /// splitmix64 - good dispersion for a benchmark id, no need for a
     /// cryptographic hash. Only the *length and entropy class* need to match
-    /// a real sha256-derived id (`plugins/js-ts/src/extract.ts::hash`, 32 hex
+    /// a real sha256-derived id (`plugins/typescript/src/extract.ts::hash`, 32 hex
     /// chars, effectively uniform): `make_wide_graph`'s zero-padded counter
     /// ids compress far better than a real id would and would understate
     /// resume-token size.

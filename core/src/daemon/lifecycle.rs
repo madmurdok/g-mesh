@@ -289,7 +289,7 @@ impl PluginSupervisor {
         idle_timeout: Option<Duration>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Result<Arc<Self>> {
-        let process = PluginProcess::spawn(project_root, &manifest)
+        let process = PluginProcess::spawn(project_root, &manifest, pid_file.clone())
             .with_context(|| format!("failed to start the {} plugin", manifest.language))?;
         write_pid_file(&pid_file, process.pid());
 
@@ -371,7 +371,7 @@ impl PluginSupervisor {
         // leaves the queue intact for the next request to retry rather than
         // swallowing the changes it was about to replay.
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root, &self.manifest)
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
@@ -468,14 +468,13 @@ impl PluginSupervisor {
 
         let mut inner = self.inner.lock().unwrap();
         if inner.process.is_none() {
-            let process = PluginProcess::spawn(&self.project_root, &self.manifest).with_context(
-                || {
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
+                .with_context(|| {
                     format!(
                         "failed to wake the {} plugin for a query-time staleness check",
                         self.manifest.language
                     )
-                },
-            )?;
+                })?;
             write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
@@ -625,9 +624,17 @@ impl Drop for ConnectionGuard {
 /// `return`, after that call, not a `std::process::exit` from a timer.
 ///
 /// [`sleep_now`]: PluginSupervisor::sleep_now
+///
+/// Takes the whole [`PluginRegistry`](crate::daemon::registry::PluginRegistry)
+/// rather than one supervisor since task 155: every language that has ever
+/// been spawned gets its own idle check
+/// ([`PluginRegistry::sleep_if_idle_all`](crate::daemon::registry::PluginRegistry::sleep_if_idle_all)),
+/// independently, and every one of them is put to sleep on the core's own way
+/// out ([`PluginRegistry::sleep_all_now`](crate::daemon::registry::PluginRegistry::sleep_all_now)) -
+/// a language that was never touched simply has nothing to do either time.
 pub fn supervise(
     state_dir: &Path,
-    plugin: &PluginSupervisor,
+    registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
@@ -642,14 +649,14 @@ pub fn supervise(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
-        plugin.sleep_if_idle();
+        registry.sleep_if_idle_all();
 
         if let Some(idle) = core.idle_beyond(timeouts.core) {
             eprintln!(
                 "g-mesh daemon: no MCP requests for {idle:?} - shutting down; the next request \
                  will start a fresh daemon for this project"
             );
-            plugin.sleep_now("the core is shutting down");
+            registry.sleep_all_now("the core is shutting down");
             release_state_files(state_dir);
             return Ok(());
         }
@@ -665,9 +672,17 @@ pub fn supervise(
 /// shim connects and finds nothing there, `cli::status` cross-checks pids
 /// against the socket), and refusing to exit over one would be worse than the
 /// mess it leaves.
+///
+/// Every `plugin-<language>.pid` file is cleared, not just one - a listing
+/// of the state directory rather than a per-language loop over the registry's
+/// live supervisors, so a language that slept (and already removed its own
+/// pid file - see [`PluginSupervisor::put_to_sleep`]) is not the only kind of
+/// "already gone" this has to handle right.
 fn release_state_files(state_dir: &Path) {
     let _ = fs::remove_file(super::pid_path_in(state_dir));
-    let _ = fs::remove_file(super::plugin_pid_path_in(state_dir));
+    for (_, pid_file) in super::registry::discovered_pid_files(state_dir) {
+        let _ = fs::remove_file(pid_file);
+    }
     let _ = fs::remove_file(super::build_stamp_path_in(state_dir));
     // Named through the parent module's own constant rather than spelled out
     // again here: the file a daemon binds and the file it releases have to be

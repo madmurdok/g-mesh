@@ -77,29 +77,50 @@ pub(crate) fn plugin_entry_path() -> PathBuf {
     if let Ok(over) = std::env::var(PLUGIN_PATH_ENV) {
         return PathBuf::from(over);
     }
-    // `core/` and `plugins/js-ts/` are sibling directories in this repo, and
+    // `core/` and `plugins/typescript/` are sibling directories in this repo, and
     // there is no distribution pipeline yet (see release notes' backlog) -
     // resolving relative to this crate's own source tree, baked in at
     // compile time, is the pragmatic MVP answer.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/js-ts/dist/src/index.js")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js")
 }
+
+/// The bundled plugin's wire identifier - `Handshake.language`
+/// (`plugins/typescript/src/index.ts`), and since task 155 renamed
+/// `plugins/js-ts/` to `plugins/typescript/`, its manifest's `language` and
+/// its directory name too: the bundled plugin is discovered through the
+/// exact same "directory name is the manifest's language" rule as any other
+/// plugin, no special case retained (see
+/// `docs/architecture/plugin-modularity.md`'s Options Considered #1).
+///
+/// A constant rather than a literal at each use site because it names two
+/// genuinely different things that must never drift apart: the language
+/// [`bundled_manifest`] hands out below, and the pid-file name
+/// `daemon::plugin_pid_path` still resolves for the test suite and the few
+/// other callers that predate per-language pid files and only ever meant
+/// "the bundled JS/TS plugin's pid" (see that function's doc comment).
+/// Production code that has to be genuinely multi-language-aware
+/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant
+/// - it lists every `plugin-<language>.pid` file `PluginRegistry` writes
+/// instead of assuming this one.
+pub const BUNDLED_LANGUAGE: &str = "typescript";
 
 /// A [`PluginManifest`] describing the bundled JS/TS plugin exactly as it was
 /// spawned before this module took a manifest as an argument: `node` plus
 /// [`plugin_entry_path`]'s resolved entry point, honoring the same
 /// [`PLUGIN_PATH_ENV`] override - nothing read from an actual `plugin.toml`.
 ///
-/// This bridges [`PluginState::spawn`]/[`PluginProcess::spawn`]'s new
-/// manifest-driven signature with callers that predate real plugin discovery
-/// (`daemon::manifest::discover`, not built yet - a later task in this
-/// release, per `docs/architecture/plugin-modularity.md`). Once that
-/// discovery ships, this function's callers are expected to look the
-/// manifest up from a `PluginRegistry` instead, and this helper retired.
+/// Still used after `daemon::run` moved to `daemon::registry::PluginRegistry`
+/// (task 155): [`bundled_fingerprint`]/[`indexer_version`] below are
+/// deliberately still keyed off this one bundled-plugin view rather than the
+/// registry's discovered set - moving them is `PluginRegistry
+/// ::indexer_version`'s job, a separate, later task - and a few tests
+/// (`plugin_crash_recovery.rs`) still want a bare [`PluginManifest`] for the
+/// bundled plugin without going through a `plugin.toml` fixture.
 pub fn bundled_manifest() -> PluginManifest {
     let entry = plugin_entry_path();
     let manifest_dir = entry.parent().map(Path::to_path_buf).unwrap_or_default();
     PluginManifest {
-        language: "typescript".to_string(),
+        language: BUNDLED_LANGUAGE.to_string(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         plugin_version: String::new(),
         command: PathBuf::from("node"),
@@ -375,6 +396,16 @@ pub struct PluginProcess {
     /// (`Self::relaunch`) needs the exact command/language this process was
     /// spawned with, and no caller re-supplies it on that path.
     manifest: PluginManifest,
+    /// Where this plugin's pid is recorded - `daemon::registry
+    /// ::PluginRegistry::pid_file_for`'s per-language path for a registry-
+    /// owned supervisor, or whatever legacy/test path a caller that predates
+    /// the registry still passes. [`Self::relaunch`] rewrites *this* file,
+    /// not a hardcoded one: before task 155 it always wrote the single
+    /// legacy `plugin.pid` regardless of which language actually crashed,
+    /// which two supervisors sharing that one file would have stepped on
+    /// each other's records over - the exact hazard `PluginRegistry`'s own
+    /// module doc calls out as "not deferred" until this was fixed.
+    pid_file: PathBuf,
     state: Mutex<PluginState>,
     next_id: AtomicI64,
     /// File paths handed to [`Self::apply_file_change`] whose diff has not
@@ -387,12 +418,17 @@ pub struct PluginProcess {
 
 impl PluginProcess {
     /// Spawns `manifest`'s plugin for `project_root` - see
-    /// [`PluginState::spawn`].
-    pub fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
+    /// [`PluginState::spawn`]. `pid_file` is where [`Self::relaunch`] records
+    /// a crash-recovery respawn's fresh pid; the *first* pid (this call's own)
+    /// is the caller's job to write, matching every existing caller
+    /// (`PluginSupervisor::start`/`replay_pending`/`ensure_fresh`), which
+    /// already write it themselves right after a successful spawn.
+    pub fn spawn(project_root: &Path, manifest: &PluginManifest, pid_file: PathBuf) -> Result<Self> {
         let state = PluginState::spawn(project_root, manifest)?;
         Ok(Self {
             project_root: project_root.to_path_buf(),
             manifest: manifest.clone(),
+            pid_file,
             state: Mutex::new(state),
             next_id: AtomicI64::new(1),
             pending: Mutex::new(Vec::new()),
@@ -639,10 +675,13 @@ impl PluginProcess {
     /// one that succeeds should read as "recovered from X", not silently
     /// swallow what X was.
     ///
-    /// The plugin pid file the daemon writes at startup (`cli::stop`,
-    /// `cli::status` read it) is rewritten too - left alone, it would keep
-    /// naming a process that no longer exists, or worse, one a recycled pid
-    /// now belongs to.
+    /// `self.pid_file` - this process's own, not a hardcoded shared path - is
+    /// rewritten too - left alone, it would keep naming a process that no
+    /// longer exists, or worse, one a recycled pid now belongs to. Before
+    /// task 155 this always wrote the single legacy `plugin.pid`, which was
+    /// harmless while there was only ever one plugin but would have let two
+    /// languages' relaunches overwrite each other's pid file once there was
+    /// more than one.
     fn relaunch(&self, cause: &anyhow::Error) -> Result<()> {
         eprintln!(
             "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - \
@@ -652,17 +691,10 @@ impl PluginProcess {
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         *self.state.lock().unwrap() = fresh;
-        match crate::daemon::plugin_pid_path(&self.project_root) {
-            Ok(pid_file) => {
-                if let Err(err) = fs::write(&pid_file, pid.to_string()) {
-                    eprintln!(
-                        "g-mesh daemon: could not update the plugin pid file after relaunch: {err:#}"
-                    );
-                }
-            }
-            Err(err) => {
-                eprintln!("g-mesh daemon: could not resolve the plugin pid file after relaunch: {err:#}")
-            }
+        if let Err(err) = fs::write(&self.pid_file, pid.to_string()) {
+            eprintln!(
+                "g-mesh daemon: could not update the plugin pid file after relaunch: {err:#}"
+            );
         }
         Ok(())
     }
@@ -860,7 +892,7 @@ mod tests {
         let manifest = PluginManifest { language: "python".to_string(), ..bundled_manifest() };
         let project = tempfile::tempdir().unwrap();
 
-        let err = match PluginProcess::spawn(project.path(), &manifest) {
+        let err = match PluginProcess::spawn(project.path(), &manifest, project.path().join("plugin.pid")) {
             Ok(_) => panic!("spawning against a manifest declaring the wrong language must fail"),
             Err(err) => err,
         };

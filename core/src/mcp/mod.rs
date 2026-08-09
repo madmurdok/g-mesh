@@ -28,7 +28,8 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::lifecycle::{CoreActivity, PluginSupervisor};
+use crate::daemon::lifecycle::CoreActivity;
+use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
@@ -108,12 +109,12 @@ pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
 pub async fn serve_connection(
     stream: UnixStream,
     conn: Arc<Mutex<Connection>>,
-    plugin: Arc<PluginSupervisor>,
+    registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, plugin, core_activity, indexing, embedding)
+    let service = GMeshMcpServer::new(conn, registry, core_activity, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -122,17 +123,20 @@ pub async fn serve_connection(
 }
 
 /// The structural query surface, backed by the project's index and the
-/// language plugin.
+/// language plugins.
 ///
-/// Every handler answers out of `conn` alone. `plugin` is not there to be
-/// queried - no tool asks the language server a question - but to be *woken*:
-/// while it sleeps on its idle timeout the core queues the files that changed,
-/// and a tool call is the moment that queue has to be replayed before the
-/// index is read (see `daemon::lifecycle`).
+/// Every handler answers out of `conn` alone. `registry` is not there to be
+/// queried - no tool asks a language server a question - but to be *woken*:
+/// while a language's plugin sleeps on its idle timeout the core queues the
+/// files that changed, and a tool call is the moment that queue has to be
+/// replayed before the index is read (see `daemon::lifecycle`). Since task
+/// 155 this is a `PluginRegistry` rather than one `Arc<PluginSupervisor>`,
+/// because a tool call has no way to know ahead of time which language(s)
+/// its answer might touch.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
     conn: Arc<Mutex<Connection>>,
-    plugin: Arc<PluginSupervisor>,
+    registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
@@ -143,12 +147,12 @@ pub struct GMeshMcpServer {
 impl GMeshMcpServer {
     pub fn new(
         conn: Arc<Mutex<Connection>>,
-        plugin: Arc<PluginSupervisor>,
+        registry: Arc<PluginRegistry>,
         core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        Self { conn, plugin, core_activity, indexing, embedding, tool_router: Self::tool_router() }
+        Self { conn, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -174,32 +178,34 @@ impl GMeshMcpServer {
         None
     }
 
-    /// Brings the index up to date with whatever changed while the plugin was
-    /// asleep, and does nothing at all - not even a lock - when nothing did,
-    /// which is every call on a daemon whose plugin is awake.
+    /// Brings the index up to date with whatever changed while any language's
+    /// plugin was asleep, and does nothing at all - not even a lock - when
+    /// nothing did, which is every call on a daemon whose active plugins are
+    /// all awake.
     ///
-    /// On the blocking thread pool rather than inline: waking the plugin means
-    /// spawning Node and warming tree-sitter, and the accept loop's runtime
-    /// has two worker threads (see `daemon::serve_forever`), so doing it on
-    /// one of them would stall every other session for the length of a
-    /// process spawn.
+    /// On the blocking thread pool rather than inline: waking a plugin means
+    /// spawning a process (for the bundled one, Node plus warming tree-sitter),
+    /// and the accept loop's runtime has two worker threads (see
+    /// `daemon::serve_forever`), so doing it on one of them would stall every
+    /// other session for the length of a process spawn.
     ///
-    /// A failure is logged, not returned. The caller asked a structural
-    /// question the index can already answer; refusing it because a *later*
-    /// edit could not be replayed would turn one unreadable file into a dead
-    /// tool surface, and the queue is left intact for the next call to retry.
+    /// Failures are logged inside `PluginRegistry::replay_pending`, one per
+    /// language, not returned here. The caller asked a structural question the
+    /// index can already answer; refusing it because a *later* edit could not
+    /// be replayed would turn one unreadable file into a dead tool surface,
+    /// and each language's queue is left intact for the next call to retry.
     async fn replay_queued_changes(&self) {
-        if !self.plugin.has_pending() {
+        if !self.registry.has_pending() {
             return;
         }
-        let plugin = Arc::clone(&self.plugin);
+        let registry = Arc::clone(&self.registry);
         let conn = Arc::clone(&self.conn);
-        match tokio::task::spawn_blocking(move || plugin.replay_pending(&conn)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => eprintln!(
-                "g-mesh daemon: could not replay the changes queued while the plugin slept: {err:#}"
-            ),
-            Err(err) => eprintln!("g-mesh daemon: the plugin wake task failed: {err}"),
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            registry.replay_pending(&conn);
+        })
+        .await
+        {
+            eprintln!("g-mesh daemon: the plugin wake task failed: {err}");
         }
     }
 
@@ -232,11 +238,11 @@ impl GMeshMcpServer {
     /// is logged and the handler proceeds with whatever the index currently
     /// holds.
     async fn ensure_file_fresh(&self, file_path: &str) {
-        let plugin = Arc::clone(&self.plugin);
+        let registry = Arc::clone(&self.registry);
         let conn = Arc::clone(&self.conn);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
-        match tokio::task::spawn_blocking(move || plugin.ensure_fresh(&conn, &task_path)).await {
+        match tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path)).await {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => eprintln!(
                 "g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}"

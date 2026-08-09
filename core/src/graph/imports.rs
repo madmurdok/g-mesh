@@ -4,7 +4,7 @@
 //! A language plugin emits one placeholder `Module` node per import specifier
 //! and hangs the `IMPORTS` edge on it, because a specifier is text, not a
 //! node id it can safely point at (see `recordImport` in
-//! plugins/js-ts/src/extract.ts). When the plugin recognises the specifier as
+//! plugins/typescript/src/extract.ts). When the plugin recognises the specifier as
 //! naming a file in this project it says so, by setting the placeholder's
 //! `nativeKind` to [`RESOLVED_MODULE_NATIVE_KIND`] and its `qualifiedName` to
 //! that file's project-relative path. This module is the other half of that
@@ -49,7 +49,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a resolved import placeholder with.
-/// Mirrors `RESOLVED_MODULE_NATIVE_KIND` in plugins/js-ts/src/extract.ts -
+/// Mirrors `RESOLVED_MODULE_NATIVE_KIND` in plugins/typescript/src/extract.ts -
 /// the two are one wire contract and must be changed together.
 pub const RESOLVED_MODULE_NATIVE_KIND: &str = "resolved_module";
 
