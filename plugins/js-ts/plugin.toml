@@ -1,0 +1,26 @@
+# Bundled JS/TS plugin manifest. See docs/architecture/plugin-modularity.md
+# (Data Model section) for the schema this file follows, and
+# core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# rules it must satisfy.
+#
+# NOTE: `language` below is "typescript" - the plugin's actual wire
+# identifier, per its handshake (plugins/js-ts/src/index.ts: `language:
+# "typescript"`) and core/src/protocol/types.rs's
+# `handshake_payload_round_trips` test. `read_manifest` requires `language`
+# to equal this manifest's *containing directory* name, which is `js-ts`,
+# not `typescript` - so this manifest does not yet satisfy that rule as-is.
+# That mismatch is intentional to flag, not to silently resolve here: fixing
+# it (renaming this directory, or adding a manifest_dir override) is for the
+# discovery-wiring task that actually reads this file, not this task.
+
+[plugin]
+language = "typescript"
+protocol_version = 1
+plugin_version = "2.0.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]

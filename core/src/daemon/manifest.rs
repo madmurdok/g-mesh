@@ -380,4 +380,31 @@ extensions = [".py"]
     fn an_arg_with_no_path_separator_is_left_untouched() {
         assert_eq!(resolve_arg("--verbose", Path::new("/plugins/python")), "--verbose");
     }
+
+    /// The bundled JS/TS plugin's own `plugin.toml` (`plugins/js-ts/plugin.toml`,
+    /// embedded at compile time so this test tracks the committed file, not a
+    /// copy) must itself satisfy `read_manifest`. Its directory on disk is
+    /// named `js-ts`, not `typescript` - a known, tracked mismatch (see that
+    /// file's own header comment and the architecture doc) still open for a
+    /// later discovery-wiring task to resolve - so this test cannot point
+    /// `read_manifest` at the real path directly; instead it copies the exact
+    /// file contents into a tempdir named `typescript`, which is the name
+    /// `read_manifest` requires today, and confirms the content itself is
+    /// well-formed and matches the plugin's real handshake/version values.
+    #[test]
+    fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
+        const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/js-ts/plugin.toml");
+
+        let (_root, dir) = plugin_dir("typescript", BUNDLED_JS_TS_MANIFEST);
+
+        let manifest = read_manifest(&dir).unwrap();
+
+        assert_eq!(manifest.language, "typescript");
+        assert_eq!(manifest.protocol_version, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(manifest.command, PathBuf::from("node"));
+        assert_eq!(manifest.args, vec![dir.join("dist/src/index.js").to_string_lossy().into_owned()]);
+        assert!(manifest.extensions.contains(&".ts".to_string()));
+        assert!(manifest.extensions.contains(&".tsx".to_string()));
+        assert!(manifest.extensions.contains(&".js".to_string()));
+    }
 }
