@@ -215,6 +215,23 @@ serving off it before the request goes out, so no tool call waits on the
 checker, and a pass that fails or never answers costs the graph nothing it
 had.
 
+The pass belongs to **whoever built the index**, not to the daemon. Three
+paths build one from nothing — the cold start above, `g-mesh init`, and
+`g-mesh reindex` — and all three finish by recording `meta.bulkIndexedAt`,
+which is exactly the fact every later daemon start reads to conclude it owes
+no cold start. A pass reachable only from the cold-start branch therefore
+never ran at all for a project prepared with `init` or repaired with
+`reindex`: those indexes kept a permanently structural-only graph, missing
+every `import * as ns` call edge (nothing else produces them), every
+re-export chain core's own name-matching walk cannot finish, and every
+overload binding. So `init` and `reindex` run it themselves, synchronously,
+before returning — for `init` that is what makes its promise ("the index is
+ready when this returns") true rather than half-true, and for `reindex` it is
+the difference between repairing an index and leaving it strictly worse than
+the one a zero-config start would have built. `daemon::semantic` is the one
+place that decides how the pass is asked for; the three callers differ only
+in whether they already own a plugin registry.
+
 <a id="bind-before-walk"></a>The socket is bound **before** the cold-start
 walk, not after it. The invariant is unchanged — *no caller is ever served off
 a half-built graph* — but it is enforced in the response rather than in the

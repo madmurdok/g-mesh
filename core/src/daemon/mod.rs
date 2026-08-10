@@ -6,6 +6,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod plugin;
 pub mod registry;
+pub mod semantic;
 /// A fake, protocol-speaking plugin for the unit tests in this module tree -
 /// the only way to exercise *two* languages without a second real plugin
 /// existing. Compiled only under `cfg(test)`, and never referenced by
@@ -465,18 +466,13 @@ pub fn run(root: &Path) -> Result<()> {
         // its own, which is what baseline's eager, pre-registry spawn timing
         // gave for free and this daemon still needs.
         //
-        // Still the bundled JS/TS plugin specifically, unlike the cold-start
-        // walk just above (which spawns one one-shot `--bulk-index` process
-        // per discovered language as of task 156): this semantic pass only
-        // ever asks the bundled plugin's own long-lived supervisor to upgrade
-        // what the structural pass could only guess at. Generalizing it to
-        // run once per discovered language is separate, later work, not this
-        // one's. Spawns it if nothing has needed it yet, same as any other
+        // Which plugin this asks, and why only one of them, is
+        // `daemon::semantic`'s to say - as is the reason `cli::init` and
+        // `cli::reindex` now run the very same pass off their own walks
+        // rather than leaving it to a daemon start that will never come.
+        // Spawns the plugin if nothing has needed it yet, same as any other
         // first touch.
-        match registry
-            .get_or_spawn(plugin::BUNDLED_LANGUAGE)
-            .and_then(|supervisor| supervisor.semantic_pass(&conn, Vec::new()))
-        {
+        match semantic::run_with_registry(&registry, &conn) {
             Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
             Ok(false) => {}
             Err(err) => eprintln!(

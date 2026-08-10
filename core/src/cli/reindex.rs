@@ -26,6 +26,16 @@
 //! bootstraps one exactly as it always does, and that daemon finds an index
 //! that is already current and already fully walked - so it starts `ready`
 //! immediately rather than repeating the walk this command just finished.
+//!
+//! # Why the rebuild ends with a semantic pass
+//!
+//! That last paragraph is exactly why. A daemon that starts `ready` skips its
+//! cold-start branch whole, and the whole-project semantic pass lives inside
+//! it - so a rebuild that stopped at the walk would hand back an index missing
+//! everything only the type checker can see (`import * as ns` call edges above
+//! all; `daemon::semantic` has the full list) and nothing would ever come back
+//! for it. A command whose entire purpose is to repair a suspect index must
+//! not leave it strictly worse than the one a zero-config cold start builds.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -35,7 +45,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{manifest, registry};
+use crate::daemon::{manifest, registry, semantic};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -46,6 +56,11 @@ pub struct Outcome {
     /// before the rebuild could safely touch its index.
     pub daemon_was_running: bool,
     pub summary: BulkIndexSummary,
+    /// Whether the type checker got to say what the walk could not - see this
+    /// module's doc comment. False when no JS/TS plugin is installed, and when
+    /// the pass failed, which costs exactly the edges it was about and is
+    /// reported on stderr rather than failing the rebuild.
+    pub semantic_pass_ran: bool,
 }
 
 /// Rebuilds the index for the project the current directory belongs to.
@@ -93,7 +108,18 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     schema::record_bulk_index(&conn.lock().unwrap())
         .context("failed to record that the project was fully reindexed")?;
 
-    Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary })
+    let state_dir = connection::project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
+    let mut semantic_pass_ran = false;
+    match semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline) {
+        Ok(ran) => semantic_pass_ran = ran,
+        Err(err) => eprintln!(
+            "g-mesh: the semantic pass over the rebuilt index failed ({err:#}) - \
+             its edges keep whatever the structural pass resolved"
+        ),
+    }
+
+    Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary, semantic_pass_ran })
 }
 
 /// Renders an outcome as the text the command prints.
@@ -114,6 +140,9 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         outcome.summary.linked_imports,
         outcome.summary.linked_symbols,
     );
+    if outcome.semantic_pass_ran {
+        let _ = writeln!(out, "  semantic: pass complete over what the walk could not resolve");
+    }
     if outcome.summary.skipped_lines > 0 {
         let _ = writeln!(
             out,
@@ -140,6 +169,7 @@ mod tests {
                 linked_imports: 2,
                 linked_symbols: 1,
             },
+            semantic_pass_ran: true,
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -151,7 +181,11 @@ mod tests {
 
     #[test]
     fn a_rebuild_against_an_idle_project_says_nothing_had_to_be_stopped() {
-        let outcome = Outcome { daemon_was_running: false, summary: BulkIndexSummary::default() };
+        let outcome = Outcome {
+            daemon_was_running: false,
+            summary: BulkIndexSummary::default(),
+            semantic_pass_ran: false,
+        };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
@@ -170,6 +204,7 @@ mod tests {
                 linked_imports: 0,
                 linked_symbols: 0,
             },
+            semantic_pass_ran: false,
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
