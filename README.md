@@ -12,7 +12,7 @@ an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 - `core/` — Rust workspace: the `g-mesh` binary (`mcp-shim` + the per-project
   `daemon`), SQLite storage, graph queries, file watcher, and the MCP tool
   surface.
-- `plugins/js-ts/` — Node/TypeScript language plugin: tree-sitter parsing,
+- `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
   bulk indexing, incremental reparse. Spawned by the daemon as a child
   process, one instance per project.
 
@@ -34,10 +34,10 @@ cargo build --release
 # -> core/target/release/g-mesh
 
 # 2. JS/TS plugin
-cd ../plugins/js-ts
+cd ../plugins/typescript
 npm install
 npm run build
-# -> plugins/js-ts/dist/src/index.js
+# -> plugins/typescript/dist/src/index.js
 ```
 
 Build order doesn't matter, but both are required — the daemon refuses to
@@ -48,7 +48,7 @@ resolves the plugin's path relative to `core`'s own source tree, baked in at
 *compile time* (`core/src/daemon/plugin.rs`):
 
 ```
-<repo>/plugins/js-ts/dist/src/index.js
+<repo>/plugins/typescript/dist/src/index.js
 ```
 
 So the built `g-mesh` binary only works run from (or copied while keeping
@@ -56,7 +56,7 @@ the relative layout of) this checked-out repo. To point it at a plugin build
 elsewhere, override with an env var:
 
 ```bash
-export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/js-ts/dist/src/index.js
+export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
 ```
 
 ## How it finds a project
@@ -320,5 +320,5 @@ project's daemon before cleaning it.
 
 ```bash
 cd core && cargo test
-cd ../plugins/js-ts && npm run build && npm test
+cd ../plugins/typescript && npm run build && npm test
 ```

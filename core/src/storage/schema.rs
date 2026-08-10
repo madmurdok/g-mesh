@@ -63,7 +63,7 @@ pub const CURRENT_SCHEMA_VERSION: &str = "6";
 /// # This constant is only half of what is compared
 ///
 /// It used to be all of it, and that was the hole task 116 closed. The rule
-/// above said to bump it for "anything in `plugins/js-ts/src` that alters what
+/// above said to bump it for "anything in `plugins/typescript/src` that alters what
 /// is extracted", and task 115 - which rewrote how same-file edges resolve -
 /// did not, because nothing made it. Every index built before it went on being
 /// served afterwards: current schema, current constant, current binary, wrong
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS declarations (
 -- one, which is every edge the structural pass produces and every edge whose
 -- target has a single declaration - i.e. almost all of them. Set only on
 -- CALLS, only by the semantic pass, and part of the edge's own identity (see
--- `edgeIdFor` in plugins/js-ts/src/extract.ts), so one caller calling two
+-- `edgeIdFor` in plugins/typescript/src/extract.ts), so one caller calling two
 -- overloads of the same function stores both bindings instead of one
 -- overwriting the other.
 CREATE TABLE IF NOT EXISTS edges (

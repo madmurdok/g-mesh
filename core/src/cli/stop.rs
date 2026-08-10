@@ -1,5 +1,5 @@
-//! `g-mesh stop`: shut down the current project's daemon core and its
-//! language plugin.
+//! `g-mesh stop`: shut down the current project's daemon core and every
+//! language plugin it has spawned.
 //!
 //! The architecture doc's lifecycle model says the core deliberately does not
 //! die on a short idle timeout - it lives until it is explicitly stopped, or
@@ -7,21 +7,26 @@
 //! this command is what makes that "explicitly" mean something. Until it
 //! existed the only documented way to stop a daemon was to read its pid out
 //! of `daemon.pid` and kill it by hand, which is also the only way to find
-//! out afterwards that its plugin was still running.
+//! out afterwards that a plugin was still running.
 //!
-//! A plugin asleep on *its* idle timeout is not something this command has to
-//! handle specially, and that is by construction: the core clears `plugin.pid`
-//! when it puts one to sleep, so the plugin half of a stop is simply a no-op -
-//! the same shape as stopping a project whose plugin never started.
+//! Since task 155, "every plugin" is not one hardcoded process: `daemon
+//! ::registry::PluginRegistry` gives each language its own pid file
+//! (`plugin-<language>.pid`), so this command lists whatever is present
+//! (`daemon::registry::discovered_pid_files`) rather than assuming exactly
+//! one. A language asleep on *its own* idle timeout is not something this
+//! command has to handle specially, and that is by construction: its
+//! supervisor removes its pid file when it puts that language to sleep, so a
+//! sleeping (or never-spawned) language's half of a stop is simply a no-op -
+//! the same shape as stopping a project whose plugins never started.
 //!
-//! # Shutdown order, and why the plugin is waited for rather than killed
+//! # Shutdown order, and why plugins are waited for rather than killed
 //!
-//! The core is signalled first. The plugin is its child with the daemon
-//! holding the write end of its stdin, and the plugin exits when that pipe
-//! closes (index.ts's stdin `end` handler) - so once the core is gone the
-//! plugin normally goes on its own, and the honest thing to report is that it
-//! did. It is only signalled if it fails to, which is what makes "no orphaned
-//! processes" a guarantee rather than an expectation.
+//! The core is signalled first. Each plugin is its child with the daemon
+//! holding the write end of its stdin, and a plugin exits when that pipe
+//! closes (index.ts's stdin `end` handler, for the bundled one) - so once the
+//! core is gone every plugin normally goes on its own, and the honest thing
+//! to report is that it did. Each is only signalled if it fails to, which is
+//! what makes "no orphaned processes" a guarantee rather than an expectation.
 //!
 //! Both signals escalate: `SIGTERM`, and `SIGKILL` if that is ignored. Neither
 //! process installs a handler today, so the escalation is insurance against a
@@ -44,6 +49,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::daemon;
+use crate::storage::connection::project_dir;
 
 /// How long a signalled process is given before the next signal - generous,
 /// because overshooting costs a moment on a command a person is watching,
@@ -75,17 +81,21 @@ impl Stopped {
     }
 }
 
-/// What a single `stop` actually had to do. Both fields are `None` when
-/// nothing was running, which is the no-op case rather than a failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What a single `stop` actually had to do. `core` is `None` and `plugins` is
+/// empty when nothing was running, which is the no-op case rather than a
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
     pub core: Option<Stopped>,
-    pub plugin: Option<Stopped>,
+    /// One entry per language that had a live pid file, in the order
+    /// `daemon::registry::discovered_pid_files` reports them (sorted by
+    /// language).
+    pub plugins: Vec<(String, Stopped)>,
 }
 
 impl Outcome {
     pub fn stopped_anything(&self) -> bool {
-        self.core.is_some() || self.plugin.is_some()
+        self.core.is_some() || !self.plugins.is_empty()
     }
 }
 
@@ -105,7 +115,12 @@ pub fn run() -> Result<()> {
 /// old one for the socket.
 pub fn stop(project_root: &Path) -> Result<Outcome> {
     let core_pid = live_pid(&daemon::pid_path(project_root)?);
-    let plugin_pid = live_pid(&daemon::plugin_pid_path(project_root)?);
+    let state_dir = project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
+    let plugin_pids: Vec<(String, u32)> = daemon::registry::discovered_pid_files(&state_dir)
+        .into_iter()
+        .filter_map(|(language, path)| live_pid(&path).map(|pid| (language, pid)))
+        .collect();
 
     let mut outcome = Outcome::default();
 
@@ -116,17 +131,19 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
         );
     }
 
-    if let Some(pid) = plugin_pid {
-        // Only worth waiting on if a core was just taken away from it;
-        // an already-orphaned plugin has nothing left to notice.
+    for (language, pid) in plugin_pids {
+        // Only worth waiting on if a core was just taken away from it; an
+        // already-orphaned plugin has nothing left to notice.
         let exited_by_itself =
             outcome.core.is_some() && wait_until_gone(pid, PLUGIN_EXIT_TIMEOUT);
-        outcome.plugin = Some(if exited_by_itself {
+        let stopped = if exited_by_itself {
             Stopped::ExitedWithCore { pid }
         } else {
-            terminate(pid, TERMINATION_TIMEOUT)
-                .with_context(|| format!("failed to stop the language plugin (pid {pid})"))?
-        });
+            terminate(pid, TERMINATION_TIMEOUT).with_context(|| {
+                format!("failed to stop the {language} plugin (pid {pid})")
+            })?
+        };
+        outcome.plugins.push((language, stopped));
     }
 
     tidy_state_files(project_root)?;
@@ -194,7 +211,11 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 /// daemon crashed, and it must not delete the socket of a daemon that is
 /// somehow still serving (e.g. one whose pid file was removed by hand).
 fn tidy_state_files(project_root: &Path) -> Result<()> {
-    for path in [daemon::pid_path(project_root)?, daemon::plugin_pid_path(project_root)?] {
+    let state_dir = project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
+    let mut paths = vec![daemon::pid_path(project_root)?];
+    paths.extend(daemon::registry::discovered_pid_files(&state_dir).into_iter().map(|(_, path)| path));
+    for path in paths {
         if live_pid(&path).is_none() {
             let _ = fs::remove_file(&path);
         }
@@ -226,8 +247,13 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
     if let Some(core) = outcome.core {
         let _ = writeln!(out, "  daemon core: pid {} ({})", core.pid(), describe(core));
     }
-    if let Some(plugin) = outcome.plugin {
-        let _ = writeln!(out, "  plugin:      pid {} ({})", plugin.pid(), describe(plugin));
+    for (language, plugin) in &outcome.plugins {
+        let _ = writeln!(
+            out,
+            "  plugin ({language}): pid {} ({})",
+            plugin.pid(),
+            describe(*plugin)
+        );
     }
     out
 }
@@ -382,21 +408,38 @@ mod tests {
     fn a_shutdown_renders_both_processes_and_how_each_one_went() {
         let outcome = Outcome {
             core: Some(Stopped::Terminated { pid: 111 }),
-            plugin: Some(Stopped::ExitedWithCore { pid: 222 }),
+            plugins: vec![("typescript".to_string(), Stopped::ExitedWithCore { pid: 222 })],
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
         assert!(rendered.contains("stopped the daemon for /tmp/project"), "{rendered}");
         assert!(rendered.contains("daemon core: pid 111 (terminated)"), "{rendered}");
-        assert!(rendered.contains("plugin:      pid 222 (exited with its core)"), "{rendered}");
+        assert!(rendered.contains("plugin (typescript): pid 222 (exited with its core)"), "{rendered}");
+    }
+
+    /// Two languages each get their own line, independently described.
+    #[test]
+    fn a_shutdown_with_two_languages_renders_one_line_each() {
+        let outcome = Outcome {
+            core: Some(Stopped::Terminated { pid: 111 }),
+            plugins: vec![
+                ("go".to_string(), Stopped::ExitedWithCore { pid: 222 }),
+                ("typescript".to_string(), Stopped::Killed { pid: 333 }),
+            ],
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(rendered.contains("plugin (go): pid 222 (exited with its core)"), "{rendered}");
+        assert!(rendered.contains("plugin (typescript): pid 333 (killed after ignoring SIGTERM)"), "{rendered}");
     }
 
     #[test]
     fn an_escalated_shutdown_says_so() {
         let outcome = Outcome {
             core: Some(Stopped::Killed { pid: 111 }),
-            plugin: Some(Stopped::Killed { pid: 222 }),
+            plugins: vec![("typescript".to_string(), Stopped::Killed { pid: 222 })],
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));

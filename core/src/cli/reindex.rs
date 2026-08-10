@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::plugin;
+use crate::daemon::{manifest, registry};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -64,9 +64,20 @@ pub fn run() -> Result<()> {
 pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let stop_outcome = stop::stop(project_root)?;
 
+    // Same discovery `daemon::run`'s own cold start uses - see
+    // `daemon::bulk_index::run`'s doc comment for why the walk below takes
+    // discovery's result directly rather than a `PluginRegistry`. Resolved
+    // before the reset rather than beside the walk, because the generation
+    // this index is re-stamped with is derived from it
+    // (`daemon::registry::indexer_version`): stamping anything else here would
+    // have the next daemon start wipe the index this command just rebuilt.
+    let discovered = manifest::discover(&manifest::default_roots())
+        .context("failed to discover language plugins")?;
+
     let conn = connection::open(project_root)
         .context("failed to open the project's SQLite index")?;
-    schema::reset(&conn, &plugin::indexer_version()).context("failed to reset the project's index")?;
+    schema::reset(&conn, &registry::indexer_version(&discovered))
+        .context("failed to reset the project's index")?;
 
     let canonical_root = project_root.canonicalize().with_context(|| {
         format!("failed to canonicalize project root {}", project_root.display())
@@ -77,7 +88,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
     let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-    let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
+    let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline, &discovered)
         .context("failed to rebuild the project's index")?;
     schema::record_bulk_index(&conn.lock().unwrap())
         .context("failed to record that the project was fully reindexed")?;

@@ -419,11 +419,25 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
     let mut daemon_process =
         Daemon::spawn(project.root(), Duration::from_secs(600), CORE_IDLE);
     wait_until_indexed(project.root());
-    let plugin_pid = recorded_pid(&daemon::plugin_pid_path(project.root()).unwrap());
+    // Captured right after indexing, before anything else in this test can
+    // spend wall-clock time - what makes `started_waiting.elapsed()` below a
+    // tight enough proxy for "how long the core's own idle clock has had" to
+    // assert against.
+    let started_waiting = Instant::now();
+
+    // Since task 155, the bundled plugin's post-walk semantic pass - the
+    // thing that spawns it for a project nothing has otherwise touched -
+    // runs on a background thread rather than inline with the walk (so a
+    // structural query never waits on it), so its pid file is no longer
+    // guaranteed to exist the instant `wait_until_indexed` returns. Waited on
+    // here, after `started_waiting`, precisely so this wait's own duration
+    // doesn't get excluded from what `started_waiting.elapsed()` measures.
+    let plugin_pid_file = daemon::plugin_pid_path(project.root()).unwrap();
+    wait_for("the plugin to start", || plugin_pid_file.exists());
+    let plugin_pid = recorded_pid(&plugin_pid_file);
 
     // Not one MCP request is made for the rest of this test - that is the
     // condition being tested.
-    let started_waiting = Instant::now();
     wait_for("the core to exit on its idle timeout", || !daemon_process.is_running());
     assert!(
         started_waiting.elapsed() + Duration::from_millis(50) >= CORE_IDLE,

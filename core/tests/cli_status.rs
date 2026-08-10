@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::config::{self, CleanupConfig, GlobalConfig};
 use g_mesh::daemon;
+use g_mesh::daemon::{manifest, registry};
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -127,7 +128,14 @@ impl Project {
         std::fs::create_dir_all(self.state_dir()).expect("failed to create the state directory");
         let conn = Connection::open(self.state_dir().join("index.db"))
             .expect("failed to open index.db");
-        schema::ensure_current(&conn, &daemon::plugin::indexer_version())
+        // The same generation a daemon would stamp this index with (see
+        // `daemon::registry::indexer_version`), computed the same way from the
+        // plugins actually installed - so a daemon started against this
+        // project afterwards finds it current and leaves the backdated
+        // `lastUsed` this fixture is about alone, instead of wiping it.
+        let discovered = manifest::discover(&manifest::default_roots())
+            .expect("failed to discover language plugins");
+        schema::ensure_current(&conn, &registry::indexer_version(&discovered))
             .expect("failed to initialize the schema");
         conn.execute(
             "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
@@ -185,6 +193,12 @@ fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project
     // asserts on the plugin's pid and on complete coverage, so it has to wait
     // for the walk's own completion marker instead.
     wait_until_indexed(project.root());
+    // The registry spawns the bundled (typescript) plugin lazily - here, as a
+    // side effect of the post-walk semantic pass `daemon::run` runs once the
+    // cold-start walk commits - rather than unconditionally at daemon
+    // startup, so its pid file can appear a moment *after* the walk's own
+    // completion marker does, not atomically with it.
+    wait_for("the typescript plugin to start", || project.plugin_pid_file().exists());
 
     let core_pid = project.recorded_pid(&project.pid_file());
     let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
@@ -194,7 +208,7 @@ fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project
     let status = project.status();
 
     assert_contains(&status, &format!("daemon core:     running (pid {core_pid})"));
-    assert_contains(&status, &format!("plugin:          active (pid {plugin_pid})"));
+    assert_contains(&status, &format!("plugin (typescript):     active (pid {plugin_pid})"));
     // Both files were walked, and neither has been edited since.
     assert_contains(&status, "index coverage:  100.0% (2/2 source files)");
     assert_contains(&status, "dirty files:     0 awaiting reindex");
@@ -218,6 +232,9 @@ fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
     // The index this asserts on has to be the finished one - see the wait in
     // the test above.
     wait_until_indexed(project.root());
+    // See the test above: the bundled plugin's pid file can appear a moment
+    // after the walk's completion marker does.
+    wait_for("the typescript plugin to start", || project.plugin_pid_file().exists());
     let plugin_pid = project.recorded_pid(&project.plugin_pid_file());
 
     // Killed, not stopped, so the pid files are deliberately left behind:
@@ -225,7 +242,8 @@ fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
     daemon_process.kill().expect("failed to kill the daemon");
     daemon_process.wait().expect("failed to reap the daemon");
     // The plugin exits when the daemon's end of its stdin closes, which is
-    // what makes "plugin: not running" the correct report a moment later.
+    // what makes "no plugin pid file reads as live" the correct report a
+    // moment later.
     wait_for("the plugin to exit with its core", || !daemon::is_process_alive(plugin_pid));
 
     // A file added while nothing was watching: the index has never seen it.
@@ -235,7 +253,11 @@ fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
     let status = project.status();
 
     assert_contains(&status, "daemon core:     not running");
-    assert_contains(&status, "plugin:          not running");
+    // The stale plugin-typescript.pid left behind by the kill names a dead
+    // process, so `plugin_reports` drops it rather than reporting it -
+    // "status has to see through them rather than trust them" applies to
+    // this line just as much as to the daemon core's own.
+    assert_contains(&status, "plugins:         none active");
     assert_contains(&status, "index coverage:  66.7% (2/3 source files)");
     assert_contains(&status, "dirty files:     1 awaiting reindex");
     // Still true of the index, and still reported with no daemon to ask.
@@ -253,7 +275,7 @@ fn status_on_a_project_that_was_never_indexed_reports_an_empty_state() {
     let status = project.status();
 
     assert_contains(&status, "daemon core:     not running");
-    assert_contains(&status, "plugin:          not running");
+    assert_contains(&status, "plugins:         none active");
     assert_contains(&status, "last used:       never recorded");
     assert_contains(&status, "never fully walked");
     assert_contains(&status, "index coverage:  0.0% (0/2 source files)");

@@ -14,7 +14,7 @@
 //! [`PENDING_SYMBOL_NATIVE_KIND`], addressed by `<target file>#<imported
 //! name>` in its `qualifiedName` with the bare name repeated in `name`, and
 //! hangs the usage edge on that (see `importedSymbol` in
-//! plugins/js-ts/src/extract.ts). This module is the other half: it looks for
+//! plugins/typescript/src/extract.ts). This module is the other half: it looks for
 //! a symbol of that name *exported* by that file among the nodes actually in
 //! the index and, when exactly one fits, repoints the edge and marks it
 //! `resolved`.
@@ -65,7 +65,7 @@
 //! "Unresolved" is not always the last word on these. The JS/TS plugin's
 //! semantic pass re-asks the ones whose target file does not declare the name
 //! of the compiler itself and re-sends the edge with `source: "ts-compiler"`
-//! when it gets a single answer (`plugins/js-ts/src/semanticPass.ts`). Both of
+//! when it gets a single answer (`plugins/typescript/src/semanticPass.ts`). Both of
 //! the last two bullets are that shape:
 //!
 //!  - two `export *` branches offering one name are ambiguous *here*, where
@@ -122,20 +122,20 @@ use rusqlite::{params, Connection, Statement};
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a pending cross-file symbol with. Mirrors
-/// `PENDING_SYMBOL_NATIVE_KIND` in plugins/js-ts/src/extract.ts - the two are
+/// `PENDING_SYMBOL_NATIVE_KIND` in plugins/typescript/src/extract.ts - the two are
 /// one wire contract and must be changed together.
 pub const PENDING_SYMBOL_NATIVE_KIND: &str = "pending_symbol";
 
 /// The `nativeKind` a plugin marks a re-export with: "this file publishes
 /// `name`, which really lives at `qualifiedName`". Mirrors
-/// `REEXPORT_NATIVE_KIND` in plugins/js-ts/src/extract.ts - the two are one
+/// `REEXPORT_NATIVE_KIND` in plugins/typescript/src/extract.ts - the two are one
 /// wire contract and must be changed together.
 pub const REEXPORT_NATIVE_KIND: &str = "reexport";
 
 /// The name a whole-module re-export (`export * from "./y"`) is recorded
 /// under, at both ends of its address - it republishes every name the target
 /// exports rather than one nameable one. Mirrors `REEXPORT_ALL_NAME` in
-/// plugins/js-ts/src/extract.ts.
+/// plugins/typescript/src/extract.ts.
 pub const REEXPORT_ALL_NAME: &str = "*";
 
 /// The name a default export is imported under. A whole-module re-export is
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(edge_source(&conn, &edge), "tree-sitter");
 
         // What the semantic pass answers, in the shape it answers it: the edge
-        // re-sent under its own id (`plugins/js-ts/src/semanticPass.ts`), which
+        // re-sent under its own id (`plugins/typescript/src/semanticPass.ts`), which
         // is why this needed no storage path of its own - `apply_diff`'s
         // ON CONFLICT rewrites the row in place.
         //

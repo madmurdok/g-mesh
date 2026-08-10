@@ -64,7 +64,7 @@ use anyhow::{Context, Result};
 use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::plugin;
+use crate::daemon::{manifest, registry};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -122,9 +122,19 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             .context("failed to write the project's config.toml")?;
     }
 
+    // Discovered up front rather than inside the walk below, because the
+    // generation this index is stamped with is derived from it (see
+    // `daemon::registry::indexer_version`) - and stamping it with anything
+    // other than what `daemon::run` would compute means the very next daemon
+    // start throws away the index this command just paid to build. Same
+    // discovery `daemon::run`'s own cold start uses; the walk below takes this
+    // same value rather than repeating the scan.
+    let discovered = manifest::discover(&manifest::default_roots())
+        .context("failed to discover language plugins")?;
+
     let conn = connection::open(project_root)
         .context("failed to open the project's SQLite index")?;
-    schema::ensure_current(&conn, &plugin::indexer_version())
+    schema::ensure_current(&conn, &registry::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?;
     let already_indexed = schema::bulk_index_completed(&conn)
         .context("failed to check whether the project has already been indexed")?;
@@ -143,7 +153,10 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let project_config = config::read_project_config(project_root)
             .context("failed to read the project's config.toml")?;
         let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline)
+        // Discovery's result, resolved above, handed straight in - see
+        // `daemon::bulk_index::run`'s doc comment for why it takes that
+        // directly rather than a `PluginRegistry`.
+        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline, &discovered)
             .context("failed to build the project's initial index")?;
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;

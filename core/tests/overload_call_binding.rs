@@ -17,7 +17,7 @@
 //! `an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass`, including
 //! its rewrite loop and the reason for it.
 //!
-//! Requires `plugins/js-ts/dist/` to be up to date, which `core/build.rs` keeps
+//! Requires `plugins/typescript/dist/` to be up to date, which `core/build.rs` keeps
 //! so.
 
 use std::fs;

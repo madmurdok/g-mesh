@@ -112,6 +112,35 @@ impl Harness {
         fs::write(harness.plugin_path(), STUB_PLUGIN).unwrap();
         fs::write(harness.method_log(), "").unwrap();
         fs::write(harness.root().join("seed.ts"), "export const seed = 1;\n").unwrap();
+
+        // As of task 156, `daemon::bulk_index` no longer resolves the plugin
+        // via `plugin::PLUGIN_PATH_ENV` at all - it walks whatever
+        // `daemon::manifest::discover` found, exactly like the interactive
+        // supervisor a semantic pass runs against always has; and as of task
+        // 163, `registry::indexer_version` fingerprints every *discovered*
+        // manifest rather than the one bundled-plugin view
+        // `plugin::bundled_manifest` resolves from `PLUGIN_PATH_ENV`. Nothing
+        // this test exercises reads that env var any more - only
+        // `daemon::build_stamp` still does, for a question (is this running
+        // daemon's JS/TS build still mine?) this test has no reason to ask -
+        // so it is not set here. A manifest under `G_MESH_PLUGIN_ROOTS_OVERRIDE`
+        // - `daemon::manifest`'s own generalized discovery override - is what
+        // points both the bulk walk and the interactive supervisor at this
+        // stub.
+        let plugins_root = harness.aux.path().join("plugins");
+        let language_dir = plugins_root.join("typescript");
+        fs::create_dir_all(&language_dir).unwrap();
+        fs::write(
+            language_dir.join("plugin.toml"),
+            format!(
+                "[plugin]\nlanguage = \"typescript\"\nprotocol_version = 1\nplugin_version = \"0.1.0\"\n\n\
+                 [plugin.spawn]\ncommand = \"node\"\nargs = [\"{}\"]\n\n\
+                 [plugin.languages]\nextensions = [\".ts\"]\n",
+                harness.plugin_path().to_string_lossy().replace('\\', "\\\\"),
+            ),
+        )
+        .unwrap();
+
         harness
     }
 
@@ -123,6 +152,10 @@ impl Harness {
         self.aux.path().join("index.js")
     }
 
+    fn plugins_root(&self) -> PathBuf {
+        self.aux.path().join("plugins")
+    }
+
     fn method_log(&self) -> PathBuf {
         self.aux.path().join("methods.log")
     }
@@ -132,7 +165,7 @@ impl Harness {
             .arg("daemon")
             .arg("--project-root")
             .arg(self.root())
-            .env(daemon::plugin::PLUGIN_PATH_ENV, self.plugin_path())
+            .env(daemon::manifest::PLUGIN_ROOTS_OVERRIDE_ENV, self.plugins_root())
             .env(METHOD_LOG_ENV, self.method_log())
             .stdin(Stdio::null())
             .stdout(Stdio::null())

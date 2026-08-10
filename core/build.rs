@@ -1,4 +1,4 @@
-// Keeps the bundled JS/TS plugin's compiled output (plugins/js-ts/dist/)
+// Keeps the bundled JS/TS plugin's compiled output (plugins/typescript/dist/)
 // up to date whenever its sources change, so `cargo test`'s end-to-end
 // daemon<->plugin test always exercises a fresh build without a separate
 // manual build step. `daemon::plugin` resolves the plugin's entry point
@@ -15,7 +15,7 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets this"));
-    let plugin_dir = manifest_dir.join("../plugins/js-ts");
+    let plugin_dir = manifest_dir.join("../plugins/typescript");
 
     println!("cargo:rerun-if-changed={}", plugin_dir.join("src").display());
     println!("cargo:rerun-if-changed={}", plugin_dir.join("package.json").display());

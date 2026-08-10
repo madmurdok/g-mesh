@@ -37,7 +37,7 @@ pub struct VisitedNode {
 /// so the encoded token grows with every call and is O(total nodes/edges
 /// reported so far), not O(one page). Measured on a synthetic 40,201-node
 /// graph (`core/tests/resume_token_size_scratch.rs`, since removed) with
-/// realistic 32-hex-char sha256 ids (`plugins/js-ts/src/extract.ts::hash`)
+/// realistic 32-hex-char sha256 ids (`plugins/typescript/src/extract.ts::hash`)
 /// and the real `encode`/`decode` below: a single `DEFAULT_EXPLORATION_BUDGET`
 /// (5000) cutoff alone already produces a ~580 KB token before compression
 /// (~250 KB after); chaining resumes to the graph's edge pushes it to ~4.6 MB

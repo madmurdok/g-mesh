@@ -6,7 +6,7 @@
 //! daemon needs the check at all. This file is about the half that argument
 //! left out. Everything in the index is computed by the plugin - a separate
 //! Node process, built by `npm`, that the core binary says nothing about - so
-//! `cd plugins/js-ts && npm run build` after an extractor change used to leave
+//! `cd plugins/typescript && npm run build` after an extractor change used to leave
 //! a running daemon holding logic that no longer existed on disk, with
 //! `g-mesh status` truthfully reporting "daemon build: this build" beside it.
 //!
@@ -16,26 +16,51 @@
 //!
 //! # How a rebuild is staged
 //!
-//! With a real one. Each test copies the compiled plugin into a directory of
-//! its own and points the daemon at it through
-//! [`PLUGIN_PATH_ENV`](g_mesh::daemon::plugin::PLUGIN_PATH_ENV), then edits a
-//! file in that copy while the daemon is up - which is byte for byte what
-//! `npm run build` over a changed extractor does. Nothing is doctored and no
-//! second binary is compiled: the core executable the shim and the daemon come
-//! from is the same file throughout, which is precisely the condition under
-//! which the old check saw nothing.
+//! With a real one. Each test installs a private copy of the compiled plugin -
+//! a `plugin.toml` beside a copy of `dist/src/*.js`, laid out exactly as the
+//! bundled plugin is - into a discovery root of its own, points core at that
+//! root through
+//! [`PLUGIN_ROOTS_OVERRIDE_ENV`](g_mesh::daemon::manifest::PLUGIN_ROOTS_OVERRIDE_ENV),
+//! and edits a file in the copy while the daemon is up - which is byte for
+//! byte what `npm run build` over a changed extractor does. Nothing is
+//! doctored and no second binary is compiled: the core executable the shim and
+//! the daemon come from is the same file throughout, which is precisely the
+//! condition under which the old check saw nothing.
 //!
-//! The copy lives *inside* `plugins/js-ts/dist/` rather than in a temp
+//! The override is what makes this a test of the mechanism rather than of a
+//! coincidence. Since task 163 the index's generation
+//! (`daemon::registry::indexer_version`) is a digest over every *discovered*
+//! plugin's build, so the plugin whose rebuild has to be noticed is the one
+//! discovery found - and pointing discovery at the copy is what makes the
+//! daemon under test genuinely run, and be judged on, the build these tests
+//! edit. [`PLUGIN_PATH_ENV`](g_mesh::daemon::plugin::PLUGIN_PATH_ENV) is still
+//! set alongside it, because the *other* half of the chain these tests walk
+//! end to end - `daemon::build_stamp`, which is what makes a shim retire the
+//! incumbent daemon at all - is keyed off the bundled entry point that
+//! variable redirects.
+//!
+//! The copy still lives *inside* `plugins/typescript/` rather than in a temp
 //! directory, because Node resolves `require("tree-sitter")` by walking up
 //! from the file that asked - a plugin copied outside the package would fail
 //! to load its grammars for reasons that have nothing to do with what is
 //! being tested.
+//!
+//! One consequence of that placement, worth stating because it is not
+//! obvious: while a copy exists, the *bundled* plugin directory it sits in has
+//! different contents, so the generation string a daemon discovering the
+//! bundled plugin would compute moves too. Nothing in the suite observes that
+//! - `cargo test` runs one test binary at a time, each copy is created before
+//! this file's own daemons start and removed on `Drop` - but a test elsewhere
+//! made to run *concurrently* with this file could see an index of its own go
+//! stale for reasons it never caused.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use g_mesh::daemon::{self, plugin::PLUGIN_PATH_ENV};
+use g_mesh::daemon::{
+    self, manifest::PLUGIN_ROOTS_OVERRIDE_ENV, plugin::PLUGIN_PATH_ENV,
+};
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -73,24 +98,39 @@ const REBUILT_FILE: &str = "extract.js";
 /// Where `core/build.rs` leaves the compiled plugin, resolved the same way
 /// `daemon::plugin::plugin_entry_path` resolves it.
 fn plugin_dist_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/js-ts/dist")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist")
 }
 
-/// A private copy of the compiled plugin, so a test can rebuild "the plugin"
-/// without touching the one every other test in the suite is using.
+/// A private, discoverable copy of the compiled plugin, so a test can rebuild
+/// "the plugin" without touching the one every other test in the suite is
+/// using.
+///
+/// Laid out as a discovery root of its own (`<root>/typescript/plugin.toml`
+/// plus `<root>/typescript/dist/src/*.js`) rather than as a bare directory of
+/// `.js` files: that is what `daemon::manifest::discover` reads, and since
+/// task 163 discovery's output is what both the daemon's plugin processes and
+/// the index's generation string are derived from.
 struct PluginBuild {
-    dir: PathBuf,
+    /// The discovery root - what [`PLUGIN_ROOTS_OVERRIDE_ENV`] is pointed at.
+    root: PathBuf,
+    /// `<root>/typescript/` - the plugin directory itself, whose whole
+    /// content is what `indexer_version` fingerprints.
+    plugin_dir: PathBuf,
 }
 
 impl PluginBuild {
     fn copied() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = plugin_dist_dir().join(format!(
+        let root = plugin_dist_dir().join(format!(
             "task-116-plugin-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
-        std::fs::create_dir_all(&dir).expect("failed to create a plugin build directory");
+        // The directory name has to be the manifest's `language` - that is
+        // `read_manifest`'s own rule, not a convention this test picks.
+        let plugin_dir = root.join("typescript");
+        let emitted = plugin_dir.join("dist").join("src");
+        std::fs::create_dir_all(&emitted).expect("failed to create a plugin build directory");
 
         let source = plugin_dist_dir().join("src");
         let entries = std::fs::read_dir(&source).unwrap_or_else(|err| {
@@ -104,16 +144,23 @@ impl PluginBuild {
             if entry.path().extension().and_then(|ext| ext.to_str()) != Some("js") {
                 continue;
             }
-            std::fs::copy(entry.path(), dir.join(entry.file_name()))
+            std::fs::copy(entry.path(), emitted.join(entry.file_name()))
                 .expect("failed to copy a compiled plugin file");
         }
-        assert!(dir.join("index.js").exists(), "the copied plugin must have an entry point");
+        assert!(emitted.join("index.js").exists(), "the copied plugin must have an entry point");
+        std::fs::write(plugin_dir.join("plugin.toml"), MANIFEST)
+            .expect("failed to write the copied plugin's manifest");
 
-        Self { dir }
+        Self { root, plugin_dir }
     }
 
     fn entry(&self) -> PathBuf {
-        self.dir.join("index.js")
+        self.plugin_dir.join("dist").join("src").join("index.js")
+    }
+
+    /// The one emitted file these tests rebuild, resolved inside the copy.
+    fn rebuilt_file(&self) -> PathBuf {
+        self.plugin_dir.join("dist").join("src").join(REBUILT_FILE)
     }
 
     /// Rewrites one emitted file, exactly as a `tsc` run over changed sources
@@ -121,7 +168,7 @@ impl PluginBuild {
     /// still behaves identically - the test is about whether the *change* is
     /// noticed, not about what the change does.
     fn rebuild_with_a_change(&self) {
-        let path = self.dir.join(REBUILT_FILE);
+        let path = self.rebuilt_file();
         let mut source = std::fs::read_to_string(&path).expect("failed to read the emitted extractor");
         source.push_str("\n// rebuilt with different extraction logic\n");
         std::fs::write(&path, source).expect("failed to rewrite the emitted extractor");
@@ -130,7 +177,7 @@ impl PluginBuild {
     /// A rebuild that emitted the same bytes - the common case, since `npm run
     /// build` rewrites everything whether or not anything changed.
     fn rebuild_unchanged(&self) {
-        let path = self.dir.join(REBUILT_FILE);
+        let path = self.rebuilt_file();
         let source = std::fs::read(&path).expect("failed to read the emitted extractor");
         // Long enough that the filesystem records a different mtime, which is
         // what makes this a real test of "content, not mtime".
@@ -141,9 +188,27 @@ impl PluginBuild {
 
 impl Drop for PluginBuild {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+/// The copied plugin's manifest: the bundled one's, with `dist/src` where the
+/// copy really put the emitted files. Written out rather than copied from
+/// `plugins/typescript/plugin.toml` so a test failure points at a mismatch
+/// between core and this fixture, not at a file two tests share.
+const MANIFEST: &str = r#"
+[plugin]
+language = "typescript"
+protocol_version = 1
+plugin_version = "2.0.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+"#;
 
 struct Project {
     dir: tempfile::TempDir,
@@ -218,8 +283,15 @@ fn body(result: &CallToolResult) -> Value {
 /// daemon behind it, which is the whole subject of this file.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let entry = project.plugin.entry();
+    let root = project.plugin.root.clone();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(project.root()).env(PLUGIN_PATH_ENV, &entry);
+        cmd.arg("mcp-shim")
+            .current_dir(project.root())
+            .env(PLUGIN_PATH_ENV, &entry)
+            // Inherited by the daemon this shim bootstraps, which is what has
+            // to discover (and be judged on) this test's own plugin build
+            // rather than the bundled one every other test uses.
+            .env(PLUGIN_ROOTS_OVERRIDE_ENV, &root);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -273,6 +345,7 @@ fn status(project: &Project) -> String {
         .arg("status")
         .current_dir(project.root())
         .env(PLUGIN_PATH_ENV, project.plugin.entry())
+        .env(PLUGIN_ROOTS_OVERRIDE_ENV, &project.plugin.root)
         .output()
         .expect("failed to run `g-mesh status`");
     assert!(

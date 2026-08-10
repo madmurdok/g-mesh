@@ -13,7 +13,7 @@
 //! semantic layer can produce.
 //!
 //! Structured after `reexport_linking.rs`, which proves the same chain for the
-//! placeholders tree-sitter *can* emit; requires `plugins/js-ts/dist/` to be up
+//! placeholders tree-sitter *can* emit; requires `plugins/typescript/dist/` to be up
 //! to date, which `core/build.rs` keeps so.
 
 use std::path::{Path, PathBuf};
