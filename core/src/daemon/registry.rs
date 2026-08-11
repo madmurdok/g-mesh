@@ -310,6 +310,18 @@ impl PluginRegistry {
         self.discovered.routing.get(&extension).map(String::as_str)
     }
 
+    /// Whether a plugin was discovered for `language` at all - the same
+    /// question [`get_or_spawn`](Self::get_or_spawn) answers with an `Err`
+    /// when it fails, exposed here so a caller that wants "nothing to do" to
+    /// be a distinct outcome from "the plugin was there and the request to
+    /// it failed" can tell the two apart before asking. `daemon::semantic`
+    /// is the motivating caller: an install with no bundled JS/TS plugin
+    /// owes the whole-project semantic pass nothing, on every daemon start,
+    /// not a stderr line every time.
+    pub fn has_manifest(&self, language: &str) -> bool {
+        self.discovered.manifests.contains_key(language)
+    }
+
     /// The supervisor for `language`, spawning its plugin if this is the
     /// first time anything has needed it.
     ///

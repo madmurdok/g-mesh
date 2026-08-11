@@ -41,10 +41,43 @@
 //!
 //! The cost is a window: a build interrupted *during* the pass leaves an index
 //! that calls itself complete and has no semantic layer, and nothing later goes
-//! looking. Closing that needs a second recorded fact (a `meta.semanticPassAt`
-//! the daemon could check independently of whether it owed a walk), which is a
-//! schema change and its own ticket. Until then the escape hatch is the one it
-//! already was: `g-mesh reindex`, which now ends with this pass.
+//! looking - unless something reads a second, independent fact. That is
+//! `meta.semanticPassAt` (`storage::schema::semantic_pass_completed` /
+//! `record_semantic_pass`), written by every caller here on `Ok(_)` - both
+//! `Ok(true)` (the pass ran) and `Ok(false)` (no bundled plugin, nothing was
+//! ever owed) - and left unset on `Err` (the pass was asked for and did not
+//! finish, whether that failure was a plugin crash, a kill, or a timeout).
+//! `Err` and "left unset" are the only states that matter to a later reader:
+//! neither says *why* the pass did not finish, and none of the three callers
+//! needs to, because the fix is the same regardless - ask again.
+//!
+//! `daemon::run`'s cold start is the one caller that can ask again on its own:
+//! a restart against a project whose walk is done (`bulkIndexedAt` set) but
+//! whose pass is not (`semanticPassAt` unset) retries the pass right where the
+//! cold-start branch would have run it, without repeating the walk. `cli::init`
+//! does the same when a second run finds `already_indexed` true but the pass
+//! still unrecorded. `cli::reindex` never needed this: it always ends with the
+//! pass regardless of what came before, which is why it stayed the escape
+//! hatch this doc used to point to - it still works, it is just no longer the
+//! *only* thing that notices.
+//!
+//! `semanticPassAt` is a one-shot completion flag, not a staleness digest: it
+//! answers "has the whole-project pass ever finished", once, and is not reset
+//! by an ordinary source edit after that. Keeping the semantic layer current
+//! as files change is the incremental watcher's job already
+//! (`watcher::apply::apply_semantic_pass`, exercised end-to-end by
+//! `core/tests/semantic_pass_trigger.rs`'s
+//! `core_asks_for_a_semantic_pass_after_each_incremental_reparse`) - every
+//! settled reparse gets its own per-file pass over exactly the file that
+//! changed, which is strictly finer-grained than re-running the whole-project
+//! pass could be. Wiring `semanticPassAt` into that machinery would duplicate
+//! a freshness guarantee that already exists; it only has to cover the one
+//! thing nothing else does, a completion that was interrupted before it ever
+//! happened once. It does reset to `NULL` alongside `bulkIndexedAt` whenever
+//! `storage::schema::reset` wipes the project (a schema or indexer-version
+//! mismatch, or `cli::reindex`'s unconditional wipe) - that is the same
+//! "throw the whole graph away and start over" event `bulkIndexedAt` already
+//! resets for, not a second staleness mechanism of its own.
 //!
 //! # Best-effort, everywhere
 //!
@@ -83,7 +116,17 @@ const PLUGIN_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// (which walks every discovered language): this pass only ever asks that one
 /// plugin's semantic layer to upgrade what its structural layer could guess at.
 /// Generalizing it to run once per discovered language is separate, later work.
+///
+/// `Ok(false)` covers the same legitimate case [`run_once`]'s doc comment
+/// does - no bundled JS/TS plugin discovered - checked explicitly rather
+/// than left to `get_or_spawn`'s `Err`, so a caller that retries this on
+/// every daemon start (see `daemon::mod`'s cold-start-adjacent retry for an
+/// interrupted pass) gets a quiet no-op on an install with no bundled
+/// plugin instead of the same stderr line every single start.
 pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) -> Result<bool> {
+    if !registry.has_manifest(plugin::BUNDLED_LANGUAGE) {
+        return Ok(false);
+    }
     registry
         .get_or_spawn(plugin::BUNDLED_LANGUAGE)
         .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new()))

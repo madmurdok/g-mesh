@@ -260,6 +260,18 @@ pub fn run(root: &Path) -> Result<()> {
     // still owed its index.
     let needs_bulk_index = !schema::bulk_index_completed(&conn)
         .context("failed to check whether the project has been indexed")?;
+    // Independent of the walk: a project that has been walked can still owe
+    // its whole-project semantic pass, if a previous attempt at it (this
+    // cold-start branch, `cli::init`, or `cli::reindex`) was interrupted
+    // after `bulkIndexedAt` was already recorded but before the pass itself
+    // finished - see `daemon::semantic`'s module doc. `needs_bulk_index`
+    // above already covers a project with no walk at all (its own cold-start
+    // branch below asks for the pass as part of that walk); this is what
+    // notices the case that branch will never take again, because the walk
+    // it would have run is not owed.
+    let needs_semantic_pass_retry = !needs_bulk_index
+        && !schema::semantic_pass_completed(&conn)
+            .context("failed to check whether the project's semantic pass has completed")?;
     let conn = Arc::new(Mutex::new(conn));
 
     // ProjectWatcher reports canonicalized absolute paths (see its own doc
@@ -472,13 +484,50 @@ pub fn run(root: &Path) -> Result<()> {
         // rather than leaving it to a daemon start that will never come.
         // Spawns the plugin if nothing has needed it yet, same as any other
         // first touch.
-        match semantic::run_with_registry(&registry, &conn) {
+        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
+        match &semantic_outcome {
             Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
             Ok(false) => {}
             Err(err) => eprintln!(
                 "g-mesh daemon: the semantic pass over the freshly built index failed ({err:#}) - \
                  its edges keep whatever the structural pass resolved"
             ),
+        }
+        // `Ok(_)` either way - the pass ran, or there was nothing for it to
+        // do (no bundled plugin) - is what `record_semantic_pass`'s own doc
+        // says counts as complete. Only `Err` (the pass was asked for and did
+        // not finish) must leave this unset, so a later start still finds it
+        // owed.
+        if semantic_outcome.is_ok() {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
+            }
+        }
+    } else if needs_semantic_pass_retry {
+        // The walk this project was owed already happened, in some earlier
+        // start or in `cli::init` / `cli::reindex` - `needs_bulk_index` above
+        // is false, so the branch that would normally ask for this pass will
+        // never run. Asked for here instead, at the same point in startup
+        // (before the watcher, for the same race the comment above this
+        // block explains) and against the same registry, so a project whose
+        // pass was interrupted gets exactly one more chance at it per daemon
+        // start rather than none.
+        eprintln!(
+            "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
+        );
+        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
+        match &semantic_outcome {
+            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete"),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "g-mesh daemon: retrying the semantic pass failed ({err:#}) - \
+                 it will be retried again on the next start"
+            ),
+        }
+        if semantic_outcome.is_ok() {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
+            }
         }
     }
 
