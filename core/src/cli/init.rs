@@ -68,14 +68,23 @@
 //!   `schema::bulk_index_completed` already says the project has been fully
 //!   walked - the same fact `daemon::run`'s own cold start checks before
 //!   deciding whether it owes a walk.
-//! - The semantic pass rides on that same decision rather than on one of its
-//!   own: it follows a walk this command actually ran, so a second `init`
-//!   starts no type checker either. It is the more expensive of the two on a
-//!   large project (one round trip per question the walk left open), and
-//!   nothing about a project that has not changed makes its answers stale.
-//!   A project whose index predates this behaviour therefore stays as it is
-//!   until something rebuilds it - `g-mesh reindex`, which runs the pass for
-//!   the same reason this does.
+//! - The semantic pass rides on the walk's own decision when there was a walk
+//!   to run: it follows a walk this command actually made, so a second
+//!   `init` against a project that has not changed starts no extra type
+//!   checker. It is the more expensive of the two on a large project (one
+//!   round trip per question the walk left open), and nothing about a
+//!   project that has not changed makes its answers stale.
+//!
+//!   What idempotence does *not* mean is "never runs the pass on an
+//!   already-walked project" - `meta.semanticPassAt`
+//!   (`storage::schema::semantic_pass_completed`) is checked independently of
+//!   `bulkIndexedAt` for exactly that reason: a project whose earlier `init`
+//!   (or daemon cold start, or `reindex`) recorded the walk but was
+//!   interrupted before its pass finished must not stay in that state
+//!   forever just because nothing ever asks for the walk again. A second
+//!   `init` against such a project retries only the pass, not the walk - see
+//!   `daemon::semantic`'s module doc for the full argument, which this
+//!   command shares with `daemon::run`'s own cold start.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -170,6 +179,46 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
 
     let mut semantic_pass_ran = false;
     let summary = if already_indexed {
+        // The walk is not owed again, but the pass that follows it might
+        // still be: an earlier `init` (or a daemon cold start, or a
+        // `reindex`) could have recorded `bulkIndexedAt` and then been
+        // interrupted before its own semantic pass finished - see
+        // `daemon::semantic`'s module doc. Without this check, a second
+        // `init` against such a project would print "already fully indexed -
+        // nothing to do" and leave it exactly as broken as the first attempt
+        // did, with no daemon cold start ever coming along to retry it
+        // (`bulkIndexedAt` is what tells every later daemon start it owes no
+        // cold start at all). `g-mesh reindex` always ends with the pass
+        // regardless, so it stays the unconditional escape hatch either way.
+        let already_semantic_passed = schema::semantic_pass_completed(&conn)
+            .context("failed to check whether the project's semantic pass has completed")?;
+        if !already_semantic_passed {
+            let canonical_root = project_root.canonicalize().with_context(|| {
+                format!("failed to canonicalize project root {}", project_root.display())
+            })?;
+            let conn = Arc::new(Mutex::new(conn));
+            let project_config = config::read_project_config(project_root)
+                .context("failed to read the project's config.toml")?;
+            let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+            let semantic_outcome = semantic::run_once(
+                &canonical_root,
+                &state_dir,
+                &conn,
+                &discovered,
+                &embedding_pipeline,
+            );
+            match &semantic_outcome {
+                Ok(ran) => semantic_pass_ran = *ran,
+                Err(err) => eprintln!(
+                    "g-mesh: the semantic pass over the already-indexed project failed ({err:#}) - \
+                     its edges keep whatever the structural pass resolved"
+                ),
+            }
+            if semantic_outcome.is_ok() {
+                schema::record_semantic_pass(&conn.lock().unwrap())
+                    .context("failed to record that the semantic pass completed")?;
+            }
+        }
         None
     } else {
         let canonical_root = project_root.canonicalize().with_context(|| {
@@ -196,12 +245,18 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // this command owes the pass it just made unreachable, and running it
         // here is also the only way `init`'s promise stays true: that the
         // index is *ready* when it returns, not merely walked.
-        match semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline) {
-            Ok(ran) => semantic_pass_ran = ran,
+        let semantic_outcome =
+            semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
+        match &semantic_outcome {
+            Ok(ran) => semantic_pass_ran = *ran,
             Err(err) => eprintln!(
                 "g-mesh: the semantic pass over the freshly built index failed ({err:#}) - \
                  its edges keep whatever the structural pass resolved"
             ),
+        }
+        if semantic_outcome.is_ok() {
+            schema::record_semantic_pass(&conn.lock().unwrap())
+                .context("failed to record that the semantic pass completed")?;
         }
         Some(summary)
     };

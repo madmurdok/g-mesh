@@ -111,12 +111,22 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let state_dir = connection::project_dir(project_root)
         .context("failed to resolve the project's state directory")?;
     let mut semantic_pass_ran = false;
-    match semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline) {
-        Ok(ran) => semantic_pass_ran = ran,
+    let semantic_outcome =
+        semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
+    match &semantic_outcome {
+        Ok(ran) => semantic_pass_ran = *ran,
         Err(err) => eprintln!(
             "g-mesh: the semantic pass over the rebuilt index failed ({err:#}) - \
              its edges keep whatever the structural pass resolved"
         ),
+    }
+    // `Ok(_)` either way records `semanticPassAt` - see `daemon::semantic`'s
+    // module doc. A wipe (`schema::reset` above) already cleared any previous
+    // value, so this command's own attempt is what decides whether the
+    // rebuilt index is left calling its semantic pass complete.
+    if semantic_outcome.is_ok() {
+        schema::record_semantic_pass(&conn.lock().unwrap())
+            .context("failed to record that the semantic pass completed")?;
     }
 
     Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary, semantic_pass_ran })

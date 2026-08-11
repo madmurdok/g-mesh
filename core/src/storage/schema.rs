@@ -30,7 +30,18 @@ use rusqlite::{Connection, OptionalExtension};
 /// version bump is how every existing index picks up the new table the same
 /// way it has picked up every table before it - a wipe and a full reindex,
 /// not a hand-written migration.
-pub const CURRENT_SCHEMA_VERSION: &str = "6";
+///
+/// Bumped to "7" when `meta.semanticPassAt` was added - see
+/// `daemon::semantic`'s module doc for the gap it closes: `bulkIndexedAt`
+/// alone cannot tell a project whose whole-project semantic pass genuinely
+/// finished apart from one whose pass was interrupted after the walk had
+/// already been recorded complete. A version bump (rather than an `ALTER
+/// TABLE`, which this codebase's "no migration framework" rule already rules
+/// out - see this constant's own doc above) is the same reindex-on-mismatch
+/// path every other column here has taken; the column is nullable and reset
+/// by a wipe exactly like `bulkIndexedAt`, so a fresh index after the bump
+/// starts owing both facts, not just the new one.
+pub const CURRENT_SCHEMA_VERSION: &str = "7";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -158,13 +169,26 @@ CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
 -- any nodes?": a walk interrupted half way also leaves nodes behind, and
 -- resuming from a partial index as if it were complete is the exact failure
 -- this column exists to rule out.
+--
+-- semanticPassAt is the same idea for the whole-project semantic pass that
+-- follows a walk (see daemon::semantic): NULL until that pass has completed
+-- at least once, independently of bulkIndexedAt. The two are deliberately
+-- separate facts rather than one - every caller that builds an index records
+-- bulkIndexedAt *before* asking for the pass (see daemon::semantic's module
+-- doc for why), so a pass interrupted afterwards (a killed plugin, a crash, a
+-- timeout) would otherwise leave a project that calls itself fully indexed
+-- with no semantic layer and nothing left to notice. semanticPassAt is what
+-- notices: unset here after a project's walk is done means the pass is still
+-- owed, and daemon::mod's cold start (and cli::init's idempotent rerun) read
+-- exactly that to retry it without repeating the walk.
 CREATE TABLE IF NOT EXISTS meta (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version  TEXT NOT NULL,
     indexer_version TEXT NOT NULL,
     embedding_model TEXT,
     lastUsed        TEXT NOT NULL,
-    bulkIndexedAt   TEXT
+    bulkIndexedAt   TEXT,
+    semanticPassAt  TEXT
 );
 
 -- Baseline on-disk state (mtime + content hash) a file's index was last
@@ -289,6 +313,40 @@ pub fn bulk_index_completed(conn: &Connection) -> Result<bool> {
 pub fn record_bulk_index(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", [])
         .context("failed to record bulkIndexedAt")?;
+    Ok(())
+}
+
+/// Whether the whole-project semantic pass has ever finished for this index -
+/// independent of [`bulk_index_completed`], and deliberately so. `false` with
+/// `bulk_index_completed` also `false` just means the project has not been
+/// walked yet (the ordinary "brand new index" case, and the pass has nowhere
+/// to run before the walk it upgrades). `false` with `bulk_index_completed`
+/// `true` is the gap this column exists to name: a walk that finished, and a
+/// pass that started (its own record is what set `bulkIndexedAt`, per
+/// `daemon::semantic`'s module doc's ordering) but was interrupted - a killed
+/// plugin, a crash, a process timeout - before it could finish and record
+/// itself. See `daemon::semantic::run_with_registry` / `run_once` for the two
+/// call shapes that write this, and `daemon::mod`'s cold start / `cli::init`
+/// for the readers that treat the second case as still owed.
+pub fn semantic_pass_completed(conn: &Connection) -> Result<bool> {
+    let recorded: Option<Option<String>> = conn
+        .query_row("SELECT semanticPassAt FROM meta WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read semanticPassAt")?;
+    Ok(matches!(recorded, Some(Some(_))))
+}
+
+/// Marks the whole-project semantic pass complete. Written only after
+/// `daemon::semantic::run_with_registry` / `run_once` returns `Ok(_)` - both
+/// `Ok(true)` (the pass actually ran) and `Ok(false)` (no bundled plugin was
+/// discovered, so nothing was ever owed) count as complete, the same way
+/// `run_once`'s own doc comment treats a missing plugin as a legitimate
+/// install rather than a failure. An `Err` (the pass was asked for and did
+/// not finish) must never reach this - the caller's `match` is what enforces
+/// that, not this function, which just writes what it is told.
+pub fn record_semantic_pass(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+        .context("failed to record semanticPassAt")?;
     Ok(())
 }
 
@@ -581,6 +639,49 @@ mod tests {
         // index must not ask for the walk again.
         assert!(!ensure_current(&conn, GENERATION).unwrap());
         assert!(bulk_index_completed(&conn).unwrap());
+    }
+
+    /// The gap task 62cc2d0f closes: `bulkIndexedAt` and `semanticPassAt` are
+    /// independent facts, so a walk finishing says nothing about whether the
+    /// pass that follows it did too.
+    #[test]
+    fn a_walked_index_still_owes_its_semantic_pass_until_one_is_recorded() {
+        let conn = setup();
+        assert!(ensure_current(&conn, GENERATION).unwrap());
+        assert!(
+            !semantic_pass_completed(&conn).unwrap(),
+            "a fresh index has had no semantic pass either"
+        );
+
+        record_bulk_index(&conn).unwrap();
+        assert!(bulk_index_completed(&conn).unwrap());
+        assert!(
+            !semantic_pass_completed(&conn).unwrap(),
+            "recording the walk must not also mark the pass complete - \
+             a pass interrupted right after this point is exactly the gap this column exists for"
+        );
+
+        record_semantic_pass(&conn).unwrap();
+        assert!(semantic_pass_completed(&conn).unwrap());
+        // Recording the pass must not retroactively touch the walk's own flag.
+        assert!(bulk_index_completed(&conn).unwrap());
+    }
+
+    /// A version-mismatch wipe throws the whole graph away, so both facts
+    /// about it - not just the walk - are owed again afterwards.
+    #[test]
+    fn a_version_mismatch_wipe_makes_the_semantic_pass_owed_again_too() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        record_bulk_index(&conn).unwrap();
+        record_semantic_pass(&conn).unwrap();
+
+        conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
+        assert!(ensure_current(&conn, GENERATION).unwrap());
+        assert!(
+            !semantic_pass_completed(&conn).unwrap(),
+            "data wiped by a version mismatch has to have its semantic pass redone too"
+        );
     }
 
     #[test]
