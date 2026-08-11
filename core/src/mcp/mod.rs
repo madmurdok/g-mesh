@@ -13,6 +13,28 @@
 //! not to be. `daemon::run` enters a small runtime for its accept loop alone,
 //! so async stops at this module's front door; handlers below hold the same
 //! plain `Mutex` guards the synchronous code always has.
+//!
+//! # Why the parameter doc comments below are terse
+//!
+//! Every `///` on a parameter struct in this file is compiled by `schemars`
+//! into that tool's JSON Schema `description`, and the whole `tools/list`
+//! response sits in the model's cached prompt prefix - so it is re-read, and
+//! re-billed as `cacheReadTokens`, on *every* request of *every* conversation,
+//! not once. A sentence of rationale here therefore costs far more over a
+//! session than the same sentence in a `//` comment, which never reaches the
+//! wire at all.
+//!
+//! Measured (task f05b320f, against serena's 5-tool surface as a reference
+//! point): the eight schemas were 11,722 bytes, 62% of it description text,
+//! with `file_paths`/`symbol_name`/`limit`/`symbol_id`/`cursor` each repeated
+//! near-verbatim across three to six tools. Compressing that prose - without
+//! dropping a single fact a caller acts on - took the surface to 9,845 bytes,
+//! roughly 600 fewer prompt tokens on every request.
+//!
+//! So: state defaults, caps, mutual exclusions and the ambiguity protocol,
+//! because a caller's behaviour changes on them. Put the *why* in a `//`
+//! comment or this module doc instead, and keep guidance that spans tools in
+//! `get_info`'s `instructions` (sent once per session, not once per tool).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -473,7 +495,7 @@ pub struct FindDefinitionParams {
     pub file_path: Option<String>,
     /// Cursor position within `file_path`, used to resolve the symbol under it.
     pub position: Option<Position>,
-    /// Opaque cursor from a previous page of results.
+    /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
 }
 
@@ -486,27 +508,23 @@ pub struct FindDefinitionParams {
 /// at every call site is noise that hides which one the test is about.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
-    /// Id of the anchor symbol, as returned by `find_definition`. Give this
-    /// or `symbol_name`, never both.
+    /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
+    /// never both.
     pub symbol_id: Option<String>,
-    /// Alternative to `symbol_id` that skips the `find_definition` call -
-    /// resolved the same way (qualified name first, then bare name). If
-    /// ambiguous, returns a ranked candidate list (`ambiguous: true`);
-    /// re-call with a candidate's `id` as `symbol_id`.
+    /// Anchor by name instead, skipping `find_definition` - resolved
+    /// qualified name first, then bare. If ambiguous, returns `ambiguous:
+    /// true` with ranked candidates; re-call with a candidate's `id` as
+    /// `symbol_id`.
     pub symbol_name: Option<String>,
-    /// Opaque cursor from a previous page of results.
+    /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum results (default 20, capped at 200) - raise for a wide result
-    /// set instead of paging via `cursor`.
+    /// Maximum results (default 20, max 200) - raise it rather than paging
+    /// via `cursor`.
     pub limit: Option<u32>,
-    /// Restrict results to rows whose referencing/calling/implementing node
-    /// lives in one of these files (project-relative, matching `file_path`
-    /// exactly as it appears elsewhere in this tool's own output - no
-    /// prefix or glob matching). Use this to answer "of these known files,
-    /// which ones reference/call this symbol?" in one call instead of one
-    /// unscoped call plus a grep per file. Omit for the default, unscoped
-    /// search across the whole project; an empty array behaves identically
-    /// to omitting it, not "match nothing".
+    /// Restrict results to rows in these files: project-relative, matched
+    /// exactly as `filePath` appears in this tool's own output (no prefix or
+    /// glob). Answers "which of these files reference this?" in one call.
+    /// Omit or pass `[]` to search the whole project.
     pub file_paths: Option<Vec<String>>,
 }
 
@@ -526,41 +544,34 @@ pub struct SymbolQueryParams {
 /// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct FindImplementationsParams {
-    /// Id of the anchor symbol, as returned by `find_definition`. Give this
-    /// or `symbol_name`, never both.
+    /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
+    /// never both.
     pub symbol_id: Option<String>,
-    /// Alternative to `symbol_id` that skips the `find_definition` call -
-    /// resolved the same way (qualified name first, then bare name). If
-    /// ambiguous, returns a ranked candidate list (`ambiguous: true`);
-    /// re-call with a candidate's `id` as `symbol_id`.
+    /// Anchor by name instead, skipping `find_definition` - resolved
+    /// qualified name first, then bare. If ambiguous, returns `ambiguous:
+    /// true` with ranked candidates; re-call with a candidate's `id` as
+    /// `symbol_id`.
     pub symbol_name: Option<String>,
-    /// Opaque cursor from a previous page of results. Only meaningful when
-    /// `transitive` is absent/false - the transitive walk's own continuation
-    /// is `resume_token`, not this field.
+    /// Opaque cursor from a previous page. Ignored when `transitive: true` -
+    /// that walk continues via `resume_token`.
     pub cursor: Option<String>,
-    /// Maximum results (default 20, capped at 200) - raise for a wide result
-    /// set instead of paging via `cursor`. Ignored when `transitive: true`.
+    /// Maximum results (default 20, max 200) - raise it rather than paging
+    /// via `cursor`. Ignored when `transitive: true`.
     pub limit: Option<u32>,
-    /// Restrict results to rows whose implementing/extending node lives in
-    /// one of these files (project-relative, matching `file_path` exactly as
-    /// it appears elsewhere in this tool's own output - no prefix or glob
-    /// matching). Omit for the default, unscoped search across the whole
-    /// project; an empty array behaves identically to omitting it, not
-    /// "match nothing". Ignored when `transitive: true`.
+    /// Restrict results to rows in these files: project-relative, matched
+    /// exactly as `filePath` appears in this tool's own output (no prefix or
+    /// glob). Omit or pass `[]` to search the whole project. Ignored when
+    /// `transitive: true`.
     pub file_paths: Option<Vec<String>>,
-    /// Walk the whole implementer/extender hierarchy instead of just the
-    /// direct one, up to `max_depth` hops (e.g. a class extending a class
-    /// that implements the anchor interface). Absent or `false` behaves
-    /// exactly as this tool always has: direct implementors/extenders only.
+    /// Walk the whole implementer/extender hierarchy (e.g. a class extending
+    /// a class that implements the anchor), up to `max_depth` hops. Absent
+    /// or `false`: direct implementors/extenders only.
     pub transitive: Option<bool>,
-    /// How many `extends`/`implements` hops to follow when `transitive:
-    /// true`. Defaults to the walk engine's own default (5) - a real type
-    /// hierarchy has nowhere near the fan-out risk an import graph does, so
-    /// this tool does not tighten it further. Ignored without `transitive:
-    /// true`.
+    /// How many `extends`/`implements` hops to follow (default 5). Ignored
+    /// without `transitive: true`.
     pub max_depth: Option<u32>,
-    /// Opaque token from a previous, truncated transitive walk - continues
-    /// that walk exactly. Give this alone, without `symbol_id`/`symbol_name`/
+    /// Token from a previous, truncated transitive walk - continues it
+    /// exactly. Give it alone, without `symbol_id`/`symbol_name`/
     /// `transitive`: the token already carries the walk it continues.
     pub resume_token: Option<String>,
 }
@@ -571,13 +582,11 @@ pub struct FindImplementationsParams {
 pub struct GetFileOutlineParams {
     /// Project-relative path of the file to outline.
     pub file_path: String,
-    /// Opaque cursor from a previous page of results.
+    /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum symbols to return (default 20, capped at 200) - raise this for
-    /// a file with many top-level symbols instead of paging via `cursor`. A
-    /// file that fits in one call with `limit` set high enough is one round
-    /// trip instead of several, each of which re-pays the whole
-    /// conversation's cached prefix for a handful more rows.
+    /// Maximum symbols (default 20, max 200) - raise it for a big file rather
+    /// than paging via `cursor`: one call costs far less than several, each
+    /// of which re-pays the whole conversation's cached prefix.
     pub limit: Option<u32>,
 }
 
@@ -601,15 +610,14 @@ pub struct GetDependenciesParams {
 /// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchCodeParams {
-    /// Free-text description of what you're looking for (e.g. "parses a
-    /// config file", "retries a failed network request"). Matched by
-    /// semantic similarity against each symbol's doc comment and signature,
-    /// not by keyword - different wording for the same idea still ranks
-    /// well.
+    /// What you're looking for, in free text (e.g. "parses a config file").
+    /// Matched by semantic similarity against each symbol's doc comment and
+    /// signature, not by keyword - different wording for the same idea still
+    /// ranks well.
     pub query: String,
-    /// Opaque cursor from a previous page of results.
+    /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum results (default 20, capped at 200) - raise for a wide result
-    /// set instead of paging via `cursor`.
+    /// Maximum results (default 20, max 200) - raise it rather than paging
+    /// via `cursor`.
     pub limit: Option<u32>,
 }
