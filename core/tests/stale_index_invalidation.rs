@@ -13,7 +13,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -69,7 +68,10 @@ impl Project {
 
     /// Stops the daemon and its plugin the way a reboot or an `-9` would,
     /// leaving the index exactly as it is on disk - which is the state the
-    /// next start has to make a judgement about.
+    /// next start has to make a judgement about. Waits for each process to
+    /// actually die (see `common::kill_and_wait`) so a restart spawned right
+    /// after this returns cannot race a not-yet-dead process for
+    /// `daemon.lock`.
     fn stop(&self) {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
@@ -77,32 +79,7 @@ impl Project {
                 // Stopped twice over on the last phase (here, then again from
                 // `Drop`), so "no such process" is the expected second answer
                 // and not worth printing into the test output.
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                // `kill -9` returning only means the signal was *delivered*,
-                // not that the kernel has finished tearing the process down -
-                // its `flock` on `daemon.lock` (`daemon::acquire_singleton_lock`)
-                // is released as part of that teardown, not the instant the
-                // signal lands. A restart spawned immediately after this call
-                // returns can otherwise race a not-yet-fully-dead process for
-                // that lock, lose (`try_lock`'s `WouldBlock` reads as "an
-                // incumbent is already serving"), and exit without binding a
-                // socket at all - which nothing here or in the shim retries,
-                // so the bootstrap that follows blows its whole budget waiting
-                // for a socket that was never going to appear. Waiting for
-                // `kill(pid, 0)` to start failing (`is_process_alive`) is the
-                // same confirmation `cli::stop::stop` already gives its own
-                // callers (see `cli_stop.rs`'s `wait_for("the daemon to
-                // die", ...)`); this hand-rolled stop owes its caller the
-                // same guarantee before handing back a project a new daemon
-                // is about to be started against.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while daemon::is_process_alive(pid) && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
+                common::kill_and_wait(pid);
             }
         }
         // The socket file outlives the process it belonged to; leaving it
