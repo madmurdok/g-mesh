@@ -6,6 +6,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod plugin;
 pub mod registry;
+pub mod semantic;
 /// A fake, protocol-speaking plugin for the unit tests in this module tree -
 /// the only way to exercise *two* languages without a second real plugin
 /// existing. Compiled only under `cfg(test)`, and never referenced by
@@ -259,6 +260,18 @@ pub fn run(root: &Path) -> Result<()> {
     // still owed its index.
     let needs_bulk_index = !schema::bulk_index_completed(&conn)
         .context("failed to check whether the project has been indexed")?;
+    // Independent of the walk: a project that has been walked can still owe
+    // its whole-project semantic pass, if a previous attempt at it (this
+    // cold-start branch, `cli::init`, or `cli::reindex`) was interrupted
+    // after `bulkIndexedAt` was already recorded but before the pass itself
+    // finished - see `daemon::semantic`'s module doc. `needs_bulk_index`
+    // above already covers a project with no walk at all (its own cold-start
+    // branch below asks for the pass as part of that walk); this is what
+    // notices the case that branch will never take again, because the walk
+    // it would have run is not owed.
+    let needs_semantic_pass_retry = !needs_bulk_index
+        && !schema::semantic_pass_completed(&conn)
+            .context("failed to check whether the project's semantic pass has completed")?;
     let conn = Arc::new(Mutex::new(conn));
 
     // ProjectWatcher reports canonicalized absolute paths (see its own doc
@@ -465,24 +478,56 @@ pub fn run(root: &Path) -> Result<()> {
         // its own, which is what baseline's eager, pre-registry spawn timing
         // gave for free and this daemon still needs.
         //
-        // Still the bundled JS/TS plugin specifically, unlike the cold-start
-        // walk just above (which spawns one one-shot `--bulk-index` process
-        // per discovered language as of task 156): this semantic pass only
-        // ever asks the bundled plugin's own long-lived supervisor to upgrade
-        // what the structural pass could only guess at. Generalizing it to
-        // run once per discovered language is separate, later work, not this
-        // one's. Spawns it if nothing has needed it yet, same as any other
+        // Which plugin this asks, and why only one of them, is
+        // `daemon::semantic`'s to say - as is the reason `cli::init` and
+        // `cli::reindex` now run the very same pass off their own walks
+        // rather than leaving it to a daemon start that will never come.
+        // Spawns the plugin if nothing has needed it yet, same as any other
         // first touch.
-        match registry
-            .get_or_spawn(plugin::BUNDLED_LANGUAGE)
-            .and_then(|supervisor| supervisor.semantic_pass(&conn, Vec::new()))
-        {
+        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
+        match &semantic_outcome {
             Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
             Ok(false) => {}
             Err(err) => eprintln!(
                 "g-mesh daemon: the semantic pass over the freshly built index failed ({err:#}) - \
                  its edges keep whatever the structural pass resolved"
             ),
+        }
+        // `Ok(_)` either way - the pass ran, or there was nothing for it to
+        // do (no bundled plugin) - is what `record_semantic_pass`'s own doc
+        // says counts as complete. Only `Err` (the pass was asked for and did
+        // not finish) must leave this unset, so a later start still finds it
+        // owed.
+        if semantic_outcome.is_ok() {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
+            }
+        }
+    } else if needs_semantic_pass_retry {
+        // The walk this project was owed already happened, in some earlier
+        // start or in `cli::init` / `cli::reindex` - `needs_bulk_index` above
+        // is false, so the branch that would normally ask for this pass will
+        // never run. Asked for here instead, at the same point in startup
+        // (before the watcher, for the same race the comment above this
+        // block explains) and against the same registry, so a project whose
+        // pass was interrupted gets exactly one more chance at it per daemon
+        // start rather than none.
+        eprintln!(
+            "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
+        );
+        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
+        match &semantic_outcome {
+            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete"),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "g-mesh daemon: retrying the semantic pass failed ({err:#}) - \
+                 it will be retried again on the next start"
+            ),
+        }
+        if semantic_outcome.is_ok() {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
+            }
         }
     }
 

@@ -154,6 +154,14 @@ pub struct PluginReport {
 pub struct IndexStatus {
     /// Whether a full project walk has ever finished (`meta.bulkIndexedAt`).
     pub bulk_indexed: bool,
+    /// Whether the whole-project semantic pass that follows a walk has ever
+    /// finished (`meta.semanticPassAt`) - independent of `bulk_indexed`,
+    /// deliberately: every walk records `bulkIndexedAt` before asking for
+    /// this pass (see `daemon::semantic`'s module doc), so a pass
+    /// interrupted afterwards (a killed plugin, a crash, a timeout) leaves
+    /// `bulk_indexed` true and this `false`. That combination is the one
+    /// [`render`] calls out by name - see task 62cc2d0f.
+    pub semantic_pass_completed: bool,
     /// Source files found on disk now - the denominator of coverage.
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
@@ -316,6 +324,7 @@ pub fn index_status(project_root: &Path, db_path: &Path) -> Result<IndexStatus> 
     if !db_path.exists() {
         return Ok(IndexStatus {
             bulk_indexed: false,
+            semantic_pass_completed: false,
             discovered: discovered.len(),
             indexed: 0,
             dirty: discovered.len(),
@@ -355,6 +364,8 @@ pub fn index_status(project_root: &Path, db_path: &Path) -> Result<IndexStatus> 
     Ok(IndexStatus {
         bulk_indexed: crate::storage::schema::bulk_index_completed(&conn)
             .context("failed to read whether the project has been fully walked")?,
+        semantic_pass_completed: crate::storage::schema::semantic_pass_completed(&conn)
+            .context("failed to read whether the project's semantic pass has completed")?,
         discovered: discovered.len(),
         indexed,
         dirty,
@@ -533,6 +544,26 @@ pub fn render(report: &Report) -> String {
         let _ = writeln!(out, "  dirty files:     {} awaiting the walk already in progress", index.dirty);
     } else {
         let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
+    }
+
+    // Only meaningful once a walk has actually landed - before that,
+    // `index:` above already says a cold start (or the walk in progress) is
+    // what is owed, and a semantic pass has nowhere to run yet regardless.
+    // Once `bulk_indexed` is true, `semantic_pass_completed` is the fact
+    // `bulk_indexed` alone cannot tell apart from a genuinely finished index:
+    // a pass interrupted after the walk was already recorded (a killed
+    // plugin, a crash, a timeout) leaves exactly this combination, and
+    // nothing else in this report would ever call it out - see task
+    // 62cc2d0f / `daemon::semantic`'s module doc.
+    if index.bulk_indexed {
+        if index.semantic_pass_completed {
+            let _ = writeln!(out, "  semantic pass:   complete");
+        } else {
+            let _ = writeln!(
+                out,
+                "  semantic pass:   never completed - run `g-mesh reindex` to repair it"
+            );
+        }
     }
 
     if index.syntax_error_files.is_empty() {
@@ -815,6 +846,7 @@ mod tests {
             }),
             index: IndexStatus {
                 bulk_indexed: true,
+                semantic_pass_completed: true,
                 discovered: 4,
                 indexed: 3,
                 dirty: 1,
@@ -831,6 +863,40 @@ mod tests {
         assert!(rendered.contains("75.0% (3/4 source files)"), "{rendered}");
         assert!(rendered.contains("1 awaiting reindex"), "{rendered}");
         assert!(rendered.contains("src/broken.ts"), "{rendered}");
+        assert!(rendered.contains("semantic pass:   complete"), "{rendered}");
+    }
+
+    /// The gap task 62cc2d0f closes: a walked index whose semantic pass never
+    /// finished must not read as fully healthy just because `bulk_indexed` is
+    /// true - `status` is the explicit-surfacing half of the fix (the other
+    /// half is the daemon retrying on its own next start).
+    #[test]
+    fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
+        let report = Report {
+            project_root: PathBuf::from("/tmp/project"),
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            core: CoreState::NotRunning,
+            build: BuildState::NotRunning,
+            plugins: Vec::new(),
+            last_used: None,
+            index: IndexStatus {
+                bulk_indexed: true,
+                semantic_pass_completed: false,
+                discovered: 4,
+                indexed: 4,
+                dirty: 0,
+                syntax_error_files: Vec::new(),
+            },
+        };
+
+        let rendered = render(&report);
+
+        assert!(
+            rendered.contains("semantic pass:   never completed - run `g-mesh reindex` to repair it"),
+            "an interrupted semantic pass must be surfaced explicitly, not silently folded into \
+             a healthy-looking report:\n{rendered}"
+        );
     }
 
     /// Task 108: a daemon mid-cold-start-walk (task 105 already made it
@@ -853,6 +919,7 @@ mod tests {
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
+                semantic_pass_completed: false,
                 discovered: 4,
                 indexed: 1,
                 dirty: 3,
@@ -889,6 +956,7 @@ mod tests {
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
+                semantic_pass_completed: false,
                 discovered: 2,
                 indexed: 0,
                 dirty: 2,
@@ -975,6 +1043,7 @@ mod tests {
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: true,
+                semantic_pass_completed: true,
                 discovered: 0,
                 indexed: 0,
                 dirty: 0,

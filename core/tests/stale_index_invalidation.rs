@@ -13,7 +13,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -69,7 +68,10 @@ impl Project {
 
     /// Stops the daemon and its plugin the way a reboot or an `-9` would,
     /// leaving the index exactly as it is on disk - which is the state the
-    /// next start has to make a judgement about.
+    /// next start has to make a judgement about. Waits for each process to
+    /// actually die (see `common::kill_and_wait`) so a restart spawned right
+    /// after this returns cannot race a not-yet-dead process for
+    /// `daemon.lock`.
     fn stop(&self) {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
@@ -77,11 +79,7 @@ impl Project {
                 // Stopped twice over on the last phase (here, then again from
                 // `Drop`), so "no such process" is the expected second answer
                 // and not worth printing into the test output.
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         // The socket file outlives the process it belonged to; leaving it

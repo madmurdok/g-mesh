@@ -30,7 +30,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::Path;
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -127,16 +126,15 @@ impl Project {
     }
 
     /// Kills the daemon and its plugin the way a reboot would, leaving the
-    /// index on disk exactly as it is - the state the next start has to judge.
+    /// index on disk exactly as it is - the state the next start has to
+    /// judge. Waits for each process to actually die (see
+    /// `common::kill_and_wait`) so a restart spawned right after this returns
+    /// cannot race a not-yet-dead process for `daemon.lock`.
     fn stop(&self) {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         if let Ok(socket) = daemon::socket_path(self.root()) {

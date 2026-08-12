@@ -29,6 +29,20 @@
 //! already fully walked - the same postcondition `cli::reindex`'s module
 //! doc describes.
 //!
+//! # Why the walk is followed by a semantic pass
+//!
+//! Because "ready" has to mean the same thing here as it does anywhere else.
+//! A bulk walk produces the graph tree-sitter can see, and `daemon::run`
+//! follows its own walk with a whole-project semantic pass that produces the
+//! rest - the call edges hidden behind `import * as ns`, the re-export chains
+//! core's name-matching walk cannot finish, the overload a call really binds.
+//! That daemon-side pass is reached only on a cold start, and the very record
+//! this command writes (`meta.bulkIndexedAt`) is what tells every later daemon
+//! it owes no cold start. So an `init`ed project used to keep a permanently
+//! structural-only graph, and `find_callers` on a function reached only
+//! through a namespace import answered nothing on an index that called itself
+//! complete. `daemon::semantic` holds the rest of that argument.
+//!
 //! # Why a daemon already running is stopped first
 //!
 //! Same reasoning as `cli::reindex`: this command opens the project's SQLite
@@ -54,6 +68,23 @@
 //!   `schema::bulk_index_completed` already says the project has been fully
 //!   walked - the same fact `daemon::run`'s own cold start checks before
 //!   deciding whether it owes a walk.
+//! - The semantic pass rides on the walk's own decision when there was a walk
+//!   to run: it follows a walk this command actually made, so a second
+//!   `init` against a project that has not changed starts no extra type
+//!   checker. It is the more expensive of the two on a large project (one
+//!   round trip per question the walk left open), and nothing about a
+//!   project that has not changed makes its answers stale.
+//!
+//!   What idempotence does *not* mean is "never runs the pass on an
+//!   already-walked project" - `meta.semanticPassAt`
+//!   (`storage::schema::semantic_pass_completed`) is checked independently of
+//!   `bulkIndexedAt` for exactly that reason: a project whose earlier `init`
+//!   (or daemon cold start, or `reindex`) recorded the walk but was
+//!   interrupted before its pass finished must not stay in that state
+//!   forever just because nothing ever asks for the walk again. A second
+//!   `init` against such a project retries only the pass, not the walk - see
+//!   `daemon::semantic`'s module doc for the full argument, which this
+//!   command shares with `daemon::run`'s own cold start.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -64,7 +95,7 @@ use anyhow::{Context, Result};
 use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{manifest, registry};
+use crate::daemon::{manifest, registry, semantic};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -82,6 +113,13 @@ pub struct Outcome {
     /// `None` when the project was already fully walked and the bulk index
     /// was skipped rather than repeated.
     pub summary: Option<BulkIndexSummary>,
+    /// Whether the type checker got to say what the structural walk could
+    /// not - see `daemon::semantic` for why a walk on its own leaves an
+    /// index that is complete only in the shapes tree-sitter can see. False
+    /// whenever there was no walk to follow (an already-indexed project),
+    /// when no JS/TS plugin is installed, and when the pass failed - which
+    /// costs exactly the edges it was about and is reported on stderr.
+    pub semantic_pass_ran: bool,
     /// The `--agent` targets that were requested, carried through so
     /// [`render`] knows which of `agent_instructions`'s fields to report on.
     /// Empty means `--agent` was not used at all, in which case `render`
@@ -139,7 +177,48 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     let already_indexed = schema::bulk_index_completed(&conn)
         .context("failed to check whether the project has already been indexed")?;
 
+    let mut semantic_pass_ran = false;
     let summary = if already_indexed {
+        // The walk is not owed again, but the pass that follows it might
+        // still be: an earlier `init` (or a daemon cold start, or a
+        // `reindex`) could have recorded `bulkIndexedAt` and then been
+        // interrupted before its own semantic pass finished - see
+        // `daemon::semantic`'s module doc. Without this check, a second
+        // `init` against such a project would print "already fully indexed -
+        // nothing to do" and leave it exactly as broken as the first attempt
+        // did, with no daemon cold start ever coming along to retry it
+        // (`bulkIndexedAt` is what tells every later daemon start it owes no
+        // cold start at all). `g-mesh reindex` always ends with the pass
+        // regardless, so it stays the unconditional escape hatch either way.
+        let already_semantic_passed = schema::semantic_pass_completed(&conn)
+            .context("failed to check whether the project's semantic pass has completed")?;
+        if !already_semantic_passed {
+            let canonical_root = project_root.canonicalize().with_context(|| {
+                format!("failed to canonicalize project root {}", project_root.display())
+            })?;
+            let conn = Arc::new(Mutex::new(conn));
+            let project_config = config::read_project_config(project_root)
+                .context("failed to read the project's config.toml")?;
+            let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+            let semantic_outcome = semantic::run_once(
+                &canonical_root,
+                &state_dir,
+                &conn,
+                &discovered,
+                &embedding_pipeline,
+            );
+            match &semantic_outcome {
+                Ok(ran) => semantic_pass_ran = *ran,
+                Err(err) => eprintln!(
+                    "g-mesh: the semantic pass over the already-indexed project failed ({err:#}) - \
+                     its edges keep whatever the structural pass resolved"
+                ),
+            }
+            if semantic_outcome.is_ok() {
+                schema::record_semantic_pass(&conn.lock().unwrap())
+                    .context("failed to record that the semantic pass completed")?;
+            }
+        }
         None
     } else {
         let canonical_root = project_root.canonicalize().with_context(|| {
@@ -160,6 +239,25 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             .context("failed to build the project's initial index")?;
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
+        // The walk is only the half of a complete index that tree-sitter can
+        // see, and the record just written is what stops any later daemon
+        // start from finishing the other half - see `daemon::semantic`. So
+        // this command owes the pass it just made unreachable, and running it
+        // here is also the only way `init`'s promise stays true: that the
+        // index is *ready* when it returns, not merely walked.
+        let semantic_outcome =
+            semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
+        match &semantic_outcome {
+            Ok(ran) => semantic_pass_ran = *ran,
+            Err(err) => eprintln!(
+                "g-mesh: the semantic pass over the freshly built index failed ({err:#}) - \
+                 its edges keep whatever the structural pass resolved"
+            ),
+        }
+        if semantic_outcome.is_ok() {
+            schema::record_semantic_pass(&conn.lock().unwrap())
+                .context("failed to record that the semantic pass completed")?;
+        }
         Some(summary)
     };
 
@@ -172,6 +270,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         daemon_was_running: stop_outcome.stopped_anything(),
         config_written,
         summary,
+        semantic_pass_ran,
         agents: agents.to_vec(),
         agent_instructions: agent_instructions_outcome,
     })
@@ -212,6 +311,9 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         None => {
             let _ = writeln!(out, "  index:      already fully indexed - nothing to do");
         }
+    }
+    if outcome.semantic_pass_ran {
+        let _ = writeln!(out, "  semantic:   pass complete over what the walk could not resolve");
     }
     if !outcome.agents.is_empty() {
         if outcome.agent_instructions.agents_md_written {
@@ -262,6 +364,7 @@ mod tests {
                 linked_imports: 2,
                 linked_symbols: 1,
             }),
+            semantic_pass_ran: true,
             agents: Vec::new(),
             agent_instructions: agent_instructions::Outcome::default(),
         };
@@ -282,6 +385,7 @@ mod tests {
             daemon_was_running: false,
             config_written: false,
             summary: None,
+            semantic_pass_ran: false,
             agents: Vec::new(),
             agent_instructions: agent_instructions::Outcome::default(),
         };
@@ -300,6 +404,7 @@ mod tests {
             daemon_was_running: true,
             config_written: false,
             summary: Some(BulkIndexSummary::default()),
+            semantic_pass_ran: false,
             agents: Vec::new(),
             agent_instructions: agent_instructions::Outcome::default(),
         };
@@ -319,6 +424,7 @@ mod tests {
             daemon_was_running: false,
             config_written: false,
             summary: None,
+            semantic_pass_ran: false,
             agents: Vec::new(),
             agent_instructions: agent_instructions::Outcome::default(),
         };
@@ -340,6 +446,7 @@ mod tests {
             daemon_was_running: false,
             config_written: false,
             summary: None,
+            semantic_pass_ran: false,
             agents: vec![AgentTarget::Claude, AgentTarget::Gemini],
             agent_instructions: agent_instructions::Outcome {
                 agents_md_written: true,
@@ -365,6 +472,7 @@ mod tests {
             daemon_was_running: false,
             config_written: false,
             summary: None,
+            semantic_pass_ran: false,
             agents: vec![AgentTarget::Claude],
             agent_instructions: agent_instructions::Outcome::default(),
         };
