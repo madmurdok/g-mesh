@@ -21,8 +21,10 @@
 //! binaries that ask for it, not built as a test binary of its own.
 
 use std::path::Path;
+use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
+use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -63,5 +65,34 @@ pub fn wait_until_indexed(root: &Path) {
             root.display()
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Sends `kill -9` to `pid` and does not return until the kernel has actually
+/// finished tearing the process down, not merely until the signal was
+/// delivered.
+///
+/// `kill -9` returning only means the signal was *delivered* - its `flock` on
+/// `daemon.lock` (`daemon::acquire_singleton_lock`) is released as part of
+/// teardown, not the instant the signal lands. A restart spawned immediately
+/// after a hand-rolled `stop()` that skipped this wait could race a
+/// not-yet-fully-dead process for that lock, lose (`try_lock`'s `WouldBlock`
+/// reads as "an incumbent is already serving"), and exit without ever binding
+/// a socket - which nothing retries, so a bootstrap budget that follows burns
+/// its whole timeout waiting for a socket that was never coming. Polling
+/// `daemon::is_process_alive` until it reports dead gives the same
+/// confirmation `cli::stop::stop` already gives its own callers (see
+/// `cli_stop.rs`'s `wait_for("the daemon to die", ...)`), just applied to a
+/// test's hand-rolled kill.
+///
+/// `allow(dead_code)`: each integration test file is its own crate, and only
+/// two of this module's many consumers hand-roll a kill; cargo has no way to
+/// see it is used from the crate that does not include this one.
+#[allow(dead_code)]
+pub fn kill_and_wait(pid: u32) {
+    let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).stderr(std::process::Stdio::null()).status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon::is_process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
