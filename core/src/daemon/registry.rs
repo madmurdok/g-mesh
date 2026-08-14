@@ -30,14 +30,43 @@
 //! but it is a guarantee worth stating, because the single-plugin daemon this
 //! replaces could not offer it: there, a broken plugin was a broken daemon.
 //!
-//! # Lock order
+//! # Lock order, and why nothing waits behind a spawn
 //!
-//! `supervisors` is the *outermost* lock in the daemon. It is taken only by
-//! [`get_or_spawn`](PluginRegistry::get_or_spawn), which releases it before
-//! its caller touches the supervisor it returns, so the existing order
+//! `supervisors` is the *outermost* lock in the daemon. It is released before
+//! any caller touches the supervisor it got back, so the existing order
 //! `daemon::lifecycle` documents (supervisor lock first, SQLite connection
 //! inside it) continues below this one and nothing ever reaches back up:
 //! a supervisor knows nothing about the registry that owns it.
+//!
+//! Since task 164 it is also only ever held for a map lookup or a single
+//! insert/remove - never across a spawn.
+//! [`get_or_spawn`](PluginRegistry::get_or_spawn) used to hold it for the
+//! whole process launch plus handshake, deliberately (task 154), because a
+//! get-or-insert under one lock is the simplest thing that cannot
+//! double-spawn a language. What that
+//! overlooked is that `std::sync::Mutex` has no reader/writer distinction, so
+//! *every* other caller of this map paid for it - including
+//! [`active_supervisors`](PluginRegistry::active_supervisors), which only
+//! wants to clone it, and through it [`has_pending`](PluginRegistry::has_pending),
+//! which every MCP tool call asks before it answers. One language's spawn
+//! stalled queries about every other language, and queries that needed no
+//! plugin at all (measured: 270-494ms, see `core/tests/cold_start_grace_wait.rs`).
+//!
+//! [`SupervisorSlot`] is what replaces it: a language being spawned right now
+//! has a `Spawning` marker in the map from before the lock is released until
+//! after the spawn ends, so the get-or-insert that rules out a double spawn is
+//! still one short critical section, and the spawn itself happens with no lock
+//! held at all. Readers skip a `Spawning` slot (there is no process to sleep,
+//! no queue to replay and no idle timer to check behind it yet); a second
+//! caller wanting the *same* language waits on the marker itself rather than
+//! on the map. See [`SpawnInProgress`] and [`SpawnReservation`].
+//!
+//! An `RwLock` alone would not have fixed this and is not what this uses: the
+//! problem was never that readers exclude each other, it was that one writer
+//! held the map for hundreds of milliseconds. A write guard taken across the
+//! same spawn would block readers for exactly as long. Once the spawn happens
+//! outside the lock there is nothing left for a read/write split to buy - every
+//! remaining critical section is a hash lookup.
 //!
 //! # Wired into `daemon::run` (task 155)
 //!
@@ -75,10 +104,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -229,6 +258,162 @@ pub(crate) fn fixture_indexer_version() -> String {
     indexer_version(&DiscoveredPlugins::default())
 }
 
+/// What the `supervisors` map holds for one language: a plugin that is up, or
+/// the reservation left behind by whoever is bringing it up right now.
+///
+/// The second arm is the whole of task 164's fix (see this module's doc
+/// comment). A spawn is hundreds of milliseconds of process launch and
+/// handshake; a map entry saying "someone is already doing that" costs one
+/// pointer and lets the map lock be released for every bit of it.
+#[derive(Clone)]
+enum SupervisorSlot {
+    /// A spawn is in flight. Cloned out from under the map lock by whoever
+    /// needs to wait for it - never waited on while that lock is held.
+    Spawning(Arc<SpawnInProgress>),
+    /// The plugin is up, and this is the supervisor every caller for this
+    /// language gets from now on.
+    Running(Arc<PluginSupervisor>),
+}
+
+impl SupervisorSlot {
+    /// The supervisor behind this slot, or `None` while its spawn is still in
+    /// flight.
+    ///
+    /// `None` rather than a wait, because every caller of
+    /// [`PluginRegistry::active_supervisors`] is asking about a *live* plugin:
+    /// a language still spawning has no process to put to sleep, no queue to
+    /// replay and no idle timer that could have expired, so there is nothing
+    /// for those callers to do about it even once it arrives. Waiting would
+    /// buy them exactly the stall this design exists to remove.
+    fn running(&self) -> Option<Arc<PluginSupervisor>> {
+        match self {
+            Self::Running(supervisor) => Some(Arc::clone(supervisor)),
+            Self::Spawning(_) => None,
+        }
+    }
+}
+
+/// The rendezvous behind a [`SupervisorSlot::Spawning`] entry: how a second
+/// caller for the same language finds out how the first one's spawn ended.
+///
+/// The outcome is carried here rather than left for waiters to re-read out of
+/// the map because a *failed* spawn leaves no map entry at all (a failure
+/// memoizes nothing - see [`PluginRegistry::get_or_spawn`]), so "look again"
+/// would say "absent" and send every waiter off to repeat a spawn that has
+/// just been shown not to work. Answering them with the failure the spawn
+/// actually hit is both cheaper and more honest.
+struct SpawnInProgress {
+    /// `None` until the spawning thread settles it.
+    ///
+    /// The failure side is a rendered string, not an `anyhow::Error`: one
+    /// failure has to be handed to arbitrarily many waiters and
+    /// `anyhow::Error` is not `Clone`. `{err:#}` keeps the whole context
+    /// chain, which is all any caller here does with it anyway (every one of
+    /// them logs it).
+    outcome: Mutex<Option<Result<Arc<PluginSupervisor>, String>>>,
+    settled: Condvar,
+}
+
+impl SpawnInProgress {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { outcome: Mutex::new(None), settled: Condvar::new() })
+    }
+
+    /// Blocks until the spawn this marker stands for has ended, and answers
+    /// with whatever it produced.
+    ///
+    /// Called with no other lock held - in particular not the map's, which is
+    /// the entire point - so a language spawning slowly holds up only the
+    /// callers that asked for that same language.
+    fn wait(&self) -> Result<Arc<PluginSupervisor>> {
+        let mut outcome = self.outcome.lock().unwrap();
+        while outcome.is_none() {
+            outcome = self.settled.wait(outcome).unwrap();
+        }
+        match outcome.as_ref().expect("the loop above only exits once it is settled") {
+            Ok(supervisor) => Ok(Arc::clone(supervisor)),
+            Err(message) => Err(anyhow!("{message}")),
+        }
+    }
+
+    /// Publishes how the spawn ended and releases everyone waiting on it.
+    fn settle(&self, outcome: Result<Arc<PluginSupervisor>, String>) {
+        *self.outcome.lock().unwrap() = Some(outcome);
+        self.settled.notify_all();
+    }
+}
+
+/// The [`SupervisorSlot::Spawning`] entry one caller put in the map, and the
+/// promise that it is replaced (on success) or removed (on failure) however
+/// the spawn ends.
+///
+/// A guard rather than a plain pair of statements because "however it ends"
+/// includes a panic. A reservation left behind by a thread that unwound would
+/// be a language nothing can ever spawn again and a marker every later caller
+/// waits on forever - a hang, where the old code's equivalent (a panic while
+/// holding the map lock) was at least a loud, poisoned-mutex failure. [`Drop`]
+/// below turns it back into a loud one.
+struct SpawnReservation<'registry> {
+    registry: &'registry PluginRegistry,
+    language: String,
+    marker: Arc<SpawnInProgress>,
+    settled: bool,
+}
+
+impl SpawnReservation<'_> {
+    /// Hands `spawned` back to the caller after making it the map's answer for
+    /// this language and releasing anyone who waited on it.
+    ///
+    /// The map is updated *before* the marker is settled, so a waiter released
+    /// by it can never observe a supervisor that
+    /// [`PluginRegistry::active_supervisors`] would still be blind to.
+    fn settle(&mut self, spawned: Result<Arc<PluginSupervisor>>) -> Result<Arc<PluginSupervisor>> {
+        let published = {
+            let mut supervisors = self.registry.supervisors.lock().unwrap();
+            match &spawned {
+                Ok(supervisor) => {
+                    supervisors.insert(
+                        self.language.clone(),
+                        SupervisorSlot::Running(Arc::clone(supervisor)),
+                    );
+                    Ok(Arc::clone(supervisor))
+                }
+                // A spawn that failed memoizes nothing, so the reservation
+                // goes too: the next file of this language tries again, which
+                // is the right behaviour for a plugin whose runtime is missing
+                // or briefly unavailable.
+                Err(err) => {
+                    supervisors.remove(&self.language);
+                    Err(format!("{err:#}"))
+                }
+            }
+        };
+        self.marker.settle(published);
+        self.settled = true;
+        spawned
+    }
+}
+
+impl Drop for SpawnReservation<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Only reachable while unwinding out of the spawn, so this deviates
+        // from the `.lock().unwrap()` this module uses everywhere else: a
+        // second panic here would abort the process outright, and the point of
+        // this guard is to leave a *reportable* failure behind rather than a
+        // permanently wedged language.
+        if let Ok(mut supervisors) = self.registry.supervisors.lock() {
+            supervisors.remove(&self.language);
+        }
+        self.marker.settle(Err(format!(
+            "the thread spawning the {} plugin panicked before it finished",
+            self.language
+        )));
+    }
+}
+
 /// The daemon's plugins: what was discovered, and which of them are running.
 pub struct PluginRegistry {
     /// Canonicalized, exactly as [`PluginSupervisor`] wants it - every
@@ -265,10 +450,14 @@ pub struct PluginRegistry {
     /// pipeline, one lazily-loaded model, however many plugins ask it to
     /// embed something.
     embedding: Arc<EmbeddingPipeline>,
-    /// language -> its supervisor, filled in lazily by
+    /// language -> its supervisor, or the reservation standing in for one
+    /// while it is being spawned ([`SupervisorSlot`]), filled in lazily by
     /// [`get_or_spawn`](Self::get_or_spawn). A language absent from this map
     /// is one whose files this daemon has not seen yet, not one that failed.
-    supervisors: Mutex<HashMap<String, Arc<PluginSupervisor>>>,
+    ///
+    /// Held for a lookup or a single insert/remove and nothing else - see this
+    /// module's doc comment for why that is a hard rule and not a preference.
+    supervisors: Mutex<HashMap<String, SupervisorSlot>>,
     /// Extensions already reported as unclaimed. A mixed-language repo where
     /// only some languages have plugins is an expected steady state, not an
     /// error, so it gets one line per extension for the whole daemon run
@@ -325,45 +514,70 @@ impl PluginRegistry {
     /// The supervisor for `language`, spawning its plugin if this is the
     /// first time anything has needed it.
     ///
-    /// # Why the map stays locked across the spawn
+    /// # Why the map is not locked across the spawn
     ///
     /// Spawning is not free - it is a process launch plus a handshake round
     /// trip, and for a plugin that starts a type checker it is the most
-    /// expensive thing the daemon ever does - so holding a daemon-wide lock
-    /// across it deserves an argument rather than an assumption.
+    /// expensive thing the daemon ever does. Task 154 held the map across all
+    /// of it, on the argument that a get-or-insert under one lock is the only
+    /// shape that cannot double-spawn a language: the naive alternative (look,
+    /// unlock, spawn, relock, insert) has two callers racing on the same new
+    /// language start two processes, one of which is then either killed -
+    /// paying its whole startup cost for nothing, precisely when the daemon is
+    /// busiest - or dropped without a `shutdown` and left running with nothing
+    /// reading its pipes.
     ///
-    /// The alternative (look, unlock, spawn, relock, insert) makes two
-    /// callers racing on the *same* new language spawn two processes, one of
-    /// which is then immediately thrown away: either killed - paying its
-    /// whole startup cost for nothing, and doing so precisely when the daemon
-    /// is busiest - or, if the loser is simply dropped without a
-    /// `shutdown`, left running with nothing reading its pipes. A get-or-
-    /// insert under one lock cannot produce that state at all.
+    /// That argument is still right about the alternative it considered, and
+    /// wrong about the cost, which turned out not to be "a caller wanting
+    /// language B waits behind a caller starting language A" at all: with one
+    /// plain `Mutex` over the map, *every* reader of it waited too - including
+    /// [`has_pending`](Self::has_pending), which every MCP tool call asks
+    /// before it answers, about languages it has nothing to do with. See this
+    /// module's doc comment (and task 164) for the measured effect.
     ///
-    /// What it costs instead is that a caller wanting language B waits behind
-    /// a caller starting language A. That is bounded and small: it happens at
-    /// most once per language per daemon run (afterwards this is a hash
-    /// lookup), the number of languages is the number of installed plugins,
-    /// and the wait is the same handshake the waiting caller would have had
-    /// to pay for its own plugin anyway. Nothing can deadlock behind it
-    /// either - `PluginSupervisor::start` takes no lock this daemon shares
-    /// (the supervisor it builds is not reachable by anyone else until this
-    /// function returns it), and no supervisor ever calls back into the
-    /// registry. A finer-grained scheme - a per-language spawn slot, so two
-    /// languages can start concurrently - would buy back only that one
-    /// serialized handshake, and is not worth a second lock to reason about
-    /// until a real install has enough plugins for it to matter.
+    /// So the reservation, not the spawn, is what this holds the lock for:
+    /// insert a [`SupervisorSlot::Spawning`] marker, release the map, spawn
+    /// with nothing locked, then swap the marker for the finished supervisor
+    /// under a second, equally short critical section
+    /// ([`SpawnReservation::settle`]). A concurrent caller for the *same*
+    /// language finds the marker and waits on that instead of on the map, so
+    /// it still cannot start a second process - the double-spawn guarantee is
+    /// unchanged - while a caller for any other language, and every reader,
+    /// is held up for a hash lookup rather than a handshake.
+    ///
+    /// Nothing can deadlock behind it: `PluginSupervisor::start` takes no lock
+    /// this daemon shares (the supervisor it builds is not reachable by anyone
+    /// else until it is published), no supervisor ever calls back into the
+    /// registry, and the wait above is entered only after the map lock has
+    /// been dropped.
     ///
     /// A spawn that *fails* memoizes nothing: the error goes to the caller
     /// and the next file of that language tries again, which is the right
     /// behaviour for a plugin whose runtime is missing or briefly
-    /// unavailable.
+    /// unavailable. Callers that were already waiting on that same spawn are
+    /// given its failure rather than each repeating it, which is the one
+    /// behavioural difference from the serialized version - and the honest
+    /// one: they asked while it was in flight, so it is their answer too.
     pub fn get_or_spawn(&self, language: &str) -> Result<Arc<PluginSupervisor>> {
         let mut supervisors = self.supervisors.lock().unwrap();
-        if let Some(running) = supervisors.get(language) {
-            return Ok(Arc::clone(running));
+        // Cloned out of the map so the decision below can act with the guard
+        // dropped - both arms leave the map lock before doing anything that
+        // takes longer than a hash lookup.
+        match supervisors.get(language).cloned() {
+            Some(SupervisorSlot::Running(running)) => return Ok(running),
+            Some(SupervisorSlot::Spawning(marker)) => {
+                drop(supervisors);
+                return marker.wait().with_context(|| {
+                    format!(
+                        "the in-progress spawn of the {language} plugin this call waited on failed"
+                    )
+                });
+            }
+            None => {}
         }
 
+        // Ahead of the reservation, so a language nothing was discovered for
+        // never leaves a marker behind for a spawn that is not going to happen.
         let manifest = self.discovered.manifests.get(language).with_context(|| {
             format!(
                 "no plugin was discovered for language \"{language}\" (discovered: {})",
@@ -371,15 +585,24 @@ impl PluginRegistry {
             )
         })?;
 
-        let supervisor = PluginSupervisor::start(
+        let marker = SpawnInProgress::new();
+        supervisors.insert(language.to_string(), SupervisorSlot::Spawning(Arc::clone(&marker)));
+        drop(supervisors);
+
+        let mut reservation = SpawnReservation {
+            registry: self,
+            language: language.to_string(),
+            marker,
+            settled: false,
+        };
+        let spawned = PluginSupervisor::start(
             &self.project_root,
             manifest.clone(),
             self.pid_file_for(language),
             self.idle_timeout,
             Arc::clone(&self.embedding),
-        )?;
-        supervisors.insert(language.to_string(), Arc::clone(&supervisor));
-        Ok(supervisor)
+        );
+        reservation.settle(spawned)
     }
 
     /// The watcher thread's entry point, with routing in front of it: hands
@@ -470,8 +693,15 @@ impl PluginRegistry {
     /// to replay, so [`daemon::lifecycle::supervise`](crate::daemon::lifecycle::supervise)
     /// and the MCP layer's wake/replay path both act on this set rather than
     /// on every discovered manifest.
+    ///
+    /// Never waits on anything: a language whose spawn is still in flight is
+    /// skipped (see [`SupervisorSlot::running`]), and the map lock is held for
+    /// the walk over what is already there and nothing else. That is what
+    /// makes this - and therefore [`has_pending`](Self::has_pending), which
+    /// every MCP tool call asks - safe to call while some other language, or
+    /// this same one, is in the middle of a spawn.
     pub fn active_supervisors(&self) -> Vec<Arc<PluginSupervisor>> {
-        self.supervisors.lock().unwrap().values().cloned().collect()
+        self.supervisors.lock().unwrap().values().filter_map(SupervisorSlot::running).collect()
     }
 
     /// Puts every active, idle-enough supervisor to sleep - one call to
@@ -489,7 +719,38 @@ impl PluginRegistry {
     /// Stops every active supervisor's plugin regardless of idleness - what
     /// the daemon does on its own way out, applied to every language that
     /// has ever been spawned rather than to one hardcoded supervisor.
+    ///
+    /// The one caller that waits for a spawn in flight rather than skipping
+    /// it, and the reason [`active_supervisors`](Self::active_supervisors) is
+    /// not enough here: this runs as the core exits, so a plugin that finishes
+    /// spawning a moment after being skipped would be a process nothing ever
+    /// deliberately ended, and a `plugin-<language>.pid` file written just
+    /// after `daemon::lifecycle::release_state_files` cleared it. Waiting
+    /// costs the shutdown path one handshake it was going to have to reap
+    /// anyway, and costs no other caller anything - nobody is waiting on a
+    /// daemon that is already on its way out.
+    ///
+    /// One pass, not a loop until the map is quiet: this waits for the spawns
+    /// that were in flight when it was called, which is the guarantee it
+    /// needs, rather than promising to outlast a thread that keeps starting
+    /// new ones.
     pub fn sleep_all_now(&self, reason: &str) {
+        let in_flight: Vec<Arc<SpawnInProgress>> = {
+            let supervisors = self.supervisors.lock().unwrap();
+            supervisors
+                .values()
+                .filter_map(|slot| match slot {
+                    SupervisorSlot::Spawning(marker) => Some(Arc::clone(marker)),
+                    SupervisorSlot::Running(_) => None,
+                })
+                .collect()
+        };
+        for marker in in_flight {
+            // Its failure, if it failed, is already the spawning caller's to
+            // report; all this needs is for it to be over.
+            let _ = marker.wait();
+        }
+
         for supervisor in self.active_supervisors() {
             supervisor.sleep_now(reason);
         }
@@ -498,6 +759,12 @@ impl PluginRegistry {
     /// Whether any active supervisor has something queued for its next wake -
     /// the registry's analog of [`PluginSupervisor::has_pending`], cheap
     /// enough to ask on every MCP tool call the same way that one already is.
+    ///
+    /// "Cheap" is a property of the whole path, not just of the atomic each
+    /// supervisor answers from: this is the call every MCP handler makes
+    /// before it answers anything (`mcp::GMeshMcpServer::replay_queued_changes`),
+    /// so the map lookup underneath it must never be able to queue behind a
+    /// spawn - see [`active_supervisors`](Self::active_supervisors).
     pub fn has_pending(&self) -> bool {
         self.active_supervisors().iter().any(|supervisor| supervisor.has_pending())
     }
@@ -591,6 +858,25 @@ mod tests {
     fn registry_over(
         languages: &[&str],
     ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+        registry_over_inner(languages, false)
+    }
+
+    /// [`registry_over`], over plugins whose spawn does not finish until the
+    /// test opens their handshake gate - what every test about *while a spawn
+    /// is in flight* is built on, since that window is otherwise a few
+    /// unobservable milliseconds wide. See `test_plugin::install_gated`, and
+    /// note its warning: every one of those tests has to open the gate on
+    /// every path, or the thread it left spawning never joins.
+    fn registry_over_gated(
+        languages: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+        registry_over_inner(languages, true)
+    }
+
+    fn registry_over_inner(
+        languages: &[&str],
+        gated: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -598,7 +884,9 @@ mod tests {
             .iter()
             .map(|language| {
                 let extension = extension_for(language);
-                test_plugin::install(plugins.path(), language, &[extension.as_str()])
+                let install =
+                    if gated { test_plugin::install_gated } else { test_plugin::install };
+                install(plugins.path(), language, &[extension.as_str()])
             })
             .collect();
 
@@ -998,6 +1286,247 @@ mod tests {
         registry.file_changed(&conn, "other.go-src".to_string());
         assert_eq!(go.pid(), Some(go_pid), "and it must still be serving off that same process");
         assert_eq!(test_plugin::spawns(go_dir).len(), 1);
+    }
+
+    /// How long the task-164 tests below give a plugin *process* to appear
+    /// once something has asked for it. Only ever hit by a genuine failure, so
+    /// it is generous: a `node` start under a fully parallel `cargo test` has
+    /// been measured taking over a second on this machine, and none of these
+    /// tests is about how long that takes.
+    const SPAWN_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// How long a test waits for a reader thread it expects straight back.
+    /// Reaching this means the reader is blocked on the in-progress spawn -
+    /// which nothing releases until the test itself does, further down - so it
+    /// is a failure signal, not a timing measurement.
+    const READER_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// What the reader call itself is allowed to cost once it has been shown
+    /// to come back at all. Deliberately loose next to the map lookup it
+    /// really measures: [`READER_DEADLINE`] is what catches a reader that
+    /// waited on the spawn, and this only has to rule out a reader that
+    /// somehow waited on *most* of one without a loaded machine's scheduling
+    /// noise failing it by accident.
+    const READER_BUDGET: Duration = Duration::from_millis(500);
+
+    /// Whether `plugin_dir`'s plugin has been started `count` times, waiting
+    /// up to [`SPAWN_DEADLINE`] for it.
+    ///
+    /// A `bool` rather than an assertion because the caller usually has a gate
+    /// to open before it is allowed to fail (see `test_plugin::install_gated`):
+    /// panicking here would leave a thread spawning forever and hang the test
+    /// instead of failing it.
+    ///
+    /// The fixture plugin records its pid before it does anything else, so
+    /// against a gated plugin this returns *during* the spawn - the process
+    /// exists, `PluginProcess::spawn` is still blocked reading its handshake -
+    /// which is exactly the state the tests below need, entered by observation
+    /// rather than by sleeping a guessed amount.
+    fn spawned_within(plugin_dir: &Path, count: usize) -> bool {
+        let deadline = std::time::Instant::now() + SPAWN_DEADLINE;
+        while test_plugin::spawns(plugin_dir).len() < count {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    /// Task 164's headline acceptance criterion: a reader of the registry is
+    /// not blocked behind an in-progress spawn - not even the spawn of the
+    /// very language it is asking about.
+    ///
+    /// `has_pending` is the call that made this matter (every MCP tool call
+    /// asks it, via `mcp::GMeshMcpServer::replay_queued_changes`), and
+    /// `active_supervisors` is what it and every other reader goes through.
+    /// Both are called from a thread of their own while the spawn is held
+    /// open, so "was it blocked" is answered by whether that thread comes back
+    /// at all rather than by how long anything took: before this fix they took
+    /// the same `Mutex` `get_or_spawn` held for the whole spawn, so the reader
+    /// could not return until the gate below was opened - which happens after
+    /// it is waited for.
+    #[test]
+    fn a_reader_is_not_held_up_by_an_in_progress_spawn() {
+        let (_project, _plugins, dirs, registry) = registry_over_gated(&["python"]);
+        let python = &dirs[0];
+
+        let (in_flight, measured): (bool, Option<(usize, bool, Duration)>) =
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    registry.get_or_spawn("python").expect("the fixture plugin must start");
+                });
+                // The process is up and waiting on its gate: the spawn is in
+                // flight, and stays that way until this test says otherwise.
+                let in_flight = spawned_within(python, 1);
+
+                let measured = in_flight.then(|| {
+                    let (reported, reports) = std::sync::mpsc::channel();
+                    let reader = &registry;
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let active = reader.active_supervisors().len();
+                        let pending = reader.has_pending();
+                        let _ = reported.send((active, pending, started.elapsed()));
+                    });
+                    reports.recv_timeout(READER_DEADLINE).ok()
+                });
+
+                // Before anything is asserted, whatever happened above: a
+                // spawning thread that is never let go never joins, and this
+                // scope would hang instead of failing.
+                test_plugin::open_handshake_gate(python);
+                (in_flight, measured.flatten())
+            });
+
+        assert!(in_flight, "the plugin process never started, so no spawn was ever in flight");
+        let (active, pending, elapsed) = measured.expect(
+            "a reader never came back while a spawn was in flight - it is blocked behind it",
+        );
+        // Nothing is reported yet, which is what proves the reader really did
+        // run inside the spawn rather than after it.
+        assert_eq!(
+            active, 0,
+            "a language whose spawn has not finished is not an active supervisor yet"
+        );
+        assert!(!pending, "a supervisor that does not exist yet has nothing queued");
+        assert!(elapsed < READER_BUDGET, "a reader spent most of a spawn waiting: {elapsed:?}");
+
+        // ...and once the spawn lands, the same readers see it, so skipping
+        // the slot was a deferral and not a drop.
+        assert_eq!(registry.active_supervisors().len(), 1);
+        assert_eq!(test_plugin::spawns(python).len(), 1, "exactly one process, once");
+    }
+
+    /// Task 154's guarantee, kept: callers racing on the same unspawned
+    /// language produce exactly one process, and the same supervisor for
+    /// everyone. Asserted against a plugin whose spawn is held open until
+    /// every racer has had its chance at it, rather than one that comes up so
+    /// fast the race is over before it starts.
+    #[test]
+    fn racing_callers_for_one_language_still_spawn_exactly_one_process() {
+        let (_project, _plugins, dirs, registry) = registry_over_gated(&["python"]);
+        let python = &dirs[0];
+
+        let supervisors: Vec<Arc<PluginSupervisor>> = std::thread::scope(|scope| {
+            let racers: Vec<_> =
+                (0..4).map(|_| scope.spawn(|| registry.get_or_spawn("python"))).collect();
+
+            // One racer has reserved the slot and its process is up; the
+            // others get a moment to reach the same call before that spawn is
+            // allowed to finish. Any of them that got past the reservation
+            // would start a second process, which the spawn log below counts -
+            // the grace period makes the race real, it is not what makes the
+            // assertion true.
+            let in_flight = spawned_within(python, 1);
+            std::thread::sleep(Duration::from_millis(20));
+            test_plugin::open_handshake_gate(python);
+            assert!(in_flight, "the plugin process never started");
+
+            racers
+                .into_iter()
+                .map(|racer| {
+                    racer.join().expect("no racer may panic").expect("the fixture plugin must start")
+                })
+                .collect()
+        });
+
+        assert_eq!(
+            test_plugin::spawns(python).len(),
+            1,
+            "four callers racing on one language must not start four plugin processes"
+        );
+        assert_eq!(registry.supervisors.lock().unwrap().len(), 1);
+        for supervisor in &supervisors {
+            assert!(
+                Arc::ptr_eq(supervisor, &supervisors[0]),
+                "every racer must be handed the one supervisor that was actually spawned"
+            );
+        }
+    }
+
+    /// The other half of what the old whole-spawn lock cost: two *different*
+    /// languages could not start at the same time either.
+    ///
+    /// Asserted on processes rather than on elapsed time, and so without a
+    /// timing assumption of any kind: both plugins have to be *running* while
+    /// neither handshake has been let through, which under a lock held across
+    /// the whole spawn is impossible by construction - whichever language got
+    /// there first would hold the map until its own gate opened, and the
+    /// second language's process could not even be launched.
+    #[test]
+    fn two_languages_spawn_at_the_same_time_rather_than_one_after_the_other() {
+        let (_project, _plugins, dirs, registry) = registry_over_gated(&["python", "go"]);
+        let (python, go) = (&dirs[0], &dirs[1]);
+
+        let both_up = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                registry.get_or_spawn("python").expect("the python fixture must start");
+            });
+            scope.spawn(|| {
+                registry.get_or_spawn("go").expect("the go fixture must start");
+            });
+
+            let both_up = spawned_within(python, 1) && spawned_within(go, 1);
+            test_plugin::open_handshake_gate(python);
+            test_plugin::open_handshake_gate(go);
+            both_up
+        });
+
+        assert!(
+            both_up,
+            "one language's process never started while the other's spawn was in flight - \
+             the two spawns were serialized"
+        );
+        assert_eq!(registry.active_supervisors().len(), 2);
+    }
+
+    /// A spawn that fails still memoizes nothing - the criterion the old
+    /// implementation met by never inserting anything, and this one has to
+    /// meet by removing the reservation it did insert. The callers that were
+    /// waiting on it are answered with its failure rather than each repeating
+    /// it, and the language is spawnable again the moment its plugin works.
+    #[test]
+    fn a_failed_spawn_memoizes_nothing_and_answers_everyone_waiting_on_it() {
+        let (_project, plugins, dirs, registry) = registry_over(&["python"]);
+        // A plugin whose runtime is broken: it stays up long enough for the
+        // other callers to pile in behind it, then exits without ever sending
+        // a handshake, which is what `PluginProcess::spawn` fails on.
+        fs::write(
+            dirs[0].join("plugin.js"),
+            "// Generated by daemon::registry's tests - a plugin that never handshakes.\n\
+             setTimeout(() => process.exit(1), 200);\n",
+        )
+        .expect("failed to break the fixture plugin");
+
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| match registry.get_or_spawn("python") {
+                        Ok(_) => panic!("a plugin that never handshakes must not start"),
+                        Err(err) => format!("{err:#}"),
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|racer| racer.join().expect("no racer may panic")).collect()
+        });
+
+        assert_eq!(failures.len(), 3);
+        for failure in &failures {
+            assert!(failure.contains("python"), "the failure must name the language: {failure}");
+        }
+        assert!(
+            registry.supervisors.lock().unwrap().is_empty(),
+            "a failed spawn - reservation and all - must leave the map exactly as it found it"
+        );
+
+        // Nothing is wedged: the next caller after the plugin is fixed gets a
+        // real supervisor, which a leftover reservation would have made
+        // impossible (it would wait forever on a spawn that already ended).
+        test_plugin::install(plugins.path(), "python", &[extension_for("python").as_str()]);
+        let supervisor = registry.get_or_spawn("python").expect("the repaired plugin must start");
+        assert_eq!(supervisor.language(), "python");
+        assert_eq!(registry.active_supervisors().len(), 1);
     }
 
     #[test]
