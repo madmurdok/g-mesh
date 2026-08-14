@@ -338,8 +338,19 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
          export function alphaAgain(): number {\n  return alpha() + 1;\n}\n",
     );
     // Long enough for the watcher event to have been delivered and handled;
-    // what it was handled *into* is what the assertion below is about.
-    thread::sleep(Duration::from_millis(300));
+    // what it was handled *into* is what the assertion below is about. Since
+    // task 129 "handled" is no longer near-instant: the watcher thread now
+    // debounces (`daemon::DEBOUNCE_WINDOW`, 300ms as of this writing) before
+    // it even looks at a raw event, and its own poll loop only re-checks on
+    // that same cadence, so worst case is comfortably more than one window,
+    // not one. This has to clear that *before* the MCP session below opens -
+    // otherwise `prepare`'s `replay_queued_changes` (`mcp::mod`) can run
+    // ahead of the debounce settling, find nothing queued yet, and let a
+    // same-request `ensure_file_fresh` for the other file wake the plugin
+    // first; the alpha.ts change would then reach the plugin directly once
+    // its own debounce fires, rather than through the queued-replay path
+    // this test's `replayed_paths()` asserts on.
+    thread::sleep(Duration::from_millis(900));
     assert!(
         !project.index_contains("alphaAgain"),
         "a sleeping plugin must queue the change, not reparse it - nothing may reach the index \

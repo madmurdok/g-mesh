@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 /// gone quiet for `window` - i.e. it fires on the trailing edge, once, per
 /// burst. Different paths track independent timers, so unrelated files
 /// never coalesce with each other.
+///
+/// Constructed and driven by `daemon::run`'s watcher thread since task 129
+/// (`daemon::watch_and_route_once`, windowed by `daemon::DEBOUNCE_WINDOW`) -
+/// see that thread's own comment for why this type, specifically, is what
+/// closes the "one plugin round trip per raw event" gap, and why
+/// `watcher::burst::BurstBatcher` is not wired in alongside it.
 pub struct Debouncer {
     window: Duration,
     last_seen: HashMap<PathBuf, Instant>,

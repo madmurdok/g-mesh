@@ -46,15 +46,25 @@
 //! for reasons specific to this second window that do not hold for the
 //! first:
 //!
-//! - **The window is narrower than it sounds, and for a reason worth
-//!   recording.** `daemon::run`'s watcher thread has no debounce actually
-//!   wired in - `watcher::debounce::Debouncer` is built and unit-tested but
-//!   never constructed there (see that function's own comment). So the gap a
-//!   query can land in is "OS file-watch event latency plus one
-//!   reparse-and-commit round trip to the plugin", not a deliberately
-//!   batched settling window. It only grows under a burst of near-simultaneous
-//!   writes (e.g. `git checkout`), and then only because changes are applied
-//!   one at a time, never because anything is waiting on purpose.
+//! - **The window is bounded, and - since task 129 - deliberately so.**
+//!   `daemon::run`'s watcher thread now debounces: raw events are recorded
+//!   into a `watcher::debounce::Debouncer` and only routed to the plugin once
+//!   a path has gone quiet for `daemon::DEBOUNCE_WINDOW` (300ms) - see
+//!   `daemon::watch_and_route_once`. Before that task, the gap a query could
+//!   land in was "OS file-watch event latency plus one reparse-and-commit
+//!   round trip to the plugin," and it grew under a burst of near-simultaneous
+//!   writes only because changes were applied one at a time, never because
+//!   anything was waiting on purpose. That second half is no longer true: a
+//!   deliberate wait is now exactly the point, trading a bounded amount of
+//!   this staleness window for coalescing a burst's plugin round trips into
+//!   one. What has not changed is that the wait is bounded and known - "OS
+//!   latency plus up to one debounce window plus one round trip," not
+//!   unbounded - which is what keeps the next bullet's argument (a query in
+//!   this window reads stale-but-consistent data, never a torn graph) holding
+//!   regardless of the window's exact width. `watcher::burst::BurstBatcher`
+//!   is a different type, for a different problem, and is deliberately not
+//!   wired in here at all - see `daemon::run`'s own comment on the watcher
+//!   thread for why.
 //! - **It cannot be answered with a torn or half-built graph.**
 //!   `apply_file_change` holds the *same* `Arc<Mutex<Connection>>` every MCP
 //!   handler locks to answer a query, for the entire reparse-plus-commit, and

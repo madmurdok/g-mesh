@@ -40,6 +40,27 @@
 //! "the second file of the same language reuses the first supervisor" and
 //! "waking a sleeping supervisor re-spawns the plugin its own manifest names"
 //! into assertions about processes rather than about return values.
+//!
+//! # Counting round trips
+//!
+//! Same idea, one level down: every framed request that carries an id (a
+//! real round trip, as opposed to the handshake or a notification) is
+//! appended to `requests.log` in the same directory, as `"<method>
+//! <filePath>"`, before it is answered ([`requests`]). Task 129 is what
+//! first needed this - "a burst of rapid saves to the same file costs one
+//! plugin round trip, not one per save" is a claim about how many times the
+//! plugin was actually asked, and `spawns.log` alone cannot distinguish a
+//! debounced burst from a single lucky one that never crashed the process it
+//! was already talking to.
+//!
+//! [`file_changed_requests`] narrows that log to just the `fileChanged`
+//! entries - what `PluginSupervisor::file_changed`/`apply_file_change`
+//! actually sends per incremental reparse - excluding the `semanticPass`
+//! request `apply_file_change` also always sends on the very same round trip
+//! (`watcher::apply::apply_file_change`'s own doc comment): that one is a
+//! fixed 1:1 side effect of a `fileChanged` request, not a second thing a
+//! debounce test is checking, so counting both together would double every
+//! number for a reason unrelated to what changed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +73,10 @@ use crate::storage::schema;
 
 /// The file each fake plugin process appends its pid to on startup.
 const SPAWN_LOG: &str = "spawns.log";
+
+/// The file each fake plugin process appends one line to per answered
+/// request that carried an id - see this module's "Counting round trips" doc.
+const REQUEST_LOG: &str = "requests.log";
 
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
@@ -75,6 +100,31 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(SPAWN_LOG)) else { return Vec::new() };
     log.lines().filter_map(|line| line.trim().parse().ok()).collect()
+}
+
+/// Every id-carrying request this plugin directory's process(es) have ever
+/// answered, oldest first, across every spawn, as `"<method> <filePath>"`
+/// (`filePath` empty for a request with no such field, e.g. `status`).
+/// Empty (rather than a panic) before the first one, same as [`spawns`].
+pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugin_dir.join(REQUEST_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Just the `fileChanged` requests among [`requests`], as the file path each
+/// one named - i.e. one entry per real `PluginSupervisor::file_changed` ->
+/// `apply_file_change` round trip, the granularity task 129's debounce test
+/// cares about. Deliberately excludes the `semanticPass` request
+/// `apply_file_change` also always sends on the same round trip
+/// (`watcher::apply::apply_file_change`'s own doc): that one is a fixed,
+/// pre-existing 1:1 side effect of *this* one, not a second thing debouncing
+/// could coalesce away, and counting it in would double every number below
+/// for a reason that has nothing to do with what this test is checking.
+pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
+    requests(plugin_dir)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("fileChanged ").map(str::to_string))
+        .collect()
 }
 
 /// A fresh in-memory index for the (empty) diffs a fake plugin's round trips
@@ -189,6 +239,8 @@ process.stdin.on("data", (chunk) => {{
     const request = JSON.parse(buffered.slice(bodyStart, bodyEnd).toString("utf8"));
     buffered = buffered.slice(bodyEnd);
     if (request.id !== undefined && request.id !== null) {{
+      const filePath = (request.params && request.params.filePath) || "";
+      fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
       writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
     }}
   }}
