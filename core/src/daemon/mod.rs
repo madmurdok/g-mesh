@@ -457,15 +457,16 @@ pub fn run(root: &Path) -> Result<()> {
         // startup over it would throw away a perfectly good index.
         //
         // Run inline, not backgrounded, deliberately - a background thread
-        // was tried here and reverted. `get_or_spawn` now has to spawn the
-        // plugin process itself the first time anything needs it (this call
-        // used to be the one exception, running against a supervisor the
-        // daemon had already spawned unconditionally before this point), so
-        // running it inline does cost the first post-cold-start query some
-        // real latency it did not pay before - see task 164, which owns
-        // fixing that properly (finer-grained locking in `PluginRegistry` so
-        // an unrelated reader is never held up by someone else's spawn).
-        // Backgrounding this call instead is the wrong fix for it: this pass
+        // was tried here and reverted. `get_or_spawn` has to spawn the plugin
+        // process itself the first time anything needs it (this call used to
+        // be the one exception, running against a supervisor the daemon had
+        // already spawned unconditionally before this point), and a query
+        // arriving alongside it used to wait out that whole spawn - the
+        // registry's supervisors lock was held for all of it. That was task
+        // 164, and it is fixed where it belonged: the lock is now held for a
+        // map lookup only, so a concurrent query waits on nothing (see
+        // `daemon::registry`'s doc comment). Backgrounding this call instead
+        // was the wrong fix for it, and still is: this pass
         // and the watcher's own incremental per-file semantic passes both
         // ultimately serialize on the same plugin process, but nothing
         // orders *which* of two independently-triggered passes commits last,

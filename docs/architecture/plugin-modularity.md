@@ -335,6 +335,16 @@ pub struct PluginRegistry {
     discovered: DiscoveredPlugins,
     idle_timeout: Option<Duration>,
     embedding: Arc<EmbeddingPipeline>,
+    /// Shipped as `Mutex<HashMap<String, SupervisorSlot>>`, where a slot is
+    /// either a running supervisor or the reservation left by whoever is
+    /// spawning that language right now — not the plain
+    /// `Mutex<HashMap<String, Arc<PluginSupervisor>>>` sketched here (task
+    /// 164). The map value had to grow a second state because this lock is
+    /// also what every reader of the registry takes (`active_supervisors`,
+    /// and through it `has_pending`, which every MCP tool call asks), so a
+    /// `get_or_spawn` that held it across a process launch plus handshake
+    /// stalled queries that had nothing to do with the language being
+    /// spawned. See `daemon::registry`'s module doc.
     supervisors: Mutex<HashMap<String, Arc<PluginSupervisor>>>, // lazily filled
 }
 
@@ -345,6 +355,10 @@ impl PluginRegistry {
     pub fn language_for(&self, file_path: &str) -> Option<&str>;
 
     /// Existing supervisor for `language`, or spawns and memoizes a new one.
+    /// Reserves the map entry under a short lock, spawns with none held, and
+    /// swaps the reservation for the supervisor under a second short one, so
+    /// two callers still cannot double-spawn one language while no unrelated
+    /// caller waits on either step (task 164).
     pub fn get_or_spawn(&self, language: &str) -> Result<Arc<PluginSupervisor>>;
 
     /// Routes to the right supervisor via `language_for`; a no-match logs
