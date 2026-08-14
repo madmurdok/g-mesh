@@ -32,6 +32,7 @@ use crate::gc::last_used;
 use crate::mcp;
 use crate::storage::connection::{self, project_dir};
 use crate::storage::schema;
+use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
 
 const SOCKET_FILE: &str = "daemon.sock";
@@ -49,13 +50,29 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// on it would deadlock against the shim waiting for the daemon.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
-/// How long the watcher thread blocks waiting for the next change before
-/// looping round to wait again. Nothing depends on the number - the loop is
-/// unconditional - it only keeps the thread from parking forever on a channel
-/// whose sender may have gone away. Deliberately not related to either idle
+/// How long the watcher thread waits, after the most recent raw filesystem
+/// event for a given path, before treating that path's burst as settled and
+/// asking the plugin to reparse it - the window
+/// [`watcher::debounce::Debouncer`](crate::watcher::debounce::Debouncer)
+/// coalesces around. Task 129 wired that debouncer in; before it, this
+/// constant (then named `WATCH_POLL_INTERVAL`, three orders of magnitude
+/// larger) only bounded how long the loop blocked between iterations so it
+/// never parked forever on a channel whose sender had gone away - nothing
+/// depended on its actual value. That is no longer true: this loop now also
+/// depends on this being short enough to notice a settled burst promptly (a
+/// path recorded just before the channel goes quiet is only drained the next
+/// time the loop wakes up on its own), so it doubles as both the debounce
+/// window and the idle poll bound. Deliberately not related to either idle
 /// timeout: the plugin's sleep is decided by `daemon::lifecycle`, never by how
 /// long this happened to wait.
-const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(3600);
+///
+/// 300ms: long enough to coalesce the rapid-fire re-saves a real burst
+/// produces (editor autosave, a formatter re-writing the file it just saved,
+/// `git checkout`/`git pull` touching many files at once) into a single
+/// plugin round trip per file, short enough that an isolated, ordinary edit
+/// still reaches the plugin promptly - in the same range most editors and
+/// file-watch tooling already use for the same trade-off.
+const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
 /// The AF_UNIX socket a project's daemon listens on. The shim derives the
 /// same path from its own cwd, which is how the two find each other without
@@ -457,15 +474,16 @@ pub fn run(root: &Path) -> Result<()> {
         // startup over it would throw away a perfectly good index.
         //
         // Run inline, not backgrounded, deliberately - a background thread
-        // was tried here and reverted. `get_or_spawn` now has to spawn the
-        // plugin process itself the first time anything needs it (this call
-        // used to be the one exception, running against a supervisor the
-        // daemon had already spawned unconditionally before this point), so
-        // running it inline does cost the first post-cold-start query some
-        // real latency it did not pay before - see task 164, which owns
-        // fixing that properly (finer-grained locking in `PluginRegistry` so
-        // an unrelated reader is never held up by someone else's spawn).
-        // Backgrounding this call instead is the wrong fix for it: this pass
+        // was tried here and reverted. `get_or_spawn` has to spawn the plugin
+        // process itself the first time anything needs it (this call used to
+        // be the one exception, running against a supervisor the daemon had
+        // already spawned unconditionally before this point), and a query
+        // arriving alongside it used to wait out that whole spawn - the
+        // registry's supervisors lock was held for all of it. That was task
+        // 164, and it is fixed where it belonged: the lock is now held for a
+        // map lookup only, so a concurrent query waits on nothing (see
+        // `daemon::registry`'s doc comment). Backgrounding this call instead
+        // was the wrong fix for it, and still is: this pass
         // and the watcher's own incremental per-file semantic passes both
         // ultimately serialize on the same plugin process, but nothing
         // orders *which* of two independently-triggered passes commits last,
@@ -536,38 +554,41 @@ pub fn run(root: &Path) -> Result<()> {
         let conn = Arc::clone(&conn);
         let registry = Arc::clone(&registry);
         let root = canonical_root.clone();
-        // Debouncer/BurstBatcher (watcher::debounce, watcher::burst) would
-        // coalesce a burst of saves into fewer plugin round trips, but
-        // wiring them in is nice-to-have, not required by this ticket's
-        // acceptance criteria - left for a later pass rather than scope-
-        // creeping into a batching rewrite here.
-        thread::spawn(move || loop {
-            match watcher.next_change(WATCH_POLL_INTERVAL) {
-                None => continue, // nothing arrived within the poll window; keep waiting
-                Some(path) => {
-                    let Some(file_path) = relative_wire_path(&root, &path) else {
-                        // Outside the project root - shouldn't happen given how
-                        // ProjectWatcher is scoped, but there is nothing to
-                        // route a plugin request for if it does.
-                        continue;
-                    };
-                    if file_path.is_empty() {
-                        // The project root itself, which macOS reports as a
-                        // change to the directory a file was written in. There
-                        // is no file to reparse, and queueing it would put a
-                        // path the plugin cannot answer for into the replay
-                        // list a sleeping core builds.
-                        continue;
-                    }
-                    // Routed to whichever language claims this file's
-                    // extension, spawning that plugin if this is the first
-                    // file of its kind (`daemon::registry::PluginRegistry
-                    // ::file_changed`); applied now if that plugin is awake,
-                    // queued for its next wake if it is asleep - the
-                    // supervisor it resolves to owns that decision because
-                    // only it can read both facts at once.
-                    registry.file_changed(&conn, file_path);
-                }
+        // `watcher::debounce::Debouncer` is wired in here (task 129): raw
+        // events are recorded into it instead of routed straight to the
+        // registry, and only a path whose debounce window has gone quiet is
+        // actually sent to the plugin - see `watch_and_route_once` below for
+        // the per-iteration shape and `DEBOUNCE_WINDOW` for the window and
+        // why its value is no longer a "nothing depends on this" constant.
+        //
+        // `watcher::burst::BurstBatcher` is a different type for a different
+        // problem and is deliberately *not* wired in here. Its job is
+        // coalescing already-produced diffs from *several different files*
+        // into one SQLite transaction - but the plugin's own wire protocol
+        // (`protocol::types`, `plugins/typescript/src/protocol.ts`) has no
+        // batch request: every file still needs its own `FileChanged`
+        // round trip to the plugin no matter how those round trips' diffs
+        // get committed afterward, so `BurstBatcher` would not reduce the
+        // thing this ticket is about - plugin round trips - for a burst
+        // touching many distinct files (a `git checkout`, say). What it
+        // would reduce is SQLite commit count, and reaching that would mean
+        // splitting `daemon::plugin::PluginProcess::apply_file_change`'s
+        // single locked round trip into "get the diff from the plugin" and
+        // "commit it", so several files' round trips could share one
+        // `BurstBatcher::flush_if_ready` commit - a real change to that
+        // module's crash-recovery/pending-queue contract and to
+        // `ensure_fresh`'s synchronous per-file check (both hold the same
+        // connection this would need to leave uncommitted for longer), not
+        // "construct an existing type here". `Debouncer` alone already
+        // clears this ticket's acceptance bar - fewer plugin round trips for
+        // a burst of rapid saves - for the shape its own problem statement
+        // leads with (editor autosave rewriting the same file repeatedly);
+        // batching *different* files' commits is real, separate work left
+        // for its own ticket rather than folded in here as scope creep.
+        thread::spawn(move || {
+            let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+            loop {
+                watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
             }
         });
     }
@@ -578,6 +599,49 @@ pub fn run(root: &Path) -> Result<()> {
     // returns and the OS reclaims the socket, the watchers and the SQLite
     // handle.
     lifecycle::supervise(&dir, &registry, &core_activity, timeouts, accept_loop)
+}
+
+/// One iteration of the watcher thread's loop: waits up to [`DEBOUNCE_WINDOW`]
+/// for the next raw change, records it into `debouncer`, then routes every
+/// path whose debounce window has gone quiet since - possibly none, possibly
+/// more than one - to `registry`.
+///
+/// Pulled out of the `thread::spawn` closure in [`run`] as its own function
+/// so a test can drive it directly, one call per iteration, without spawning
+/// a real background thread: [`run`]'s own loop is just this called
+/// unconditionally forever.
+fn watch_and_route_once(
+    watcher: &ProjectWatcher,
+    debouncer: &mut Debouncer,
+    root: &Path,
+    conn: &Mutex<Connection>,
+    registry: &PluginRegistry,
+) {
+    if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
+        debouncer.record(path);
+    }
+    for settled in debouncer.drain_ready() {
+        let Some(file_path) = relative_wire_path(root, &settled) else {
+            // Outside the project root - shouldn't happen given how
+            // ProjectWatcher is scoped, but there is nothing to route a
+            // plugin request for if it does.
+            continue;
+        };
+        if file_path.is_empty() {
+            // The project root itself, which macOS reports as a change to
+            // the directory a file was written in. There is no file to
+            // reparse, and queueing it would put a path the plugin cannot
+            // answer for into the replay list a sleeping core builds.
+            continue;
+        }
+        // Routed to whichever language claims this file's extension,
+        // spawning that plugin if this is the first file of its kind
+        // (`daemon::registry::PluginRegistry::file_changed`); applied now if
+        // that plugin is awake, queued for its next wake if it is asleep -
+        // the supervisor it resolves to owns that decision because only it
+        // can read both facts at once.
+        registry.file_changed(conn, file_path);
+    }
 }
 
 /// Runs the MCP accept loop until the process is killed.
@@ -671,12 +735,43 @@ fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// How long [`acquire_singleton_lock`] keeps retrying a contended lock before
+/// concluding a live incumbent holds it.
+///
+/// Bounded well below the shim's shortest observed bootstrap budget (1s in
+/// `serving_while_indexing.rs`'s tests, 10s by default) so a genuinely
+/// running second daemon still gives up promptly - this only papers over a
+/// release that is already in flight, not a real incumbent.
+const SINGLETON_LOCK_RETRY_BUDGET: Duration = Duration::from_millis(300);
+
+/// How long each retry waits before trying the lock again. Short next to
+/// [`SINGLETON_LOCK_RETRY_BUDGET`] so the kernel's async release of a just-
+/// killed predecessor's `flock` (see below) is caught within a handful of
+/// attempts rather than costing most of the budget on one long sleep.
+const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Takes the project's daemon lock, or reports that someone else holds it.
 ///
 /// The returned `File` must stay alive for as long as the daemon runs: the
 /// lock is advisory and tied to the open file, so dropping it (or exiting,
 /// or being killed) releases it - which is exactly what lets the next daemon
 /// take over from a crashed one without any stale-lock cleanup.
+///
+/// # Why a contended lock is retried instead of failing immediately
+///
+/// A `kill -9`'d predecessor's `flock` is released by the kernel as part of
+/// its teardown, not the instant the signal lands or even the instant the
+/// process stops being visible to `kill(pid, 0)` (`is_process_alive`) - the
+/// fd table is torn down slightly later. A replacement daemon bootstrapped
+/// immediately after such a kill (exactly what a test harness restarting a
+/// daemon does, and what a crash-and-respawn does in the wild) can therefore
+/// find the lock still held by a process that is, for every purpose other
+/// than this exact race, already gone. Retrying briefly tells that case apart
+/// from an actual incumbent without changing the outcome for one: a real
+/// second daemon still holds the lock past `SINGLETON_LOCK_RETRY_BUDGET` and
+/// still loses. A clean shutdown (`g-mesh stop`, SIGTERM + wait for exit)
+/// never hits this at all - it does not leave the lock held after the process
+/// it belonged to is confirmed gone.
 fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     let path = dir.join(DAEMON_LOCK_FILE);
     let file = File::options()
@@ -686,11 +781,261 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
         .open(&path)
         .with_context(|| format!("failed to open daemon lock file {}", path.display()))?;
 
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(err)) => Err(err)
-            .with_context(|| format!("failed to lock {}", path.display())),
+    let deadline = std::time::Instant::now() + SINGLETON_LOCK_RETRY_BUDGET;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(SINGLETON_LOCK_RETRY_INTERVAL);
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Forces the exact shape of task 165's race deterministically, instead
+    /// of relying on a real `kill -9`'s unpredictable teardown delay the way
+    /// the integration tests that first surfaced it incidentally do.
+    ///
+    /// `flock` is scoped to the *open file description*, not the process
+    /// that holds it, so two independent `open()` calls from the very same
+    /// process contend exactly as two different processes would - which is
+    /// what lets a second thread stand in for a just-killed predecessor: it
+    /// takes the lock, holds it for a short, fixed window, then releases it,
+    /// the same shape as the kernel finishing a killed daemon's fd teardown
+    /// slightly after the replacement's first attempt. Before the retry loop
+    /// this exercises, that first attempt alone would see `WouldBlock` and
+    /// `acquire_singleton_lock` would give up immediately - exactly bug 165.
+    #[test]
+    fn a_lock_released_shortly_after_the_first_attempt_is_still_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+
+        let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
+        holder.lock().expect("failed to take the stand-in lock");
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let hold_for = SINGLETON_LOCK_RETRY_INTERVAL * 2;
+        let releaser = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            thread::sleep(hold_for);
+            drop(holder);
+        });
+
+        // Waits for the holder thread to have the lock before racing it, so
+        // this cannot flake the other way - `acquire_singleton_lock` winning
+        // a lock nobody was contending yet.
+        ready_rx.recv().unwrap();
+        let acquired =
+            acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+        releaser.join().unwrap();
+
+        assert!(
+            acquired.is_some(),
+            "a lock released well within the retry budget must still be acquired, not treated as a live incumbent"
+        );
+    }
+
+    /// The other half of the acceptance bar, without which the fix above
+    /// could regress into "the singleton lock no longer excludes anyone":
+    /// a lock held for the whole retry budget - a genuinely running
+    /// incumbent, not a predecessor mid-teardown - must still lose.
+    #[test]
+    fn a_lock_held_past_the_retry_budget_is_not_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+
+        let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
+        holder.lock().expect("failed to take the stand-in lock");
+
+        let acquired =
+            acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+
+        assert!(
+            acquired.is_none(),
+            "a lock held by a live incumbent for the whole retry budget must not be acquired"
+        );
+        drop(holder);
+    }
+
+    /// A registry over `languages`, each installed as a fake plugin
+    /// (`test_plugin`) claiming one extension named after it (`python` ->
+    /// `.python-src`), plus the fixture directories backing it - dropping
+    /// them would delete the plugin/project directories before a test using
+    /// the registry is done with them. Mirrors `daemon::registry`'s own
+    /// `registry_over` test fixture, which is private to that module and so
+    /// not reusable from here directly.
+    fn registry_over(languages: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+
+        let dirs = languages
+            .iter()
+            .map(|language| {
+                let extension = format!(".{language}-src");
+                test_plugin::install(plugins.path(), language, &[extension.as_str()])
+            })
+            .collect();
+
+        let discovered = manifest::discover(&[plugins.path().to_path_buf()])
+            .expect("the fixtures must discover cleanly");
+        let root = project.path().canonicalize().expect("failed to canonicalize the fixture project root");
+        let state_dir =
+            project_dir(project.path()).expect("failed to resolve the fixture project's state directory");
+        fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            &root,
+            state_dir,
+            discovered,
+            None,
+            Arc::new(crate::embedding::EmbeddingPipeline::disabled()),
+        );
+        (project, plugins, dirs, registry)
+    }
+
+    /// Runs `watch_and_route_once` a handful of times up front, the same way
+    /// `watcher::mod`'s own tests drain a fresh watcher before asserting on
+    /// it - macOS FSEvents can replay startup noise (a creation event for
+    /// the watched root itself) shortly after the watch begins, and letting
+    /// that settle first keeps it from being mistaken for the burst under
+    /// test. `relative_wire_path` already filters root-directory events out
+    /// before they would ever reach `registry`, so this exists for timing
+    /// hygiene rather than because noise could itself register as a round
+    /// trip.
+    fn drain_startup_noise(
+        watcher: &ProjectWatcher,
+        debouncer: &mut Debouncer,
+        root: &Path,
+        conn: &Mutex<Connection>,
+        registry: &PluginRegistry,
+    ) {
+        for _ in 0..2 {
+            watch_and_route_once(watcher, debouncer, root, conn, registry);
+        }
+    }
+
+    /// Pumps `watch_and_route_once` for a bounded window comfortably longer
+    /// than [`DEBOUNCE_WINDOW`] - long enough to both drain whatever raw
+    /// events a preceding burst queued and let their debounce window elapse
+    /// and fire, without looping forever the way `run`'s real watcher thread
+    /// does.
+    fn pump_until_settled(
+        watcher: &ProjectWatcher,
+        debouncer: &mut Debouncer,
+        root: &Path,
+        conn: &Mutex<Connection>,
+        registry: &PluginRegistry,
+    ) {
+        let deadline = std::time::Instant::now() + DEBOUNCE_WINDOW * 3;
+        while std::time::Instant::now() < deadline {
+            watch_and_route_once(watcher, debouncer, root, conn, registry);
+        }
+    }
+
+    /// The concrete acceptance bar for task 129: a burst of rapid saves to
+    /// the *same* file must cost the plugin one round trip, not one per
+    /// save. Drives `watch_and_route_once` - `run`'s watcher thread's own
+    /// per-iteration logic - directly, against a real `ProjectWatcher` over
+    /// a real tempdir and a real `PluginRegistry` over a fake plugin that
+    /// logs every `fileChanged` round trip it actually answers
+    /// (`test_plugin::file_changed_requests`), rather than spawning a
+    /// background thread: that lets the burst and the assertion be
+    /// sequenced deterministically instead of racing a loop nothing here
+    /// could join.
+    #[test]
+    fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_per_save() {
+        let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+        let plugin_dir = &dirs[0];
+        let conn = test_plugin::empty_index();
+        let root = project.path().canonicalize().unwrap();
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+        drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        let file = root.join("a.python-src");
+        for i in 0..5 {
+            fs::write(&file, format!("v{i}")).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+        }
+
+        // Every write so far was well under DEBOUNCE_WINDOW apart, so nothing
+        // must have settled and fired yet - proof this is actually debounced
+        // rather than merely fast.
+        assert!(
+            test_plugin::file_changed_requests(plugin_dir).is_empty(),
+            "a burst still in progress must not have reached the plugin yet"
+        );
+
+        pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        assert_eq!(
+            test_plugin::file_changed_requests(plugin_dir).len(),
+            1,
+            "a burst of 5 rapid saves to the same file must cost exactly one plugin round trip, not one per save"
+        );
+    }
+
+    /// The other half of the same claim: debouncing must only coalesce a
+    /// genuine *burst*, never delay or drop an isolated, non-bursty edit.
+    #[test]
+    fn an_isolated_save_still_reaches_the_plugin_exactly_once() {
+        let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+        let plugin_dir = &dirs[0];
+        let conn = test_plugin::empty_index();
+        let root = project.path().canonicalize().unwrap();
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+        drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        fs::write(root.join("a.python-src"), "v0").unwrap();
+        pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        assert_eq!(
+            test_plugin::file_changed_requests(plugin_dir).len(),
+            1,
+            "a single isolated save must still reach the plugin, exactly once"
+        );
+    }
+
+    /// Debouncing coalesces repeats of the *same* path; it must not
+    /// accidentally coalesce two genuinely different files landing in the
+    /// same burst into one round trip - each still needs its own reparse.
+    #[test]
+    fn two_different_files_in_the_same_burst_each_get_their_own_round_trip() {
+        let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+        let plugin_dir = &dirs[0];
+        let conn = test_plugin::empty_index();
+        let root = project.path().canonicalize().unwrap();
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+        drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        fs::write(root.join("a.python-src"), "a").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+        fs::write(root.join("b.python-src"), "b").unwrap();
+        pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
+
+        let mut requested = test_plugin::file_changed_requests(plugin_dir);
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec!["a.python-src".to_string(), "b.python-src".to_string()],
+            "two distinct files in the same burst must each still get their own round trip"
+        );
     }
 }
 

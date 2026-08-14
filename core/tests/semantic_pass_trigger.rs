@@ -252,6 +252,15 @@ fn core_asks_for_a_semantic_pass_after_each_incremental_reparse() {
     // missed-and-retried but missed outright, and the test would then hang
     // on an event that is never coming. Editing again costs nothing when the
     // watcher is already up: the first edit answers and the loop ends.
+    //
+    // The gap between retries has to clear `daemon::DEBOUNCE_WINDOW` (300ms
+    // as of task 129, private to that module) with margin, not just be
+    // "long enough to answer": the daemon's watcher thread now waits for a
+    // path to go quiet before routing it, so a retry cadence shorter than
+    // that window would keep re-arming the very same debounce timer forever
+    // - each write looking, from the watcher's side, like the burst still
+    // going on rather than a fresh, isolated edit - and this loop would never
+    // observe a settle at all.
     let deadline = Instant::now() + TIMEOUT;
     let mut edits = 0;
     let methods = loop {
@@ -261,7 +270,7 @@ fn core_asks_for_a_semantic_pass_after_each_incremental_reparse() {
             format!("export function edited(): number {{\n  return {edits};\n}}\n"),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(700));
 
         let methods = harness.methods();
         // Only the tail is considered, so a reparse can only be credited to

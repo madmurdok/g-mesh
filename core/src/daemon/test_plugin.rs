@@ -40,6 +40,27 @@
 //! "the second file of the same language reuses the first supervisor" and
 //! "waking a sleeping supervisor re-spawns the plugin its own manifest names"
 //! into assertions about processes rather than about return values.
+//!
+//! # Counting round trips
+//!
+//! Same idea, one level down: every framed request that carries an id (a
+//! real round trip, as opposed to the handshake or a notification) is
+//! appended to `requests.log` in the same directory, as `"<method>
+//! <filePath>"`, before it is answered ([`requests`]). Task 129 is what
+//! first needed this - "a burst of rapid saves to the same file costs one
+//! plugin round trip, not one per save" is a claim about how many times the
+//! plugin was actually asked, and `spawns.log` alone cannot distinguish a
+//! debounced burst from a single lucky one that never crashed the process it
+//! was already talking to.
+//!
+//! [`file_changed_requests`] narrows that log to just the `fileChanged`
+//! entries - what `PluginSupervisor::file_changed`/`apply_file_change`
+//! actually sends per incremental reparse - excluding the `semanticPass`
+//! request `apply_file_change` also always sends on the very same round trip
+//! (`watcher::apply::apply_file_change`'s own doc comment): that one is a
+//! fixed 1:1 side effect of a `fileChanged` request, not a second thing a
+//! debounce test is checking, so counting both together would double every
+//! number for a reason unrelated to what changed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +74,14 @@ use crate::storage::schema;
 /// The file each fake plugin process appends its pid to on startup.
 const SPAWN_LOG: &str = "spawns.log";
 
+/// The file a *gated* plugin waits for before it announces its handshake -
+/// see [`install_gated`] and [`open_handshake_gate`].
+const HANDSHAKE_GATE: &str = "handshake.allow";
+
+/// The file each fake plugin process appends one line to per answered
+/// request that carried an id - see this module's "Counting round trips" doc.
+const REQUEST_LOG: &str = "requests.log";
+
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
 ///
@@ -60,9 +89,49 @@ const SPAWN_LOG: &str = "spawns.log";
 /// `daemon::manifest::discover(&[root])` picks it up with no test-only path
 /// through discovery.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false)
+}
+
+/// [`install`], but the plugin does not answer its handshake until
+/// [`open_handshake_gate`] is called - a spawn that is *held open* for as long
+/// as a test wants to look at what the rest of the daemon does meanwhile
+/// (`daemon::registry`'s task-164 tests).
+///
+/// A gate rather than a sleep, deliberately. What those tests are about is a
+/// spawn that is in flight *right now*, and a real one is a process launch
+/// plus whatever the plugin does before it can speak - hundreds of
+/// milliseconds, but a different number on every machine and a wildly
+/// different one under a loaded `cargo test`, where a bare `node` start has
+/// been measured taking over a second. Any test that raced a fixed delay
+/// would be asserting about this machine's scheduler as much as about the
+/// daemon. A gate removes wall-clock time from the question entirely: the
+/// spawn stays in flight until the test says otherwise, so "while a spawn is
+/// in progress" is a state the test *holds*, not one it hopes to catch.
+///
+/// The gate sits in front of the handshake frame specifically, because that is
+/// what `PluginProcess::spawn` blocks on. The process itself still starts, and
+/// still records its pid in `spawns.log` first, so a test can tell "the spawn
+/// is in flight" from "it has not started yet" by observation ([`spawns`]).
+///
+/// Every test that installs one of these **must** open its gate, on every path
+/// including a failing assertion: a spawning thread that is never let go never
+/// joins.
+pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, true)
+}
+
+/// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
+/// [`install_gated`]. Idempotent, and safe to call on a plugin that was never
+/// gated in the first place.
+pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
+    fs::write(plugin_dir.join(HANDSHAKE_GATE), "go\n")
+        .expect("failed to open the fake plugin's handshake gate");
+}
+
+fn install_inner(root: &Path, language: &str, extensions: &[&str], gated: bool) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language))
+    fs::write(dir.join("plugin.js"), entry_point(language, gated))
         .expect("failed to write the fake plugin's entry point");
     fs::write(dir.join("plugin.toml"), manifest(language, extensions))
         .expect("failed to write the fake plugin's manifest");
@@ -75,6 +144,31 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(SPAWN_LOG)) else { return Vec::new() };
     log.lines().filter_map(|line| line.trim().parse().ok()).collect()
+}
+
+/// Every id-carrying request this plugin directory's process(es) have ever
+/// answered, oldest first, across every spawn, as `"<method> <filePath>"`
+/// (`filePath` empty for a request with no such field, e.g. `status`).
+/// Empty (rather than a panic) before the first one, same as [`spawns`].
+pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugin_dir.join(REQUEST_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Just the `fileChanged` requests among [`requests`], as the file path each
+/// one named - i.e. one entry per real `PluginSupervisor::file_changed` ->
+/// `apply_file_change` round trip, the granularity task 129's debounce test
+/// cares about. Deliberately excludes the `semanticPass` request
+/// `apply_file_change` also always sends on the same round trip
+/// (`watcher::apply::apply_file_change`'s own doc): that one is a fixed,
+/// pre-existing 1:1 side effect of *this* one, not a second thing debouncing
+/// could coalesce away, and counting it in would double every number below
+/// for a reason that has nothing to do with what this test is checking.
+pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
+    requests(plugin_dir)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("fileChanged ").map(str::to_string))
+        .collect()
 }
 
 /// A fresh in-memory index for the (empty) diffs a fake plugin's round trips
@@ -108,14 +202,15 @@ extensions = [{extensions}]
     )
 }
 
-/// The fake plugin itself: record the spawn, handshake, then answer every
-/// framed request that carries an id with an empty diff under that same id.
+/// The fake plugin itself: record the spawn, handshake (once its gate is open,
+/// if a test asked for a `gated` one), then answer every framed request that
+/// carries an id with an empty diff under that same id.
 ///
 /// Deliberately minimal about framing - it re-implements just enough of
 /// `protocol::jsonrpc` to be a peer, and would rather hang than guess if core
 /// ever sent something it does not understand, since a test that hangs is
 /// easier to diagnose than one that silently agrees with a bug.
-fn entry_point(language: &str) -> String {
+fn entry_point(language: &str, gated: bool) -> String {
     format!(
         r#"// Generated by core/src/daemon/test_plugin.rs - not a real plugin.
 const fs = require("fs");
@@ -168,11 +263,29 @@ function writeFrame(message) {{
   process.stdout.write(body);
 }}
 
-writeFrame({{
-  protocolVersion: {CURRENT_PROTOCOL_VERSION},
-  language: "{language}",
-  pluginVersion: "0.0.0-test",
-}});
+// The handshake core blocks on inside `PluginProcess::spawn`. Sent straight
+// away (the ordinary case), or held until a test opens this plugin's gate
+// file - which is how a test keeps a spawn in flight for as long as it needs
+// to look at something else. See `install_gated`.
+function announce() {{
+  writeFrame({{
+    protocolVersion: {CURRENT_PROTOCOL_VERSION},
+    language: "{language}",
+    pluginVersion: "0.0.0-test",
+  }});
+}}
+if ({gated}) {{
+  const gate = path.join(__dirname, "{HANDSHAKE_GATE}");
+  (function awaitGate() {{
+    if (fs.existsSync(gate)) {{
+      announce();
+      return;
+    }}
+    setTimeout(awaitGate, 5);
+  }})();
+}} else {{
+  announce();
+}}
 
 let buffered = Buffer.alloc(0);
 process.stdin.on("data", (chunk) => {{
@@ -189,6 +302,8 @@ process.stdin.on("data", (chunk) => {{
     const request = JSON.parse(buffered.slice(bodyStart, bodyEnd).toString("utf8"));
     buffered = buffered.slice(bodyEnd);
     if (request.id !== undefined && request.id !== null) {{
+      const filePath = (request.params && request.params.filePath) || "";
+      fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
       writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
     }}
   }}
