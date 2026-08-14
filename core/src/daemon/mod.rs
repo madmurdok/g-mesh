@@ -671,12 +671,43 @@ fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// How long [`acquire_singleton_lock`] keeps retrying a contended lock before
+/// concluding a live incumbent holds it.
+///
+/// Bounded well below the shim's shortest observed bootstrap budget (1s in
+/// `serving_while_indexing.rs`'s tests, 10s by default) so a genuinely
+/// running second daemon still gives up promptly - this only papers over a
+/// release that is already in flight, not a real incumbent.
+const SINGLETON_LOCK_RETRY_BUDGET: Duration = Duration::from_millis(300);
+
+/// How long each retry waits before trying the lock again. Short next to
+/// [`SINGLETON_LOCK_RETRY_BUDGET`] so the kernel's async release of a just-
+/// killed predecessor's `flock` (see below) is caught within a handful of
+/// attempts rather than costing most of the budget on one long sleep.
+const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Takes the project's daemon lock, or reports that someone else holds it.
 ///
 /// The returned `File` must stay alive for as long as the daemon runs: the
 /// lock is advisory and tied to the open file, so dropping it (or exiting,
 /// or being killed) releases it - which is exactly what lets the next daemon
 /// take over from a crashed one without any stale-lock cleanup.
+///
+/// # Why a contended lock is retried instead of failing immediately
+///
+/// A `kill -9`'d predecessor's `flock` is released by the kernel as part of
+/// its teardown, not the instant the signal lands or even the instant the
+/// process stops being visible to `kill(pid, 0)` (`is_process_alive`) - the
+/// fd table is torn down slightly later. A replacement daemon bootstrapped
+/// immediately after such a kill (exactly what a test harness restarting a
+/// daemon does, and what a crash-and-respawn does in the wild) can therefore
+/// find the lock still held by a process that is, for every purpose other
+/// than this exact race, already gone. Retrying briefly tells that case apart
+/// from an actual incumbent without changing the outcome for one: a real
+/// second daemon still holds the lock past `SINGLETON_LOCK_RETRY_BUDGET` and
+/// still loses. A clean shutdown (`g-mesh stop`, SIGTERM + wait for exit)
+/// never hits this at all - it does not leave the lock held after the process
+/// it belonged to is confirmed gone.
 fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     let path = dir.join(DAEMON_LOCK_FILE);
     let file = File::options()
@@ -686,11 +717,90 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
         .open(&path)
         .with_context(|| format!("failed to open daemon lock file {}", path.display()))?;
 
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(err)) => Err(err)
-            .with_context(|| format!("failed to lock {}", path.display())),
+    let deadline = std::time::Instant::now() + SINGLETON_LOCK_RETRY_BUDGET;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(SINGLETON_LOCK_RETRY_INTERVAL);
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Forces the exact shape of task 165's race deterministically, instead
+    /// of relying on a real `kill -9`'s unpredictable teardown delay the way
+    /// the integration tests that first surfaced it incidentally do.
+    ///
+    /// `flock` is scoped to the *open file description*, not the process
+    /// that holds it, so two independent `open()` calls from the very same
+    /// process contend exactly as two different processes would - which is
+    /// what lets a second thread stand in for a just-killed predecessor: it
+    /// takes the lock, holds it for a short, fixed window, then releases it,
+    /// the same shape as the kernel finishing a killed daemon's fd teardown
+    /// slightly after the replacement's first attempt. Before the retry loop
+    /// this exercises, that first attempt alone would see `WouldBlock` and
+    /// `acquire_singleton_lock` would give up immediately - exactly bug 165.
+    #[test]
+    fn a_lock_released_shortly_after_the_first_attempt_is_still_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+
+        let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
+        holder.lock().expect("failed to take the stand-in lock");
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let hold_for = SINGLETON_LOCK_RETRY_INTERVAL * 2;
+        let releaser = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            thread::sleep(hold_for);
+            drop(holder);
+        });
+
+        // Waits for the holder thread to have the lock before racing it, so
+        // this cannot flake the other way - `acquire_singleton_lock` winning
+        // a lock nobody was contending yet.
+        ready_rx.recv().unwrap();
+        let acquired =
+            acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+        releaser.join().unwrap();
+
+        assert!(
+            acquired.is_some(),
+            "a lock released well within the retry budget must still be acquired, not treated as a live incumbent"
+        );
+    }
+
+    /// The other half of the acceptance bar, without which the fix above
+    /// could regress into "the singleton lock no longer excludes anyone":
+    /// a lock held for the whole retry budget - a genuinely running
+    /// incumbent, not a predecessor mid-teardown - must still lose.
+    #[test]
+    fn a_lock_held_past_the_retry_budget_is_not_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+
+        let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
+        holder.lock().expect("failed to take the stand-in lock");
+
+        let acquired =
+            acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+
+        assert!(
+            acquired.is_none(),
+            "a lock held by a live incumbent for the whole retry budget must not be acquired"
+        );
+        drop(holder);
     }
 }
 
