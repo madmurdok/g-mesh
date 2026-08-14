@@ -17,6 +17,14 @@ use crate::storage::write::{apply_diff, Diff};
 /// whole batch rather than per-path: there is a single shared "last event
 /// seen" timestamp, not one per file, since the goal here is grouping
 /// events *across* files rather than coalescing repeats of the same file.
+///
+/// Unlike `Debouncer`, this type is not constructed by `daemon::run`'s
+/// watcher thread - see that thread's own comment (where `Debouncer` is
+/// wired in instead) for the documented reasoning: the plugin's wire
+/// protocol has no batch `FileChanged` request, so batching commits here
+/// would not reduce the plugin round trips a burst of *different* files
+/// costs, only the SQLite commit count, which was judged separate work
+/// (task 129) rather than something to fold into that ticket's wiring pass.
 pub struct BurstBatcher {
     window: Duration,
     pending: Diff,
