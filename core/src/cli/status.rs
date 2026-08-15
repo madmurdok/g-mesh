@@ -87,6 +87,14 @@ pub enum CoreState {
     /// is merely busy indexing - it means one that died without clearing its
     /// pid file, or a wedged one.
     NotAccepting { pid: u32 },
+    /// Nothing in `daemon.pid`, but a live process is still holding this
+    /// project's singleton lock after having served it - so no other daemon
+    /// can take the project over, and nothing can reach this one either
+    /// (task 184). Kept apart from `NotAccepting`, which describes a daemon
+    /// that still has a pid file: what makes this one worth its own variant is
+    /// precisely that every check keyed off `daemon.pid` reports it as nothing
+    /// running at all.
+    Wedged { pid: u32 },
     /// No live daemon, whatever `daemon.pid` may still say.
     NotRunning,
 }
@@ -244,13 +252,22 @@ pub fn collect(project_root: &Path) -> Result<Report> {
 }
 
 fn core_state(project_root: &Path) -> Result<CoreState> {
-    let Some(pid) = daemon::read_pid_file(&daemon::pid_path(project_root)?) else {
-        return Ok(CoreState::NotRunning);
+    let recorded = daemon::read_pid_file(&daemon::pid_path(project_root)?)
+        .filter(|&pid| daemon::is_process_alive(pid));
+    let Some(pid) = recorded else {
+        // No pid file, or one left behind by a daemon that crashed or was
+        // killed - which used to end the enquiry. It no longer can: a daemon
+        // that removed its own pid file on the way out and then failed to
+        // actually exit is still holding the project's singleton lock, and
+        // reporting that as "not running" is what let it wedge the project
+        // unnoticed. The lock is asked because it is the same fact
+        // `daemon::acquire_singleton_lock` acts on, so this report and the
+        // next bootstrap cannot disagree.
+        return Ok(match daemon::inspect_daemon_lock(project_root)? {
+            daemon::DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
+            _ => CoreState::NotRunning,
+        });
     };
-    if !daemon::is_process_alive(pid) {
-        // A pid file left behind by a daemon that crashed or was killed.
-        return Ok(CoreState::NotRunning);
-    }
     Ok(if daemon::is_listening(project_root)? {
         CoreState::Running { pid }
     } else {
@@ -306,7 +323,11 @@ fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
 /// dead core to go with it) for every row.
 fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
     match core {
-        CoreState::NotRunning => PluginState::Orphaned { pid },
+        // A wedged core counts as gone for the plugin's purposes: it is not
+        // answering anything, so a plugin still alive under it is as orphaned
+        // as one whose core has actually exited, and `g-mesh stop` clears
+        // both together.
+        CoreState::NotRunning | CoreState::Wedged { .. } => PluginState::Orphaned { pid },
         CoreState::Running { .. } | CoreState::NotAccepting { .. } => PluginState::Active { pid },
     }
 }
@@ -583,6 +604,10 @@ fn describe_core(core: CoreState) -> String {
         CoreState::NotAccepting { pid } => {
             format!("running but not accepting connections yet (pid {pid})")
         }
+        CoreState::Wedged { pid } => format!(
+            "wedged (pid {pid}) - holds this project's daemon lock but serves nothing; \
+             run `g-mesh stop` to clear it"
+        ),
         CoreState::NotRunning => "not running".to_string(),
     }
 }

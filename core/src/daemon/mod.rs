@@ -15,6 +15,7 @@ pub mod semantic;
 pub(crate) mod test_plugin;
 
 use std::fs::{self, File, TryLockError};
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -130,6 +131,17 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
 }
 
+/// The singleton lock a running daemon holds for its whole lifetime, resolved
+/// from a project root and - like the pid files - from an already-known state
+/// directory.
+pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
+    Ok(project_dir(root)?.join(DAEMON_LOCK_FILE))
+}
+
+pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(DAEMON_LOCK_FILE)
+}
+
 /// Reads a pid out of one of the files above. `None` for a file that isn't
 /// there or doesn't hold a pid - both mean "nothing recorded", which is what
 /// every caller does with them anyway.
@@ -201,15 +213,9 @@ pub fn run(root: &Path) -> Result<()> {
     // hand - exits here instead of going on to clear and rebind a socket its
     // predecessor is already serving. Losing this race is the expected,
     // healthy outcome, not an error: the caller connects to the incumbent.
-    let _singleton = match acquire_singleton_lock(&dir)? {
+    let singleton = match acquire_singleton_lock(&dir)? {
         Some(lock) => lock,
-        None => {
-            eprintln!(
-                "g-mesh daemon: another daemon already serves {} - exiting",
-                root.display()
-            );
-            return Ok(());
-        }
+        None => return stand_down(root),
     };
 
     // Published here - after the singleton lock, so it always describes the
@@ -320,6 +326,14 @@ pub fn run(root: &Path) -> Result<()> {
     let pid_file = dir.join(PID_FILE);
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
+
+    // And recorded in the lock file too, now that this process is genuinely
+    // serving. The pid file above answers "which process is the daemon"; this
+    // answers "is the lock's holder still doing the job the lock entitles it
+    // to", which is the only question a process that cannot take the lock can
+    // usefully ask - and the one nothing could answer before task 184. See
+    // `record_serving_owner`.
+    record_serving_owner(&singleton);
 
     // Both idle timers are resolved once, here, from the project's
     // config.toml (or its documented defaults, for a project with none), and
@@ -598,7 +612,52 @@ pub fn run(root: &Path) -> Result<()> {
     // this daemon deciding it has been unused long enough to go - `main`
     // returns and the OS reclaims the socket, the watchers and the SQLite
     // handle.
-    lifecycle::supervise(&dir, &registry, &core_activity, timeouts, accept_loop)
+    let outcome = lifecycle::supervise(&dir, &registry, &core_activity, timeouts, accept_loop);
+
+    // Released here, explicitly, rather than whenever this frame happens to
+    // unwind. `supervise` has already removed the socket and the pid file on
+    // its way out, so from this instant the lock is the *only* thing still
+    // claiming this project - and every other process reads a held lock as a
+    // daemon that serves it. Anything slow between here and the process
+    // actually going away (a teardown, a static destructor of a statically
+    // linked dependency, a thread that will not join) would therefore leave a
+    // live process holding a project nobody can reach, which is task 184's
+    // wedge. Dropping the file closes the fd, which is what releases the
+    // advisory lock; nothing after this point can put it back.
+    drop(singleton);
+    outcome
+}
+
+/// What a daemon that lost the singleton race does about it.
+///
+/// Losing to a healthy incumbent is the expected outcome and not an error: the
+/// caller connects to the incumbent, and the exit is quiet. Losing to a holder
+/// that is *not* serving is a different thing entirely (the caller is about to
+/// wait out its whole bootstrap timeout on a socket that will never appear), so
+/// that one exits non-zero with a diagnostic naming the offending pid.
+/// Nobody reads a detached daemon's stderr, which is why the shim recovers
+/// from this state on its own (`shim::connect_or_bootstrap`); this message is
+/// for the person who ran `g-mesh daemon` by hand, and for a daemon log if one
+/// is ever collected.
+fn stand_down(root: &Path) -> Result<()> {
+    match inspect_daemon_lock(root)? {
+        DaemonLock::Wedged { pid } => anyhow::bail!(
+            "pid {pid} holds the daemon lock for {} but is not serving it - nothing can connect \
+             to it and no other daemon can take over while it lives; run `g-mesh stop` in that \
+             project to clear it",
+            root.display()
+        ),
+        // `Free` is reachable only if the incumbent released the lock between
+        // the failed acquisition and this check, which is a bootstrap that
+        // arrived a moment too early rather than a fault: the next one wins.
+        DaemonLock::Free | DaemonLock::Serving | DaemonLock::Starting => {
+            eprintln!(
+                "g-mesh daemon: another daemon already serves {} - exiting",
+                root.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// One iteration of the watcher thread's loop: waits up to [`DEBOUNCE_WINDOW`]
@@ -784,7 +843,13 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     let deadline = std::time::Instant::now() + SINGLETON_LOCK_RETRY_BUDGET;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                // Emptied the instant it is taken, so the file says "held by a
+                // daemon that is not serving yet" for exactly as long as that
+                // is true - see `record_serving_owner` for the other half.
+                clear_serving_owner(&file, &path);
+                return Ok(Some(file));
+            }
             Err(TryLockError::WouldBlock) => {
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
@@ -796,6 +861,148 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
             }
         }
     }
+}
+
+/// What holds a project's daemon lock right now, judged from outside the
+/// process that holds it.
+///
+/// The lock is the only thing that decides who may serve a project
+/// ([`acquire_singleton_lock`]), so every other process's picture of "is this
+/// project served" has to be answerable from it - which, before task 184, it
+/// was not: a held lock read as "a daemon serves this project" and nothing
+/// else, so a holder that had stopped serving wedged the project for as long
+/// as it stayed alive. These four states are what "held" is now allowed to
+/// mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonLock {
+    /// Nobody holds it: the project has no daemon and a bootstrap may go ahead.
+    Free,
+    /// Held by a daemon that is answering on the project's socket - the
+    /// healthy incumbent, and the only state in which another daemon must
+    /// stand down.
+    Serving,
+    /// Held, but the holder has not published itself as serving yet: a daemon
+    /// between taking the lock and binding its socket (or one from a build
+    /// before that was recorded). Not a wedge - it is entitled to a moment -
+    /// so nothing may evict it on the strength of this alone.
+    Starting,
+    /// Held by a live process that *did* publish itself as serving and is not
+    /// answering any more: the state task 184 is about. The socket it bound is
+    /// gone (or it stopped accepting on it), so no client can ever reach it
+    /// again, and it will keep the project to itself until it exits.
+    Wedged { pid: u32 },
+}
+
+/// Diagnoses [`DaemonLock`] for `root`.
+///
+/// Deliberately asks the socket first: an incumbent that answers is healthy
+/// whatever the lock file says, and that is also the cheapest of the three
+/// checks. Only once nothing answers is the lock itself probed - by taking it
+/// and immediately dropping it, which is the one way to tell "held" from
+/// "free" without the holder's cooperation. That momentary acquisition is
+/// invisible to a daemon racing for the same lock: it retries for
+/// [`SINGLETON_LOCK_RETRY_BUDGET`], three orders of magnitude longer than this
+/// holds anything.
+pub fn inspect_daemon_lock(root: &Path) -> Result<DaemonLock> {
+    let listening = is_listening(root)?;
+    inspect_daemon_lock_in(&project_dir(root)?, listening)
+}
+
+/// [`inspect_daemon_lock`] against an already-resolved state directory and an
+/// already-answered "is anything listening", so the judgement can be tested
+/// over its whole table without a real socket or a real `~/.g-mesh`.
+fn inspect_daemon_lock_in(state_dir: &Path, listening: bool) -> Result<DaemonLock> {
+    if listening {
+        return Ok(DaemonLock::Serving);
+    }
+    if !daemon_lock_is_held(state_dir)? {
+        return Ok(DaemonLock::Free);
+    }
+    match serving_owner_in(state_dir).filter(|&pid| is_process_alive(pid)) {
+        Some(pid) => Ok(DaemonLock::Wedged { pid }),
+        None => Ok(DaemonLock::Starting),
+    }
+}
+
+/// Whether anything holds the project's daemon lock.
+///
+/// A lock file that does not exist has never been taken; failing to *open* one
+/// that does is reported as "not held" for the same reason every other
+/// external observation here degrades that way - the answer this feeds
+/// (evicting a wedged daemon) must fail towards leaving processes alone.
+fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
+    let path = daemon_lock_path_in(state_dir);
+    let Ok(file) = File::options().write(true).truncate(false).open(&path) else {
+        return Ok(false);
+    };
+    match file.try_lock() {
+        // Held by nobody: taken here for an instant and released by this drop.
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("failed to probe {}", path.display()))
+        }
+    }
+}
+
+/// Records that the lock's holder is now serving, by writing its pid into the
+/// lock file.
+///
+/// Called after the socket is bound, never before, and that ordering is the
+/// whole point: the pid in this file does not mean "a daemon exists" (the lock
+/// itself already means that) but "a daemon got as far as serving". A holder
+/// with no pid recorded is starting up and must be left alone; a holder whose
+/// recorded pid is alive while nothing answers has stopped serving and can be
+/// evicted. Two different questions, and a pid file that could only answer the
+/// first is why `cli::stop` could not see the wedged daemon at all.
+///
+/// Written into the lock file rather than alongside it so the two can never
+/// disagree: whoever reads it is reading the very file whose lock they just
+/// found held, and only the holder can have written it.
+///
+/// Terminated by a newline, and [`serving_owner_in`] refuses a record without
+/// one. Nothing else in the daemon's pid files bothers, and this one has to:
+/// its reader may go on to *signal* the pid it reads, and a reader that caught
+/// the file mid-rewrite and parsed half a pid would signal an unrelated
+/// process. The newline makes any state other than "fully written" - empty,
+/// truncated, half-written - read as nothing recorded, which is the state that
+/// gets left alone.
+///
+/// Best-effort, like every other pid-file write in the daemon: the cost of
+/// failing is a wedge that reads as `Starting` and is left alone, which is the
+/// behaviour this project had before the record existed.
+fn record_serving_owner(lock: &File) {
+    if let Err(err) = write_lock_body(lock, format!("{}\n", std::process::id()).as_bytes()) {
+        eprintln!("g-mesh daemon: failed to record itself as the lock's owner: {err}");
+    }
+}
+
+/// Empties the lock file, so a fresh holder does not inherit its predecessor's
+/// claim to be serving.
+fn clear_serving_owner(lock: &File, path: &Path) {
+    if let Err(err) = write_lock_body(lock, b"") {
+        eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display());
+    }
+}
+
+fn write_lock_body(lock: &File, body: &[u8]) -> std::io::Result<()> {
+    let mut handle = lock;
+    handle.set_len(0)?;
+    handle.seek(SeekFrom::Start(0))?;
+    handle.write_all(body)?;
+    handle.flush()
+}
+
+/// The pid the lock's holder recorded once it began serving, if any.
+///
+/// `None` for an empty file (a holder that is still starting up), a missing
+/// one, an unparseable one, or one with no terminating newline - all of which
+/// mean "nothing recorded", the same reading [`read_pid_file`] gives the
+/// daemon's other pid files, with the newline requirement
+/// [`record_serving_owner`] explains added on top.
+pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
+    let recorded = fs::read_to_string(daemon_lock_path_in(state_dir)).ok()?;
+    recorded.strip_suffix('\n')?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -865,6 +1072,160 @@ mod tests {
             "a lock held by a live incumbent for the whole retry budget must not be acquired"
         );
         drop(holder);
+    }
+
+    /// Takes the daemon lock the way a real daemon does, and hands back both
+    /// the file (dropping it releases the lock) and the directory it lives in.
+    /// `flock` is scoped to the open file description rather than to the
+    /// process, so a lock taken here contends with `acquire_singleton_lock`
+    /// exactly as another process's would - the same property task 165's
+    /// tests above already rely on.
+    fn held_lock(dir: &Path) -> File {
+        acquire_singleton_lock(dir)
+            .expect("taking the lock must not error")
+            .expect("nothing else holds this fixture's lock")
+    }
+
+    /// A project nobody is serving and nobody has locked: a bootstrap may go
+    /// ahead, and nothing is there to evict.
+    #[test]
+    fn an_unheld_lock_reads_as_free() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Free
+        );
+
+        // Including once a daemon has held it and let it go - the pid it
+        // recorded while serving must not outlive the lock itself, or a
+        // recycled pid would read as a wedged incumbent.
+        let lock = held_lock(dir.path());
+        record_serving_owner(&lock);
+        drop(lock);
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Free,
+            "a released lock is free however recently its holder was serving"
+        );
+    }
+
+    /// A daemon between taking the lock and binding its socket. Indistinguishable
+    /// from a wedged one by the lock alone, which is exactly why the daemon
+    /// records itself as serving separately - and why this must not be
+    /// evictable.
+    #[test]
+    fn a_lock_held_by_a_daemon_that_has_not_begun_serving_reads_as_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = held_lock(dir.path());
+
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Starting,
+            "a holder that never published itself as serving is starting up, not wedged"
+        );
+    }
+
+    /// Task 184's state, forced deterministically: the lock is held, its
+    /// holder published itself as serving and is alive, and nothing is
+    /// listening. That combination - and only that one - is a wedge.
+    #[test]
+    fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = held_lock(dir.path());
+        record_serving_owner(&lock);
+
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Wedged {
+                pid: std::process::id()
+            },
+            "a live holder that was serving and answers nothing is the wedge, and it must be \
+             named by pid so `stop` and the shim can act on it"
+        );
+    }
+
+    /// The guard that keeps the eviction path from ever taking a session away
+    /// from someone: a holder that answers is healthy no matter what else is
+    /// true of it.
+    #[test]
+    fn a_holder_that_is_still_answering_is_never_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = held_lock(dir.path());
+        record_serving_owner(&lock);
+
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), true).unwrap(),
+            DaemonLock::Serving,
+            "a daemon answering on its socket must never be a candidate for eviction"
+        );
+    }
+
+    /// The record has to survive one daemon replacing another: a fresh holder
+    /// starts out as `Starting`, not as the wedged incumbent it took over
+    /// from.
+    #[test]
+    fn a_new_holder_does_not_inherit_its_predecessors_claim_to_be_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = held_lock(dir.path());
+        record_serving_owner(&first);
+        assert_eq!(serving_owner_in(dir.path()), Some(std::process::id()));
+        drop(first);
+
+        let _second = held_lock(dir.path());
+        assert_eq!(
+            serving_owner_in(dir.path()),
+            None,
+            "taking the lock clears the record"
+        );
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Starting
+        );
+    }
+
+    /// A lock file from a build that predates the record reads as `Starting` -
+    /// nothing is claimed about it, so nothing may be done to it. The safe
+    /// direction: an old daemon is left alone rather than signalled on a guess.
+    #[test]
+    fn a_lock_file_with_no_record_in_it_is_never_treated_as_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+        let holder = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+
+        assert_eq!(serving_owner_in(dir.path()), None);
+        assert_eq!(
+            inspect_daemon_lock_in(dir.path(), false).unwrap(),
+            DaemonLock::Starting
+        );
+    }
+
+    /// The record is what decides whether a live process gets signalled, so a
+    /// half-written one must never parse. Asserted over the shapes a reader
+    /// could catch mid-rewrite - and over a stray one, since a lock file is
+    /// world-readable and this is the one pid the daemon acts on rather than
+    /// merely reports.
+    #[test]
+    fn a_record_without_its_terminating_newline_is_not_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOCK_FILE);
+
+        for partial in ["", "1", "12", "1234"] {
+            fs::write(&path, partial).unwrap();
+            assert_eq!(
+                serving_owner_in(dir.path()),
+                None,
+                "{partial:?} is not a finished record and must not name anything to signal"
+            );
+        }
+
+        fs::write(&path, "1234\n").unwrap();
+        assert_eq!(serving_owner_in(dir.path()), Some(1234));
     }
 
     /// A registry over `languages`, each installed as a fake plugin
