@@ -142,7 +142,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
                 }
             }
         }
-        Incumbent::Absent => {}
+        Incumbent::Absent => evict_wedged_daemon(root),
     }
 
     spawn_detached_daemon(root)?;
@@ -213,6 +213,83 @@ fn retire_outdated_daemon(root: &Path, vintage: Vintage) -> bool {
             false
         }
     }
+}
+
+/// How long a daemon that holds the singleton lock while not serving is given
+/// to start serving before it is evicted.
+///
+/// It only has to cover the gap between a daemon publishing itself as serving
+/// (`daemon::record_serving_owner`, written immediately after the bind) and
+/// that socket being connectable, which is a scheduling hiccup rather than any
+/// real work - a daemon that has not got that far reads as
+/// `DaemonLock::Starting` and is never a candidate here in the first place.
+/// Kept well inside [`BOOTSTRAP_TIMEOUT`] so the replacement this clears the
+/// way for still has most of the budget left to bind in.
+const WEDGE_CONFIRMATION: Duration = Duration::from_millis(500);
+
+/// Clears a daemon that holds this project's singleton lock but has stopped
+/// serving it, so the bootstrap below can succeed instead of exiting on a lock
+/// no client can benefit from (task 184).
+///
+/// # Why this is safe to do automatically, and why only from here
+///
+/// The singleton lock exists so two daemons can never both serve one project,
+/// and an eviction that races could break exactly that. Three things keep it
+/// intact:
+///
+/// - Only a holder confirmed **not** to be serving is ever signalled. A daemon
+///   answering on its socket is `DaemonLock::Serving` and is never touched, so
+///   no client's session is taken away by this; a holder that has taken the
+///   lock but not yet published itself as serving is `DaemonLock::Starting`
+///   and is left to finish starting.
+/// - The judgement is confirmed a second time after
+///   [`WEDGE_CONFIRMATION`], because "not answering" is the one input here
+///   that could be a momentary artifact rather than a state.
+/// - This runs under the bootstrap lock, held across the eviction *and* the
+///   spawn that follows it, so two shims cannot evict-and-replace at once -
+///   the same serialization that already stops two shims from bootstrapping
+///   two daemons, and the reason this lives in the shim rather than in the
+///   daemon: the daemon deliberately never takes the bootstrap lock, because
+///   the shim holds it *while* spawning one (see `daemon::DAEMON_LOCK_FILE`'s
+///   own note on why the two locks are separate files).
+///
+/// Even if all of that failed, the daemon that follows still has to take the
+/// singleton lock before it serves anything, so the worst an eviction can cost
+/// is a bootstrap that loses the race and exits - never two daemons on one
+/// project.
+///
+/// Best-effort: a failure to signal is reported and the bootstrap goes ahead
+/// anyway, which lands back on today's behaviour (the new daemon exits on the
+/// lock and the caller is told why) rather than on a worse one.
+fn evict_wedged_daemon(root: &Path) {
+    let daemon::DaemonLock::Wedged { pid } = lock_state(root) else {
+        return;
+    };
+    thread::sleep(WEDGE_CONFIRMATION);
+    let daemon::DaemonLock::Wedged { pid: confirmed } = lock_state(root) else {
+        return;
+    };
+    if confirmed != pid {
+        // A different process holds it now, so whatever the first look saw has
+        // already gone - and signalling the newcomer on its behalf is exactly
+        // what this second look exists to prevent.
+        return;
+    }
+
+    eprintln!(
+        "g-mesh mcp-shim: pid {pid} holds the daemon lock for {} but stopped serving it - \
+         clearing it so this project can be served again",
+        root.display()
+    );
+    if let Err(err) = stop::terminate(pid, stop::TERMINATION_TIMEOUT) {
+        eprintln!("g-mesh mcp-shim: could not clear the wedged daemon (pid {pid}): {err:#}");
+    }
+}
+
+/// [`daemon::inspect_daemon_lock`], with a failure to inspect reading as
+/// "nothing to act on" - the direction that leaves processes alone.
+fn lock_state(root: &Path) -> daemon::DaemonLock {
+    daemon::inspect_daemon_lock(root).unwrap_or(daemon::DaemonLock::Free)
 }
 
 /// Opens (creating if absent) the project's bootstrap lock file and blocks

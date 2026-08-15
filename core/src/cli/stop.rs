@@ -55,7 +55,7 @@ use crate::storage::connection::project_dir;
 /// because overshooting costs a moment on a command a person is watching,
 /// while undershooting escalates to `SIGKILL` against a process that was
 /// shutting down cleanly all along.
-const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the plugin is given to notice its core is gone and exit by
 /// itself, before it is signalled like anything else.
 const PLUGIN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,6 +91,13 @@ pub struct Outcome {
     /// `daemon::registry::discovered_pid_files` reports them (sorted by
     /// language).
     pub plugins: Vec<(String, Stopped)>,
+    /// Whether the core this command stopped was found through the daemon
+    /// lock rather than through `daemon.pid` - a daemon that had already
+    /// deleted its own pid file and then failed to go away (task 184).
+    /// Reported because "nothing was running" was the *wrong* answer this
+    /// command used to give for it, and someone who has just been told that
+    /// deserves to know why the answer changed.
+    pub core_was_wedged: bool,
 }
 
 impl Outcome {
@@ -114,15 +121,30 @@ pub fn run() -> Result<()> {
 /// gets `Ok` back can bootstrap a fresh daemon immediately without racing the
 /// old one for the socket.
 pub fn stop(project_root: &Path) -> Result<Outcome> {
-    let core_pid = live_pid(&daemon::pid_path(project_root)?);
+    let mut outcome = Outcome::default();
+    // The pid file first, because a healthy daemon is what this command
+    // stops almost every time it is run. The daemon lock second, and only
+    // when the pid file has nothing to say: a daemon whose idle shutdown
+    // removed its pid file and then failed to exit is invisible to every
+    // check keyed off that file, and holds the project's lock for as long as
+    // it lives - so the lock, not the pid file, is the source of truth this
+    // has to agree with `daemon::acquire_singleton_lock` on.
+    let core_pid = match live_pid(&daemon::pid_path(project_root)?) {
+        Some(pid) => Some(pid),
+        None => match daemon::inspect_daemon_lock(project_root)? {
+            daemon::DaemonLock::Wedged { pid } => {
+                outcome.core_was_wedged = true;
+                Some(pid)
+            }
+            _ => None,
+        },
+    };
     let state_dir = project_dir(project_root)
         .context("failed to resolve the project's state directory")?;
     let plugin_pids: Vec<(String, u32)> = daemon::registry::discovered_pid_files(&state_dir)
         .into_iter()
         .filter_map(|(language, path)| live_pid(&path).map(|pid| (language, pid)))
         .collect();
-
-    let mut outcome = Outcome::default();
 
     if let Some(pid) = core_pid {
         outcome.core = Some(
@@ -157,7 +179,13 @@ fn live_pid(path: &Path) -> Option<u32> {
 }
 
 /// `SIGTERM`, then `SIGKILL`, waiting for the process to go after each.
-fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
+///
+/// `pub(crate)` for `shim::evict_wedged_daemon`, which has to clear exactly
+/// this kind of process out of the way before it can bootstrap a replacement,
+/// and must escalate the same way rather than grow a second implementation of
+/// it - the same argument `shim::retire_outdated_daemon` already makes for
+/// reusing [`stop`] itself.
+pub(crate) fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
     send_signal(pid, libc::SIGTERM)?;
     if wait_until_gone(pid, grace) {
         return Ok(Stopped::Terminated { pid });
@@ -246,6 +274,13 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
     let mut out = format!("g-mesh: stopped the daemon for {}\n", project_root.display());
     if let Some(core) = outcome.core {
         let _ = writeln!(out, "  daemon core: pid {} ({})", core.pid(), describe(core));
+        if outcome.core_was_wedged {
+            let _ = writeln!(
+                out,
+                "    it had removed its own pid file but was still holding this project's \
+                 daemon lock, which is why nothing could connect to it"
+            );
+        }
     }
     for (language, plugin) in &outcome.plugins {
         let _ = writeln!(
@@ -409,6 +444,7 @@ mod tests {
         let outcome = Outcome {
             core: Some(Stopped::Terminated { pid: 111 }),
             plugins: vec![("typescript".to_string(), Stopped::ExitedWithCore { pid: 222 })],
+            ..Outcome::default()
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -427,6 +463,7 @@ mod tests {
                 ("go".to_string(), Stopped::ExitedWithCore { pid: 222 }),
                 ("typescript".to_string(), Stopped::Killed { pid: 333 }),
             ],
+            ..Outcome::default()
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -440,6 +477,7 @@ mod tests {
         let outcome = Outcome {
             core: Some(Stopped::Killed { pid: 111 }),
             plugins: vec![("typescript".to_string(), Stopped::Killed { pid: 222 })],
+            ..Outcome::default()
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
