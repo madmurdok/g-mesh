@@ -42,7 +42,36 @@ const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
 /// Claude Code's own docs call unreliable for learning the session's project
 /// root. Preferring it over cwd is what lets g-mesh be registered once,
 /// globally, instead of once per project.
-const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+///
+/// It is inherited, though, like any other environment variable, and the shim
+/// cannot tell "my MCP client set this for me" from "something four processes
+/// up the tree was an MCP server". Anything that runs `g-mesh mcp-shim`
+/// underneath a Claude Code session - a wrapper script, a test suite, a task
+/// runner invoked from an MCP server of its own - therefore gets the
+/// *session's* project served, whatever cwd it took care to set. `pub` so
+/// those callers can name the variable they have to clear rather than
+/// hard-coding a copy of it; `core/tests` does exactly that, which is task
+/// 192.
+pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+
+/// Path to append the bootstrapped daemon's stderr to, instead of discarding
+/// it. Unset in every normal run, which is the only reason the daemon's stderr
+/// can go to `/dev/null` at all: nobody is on the other end of a detached
+/// process's console.
+///
+/// That default is what makes a daemon that starts and then stalls
+/// undiagnosable from the outside - the shim can say "it never began
+/// answering", and nothing can say why. Pointing this at a file gives the one
+/// missing channel back, and costs nothing when it is unset. It captures the
+/// plugin processes' stderr too, since they are spawned with
+/// `Stdio::inherit()` (`daemon::bulk_index::walk_one_language`,
+/// `daemon::plugin::PluginProcess::spawn`).
+///
+/// Appended to, never truncated, so several daemons - or several runs - can
+/// share one file without erasing each other; a path that cannot be opened
+/// falls back to `/dev/null` rather than failing the bootstrap, because a
+/// diagnostic aid must never be the reason a daemon does not start.
+pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
 
 /// Stateless stdio<->AF_UNIX proxy. Project identity - the only thing the
 /// shim needs - comes from `CLAUDE_PROJECT_DIR` when the client set it, or
@@ -145,6 +174,22 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
         Incumbent::Absent => evict_wedged_daemon(root),
     }
 
+    // Said out loud, once per cold start, because this is the moment the shim
+    // commits to a project - and the moment its answer to "which project?" is
+    // worth auditing. `PROJECT_DIR_ENV` is inherited by anything that runs the
+    // shim underneath an MCP server, so a caller that set a cwd and expected
+    // it to be honored can be serving a completely different tree; naming both
+    // the root and where it came from turns that from an invisible
+    // redirection into one line of the client's server log. Reusing an
+    // already-running daemon stays silent: nothing was decided there.
+    eprintln!(
+        "g-mesh mcp-shim: nothing is serving {} ({}) - starting a daemon for it",
+        root.display(),
+        match std::env::var_os(PROJECT_DIR_ENV) {
+            Some(dir) if !dir.is_empty() => format!("from {PROJECT_DIR_ENV}"),
+            _ => "the current directory".to_string(),
+        }
+    );
     spawn_detached_daemon(root)?;
     let stream = wait_until_listening(&socket);
     // Released the moment the daemon is reachable - or, just as importantly,
@@ -363,11 +408,34 @@ fn spawn_detached_daemon(root: &Path) -> Result<()> {
         .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(daemon_stderr())
         .process_group(0)
         .spawn()
         .with_context(|| format!("failed to spawn a daemon via {}", exe.display()))?;
     Ok(())
+}
+
+/// `/dev/null` unless [`DAEMON_LOG_ENV`] names a file that can be appended to.
+///
+/// Never a pipe, whatever the setting: the shim drops the `Child` without
+/// waiting, so nothing would ever drain it, and the first daemon (or plugin)
+/// to fill the pipe buffer would block forever on a write it does not know is
+/// unread. A file and `/dev/null` both absorb writes unconditionally, which is
+/// the property the detached daemon's stderr has to keep.
+fn daemon_stderr() -> Stdio {
+    let Some(path) = std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) else {
+        return Stdio::null();
+    };
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => Stdio::from(file),
+        Err(err) => {
+            eprintln!(
+                "g-mesh mcp-shim: could not open {} ({DAEMON_LOG_ENV}) for the daemon's stderr, discarding it instead: {err}",
+                Path::new(&path).display()
+            );
+            Stdio::null()
+        }
+    }
 }
 
 fn proxy(stream: UnixStream) -> Result<()> {

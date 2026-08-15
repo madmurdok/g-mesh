@@ -174,6 +174,7 @@ async fn connect_with(
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim")
             .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", BOOTSTRAP_BUDGET.as_millis().to_string())
             .env(WALK_DELAY_ENV, hold_the_walk_open.as_millis().to_string())
             // This suite is about grace-window/bootstrap timing, not

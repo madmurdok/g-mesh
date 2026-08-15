@@ -99,10 +99,24 @@ fn spawn_daemon(root: &Path) -> Child {
         .expect("failed to spawn the daemon")
 }
 
+/// Every spawn in this suite clears [`g_mesh::shim::PROJECT_DIR_ENV`] for the
+/// same reason this one does, and
+/// [`every_shim_spawn_in_this_suite_decides_which_project_it_serves`] holds
+/// the whole directory to it: the variable is set by Claude Code on the MCP
+/// servers it spawns and inherited by everything underneath them, so a
+/// `cargo test` launched from one - a release script, an editor's test
+/// integration, an MCP server that shells out - hands every shim here the
+/// *session's* project root and quietly discards the `current_dir` below.
+/// Task 192: that is what made this suite hang for three releases, always in
+/// the alphabetically first file to reach a shim, always as
+/// "the cold-start bulk walk for /var/folders/.../.tmpXXXX did not finish" -
+/// a walk that was never running, for a project no daemon had been asked to
+/// serve.
 fn spawn_shim(root: &Path) -> Child {
     Command::new(BIN)
         .arg("mcp-shim")
         .current_dir(root)
+        .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -117,7 +131,7 @@ fn spawn_shim_with_project_dir_env(cwd: &Path, project_dir_env: &Path) -> Child 
     Command::new(BIN)
         .arg("mcp-shim")
         .current_dir(cwd)
-        .env("CLAUDE_PROJECT_DIR", project_dir_env)
+        .env(g_mesh::shim::PROJECT_DIR_ENV, project_dir_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -316,6 +330,93 @@ fn shim_prefers_claude_project_dir_env_over_cwd() {
     assert!(
         !cwd_decoy.socket().exists(),
         "cwd must be ignored once CLAUDE_PROJECT_DIR is set"
+    );
+}
+
+/// The regression guard for task 192, and deliberately a check on this
+/// directory's source rather than on a running shim.
+///
+/// The behaviour is not in doubt and is already covered both ways:
+/// [`shim_prefers_claude_project_dir_env_over_cwd`] proves the variable wins
+/// when it is set, and every other test here proves cwd is used when it is
+/// not. What broke three releases was neither - it was a *test suite* that
+/// never said which of the two it wanted, and so silently got the first one
+/// whenever `cargo test` ran underneath something that exports it. A runtime
+/// test can only ever assert that for the one spawn it performs; the property
+/// that actually needs holding is "no spawn anywhere in `core/tests` leaves
+/// this to the ambient environment", and that is a property of the files.
+///
+/// A new test file that spawns a shim and forgets fails here, by name, with
+/// the line to fix - rather than by hanging for 90 seconds in whichever file
+/// happens to sort first, months later, on someone else's release.
+///
+/// Both ways of deciding count: clearing the variable (what a test with a
+/// `current_dir` of its own wants) and setting it (what
+/// `spawn_shim_with_project_dir_env` wants). Only inheriting it silently is
+/// the failure.
+#[test]
+fn every_shim_spawn_in_this_suite_decides_which_project_it_serves() {
+    // Comments are stripped before anything is judged, so that neither a doc
+    // comment mentioning the subcommand counts as a spawn, nor a commented-out
+    // `env_remove` counts as a decision.
+    fn code(line: &str) -> &str {
+        line.split("//").next().unwrap_or("")
+    }
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut undecided: Vec<String> = Vec::new();
+    let mut spawns = 0usize;
+
+    let entries = std::fs::read_dir(&tests_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", tests_dir.display()));
+    for entry in entries {
+        let path = entry.expect("failed to read a directory entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let lines: Vec<&str> = source.lines().collect();
+
+        for (index, line) in lines.iter().enumerate() {
+            // Written as an escaped literal so this very line is not one of
+            // the spawn sites it goes looking for.
+            if !code(line).contains("arg(\"mcp-shim\")") {
+                continue;
+            }
+            spawns += 1;
+            // The rest of the statement the spawn is part of: builder chains
+            // here run over anything from one line to a dozen, so the extent
+            // is the terminating semicolon rather than a fixed window.
+            let mut statement = String::new();
+            for following in &lines[index..] {
+                statement.push_str(code(following));
+                if code(following).contains(';') {
+                    break;
+                }
+            }
+            if !statement.contains("PROJECT_DIR_ENV") {
+                let name = path.file_name().unwrap_or_default();
+                undecided.push(format!("{}:{}", name.to_string_lossy(), index + 1));
+            }
+        }
+    }
+
+    // A scanner that has stopped recognizing spawn sites would pass this test
+    // by finding nothing at all, which is the one way it could go quietly
+    // wrong. The floor is well under today's count, so ordinary churn does not
+    // touch it, and a rename of the subcommand or the builder shape does.
+    assert!(
+        spawns >= 20,
+        "only {spawns} `mcp-shim` spawns were recognized in {} - the scan below has stopped \
+         matching how this suite spawns them, and is no longer guarding anything",
+        tests_dir.display()
+    );
+    assert!(
+        undecided.is_empty(),
+        "these `mcp-shim` spawns inherit CLAUDE_PROJECT_DIR from whatever launched \
+         `cargo test`, so they serve that project instead of their own fixture: {undecided:?}. \
+         Add `.env_remove(g_mesh::shim::PROJECT_DIR_ENV)` to each (or set it deliberately, \
+         as `spawn_shim_with_project_dir_env` does)."
     );
 }
 
