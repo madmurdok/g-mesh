@@ -167,6 +167,7 @@ async fn connect_with(
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim")
             .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", SHORT_BOOTSTRAP_BUDGET.as_millis().to_string());
         if let Some(delay) = hold_the_walk_open {
             cmd.env("G_MESH_BULK_INDEX_DELAY_MS", delay.as_millis().to_string());

@@ -75,6 +75,16 @@ and SQLite paths under `~/.g-mesh/projects/<hash>/` — like this:
    of this doc had you register it (once per project, cwd pinned at
    registration time).
 
+`CLAUDE_PROJECT_DIR` is an ordinary environment variable, so it is **inherited
+by everything a Claude Code session starts**, however deep — and the shim
+cannot tell "my own MCP client set this" from "an MCP server four processes up
+did". Anything that runs `g-mesh mcp-shim` from inside such a process (a
+wrapper script, a task runner, a test suite) is therefore served the
+*session's* project, whatever `cwd` it set. Clear the variable for the child
+if you meant `cwd` to decide. On a cold start the shim now says which root it
+picked and where the root came from, on stderr, so a redirected shim shows up
+in the client's server log rather than as an empty answer.
+
 The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
 project's SQLite index, spawns the JS/TS plugin, builds the initial index if
@@ -327,3 +337,26 @@ project's daemon before cleaning it.
 cd core && cargo test
 cd ../plugins/typescript && npm run build && npm test
 ```
+
+The integration tests spawn real shims, real daemons and a real plugin against
+temp-directory fixtures, so they care about the environment they run in:
+
+- **`CLAUDE_PROJECT_DIR` must not leak into the suite.** Every shim spawn in
+  `core/tests` clears it (a test enforces that for the whole directory), so
+  the suite is safe to launch from a CI runner, a release script, or an MCP
+  server that shells out — all of which inherit it from a Claude Code session
+  and would otherwise point every fixture's shim at the session's own
+  project. Before that fix the symptom was a hang, not an error: the fixture's
+  daemon was never started, so its walk never completed and the run failed in
+  whichever file happened to reach a shim first with "the cold-start bulk walk
+  for /var/folders/…/.tmpXXXX did not finish within 90s".
+- Nothing else about the launching process matters: piped stdio, a
+  long-running parent, and a one-shot script all behave identically (measured,
+  task 192).
+- `G_MESH_TEST_INDEXED_TIMEOUT_SECS` raises the per-project indexing budget
+  (default 90s) on a machine slow enough to need it. If it does not help, the
+  walk is not slow — something is wrong.
+- `G_MESH_DAEMON_LOG=<file>` makes a shim-bootstrapped daemon append its
+  stderr (and its plugins') to that file instead of discarding it. Detached
+  daemons have no console, so this is the only way to see what one is doing
+  during a test run; unset, nothing changes.

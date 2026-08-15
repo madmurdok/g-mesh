@@ -152,7 +152,9 @@ async fn find_callers_reaches_a_caller_that_went_through_a_namespace_import() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(&root);
+        cmd.arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

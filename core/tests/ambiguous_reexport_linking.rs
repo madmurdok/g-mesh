@@ -121,7 +121,9 @@ async fn find_callers_resolves_through_an_ambiguous_export_star_barrel() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(&root);
+        cmd.arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

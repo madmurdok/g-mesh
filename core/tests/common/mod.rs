@@ -79,9 +79,19 @@ pub fn wait_until_indexed(root: &Path) {
         if indexed {
             return;
         }
+        // Both ways this can fire are named, because for three releases only
+        // the first one was and it was the wrong one every time. A walk that
+        // is merely slow finishes eventually and wants a bigger budget; a walk
+        // that never started ignores any budget at all, and the way that
+        // happens is a shim that went and served a *different* project - see
+        // `shim::PROJECT_DIR_ENV` and task 192.
         assert!(
             Instant::now() < deadline,
-            "the cold-start bulk walk for {} did not finish within {timeout:?} (raise G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow)",
+            "the cold-start bulk walk for {} did not finish within {timeout:?}. Raise \
+             G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow - but if a bigger \
+             budget changes nothing, no daemon is walking this root at all: check that the shim \
+             was not handed an inherited CLAUDE_PROJECT_DIR, and set G_MESH_DAEMON_LOG to see \
+             what the daemon that did start was doing",
             root.display()
         );
         std::thread::sleep(Duration::from_millis(20));

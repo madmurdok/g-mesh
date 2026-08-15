@@ -287,6 +287,7 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim")
             .current_dir(project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env(PLUGIN_PATH_ENV, &entry)
             // Inherited by the daemon this shim bootstraps, which is what has
             // to discover (and be judged on) this test's own plugin build

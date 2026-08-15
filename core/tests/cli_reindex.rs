@@ -86,6 +86,7 @@ impl Project {
         let mut shim = Command::new(BIN)
             .arg("mcp-shim")
             .current_dir(self.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -194,7 +195,9 @@ fn body(result: &CallToolResult) -> Value {
 /// changed.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(TokioCommand::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(project.root());
+        cmd.arg("mcp-shim")
+            .current_dir(project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

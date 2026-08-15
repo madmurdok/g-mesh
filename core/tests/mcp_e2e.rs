@@ -110,7 +110,9 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // Same spawn shape the MCP client of a real editor uses: the project
     // directory as cwd is the shim's entire notion of project identity.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(&root);
+        cmd.arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
 
