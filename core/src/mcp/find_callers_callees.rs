@@ -148,6 +148,10 @@ impl From<CallSite> for CalleeSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CallerPage {
+    /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
+    /// so a caller asking about usages "elsewhere" doesn't need a separate
+    /// `find_definition` call just to learn the anchor's own file/line.
+    anchor: anchor::AnchorInfo,
     results: Vec<CallerSite>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -163,6 +167,8 @@ struct CallerPage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CalleePage {
+    /// See `anchor::AnchorInfo`, same rationale as `CallerPage`'s own field.
+    anchor: anchor::AnchorInfo,
     results: Vec<CalleeSite>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -183,6 +189,7 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -200,6 +207,7 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
     success(&CallerPage {
+        anchor: anchor_info,
         results: bounded.results,
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
@@ -216,6 +224,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -233,6 +242,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
     success(&CalleePage {
+        anchor: anchor_info,
         results: bounded.results,
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
@@ -399,6 +409,28 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
+    }
+
+    /// Task #190: both `find_callers` and `find_callees` echo the resolved
+    /// anchor in their own response, not just `find_references`'s - each
+    /// builds its own response struct, so this has to be proven per tool.
+    #[test]
+    fn both_directions_echo_the_resolved_anchor() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let callers = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(callers["anchor"]["id"], "b");
+        assert_eq!(callers["anchor"]["qualifiedName"], "pkg::b");
+        assert_eq!(callers["anchor"]["kind"], "Function");
+        assert_eq!(callers["anchor"]["filePath"], "b.rs");
+
+        let callees = json_body(
+            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(callees["anchor"]["id"], "b");
+        assert_eq!(callees["anchor"]["qualifiedName"], "pkg::b");
     }
 
     /// Both directions must accept the name form: the anchor lookup is

@@ -30,6 +30,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, FindImplementationsParams, SymbolQueryParams};
@@ -71,6 +72,10 @@ struct ImplementationSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImplementationPage {
+    /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
+    /// so a caller asking about usages "elsewhere" doesn't need a separate
+    /// `find_definition` call just to learn the anchor's own file/line.
+    anchor: anchor::AnchorInfo,
     results: Vec<ImplementationSite>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -140,6 +145,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -147,6 +153,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         .map_err(|e| internal_error("failed to find implementations", e))?;
 
     success(&ImplementationPage {
+        anchor: anchor_info,
         results: page.results,
         has_more: page.has_more,
         next_cursor: page.next_cursor,
@@ -211,6 +218,14 @@ impl From<ReachedNode> for TransitiveImplementationSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TransitiveImplementationWalk {
+    /// See `anchor::AnchorInfo`. Present only on a fresh walk (`from_root`),
+    /// absent (not `null`) on a resumed one - same "only when this call
+    /// actually resolved an anchor" convention `hint` below already follows:
+    /// a resumed call's caller already saw this on the response that handed
+    /// it the token, so re-fetching the node just to repeat it would spend a
+    /// query on information already delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor: Option<anchor::AnchorInfo>,
     results: Vec<TransitiveImplementationSite>,
     truncated: bool,
     truncated_by: Option<&'static str>,
@@ -251,6 +266,7 @@ fn bound_walk(
     result: TraversalResult,
     max_depth: u32,
     max_fanout: u32,
+    anchor: Option<anchor::AnchorInfo>,
     hint: Option<&'static str>,
     prior_visited: Vec<VisitedNode>,
     prior_walked: Vec<String>,
@@ -269,6 +285,7 @@ fn bound_walk(
 
     let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
         return TransitiveImplementationWalk {
+            anchor,
             results: dtos,
             truncated: result.truncated,
             truncated_by: result.truncated_by.map(wire_name),
@@ -301,6 +318,7 @@ fn bound_walk(
     });
 
     TransitiveImplementationWalk {
+        anchor,
         results: dtos.into_iter().take(cut).collect(),
         truncated: true,
         truncated_by: Some("responseSize"),
@@ -324,11 +342,12 @@ fn bound_walk(
 /// one here rather than a tool-specific tightening.
 fn from_root(
     conn: &Connection,
-    anchor_id: String,
+    anchor_node: &NodeRecord,
     hint: Option<&'static str>,
     max_depth: Option<u32>,
 ) -> Result<CallToolResult, ErrorData> {
-    let mut options = TraversalOptions::new(anchor_id, Direction::Incoming);
+    let anchor_info = anchor::AnchorInfo::from(anchor_node);
+    let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
     if let Some(depth) = max_depth {
         options.max_depth = depth;
@@ -337,7 +356,7 @@ fn from_root(
 
     let result = traversal::traverse(conn, options)
         .map_err(|e| internal_error("failed to walk the implementation hierarchy", e))?;
-    success(&bound_walk(result, max_depth, max_fanout, hint, Vec::new(), Vec::new()))
+    success(&bound_walk(result, max_depth, max_fanout, Some(anchor_info), hint, Vec::new(), Vec::new()))
 }
 
 /// Continues a transitive walk the exploration budget or a prior
@@ -356,7 +375,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the implementation walk", e))?;
-    success(&bound_walk(result, max_depth, max_fanout, None, prior_visited, prior_walked))
+    success(&bound_walk(result, max_depth, max_fanout, None, None, prior_visited, prior_walked))
 }
 
 /// The entry point `mod.rs` calls. Dispatches on `transitive`/`resume_token`
@@ -396,7 +415,7 @@ pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementation
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, anchor.id, hint, max_depth)
+    from_root(&conn, &anchor, hint, max_depth)
 }
 
 #[cfg(test)]
@@ -523,6 +542,71 @@ mod tests {
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
+    }
+
+    /// Task #190: the single-hop response echoes the resolved anchor.
+    #[test]
+    fn the_single_hop_response_echoes_the_resolved_anchor() {
+        let conn = setup_chain();
+        let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["anchor"]["id"], "interface");
+        assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
+        assert_eq!(body["anchor"]["kind"], "Type");
+        assert_eq!(body["anchor"]["filePath"], "iface.rs");
+    }
+
+    /// The transitive walk's own response echoes the anchor too - it is the
+    /// same tool, and the resolved node is available exactly as it is on the
+    /// single-hop path. A resumed call, by contrast, must not carry it: see
+    /// `a_resumed_transitive_walk_does_not_repeat_the_anchor` below.
+    #[test]
+    fn a_fresh_transitive_walk_echoes_the_resolved_anchor() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+        let params = FindImplementationsParams {
+            symbol_id: Some("interface".to_string()),
+            transitive: Some(true),
+            ..Default::default()
+        };
+        let body = json_body(&dispatch(&conn, params).unwrap());
+        assert_eq!(body["anchor"]["id"], "interface");
+        assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
+    }
+
+    /// A resumed walk's caller already received the anchor on the response
+    /// that handed it the `resumeToken`, so re-fetching the node just to
+    /// repeat it would spend a query for nothing new - see `continued`'s own
+    /// doc comment for the identical reasoning already established for
+    /// `hint`. Driven through `traverse` + `bound_walk`/`continued` directly,
+    /// same reason as `a_response_size_cut_is_continued_...` above: reaching
+    /// a `responseSize` cut needs a `max_fanout` wider than this tool's own
+    /// default, which `FindImplementationsParams` does not expose.
+    #[test]
+    fn a_resumed_transitive_walk_does_not_repeat_the_anchor() {
+        let wide: usize = 600;
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        for i in 0..wide {
+            let id = format!("impl{i:05}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
+                .unwrap();
+        }
+
+        let anchor_node = queries::get_node(&conn, "interface").unwrap().expect("anchor node must exist");
+        let anchor_info = anchor::AnchorInfo::from(&anchor_node);
+
+        let mut options = TraversalOptions::new("interface", Direction::Incoming);
+        options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
+        options.max_fanout = 10_000;
+        let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
+        let result = traversal::traverse(&conn, options).unwrap();
+        let first = bound_walk(result, max_depth, max_fanout, Some(anchor_info), None, Vec::new(), Vec::new());
+        assert!(first.anchor.is_some(), "the first page of a fresh walk still carries the anchor");
+        let token = first.resume_token.expect("this wide a fanout must truncate and hand back a token");
+
+        let resumed = json_body(&continued(&conn, &token).unwrap());
+        assert!(resumed.get("anchor").is_none(), "a resumed page must not repeat the anchor, not even as null: {resumed}");
     }
 
     /// Anchoring by name must reach the same node the id does - here the
@@ -804,7 +888,7 @@ mod tests {
         options.max_fanout = 1;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let walk = bound_walk(result, max_depth, max_fanout, None, Vec::new(), Vec::new());
+        let walk = bound_walk(result, max_depth, max_fanout, None, None, Vec::new(), Vec::new());
 
         assert_eq!(walk.results.len(), 1, "one of the three implementors, and a warning");
         assert!(walk.truncated);
@@ -838,7 +922,7 @@ mod tests {
         options.max_fanout = 10_000;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let first = bound_walk(result, max_depth, max_fanout, None, Vec::new(), Vec::new());
+        let first = bound_walk(result, max_depth, max_fanout, None, None, Vec::new(), Vec::new());
 
         assert!(!first.results.is_empty(), "at least one row must come back");
         assert!(first.results.len() < wide, "one response must not hold all {wide} implementors: {}", first.results.len());
