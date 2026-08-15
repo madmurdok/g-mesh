@@ -72,6 +72,10 @@ struct ReferenceSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferencePage {
+    /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
+    /// so a caller asking about usages "elsewhere" doesn't need a separate
+    /// `find_definition` call just to learn the anchor's own file/line.
+    anchor: anchor::AnchorInfo,
     results: Vec<ReferenceSite>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -142,6 +146,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -149,6 +154,7 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         .map_err(|e| internal_error("failed to find references", e))?;
 
     success(&ReferencePage {
+        anchor: anchor_info,
         results: page.results,
         has_more: page.has_more,
         next_cursor: page.next_cursor,
@@ -534,6 +540,26 @@ mod tests {
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
+    }
+
+    /// The point of task #190: the response itself says what it anchored on,
+    /// so a caller asking about usages "elsewhere" (excluding the definition
+    /// file) can read the anchor's own `filePath` straight off this response
+    /// instead of issuing a separate `find_definition` call first.
+    #[test]
+    fn the_response_echoes_the_resolved_anchor() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["anchor"]["id"], "target");
+        assert_eq!(body["anchor"]["qualifiedName"], "pkg::run");
+        assert_eq!(body["anchor"]["kind"], "Function");
+        assert_eq!(body["anchor"]["filePath"], "target.rs");
+        assert_eq!(body["anchor"]["startLine"], 0);
     }
 
     /// The whole point of `symbol_name`: an unambiguous name lands on the
