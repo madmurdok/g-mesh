@@ -122,12 +122,25 @@ pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Optio
 /// headroom for the rare oversized page, never a new default behavior for
 /// the common one.
 pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
+    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES)
+}
+
+/// [`bound_page`] with the byte budget spelled out, so a response that also
+/// carries a `files` tally can hold part of [`MAX_RESPONSE_BYTES`] back for
+/// it (see [`bound_page_reserving_tally`]) instead of the two sections
+/// separately each believing they own the whole ceiling.
+fn bound_page_within<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+    budget: usize,
+) -> Page<T> {
     if rows.is_empty() {
         return Page { results: Vec::new(), has_more, next_cursor, all_unresolved: false };
     }
 
     let items: Vec<&T> = rows.iter().map(|r| &r.item).collect();
-    let Some(cut) = longest_prefix_fitting(&items, MAX_RESPONSE_BYTES) else {
+    let Some(cut) = longest_prefix_fitting(&items, budget) else {
         let all_unresolved = rows.iter().all(|r| !r.resolved);
         return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor, all_unresolved };
     };
@@ -203,6 +216,131 @@ pub enum Direction {
     Outgoing,
     /// Edges coming into the anchor node (`toId = anchor`).
     Incoming,
+}
+
+/// One file holding at least one of the edges a [`tally_edge_files`] query
+/// matched, and how many of them it holds.
+///
+/// Deliberately short key names (`path`/`refs`, not `filePath`/`references`
+/// as the row shapes spell them): this array exists purely to be *cheaper*
+/// than the rows it summarizes, and JSON object keys repeat once per entry -
+/// on a 50-file tally the longer spelling costs ~600 bytes of pure key text
+/// for no information. The values are unambiguous without it; a tally entry
+/// can only ever be a path and a count.
+#[derive(Serialize)]
+pub struct FileTally {
+    pub path: String,
+    pub refs: i64,
+}
+
+/// Ceiling on how many entries [`tally_edge_files`] returns. Well above the
+/// widest fan-out the benchmark corpus produces (excalidraw's `pointFrom`,
+/// ~52 referencing files), and at ~40 bytes an entry a full 200 still stays
+/// inside [`FILE_TALLY_RESERVE`].
+const MAX_FILE_TALLY: usize = 200;
+
+/// Byte budget [`bound_page_reserving_tally`] holds back from
+/// [`MAX_RESPONSE_BYTES`] for a `files` tally, so a response carrying both a
+/// tally and rows never grows past the same total ceiling a rows-only
+/// response already respects. Sized for [`MAX_FILE_TALLY`] entries at typical
+/// path lengths.
+pub const FILE_TALLY_RESERVE: usize = 8_000;
+
+/// Every distinct file that holds one of the edges [`paginate_edges`] would
+/// match for the same anchor/direction/kind/scope, with a per-file count -
+/// computed over the *whole* edge set, not one page of it.
+///
+/// That "whole set" is the point. A high-fan-out anchor's rows get cut by
+/// `page_size` and again by [`MAX_RESPONSE_BYTES`], so the file-level answer
+/// a rename or impact question actually wants ("which files do I have to
+/// touch") is exactly the answer a paginated row list can't give: the caller
+/// either walks every cursor page or hedges. One `GROUP BY` over the same
+/// predicate answers it completely in a fraction of the bytes, because a
+/// tally entry is ~40 bytes where a reference row is ~260.
+///
+/// Ordered by count descending, then path ascending - the highest-count file
+/// is the one most worth reading first on an impact question, and the path
+/// tiebreak keeps the order stable across identical counts.
+pub fn tally_edge_files(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> Result<Vec<FileTally>> {
+    let (other_endpoint, this_endpoint) = match direction {
+        Direction::Outgoing => ("toId", "fromId"),
+        Direction::Incoming => ("fromId", "toId"),
+    };
+
+    // `?1` is the anchor id and `?2` the row cap; the kind filter's
+    // placeholders continue after them and the scope filter's after those,
+    // same widening rule `paginate_edges` uses.
+    let kind_filter = if edge_kinds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 3)).collect();
+        format!("e.kind IN ({})", placeholders.join(", "))
+    };
+    let scope_filter = if file_paths.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let base = 3 + edge_kinds.len();
+        let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
+        format!("n.filePath IN ({})", placeholders.join(", "))
+    };
+    let sql = format!(
+        "SELECT n.filePath AS filePath, COUNT(*) AS refs \
+         FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
+         WHERE e.{this_endpoint} = ?1 \
+           AND {kind_filter} \
+           AND {scope_filter} \
+         GROUP BY n.filePath \
+         ORDER BY refs DESC, filePath ASC \
+         LIMIT ?2"
+    );
+
+    let cap = MAX_FILE_TALLY as i64;
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor_node_id, &cap];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let tally = stmt
+        .query_map(sql_params.as_slice(), |row| Ok(FileTally { path: row.get("filePath")?, refs: row.get("refs")? }))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to tally edge files")?;
+    Ok(tally)
+}
+
+/// Whether a `files` tally is worth sending alongside `results`.
+///
+/// Two cases, and only two. The page is incomplete (`has_more`), so the rows
+/// genuinely cannot show every file and the tally is information the caller
+/// has no other cheap way to get. Or the rows repeat files (`rows > files`),
+/// so a caller after the file-level answer would otherwise dedupe them by
+/// hand - the exact work that costs an agent its reasoning tokens on a
+/// high-fan-out lookup.
+///
+/// Everything else - a complete page whose rows already sit one per file -
+/// gets no tally at all, because there the tally would be a byte-for-byte
+/// restatement of the `filePath` column. That is what keeps this free on the
+/// narrow, exact lookups (a disambiguated symbol with three usages) where the
+/// row list is already the whole answer.
+pub fn tally_is_worth_sending(row_count: usize, tally: &[FileTally], has_more: bool) -> bool {
+    has_more || row_count > tally.len()
+}
+
+/// [`bound_page`], but leaving [`FILE_TALLY_RESERVE`] bytes of the response
+/// budget free for a `files` tally the caller is about to attach. Rows are
+/// still what gets cut - a tally is bounded by [`MAX_FILE_TALLY`] and never
+/// grows without bound, while rows do.
+pub fn bound_page_reserving_tally<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+) -> Page<T> {
+    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - FILE_TALLY_RESERVE)
 }
 
 /// An edge alongside the `locality` [`paginate_edges`] already computed for
