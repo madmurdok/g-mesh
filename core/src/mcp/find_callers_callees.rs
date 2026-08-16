@@ -153,6 +153,18 @@ struct CallerPage {
     /// `find_definition` call just to learn the anchor's own file/line.
     anchor: anchor::AnchorInfo,
     results: Vec<CallerSite>,
+    /// Every file holding a call to the anchor, with a per-file count, over
+    /// the whole edge set rather than this page - see
+    /// `pagination::tally_edge_files`, and `find_references`' identically
+    /// gated field for when it appears and when it stays off the wire.
+    ///
+    /// `find_callees` has no counterpart on purpose. "Which files does this
+    /// function reach" is not a question anybody asks before an edit; the
+    /// impact questions that want a file-level answer - a rename, a signature
+    /// change, a removal - all run *inbound*, so a callee-side tally would be
+    /// payload on every response for a question the tool never gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<pagination::FileTally>>,
     has_more: bool,
     next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every caller in `results` came
@@ -204,11 +216,16 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
             pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
+    let bounded = pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor);
+
+    let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
+        .map_err(|e| internal_error("failed to tally calling files", e))?;
+    let files = pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
 
     success(&CallerPage {
         anchor: anchor_info,
         results: bounded.results,
+        files,
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
