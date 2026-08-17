@@ -43,6 +43,27 @@ npm run build
 Build order doesn't matter, but both are required — the daemon refuses to
 start (hard failure) if it can't spawn the plugin.
 
+### 3. Embedding model (optional — only `search_code` needs it)
+
+The seven structural tools work with nothing else installed. `search_code`,
+the semantic one, needs a model directory that **you fetch explicitly** —
+nothing in g-mesh ever downloads anything on its own, by design:
+
+```bash
+core/scripts/fetch-embedding-model.sh
+# -> ~/.g-mesh/models/jina-embeddings-v2-base-code/{model.onnx,tokenizer.json}
+```
+
+That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
+`516f4baf13dec4ddddda8631e019b5737c8bc250`, and `model.onnx` alone is ~610 MiB
+— which is why it is neither vendored nor downloaded behind your back. Pass a
+directory to the script, or set `G_MESH_MODEL_DIR`, to put it elsewhere; the
+script and the loader resolve the location the same way, so they cannot
+disagree.
+
+Skipping this is a perfectly good choice. Everything else works; `search_code`
+just reports that semantic search is unavailable.
+
 **Important**: there is no distribution/packaging step yet. The daemon
 resolves the plugin's path relative to `core`'s own source tree, baked in at
 *compile time* (`core/src/daemon/plugin.rs`):
@@ -290,7 +311,13 @@ defaults when a project or machine has never run either.
 ## Tools exposed
 
 `find_definition`, `find_references`, `find_callers`, `find_callees`,
-`find_implementations`, `get_file_outline`, `get_dependencies`.
+`find_implementations`, `get_file_outline`, `get_dependencies` — all
+structural, all available with no extra setup.
+
+Plus `search_code`: free-text semantic search over doc comments and
+signatures, ranked by similarity. It is the one tool with a prerequisite —
+the embedding model above — and the one whose top hit is a ranked guess
+rather than a resolved graph answer.
 
 ## Known limits
 
@@ -379,7 +406,8 @@ CC0/Artistic-2.0, and public-domain SQLite via `rusqlite`'s bundled build);
 nothing here is copyleft.
 
 **The embedding model is not part of this repository.** `search_code` needs a
-model directory that you fetch yourself (see `core/src/embedding/model.rs` —
-`model.onnx` alone is ~610 MiB, which is why it is not vendored), and that
-model carries whatever license its own publisher set. Check it before
-redistributing a machine image or a container that has one baked in.
+model directory that you fetch yourself (see "Embedding model" above —
+`model.onnx` alone is ~610 MiB, which is why it is not vendored). The default
+model, `jina-embeddings-v2-base-code`, is Apache-2.0, so redistributing it
+inside a machine image or container is permitted under its own terms; if you
+point g-mesh at a different model, check that model's license yourself.
