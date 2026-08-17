@@ -92,6 +92,30 @@ elsewhere, override with an env var:
 export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
 ```
 
+### Release artifacts (build pipeline only, not a distribution yet)
+
+`scripts/build-targets.sh` builds and packages one archive per Rust target
+triple — `g-mesh-v<version>-<triple>.tar.gz` (`.zip` on Windows) plus a
+`.sha256`, written to `dist/`:
+
+```bash
+scripts/build-targets.sh                      # host target
+scripts/build-targets.sh x86_64-apple-darwin  # a specific one
+scripts/build-targets.sh --list               # the four supported triples
+```
+
+`.github/workflows/release.yml` runs that same script across four native
+runners (Intel macOS, Apple Silicon, Linux, Windows) from one trigger, so CI
+artifact names are reproducible locally. Native runners rather than true
+cross-compilation because `rusqlite`(bundled)/`tokenizers`(onig)/`sqlite-vec`
+compile C for the target and `ort` links ONNX Runtime statically against a
+per-platform C++ stdlib.
+
+The caveat above still applies in full: because the plugin path is baked in at
+compile time, these archives contain a binary that **cannot yet run outside
+this repo layout**. They exercise the build pipeline; making them installable
+is a separate, still-open piece of work.
+
 ## How it finds a project
 
 `g-mesh mcp-shim` takes no arguments. It resolves the project root — the
