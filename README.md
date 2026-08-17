@@ -47,22 +47,34 @@ start (hard failure) if it can't spawn the plugin.
 
 The seven structural tools work with nothing else installed. `search_code`,
 the semantic one, needs a model directory that **you fetch explicitly** —
-nothing in g-mesh ever downloads anything on its own, by design:
+nothing in g-mesh ever downloads anything on its own, by design (that is
+enforced by a test: the HTTP client is reachable from this one command and
+from nowhere else in the codebase). Using the binary built in step 1
+(`core/target/release/g-mesh`, until it is on your `PATH`):
 
 ```bash
-core/scripts/fetch-embedding-model.sh
+g-mesh model fetch
 # -> ~/.g-mesh/models/jina-embeddings-v2-base-code/{model.onnx,tokenizer.json}
+
+g-mesh model status   # where the weights are expected, and whether they're there
 ```
 
 That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
-`516f4baf13dec4ddddda8631e019b5737c8bc250`, and `model.onnx` alone is ~610 MiB
-— which is why it is neither vendored nor downloaded behind your back. Pass a
-directory to the script, or set `G_MESH_MODEL_DIR`, to put it elsewhere; the
-script and the loader resolve the location the same way, so they cannot
-disagree.
+`516f4baf13dec4ddddda8631e019b5737c8bc250`, and `model.onnx` alone is ~612 MiB
+— which is why it is neither vendored nor downloaded behind your back. Each
+file is checked against a pinned SHA-256 and only then moved into place, so an
+interrupted download leaves a `.partial` you can delete, never a truncated
+`model.onnx` that loads as garbage. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
+put it elsewhere; the command and the loader share one resolution function, so
+they cannot disagree.
 
-Skipping this is a perfectly good choice. Everything else works; `search_code`
-just reports that semantic search is unavailable.
+The download is HTTPS from the binary itself — no `curl`, no Python, no
+Hugging Face CLI. `core/scripts/fetch-embedding-model.sh` does the same
+download as a shell one-liner and is kept for a checkout with nothing built
+yet; it skips the checksum.
+
+Skipping this step entirely is a perfectly good choice. Everything else works;
+`search_code` just reports that semantic search is unavailable.
 
 **Important**: there is no distribution/packaging step yet. The daemon
 resolves the plugin's path relative to `core`'s own source tree, baked in at

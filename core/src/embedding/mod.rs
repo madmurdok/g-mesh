@@ -19,5 +19,5 @@
 pub mod model;
 pub mod pipeline;
 
-pub use model::{cosine_similarity, default_model_dir, EmbeddingModel, EMBEDDING_DIM};
+pub use model::{cosine_similarity, default_model_dir, resolve_model_dir, EmbeddingModel, EMBEDDING_DIM};
 pub use pipeline::EmbeddingPipeline;

@@ -10,14 +10,14 @@
 //! # Real model weights
 //!
 //! The tests that actually call into `EmbeddingModel::embed` need
-//! `model.onnx`/`tokenizer.json` on disk (`core/scripts/fetch-embedding-model.sh`)
+//! `model.onnx`/`tokenizer.json` on disk (`g-mesh model fetch`)
 //! and are `#[ignore]`d for the same reason `embedding::model`'s own weight-
 //! dependent tests are: CI and a fresh checkout do not have ~600MiB of ONNX
 //! weights lying around, so a suite that hard-required them would fail
 //! everywhere but a machine that happened to have fetched the model first.
 //! Run them explicitly once the weights are present:
 //!
-//!     core/scripts/fetch-embedding-model.sh
+//!     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
 //!     cd core && cargo test --test embedding_generation_pipeline -- --ignored
 
 use std::collections::HashMap;
@@ -139,7 +139,7 @@ fn weights_available() -> bool {
 fn load_real_pipeline() -> EmbeddingPipeline {
     assert!(
         weights_available(),
-        "real model weights are required for this test; run core/scripts/fetch-embedding-model.sh first"
+        "real model weights are required for this test; run `g-mesh model fetch` first"
     );
     EmbeddingPipeline::load(&g_mesh::config::EmbeddingConfig::default())
 }

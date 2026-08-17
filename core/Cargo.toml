@@ -57,6 +57,23 @@ sqlite-vec = "0.1.9"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 toml = "0.8"
+# The HTTP client behind `g-mesh model fetch` (src/cli/model.rs) - the one and
+# only place in this crate that opens a network connection, enforced by a test
+# there. Deliberately not "shell out to curl": the same promise that made ONNX
+# Runtime a static link (see the `ort` pin above - "one binary with no runtime
+# dependency for the user", REQUIREMENTS.md) rules out requiring curl in PATH,
+# which distroless/alpine images and Windows do not guarantee.
+#
+# `tls` is rustls with the bundled Mozilla root store (webpki-roots), so
+# certificate validation does not depend on the host having a usable CA bundle
+# either; `proxy-from-env` keeps `HTTPS_PROXY` working for anyone behind a
+# corporate proxy, which curl would have honored for free. `gzip` (a default) is
+# off: the payload is 612 MiB of already-incompressible ONNX weights.
+#
+# 2.x rather than 3.x on purpose: `ort-sys`'s build script already pulls ureq 2
+# into this tree, so this reuses that subtree instead of compiling a second
+# copy of ureq and rustls.
+ureq = { version = "2", default-features = false, features = ["tls", "proxy-from-env"] }
 
 [dev-dependencies]
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }

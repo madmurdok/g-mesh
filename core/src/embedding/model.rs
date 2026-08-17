@@ -38,10 +38,15 @@
 //!   tokenizer.json   -> <model dir>/tokenizer.json
 //! ```
 //!
-//! `core/scripts/fetch-embedding-model.sh` does exactly that, into the
-//! directory [`default_model_dir`] resolves to. The model is Apache-2.0, so
-//! redistributing it with g-mesh later is possible; that is a packaging
-//! decision, not this module's.
+//! `g-mesh model fetch` (see [`crate::cli::model`]) does exactly that, into the
+//! directory [`resolve_model_dir`] resolves to - it is a user-typed command,
+//! never something this module or the daemon triggers.
+//! `core/scripts/fetch-embedding-model.sh` is the same download as a shell
+//! one-liner, kept for a source checkout that has no built binary yet; both
+//! share this module's directory resolution and file names, and a test in
+//! `cli::model` fails if the script's pinned revision ever drifts from the
+//! binary's. The model is Apache-2.0, so redistributing it with g-mesh later is
+//! possible; that is a packaging decision, not this module's.
 //!
 //! # Determinism
 //!
@@ -65,8 +70,13 @@ use tokenizers::TruncationParams;
 /// Face uses, so a directory can be populated by copying files straight out of
 /// a model repo without renaming (`onnx/model.onnx` flattened to
 /// `model.onnx`).
-const ONNX_FILE_NAME: &str = "model.onnx";
-const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
+///
+/// `pub(crate)` because `cli::model` writes exactly these files: the fetcher
+/// naming one of them differently would produce a directory this loader
+/// rejects, so the two read the same constant rather than each spelling it
+/// out.
+pub(crate) const ONNX_FILE_NAME: &str = "model.onnx";
+pub(crate) const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
 
 /// ONNX graph input/output names. BERT-style encoders exported by
 /// `transformers` use exactly these; they are addressed by name rather than by
@@ -142,7 +152,7 @@ impl EmbeddingModel {
             if !path.exists() {
                 bail!(
                     "embedding model file {} not found.\n\
-                     Fetch the model first: core/scripts/fetch-embedding-model.sh {}",
+                     Fetch the model first: g-mesh model fetch --dir {}",
                     path.display(),
                     model_dir.display()
                 );
@@ -313,6 +323,23 @@ pub fn default_model_dir(model_name: &str) -> Result<PathBuf> {
     Ok(home.join(".g-mesh").join("models").join(model_name))
 }
 
+/// The full resolution order for a model directory: an explicitly given path,
+/// else [`default_model_dir`] (`$G_MESH_MODEL_DIR`, else
+/// `~/.g-mesh/models/<model_name>`).
+///
+/// Lives here, beside the loader that *reads* those directories, because the
+/// writer (`g-mesh model fetch`, see [`crate::cli::model`]) and the reader
+/// disagreeing about the location is the one failure neither side can detect:
+/// the fetcher would report success and the loader would still report a
+/// missing model. Only one of them may own the answer, and it is this
+/// function.
+pub fn resolve_model_dir(explicit: Option<&Path>, model_name: &str) -> Result<PathBuf> {
+    match explicit {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => default_model_dir(model_name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = EmbeddingModel::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("model.onnx"), "{err}");
-        assert!(err.contains("fetch-embedding-model.sh"), "{err}");
+        assert!(err.contains("g-mesh model fetch"), "{err}");
     }
 
     #[test]
@@ -355,6 +382,20 @@ mod tests {
         assert_eq!(
             default_model_dir("some-model").unwrap(),
             home.join(".g-mesh").join("models").join("some-model")
+        );
+    }
+
+    /// An explicit directory wins over both the env override and the home
+    /// default - the `--dir` argument of `g-mesh model fetch` relies on this,
+    /// and so does anyone who set `G_MESH_MODEL_DIR` and then asked for a
+    /// different directory once.
+    #[test]
+    fn an_explicit_directory_wins_over_the_env_override_and_the_default() {
+        let explicit = Path::new("/somewhere/else");
+        assert_eq!(resolve_model_dir(Some(explicit), "some-model").unwrap(), explicit);
+        assert_eq!(
+            resolve_model_dir(None, "some-model").unwrap(),
+            default_model_dir("some-model").unwrap()
         );
     }
 
@@ -417,7 +458,7 @@ mod tests {
     // are not in the repo, and they take seconds rather than milliseconds. To
     // run them:
     //
-    //     core/scripts/fetch-embedding-model.sh
+    //     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
     //     cd core && cargo test embedding -- --ignored --test-threads=1
     //
     // `--test-threads=1` only keeps peak memory to one loaded model; the

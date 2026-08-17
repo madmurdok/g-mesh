@@ -5,6 +5,18 @@
 # path and it is deliberately explicit: nothing in the daemon downloads
 # anything by itself.
 #
+# `g-mesh model fetch` (core/src/cli/model.rs) is the supported way to do this
+# and the only one an installed binary has - it downloads the same two files,
+# from the same pinned revision, into the same directory, and additionally
+# verifies them against pinned SHA-256 digests, which this script does not.
+#
+# This script is kept anyway, for the one case the binary cannot serve: a fresh
+# checkout with nothing built yet, where fetching the weights first lets
+# `cargo test embedding -- --ignored` run on the same pass as the build. It is
+# a contributor convenience, not a second source of truth - a unit test in
+# cli::model fails the build if the revision, the remote paths or the file
+# names below ever drift from the binary's.
+#
 # Usage:
 #   core/scripts/fetch-embedding-model.sh [target-dir]
 #
@@ -54,5 +66,6 @@ fetch "tokenizer.json" "tokenizer.json"
 
 echo
 echo "model ready in ${TARGET_DIR}"
+echo "(no checksum was verified - 'g-mesh model fetch' does that)"
 echo "run the full embedding tests with:"
 echo "  cd core && cargo test embedding -- --ignored --test-threads=1"
