@@ -724,6 +724,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "ureq",
 ]
 
 [[package]]

@@ -186,7 +186,7 @@ async fn connect_with(
             // with no model files makes `EmbeddingModel::load` fail its
             // `Path::exists()` check immediately - see its doc comment - so
             // embedding is skipped exactly like it would be for any
-            // contributor who has not run `fetch-embedding-model.sh`.
+            // contributor who has not run `g-mesh model fetch`.
             .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
     }))
     .expect("failed to spawn the shim");

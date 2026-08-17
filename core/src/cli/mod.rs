@@ -18,11 +18,18 @@
 //! way the MCP tool schemas were, so `--help` described the finished CLI
 //! before it grew a command at a time; `dispatch` below no longer has a
 //! `not_implemented` fallback to fall into.
+//!
+//! `model` was added after that surface was declared, because a binary
+//! installed without this repository had no way to obtain the embedding
+//! weights and therefore no way to use `search_code` at all (see
+//! [`crate::cli::model`]). It is also the only command here that opens a
+//! network connection, which that module keeps true structurally.
 
 pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;
 pub mod init;
+pub mod model;
 pub mod plugins;
 pub mod reindex;
 pub mod status;
@@ -70,6 +77,11 @@ pub enum Command {
         #[command(subcommand)]
         command: PluginsCommand,
     },
+    /// Fetch or inspect the embedding model that `search_code` needs.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     /// Delete cached project indexes under `~/.g-mesh/projects/`.
     Clean(CleanArgs),
     /// Stop the current project's daemon core and its plugin process.
@@ -93,6 +105,33 @@ pub enum Command {
 pub enum PluginsCommand {
     /// List the language plugins installed under `~/.g-mesh/plugins/`.
     List,
+}
+
+/// The embedding model's own commands, grouped under `model` rather than
+/// spelled `fetch-model`/`model-status` at the top level, for the same reason
+/// `plugins` is: they act on one thing, and the group is where a later
+/// `model rm` or `model verify` belongs.
+///
+/// `fetch` is the only command in the whole CLI that opens a network
+/// connection, and it does so *because the user typed it* - see
+/// [`crate::cli::model`] for how that stays true.
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// Download the embedding model's weights (~612 MiB) into the directory
+    /// the loader reads.
+    Fetch {
+        /// Where to put the weights. Defaults to `$G_MESH_MODEL_DIR`, else
+        /// `~/.g-mesh/models/<model>` - the same resolution the loader uses,
+        /// so the two cannot disagree.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Report whether the weights are present, and where they are expected.
+    Status {
+        /// Directory to inspect, resolved exactly as `fetch --dir` is.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// A coding agent/tool `init --agent` can auto-install project-instruction
@@ -151,6 +190,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Plugins { command } => match command {
             PluginsCommand::List => plugins::run(),
         },
+        Command::Model { command } => model::run(&command),
         Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
@@ -218,6 +258,39 @@ mod tests {
         let bare = parse(&["plugins"]).expect_err("`plugins` alone names no action");
         assert_eq!(bare.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
         assert!(parse(&["plugins", "uninstall"]).is_err(), "only `list` exists today");
+    }
+
+    /// `model` groups its own subcommands the way `plugins` does, and both of
+    /// them take an optional `--dir`, which is what lets a fetch land
+    /// somewhere other than the per-user default.
+    #[test]
+    fn model_requires_a_subcommand_and_both_take_an_optional_dir() {
+        assert!(matches!(
+            command_of(&["model", "fetch"]),
+            Command::Model { command: ModelCommand::Fetch { dir: None } }
+        ));
+        assert!(matches!(
+            command_of(&["model", "status"]),
+            Command::Model { command: ModelCommand::Status { dir: None } }
+        ));
+
+        match command_of(&["model", "fetch", "--dir", "/tmp/weights"]) {
+            Command::Model { command: ModelCommand::Fetch { dir } } => {
+                assert_eq!(dir, Some(PathBuf::from("/tmp/weights")));
+            }
+            other => panic!("expected `model fetch`, got {other:?}"),
+        }
+        match command_of(&["model", "status", "--dir", "/tmp/weights"]) {
+            Command::Model { command: ModelCommand::Status { dir } } => {
+                assert_eq!(dir, Some(PathBuf::from("/tmp/weights")));
+            }
+            other => panic!("expected `model status`, got {other:?}"),
+        }
+
+        let bare = parse(&["model"]).expect_err("`model` alone names no action");
+        assert_eq!(bare.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+        assert!(parse(&["model", "rm"]).is_err(), "only `fetch` and `status` exist today");
+        assert!(parse(&["model", "fetch", "/tmp/weights"]).is_err(), "--dir is a flag, not positional");
     }
 
     /// All four documented `clean` forms land in the same positional slot.
@@ -321,7 +394,7 @@ mod tests {
     fn help_lists_every_human_facing_command_and_hides_the_daemon() {
         let help = Cli::command().render_help().to_string();
         for name in
-            ["init", "config", "status", "reindex", "plugins", "clean", "stop", "mcp-shim"]
+            ["init", "config", "status", "reindex", "plugins", "model", "clean", "stop", "mcp-shim"]
         {
             assert!(help.contains(name), "`--help` must mention `{name}`:\n{help}");
         }

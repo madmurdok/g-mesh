@@ -102,8 +102,8 @@ pub(super) fn handle(
     let Some(query_vector) = embedding.embed_query(&params.query) else {
         return error(
             "g-mesh: semantic search is not available for this project - no embedding model \
-             is loaded. Run core/scripts/fetch-embedding-model.sh and restart the daemon, or \
-             use the structural tools (find_references, find_definition, ...) instead.",
+             is loaded. Run `g-mesh model fetch` and restart the daemon, or use the \
+             structural tools (find_references, find_definition, ...) instead.",
         );
     };
 
@@ -236,7 +236,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result = handle(&conn, &embedding, params).unwrap();
-        assert!(error_text(&result).contains("fetch-embedding-model.sh"));
+        assert!(error_text(&result).contains("g-mesh model fetch"));
     }
 
     /// A disabled pipeline (`MODEL_DIR_ENV` pointed at nothing) is the same
@@ -252,7 +252,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result = handle(&conn, &embedding, params).unwrap();
-        assert!(error_text(&result).contains("fetch-embedding-model.sh"));
+        assert!(error_text(&result).contains("g-mesh model fetch"));
         std::env::remove_var(MODEL_DIR_ENV);
     }
 
@@ -281,13 +281,13 @@ mod tests {
     /// going through the same real model, not synthetic vectors like the
     /// tests above.
     #[test]
-    #[ignore = "needs the real model weights; run core/scripts/fetch-embedding-model.sh first"]
+    #[ignore = "needs the real model weights; run `g-mesh model fetch` first"]
     fn a_query_related_to_a_docstring_ranks_that_symbol_above_an_unrelated_one() {
         let dir = crate::embedding::default_model_dir(&crate::config::EmbeddingConfig::default().model)
             .expect("failed to resolve the default model directory");
         assert!(
             dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists(),
-            "real model weights are required for this test; run core/scripts/fetch-embedding-model.sh first"
+            "real model weights are required for this test; run `g-mesh model fetch` first"
         );
         let model = crate::embedding::EmbeddingModel::load(&dir).expect("failed to load the real model");
 

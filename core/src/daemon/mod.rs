@@ -357,8 +357,9 @@ pub fn run(root: &Path) -> Result<()> {
     // its own thread - never this one, and never before something has
     // actually asked to embed. A model that is not available on this machine
     // does not stop the daemon - see `EmbeddingPipeline::load`'s doc comment -
-    // it just means nothing gets embedded until
-    // `core/scripts/fetch-embedding-model.sh` has been run.
+    // it just means nothing gets embedded until the user has run
+    // `g-mesh model fetch` themselves. Never this process: the daemon has no
+    // way to reach the fetcher (see `cli::model`), on purpose.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
 
     // The cold-start bulk walk below (`daemon::bulk_index::run`) needs its
