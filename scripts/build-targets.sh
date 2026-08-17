@@ -19,19 +19,30 @@
 #                   `version` field of core/Cargo.toml)
 #   DIST_DIR        where archives land (default: <repo>/dist)
 #   CARGO_PROFILE   cargo profile (default: release)
+#   G_MESH_SKIP_PLUGIN_BUNDLE
+#                   set to 1 to package the core binary alone - see below
 #
 # ---------------------------------------------------------------------------
-# KNOWN LIMITATION - the artifacts this produces are NOT yet independently
-# usable, and that is expected at this point in the project.
+# WHAT AN ARCHIVE CONTAINS
 #
-# `core/src/daemon/plugin.rs` resolves the bundled JS/TS plugin through
-# `env!("CARGO_MANIFEST_DIR")`, i.e. the path to *this checkout* is baked into
-# the binary at compile time. A binary unpacked anywhere else therefore cannot
-# find `plugins/typescript/dist/src/index.js`, and the daemon refuses to start
-# without it. Teaching the binary to find a plugin next to itself, and putting
-# that plugin in the archive, is task #65 (plugin bundling) - deliberately not
-# done here. Until then these archives are useful for testing the *pipeline*,
-# not for shipping to users.
+#   g-mesh[.exe]                     the core binary
+#   plugins/typescript/              the JS/TS plugin as a self-contained
+#                                    executable, its native addons, and the
+#                                    plugin.toml core discovers it through
+#                                    (built by scripts/bundle-plugin.sh)
+#   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
+#
+# The plugin is not optional dressing: core cannot index anything without one,
+# so an archive without it is not a release artifact. Both halves have to be
+# for the *same* platform, which is why each target is built on its own runner
+# (see .github/workflows/release.yml) - a single-executable plugin embeds the
+# build machine's own Node runtime and cannot be cross-built.
+#
+# `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
+# without a plugin: exercising the Rust cross-build path (macOS x86_64 ->
+# aarch64 does work) when the resulting archive is known not to be shippable.
+# It warns loudly, because that is exactly the state task 64 shipped in and
+# task 65 was opened to fix.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -163,6 +174,16 @@ build_one() {
 	cp "$REPO_ROOT/LICENSE" "$REPO_ROOT/LICENSE-MIT" "$REPO_ROOT/LICENSE-APACHE" \
 		"$REPO_ROOT/README.md" "$stage_dir/"
 
+	# `plugins/` beside the binary is not a convention this script invents - it
+	# is where `daemon::manifest::bundled_roots` looks in an installed layout,
+	# which is what makes the unpacked archive work from any directory.
+	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
+		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugin. The resulting archive CANNOT index anything and must not be published." >&2
+	else
+		log "bundling the JS/TS plugin for $target"
+		bash "$REPO_ROOT/scripts/bundle-plugin.sh" "$target" "$stage_dir/plugins"
+	fi
+
 	archive_path="$DIST_DIR/g-mesh-v$version-$target.$ext"
 	rm -f "$archive_path"
 	make_archive "$stage_dir" "$archive_path"
@@ -186,6 +207,16 @@ build_one() {
 		*"$version"*) ;;
 		*) die "version mismatch: archive says $version, binary says '$reported'" ;;
 		esac
+
+		# The check task 64 could not make: that the *staged* binary finds the
+		# *staged* plugin, through the same discovery an unpacked archive uses
+		# (`plugins/` beside the executable). This is the one that fails if the
+		# path resolution regresses back to a compile-time path.
+		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
+			log "smoke test: the staged binary discovers the staged plugin"
+			"$stage_dir/$bin_name" plugins list | grep -q "typescript" ||
+				die "the staged binary does not discover the plugin staged beside it"
+		fi
 	else
 		log "smoke test skipped: $target is not the host ($host)"
 	fi

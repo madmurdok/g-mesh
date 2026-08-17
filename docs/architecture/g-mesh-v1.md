@@ -1528,13 +1528,53 @@ Install via `curl | sh` pulling checksummed, platform-named binaries
 (standard Rust target triples, e.g. `g-mesh-x86_64-apple-darwin`) from
 GitHub Releases for v1; an `npm install -g g-mesh` wrapper around the same
 artifacts is a plausible future addition, not a blocker. The JS/TS plugin
-ships as a self-contained executable (Node SEA / `bun build --compile`) in
-the same release archive — no system Node.js required, consistent with the
-standalone requirement. Plugin discovery/loading is a general/pluggable
+ships as a self-contained executable in the same release archive — no system
+Node.js required, consistent with the standalone requirement. Plugin
+discovery/loading is a general/pluggable
 interface from v1 (`~/.g-mesh/plugins/<language>/` + manifest with a
 protocol version) even though the only populated path in v1 is the bundled
 JS/TS plugin — this avoids an architecture rework when a second, separately
 distributed plugin shows up.
+
+### Node SEA, not `bun build --compile` (task 65)
+
+Both candidates named above were tried against this repo's actual plugin.
+`bun build --compile` cannot ship it, because of the plugin's native
+dependencies — tree-sitter and its two grammars are C addons loaded from
+`prebuilds/<platform>-<arch>/*.node`. Measured on Bun 1.3.14, macOS x64:
+
+- Inlined, the compiled binary aborts on the first parse — `TypeError:
+  Attempted to assign to readonly property` in `initializeLanguageNodeClasses`,
+  where node-tree-sitter's wrapper assigns `nodeSubclass.prototype.type`. The
+  same code runs correctly under `bun app.js`, so this is the compile path
+  specifically, not Bun's N-API support.
+- Marked `--external`, the compiled binary cannot resolve them at all: module
+  resolution inside a compiled Bun binary is rooted at the virtual
+  `/$bunfs/root/`, so a `node_modules/` shipped beside the executable is
+  invisible.
+
+Node's SEA has neither problem, and the runtime it embeds is the same Node the
+plugin is developed and measured against — shipping it this way changes nothing
+about the plugin's behavior. Its cost is that the SEA is a copy of the *build
+machine's* Node binary, so each archive must be built on the platform it
+targets; that is already how the release matrix works, for unrelated reasons on
+the Rust side.
+
+The one thing this forced a change for is the semantic layer. A SEA executable
+is a JS runtime but not a `node` CLI: it always runs its embedded script, so
+`spawn(process.execPath, [tsserverPath])` — how `SemanticServer` starts
+tsserver — would have spawned a second copy of the plugin. The bundled build
+therefore recognizes a `--run-node <script>` argv prefix and runs that script
+as Node would (`plugins/typescript/src/runtime.ts`), which is what keeps
+semantic resolution working with no Node.js installed: verified end to end
+against a project's own `lib/tsserver.js`, with `node` removed from `PATH`, by
+resolving a cross-file `definition`.
+
+What the archive does not carry is a TypeScript compiler (~23MB). The semantic
+pass already prefers the project's own `node_modules/typescript` so that a
+project is analyzed by the compiler it builds with; the embedded runtime
+executes it. A project with no TypeScript at all gets no semantic upgrade and a
+complete structural index — the documented degradation, not a failure.
 
 ## Open Questions / Risks
 

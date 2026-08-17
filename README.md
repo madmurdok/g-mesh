@@ -76,23 +76,27 @@ yet; it skips the checksum.
 Skipping this step entirely is a perfectly good choice. Everything else works;
 `search_code` just reports that semantic search is unavailable.
 
-**Important**: there is no distribution/packaging step yet. The daemon
-resolves the plugin's path relative to `core`'s own source tree, baked in at
-*compile time* (`core/src/daemon/plugin.rs`):
+A binary built this way finds the plugin through this checkout: the daemon
+falls back to a path relative to `core`'s own source tree, baked in at *compile
+time* (`core/src/daemon/plugin.rs`):
 
 ```
 <repo>/plugins/typescript/dist/src/index.js
 ```
 
-So the built `g-mesh` binary only works run from (or copied while keeping
-the relative layout of) this checked-out repo. To point it at a plugin build
-elsewhere, override with an env var:
+That fallback is the last of three steps. In precedence order, the daemon uses:
+
+1. `G_MESH_JS_TS_PLUGIN_PATH`, if set — a plugin build of your own. A `.js`
+   path is run with `node`; anything else is executed directly.
+2. `plugins/typescript/` **next to the `g-mesh` binary**, which is what a
+   release archive unpacks to and needs no Node.js at all (below).
+3. The compile-time checkout path above.
 
 ```bash
 export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
 ```
 
-### Release artifacts (build pipeline only, not a distribution yet)
+### Release artifacts
 
 `scripts/build-targets.sh` builds and packages one archive per Rust target
 triple — `g-mesh-v<version>-<triple>.tar.gz` (`.zip` on Windows) plus a
@@ -111,10 +115,36 @@ cross-compilation because `rusqlite`(bundled)/`tokenizers`(onig)/`sqlite-vec`
 compile C for the target and `ort` links ONNX Runtime statically against a
 per-platform C++ stdlib.
 
-The caveat above still applies in full: because the plugin path is baked in at
-compile time, these archives contain a binary that **cannot yet run outside
-this repo layout**. They exercise the build pipeline; making them installable
-is a separate, still-open piece of work.
+Each archive holds a complete install, not just the binary:
+
+```
+g-mesh-v<version>-<triple>/
+  g-mesh                                  the core binary
+  plugins/typescript/
+    g-mesh-plugin-typescript              the JS/TS plugin, runtime included
+    node_modules/                         its native tree-sitter grammars
+    plugin.toml                           how core discovers and spawns it
+    LICENSE-nodejs                        the embedded runtime's notice
+  LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
+```
+
+**No Node.js required.** The plugin is compiled with [Node's single-executable
+application](https://nodejs.org/api/single-executable-applications.html)
+support (`scripts/bundle-plugin.sh`), so it embeds its own JS runtime. Indexing
+— the whole structural graph — works on a machine with no Node installed.
+
+The one thing the archive does *not* carry is a TypeScript compiler. The
+semantic pass that upgrades unresolved edges drives `tsserver`, and it
+deliberately prefers **the project's own** `node_modules/typescript` so a
+project is analyzed by the compiler it builds with; the plugin's embedded
+runtime is what executes it, so this too needs no system Node. A project with
+no TypeScript installed at all simply gets no semantic upgrade — every
+structural edge is still indexed. To cover that case, drop a `typescript`
+package into `node_modules/` beside the plugin executable.
+
+Building an archive requires Node 20+ on the build machine, and each archive
+must be built on the platform it targets: a single-executable plugin embeds the
+build machine's own Node runtime and cannot be cross-built.
 
 ## How it finds a project
 
