@@ -63,6 +63,7 @@ impl Project {
         let mut shim = Command::new(BIN)
             .arg("mcp-shim")
             .current_dir(self.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

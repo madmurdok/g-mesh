@@ -23,6 +23,7 @@
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
@@ -37,6 +38,51 @@ use super::SymbolQueryParams;
 /// `Err` stays reserved for genuine protocol-level failures, as everywhere
 /// else in this module tree.
 pub(super) type Anchor = Result<Result<NodeRecord, CallToolResult>, ErrorData>;
+
+/// What `symbol_name`/`symbol_id` resolved to, echoed back on every response
+/// of the four tools built on [`resolve`] (`find_references`, `find_callers`,
+/// `find_callees`, `find_implementations`).
+///
+/// Exists to remove a round trip, not to add information nothing had before:
+/// every field here already lived in the `NodeRecord` each tool resolved and
+/// discarded after using it to walk edges. Without an echo, a prompt asking
+/// about usages "elsewhere" - i.e. excluding the definition file - forced a
+/// `find_definition` call first, purely to learn where the definition lives;
+/// `find_definition` was never resolving anything these tools had not already
+/// resolved for themselves (task #190, following the round-trip #189
+/// measured directly: tt-scenario-impact-requireproject kept a mandatory
+/// `find_definition` step even after the trailing-grep habit it originally
+/// targeted was fixed).
+///
+/// Deliberately five fields, not the full node: `startCol`/`endLine`/
+/// `endCol`/`signature`/`docComment` answer "what does this symbol look
+/// like", which is `find_definition`'s job, not "which node did this call
+/// anchor on and where does it live", which is all a follow-up filtering
+/// question needs. Widening this to the full node would blur that line and
+/// pay full `DefinitionNode` bytes on every page of every one of the four
+/// highest-traffic tools for information most callers of this echo do not
+/// need.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AnchorInfo {
+    pub(super) id: String,
+    pub(super) qualified_name: String,
+    pub(super) kind: String,
+    pub(super) file_path: String,
+    pub(super) start_line: i64,
+}
+
+impl From<&NodeRecord> for AnchorInfo {
+    fn from(node: &NodeRecord) -> Self {
+        Self {
+            id: node.id.clone(),
+            qualified_name: node.qualified_name.clone(),
+            kind: node.kind.clone(),
+            file_path: node.file_path.clone(),
+            start_line: node.start_line,
+        }
+    }
+}
 
 pub(super) fn resolve(conn: &Connection, params: &SymbolQueryParams) -> Anchor {
     // Mirrors `find_definition::handle`'s alternation check: both addressing

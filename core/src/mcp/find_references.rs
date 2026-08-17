@@ -72,7 +72,20 @@ struct ReferenceSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferencePage {
+    /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
+    /// so a caller asking about usages "elsewhere" doesn't need a separate
+    /// `find_definition` call just to learn the anchor's own file/line.
+    anchor: anchor::AnchorInfo,
     results: Vec<ReferenceSite>,
+    /// Every file holding a reference to the anchor, with a per-file count,
+    /// computed over the whole edge set rather than this page - see
+    /// `pagination::tally_edge_files`. Present only when it says something
+    /// `results` doesn't already say (`pagination::tally_is_worth_sending`):
+    /// the page is incomplete, or its rows repeat files. Omitted entirely -
+    /// not sent as an empty array - otherwise, so an exact narrow lookup's
+    /// response is byte-for-byte what it was before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<pagination::FileTally>>,
     has_more: bool,
     next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every reference in `results`
@@ -131,7 +144,7 @@ fn list_references(
         });
     }
 
-    Ok(pagination::bound_page(rows, page.has_more, page.next_cursor))
+    Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor))
 }
 
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
@@ -142,14 +155,21 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
     let page = list_references(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to find references", e))?;
 
+    let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
+        .map_err(|e| internal_error("failed to tally referencing files", e))?;
+    let files = pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
+
     success(&ReferencePage {
+        anchor: anchor_info,
         results: page.results,
+        files,
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
@@ -260,6 +280,110 @@ mod tests {
         reference_ids.sort();
         assert_eq!(reference_ids, caller_ids, "find_references must return at least every caller find_callers returns");
         assert_eq!(references["results"][0]["referenceKind"], "CALLS");
+    }
+
+    /// The `files` tally is the file-level answer an impact question wants,
+    /// and it has to be complete even when `results` isn't: five references
+    /// spread over three files, read one row at a time, must still report all
+    /// three files on the very first page.
+    #[test]
+    fn files_tally_covers_every_file_even_when_the_page_is_truncated() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        for (i, file) in ["a.ts", "a.ts", "a.ts", "b.ts", "c.ts"].iter().enumerate() {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(1), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "precondition: limit 1 shows a single row");
+        assert_eq!(body["hasMore"], true, "precondition: four more references are behind the cursor");
+
+        let files = body["files"].as_array().expect("a truncated page must carry the whole-set files tally");
+        let listed: Vec<(&str, i64)> =
+            files.iter().map(|f| (f["path"].as_str().unwrap(), f["refs"].as_i64().unwrap())).collect();
+        assert_eq!(
+            listed,
+            vec![("a.ts", 3), ("b.ts", 1), ("c.ts", 1)],
+            "every referencing file, counted over the whole edge set and ordered by count descending"
+        );
+    }
+
+    /// The gate that keeps the tally free on exact, narrow lookups - the
+    /// ambiguous-name category's whole shape. One reference per file on a
+    /// complete page means the tally would restate the `filePath` column
+    /// verbatim, so it must not be sent at all (absent, not an empty array).
+    #[test]
+    fn files_tally_is_omitted_when_the_rows_already_are_the_file_answer() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        for (i, file) in ["a.ts", "b.ts"].iter().enumerate() {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body = json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        assert_eq!(body["hasMore"], false, "precondition: the page is complete");
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+        assert!(body.get("files").is_none(), "a one-row-per-file complete page must not repeat itself as a tally: {body}");
+    }
+
+    /// Same gate from the other side: a complete page whose rows repeat files
+    /// still gets a tally, because deduplicating those rows by hand is
+    /// exactly the work the tally exists to remove.
+    #[test]
+    fn files_tally_is_sent_when_a_complete_page_repeats_files() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        for (i, file) in ["a.ts", "a.ts", "b.ts"].iter().enumerate() {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body = json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        assert_eq!(body["hasMore"], false);
+        let files = body["files"].as_array().expect("three rows over two files leave real deduplication to do");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], "a.ts");
+        assert_eq!(files[0]["refs"], 2);
+    }
+
+    /// `file_paths` scopes the rows, so it has to scope the tally the same
+    /// way - a tally wider than the page it accompanies would report files
+    /// the caller explicitly excluded.
+    #[test]
+    fn files_tally_respects_the_file_paths_scope() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        for (i, file) in ["a.ts", "a.ts", "b.ts"].iter().enumerate() {
+            let id = format!("caller_{i}");
+            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
+            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+
+        let body = json_body(
+            &handle(
+                &conn,
+                SymbolQueryParams {
+                    symbol_id: Some("target".to_string()),
+                    file_paths: Some(vec!["a.ts".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let files = body["files"].as_array().expect("two in-scope rows in one file still leave deduplication to do");
+        assert_eq!(files.len(), 1, "b.ts is out of scope and must not appear in the tally: {body}");
+        assert_eq!(files[0]["path"], "a.ts");
     }
 
     /// The other kind the union has to cover: `class Sub extends Base` is
@@ -534,6 +658,26 @@ mod tests {
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
+    }
+
+    /// The point of task #190: the response itself says what it anchored on,
+    /// so a caller asking about usages "elsewhere" (excluding the definition
+    /// file) can read the anchor's own `filePath` straight off this response
+    /// instead of issuing a separate `find_definition` call first.
+    #[test]
+    fn the_response_echoes_the_resolved_anchor() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        assert_eq!(body["anchor"]["id"], "target");
+        assert_eq!(body["anchor"]["qualifiedName"], "pkg::run");
+        assert_eq!(body["anchor"]["kind"], "Function");
+        assert_eq!(body["anchor"]["filePath"], "target.rs");
+        assert_eq!(body["anchor"]["startLine"], 0);
     }
 
     /// The whole point of `symbol_name`: an unambiguous name lands on the

@@ -30,8 +30,27 @@ use g_mesh::storage::schema;
 use rusqlite::Connection;
 
 /// Generous next to the sub-second walks these fixtures produce; it is a
-/// deadlock guard, not a timing assertion.
-const INDEXED_TIMEOUT: Duration = Duration::from_secs(30);
+/// deadlock guard, not a timing assertion - so it is deliberately far above
+/// what a healthy walk needs rather than tuned close to it.
+///
+/// The old 30s was not far enough. The walk competes with whatever else the
+/// machine is doing, and the first one after an idle spell also pays for a
+/// cold file cache: measured at 7-9s on a quiet machine, but 38.5s during a
+/// 2.4.0 release run, which reported an environmental slowdown as a test
+/// failure and forced the release gate to be skipped.
+const DEFAULT_INDEXED_TIMEOUT_SECS: u64 = 90;
+
+/// [`DEFAULT_INDEXED_TIMEOUT_SECS`], or `G_MESH_TEST_INDEXED_TIMEOUT_SECS` if
+/// it is set to a parsable number - an unparsable value falls back to the
+/// default rather than failing the run, since a typo in a debugging env var
+/// should not look like a product bug.
+fn indexed_timeout() -> Duration {
+    let secs = std::env::var("G_MESH_TEST_INDEXED_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INDEXED_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// Blocks until the daemon serving `root` has recorded a completed
 /// cold-start walk.
@@ -50,7 +69,8 @@ const INDEXED_TIMEOUT: Duration = Duration::from_secs(30);
 /// previous generation's marker and believe the new walk is done.
 pub fn wait_until_indexed(root: &Path) {
     let db = project_dir(root).expect("failed to resolve the state directory").join("index.db");
-    let deadline = Instant::now() + INDEXED_TIMEOUT;
+    let timeout = indexed_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         let indexed = Connection::open(&db)
             .ok()
@@ -59,9 +79,19 @@ pub fn wait_until_indexed(root: &Path) {
         if indexed {
             return;
         }
+        // Both ways this can fire are named, because for three releases only
+        // the first one was and it was the wrong one every time. A walk that
+        // is merely slow finishes eventually and wants a bigger budget; a walk
+        // that never started ignores any budget at all, and the way that
+        // happens is a shim that went and served a *different* project - see
+        // `shim::PROJECT_DIR_ENV` and task 192.
         assert!(
             Instant::now() < deadline,
-            "the cold-start bulk walk for {} did not finish within {INDEXED_TIMEOUT:?}",
+            "the cold-start bulk walk for {} did not finish within {timeout:?}. Raise \
+             G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow - but if a bigger \
+             budget changes nothing, no daemon is walking this root at all: check that the shim \
+             was not handed an inherited CLAUDE_PROJECT_DIR, and set G_MESH_DAEMON_LOG to see \
+             what the daemon that did start was doing",
             root.display()
         );
         std::thread::sleep(Duration::from_millis(20));

@@ -148,7 +148,23 @@ impl From<CallSite> for CalleeSite {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CallerPage {
+    /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
+    /// so a caller asking about usages "elsewhere" doesn't need a separate
+    /// `find_definition` call just to learn the anchor's own file/line.
+    anchor: anchor::AnchorInfo,
     results: Vec<CallerSite>,
+    /// Every file holding a call to the anchor, with a per-file count, over
+    /// the whole edge set rather than this page - see
+    /// `pagination::tally_edge_files`, and `find_references`' identically
+    /// gated field for when it appears and when it stays off the wire.
+    ///
+    /// `find_callees` has no counterpart on purpose. "Which files does this
+    /// function reach" is not a question anybody asks before an edit; the
+    /// impact questions that want a file-level answer - a rename, a signature
+    /// change, a removal - all run *inbound*, so a callee-side tally would be
+    /// payload on every response for a question the tool never gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<pagination::FileTally>>,
     has_more: bool,
     next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every caller in `results` came
@@ -163,6 +179,8 @@ struct CallerPage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CalleePage {
+    /// See `anchor::AnchorInfo`, same rationale as `CallerPage`'s own field.
+    anchor: anchor::AnchorInfo,
     results: Vec<CalleeSite>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -183,6 +201,7 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -197,10 +216,16 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
             pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
+    let bounded = pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor);
+
+    let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
+        .map_err(|e| internal_error("failed to tally calling files", e))?;
+    let files = pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
 
     success(&CallerPage {
+        anchor: anchor_info,
         results: bounded.results,
+        files,
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
@@ -216,6 +241,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
         Err(finished) => return Ok(finished),
     };
     let hint = anchor::file_anchor_hint(&anchor);
+    let anchor_info = anchor::AnchorInfo::from(&anchor);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -233,6 +259,7 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
     success(&CalleePage {
+        anchor: anchor_info,
         results: bounded.results,
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
@@ -399,6 +426,28 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
+    }
+
+    /// Task #190: both `find_callers` and `find_callees` echo the resolved
+    /// anchor in their own response, not just `find_references`'s - each
+    /// builds its own response struct, so this has to be proven per tool.
+    #[test]
+    fn both_directions_echo_the_resolved_anchor() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+
+        let callers = json_body(
+            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(callers["anchor"]["id"], "b");
+        assert_eq!(callers["anchor"]["qualifiedName"], "pkg::b");
+        assert_eq!(callers["anchor"]["kind"], "Function");
+        assert_eq!(callers["anchor"]["filePath"], "b.rs");
+
+        let callees = json_body(
+            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+        );
+        assert_eq!(callees["anchor"]["id"], "b");
+        assert_eq!(callees["anchor"]["qualifiedName"], "pkg::b");
     }
 
     /// Both directions must accept the name form: the anchor lookup is

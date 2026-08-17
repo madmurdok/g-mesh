@@ -146,7 +146,9 @@ async fn find_references_sees_generic_heads_and_heritage_type_arguments() {
     // handshake no longer implies a built index - the walk's own completion
     // marker is what does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(&root);
+        cmd.arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

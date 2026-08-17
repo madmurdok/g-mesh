@@ -113,7 +113,9 @@ fn body(result: &CallToolResult) -> Value {
 /// daemon that had to make its own decision about the index on disk.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(project.root());
+        cmd.arg("mcp-shim")
+            .current_dir(project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
