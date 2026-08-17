@@ -2,6 +2,7 @@
 name = "g-mesh"
 version = "2.6.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "g_mesh"

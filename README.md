@@ -361,3 +361,25 @@ temp-directory fixtures, so they care about the environment they run in:
   stderr (and its plugins') to that file instead of discarding it. Detached
   daemons have no console, so this is the only way to see what one is doing
   during a test run; unset, nothing changes.
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option — the Rust ecosystem's usual dual license. Take MIT if you want
+the shorter terms, Apache-2.0 if you want its explicit patent grant. Unless you
+state otherwise, any contribution you intentionally submit for inclusion in
+this work shall be dual licensed as above, with no additional terms.
+
+Everything g-mesh depends on is permissively licensed (MIT, Apache-2.0,
+CC0/Artistic-2.0, and public-domain SQLite via `rusqlite`'s bundled build);
+nothing here is copyleft.
+
+**The embedding model is not part of this repository.** `search_code` needs a
+model directory that you fetch yourself (see `core/src/embedding/model.rs` —
+`model.onnx` alone is ~610 MiB, which is why it is not vendored), and that
+model carries whatever license its own publisher set. Check it before
+redistributing a machine image or a container that has one baked in.
