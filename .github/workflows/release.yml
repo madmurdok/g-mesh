@@ -1,0 +1,150 @@
+# Builds `g-mesh` for every target triple REQUIREMENTS.md implies, from a
+# single trigger, and uploads one named archive per triple.
+#
+# STATUS: this file has never been executed. It was written offline; the YAML
+# parses, the runner labels and action majors were checked against GitHub's
+# current docs, and the build/package script it calls was run for real on
+# x86_64-apple-darwin. Nothing else here is proven - treat the first run as the
+# test, and expect the Windows job (the only one with no local counterpart at
+# all: MSVC toolchain, 7-Zip, Git Bash path handling) to be the likeliest to
+# need a fix.
+#
+# ---------------------------------------------------------------------------
+# WHAT THESE ARTIFACTS ARE NOT (yet)
+#
+# They are NOT installable builds. `core/src/daemon/plugin.rs` bakes the path
+# to the JS/TS plugin into the binary at compile time via
+# `env!("CARGO_MANIFEST_DIR")`, so a binary unpacked outside this repo's own
+# checkout cannot find `plugins/typescript/dist/src/index.js`, and the daemon
+# hard-fails without it (see README, "there is no distribution/packaging step
+# yet"). Making the binary relocatable and putting the plugin in the archive is
+# task #65; publishing these archives to GitHub Releases is #67; the curl|sh
+# installer is #66. This workflow deliberately stops at "correctly-named
+# artifacts exist", which is all task #64 claims.
+# ---------------------------------------------------------------------------
+#
+# WHY A MATRIX ON NATIVE RUNNERS, NOT TRUE CROSS-COMPILATION
+#
+# Four dependencies compile C/C++ (or asm) for the target: `rusqlite` with
+# `bundled` (SQLite), `tokenizers` with `onig` (the Oniguruma regex library),
+# `sqlite-vec`, and `ring`, which arrives transitively through `ureq`'s rustls
+# TLS. On top of that, `ort` links ONNX Runtime statically, which
+# drags in a C++ standard library that differs per platform (libc++ on macOS,
+# libstdc++ on Linux, the MSVC CRT on Windows). Producing all four triples from
+# one host would mean supplying four cross toolchains and four sysroots and
+# getting every C++ stdlib link right - `cross`/zig territory, and the MSVC
+# target is not honestly reachable from a non-Windows host at all. A runner per
+# platform makes each build a plain native `cargo build` with the toolchain the
+# image already has. The cost is four machines instead of one; the benefit is
+# that nothing here depends on a cross-toolchain setup that breaks silently.
+#
+# This is measured, not assumed: `cargo check --target
+# x86_64-unknown-linux-gnu` on a macOS host dies at the *first* crate that
+# compiles C - `ring`, long before SQLite or Oniguruma get a turn - with
+# `failed to find tool "x86_64-linux-gnu-gcc"`. Making that work means
+# installing and maintaining a Linux cross toolchain (or `cross` + Docker) for
+# every C dependency in the tree, and the Windows MSVC target has no honest
+# equivalent at all.
+#
+# One measured exception, worth writing down because it is the escape hatch for
+# 2027: macOS -> macOS *does* cross-compile out of the box, because Apple's
+# clang carries both architectures' SDKs. `cargo build --release --target
+# aarch64-apple-darwin` on an x86_64 Mac was run while writing this and
+# produced a working arm64 binary (onig_sys, rusqlite/bundled, sqlite-vec and
+# ort-sys all compiled; `otool -L` showed only system dylibs, i.e. ONNX Runtime
+# really is statically linked). So the two macOS rows below can be collapsed
+# onto one runner if that ever becomes necessary. They are kept separate today
+# because a native job can actually *execute* what it just built - the
+# `--version` smoke test in the script - and a cross-built one cannot.
+#
+# `ort` is pinned to `=2.0.0-rc.9` (see core/Cargo.toml for why). Verified
+# against that release's own `dist.txt`: it ships a *static*, execution-
+# provider-free prebuilt for all four triples below (ONNX Runtime 1.20.0), so
+# no target here is blocked by the pin. `ort-sys` downloads that prebuilt
+# during the build, so these jobs need network access - they are not hermetic.
+
+name: Release artifacts
+
+on:
+  # The repository has no git tags yet, so `workflow_dispatch` is the trigger
+  # that actually works today: Actions tab -> this workflow -> "Run workflow".
+  # The tag trigger is here for when releases start being cut (task #67) and
+  # costs nothing until then - no tag needs to be created to use this.
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  # Building four targets is expensive, so PRs only trigger it when the
+  # pipeline itself changes. This is the intended way to prove the workflow
+  # works before relying on it for a real release: open a PR touching these
+  # two files and watch all four jobs.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/build-targets.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # A full build compiles ONNX Runtime bindings, bundled SQLite and Oniguruma
+    # from scratch (no cache is used - a release build should not be able to
+    # pick up a stale object file), which is slow on the macOS images.
+    timeout-minutes: 90
+    strategy:
+      # One platform failing should not hide whether the other three work.
+      fail-fast: false
+      matrix:
+        include:
+          # Intel macOS. NOT `macos-13`: that image was retired on 2025-12-04.
+          # `macos-15-intel` is the current Intel image and GitHub has
+          # announced it as the last one - x86_64 macOS runners go away in
+          # autumn 2027, at which point this row needs a rethink (a local
+          # Intel Mac, or dropping the target).
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          # Pinned to the oldest supported Ubuntu on purpose: the glibc the
+          # binary links against is the runner's (2.35 here), and a binary
+          # built on a newer image simply will not start on an older distro.
+          # `ubuntu-latest` would silently narrow who can run the artifact.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+
+    steps:
+      # Pinned to the current major of each action as of 2026-08.
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -vV
+
+      # All naming/staging/archiving lives in the script so that what CI
+      # produces is exactly what a developer can reproduce locally. Invoked via
+      # `bash` rather than as an executable because the checkout on Windows
+      # does not carry the file mode.
+      - name: Build and package ${{ matrix.target }}
+        shell: bash
+        run: bash scripts/build-targets.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: g-mesh-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
