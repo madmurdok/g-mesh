@@ -10,17 +10,18 @@
 # need a fix.
 #
 # ---------------------------------------------------------------------------
-# WHAT THESE ARTIFACTS ARE NOT (yet)
+# WHAT THESE ARTIFACTS ARE
 #
-# They are NOT installable builds. `core/src/daemon/plugin.rs` bakes the path
-# to the JS/TS plugin into the binary at compile time via
-# `env!("CARGO_MANIFEST_DIR")`, so a binary unpacked outside this repo's own
-# checkout cannot find `plugins/typescript/dist/src/index.js`, and the daemon
-# hard-fails without it (see README, "there is no distribution/packaging step
-# yet"). Making the binary relocatable and putting the plugin in the archive is
-# task #65; publishing these archives to GitHub Releases is #67; the curl|sh
-# installer is #66. This workflow deliberately stops at "correctly-named
-# artifacts exist", which is all task #64 claims.
+# Since task #65 each archive carries both halves of a working install: the
+# core binary, and the JS/TS plugin compiled to a self-contained executable
+# (Node's SEA - it embeds the runtime, so the machine needs no Node.js) in
+# `plugins/typescript/`, which is where `daemon::manifest::bundled_roots` looks
+# beside the executable. What is still open: publishing these archives to
+# GitHub Releases is #67, and the curl|sh installer is #66.
+#
+# This is also why every job needs Node: the plugin is built here, and the
+# runtime it embeds is the one `setup-node` installs on that runner. Pinning
+# that version pins what ships.
 # ---------------------------------------------------------------------------
 #
 # WHY A MATRIX ON NATIVE RUNNERS, NOT TRUE CROSS-COMPILATION
@@ -82,6 +83,7 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "scripts/build-targets.sh"
+      - "scripts/bundle-plugin.sh"
 
 permissions:
   contents: read
@@ -131,6 +133,15 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustc -vV
+
+      # Pinned, not `lts/*`: this Node is not just a build tool here, it is the
+      # runtime that gets copied into the shipped plugin executable (see
+      # scripts/bundle-plugin.sh), so an unpinned version would silently change
+      # what users run. 20.x is the floor Node's SEA support and the plugin's
+      # own `engines` field both require.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
 
       # All naming/staging/archiving lives in the script so that what CI
       # produces is exactly what a developer can reproduce locally. Invoked via

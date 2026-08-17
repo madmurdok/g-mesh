@@ -90,6 +90,7 @@ import { existsSync } from "node:fs";
 import * as path from "node:path";
 
 import { FrameReader } from "./jsonrpc";
+import { IS_SELF_CONTAINED, nodeRuntimeArgv } from "./runtime";
 
 /**
  * tsserver's wire protocol is asymmetric, which is the one thing the
@@ -176,16 +177,29 @@ const STDERR_TAIL_BYTES = 4096;
 
 /**
  * Resolution order for the compiler to drive: the project's own TypeScript,
- * then the copy bundled with this plugin. Returns a path to `lib/tsserver.js`;
- * existence is the caller's check (this is pure path arithmetic so it stays
- * testable without a filesystem).
+ * then whatever copy ships with this plugin. Returns a path to
+ * `lib/tsserver.js`; existence is the caller's check (this is pure path
+ * arithmetic so it stays testable without a filesystem).
+ *
+ * The second entry is the one thing that differs between the two shapes this
+ * plugin ships in (see runtime.ts). From `dist/` it is the `typescript`
+ * package in this plugin's own `node_modules`, two levels up from the compiled
+ * file. The single-executable release build has no such tree - and no
+ * `typescript` package of its own, deliberately: the release archive would
+ * grow by ~23MB to serve only projects that have no TypeScript installed at
+ * all, while every project that does have one is analyzed by *its* compiler
+ * either way. So the bundle's fallback is a `node_modules/typescript` sitting
+ * next to the executable, which is empty in the shipped archive and is the
+ * supported place to drop a compiler if a Node-less machine ever needs one.
+ * (`__dirname` is not that place: inside a SEA it resolves to the executable's
+ * own directory, so the `../..` walk above would climb out of the install.)
  */
 export function tsserverCandidates(projectRoot: string): string[] {
-  const bundled = path.join(__dirname, "..", "..", "node_modules", "typescript", "lib", "tsserver.js");
-  return [
-    path.join(projectRoot, "node_modules", "typescript", "lib", "tsserver.js"),
-    bundled,
-  ];
+  const ownInstall = path.join(projectRoot, "node_modules", "typescript", "lib", "tsserver.js");
+  const shipped = IS_SELF_CONTAINED
+    ? path.join(path.dirname(process.execPath), "node_modules", "typescript", "lib", "tsserver.js")
+    : path.join(__dirname, "..", "..", "node_modules", "typescript", "lib", "tsserver.js");
+  return [ownInstall, shipped];
 }
 
 /**
@@ -289,9 +303,14 @@ export class SemanticServer {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.onExit = options.onExit;
 
+    // `process.execPath` rather than a `node` looked up on PATH, in both
+    // shapes: the compiler must run on the same runtime this plugin was
+    // verified against, and in the release build there may be no `node`
+    // installed at all - the executable is itself the runtime, which
+    // `nodeRuntimeArgv` is what asks it to be (see runtime.ts).
     this.child = spawn(
       process.execPath,
-      [options.tsserverPath, ...DEFAULT_ARGS, ...(options.args ?? [])],
+      nodeRuntimeArgv(options.tsserverPath, [...DEFAULT_ARGS, ...(options.args ?? [])]),
       { cwd: projectRoot, stdio: ["pipe", "pipe", "pipe"] },
     ) as ChildProcessWithoutNullStreams;
 

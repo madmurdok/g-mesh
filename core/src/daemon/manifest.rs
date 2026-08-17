@@ -55,24 +55,16 @@ pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = "G_MESH_PLUGIN_ROOTS_OVERRIDE";
 /// The roots [`discover`] scans, in precedence order, honoring
 /// [`PLUGIN_ROOTS_OVERRIDE_ENV`].
 ///
-/// With no override set, returns up to two roots:
+/// With no override set, returns the user root followed by [`bundled_roots`]:
 /// 1. `~/.g-mesh/plugins/` - user-installed, global (not per-project),
 ///    resolved the same way `config::global_config_path` resolves everything
 ///    else under `~/.g-mesh/...`. Skipped (not an error - matches this
 ///    module's "a root that does not exist contributes nothing" philosophy
 ///    in [`discover`]) if the home directory cannot be resolved at all.
-/// 2. The bundled root. In a repo checkout this resolves the same way
-///    `daemon::plugin::plugin_entry_path`'s dev-checkout fallback does today:
-///    relative to this crate's own source tree
-///    (`CARGO_MANIFEST_DIR/../plugins/`), since `core/` and `plugins/` are
-///    sibling directories with no distribution pipeline yet. TODO: a real
-///    install has no `CARGO_MANIFEST_DIR` - that case needs resolving
-///    relative to `std::env::current_exe()` instead, matching the "JS/TS
-///    plugin ships in the same release archive" line in the v1 architecture
-///    doc's Distribution section; not implemented yet because there is no
-///    installed release to test it against.
+/// 2. The bundled roots - see [`bundled_roots`] for why there are two of them
+///    and why listing both costs nothing.
 ///
-/// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, both standard roots are replaced
+/// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, every standard root is replaced
 /// entirely by a single-element vec of just that one path.
 pub fn default_roots() -> Vec<PathBuf> {
     if let Ok(over) = std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV) {
@@ -83,8 +75,47 @@ pub fn default_roots() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".g-mesh").join("plugins"));
     }
+    roots.extend(bundled_roots());
+    roots
+}
+
+/// Where the plugins that ship *with* g-mesh live, installed root first.
+///
+/// The two entries are the two shapes this project exists in, and exactly one
+/// of them is real on any given machine - which is why both can be listed
+/// unconditionally rather than switched between:
+///
+/// 1. An **installed** layout: `plugins/` beside the core executable, which is
+///    what a release archive unpacks to (`scripts/build-targets.sh`). In a
+///    checkout this points inside `core/target/<profile>/`, where nothing
+///    creates a `plugins/` directory, so it contributes nothing.
+/// 2. A **checkout** layout: `CARGO_MANIFEST_DIR/../plugins/`, baked in at
+///    compile time, since `core/` and `plugins/` are sibling directories here.
+///    An installed binary's compile-time path is a directory on the build
+///    machine that does not exist on the user's, so it too contributes
+///    nothing - a root that does not exist is skipped by [`discover`].
+///
+/// Installed first so that if a release archive is ever unpacked *inside* a
+/// checkout, the plugin that shipped with the binary wins over whatever happens
+/// to be built in the tree around it - the same "closest to the artifact that is
+/// actually running" rule that makes `~/.g-mesh/plugins/` outrank both.
+///
+/// [`std::env::current_exe`] failing is not an error here: it means the process
+/// cannot locate itself, and the checkout root below is still worth trying.
+pub fn bundled_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(installed) = installed_bundled_root() {
+        roots.push(installed);
+    }
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins"));
     roots
+}
+
+/// `plugins/` next to the running executable - see [`bundled_roots`]. `None`
+/// only when this process cannot resolve its own path at all.
+pub fn installed_bundled_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("plugins"))
 }
 
 /// One plugin directory's fully-resolved manifest - see this module's doc
@@ -363,6 +394,23 @@ mod tests {
             "expected {} to contain typescript/plugin.toml",
             bundled.display()
         );
+    }
+
+    /// The half of the answer a release archive needs: an unpacked install has
+    /// no `CARGO_MANIFEST_DIR` to resolve, so discovery has to be able to find
+    /// `plugins/` beside the binary that is running. Ordered ahead of the
+    /// checkout root - see [`bundled_roots`].
+    #[test]
+    fn the_installed_root_sits_beside_the_executable_and_outranks_the_checkout_root() {
+        let roots = bundled_roots();
+
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        assert_eq!(
+            roots.first(),
+            Some(&exe_dir.join("plugins")),
+            "the installed root must be `plugins/` next to the running executable"
+        );
+        assert_eq!(roots.len(), 2, "installed and checkout roots, in that order");
     }
 
     #[test]
