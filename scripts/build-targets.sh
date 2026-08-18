@@ -13,6 +13,16 @@
 #   scripts/build-targets.sh                      # host target only
 #   scripts/build-targets.sh x86_64-apple-darwin  # one explicit target
 #   scripts/build-targets.sh --list               # the four supported triples
+#   scripts/build-targets.sh --version            # version the artifacts are named after
+#   scripts/build-targets.sh --asset-names [target...]
+#                                                 # names a full release publishes
+#
+# The three query flags answer questions *without building*, so they need
+# neither cargo nor rustup and cost nothing to call. `--asset-names` exists for
+# the publishing job in .github/workflows/release.yml: it uploads exactly the
+# names this script says it emits, computed by the same code that emits them,
+# so renaming an artifact here cannot silently desync the Release from the
+# install script that fetches those names by URL.
 #
 # Environment:
 #   G_MESH_VERSION  version string used in artifact names (default: the
@@ -84,6 +94,12 @@ crate_version() {
 	' "$REPO_ROOT/core/Cargo.toml"
 }
 
+resolve_version() {
+	local version="${G_MESH_VERSION:-$(crate_version)}"
+	[ -n "$version" ] || die "could not determine version from core/Cargo.toml"
+	printf '%s\n' "$version"
+}
+
 sha256_of() {
 	if command -v sha256sum >/dev/null 2>&1; then
 		sha256sum "$1"
@@ -101,6 +117,18 @@ archive_ext_for() {
 	*-windows-*) echo "zip" ;;
 	*) echo "tar.gz" ;;
 	esac
+}
+
+# The two names every artifact is derived from, in one place. `build_one` and
+# `--asset-names` both go through these, which is what makes "the names CI
+# publishes" and "the names this script writes" the same string by
+# construction rather than by two developers keeping two spellings in step.
+artifact_stem_for() {
+	echo "g-mesh-v$2-$1" # $1 = target, $2 = version
+}
+
+archive_name_for() {
+	echo "$(artifact_stem_for "$1" "$2").$(archive_ext_for "$1")"
 }
 
 # Creates $2 (an archive) from the directory $1, which must live inside
@@ -141,12 +169,11 @@ make_archive() {
 
 build_one() {
 	local target="$1" version="$2" host="$3"
-	local bin_name="g-mesh" ext stage_dir archive_path
+	local bin_name="g-mesh" stage_dir archive_path
 
 	case "$target" in
 	*-windows-*) bin_name="g-mesh.exe" ;;
 	esac
-	ext="$(archive_ext_for "$target")"
 
 	log "installing rust std for $target (no-op if already present)"
 	rustup target add "$target" >/dev/null
@@ -164,7 +191,7 @@ build_one() {
 	local built="$REPO_ROOT/core/target/$target/$profile_dir/$bin_name"
 	[ -f "$built" ] || die "expected binary not found: $built"
 
-	stage_dir="$DIST_DIR/g-mesh-v$version-$target"
+	stage_dir="$DIST_DIR/$(artifact_stem_for "$target" "$version")"
 	rm -rf "$stage_dir"
 	mkdir -p "$stage_dir"
 	cp "$built" "$stage_dir/$bin_name"
@@ -184,7 +211,7 @@ build_one() {
 		bash "$REPO_ROOT/scripts/bundle-plugin.sh" "$target" "$stage_dir/plugins"
 	fi
 
-	archive_path="$DIST_DIR/g-mesh-v$version-$target.$ext"
+	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
 	rm -f "$archive_path"
 	make_archive "$stage_dir" "$archive_path"
 	[ -f "$archive_path" ] || die "archive was not created: $archive_path"
@@ -225,18 +252,44 @@ build_one() {
 }
 
 main() {
-	if [ "${1:-}" = "--list" ]; then
+	# The query flags deliberately return before the toolchain checks below:
+	# CI's publishing job asks this script for names on a runner that has no
+	# Rust installed, and installing one just to print a string would be absurd.
+	case "${1:-}" in
+	--list)
 		printf '%s\n' "${SUPPORTED_TARGETS[@]}"
 		return 0
-	fi
+		;;
+	--version)
+		resolve_version
+		return 0
+		;;
+	--asset-names)
+		shift
+		local asset_version asset_targets=("$@") asset_target archive
+		asset_version="$(resolve_version)"
+		if [ ${#asset_targets[@]} -eq 0 ]; then
+			asset_targets=("${SUPPORTED_TARGETS[@]}")
+		fi
+		for asset_target in "${asset_targets[@]}"; do
+			archive="$(archive_name_for "$asset_target" "$asset_version")"
+			# Archive first, its checksum second: consumers that want only the
+			# archive can take the odd lines, and the pair stays adjacent.
+			printf '%s\n%s\n' "$archive" "$archive.sha256"
+		done
+		return 0
+		;;
+	-*)
+		die "unknown flag: $1 (try --list, --version, --asset-names)"
+		;;
+	esac
 
 	command -v rustup >/dev/null 2>&1 || die "rustup is required"
 	command -v cargo >/dev/null 2>&1 || die "cargo is required"
 
 	local host version
 	host="$(host_triple)"
-	version="${G_MESH_VERSION:-$(crate_version)}"
-	[ -n "$version" ] || die "could not determine version from core/Cargo.toml"
+	version="$(resolve_version)"
 
 	local targets=("$@")
 	if [ ${#targets[@]} -eq 0 ]; then
