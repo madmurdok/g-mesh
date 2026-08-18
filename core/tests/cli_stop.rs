@@ -39,8 +39,22 @@ impl Project {
         project_dir(self.root()).expect("failed to resolve the project state directory")
     }
 
+    /// The Unix socket *file*, for the three assertions below that are about
+    /// the file rather than about the daemon. Unix-only on purpose: on
+    /// Windows the endpoint is a pipe name with no filesystem presence, so
+    /// there is no file whose existence could be asserted - see
+    /// `g_mesh::ipc::windows`. The behavioural half of each of those
+    /// assertions is checked through [`Project::is_listening`] on both
+    /// platforms.
+    #[cfg(unix)]
     fn socket(&self) -> PathBuf {
         daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+    }
+
+    /// Whether anything is answering on the project's endpoint - the
+    /// platform-independent form of "the socket is (not) held".
+    fn is_listening(&self) -> bool {
+        daemon::is_listening(self.root()).expect("failed to probe the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
@@ -165,7 +179,9 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
         !daemon::is_process_alive(plugin),
         "the plugin (pid {plugin}) was orphaned by stop"
     );
-    assert!(!project.socket().exists(), "the daemon socket must be released");
+    assert!(!project.is_listening(), "the daemon endpoint must be released");
+    #[cfg(unix)]
+    assert!(!project.socket().exists(), "the daemon socket file must be removed");
     assert!(!project.pid_file().exists(), "the daemon pid file must be cleared");
     assert!(!project.plugin_pid_file().exists(), "the plugin pid file must be cleared");
 }
@@ -190,7 +206,7 @@ fn a_stopped_project_can_be_bootstrapped_again_immediately() {
 
     assert_ne!(second_core, first_core, "a genuinely new daemon must have taken over");
     assert!(daemon::is_process_alive(second_core));
-    assert!(project.socket().exists(), "the new daemon must have bound the socket");
+    assert!(project.is_listening(), "the new daemon must have bound the endpoint");
 }
 
 #[test]
@@ -249,5 +265,6 @@ fn stop_clears_the_state_a_crashed_daemon_left_behind() {
     );
     assert!(!project.pid_file().exists(), "the stale daemon pid file must be cleared");
     assert!(!project.plugin_pid_file().exists(), "the stale plugin pid file must be cleared");
+    #[cfg(unix)]
     assert!(!project.socket().exists(), "the stale socket file must be cleared");
 }

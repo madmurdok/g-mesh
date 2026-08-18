@@ -9,7 +9,6 @@
 //! it.
 
 use std::io::{BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -17,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -57,8 +57,16 @@ impl Project {
         self.dir.path()
     }
 
-    fn socket(&self) -> PathBuf {
-        daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+    fn endpoint(&self) -> ipc::Endpoint {
+        daemon::endpoint(self.root()).expect("failed to resolve the daemon endpoint")
+    }
+
+    /// Whether anything is answering on this project's endpoint. Replaces
+    /// "the socket file exists" everywhere below: it is the same question on
+    /// Unix and the only form of it that exists on Windows, where a pipe name
+    /// has no filesystem presence at all.
+    fn is_listening(&self) -> bool {
+        daemon::is_listening(self.root()).expect("failed to probe the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
@@ -246,11 +254,11 @@ fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// One MCP probe over the daemon socket directly, bypassing the shim.
-fn round_trip_over_socket(socket: &Path) -> Vec<String> {
-    let stream = UnixStream::connect(socket)
-        .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", socket.display()));
-    let writer = stream.try_clone().expect("failed to clone the daemon socket");
+/// One MCP probe over the daemon endpoint directly, bypassing the shim.
+fn round_trip_over_socket(endpoint: &ipc::Endpoint) -> Vec<String> {
+    let stream = ipc::Stream::connect(endpoint)
+        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let writer = stream.try_clone().expect("failed to clone the daemon connection");
     mcp_tool_names(writer, stream)
 }
 
@@ -264,8 +272,7 @@ fn assert_tool_surface(names: &[String]) {
 fn shim_proxies_through_an_already_running_daemon() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    let socket = project.socket();
-    // The pid file is written once the socket is bound, so it is the signal
+    // The pid file is written once the endpoint is bound, so it is the signal
     // that the daemon is actually listening.
     let pid_file = project.pid_file();
     wait_for("the daemon to start listening", || pid_file.exists());
@@ -276,7 +283,7 @@ fn shim_proxies_through_an_already_running_daemon() {
     let mut shim = spawn_shim(project.root());
     assert_tool_surface(&round_trip_through_shim(&mut shim));
 
-    assert!(socket.exists(), "the daemon socket must survive the shim");
+    assert!(project.is_listening(), "the daemon must survive the shim");
     assert_eq!(
         project.daemon_pid(),
         pid_before,
@@ -289,19 +296,18 @@ fn shim_proxies_through_an_already_running_daemon() {
 #[test]
 fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
     let project = Project::new();
-    let socket = project.socket();
-    assert!(!socket.exists(), "no daemon may be running for a fresh project root");
+    assert!(!project.is_listening(), "no daemon may be running for a fresh project root");
 
     let mut shim = spawn_shim(project.root());
     assert_tool_surface(&round_trip_through_shim(&mut shim));
 
-    assert!(socket.exists(), "the bootstrapped daemon must have bound its socket");
+    assert!(project.is_listening(), "the bootstrapped daemon must have bound its endpoint");
     let pid = project.daemon_pid();
 
     // The shim has already exited; a second round trip over the same socket
     // proves the daemon it spawned is genuinely detached rather than a child
     // that died with its parent.
-    assert_tool_surface(&round_trip_over_socket(&socket));
+    assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
 
     let alive = Command::new("kill")
         .arg("-0")
@@ -324,11 +330,11 @@ fn shim_prefers_claude_project_dir_env_over_cwd() {
     assert_tool_surface(&round_trip_through_shim(&mut shim));
 
     assert!(
-        env_project.socket().exists(),
+        env_project.is_listening(),
         "the daemon must have bootstrapped for CLAUDE_PROJECT_DIR, not cwd"
     );
     assert!(
-        !cwd_decoy.socket().exists(),
+        !cwd_decoy.is_listening(),
         "cwd must be ignored once CLAUDE_PROJECT_DIR is set"
     );
 }
@@ -423,8 +429,7 @@ fn every_shim_spawn_in_this_suite_decides_which_project_it_serves() {
 #[test]
 fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
     let project = Project::new();
-    let socket = project.socket();
-    assert!(!socket.exists(), "no daemon may be running for a fresh project root");
+    assert!(!project.is_listening(), "no daemon may be running for a fresh project root");
 
     // Spawned back-to-back with no synchronization in between: both are
     // independent OS processes that start racing to bootstrap this
@@ -443,7 +448,7 @@ fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
     // overwritten the pid file with its own pid; a third round trip straight
     // over the socket still being served, with the pid file unchanged, proves
     // the daemon both shims talked to is still the only one alive.
-    assert_tool_surface(&round_trip_over_socket(&socket));
+    assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
     assert_eq!(project.daemon_pid(), pid, "a second daemon must never have taken over");
 
     let alive = Command::new("kill")

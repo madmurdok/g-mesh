@@ -1,6 +1,6 @@
 //! Coverage for `g-mesh daemon` itself, independent of the shim: starting it
 //! for a project opens the SQLite index, registers the file watcher, and
-//! serves a real MCP session over its socket.
+//! serves a real MCP session over its endpoint.
 //!
 //! The MCP conversation here is hand-rolled newline-delimited JSON rather than
 //! an `rmcp` client, on purpose - it pins the literal wire format the daemon
@@ -8,7 +8,6 @@
 //! could never catch. `mcp_e2e.rs` covers the real-client side.
 
 use std::io::{BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -16,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -102,9 +102,9 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 ///
 /// It all happens on a helper thread so a daemon that stops answering fails
 /// the test with a timeout instead of hanging it forever.
-fn mcp_session(socket: &Path, requests: Vec<Value>) -> Vec<Value> {
-    let stream = UnixStream::connect(socket)
-        .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", socket.display()));
+fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
+    let stream = ipc::Stream::connect(endpoint)
+        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -118,8 +118,9 @@ fn mcp_session(socket: &Path, requests: Vec<Value>) -> Vec<Value> {
     }
 }
 
-fn converse(stream: UnixStream, requests: Vec<Value>) -> Result<Vec<Value>, String> {
-    let mut writer = stream.try_clone().map_err(|e| format!("cannot clone socket: {e}"))?;
+fn converse(stream: ipc::Stream, requests: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut writer =
+        stream.try_clone().map_err(|e| format!("cannot clone the daemon connection: {e}"))?;
     let mut reader = BufReader::new(stream);
 
     send(&mut writer, &json!({
@@ -151,7 +152,7 @@ fn send<W: Write>(writer: &mut W, message: &Value) -> Result<(), String> {
     write_ndjson_frame(writer, &body).map_err(|e| format!("cannot send {message}: {e:#}"))
 }
 
-fn receive(reader: &mut BufReader<UnixStream>) -> Result<Value, String> {
+fn receive(reader: &mut BufReader<ipc::Stream>) -> Result<Value, String> {
     let frame = read_ndjson_frame(reader)
         .map_err(|e| format!("cannot read a response: {e:#}"))?
         .ok_or("the daemon closed the connection instead of answering")?;
@@ -223,8 +224,8 @@ fn daemon_opens_sqlite_watches_files_and_serves_the_mcp_tool_surface() {
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     assert!(db_path.exists(), "the daemon must open (and thus create) the project's SQLite file");
 
-    let socket = daemon::socket_path(project.root()).unwrap();
-    let responses = mcp_session(&socket, vec![tools_list_request(1)]);
+    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let responses = mcp_session(&endpoint, vec![tools_list_request(1)]);
     assert_eq!(tool_names(&responses[0]), EXPECTED_TOOLS);
 
     // A file write under the project root must not crash or hang the
@@ -233,7 +234,7 @@ fn daemon_opens_sqlite_watches_files_and_serves_the_mcp_tool_surface() {
     std::fs::write(project.root().join("tracked.txt"), b"hello").unwrap();
     std::thread::sleep(Duration::from_millis(200));
 
-    let responses = mcp_session(&socket, vec![tools_list_request(1)]);
+    let responses = mcp_session(&endpoint, vec![tools_list_request(1)]);
     assert_eq!(
         tool_names(&responses[0]),
         EXPECTED_TOOLS,
@@ -275,8 +276,8 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
     // is no sleep here, and there must not be.
     wait_until_indexed(project.root());
 
-    let socket = daemon::socket_path(project.root()).unwrap();
-    let responses = mcp_session(&socket, vec![outline_request(1, "src/greeter.ts")]);
+    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let responses = mcp_session(&endpoint, vec![outline_request(1, "src/greeter.ts")]);
 
     assert_eq!(
         responses[0]["result"]["isError"], false,
@@ -334,9 +335,9 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     let mut second_daemon = spawn_daemon(project.root());
     wait_for("the second daemon to start listening", || pid_file.exists());
 
-    let socket = daemon::socket_path(project.root()).unwrap();
+    let endpoint = daemon::endpoint(project.root()).unwrap();
     let responses = mcp_session(
-        &socket,
+        &endpoint,
         vec![outline_request(1, "src/first.ts"), outline_request(2, "src/second.ts")],
     );
 
@@ -374,12 +375,12 @@ fn unknown_method_gets_a_json_rpc_error_not_a_crash() {
     let pid_file = daemon::pid_path(project.root()).unwrap();
     wait_for("the daemon to start listening", || pid_file.exists());
 
-    let socket = daemon::socket_path(project.root()).unwrap();
+    let endpoint = daemon::endpoint(project.root()).unwrap();
     // The follow-up tools/list on the *same* connection is the point of the
     // test: a garbage request has to be answered and shrugged off, not take
     // the session down with it.
     let responses = mcp_session(
-        &socket,
+        &endpoint,
         vec![
             json!({ "jsonrpc": "2.0", "id": 1, "method": "not_a_real_method" }),
             tools_list_request(2),
@@ -407,9 +408,9 @@ fn a_rejected_tool_call_reports_an_error_result_rather_than_failing_the_session(
     // still-indexing guard ahead of it instead, and prove nothing.
     wait_until_indexed(project.root());
 
-    let socket = daemon::socket_path(project.root()).unwrap();
+    let endpoint = daemon::endpoint(project.root()).unwrap();
     let responses = mcp_session(
-        &socket,
+        &endpoint,
         vec![
             json!({
                 "jsonrpc": "2.0",

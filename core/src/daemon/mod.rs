@@ -16,7 +16,6 @@ pub(crate) mod test_plugin;
 
 use std::fs::{self, File, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -30,12 +29,16 @@ use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
 use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
+use crate::ipc;
 use crate::mcp;
 use crate::storage::connection::{self, project_dir};
 use crate::storage::schema;
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
 
+/// Unix only: on Windows the endpoint is a pipe name, not a file in this
+/// directory (see [`socket_path`] and `ipc::windows`).
+#[cfg(unix)]
 const SOCKET_FILE: &str = "daemon.sock";
 const PID_FILE: &str = "daemon.pid";
 /// Which build the live daemon started from, so a shim (or `cli::status`) can
@@ -75,9 +78,51 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 /// file-watch tooling already use for the same trade-off.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
-/// The AF_UNIX socket a project's daemon listens on. The shim derives the
-/// same path from its own cwd, which is how the two find each other without
-/// any configured port or discovery step.
+/// Where a project's daemon listens. The shim derives the same endpoint from
+/// its own cwd, which is how the two find each other without any configured
+/// port or discovery step.
+///
+/// One identity, spelled twice: on Unix it is the AF_UNIX socket file inside
+/// the project's state directory, and on Windows it is a name in the
+/// machine-wide pipe namespace carrying the same project hash the state
+/// directory is named after. `ipc::windows`'s header has the full argument
+/// for why the second cannot be a file.
+pub fn endpoint(root: &Path) -> Result<ipc::Endpoint> {
+    let dir = project_dir(root)?;
+    endpoint_in(&dir)
+        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))
+}
+
+/// [`endpoint`] resolved from an already-known state directory rather than
+/// from a project root - the form `daemon::lifecycle` has on its way out of
+/// being a daemon, and the same shape as [`pid_path_in`] and
+/// [`build_stamp_path_in`].
+///
+/// It works on both platforms for one reason, and it is the reason the
+/// Windows naming scheme is what it is: the state directory is *named after*
+/// the project hash (`storage::connection::project_dir`), so the directory
+/// carries everything the pipe name needs. `None` only for a path with no
+/// final component, which no state directory has.
+pub fn endpoint_in(state_dir: &Path) -> Option<ipc::Endpoint> {
+    #[cfg(unix)]
+    {
+        Some(ipc::Endpoint::at_path(state_dir.join(SOCKET_FILE)))
+    }
+    #[cfg(windows)]
+    {
+        Some(ipc::Endpoint::named(state_dir.file_name()?.to_str()?))
+    }
+}
+
+/// The AF_UNIX socket file a project's daemon listens on.
+///
+/// Unix-only, and deliberately so: it is the one part of the endpoint that is
+/// a path, and a Windows build that could ask for it would be asking for a
+/// file that never exists. Everything that only needs to *reach* the daemon
+/// goes through [`endpoint`] instead; this is for the callers that genuinely
+/// handle the file (`cli::stop` clearing one, the test suite waiting for one
+/// to appear).
+#[cfg(unix)]
 pub fn socket_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(SOCKET_FILE))
 }
@@ -149,23 +194,14 @@ pub fn read_pid_file(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Whether a process with this pid currently exists.
-///
-/// `kill(pid, 0)` performs the usual permission and existence checks without
-/// delivering anything. `EPERM` counts as alive: the process is there, this
-/// user just may not signal it - reporting it as gone would be the more
-/// misleading of the two answers.
+/// Whether a process with this pid currently exists - [`crate::process::is_alive`]
+/// under the name the rest of this module tree has always called it by.
 ///
 /// Inherently a snapshot, and pids are reused, so a caller that cares
-/// (`cli::status`) corroborates it with the socket rather than trusting a
-/// recorded pid on its own.
+/// (`cli::status`) corroborates it with the daemon's endpoint rather than
+/// trusting a recorded pid on its own.
 pub fn is_process_alive(pid: u32) -> bool {
-    // SAFETY: `kill` with signal 0 only inspects; it cannot affect this
-    // process, and no pointers are involved.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    crate::process::is_alive(pid)
 }
 
 /// Whether something is accepting connections on this project's socket right
@@ -175,11 +211,11 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// The connection is opened and immediately dropped; the daemon treats that
 /// as a client that hung up before saying anything.
 pub fn is_listening(root: &Path) -> Result<bool> {
-    Ok(std::os::unix::net::UnixStream::connect(socket_path(root)?).is_ok())
+    Ok(ipc::Stream::connect(&endpoint(root)?).is_ok())
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
-/// version), binds the project's AF_UNIX socket, builds the initial index if
+/// version), binds the project's daemon endpoint, builds the initial index if
 /// the project has never been walked (`bulk_index`), registers the file
 /// watcher, and serves an MCP session per connection until it is stopped or
 /// its own long idle timeout expires (`daemon::lifecycle`).
@@ -200,8 +236,10 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// socket appearing, and nothing the daemon does at startup should be allowed
 /// to grow into that budget again.
 ///
-/// Unix-only for now: AF_UNIX is available on Windows 10+ but is not wired
-/// up here (see the architecture doc's shim/daemon section).
+/// The endpoint itself is `crate::ipc`'s business: an AF_UNIX socket file on
+/// Unix, a named pipe on Windows. Everything this function does around the
+/// bind - the ordering, the pid file, the stale-endpoint clearing - is the
+/// same on both.
 pub fn run(root: &Path) -> Result<()> {
     let dir = project_dir(root)?;
     fs::create_dir_all(&dir)
@@ -305,19 +343,22 @@ pub fn run(root: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
 
-    let socket = dir.join(SOCKET_FILE);
-    // A socket file left behind by a crashed daemon makes bind() fail with
-    // AddrInUse forever, so it is cleared first. That is only safe because
-    // the singleton lock above guarantees no other daemon is serving this
-    // project: any socket file still here belongs to a dead one.
-    let _ = fs::remove_file(&socket);
+    let endpoint = endpoint_in(&dir)
+        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))?;
+    // On Unix a socket file left behind by a crashed daemon makes bind() fail
+    // with AddrInUse forever, so it is cleared first. That is only safe
+    // because the singleton lock above guarantees no other daemon is serving
+    // this project: any socket file still here belongs to a dead one. On
+    // Windows this is a no-op, because a pipe name cannot outlive the process
+    // that held it - see `ipc::windows`'s header.
+    endpoint.clear_stale();
     // Bound here, before the plugin and long before the bulk walk: from this
     // point a shim's `connect()` succeeds (the kernel queues it on the
     // listener's backlog until the accept loop below is up), which is what
     // its bootstrap timeout is actually waiting for. See this function's doc
     // comment for what replaced the old "bind last" guarantee.
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
+    let listener = ipc::Listener::bind(&endpoint)
+        .with_context(|| format!("failed to bind the daemon endpoint at {endpoint}"))?;
 
     // Still written immediately after the bind, so "the pid file exists"
     // continues to mean "something is listening" for `cli::status` and for
@@ -711,8 +752,9 @@ fn watch_and_route_once(
 /// watcher and the bulk walk have no use for it, so the runtime is entered
 /// here rather than wrapped around a daemon that would otherwise gain nothing
 /// from it. The listener is bound synchronously by [`run`] and only then
-/// handed to tokio, which keeps the bind/pid-file ordering the bootstrap race
-/// depends on exactly where it was.
+/// handed to tokio (`ipc::Listener::into_async`), which keeps the
+/// bind/pid-file ordering the bootstrap race depends on exactly where it was
+/// - and is the requirement that decided how `crate::ipc` had to be shaped.
 ///
 /// `indexing` is cloned into every accepted session, which is what lets a
 /// connection made during the cold-start walk be answered honestly rather
@@ -723,7 +765,7 @@ fn watch_and_route_once(
 /// as long as it lives, so only a project with nobody attached can ever be
 /// found idle.
 fn serve_forever(
-    listener: UnixListener,
+    listener: ipc::Listener,
     conn: Arc<Mutex<Connection>>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
@@ -740,14 +782,12 @@ fn serve_forever(
         .context("failed to build the daemon's async runtime")?;
 
     runtime.block_on(async move {
-        listener
-            .set_nonblocking(true)
-            .context("failed to put the daemon socket in non-blocking mode")?;
-        let listener = tokio::net::UnixListener::from_std(listener)
-            .context("failed to register the daemon socket with the async runtime")?;
+        let mut listener = listener
+            .into_async()
+            .context("failed to register the daemon endpoint with the async runtime")?;
 
         loop {
-            let (stream, _) = listener
+            let stream = listener
                 .accept()
                 .await
                 .context("failed to accept a daemon connection")?;
