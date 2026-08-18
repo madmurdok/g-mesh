@@ -95,22 +95,23 @@ pub fn list() -> Result<Vec<PluginInfo>> {
     list_from_roots(&default_roots()?)
 }
 
-/// The two roots `list()` scans, in the order they are reported: the user's
-/// own `~/.g-mesh/plugins/` first, then the bundled root - the same
-/// precedence order `daemon::manifest::discover`'s doc comment documents
+/// The roots `list()` scans, in the order they are reported: the user's own
+/// `~/.g-mesh/plugins/` first, then the bundled roots - the same precedence
+/// order `daemon::manifest::discover`'s doc comment documents
 /// (`~/.g-mesh/plugins/` is scanned before the bundled root, so a
 /// user-installed plugin can intentionally override a bundled one).
 ///
-/// The bundled root is resolved the same way
-/// [`crate::daemon::plugin::plugin_entry_path`] resolves the bundled JS/TS
-/// plugin's entry point today: relative to this crate's own source tree,
-/// baked in at compile time - `core/` and `plugins/` are sibling directories
-/// in this repo and there is no distribution pipeline yet.
+/// Delegating the bundled half to [`manifest::bundled_roots`] rather than
+/// re-deriving it is what keeps this listing honest about what the daemon
+/// would actually spawn: both the installed layout (a release archive's
+/// `plugins/` beside the executable) and the checkout layout are reported, and
+/// on any real machine only one of them exists - see that function for why.
 fn default_roots() -> Result<Vec<(PathBuf, PluginStatus)>> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
-    let installed_root = home.join(".g-mesh").join("plugins");
-    let bundled_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
-    Ok(vec![(installed_root, PluginStatus::Installed), (bundled_root, PluginStatus::Bundled)])
+    let user_root = home.join(".g-mesh").join("plugins");
+    let mut roots = vec![(user_root, PluginStatus::Installed)];
+    roots.extend(manifest::bundled_roots().into_iter().map(|root| (root, PluginStatus::Bundled)));
+    Ok(roots)
 }
 
 /// Scans each of `roots` in order, reporting every plugin directory found
@@ -232,7 +233,7 @@ mod tests {
         assert_eq!(plugins[0].language, "typescript");
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
         );
     }
 
@@ -253,7 +254,7 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Installed }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Installed }
         );
     }
 
@@ -276,7 +277,7 @@ mod tests {
         let good = plugins.iter().find(|p| p.language == "typescript").expect("good entry missing");
         assert_eq!(
             good.outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
         );
 
         let bad = plugins.iter().find(|p| p.language == "broken").expect("bad entry missing");

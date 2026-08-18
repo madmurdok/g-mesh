@@ -1,6 +1,6 @@
 {
   "name": "@g-mesh/plugin-js-ts",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "license": "MIT OR Apache-2.0",
   "description": "g-mesh language plugin process for JavaScript/TypeScript (control-plane skeleton)",
@@ -15,7 +15,9 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "@types/node": "^20.19.19"
+    "@types/node": "^20.19.19",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
   },
   "dependencies": {
     "ignore": "^7.0.0",

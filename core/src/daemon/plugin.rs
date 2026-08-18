@@ -1,9 +1,11 @@
 //! Spawns a language plugin as a child process from its manifest, performs
 //! its handshake, and gives the rest of the daemon a way to route
 //! `FileChanged` requests to it and apply the diff it answers with - the
-//! missing link between the daemon (Rust) and a plugin process (Node.js for
-//! the bundled one; whatever a discovered manifest's `command`/`args` name,
-//! for any other).
+//! missing link between the daemon (Rust) and a plugin process (for the
+//! bundled one: `node` plus a compiled script in a checkout, a self-contained
+//! executable that carries its own runtime in a release archive - see
+//! `launch_command_for`; for any other, whatever a discovered manifest's
+//! `command`/`args` name).
 //!
 //! [`PluginProcess`]/[`PluginState`] here are generic over any one plugin;
 //! discovery and per-language routing live in `daemon::manifest`
@@ -82,17 +84,74 @@ pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 const BASELINE_FINGERPRINT_IGNORE: &[&str] =
     &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
 
-/// Shared with `daemon::bulk_index`, which spawns the same entry point in
-/// its one-shot mode - both must honor the same override.
+/// File name of the bundled plugin's single-executable build, as
+/// `scripts/bundle-plugin.sh` stages it into a release archive. The two must
+/// agree: this is how a binary that was compiled somewhere else entirely finds
+/// the plugin sitting next to it.
+const BUNDLED_PLUGIN_EXE: &str =
+    if cfg!(windows) { "g-mesh-plugin-typescript.exe" } else { "g-mesh-plugin-typescript" };
+
+/// Where this install's bundled JS/TS plugin is, in precedence order:
+///
+/// 1. [`PLUGIN_PATH_ENV`], for the test suite and anyone pointing a binary at
+///    a plugin build of their own.
+/// 2. The single-executable plugin a release archive unpacks beside the core
+///    binary (`<exe dir>/plugins/typescript/g-mesh-plugin-typescript`). Probed
+///    for existence rather than assumed, because it is exactly what a checkout
+///    does not have.
+/// 3. The compiled entry point in this repo's own tree, baked in at compile
+///    time - `core/` and `plugins/typescript/` are sibling directories here.
+///
+/// The order matters in only one direction: an installed layout has no
+/// `CARGO_MANIFEST_DIR` to resolve, and a checkout has no executable-adjacent
+/// `plugins/`, so on any real machine at most one of (2) and (3) exists. Where
+/// both somehow do, the artifact that shipped with the running binary wins -
+/// see `daemon::manifest::bundled_roots`, which orders its roots the same way
+/// for the same reason.
 pub(crate) fn plugin_entry_path() -> PathBuf {
     if let Ok(over) = std::env::var(PLUGIN_PATH_ENV) {
         return PathBuf::from(over);
     }
-    // `core/` and `plugins/typescript/` are sibling directories in this repo, and
-    // there is no distribution pipeline yet (see release notes' backlog) -
-    // resolving relative to this crate's own source tree, baked in at
-    // compile time, is the pragmatic MVP answer.
+    if let Some(installed) = installed_plugin_executable() {
+        return installed;
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js")
+}
+
+/// The bundled plugin executable in an installed layout, if this really is
+/// one. `None` in a checkout, which is the case that falls through to the
+/// compile-time path above.
+fn installed_plugin_executable() -> Option<PathBuf> {
+    let candidate = crate::daemon::manifest::installed_bundled_root()?
+        .join(BUNDLED_LANGUAGE)
+        .join(BUNDLED_PLUGIN_EXE);
+    candidate.is_file().then_some(candidate)
+}
+
+/// How to launch whatever [`plugin_entry_path`] resolved to, as a
+/// `(command, args)` pair.
+///
+/// A script needs an interpreter and an executable must not have one, and the
+/// difference is decided by the entry's own extension rather than by which
+/// branch above produced it - which is what keeps [`PLUGIN_PATH_ENV`] working
+/// for both. Pointing it at a `dist/src/index.js` (what every test that sets
+/// it does) still spawns `node`; pointing it at a single-executable build
+/// spawns that build directly, with no Node.js needed on the machine at all.
+///
+/// `node` stays a bare command so `std::process::Command` looks it up on
+/// `$PATH` at spawn time, matching how `daemon::manifest` resolves a bare
+/// `command` in a `plugin.toml`.
+fn launch_command_for(entry: &Path) -> (PathBuf, Vec<String>) {
+    let is_script = entry
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "js" | "cjs" | "mjs"));
+
+    if is_script {
+        (PathBuf::from("node"), vec![entry.to_string_lossy().into_owned()])
+    } else {
+        (entry.to_path_buf(), Vec::new())
+    }
 }
 
 /// The bundled plugin's wire identifier - `Handshake.language`
@@ -115,10 +174,10 @@ pub(crate) fn plugin_entry_path() -> PathBuf {
 /// instead of assuming this one.
 pub const BUNDLED_LANGUAGE: &str = "typescript";
 
-/// A [`PluginManifest`] describing the bundled JS/TS plugin exactly as it was
-/// spawned before this module took a manifest as an argument: `node` plus
-/// [`plugin_entry_path`]'s resolved entry point, honoring the same
-/// [`PLUGIN_PATH_ENV`] override - nothing read from an actual `plugin.toml`.
+/// A [`PluginManifest`] describing the bundled JS/TS plugin as this install
+/// would spawn it - [`plugin_entry_path`]'s resolved entry point plus whatever
+/// `launch_command_for` says runs it, honoring the same [`PLUGIN_PATH_ENV`]
+/// override - with nothing read from an actual `plugin.toml`.
 ///
 /// Still used after `daemon::run` moved to `daemon::registry::PluginRegistry`
 /// (task 155) and after the index's generation string stopped being keyed off
@@ -132,12 +191,13 @@ pub const BUNDLED_LANGUAGE: &str = "typescript";
 pub fn bundled_manifest() -> PluginManifest {
     let entry = plugin_entry_path();
     let manifest_dir = entry.parent().map(Path::to_path_buf).unwrap_or_default();
+    let (command, args) = launch_command_for(&entry);
     PluginManifest {
         language: BUNDLED_LANGUAGE.to_string(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         plugin_version: String::new(),
-        command: PathBuf::from("node"),
-        args: vec![entry.to_string_lossy().into_owned()],
+        command,
+        args,
         extensions: Vec::new(),
         fingerprint_ignore: Vec::new(),
         manifest_dir,
@@ -903,6 +963,62 @@ mod tests {
         );
         assert_eq!(bundled.len(), FINGERPRINT_HEX_CHARS);
         assert!(bundled.chars().all(|c| c.is_ascii_hexdigit()), "{bundled} must be hex");
+    }
+
+    /// A compiled `.js` entry point needs `node` in front of it, and the
+    /// argument order has to be exactly what a shell would have written -
+    /// this is the shape every existing install and every test that sets
+    /// [`PLUGIN_PATH_ENV`] depends on.
+    #[test]
+    fn a_javascript_entry_point_is_launched_through_node() {
+        let entry = Path::new("/somewhere/plugins/typescript/dist/src/index.js");
+
+        let (command, args) = launch_command_for(entry);
+
+        assert_eq!(command, PathBuf::from("node"), "a script needs an interpreter");
+        assert_eq!(args, vec![entry.to_string_lossy().into_owned()]);
+    }
+
+    /// The single-executable build (`scripts/bundle-plugin.sh`) carries its own
+    /// runtime, so naming an interpreter would both be wrong and reintroduce
+    /// the Node.js dependency the whole bundle exists to remove.
+    #[test]
+    fn a_self_contained_plugin_executable_is_launched_directly() {
+        let entry = Path::new("/opt/g-mesh/plugins/typescript/g-mesh-plugin-typescript");
+
+        let (command, args) = launch_command_for(entry);
+
+        assert_eq!(command, entry, "the executable is its own command");
+        assert!(args.is_empty(), "nothing is prepended to a native executable's argv");
+    }
+
+    /// Windows names the same artifact with an extension, which must not be
+    /// mistaken for a script.
+    #[test]
+    fn a_windows_plugin_executable_is_launched_directly_too() {
+        let (command, args) =
+            launch_command_for(Path::new(r"C:\g-mesh\plugins\typescript\g-mesh-plugin-typescript.exe"));
+
+        assert!(args.is_empty(), "{command:?} took interpreter arguments it should not have");
+        assert_ne!(command, PathBuf::from("node"));
+    }
+
+    /// The dev checkout keeps the behavior it has always had: nothing about
+    /// bundling a release may change how `cargo test` and a working tree spawn
+    /// the plugin. (Test binaries live in `core/target/<profile>/deps/`, where
+    /// no `plugins/` directory exists, so resolution falls through to the
+    /// compile-time path.)
+    #[test]
+    fn a_checkout_still_resolves_to_the_compiled_javascript_entry_point() {
+        let manifest = bundled_manifest();
+
+        assert_eq!(manifest.command, PathBuf::from("node"));
+        assert_eq!(manifest.args.len(), 1);
+        assert!(
+            manifest.args[0].ends_with("index.js"),
+            "expected a compiled JS entry point, got {}",
+            manifest.args[0]
+        );
     }
 
     /// The check `docs/architecture/plugin-modularity.md`'s Interfaces

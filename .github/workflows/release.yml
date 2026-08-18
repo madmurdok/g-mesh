@@ -1,0 +1,450 @@
+# Builds `g-mesh` for every target triple REQUIREMENTS.md implies, from a
+# single trigger, uploads one named archive per triple, and - on a version tag
+# - publishes them as a draft GitHub Release.
+#
+# STATUS: this file has never been executed. It was written offline; the YAML
+# parses, the runner labels and action majors were checked against GitHub's
+# current docs, and the build/package script it calls was run for real on
+# x86_64-apple-darwin. Nothing else here is proven - treat the first run as the
+# test, and expect the Windows job (the only one with no local counterpart at
+# all: MSVC toolchain, 7-Zip, Git Bash path handling) to be the likeliest to
+# need a fix. The publish job added by #67 is unproven in a different way: its
+# steps have never talked to the Releases API, but the one thing that would be
+# invisible if it were wrong - whether the asset names it uploads are the names
+# the build produces - is not a guess. Both come from `build-targets.sh
+# --asset-names`, and `scripts/prepare-release-assets.sh` fails the release if
+# the files on disk disagree with it.
+#
+# ---------------------------------------------------------------------------
+# WHAT THESE ARTIFACTS ARE
+#
+# Since task #65 each archive carries both halves of a working install: the
+# core binary, and the JS/TS plugin compiled to a self-contained executable
+# (Node's SEA - it embeds the runtime, so the machine needs no Node.js) in
+# `plugins/typescript/`, which is where `daemon::manifest::bundled_roots` looks
+# beside the executable. `scripts/install.sh` (#66) fetches exactly these
+# assets, by the URLs the section below fixes, and verifies the `.sha256`
+# beside each archive before it unpacks anything.
+#
+# ---------------------------------------------------------------------------
+# HOW TO CUT A RELEASE
+#
+# 1. Make sure `core/Cargo.toml`'s version is the version you are releasing.
+#    It, not the tag, is what the artifacts are named after; the tag is checked
+#    against it in the first step of every build job so a mismatch costs a
+#    minute instead of four 90-minute builds.
+# 2. Tag the commit and push the tag:  `git tag v2.7.0 && git push origin v2.7.0`
+#    The repository has no tags at all today, so this is a deliberate, manual,
+#    human act - nothing in this pipeline creates one.
+# 3. Four builds run (~1h). If any one of them fails, nothing is published:
+#    the publish job `needs: build`, and a three-platform Release is worse than
+#    none, because an installer cannot tell "not built yet" from "your platform
+#    is not supported".
+# 4. A DRAFT Release appears with nine assets. Drafts are invisible to the
+#    public and fire no `release: published` event, so review it - notes, asset
+#    list, checksums - and press "Publish release" yourself.
+#
+# The draft step is the deliberate cost of this design: `/releases/latest/
+# download/...` URLs 404 until a human publishes, so #66's installer is not
+# usable the moment the workflow goes green. That is the intended trade for
+# never having a bad build become public automatically, on a repository where
+# this pipeline has yet to run once.
+#
+# THE ASSETS, AND THE CONTRACT WITH #66
+#
+#   g-mesh-v<version>-<target>.tar.gz          (.zip for the windows target)
+#   g-mesh-v<version>-<target>.tar.gz.sha256   one per archive
+#   SHA256SUMS                                 all four, for `sha256sum -c`
+#
+# Both checksum forms are published on purpose: the per-asset file is one small
+# extra fetch for an installer that already knows which single archive it
+# wants, and SHA256SUMS is the form a human verifying a download by hand
+# expects. The download URL an installer builds is
+#
+#   https://github.com/<owner>/<repo>/releases/download/v<version>/<asset>
+#
+# and only the `<version>` and `<target>` parts vary - which is why the names
+# are generated, not typed.
+#
+# This is also why every job needs Node: the plugin is built here, and the
+# runtime it embeds is the one `setup-node` installs on that runner. Pinning
+# that version pins what ships.
+# ---------------------------------------------------------------------------
+#
+# WHY A MATRIX ON NATIVE RUNNERS, NOT TRUE CROSS-COMPILATION
+#
+# Four dependencies compile C/C++ (or asm) for the target: `rusqlite` with
+# `bundled` (SQLite), `tokenizers` with `onig` (the Oniguruma regex library),
+# `sqlite-vec`, and `ring`, which arrives transitively through `ureq`'s rustls
+# TLS. On top of that, `ort` links ONNX Runtime statically, which
+# drags in a C++ standard library that differs per platform (libc++ on macOS,
+# libstdc++ on Linux, the MSVC CRT on Windows). Producing all four triples from
+# one host would mean supplying four cross toolchains and four sysroots and
+# getting every C++ stdlib link right - `cross`/zig territory, and the MSVC
+# target is not honestly reachable from a non-Windows host at all. A runner per
+# platform makes each build a plain native `cargo build` with the toolchain the
+# image already has. The cost is four machines instead of one; the benefit is
+# that nothing here depends on a cross-toolchain setup that breaks silently.
+#
+# This is measured, not assumed: `cargo check --target
+# x86_64-unknown-linux-gnu` on a macOS host dies at the *first* crate that
+# compiles C - `ring`, long before SQLite or Oniguruma get a turn - with
+# `failed to find tool "x86_64-linux-gnu-gcc"`. Making that work means
+# installing and maintaining a Linux cross toolchain (or `cross` + Docker) for
+# every C dependency in the tree, and the Windows MSVC target has no honest
+# equivalent at all.
+#
+# One measured exception, worth writing down because it is the escape hatch for
+# 2027: macOS -> macOS *does* cross-compile out of the box, because Apple's
+# clang carries both architectures' SDKs. `cargo build --release --target
+# aarch64-apple-darwin` on an x86_64 Mac was run while writing this and
+# produced a working arm64 binary (onig_sys, rusqlite/bundled, sqlite-vec and
+# ort-sys all compiled; `otool -L` showed only system dylibs, i.e. ONNX Runtime
+# really is statically linked). So the two macOS rows below can be collapsed
+# onto one runner if that ever becomes necessary. They are kept separate today
+# because a native job can actually *execute* what it just built - the
+# `--version` smoke test in the script - and a cross-built one cannot.
+#
+# `ort` is pinned to `=2.0.0-rc.9` (see core/Cargo.toml for why). Verified
+# against that release's own `dist.txt`: it ships a *static*, execution-
+# provider-free prebuilt for all four triples below (ONNX Runtime 1.20.0), so
+# no target here is blocked by the pin. `ort-sys` downloads that prebuilt
+# during the build, so these jobs need network access - they are not hermetic.
+
+name: Release artifacts
+
+on:
+  # Builds artifacts and verifies them, but creates no Release, whatever the
+  # branch. This is the safe way to exercise the pipeline - Actions tab -> this
+  # workflow -> "Run workflow" - and the reason publishing is bound to a tag
+  # rather than to a button somebody might press by accident. Run this once
+  # before cutting the first tag: the `verify` job rehearses everything the
+  # release depends on except the Releases API calls themselves.
+  workflow_dispatch:
+  # The one trigger that publishes. The repository still has no tags; pushing
+  # the first one is the deliberate human act that cuts the first release.
+  push:
+    tags:
+      - "v*"
+  # Building four targets is expensive, so PRs only trigger it when the
+  # pipeline itself changes. This is the intended way to prove the workflow
+  # works before relying on it for a real release: open a PR touching these
+  # two files and watch all four jobs.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/build-targets.sh"
+      - "scripts/bundle-plugin.sh"
+      - "scripts/prepare-release-assets.sh"
+
+# The floor for every job. Only the `publish` job raises it, to `contents:
+# write`, and only for itself - the jobs that compile third-party C, C++ and
+# Rust never hold a token that can write to this repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A superseded branch build is worth cancelling; a release in flight is not.
+  # Cancelling between "assets uploaded" and "Release created" would leave a
+  # half-formed draft that the next run then has to reconcile.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # A full build compiles ONNX Runtime bindings, bundled SQLite and Oniguruma
+    # from scratch (no cache is used - a release build should not be able to
+    # pick up a stale object file), which is slow on the macOS images.
+    timeout-minutes: 90
+    strategy:
+      # One platform failing should not hide whether the other three work.
+      fail-fast: false
+      matrix:
+        include:
+          # Intel macOS. NOT `macos-13`: that image was retired on 2025-12-04.
+          # `macos-15-intel` is the current Intel image and GitHub has
+          # announced it as the last one - x86_64 macOS runners go away in
+          # autumn 2027, at which point this row needs a rethink (a local
+          # Intel Mac, or dropping the target).
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          # Pinned to the oldest supported Ubuntu on purpose: the glibc the
+          # binary links against is the runner's (2.35 here), and a binary
+          # built on a newer image simply will not start on an older distro.
+          # `ubuntu-latest` would silently narrow who can run the artifact.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+
+    steps:
+      # Pinned to the current major of each action as of 2026-08.
+      - uses: actions/checkout@v7
+
+      # First, because it is the cheapest possible failure. The archives are
+      # named after `core/Cargo.toml`'s version, so a tag that disagrees with
+      # it would otherwise burn four 90-minute builds to produce a "v2.7.0"
+      # Release whose every file says v2.6.0. `--version` needs no toolchain,
+      # which is why this can run before Rust is installed.
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          crate="$(bash scripts/build-targets.sh --version)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match core/Cargo.toml version $crate - bump the crate version, or delete and recut the tag"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches crate version $crate"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -vV
+
+      # Pinned, not `lts/*`: this Node is not just a build tool here, it is the
+      # runtime that gets copied into the shipped plugin executable (see
+      # scripts/bundle-plugin.sh), so an unpinned version would silently change
+      # what users run. 20.x is the floor Node's SEA support and the plugin's
+      # own `engines` field both require.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      # All naming/staging/archiving lives in the script so that what CI
+      # produces is exactly what a developer can reproduce locally. Invoked via
+      # `bash` rather than as an executable because the checkout on Windows
+      # does not carry the file mode.
+      - name: Build and package ${{ matrix.target }}
+        shell: bash
+        run: bash scripts/build-targets.sh ${{ matrix.target }}
+
+      # `node-version` above is not a CI detail: it decides which Node runtime
+      # gets copied into the shipped plugin executable, so it is as much a
+      # property of the release as the rustc that compiled the binary. Recorded
+      # per target rather than assumed uniform, because `22.x` resolves to
+      # whatever patch each runner image happens to carry. The publish job
+      # turns these files into a table in the release notes; nothing fails if
+      # one is missing.
+      - name: Record what this artifact carries
+        shell: bash
+        run: |
+          mkdir -p dist/meta
+          {
+            echo "target=${{ matrix.target }}"
+            echo "runner=${{ matrix.runner }}"
+            echo "node=$(node --version)"
+            echo "rustc=$(rustc --version)"
+          } > "dist/meta/${{ matrix.target }}.txt"
+          cat "dist/meta/${{ matrix.target }}.txt"
+
+      # `meta/` rides along inside the same artifact rather than as a second
+      # one: upload-artifact roots the upload at the common ancestor of these
+      # paths (`dist/`), so the download in the publish job reconstructs
+      # exactly this layout. It is not published as a release asset - only the
+      # archives and their checksums are.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: g-mesh-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/meta/*.txt
+          if-no-files-found: error
+
+  # The publish job's dangerous half - "are these the right files, under the
+  # right names" - rehearsed on every non-tag run, so it is not first exercised
+  # by the release it would ruin. Deliberately a separate job rather than a
+  # step with an `if`, because permissions are per job: this one must never
+  # hold `contents: write`, and it never calls `gh`.
+  verify:
+    name: Verify assets (dry run)
+    needs: build
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: g-mesh-*
+          merge-multiple: true
+      - name: Verify the assets and build SHA256SUMS
+        shell: bash
+        # No G_MESH_VERSION: off a tag, core/Cargo.toml is the only version
+        # there is, and it is exactly what the archives were named after.
+        run: bash scripts/prepare-release-assets.sh dist
+      - name: Show what a release would publish
+        shell: bash
+        run: |
+          {
+            echo '### Assets a release from this commit would publish'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo 'Nothing was published: this run is not a version tag.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish draft Release
+    # This is the "all four or nothing" rule, and it needs no `if` of its own:
+    # the matrix is `fail-fast: false` so one platform's failure cannot hide
+    # the other three, but `build` as a whole only succeeds when every leg
+    # does, and a job whose `needs` did not succeed is skipped. The `if` below
+    # narrows *when* this job runs; it does not weaken that (only `always()`,
+    # `failure()` or `cancelled()` would, which is exactly why none appear
+    # here).
+    needs: build
+    # Publishing is bound to a version tag and nothing else. Manual and PR runs
+    # still build and upload all four artifacts, so the pipeline stays testable
+    # without any path from a button press to a public Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      # The only elevated permission in this file, scoped to the one job that
+      # needs it. Creating a Release and uploading assets is all `contents:
+      # write` is for here - no packages, no id-token, no deployments.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # v8, not v7: download-artifact and upload-artifact are versioned
+      # independently and their current majors do not match.
+      - name: Download every target's artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: g-mesh-*
+          merge-multiple: true
+
+      # The check that makes the rest of this job safe. It fails the release if
+      # any archive, checksum or name is not exactly what a full four-target
+      # build produces - including the case that matters most to #66's
+      # installer, an asset whose URL is not the one the naming convention
+      # predicts. It also writes dist/SHA256SUMS.
+      - name: Verify the assets and build SHA256SUMS
+        shell: bash
+        run: |
+          # The tag decides the version here. If it disagrees with
+          # core/Cargo.toml the archives are named after the crate version, the
+          # expected names will not be found, and the release stops - the same
+          # mismatch the build jobs already refuse to start on, re-checked
+          # against the files that actually exist.
+          G_MESH_VERSION="${GITHUB_REF_NAME#v}" bash scripts/prepare-release-assets.sh dist
+
+      - name: Compose release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+
+          {
+            echo "## Downloads"
+            echo
+            echo "| target | archive | Node runtime inside | built with |"
+            echo "| --- | --- | --- | --- |"
+            for target in $(bash scripts/build-targets.sh --list); do
+              # First line is the archive, second is its .sha256. Piping to
+              # `head -1` would risk a SIGPIPE failure under `pipefail`.
+              names="$(G_MESH_VERSION="$version" bash scripts/build-targets.sh --asset-names "$target")"
+              archive="${names%%$'\n'*}"
+
+              node="unknown"
+              rustc="unknown"
+              meta="dist/meta/$target.txt"
+              if [ -f "$meta" ]; then
+                node="$(awk -F= '$1 == "node" { print $2 }' "$meta")"
+                rustc="$(awk -F= '$1 == "rustc" { print $2 }' "$meta")"
+              fi
+
+              echo "| \`$target\` | \`$archive\` | $node | $rustc |"
+            done
+
+            echo
+            echo "Every archive unpacks to a directory holding the \`g-mesh\` binary and the"
+            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`. The"
+            echo "machine running it needs no Node.js and no toolchain; \`g-mesh model fetch\`"
+            echo "downloads the embedding model \`search_code\` needs."
+            echo
+            echo "### Verifying a download"
+            echo
+            echo '```'
+            echo "curl -LO https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS   # or: shasum -a 256 -c SHA256SUMS"
+            echo '```'
+            echo
+            echo "Each archive also has its own \`.sha256\` next to it, for verifying just one."
+          } > notes.md
+
+          # GitHub's own "what changed" text, fetched through the API and
+          # concatenated here rather than passed as `gh release create
+          # --generate-notes`: that flag's behaviour when a body is also
+          # supplied has varied between gh versions, and the runner's gh is not
+          # pinned. Notes are the one part of a release worth degrading rather
+          # than failing over - a human reviews the draft before it goes out.
+          if gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" --jq .body > generated.md; then
+            { echo; echo "---"; echo; cat generated.md; } >> notes.md
+          else
+            echo "::warning::could not generate the changelog section; publishing notes without it"
+          fi
+
+          cat notes.md
+
+      - name: Create or refresh the draft Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+
+          # SHA256SUMS is the manifest: the previous step wrote one line per
+          # archive it verified, so an upload list derived from it can neither
+          # include a file that was not checked nor silently drop one - which
+          # an unexpanded `dist/*.zip` glob could.
+          assets=(dist/SHA256SUMS)
+          while read -r _sum name; do
+            name="${name#\*}"
+            assets+=("dist/$name" "dist/$name.sha256")
+          done < dist/SHA256SUMS
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # A re-run against a Release that already exists - possibly one a
+            # human has already edited or even published. Replace the assets
+            # and touch nothing else: passing --draft again here would
+            # un-publish a live release.
+            echo "Release $tag already exists; replacing its assets only."
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --draft \
+              --title "$tag" \
+              --notes-file notes.md
+          fi
+
+          # Cosmetic, so it must not be able to fail a release that has already
+          # happened: a red X here would say "publishing broke" about a draft
+          # that is sitting there complete.
+          is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft || echo unknown)"
+          {
+            echo "### $tag"
+            echo
+            echo "- draft: \`$is_draft\`"
+            echo "- assets uploaded: ${#assets[@]}"
+            echo
+            echo "A draft is not public and fires no \`release: published\` event until"
+            echo "someone opens it and presses **Publish release**."
+          } >> "$GITHUB_STEP_SUMMARY"

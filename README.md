@@ -19,6 +19,64 @@ an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 The daemon and shim are one binary (`core/target/{debug,release}/g-mesh`);
 the plugin is a separate Node entry point the daemon launches with `node`.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.sh | sh
+```
+
+`scripts/install.sh` detects the platform, downloads the matching release
+archive, **verifies its SHA-256 before unpacking anything** (a mismatch aborts
+with both hashes printed and installs nothing), runs the downloaded binary once
+to prove it executes and discovers its plugin, and only then installs. It needs
+neither Rust nor Node.js: the archive carries the core binary and a plugin with
+its own embedded runtime.
+
+What lands on disk is a *directory*, not one file — by default `~/.g-mesh/bin`:
+
+```
+~/.g-mesh/bin/
+  g-mesh                 the core binary
+  plugins/typescript/    the plugin core discovers beside it
+  LICENSE*, README.md
+```
+
+Those two halves have to stay together: core looks for `plugins/` next to the
+running executable, so a lone `g-mesh` copied onto your `PATH` is a binary that
+cannot index anything. That is also why the script creates no
+`/usr/local/bin/g-mesh` symlink — `std::env::current_exe()` does not resolve
+symlinks on macOS, so a symlinked g-mesh would hunt for its plugin beside the
+symlink and find nothing. Put the install directory itself on `PATH`; the
+script prints the line and edits no rc file of yours:
+
+```bash
+export PATH="$HOME/.g-mesh/bin:$PATH"
+```
+
+Flags go through the pipe with `sh -s --`, or as environment variables:
+
+```bash
+curl -fsSL .../install.sh | sh -s -- --version 2.7.0          # pin a release
+curl -fsSL .../install.sh | sh -s -- --install-dir ~/opt/g-mesh
+G_MESH_VERSION=2.7.0 G_MESH_INSTALL_DIR=~/opt/g-mesh sh install.sh
+```
+
+Uninstalling is `rm -rf ~/.g-mesh/bin` — settings, project indexes and the
+embedding model live elsewhere under `~/.g-mesh` and survive it.
+
+**Windows is not supported by this script.** That target ships a `.zip`, which
+a POSIX shell has no portable way to unpack, so the script refuses instead of
+pretending. Install it by hand: download
+`g-mesh-v<version>-x86_64-pc-windows-msvc.zip` from the releases page, unpack
+it somewhere permanent — keeping `g-mesh.exe` and `plugins\` beside each other,
+for the reason above — and add that directory to `PATH`.
+
+**Until a release is published, this installs nothing.** Releases are built as
+drafts and are invisible — and their download URLs 404 — until a human presses
+Publish (see "Cutting a release" below). The script says exactly that, with
+what to do about it, instead of showing a bare 404 — until then the
+build-from-source path below is the only one that works.
+
 ## Prerequisites
 
 - Rust toolchain (`cargo`, stable) — build the core.
@@ -76,21 +134,87 @@ yet; it skips the checksum.
 Skipping this step entirely is a perfectly good choice. Everything else works;
 `search_code` just reports that semantic search is unavailable.
 
-**Important**: there is no distribution/packaging step yet. The daemon
-resolves the plugin's path relative to `core`'s own source tree, baked in at
-*compile time* (`core/src/daemon/plugin.rs`):
+A binary built this way finds the plugin through this checkout: the daemon
+falls back to a path relative to `core`'s own source tree, baked in at *compile
+time* (`core/src/daemon/plugin.rs`):
 
 ```
 <repo>/plugins/typescript/dist/src/index.js
 ```
 
-So the built `g-mesh` binary only works run from (or copied while keeping
-the relative layout of) this checked-out repo. To point it at a plugin build
-elsewhere, override with an env var:
+That fallback is the last of three steps. In precedence order, the daemon uses:
+
+1. `G_MESH_JS_TS_PLUGIN_PATH`, if set — a plugin build of your own. A `.js`
+   path is run with `node`; anything else is executed directly.
+2. `plugins/typescript/` **next to the `g-mesh` binary**, which is what a
+   release archive unpacks to and needs no Node.js at all (below).
+3. The compile-time checkout path above.
 
 ```bash
 export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
 ```
+
+### Release artifacts
+
+`scripts/build-targets.sh` builds and packages one archive per Rust target
+triple — `g-mesh-v<version>-<triple>.tar.gz` (`.zip` on Windows) plus a
+`.sha256`, written to `dist/`:
+
+```bash
+scripts/build-targets.sh                      # host target
+scripts/build-targets.sh x86_64-apple-darwin  # a specific one
+scripts/build-targets.sh --list               # the four supported triples
+```
+
+`.github/workflows/release.yml` runs that same script across four native
+runners (Intel macOS, Apple Silicon, Linux, Windows) from one trigger, so CI
+artifact names are reproducible locally. Native runners rather than true
+cross-compilation because `rusqlite`(bundled)/`tokenizers`(onig)/`sqlite-vec`
+compile C for the target and `ort` links ONNX Runtime statically against a
+per-platform C++ stdlib.
+
+Each archive holds a complete install, not just the binary:
+
+```
+g-mesh-v<version>-<triple>/
+  g-mesh                                  the core binary
+  plugins/typescript/
+    g-mesh-plugin-typescript              the JS/TS plugin, runtime included
+    node_modules/                         its native tree-sitter grammars
+    plugin.toml                           how core discovers and spawns it
+    LICENSE-nodejs                        the embedded runtime's notice
+  LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
+```
+
+**No Node.js required.** The plugin is compiled with [Node's single-executable
+application](https://nodejs.org/api/single-executable-applications.html)
+support (`scripts/bundle-plugin.sh`), so it embeds its own JS runtime. Indexing
+— the whole structural graph — works on a machine with no Node installed.
+
+The one thing the archive does *not* carry is a TypeScript compiler. The
+semantic pass that upgrades unresolved edges drives `tsserver`, and it
+deliberately prefers **the project's own** `node_modules/typescript` so a
+project is analyzed by the compiler it builds with; the plugin's embedded
+runtime is what executes it, so this too needs no system Node. A project with
+no TypeScript installed at all simply gets no semantic upgrade — every
+structural edge is still indexed. To cover that case, drop a `typescript`
+package into `node_modules/` beside the plugin executable.
+
+Building an archive requires Node 20+ on the build machine, and each archive
+must be built on the platform it targets: a single-executable plugin embeds the
+build machine's own Node runtime and cannot be cross-built.
+
+### Cutting a release
+
+1. Merge the release branch (with `core/Cargo.toml` already bumped to the new
+   version) into `main`.
+2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
+   version, working tree and branch state, runs `cargo test`, and creates an
+   annotated `v<version>` tag locally — it does not push by default, since
+   pushing the tag is what starts the public four-platform build and drafts a
+   Release. Pass `--push` to push it in the same step, or run the printed
+   `git push origin v<version>` yourself when ready.
+3. Once the build finishes, approve the draft on GitHub.
 
 ## How it finds a project
 

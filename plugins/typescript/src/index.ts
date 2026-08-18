@@ -4,6 +4,7 @@ import { reparseChangedFile, type FileDiff } from "./incremental";
 import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bulkIndex";
 import { stopSemanticProjects } from "./semantic";
 import { runSemanticPass } from "./semanticPass";
+import { RUN_NODE_FLAG, runNodeScript } from "./runtime";
 
 const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
 
@@ -220,6 +221,22 @@ async function runBulkIndex(projectRoot: string): Promise<void> {
 
 function main(): void {
   const args = process.argv.slice(2);
+
+  // Checked before anything else, including the handshake: in this mode the
+  // process is not a plugin at all, it is standing in for the `node` binary
+  // that a release archive deliberately does not require the machine to have
+  // (see runtime.ts). Anything written to stdout here would land in the middle
+  // of the protocol stream of whatever spawned us.
+  if (args[0] === RUN_NODE_FLAG) {
+    const script = args[1];
+    if (script === undefined) {
+      log(`${RUN_NODE_FLAG} needs a script to run`);
+      process.exitCode = 1;
+      return;
+    }
+    runNodeScript(script, args.slice(2));
+    return;
+  }
 
   if (args[0] === BULK_INDEX_FLAG) {
     // No process.exit() on success on purpose: stdout is a pipe, so its last
