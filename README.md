@@ -146,6 +146,18 @@ Building an archive requires Node 20+ on the build machine, and each archive
 must be built on the platform it targets: a single-executable plugin embeds the
 build machine's own Node runtime and cannot be cross-built.
 
+### Cutting a release
+
+1. Merge the release branch (with `core/Cargo.toml` already bumped to the new
+   version) into `main`.
+2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
+   version, working tree and branch state, runs `cargo test`, and creates an
+   annotated `v<version>` tag locally — it does not push by default, since
+   pushing the tag is what starts the public four-platform build and drafts a
+   Release. Pass `--push` to push it in the same step, or run the printed
+   `git push origin v<version>` yourself when ready.
+3. Once the build finishes, approve the draft on GitHub.
+
 ## How it finds a project
 
 `g-mesh mcp-shim` takes no arguments. It resolves the project root — the
