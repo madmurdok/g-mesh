@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(plugins[0].language, "typescript");
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
         );
     }
 
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Installed }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Installed }
         );
     }
 
@@ -277,7 +277,7 @@ mod tests {
         let good = plugins.iter().find(|p| p.language == "typescript").expect("good entry missing");
         assert_eq!(
             good.outcome,
-            PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
         );
 
         let bad = plugins.iter().find(|p| p.language == "broken").expect("bad entry missing");
