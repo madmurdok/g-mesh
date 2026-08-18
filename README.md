@@ -246,8 +246,9 @@ The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
 project's SQLite index, spawns the JS/TS plugin, builds the initial index if
 the project has never been indexed (see below), starts the file watcher, and
-serves the MCP tool surface over an `AF_UNIX` socket. The daemon outlives the
-shim and is reused by later connections for the same project.
+serves the MCP tool surface over a per-project endpoint (an `AF_UNIX` socket on
+Linux and macOS, a named pipe on Windows). The daemon outlives the shim and is
+reused by later connections for the same project.
 
 ## Is this worth registering?
 

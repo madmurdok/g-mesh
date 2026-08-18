@@ -46,8 +46,9 @@ relationships instead of inferring them from raw text.
 - **Resource footprint**: embedding model 100–500M params, <1GB footprint,
   CPU-only (no GPU dependency). Core ships as a single binary with no
   runtime dependency for the user.
-- **Platforms**: Linux, macOS, Windows ≥ 10 build 17063 / Server 2019+
-  (minimum version driven by native `AF_UNIX` socket support).
+- **Platforms**: Linux, macOS, Windows 10+ / Server 2016+ (no build-number
+  floor: the Windows transport is a named pipe, not `AF_UNIX` - see
+  [Shim ↔ daemon](#shim--daemon)).
 - **Transport**: MCP stdio only, per the MCP spec's standard transport —
   must work with any MCP client without custom integration.
 - **Privacy**: project content must not leave the machine in any default
@@ -1358,9 +1359,29 @@ shape overloads resolve *into* is decided in
 
 ### Shim ↔ daemon
 
-`AF_UNIX` sockets on every platform (native on Windows ≥ 10 build 17063 via
-Rust/tokio), carrying the same JSON-RPC framing the shim received from the
-MCP client on stdio — the shim is a pure repacking proxy.
+One endpoint per project, carrying the same JSON-RPC framing the shim received
+from the MCP client on stdio — the shim is a pure repacking proxy. Which kind
+of endpoint is the only per-platform thing in the whole path, and lives behind
+`core/src/ipc/`:
+
+- **Unix**: an `AF_UNIX` socket file at `~/.g-mesh/projects/<hash>/daemon.sock`
+  — the directory carries the project identity, the filesystem carries the
+  name, and a crashed daemon leaves the file behind for the next one to
+  unlink.
+- **Windows**: a named pipe at `\\.\pipe\g-mesh-<hash>`. This was originally
+  specified as `AF_UNIX` on every platform, "native on Windows ≥ 10 build
+  17063 via Rust/tokio", and that was wrong: Windows has had `AF_UNIX` at the
+  OS level since that build, but Rust's `UnixStream`/`UnixListener` are
+  `cfg(unix)`-only regardless and tokio exposes no Windows equivalent, so
+  there was never a shared type to compile. A named pipe is what the platform
+  actually offers with both a blocking and a tokio API.
+
+The consequence worth knowing is that a pipe name is not a file: it lives in
+one flat machine-wide namespace (so the name, not a directory, carries the
+project hash), there is nothing to unlink because the kernel reclaims the name
+when the last handle closes, and staleness surfaces as a refused bind rather
+than as a leftover file. The pid, lock and build-stamp files next to the Unix
+socket are ordinary files and are unchanged on both platforms.
 
 ## Failure Modes & Edge Cases
 

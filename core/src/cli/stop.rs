@@ -28,9 +28,13 @@
 //! to report is that it did. Each is only signalled if it fails to, which is
 //! what makes "no orphaned processes" a guarantee rather than an expectation.
 //!
-//! Both signals escalate: `SIGTERM`, and `SIGKILL` if that is ignored. Neither
-//! process installs a handler today, so the escalation is insurance against a
-//! future one that hangs, not a routine path.
+//! Both stops escalate: on Unix `SIGTERM`, and `SIGKILL` if that is ignored.
+//! Neither process installs a handler today, so the escalation is insurance
+//! against a future one that hangs, not a routine path. On Windows there is
+//! only one way to stop a process that did not ask to be stopped, so the two
+//! rungs are the same call and the escalation never escalates - see
+//! `crate::process`, which also explains why that is the honest port of what
+//! this command does rather than a shortcut past it.
 //!
 //! # Doing nothing is a success
 //!
@@ -49,12 +53,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::daemon;
+use crate::process;
 use crate::storage::connection::project_dir;
 
-/// How long a signalled process is given before the next signal - generous,
-/// because overshooting costs a moment on a command a person is watching,
-/// while undershooting escalates to `SIGKILL` against a process that was
-/// shutting down cleanly all along.
+/// How long a process that has been asked to stop is given before the next,
+/// harder attempt - generous, because overshooting costs a moment on a command
+/// a person is watching, while undershooting escalates against a process that
+/// was shutting down cleanly all along.
 pub(crate) const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the plugin is given to notice its core is gone and exit by
 /// itself, before it is signalled like anything else.
@@ -178,45 +183,37 @@ fn live_pid(path: &Path) -> Option<u32> {
     daemon::read_pid_file(path).filter(|&pid| daemon::is_process_alive(pid))
 }
 
-/// `SIGTERM`, then `SIGKILL`, waiting for the process to go after each.
+/// Ask, then insist, waiting for the process to go after each
+/// (`process::request_stop`, then `process::force_stop`).
 ///
 /// `pub(crate)` for `shim::evict_wedged_daemon`, which has to clear exactly
 /// this kind of process out of the way before it can bootstrap a replacement,
 /// and must escalate the same way rather than grow a second implementation of
 /// it - the same argument `shim::retire_outdated_daemon` already makes for
 /// reusing [`stop`] itself.
+///
+/// On Windows both rungs are `TerminateProcess`, which cannot be ignored, so
+/// the second one is dead weight there rather than a second chance -
+/// [`Stopped::Killed`] is a verdict only Unix can reach. Kept as one shape on
+/// both platforms because everything downstream of it (the escalation's
+/// waiting, `Outcome`, what `stop` reports) is genuinely the same.
 pub(crate) fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
-    send_signal(pid, libc::SIGTERM)?;
+    process::request_stop(pid)?;
     if wait_until_gone(pid, grace) {
         return Ok(Stopped::Terminated { pid });
     }
 
-    send_signal(pid, libc::SIGKILL)?;
+    process::force_stop(pid)?;
     if wait_until_gone(pid, grace) {
         return Ok(Stopped::Killed { pid });
     }
 
-    // SIGKILL cannot be caught, so reaching this means the process is stuck
-    // in the kernel (uninterruptible I/O) or is an unreaped zombie whose
-    // parent is still around - neither of which this command can fix, and
-    // both of which are worth saying out loud rather than reporting success.
-    bail!("pid {pid} is still present after SIGTERM and SIGKILL")
-}
-
-fn send_signal(pid: u32, signal: libc::c_int) -> Result<()> {
-    // SAFETY: `kill` takes no pointers, and the only process affected is the
-    // one named by `pid`.
-    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
-        return Ok(());
-    }
-
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // It exited between the liveness check and here: the outcome this
-        // call was asking for, reached without it.
-        Some(libc::ESRCH) => Ok(()),
-        _ => Err(err).with_context(|| format!("failed to signal pid {pid}")),
-    }
+    // Neither `SIGKILL` nor `TerminateProcess` can be caught, so reaching this
+    // means the process is stuck in the kernel (uninterruptible I/O) or is an
+    // unreaped zombie whose parent is still around - neither of which this
+    // command can fix, and both of which are worth saying out loud rather than
+    // reporting success.
+    bail!("pid {pid} is still present after being asked and then made to stop")
 }
 
 fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
@@ -249,17 +246,19 @@ fn tidy_state_files(project_root: &Path) -> Result<()> {
         }
     }
 
-    // A socket file outlives the daemon that bound it, and a leftover one is
-    // what `daemon::run` has to clear before it can bind. Removing it here is
-    // what "the socket is released" means to the next daemon.
+    // On Unix a socket file outlives the daemon that bound it, and a leftover
+    // one is what `daemon::run` has to clear before it can bind. Removing it
+    // here is what "the socket is released" means to the next daemon. On
+    // Windows there is nothing to release - the pipe name went with the
+    // process - and `clear_stale` is a no-op.
     //
     // The build stamp goes with it, under the same condition and for a
-    // related reason: it describes the process that was serving this socket,
-    // so once nothing is answering there it describes nobody. Keyed off the
-    // socket rather than off the pid file the loop above may have just
-    // removed, which would read as "nothing running" whatever the truth.
+    // related reason: it describes the process that was serving this
+    // endpoint, so once nothing is answering there it describes nobody. Keyed
+    // off the endpoint rather than off the pid file the loop above may have
+    // just removed, which would read as "nothing running" whatever the truth.
     if !daemon::is_listening(project_root)? {
-        let _ = fs::remove_file(daemon::socket_path(project_root)?);
+        daemon::endpoint(project_root)?.clear_stale();
         let _ = fs::remove_file(daemon::build_stamp_path(project_root)?);
     }
     Ok(())
@@ -305,118 +304,128 @@ fn describe(stopped: Stopped) -> &'static str {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::process::{Child, Command, Stdio};
 
-    /// A short grace period, so the escalation tests take milliseconds rather
-    /// than the production timeout's seconds.
-    const TEST_GRACE: Duration = Duration::from_millis(500);
+    /// The half of this module's coverage that needs a real process which can
+    /// *ignore* being asked to stop - which is what `SIGTERM` is and what
+    /// Windows has no equivalent of (`crate::process`). The escalation these
+    /// exercise still exists on both platforms; only the second rung's
+    /// meaning is Unix-specific, so only these tests are.
+    #[cfg(unix)]
+    mod signals {
+        use super::*;
+        use std::process::{Child, Command, Stdio};
 
-    /// A real child process to signal. Killed on drop, so a failing
-    /// assertion cannot leak one.
-    struct Victim(Child);
+        /// A short grace period, so the escalation tests take milliseconds rather
+        /// than the production timeout's seconds.
+        const TEST_GRACE: Duration = Duration::from_millis(500);
 
-    impl Victim {
-        /// Exits on `SIGTERM`, like every process this command signals today.
-        fn cooperative() -> Self {
-            Self::spawn("sleep 30")
+        /// A real child process to signal. Killed on drop, so a failing
+        /// assertion cannot leak one.
+        struct Victim(Child);
+
+        impl Victim {
+            /// Exits on `SIGTERM`, like every process this command signals today.
+            fn cooperative() -> Self {
+                Self::spawn("sleep 30")
+            }
+
+            /// Ignores `SIGTERM` outright - the case the `SIGKILL` escalation
+            /// exists for.
+            fn stubborn() -> Self {
+                Self::spawn("trap '' TERM; sleep 30")
+            }
+
+            fn spawn(script: &str) -> Self {
+                let child = Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("failed to spawn a test process");
+                Self(child)
+            }
+
+            fn pid(&self) -> u32 {
+                self.0.id()
+            }
+
+            /// Reaps it, so `kill(pid, 0)` stops finding a zombie. Signalling a
+            /// child of this process is the one place a test has to do the
+            /// daemon's own parent's job - in production nothing here is a child
+            /// of the process running `stop`.
+            fn reap(&mut self) {
+                let _ = self.0.wait();
+            }
         }
 
-        /// Ignores `SIGTERM` outright - the case the `SIGKILL` escalation
-        /// exists for.
-        fn stubborn() -> Self {
-            Self::spawn("trap '' TERM; sleep 30")
+        impl Drop for Victim {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
 
-        fn spawn(script: &str) -> Self {
-            let child = Command::new("sh")
-                .arg("-c")
-                .arg(script)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("failed to spawn a test process");
-            Self(child)
+        #[test]
+        fn a_process_that_honors_sigterm_is_terminated_without_escalating() {
+            let mut victim = Victim::cooperative();
+            let pid = victim.pid();
+
+            process::request_stop(pid).unwrap();
+            victim.reap();
+
+            assert!(wait_until_gone(pid, TEST_GRACE), "SIGTERM must be enough for pid {pid}");
         }
 
-        fn pid(&self) -> u32 {
-            self.0.id()
+        #[test]
+        fn a_process_that_ignores_sigterm_is_killed() {
+            let mut victim = Victim::stubborn();
+            let pid = victim.pid();
+
+            // Give the shell a moment to install its trap, or the test would be
+            // asserting about a process that had not started ignoring anything.
+            thread::sleep(Duration::from_millis(100));
+            process::request_stop(pid).unwrap();
+            assert!(
+                !wait_until_gone(pid, Duration::from_millis(200)),
+                "the stubborn process must survive SIGTERM, or this test proves nothing"
+            );
+
+            process::force_stop(pid).unwrap();
+            victim.reap();
+            assert!(wait_until_gone(pid, TEST_GRACE), "SIGKILL must be enough for pid {pid}");
         }
 
-        /// Reaps it, so `kill(pid, 0)` stops finding a zombie. Signalling a
-        /// child of this process is the one place a test has to do the
-        /// daemon's own parent's job - in production nothing here is a child
-        /// of the process running `stop`.
-        fn reap(&mut self) {
-            let _ = self.0.wait();
+        /// The race `stop` runs into whenever a process exits between the
+        /// liveness check and the signal: not an error, just the outcome arriving
+        /// early.
+        #[test]
+        fn signalling_an_already_dead_process_is_not_an_error() {
+            let mut victim = Victim::cooperative();
+            let pid = victim.pid();
+            victim.0.kill().unwrap();
+            victim.reap();
+            assert!(wait_until_gone(pid, TEST_GRACE));
+
+            process::request_stop(pid).expect("a process that is already gone is not a failure");
         }
-    }
 
-    impl Drop for Victim {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        #[test]
+        fn a_pid_file_naming_a_dead_process_reads_as_nothing_running() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon.pid");
+
+            let mut victim = Victim::cooperative();
+            fs::write(&path, victim.pid().to_string()).unwrap();
+            assert_eq!(live_pid(&path), Some(victim.pid()));
+
+            victim.0.kill().unwrap();
+            victim.reap();
+            assert!(wait_until_gone(victim.pid(), TEST_GRACE));
+
+            assert_eq!(live_pid(&path), None, "a stale pid file names nothing running");
         }
-    }
-
-    #[test]
-    fn a_process_that_honors_sigterm_is_terminated_without_escalating() {
-        let mut victim = Victim::cooperative();
-        let pid = victim.pid();
-
-        send_signal(pid, libc::SIGTERM).unwrap();
-        victim.reap();
-
-        assert!(wait_until_gone(pid, TEST_GRACE), "SIGTERM must be enough for pid {pid}");
-    }
-
-    #[test]
-    fn a_process_that_ignores_sigterm_is_killed() {
-        let mut victim = Victim::stubborn();
-        let pid = victim.pid();
-
-        // Give the shell a moment to install its trap, or the test would be
-        // asserting about a process that had not started ignoring anything.
-        thread::sleep(Duration::from_millis(100));
-        send_signal(pid, libc::SIGTERM).unwrap();
-        assert!(
-            !wait_until_gone(pid, Duration::from_millis(200)),
-            "the stubborn process must survive SIGTERM, or this test proves nothing"
-        );
-
-        send_signal(pid, libc::SIGKILL).unwrap();
-        victim.reap();
-        assert!(wait_until_gone(pid, TEST_GRACE), "SIGKILL must be enough for pid {pid}");
-    }
-
-    /// The race `stop` runs into whenever a process exits between the
-    /// liveness check and the signal: not an error, just the outcome arriving
-    /// early.
-    #[test]
-    fn signalling_an_already_dead_process_is_not_an_error() {
-        let mut victim = Victim::cooperative();
-        let pid = victim.pid();
-        victim.0.kill().unwrap();
-        victim.reap();
-        assert!(wait_until_gone(pid, TEST_GRACE));
-
-        send_signal(pid, libc::SIGTERM).expect("a process that is already gone is not a failure");
-    }
-
-    #[test]
-    fn a_pid_file_naming_a_dead_process_reads_as_nothing_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.pid");
-
-        let mut victim = Victim::cooperative();
-        fs::write(&path, victim.pid().to_string()).unwrap();
-        assert_eq!(live_pid(&path), Some(victim.pid()));
-
-        victim.0.kill().unwrap();
-        victim.reap();
-        assert!(wait_until_gone(victim.pid(), TEST_GRACE));
-
-        assert_eq!(live_pid(&path), None, "a stale pid file names nothing running");
     }
 
     #[test]

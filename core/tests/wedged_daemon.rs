@@ -1,6 +1,18 @@
 //! A daemon that is alive, holds its project's singleton lock, and serves
 //! nothing - task 184.
 //!
+//! # Unix only, and it is the staging that is Unix-only, not the bug
+//!
+//! The state under test is platform-neutral: `daemon::DaemonLock::Wedged` and
+//! `shim::evict_wedged_daemon` know nothing about the transport, and a Windows
+//! daemon can reach exactly the same shape. What has no Windows equivalent is
+//! how these tests *force* it - by unlinking a live daemon's socket file from
+//! outside the process. A named pipe has no file to unlink and its name is
+//! held by the daemon's own open handle, so nothing outside that process can
+//! take its endpoint away from it (see `g_mesh::ipc::windows`). Rather than
+//! assert a weaker version of the same thing on Windows, this file is skipped
+//! there and the coverage gap is stated plainly.
+//!
 //! # How the state is forced
 //!
 //! Not by waiting for a leaked daemon to turn up: the whole difficulty of this
@@ -29,6 +41,8 @@
 //! silently. And, on the other side of the same line, that a daemon which *is*
 //! serving is never evicted by any of it - the singleton guarantee the lock
 //! exists for.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

@@ -1,8 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -13,6 +11,8 @@ use anyhow::{bail, Context, Result};
 use crate::cli::stop;
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
+use crate::ipc;
+use crate::process;
 use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 
 /// How long to keep retrying the first connect after bootstrapping a daemon,
@@ -73,13 +73,15 @@ pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// diagnostic aid must never be the reason a daemon does not start.
 pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
 
-/// Stateless stdio<->AF_UNIX proxy. Project identity - the only thing the
+/// Stateless stdio<->daemon proxy. Project identity - the only thing the
 /// shim needs - comes from `CLAUDE_PROJECT_DIR` when the client set it, or
 /// the shim's own cwd otherwise (the only option for an MCP client that
 /// isn't Claude Code, and the historical behavior this falls back to). Once
 /// resolved, the shim hashes that path, connects to the project's daemon
-/// socket (bootstrapping a detached daemon if nothing is listening) and then
-/// moves JSON-RPC frames between the two sides without interpreting them.
+/// endpoint (bootstrapping a detached daemon if nothing is listening) and
+/// then moves JSON-RPC frames between the two sides without interpreting
+/// them. Which kind of endpoint that is - an AF_UNIX socket or a named pipe -
+/// is `crate::ipc`'s business and appears nowhere in this file.
 ///
 /// The shim is also the only process in the system that routinely holds both
 /// halves of the "is this daemon still the current build?" question - it is
@@ -103,7 +105,7 @@ fn resolve_project_root() -> Result<PathBuf> {
 enum Incumbent {
     /// Listening, and running a build no older than this one's - the
     /// overwhelmingly common case, and the connection is already open.
-    Reusable(UnixStream),
+    Reusable(ipc::Stream),
     /// Listening, but started from a build this one supersedes. Carries the
     /// verdict so the warning can say which of the two ways it was reached.
     Outdated(Vintage),
@@ -132,11 +134,12 @@ enum Incumbent {
 /// trade - it happens once, at the moment a build changes, and the
 /// alternative is every session on the machine going on being answered by a
 /// build that has been replaced.
-fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
-    let socket = daemon::socket_path(root)?;
-    // A missing socket file, a refused connection and a socket left behind by
-    // a dead daemon are all just "no daemon running" as far as the shim cares.
-    if let Incumbent::Reusable(stream) = incumbent(root, &socket)? {
+fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
+    let endpoint = daemon::endpoint(root)?;
+    // A missing endpoint, a refused connection and (on Unix) a socket left
+    // behind by a dead daemon are all just "no daemon running" as far as the
+    // shim cares.
+    if let Incumbent::Reusable(stream) = incumbent(root, &endpoint)? {
         return Ok(stream);
     }
 
@@ -158,7 +161,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
     // ahead of it was replacing an outdated daemon, finds the replacement
     // current instead of retiring it all over again. Returning drops the
     // lock, handing it to whoever is waiting next.
-    match incumbent(root, &socket)? {
+    match incumbent(root, &endpoint)? {
         Incumbent::Reusable(stream) => return Ok(stream),
         Incumbent::Outdated(vintage) => {
             if !retire_outdated_daemon(root, vintage) {
@@ -166,7 +169,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
                 // daemon that would not stop just produces a second one that
                 // exits on the singleton lock. An outdated answer with a
                 // warning beside it beats an MCP client with no tools at all.
-                if let Ok(stream) = UnixStream::connect(&socket) {
+                if let Ok(stream) = ipc::Stream::connect(&endpoint) {
                     return Ok(stream);
                 }
             }
@@ -191,7 +194,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
         }
     );
     spawn_detached_daemon(root)?;
-    let stream = wait_until_listening(&socket);
+    let stream = wait_until_listening(&endpoint);
     // Released the moment the daemon is reachable - or, just as importantly,
     // the moment bootstrapping it failed, so one bad start does not wedge
     // every other shim on this project behind a lock nobody will release.
@@ -204,8 +207,8 @@ fn connect_or_bootstrap(root: &Path) -> Result<UnixStream> {
 ///
 /// The connection is opened first and the stamp consulted second, so a project
 /// with no daemon running pays nothing for the check at all.
-fn incumbent(root: &Path, socket: &Path) -> Result<Incumbent> {
-    let Ok(stream) = UnixStream::connect(socket) else {
+fn incumbent(root: &Path, endpoint: &ipc::Endpoint) -> Result<Incumbent> {
+    let Ok(stream) = ipc::Stream::connect(endpoint) else {
         return Ok(Incumbent::Absent);
     };
 
@@ -376,17 +379,15 @@ fn bootstrap_timeout() -> Duration {
         .map_or(BOOTSTRAP_TIMEOUT, Duration::from_millis)
 }
 
-fn wait_until_listening(socket: &Path) -> Result<UnixStream> {
+fn wait_until_listening(endpoint: &ipc::Endpoint) -> Result<ipc::Stream> {
     let timeout = bootstrap_timeout();
     let deadline = Instant::now() + timeout;
     loop {
-        match UnixStream::connect(socket) {
+        match ipc::Stream::connect(endpoint) {
             Ok(stream) => return Ok(stream),
             Err(err) if Instant::now() >= deadline => {
                 bail!(
-                    "bootstrapped daemon did not accept connections on {} within {:?}: {err}",
-                    socket.display(),
-                    timeout
+                    "bootstrapped daemon did not accept connections on {endpoint} within {timeout:?}: {err}"
                 );
             }
             Err(_) => thread::sleep(BOOTSTRAP_RETRY_INTERVAL),
@@ -397,19 +398,22 @@ fn wait_until_listening(socket: &Path) -> Result<UnixStream> {
 fn spawn_detached_daemon(root: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("failed to resolve the g-mesh executable path")?;
 
-    // Detachment: null stdio keeps the daemon off the shim's stdio (which is
-    // the MCP protocol channel) and stops it dying when the client closes it;
-    // its own process group keeps signals aimed at the client's process group
-    // away from it. The `Child` is dropped without waiting, so the daemon
-    // outlives the shim and is reaped by init.
-    Command::new(&exe)
+    // Detachment has two halves. Null stdio keeps the daemon off the shim's
+    // stdio (which is the MCP protocol channel) and stops it dying when the
+    // client closes it; `process::detach` keeps signals aimed at the client's
+    // process group away from it (its own process group on Unix,
+    // `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows). The `Child`
+    // is dropped without waiting, so the daemon outlives the shim - reaped by
+    // init on Unix, and needing no reaper at all on Windows.
+    let mut command = Command::new(&exe);
+    command
         .arg("daemon")
         .arg("--project-root")
         .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(daemon_stderr())
-        .process_group(0)
+        .stderr(daemon_stderr());
+    process::detach(&mut command)
         .spawn()
         .with_context(|| format!("failed to spawn a daemon via {}", exe.display()))?;
     Ok(())
@@ -438,8 +442,8 @@ fn daemon_stderr() -> Stdio {
     }
 }
 
-fn proxy(stream: UnixStream) -> Result<()> {
-    let mut outbound = stream.try_clone().context("failed to clone the daemon socket")?;
+fn proxy(stream: ipc::Stream) -> Result<()> {
+    let mut outbound = stream.try_clone().context("failed to clone the daemon connection")?;
 
     // stdin->socket runs on its own thread while socket->stdout drives this
     // one, so a daemon that goes away ends the proxy even while the client is
@@ -451,6 +455,9 @@ fn proxy(stream: UnixStream) -> Result<()> {
         let _ = match &result {
             // EOF on stdin means the client is done: half-close so the daemon
             // sees it, can still flush replies in flight, and then closes.
+            // Windows named pipes have no half-close, so there this ends the
+            // whole connection instead - see `ipc::windows::Stream::shutdown`
+            // for what that costs.
             Ok(()) => outbound.shutdown(Shutdown::Write),
             Err(_) => outbound.shutdown(Shutdown::Both),
         };

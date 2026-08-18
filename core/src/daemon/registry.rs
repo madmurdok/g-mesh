@@ -1126,13 +1126,11 @@ mod tests {
 
     /// Kills `pid` the way an OOM-killer would - the same out-of-band crash
     /// `core/tests/plugin_crash_recovery.rs` stages, and deliberately not a
-    /// cooperative shutdown.
+    /// cooperative shutdown. `force_stop` is `SIGKILL` on Unix and
+    /// `TerminateProcess` on Windows, which is the same "no chance to clean
+    /// up" this asks for on both.
     fn kill_out_of_band(pid: u32) {
-        // SAFETY: `kill` only signals a pid this test read off a child of its
-        // own process; no pointers are involved.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
+        let _ = crate::process::force_stop(pid);
     }
 
     #[test]

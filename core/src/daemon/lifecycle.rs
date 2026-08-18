@@ -684,10 +684,14 @@ fn release_state_files(state_dir: &Path) {
         let _ = fs::remove_file(pid_file);
     }
     let _ = fs::remove_file(super::build_stamp_path_in(state_dir));
-    // Named through the parent module's own constant rather than spelled out
-    // again here: the file a daemon binds and the file it releases have to be
-    // the same one by construction.
-    let _ = fs::remove_file(state_dir.join(super::SOCKET_FILE));
+    // Derived through the parent module rather than spelled out again here:
+    // what a daemon binds and what it releases have to be the same endpoint by
+    // construction. On Windows this is a no-op, because a pipe name is
+    // released by the handle closing and there is no file to remove - see
+    // `ipc::windows`.
+    if let Some(endpoint) = super::endpoint_in(state_dir) {
+        endpoint.clear_stale();
+    }
 }
 
 /// Best-effort, like every other pid-file write in the daemon: tooling that

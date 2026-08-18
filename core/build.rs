@@ -13,6 +13,17 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// npm ships as a `.cmd` shim on Windows, and `CreateProcess` - which is what
+/// `Command` calls - only resolves real executables through `PATH`, never
+/// `PATHEXT`. Spawning bare "npm" there fails with "program not found" even
+/// on a machine with a perfectly good Node install, which is what the first
+/// Windows pipeline run reported. The other three platforms have a plain
+/// `npm` executable and want the bare name.
+#[cfg(windows)]
+const NPM: &str = "npm.cmd";
+#[cfg(not(windows))]
+const NPM: &str = "npm";
+
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets this"));
     let plugin_dir = manifest_dir.join("../plugins/typescript");
@@ -21,14 +32,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", plugin_dir.join("package.json").display());
     println!("cargo:rerun-if-changed={}", plugin_dir.join("tsconfig.json").display());
 
-    match Command::new("npm").arg("run").arg("build").current_dir(&plugin_dir).status() {
+    match Command::new(NPM).arg("run").arg("build").current_dir(&plugin_dir).status() {
         Ok(status) if status.success() => {}
         Ok(status) => println!(
-            "cargo:warning=`npm run build` in {} exited with {status} - the JS/TS plugin's dist/ may be stale",
+            "cargo:warning=`{NPM} run build` in {} exited with {status} - the JS/TS plugin's dist/ may be stale",
             plugin_dir.display()
         ),
         Err(err) => println!(
-            "cargo:warning=failed to run `npm run build` in {}: {err} - the JS/TS plugin's dist/ may be stale or missing",
+            "cargo:warning=failed to run `{NPM} run build` in {}: {err} - the JS/TS plugin's dist/ may be stale or missing",
             plugin_dir.display()
         ),
     }

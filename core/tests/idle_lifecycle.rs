@@ -20,7 +20,6 @@
 //! could be right for the wrong reason.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -28,6 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ipc;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
@@ -224,9 +224,9 @@ fn recorded_pid(path: &Path) -> u32 {
 /// duplicated for the same reason the other integration tests duplicate it: a
 /// `tests/common` entry would be shared state between suites that have no
 /// other reason to agree).
-fn mcp_session(socket: &Path, requests: Vec<Value>) -> Vec<Value> {
-    let stream = UnixStream::connect(socket)
-        .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", socket.display()));
+fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
+    let stream = ipc::Stream::connect(endpoint)
+        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -240,8 +240,8 @@ fn mcp_session(socket: &Path, requests: Vec<Value>) -> Vec<Value> {
     }
 }
 
-fn converse(stream: UnixStream, requests: Vec<Value>) -> Result<Vec<Value>, String> {
-    let mut writer = stream.try_clone().map_err(|e| format!("cannot clone socket: {e}"))?;
+fn converse(stream: ipc::Stream, requests: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut writer = stream.try_clone().map_err(|e| format!("cannot clone the daemon connection: {e}"))?;
     let mut reader = BufReader::new(stream);
 
     send(&mut writer, &json!({
@@ -273,7 +273,7 @@ fn send<W: Write>(writer: &mut W, message: &Value) -> Result<(), String> {
     write_ndjson_frame(writer, &body).map_err(|e| format!("cannot send {message}: {e:#}"))
 }
 
-fn receive(reader: &mut BufReader<UnixStream>) -> Result<Value, String> {
+fn receive(reader: &mut BufReader<ipc::Stream>) -> Result<Value, String> {
     let frame = read_ndjson_frame(reader)
         .map_err(|e| format!("cannot read a response: {e:#}"))?
         .ok_or("the daemon closed the connection instead of answering")?;
@@ -304,7 +304,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
 
     let plugin_pid_file = daemon::plugin_pid_path(project.root()).unwrap();
     let core_pid_file = daemon::pid_path(project.root()).unwrap();
-    let socket = daemon::socket_path(project.root()).unwrap();
+    let endpoint = daemon::endpoint(project.root()).unwrap();
     // Read before the walk is waited on, not after: the control-plane plugin
     // is idle for the whole cold start (the walk runs in a process of its
     // own), so it is entitled to fall asleep while that walk is still going.
@@ -327,7 +327,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     assert_eq!(recorded_pid(&core_pid_file), daemon_process.pid(), "the core is the same process");
     assert!(
         daemon::is_listening(project.root()).unwrap(),
-        "the core must still be serving its socket with its plugin asleep"
+        "the core must still be serving its endpoint with its plugin asleep"
     );
 
     // --- a change made while it sleeps is queued, not processed ----------
@@ -366,7 +366,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     // queue, not to what this particular call happened to ask about.
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let responses = mcp_session(&socket, vec![outline_request(1, "src/beta.ts")]);
+        let responses = mcp_session(&endpoint, vec![outline_request(1, "src/beta.ts")]);
         assert_eq!(
             responses[0]["result"]["isError"], false,
             "the daemon must keep answering across a plugin sleep: {}",
@@ -462,14 +462,23 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
     wait_for("the plugin to go with its core", || !daemon::is_process_alive(plugin_pid));
     assert!(
         !daemon::is_listening(project.root()).unwrap(),
-        "an exited core must leave nothing listening on its socket"
+        "an exited core must leave nothing listening on its endpoint"
     );
-    for leftover in [
+    // The socket file is in this list only on Unix: on Windows the endpoint is
+    // a pipe name the kernel reclaims with the process, so "released" is what
+    // the `is_listening` assertion above already proves and there is no file
+    // left to check (see `g_mesh::ipc::windows`).
+    // `mut` is only used by the `cfg(unix)` push below; on Windows the list is
+    // final as built.
+    #[allow(unused_mut)]
+    let mut leftovers = vec![
         daemon::pid_path(project.root()).unwrap(),
         daemon::plugin_pid_path(project.root()).unwrap(),
-        daemon::socket_path(project.root()).unwrap(),
         daemon::build_stamp_path(project.root()).unwrap(),
-    ] {
+    ];
+    #[cfg(unix)]
+    leftovers.push(daemon::socket_path(project.root()).unwrap());
+    for leftover in leftovers {
         assert!(
             !leftover.exists(),
             "a core that exited on purpose must release {} - anything left behind describes a \
