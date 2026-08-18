@@ -246,8 +246,20 @@ main() {
 	log "compiling the plugin (tsc)"
 	(cd "$PLUGIN_DIR" && npm run --silent build)
 
-	local work
+	local work work_native
 	work="$(mktemp -d)"
+	# `sea-config.json` is read by node, not by the shell, so its paths must be
+	# native. Under Git Bash on Windows `mktemp -d` yields a POSIX path
+	# (/tmp/tmp.XXXX) that node cannot resolve - the failure is silent until
+	# "Cannot read main script". `cygpath -m` gives C:/Users/... : a real
+	# Windows path that still uses forward slashes, so it needs no escaping
+	# inside JSON. Everywhere else `work` stays as-is, because the shell and
+	# the programs it launches do understand it.
+	if command -v cygpath >/dev/null 2>&1; then
+		work_native="$(cygpath -m "$work")"
+	else
+		work_native="$work"
+	fi
 	# shellcheck disable=SC2064 # $work is fixed at trap time on purpose.
 	trap "rm -rf '$work'" EXIT
 
@@ -258,8 +270,8 @@ main() {
 	# banner off the plugin's stderr, which core forwards to its own.
 	cat >"$work/sea-config.json" <<EOF
 {
-  "main": "$work/plugin.cjs",
-  "output": "$work/sea-prep.blob",
+  "main": "$work_native/plugin.cjs",
+  "output": "$work_native/sea-prep.blob",
   "disableExperimentalSEAWarning": true
 }
 EOF
