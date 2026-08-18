@@ -22,8 +22,9 @@
 # core binary, and the JS/TS plugin compiled to a self-contained executable
 # (Node's SEA - it embeds the runtime, so the machine needs no Node.js) in
 # `plugins/typescript/`, which is where `daemon::manifest::bundled_roots` looks
-# beside the executable. What is still open: the curl|sh installer, #66, which
-# fetches these assets by the URLs the section below fixes.
+# beside the executable. `scripts/install.sh` (#66) fetches exactly these
+# assets, by the URLs the section below fixes, and verifies the `.sha256`
+# beside each archive before it unpacks anything.
 #
 # ---------------------------------------------------------------------------
 # HOW TO CUT A RELEASE

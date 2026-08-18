@@ -19,6 +19,64 @@ an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 The daemon and shim are one binary (`core/target/{debug,release}/g-mesh`);
 the plugin is a separate Node entry point the daemon launches with `node`.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.sh | sh
+```
+
+`scripts/install.sh` detects the platform, downloads the matching release
+archive, **verifies its SHA-256 before unpacking anything** (a mismatch aborts
+with both hashes printed and installs nothing), runs the downloaded binary once
+to prove it executes and discovers its plugin, and only then installs. It needs
+neither Rust nor Node.js: the archive carries the core binary and a plugin with
+its own embedded runtime.
+
+What lands on disk is a *directory*, not one file — by default `~/.g-mesh/bin`:
+
+```
+~/.g-mesh/bin/
+  g-mesh                 the core binary
+  plugins/typescript/    the plugin core discovers beside it
+  LICENSE*, README.md
+```
+
+Those two halves have to stay together: core looks for `plugins/` next to the
+running executable, so a lone `g-mesh` copied onto your `PATH` is a binary that
+cannot index anything. That is also why the script creates no
+`/usr/local/bin/g-mesh` symlink — `std::env::current_exe()` does not resolve
+symlinks on macOS, so a symlinked g-mesh would hunt for its plugin beside the
+symlink and find nothing. Put the install directory itself on `PATH`; the
+script prints the line and edits no rc file of yours:
+
+```bash
+export PATH="$HOME/.g-mesh/bin:$PATH"
+```
+
+Flags go through the pipe with `sh -s --`, or as environment variables:
+
+```bash
+curl -fsSL .../install.sh | sh -s -- --version 2.7.0          # pin a release
+curl -fsSL .../install.sh | sh -s -- --install-dir ~/opt/g-mesh
+G_MESH_VERSION=2.7.0 G_MESH_INSTALL_DIR=~/opt/g-mesh sh install.sh
+```
+
+Uninstalling is `rm -rf ~/.g-mesh/bin` — settings, project indexes and the
+embedding model live elsewhere under `~/.g-mesh` and survive it.
+
+**Windows is not supported by this script.** That target ships a `.zip`, which
+a POSIX shell has no portable way to unpack, so the script refuses instead of
+pretending. Install it by hand: download
+`g-mesh-v<version>-x86_64-pc-windows-msvc.zip` from the releases page, unpack
+it somewhere permanent — keeping `g-mesh.exe` and `plugins\` beside each other,
+for the reason above — and add that directory to `PATH`.
+
+**Until a release is published, this installs nothing.** Releases are built as
+drafts and are invisible — and their download URLs 404 — until a human presses
+Publish (see "Cutting a release" below). The script says exactly that, with
+what to do about it, instead of showing a bare 404 — until then the
+build-from-source path below is the only one that works.
+
 ## Prerequisites
 
 - Rust toolchain (`cargo`, stable) — build the core.
