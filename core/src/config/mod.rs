@@ -185,7 +185,13 @@ pub fn read_project_config(root: &Path) -> Result<ProjectConfig> {
 
 /// Writes the project's `config.toml`, creating its state directory
 /// (`~/.g-mesh/projects/<hash>/`) if this is the first thing to touch it.
+///
+/// Through `connection::ensure_project_dir` rather than letting `write_toml`
+/// create the directory on its way past, so that a project configured but
+/// never indexed still records which root it belongs to - otherwise it would
+/// be the one kind of state directory `clean orphaned` could never judge.
 pub fn write_project_config(root: &Path, config: &ProjectConfig) -> Result<()> {
+    crate::storage::connection::ensure_project_dir(root)?;
     write_toml(&project_config_path(root)?, config)
 }
 

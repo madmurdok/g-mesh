@@ -501,9 +501,23 @@ nothing is up is a no-op, not an error.
 
 `g-mesh clean` deletes a cached index: the current project's by default, a
 named one with `g-mesh clean <project-id>`, everything unused for 90+ days
-with `g-mesh clean expired`, or the lot with `g-mesh clean all --force`
-(without `--force` it only reports how many it would delete). Stop a
-project's daemon before cleaning it.
+with `g-mesh clean expired`, everything whose project directory has been
+deleted with `g-mesh clean orphaned --force`, or the lot with `g-mesh clean
+all --force` (without `--force` the last two only report what they would
+delete). Stop a project's daemon before cleaning it.
+
+`orphaned` compares each index against the project root recorded in its state
+directory. Two kinds of state it deliberately leaves alone, and says so rather
+than deleting quietly:
+
+- a root that is missing *along with the directory that held it* — an ejected
+  external disk looks exactly like a deleted project, and only the parent tells
+  them apart. Delete those by id once you know which it was.
+- an index built before g-mesh recorded roots (anything from before 2.8.0),
+  which has nothing to be checked against. A project still in use records its
+  root the next time its daemon starts, so this group shrinks to the genuinely
+  dead as you work; `clean expired` or `clean all --force` are the blunt
+  instruments for what is left.
 
 ## Run tests
 
