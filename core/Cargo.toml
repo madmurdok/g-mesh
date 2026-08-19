@@ -108,6 +108,11 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Also a normal dependency - repeated here because integration tests link
+# against the library's public API plus dev-dependencies only, and
+# `tests/state_isolation.rs` has to spell out the *real* `~/.g-mesh` it must
+# not be writing into.
+dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

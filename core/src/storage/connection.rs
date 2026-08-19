@@ -5,14 +5,15 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::identity::project_hash;
+use crate::paths;
 use crate::storage::vectors;
 
-/// `~/.g-mesh/projects/`, the one directory every project's state lives
-/// under. Public because `cli::clean` enumerates it rather than deriving a
-/// single project's path from a root the way everything else here does.
+/// `~/.g-mesh/projects/` (or `$G_MESH_HOME/projects/`), the one directory
+/// every project's state lives under. Public because `cli::clean` enumerates
+/// it rather than deriving a single project's path from a root the way
+/// everything else here does.
 pub fn projects_root() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not resolve home directory")?;
-    Ok(home.join(".g-mesh").join("projects"))
+    Ok(paths::g_mesh_home()?.join("projects"))
 }
 
 /// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.

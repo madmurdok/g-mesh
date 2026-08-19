@@ -168,10 +168,9 @@ pub fn project_config_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(CONFIG_FILE_NAME))
 }
 
-/// `~/.g-mesh/config.toml`.
+/// `~/.g-mesh/config.toml`, or `$G_MESH_HOME/config.toml`.
 pub fn global_config_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not resolve home directory")?;
-    Ok(home.join(".g-mesh").join(CONFIG_FILE_NAME))
+    Ok(crate::paths::g_mesh_home()?.join(CONFIG_FILE_NAME))
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +342,7 @@ mod tests {
 
     #[test]
     fn global_config_path_is_config_toml_directly_under_the_g_mesh_home() {
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(global_config_path().unwrap(), home.join(".g-mesh").join("config.toml"));
+        let home = crate::paths::g_mesh_home().unwrap();
+        assert_eq!(global_config_path().unwrap(), home.join("config.toml"));
     }
 }

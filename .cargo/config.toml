@@ -1,0 +1,51 @@
+# Points g-mesh's state root at a directory inside `target/` for everything
+# cargo launches in this repository.
+#
+# WHY THIS FILE EXISTS
+#
+# The test suite drives the real binary against temp-directory fixtures, and
+# every fixture gets a permanent state directory under whatever
+# `paths::g_mesh_home()` resolves to. Without this, that was the developer's
+# own `~/.g-mesh`: 1422 project directories, 343 of them from a single day,
+# 267 MB - and, worse, one `cli_init` test that failed against state an
+# unrelated benchmark run was mutating at the same moment. Tests that share
+# mutable state with everything else on the machine produce failures that are
+# neither reproducible nor safely ignorable.
+#
+# Setting the variable here rather than in each test means no test can forget
+# it, unit tests inside `src/` are covered as well as the integration ones,
+# and every `g-mesh` subprocess a test spawns - and every daemon those spawn in
+# turn - inherits it for free. It also means no `set_var` at all, so nothing
+# races with the test binaries cargo runs in parallel.
+#
+# WHY `/tmp` AND NOT `core/target/`
+#
+# `target/` is the obvious place - gitignored, wiped by `cargo clean` - and it
+# does not work. A daemon binds `<state>/projects/<hash>/daemon.sock`, and
+# AF_UNIX caps the whole path at 104 bytes on macOS (`SUN_LEN`). Inside a
+# checkout that path is already ~123 bytes before the fixture's own name, so
+# every test that starts a daemon fails with "path must be shorter than
+# SUN_LEN". The real `~/.g-mesh` fits because it is short; a test root has to
+# be short for the same reason, which rules out anything nested in the
+# repository. `/tmp` is also outside the checkout, so `cargo clean` does not
+# remove it - `rm -rf /tmp/g-mesh-test-home` when you want it gone.
+#
+# This file sits at the repo root rather than in `core/` because cargo
+# discovers config by walking up from the current directory, and both `cargo
+# test` from here and the documented `cd core && cargo test` have to find it.
+#
+# On Windows the value lands at `<current drive>\tmp\g-mesh-test-home`, which
+# is unlovely but harmless: named pipes have no path-length limit, so a Windows
+# developer who would rather keep it elsewhere can just export `G_MESH_HOME`.
+#
+# KNOW THIS: cargo applies `[env]` to `cargo run` and build scripts too, not
+# only to tests. A `cargo run -- init` inside this repository therefore indexes
+# into the test home, not into yours. `force = false` means an explicitly
+# exported `G_MESH_HOME` still wins, so `G_MESH_HOME="$HOME/.g-mesh" cargo run`
+# is the escape hatch.
+#
+# Only state moves. Model weights keep their own `G_MESH_MODEL_DIR` override
+# and stay in the real `~/.g-mesh/models`, so the `#[ignore]`d weight tests
+# reuse the 612 MiB already on disk instead of re-downloading it.
+[env]
+G_MESH_HOME = { value = "/tmp/g-mesh-test-home", force = false }
