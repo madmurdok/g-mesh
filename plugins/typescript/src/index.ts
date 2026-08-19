@@ -6,7 +6,16 @@ import { stopSemanticProjects } from "./semantic";
 import { runSemanticPass } from "./semanticPass";
 import { RUN_NODE_FLAG, runNodeScript } from "./runtime";
 
-const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
+/** The version this plugin reports in its handshake. Core prints it when a
+ * protocol mismatch refuses the load - which is the moment someone most needs
+ * it to be true - while `g-mesh plugins list` prints `plugin.toml`'s copy, so
+ * the two disagreeing means one screen says 0.1.0 and the other 2.1.0 about
+ * the same plugin. That is exactly what happened: the comment here used to
+ * ask for hand-syncing with package.json, and nobody did, through two
+ * releases. `daemon::manifest`'s
+ * `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`
+ * now fails when this drifts, so the asking is enforced rather than polite. */
+const PLUGIN_VERSION = "2.1.0";
 
 /** Selects one-shot bulk-index mode instead of the control-plane loop; must
  * stay in sync with core's `daemon::bulk_index::BULK_INDEX_FLAG`. */
