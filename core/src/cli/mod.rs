@@ -154,18 +154,20 @@ pub enum AgentTarget {
     Gemini,
 }
 
-/// `clean`'s target is one positional argument because the three documented
-/// forms - a project id, `expired`, `all` - are alternatives for the same
+/// `clean`'s target is one positional argument because the documented forms -
+/// a project id, `expired`, `orphaned`, `all` - are alternatives for the same
 /// slot, not independent flags. Telling them apart is the `clean` command's
 /// own job (`cli::clean`); parsing only has to carry the word through.
 #[derive(Debug, Args)]
 pub struct CleanArgs {
     /// A project id (the `<hash>` directory name under
-    /// `~/.g-mesh/projects/`), the literal `expired`, or the literal `all`.
-    /// Omitted means the current directory's project.
+    /// `~/.g-mesh/projects/`), or one of `expired` (idle longer than
+    /// `cleanup.idleThresholdDays`), `orphaned` (the project directory has
+    /// been deleted) and `all`. Omitted means the current directory's
+    /// project.
     pub target: Option<String>,
-    /// Confirms `clean all`, which without it only reports how many projects
-    /// it would have deleted.
+    /// Confirms `clean all` and `clean orphaned`, which without it only
+    /// report what they would have deleted.
     #[arg(long)]
     pub force: bool,
 }
@@ -295,11 +297,13 @@ mod tests {
 
     /// All four documented `clean` forms land in the same positional slot.
     #[test]
-    fn clean_accepts_its_four_documented_forms() {
+    fn clean_accepts_its_five_documented_forms() {
         let cases = [
             (vec![], None, false),
             (vec!["a1b2c3d4e5f6a7b8"], Some("a1b2c3d4e5f6a7b8"), false),
             (vec!["expired"], Some("expired"), false),
+            (vec!["orphaned"], Some("orphaned"), false),
+            (vec!["orphaned", "--force"], Some("orphaned"), true),
             (vec!["all"], Some("all"), false),
             (vec!["all", "--force"], Some("all"), true),
         ];
