@@ -315,6 +315,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// and config), and models are per-machine rather than per-project - the same
 /// 610 MiB should not be downloaded once per indexed repository - so they sit
 /// beside `projects/` rather than inside it.
+///
+/// Deliberately anchored to the real home even when `G_MESH_HOME`
+/// ([`crate::paths::g_mesh_home`]) points g-mesh's *state* elsewhere: that
+/// override exists so a test run stops writing project directories into the
+/// developer's home, and weights are an immutable per-machine cache rather
+/// than per-run state. Moving them with it would turn every isolated run into
+/// a 612 MiB download. Use `G_MESH_MODEL_DIR` to move them on purpose.
 pub fn default_model_dir(model_name: &str) -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(MODEL_DIR_ENV) {
         return Ok(PathBuf::from(dir));

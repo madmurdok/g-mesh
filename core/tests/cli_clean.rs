@@ -1,13 +1,15 @@
 //! `g-mesh clean` driven as a real subprocess, against a real project state
-//! directory under the real `~/.g-mesh/projects/`.
+//! directory under the projects root the run resolves.
 //!
-//! Only the cwd-scoped form is exercised here, on purpose: it is the one that
-//! can be tested end to end while touching nothing but the directory this
-//! test itself caused to exist. `clean expired` and `clean all` are scoped to
-//! *every* project on the machine, so running them against a developer's real
-//! `~/.g-mesh` would delete their work; those forms are covered by the unit
-//! tests in `cli::clean`, which inject a temp projects root and can therefore
-//! delete everything in it safely.
+//! Only the cwd-scoped form is exercised here. That used to be a hard limit:
+//! `clean expired` and `clean all` are scoped to *every* project under the
+//! root, and the root was the developer's own `~/.g-mesh`, so running them
+//! here would have deleted their work - which is why those forms are covered
+//! by the unit tests in `cli::clean`, which inject a temp projects root. Task
+//! 217 removed the hazard (`G_MESH_HOME` points a test run at
+//! `core/target/g-mesh-test-home`), so a sweeping form could now be driven end
+//! to end here; it has not been, only because the unit tests already assert
+//! what it would.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
