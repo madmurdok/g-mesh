@@ -394,8 +394,8 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
     }
 
-    /// The bundled plugin states its version in four places across three
-    /// files, and nothing but this test makes them agree.
+    /// The bundled plugin states its version in three files, and nothing but
+    /// this test makes them agree.
     ///
     /// The one that matters at runtime is `plugin.toml`: `read_manifest`
     /// parses it and `g-mesh plugins list` prints it, so it is the number a
@@ -427,14 +427,22 @@ mod tests {
             assert_eq!(
                 version, first_version,
                 "the bundled plugin's version has drifted: {first_source} says {first_version}, \
-                 {source} says {version}. Bump every declaration together, or regenerate the \
-                 lock with `npm install --package-lock-only`."
+                 {source} says {version}. Bump package.json and plugin.toml together, and \
+                 regenerate the lock with `npm install --package-lock-only`."
             );
         }
     }
 
-    /// The fourth declaration, and the only one that leaves the plugin at
-    /// runtime: `sendHandshake` in `plugins/typescript/src/index.ts`.
+    /// The version that actually leaves the plugin at runtime, reported by
+    /// `sendHandshake` in `plugins/typescript/src/index.ts`.
+    ///
+    /// No longer a declaration of its own - `scripts/generate-version.js`
+    /// writes it from `package.json` on every build - so this test now asks
+    /// the question that survives that: whether the manifest core reads
+    /// *without* running a plugin agrees with what the running plugin says.
+    /// Those two can still drift, because `plugin.toml` is read by
+    /// `g-mesh plugins list` on plugins that were never built and so cannot
+    /// be derived from anything at runtime.
     ///
     /// Core prints it when `handshake::verify` refuses a protocol mismatch -
     /// "protocol version mismatch with typescript plugin (plugin version X)"
@@ -444,10 +452,10 @@ mod tests {
     /// and the one shown at the worst possible moment was three releases
     /// stale.
     ///
-    /// Checked by spawning the real plugin rather than by reading the
-    /// TypeScript for a literal: what matters is the value that arrives on
-    /// core's stdin, and a source-text check would pass just as happily on a
-    /// constant nothing sends.
+    /// Checked by spawning the real plugin rather than by reading its source:
+    /// what matters is the value that arrives on core's stdin. A source-text
+    /// check would pass just as happily on a build that was never rerun after
+    /// the version changed.
     #[test]
     fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
         let dir = bundled_typescript_plugin_dir();
@@ -471,7 +479,8 @@ mod tests {
         assert_eq!(
             handshake.plugin_version, manifest.plugin_version,
             "the bundled plugin's handshake reports {}, but its plugin.toml declares {} - \
-             update PLUGIN_VERSION in plugins/typescript/src/index.ts and rebuild the plugin",
+             the handshake follows package.json (via scripts/generate-version.js), so either \
+             plugin.toml is stale or the plugin needs rebuilding",
             handshake.plugin_version, manifest.plugin_version
         );
     }

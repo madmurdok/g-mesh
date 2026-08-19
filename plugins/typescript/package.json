@@ -6,9 +6,10 @@
   "description": "g-mesh language plugin process for JavaScript/TypeScript (control-plane skeleton)",
   "main": "dist/src/index.js",
   "scripts": {
+    "prebuild": "node scripts/generate-version.js",
     "build": "tsc",
     "start": "node dist/src/index.js",
-    "pretest": "tsc",
+    "pretest": "npm run build",
     "test": "node --test dist/test"
   },
   "engines": {
