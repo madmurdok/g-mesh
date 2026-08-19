@@ -201,6 +201,23 @@ mod tests {
     /// is also the name a fixture root here has to use for the same reason.
     const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
 
+    /// The version the included manifest declares, read out of it rather
+    /// than restated here.
+    ///
+    /// Three assertions below are about *which* version `list` reports, not
+    /// about what that version happens to be, so spelling it out made a
+    /// legitimate plugin bump fail three unrelated tests - and fail them
+    /// confusingly, since `include_str!` bakes the manifest into the test
+    /// binary and cargo only notices an edit by mtime.
+    fn bundled_plugin_version() -> String {
+        BUNDLED_JS_TS_MANIFEST
+            .parse::<toml::Value>()
+            .expect("the bundled manifest must be valid TOML")["plugin"]["plugin_version"]
+            .as_str()
+            .expect("plugin_version must be a string")
+            .to_string()
+    }
+
     /// Builds a fresh tempdir root containing one `<dir_name>/plugin.toml`
     /// per entry in `plugins`.
     fn fixture_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
@@ -233,7 +250,7 @@ mod tests {
         assert_eq!(plugins[0].language, "typescript");
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Bundled }
         );
     }
 
@@ -254,7 +271,7 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Installed }
+            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Installed }
         );
     }
 
@@ -277,7 +294,7 @@ mod tests {
         let good = plugins.iter().find(|p| p.language == "typescript").expect("good entry missing");
         assert_eq!(
             good.outcome,
-            PluginOutcome::Loaded { version: "2.1.0".to_string(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Bundled }
         );
 
         let bad = plugins.iter().find(|p| p.language == "broken").expect("bad entry missing");
