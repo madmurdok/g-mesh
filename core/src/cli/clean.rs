@@ -1,22 +1,30 @@
 //! `g-mesh clean`: delete cached project indexes under `~/.g-mesh/projects/`.
 //!
-//! Four forms, differing only in what they are scoped to:
+//! Five forms, differing only in what they are scoped to:
 //!
 //! | invocation | scope |
 //! |---|---|
 //! | `g-mesh clean` | the current directory's project |
 //! | `g-mesh clean <project-id>` | that one project |
 //! | `g-mesh clean expired` | every project idle longer than the threshold |
+//! | `g-mesh clean orphaned` | every project whose directory was deleted, with `--force` |
 //! | `g-mesh clean all` | every project, with `--force` |
 //!
-//! # Why only `all` asks for confirmation
+//! # Why `all` and `orphaned` ask for confirmation
 //!
 //! The first three are already scoped by something the caller said or that
 //! the data itself established, so a confirmation prompt on top would be the
-//! kind that gets typed through without reading. `all` is the only one whose
-//! blast radius is "everything, including the project you are standing in",
-//! so without `--force` it reports the count it *would* have deleted and
-//! removes nothing.
+//! kind that gets typed through without reading. `all`'s blast radius is
+//! "everything, including the project you are standing in", so without
+//! `--force` it reports the count it *would* have deleted and removes
+//! nothing.
+//!
+//! `orphaned` is data-scoped like `expired`, and still asks, because its
+//! criterion is far less conservative: "the project directory is not there"
+//! is a fact about this instant, where "idle for 90 days" is a fact about a
+//! quarter of a year. The preview is what lets a caller notice that the
+//! answer changed because a disk is unmounted - see `RootState` for the rest
+//! of that guard.
 //!
 //! None of this is dangerous by construction, and for the same reason schema
 //! versioning can wipe and rebuild: an index is a reproducible local cache,
@@ -59,6 +67,8 @@ pub enum Target {
     /// Every project idle for longer than `cleanup.idleThresholdDays`
     /// (default 90 - see [`config::CleanupConfig`]).
     Expired,
+    /// Every project whose recorded root no longer exists on disk.
+    Orphaned,
     /// Every project.
     All,
 }
@@ -66,13 +76,14 @@ pub enum Target {
 impl Target {
     /// Reads the single positional argument `clean` takes.
     ///
-    /// `expired` and `all` can never be mistaken for a project id: ids are
-    /// the 16 hex characters `daemon::identity::project_hash` produces, which
-    /// neither word is.
+    /// `expired`, `orphaned` and `all` can never be mistaken for a project
+    /// id: ids are the 16 hex characters `daemon::identity::project_hash`
+    /// produces, which none of those words is.
     pub fn parse(argument: Option<&str>) -> Self {
         match argument {
             None => Target::Cwd,
             Some("expired") => Target::Expired,
+            Some("orphaned") => Target::Orphaned,
             Some("all") => Target::All,
             Some(id) => Target::Project(id.to_string()),
         }
@@ -105,6 +116,29 @@ pub enum Outcome {
     },
     /// `clean all` without `--force`: a count, and nothing touched.
     WouldDelete { count: usize },
+    /// `clean orphaned` ran. `deleted` is false when `--force` was not given,
+    /// in which case `orphaned` names what *would* have gone and nothing was
+    /// touched.
+    ///
+    /// The three groups are reported separately rather than summed because
+    /// they mean different things to whoever reads them: `orphaned` is state
+    /// this command handles, while `unreachable` and `legacy` are state it
+    /// deliberately refuses to judge and the caller may still want to deal
+    /// with by hand.
+    Orphaned {
+        deleted: bool,
+        orphaned: Vec<Orphan>,
+        skipped_running: Vec<String>,
+        unreachable: Vec<Orphan>,
+        legacy: usize,
+    },
+}
+
+/// A project state directory and the root it says it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub id: String,
+    pub root: PathBuf,
 }
 
 /// Runs the `clean` the parsed arguments describe.
@@ -143,6 +177,7 @@ pub fn clean(
         Target::Cwd => clean_one(&cwd_project_id(cwd)?, projects_root, CwdScoped::Yes),
         Target::Project(id) => clean_one(id, projects_root, CwdScoped::No),
         Target::Expired => clean_many(Scope::Expired, projects_root, idle_threshold_days),
+        Target::Orphaned => clean_orphaned(force, projects_root),
         Target::All => {
             if !force {
                 return Ok(Outcome::WouldDelete { count: candidates(projects_root)?.len() });
@@ -212,6 +247,91 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
     Ok(Outcome::DeletedMany { scope, ids, skipped_running, idle_threshold_days })
 }
 
+/// What the recorded project root of a state directory says about it.
+///
+/// The distinction that carries the whole risk of this command is the last
+/// two. A root that is missing *along with the directory that contained it*
+/// is exactly what an unmounted external disk looks like: `/Volumes/Ext/proj`
+/// and `/Volumes/Ext` both vanish when the disk is ejected, while deleting a
+/// project on a filesystem that is still mounted leaves its parent in place.
+/// Treating "not present right now" as "gone forever" is the one way this
+/// feature could destroy an index someone wanted, so an absent parent is
+/// reported and never deleted.
+///
+/// Deleting a whole tree of projects at once therefore also reads as
+/// `Unreachable`. That is the trade accepted knowingly: those are cleaned by
+/// id, and being asked to name them is a smaller cost than a delete nobody
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootState {
+    /// The project is still on disk.
+    Live,
+    /// The project directory is gone, but the directory that held it is
+    /// still there - so the filesystem it lived on is present and it really
+    /// was deleted.
+    Orphaned,
+    /// The root is missing and so is its parent: possibly deleted, possibly
+    /// an unmounted volume or a moved tree. Not judged.
+    Unreachable,
+    /// No `project.root` file - a state directory created before g-mesh
+    /// recorded roots. Not judged, and never guessed at: `project_hash` is
+    /// one-way, so there is nothing to guess *from*.
+    Legacy,
+}
+
+fn root_state(root: Option<&Path>) -> RootState {
+    let Some(root) = root else {
+        return RootState::Legacy;
+    };
+    if root.exists() {
+        return RootState::Live;
+    }
+    match root.parent() {
+        Some(parent) if parent.exists() => RootState::Orphaned,
+        _ => RootState::Unreachable,
+    }
+}
+
+/// `clean orphaned`: deletes state whose project directory was deleted.
+///
+/// Without `force` this is a preview - the same posture `all` takes, for the
+/// reason this module's doc comment gives.
+fn clean_orphaned(force: bool, projects_root: &Path) -> Result<Outcome> {
+    let mut orphaned = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut skipped_running = Vec::new();
+    let mut legacy = 0;
+
+    for candidate in candidates(projects_root)? {
+        let entry = || Orphan {
+            id: candidate.id.clone(),
+            root: candidate.root.clone().unwrap_or_default(),
+        };
+        match root_state(candidate.root.as_deref()) {
+            RootState::Live => continue,
+            RootState::Legacy => legacy += 1,
+            RootState::Unreachable => unreachable.push(entry()),
+            RootState::Orphaned => {
+                // A daemon still serving a project whose directory was
+                // deleted is unusual but not impossible - it holds the index
+                // open and would be left writing to a path that no longer
+                // exists. Skipped for the same reason every other bulk form
+                // skips it.
+                if candidate.daemon_running {
+                    skipped_running.push(candidate.id);
+                    continue;
+                }
+                if force {
+                    delete(&candidate.path)?;
+                }
+                orphaned.push(entry());
+            }
+        }
+    }
+
+    Ok(Outcome::Orphaned { deleted: force, orphaned, skipped_running, unreachable, legacy })
+}
+
 /// Rejects anything that is not a bare directory name.
 ///
 /// The id is joined onto `~/.g-mesh/projects/`, so without this a `..` or an
@@ -236,6 +356,9 @@ struct Candidate {
     /// established is exactly the one not to delete on a rule about idle time.
     idle: Option<Duration>,
     daemon_running: bool,
+    /// The project root this directory records, or `None` if it records none
+    /// - see [`RootState::Legacy`].
+    root: Option<PathBuf>,
 }
 
 impl Candidate {
@@ -274,6 +397,7 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
                 .unwrap_or(None)
                 .map(|record| record.idle),
             daemon_running: daemon_is_running(&path),
+            root: daemon::identity::read_project_root(&path),
             id,
             path,
         });
@@ -314,6 +438,64 @@ pub fn render(outcome: &Outcome) -> String {
                 "g-mesh: {count} project index(es) would be deleted - \
                  re-run with --force to confirm. Nothing was deleted.\n"
             )
+        }
+        Outcome::Orphaned { deleted, orphaned, skipped_running, unreachable, legacy } => {
+            let mut out = String::new();
+            match (orphaned.len(), deleted) {
+                (0, _) => {
+                    let _ = writeln!(
+                        out,
+                        "g-mesh: no project index belongs to a directory that has been deleted"
+                    );
+                }
+                (count, true) => {
+                    let _ = writeln!(
+                        out,
+                        "g-mesh: deleted {count} project index(es) whose project directory is gone"
+                    );
+                }
+                (count, false) => {
+                    let _ = writeln!(
+                        out,
+                        "g-mesh: {count} project index(es) belong to a directory that has been \
+                         deleted - re-run with --force to confirm. Nothing was deleted."
+                    );
+                }
+            }
+            for orphan in orphaned {
+                let _ = writeln!(out, "  {}  {}", orphan.id, orphan.root.display());
+            }
+            if !skipped_running.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  skipped {} project(s) with a running daemon - run `g-mesh stop` in each first:",
+                    skipped_running.len()
+                );
+                for id in skipped_running {
+                    let _ = writeln!(out, "    {id}");
+                }
+            }
+            if !unreachable.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  left alone: {} project(s) whose root is missing along with the directory \
+                     that held it - an unmounted disk looks exactly like this. Delete one by id \
+                     if you are sure:",
+                    unreachable.len()
+                );
+                for orphan in unreachable {
+                    let _ = writeln!(out, "    {}  {}", orphan.id, orphan.root.display());
+                }
+            }
+            if *legacy > 0 {
+                let _ = writeln!(
+                    out,
+                    "  left alone: {legacy} project(s) indexed before g-mesh recorded project \
+                     roots, so there is nothing to check them against. A project still in use \
+                     records its root the next time its daemon starts."
+                );
+            }
+            out
         }
         Outcome::DeletedMany { scope, ids, skipped_running, idle_threshold_days } => {
             let mut out = String::new();
@@ -397,6 +579,12 @@ mod tests {
             path
         }
 
+        /// Records `root` as the project directory `id`'s state belongs to,
+        /// exactly as `connection::ensure_project_dir` does for a real one.
+        fn record_root(&self, id: &str, root: &Path) {
+            crate::daemon::identity::record_project_root(&self.root().join(id), root).unwrap();
+        }
+
         /// Marks a project as served by a live daemon, using this test
         /// process's own pid - which is unquestionably alive.
         fn mark_daemon_running(&self, id: &str) {
@@ -450,9 +638,10 @@ mod tests {
     }
 
     #[test]
-    fn the_positional_argument_selects_the_four_documented_forms() {
+    fn the_positional_argument_selects_the_five_documented_forms() {
         assert_eq!(Target::parse(None), Target::Cwd);
         assert_eq!(Target::parse(Some("expired")), Target::Expired);
+        assert_eq!(Target::parse(Some("orphaned")), Target::Orphaned);
         assert_eq!(Target::parse(Some("all")), Target::All);
         assert_eq!(
             Target::parse(Some("a1b2c3d4e5f6a7b8")),
@@ -717,6 +906,170 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, Outcome::DeletedMany { ref ids, .. } if ids.is_empty()));
+    }
+
+    // -----------------------------------------------------------------
+    // `clean orphaned`
+    // -----------------------------------------------------------------
+
+    /// The fixture the whole target has to get right at once: one project
+    /// still on disk, one whose directory was deleted, one whose root is
+    /// missing along with its parent, one predating recorded roots, and one
+    /// orphan a daemon is still serving. Only the second may go.
+    struct OrphanFixture {
+        projects: Projects,
+        /// Held so the live project's directory outlives the assertions.
+        _live_root: tempfile::TempDir,
+        /// The parent that stays behind when the deleted project goes - what
+        /// makes its state `Orphaned` rather than `Unreachable`.
+        _surviving_parent: tempfile::TempDir,
+    }
+
+    fn orphan_fixture() -> OrphanFixture {
+        let projects = Projects::new();
+
+        let live_root = tempfile::tempdir().unwrap();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", live_root.path());
+
+        // Deleted: created inside a parent that stays, then removed.
+        let surviving_parent = tempfile::tempdir().unwrap();
+        let deleted = surviving_parent.path().join("gone");
+        fs::create_dir(&deleted).unwrap();
+        projects.add("bbbb2222", 1);
+        projects.record_root("bbbb2222", &deleted);
+        fs::remove_dir(&deleted).unwrap();
+
+        // Unreachable: root and its parent both gone, as an ejected disk
+        // leaves them. Recorded while both existed, so the path is canonical.
+        let volume = tempfile::tempdir().unwrap();
+        let mounted = volume.path().join("mount");
+        let on_the_volume = mounted.join("project");
+        fs::create_dir_all(&on_the_volume).unwrap();
+        projects.add("cccc3333", 1);
+        projects.record_root("cccc3333", &on_the_volume);
+        fs::remove_dir_all(&mounted).unwrap();
+
+        // Legacy: indexed before roots were recorded.
+        projects.add("dddd4444", 1);
+
+        // An orphan whose daemon is still running.
+        let served = surviving_parent.path().join("served");
+        fs::create_dir(&served).unwrap();
+        projects.add("eeee5555", 1);
+        projects.record_root("eeee5555", &served);
+        projects.mark_daemon_running("eeee5555");
+        fs::remove_dir(&served).unwrap();
+
+        OrphanFixture {
+            projects,
+            _live_root: live_root,
+            _surviving_parent: surviving_parent,
+        }
+    }
+
+    /// The acceptance criterion: exactly the state whose project is gone is
+    /// deleted, and everything else - including the two kinds this command
+    /// refuses to judge - survives.
+    #[test]
+    fn orphaned_deletes_only_state_whose_project_directory_was_deleted() {
+        let fixture = orphan_fixture();
+
+        let outcome = clean_in(&fixture.projects, Target::Orphaned, true).unwrap();
+
+        let Outcome::Orphaned { deleted, orphaned, skipped_running, unreachable, legacy } = outcome
+        else {
+            panic!("expected an orphaned outcome, got {outcome:?}");
+        };
+        assert!(deleted);
+        assert_eq!(orphaned.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["bbbb2222"]);
+        assert_eq!(skipped_running, ["eeee5555"]);
+        assert_eq!(unreachable.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["cccc3333"]);
+        assert_eq!(legacy, 1);
+
+        assert!(!fixture.projects.exists("bbbb2222"), "the deleted project's state survived");
+        for survivor in ["aaaa1111", "cccc3333", "dddd4444", "eeee5555"] {
+            assert!(fixture.projects.exists(survivor), "{survivor} must not have been deleted");
+        }
+    }
+
+    /// Without `--force` it is a report, exactly as `all` is.
+    #[test]
+    fn orphaned_without_force_names_what_would_go_and_deletes_nothing() {
+        let fixture = orphan_fixture();
+
+        let outcome = clean_in(&fixture.projects, Target::Orphaned, false).unwrap();
+
+        let Outcome::Orphaned { deleted, orphaned, .. } = &outcome else {
+            panic!("expected an orphaned outcome, got {outcome:?}");
+        };
+        assert!(!deleted);
+        assert_eq!(orphaned.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["bbbb2222"]);
+        assert!(fixture.projects.exists("bbbb2222"), "nothing may be deleted without --force");
+    }
+
+    /// The classification itself, stated as the four cases rather than only
+    /// exercised through a fixture - `root_state` is where the volume guard
+    /// lives, and it is worth failing on its own terms.
+    #[test]
+    fn root_state_tells_a_deleted_project_from_an_unreachable_one() {
+        let parent = tempfile::tempdir().unwrap();
+        let live = parent.path().join("live");
+        fs::create_dir(&live).unwrap();
+
+        assert_eq!(root_state(Some(&live)), RootState::Live);
+        assert_eq!(root_state(Some(&parent.path().join("gone"))), RootState::Orphaned);
+        assert_eq!(
+            root_state(Some(&parent.path().join("unmounted").join("project"))),
+            RootState::Unreachable
+        );
+        assert_eq!(root_state(None), RootState::Legacy);
+    }
+
+    #[test]
+    fn orphaned_on_a_root_with_nothing_in_it_reports_nothing_to_do() {
+        let projects = Projects::new();
+
+        let outcome = clean_in(&projects, Target::Orphaned, true).unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Orphaned {
+                deleted: true,
+                orphaned: Vec::new(),
+                skipped_running: Vec::new(),
+                unreachable: Vec::new(),
+                legacy: 0,
+            }
+        );
+        assert!(render(&outcome).contains("no project index belongs to a directory"));
+    }
+
+    /// The report has to name the root, not only the id: the id is a hash,
+    /// and "which project was that?" is the question a caller about to delete
+    /// something actually has.
+    #[test]
+    fn the_orphaned_report_names_each_root_and_explains_what_it_left_alone() {
+        let rendered = render(&Outcome::Orphaned {
+            deleted: false,
+            orphaned: vec![Orphan {
+                id: "a1b2c3d4e5f6a7b8".to_string(),
+                root: PathBuf::from("/home/u/work/deleted-project"),
+            }],
+            skipped_running: Vec::new(),
+            unreachable: vec![Orphan {
+                id: "b2c3d4e5f6a7b8c9".to_string(),
+                root: PathBuf::from("/Volumes/Ext/project"),
+            }],
+            legacy: 7,
+        });
+
+        assert!(rendered.contains("--force"), "{rendered}");
+        assert!(rendered.contains("a1b2c3d4e5f6a7b8"), "{rendered}");
+        assert!(rendered.contains("/home/u/work/deleted-project"), "{rendered}");
+        assert!(rendered.contains("/Volumes/Ext/project"), "{rendered}");
+        assert!(rendered.contains("unmounted disk"), "{rendered}");
+        assert!(rendered.contains("7 project(s) indexed before"), "{rendered}");
     }
 
     #[test]

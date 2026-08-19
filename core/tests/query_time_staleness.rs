@@ -87,8 +87,8 @@ impl Project {
                     .status();
             }
         }
-        if let Ok(socket) = daemon::socket_path(self.root()) {
-            let _ = std::fs::remove_file(socket);
+        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+            endpoint.clear_stale();
         }
         // Give the OS a moment to actually reap the killed processes before
         // the next phase starts a fresh daemon against the same state

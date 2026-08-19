@@ -8,13 +8,13 @@
 //! process is gone.
 
 use std::io::{BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use g_mesh::daemon;
+use g_mesh::ipc;
 use g_mesh::gc::last_used::{self, LastUsed};
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
@@ -55,8 +55,8 @@ impl Project {
         project_dir(self.root()).expect("failed to resolve the project state directory")
     }
 
-    fn socket(&self) -> PathBuf {
-        daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+    fn endpoint(&self) -> ipc::Endpoint {
+        daemon::endpoint(self.root()).expect("failed to resolve the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
@@ -101,13 +101,13 @@ fn spawn_daemon(root: &Path) -> Child {
 }
 
 /// One `initialize` + `tools/call` round trip straight over the daemon
-/// socket. `tools/call` specifically, not `tools/list`: `lastUsed` is
+/// endpoint. `tools/call` specifically, not `tools/list`: `lastUsed` is
 /// advanced by the tool handlers, which is what "a request was handled"
 /// means here.
-fn call_a_tool(socket: &Path) {
-    let stream = UnixStream::connect(socket)
-        .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", socket.display()));
-    let mut writer = stream.try_clone().expect("failed to clone the daemon socket");
+fn call_a_tool(endpoint: &ipc::Endpoint) {
+    let stream = ipc::Stream::connect(endpoint)
+        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let mut writer = stream.try_clone().expect("failed to clone the daemon connection");
     let mut reader = BufReader::new(stream);
 
     send(&mut writer, &json!({
@@ -174,7 +174,7 @@ fn a_daemon_start_and_every_handled_request_advance_last_used_on_disk() {
     );
 
     thread::sleep(TICK);
-    call_a_tool(&project.socket());
+    call_a_tool(&project.endpoint());
     let after_first_request = project.last_used();
     assert!(
         after_first_request.timestamp > after_start.timestamp,
@@ -186,7 +186,7 @@ fn a_daemon_start_and_every_handled_request_advance_last_used_on_disk() {
     // Not once per session: a second request on a *new* connection has to
     // move it again.
     thread::sleep(TICK);
-    call_a_tool(&project.socket());
+    call_a_tool(&project.endpoint());
     let after_second_request = project.last_used();
     assert!(
         after_second_request.timestamp > after_first_request.timestamp,
@@ -206,7 +206,7 @@ fn last_used_survives_the_daemon_that_wrote_it() {
     wait_until_indexed(project.root());
 
     thread::sleep(TICK);
-    call_a_tool(&project.socket());
+    call_a_tool(&project.endpoint());
     let while_running = project.last_used();
 
     daemon.kill().expect("failed to kill the daemon");

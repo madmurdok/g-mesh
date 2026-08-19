@@ -246,8 +246,9 @@ The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
 project's SQLite index, spawns the JS/TS plugin, builds the initial index if
 the project has never been indexed (see below), starts the file watcher, and
-serves the MCP tool surface over an `AF_UNIX` socket. The daemon outlives the
-shim and is reused by later connections for the same project.
+serves the MCP tool surface over a per-project endpoint (an `AF_UNIX` socket on
+Linux and macOS, a named pipe on Windows). The daemon outlives the shim and is
+reused by later connections for the same project.
 
 ## Is this worth registering?
 
@@ -476,6 +477,15 @@ Per-project state lives under `~/.g-mesh/projects/<hash-of-project-root>/`:
 SQLite DB, daemon socket, pid files, lock files. Delete a project's directory
 there to force a clean reindex.
 
+`G_MESH_HOME` moves that root: set it and `projects/` and the global
+`config.toml` are read and written under it instead of `~/.g-mesh`. It is what
+this repository's own test suite uses to stop writing into the developer's
+state (see "Run tests"), and it makes a sandboxed or throwaway g-mesh possible
+without touching your real one. It does *not* move the embedding model —
+that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
+would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
+installer, not to the binary.
+
 Upgrading g-mesh does not need that, though: an index records which build of
 the indexing pipeline filled it — core's own generation *and* a digest of the
 JS/TS plugin's compiled output — and an index that no longer matches is wiped
@@ -491,9 +501,23 @@ nothing is up is a no-op, not an error.
 
 `g-mesh clean` deletes a cached index: the current project's by default, a
 named one with `g-mesh clean <project-id>`, everything unused for 90+ days
-with `g-mesh clean expired`, or the lot with `g-mesh clean all --force`
-(without `--force` it only reports how many it would delete). Stop a
-project's daemon before cleaning it.
+with `g-mesh clean expired`, everything whose project directory has been
+deleted with `g-mesh clean orphaned --force`, or the lot with `g-mesh clean
+all --force` (without `--force` the last two only report what they would
+delete). Stop a project's daemon before cleaning it.
+
+`orphaned` compares each index against the project root recorded in its state
+directory. Two kinds of state it deliberately leaves alone, and says so rather
+than deleting quietly:
+
+- a root that is missing *along with the directory that held it* — an ejected
+  external disk looks exactly like a deleted project, and only the parent tells
+  them apart. Delete those by id once you know which it was.
+- an index built before g-mesh recorded roots (anything from before 2.8.0),
+  which has nothing to be checked against. A project still in use records its
+  root the next time its daemon starts, so this group shrinks to the genuinely
+  dead as you work; `clean expired` or `clean all --force` are the blunt
+  instruments for what is left.
 
 ## Run tests
 
@@ -517,6 +541,18 @@ temp-directory fixtures, so they care about the environment they run in:
 - Nothing else about the launching process matters: piped stdio, a
   long-running parent, and a one-shot script all behave identically (measured,
   task 192).
+- **State is redirected away from your `~/.g-mesh`.** `.cargo/config.toml` at
+  the repo root sets `G_MESH_HOME` to `/tmp/g-mesh-test-home` for everything
+  cargo launches, so the fixtures' project directories land there and a run is
+  safe next to a real daemon serving a real project. (Not `target/`: a daemon
+  socket inside a checkout overruns the 104-byte AF_UNIX path limit. `rm -rf
+  /tmp/g-mesh-test-home` to clear it; `cargo clean` cannot.)
+  Without it the suite left ~350 directories a day in the real home and could
+  fail against state something else on the machine was mutating;
+  `core/tests/state_isolation.rs` fails loudly if the override stops reaching
+  either the test binary or the `g-mesh` processes it spawns. Note that cargo
+  applies `[env]` to `cargo run` too — `G_MESH_HOME="$HOME/.g-mesh" cargo run`
+  if you want a run against your own state.
 - `G_MESH_TEST_INDEXED_TIMEOUT_SECS` raises the per-project indexing budget
   (default 90s) on a machine slow enough to need it. If it does not help, the
   walk is not slow — something is wrong.

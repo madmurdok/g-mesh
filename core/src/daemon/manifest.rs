@@ -381,6 +381,126 @@ mod tests {
     /// `daemon::lifecycle`'s `ENV_LOCK` for its own env-var tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The bundled JS/TS plugin's source directory, reached the same way
+    /// [`bundled_roots`] reaches it.
+    fn bundled_typescript_plugin_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript")
+    }
+
+    fn json_at(path: &Path) -> serde_json::Value {
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+    }
+
+    /// The bundled plugin states its version in three files, and nothing but
+    /// this test makes them agree.
+    ///
+    /// The one that matters at runtime is `plugin.toml`: `read_manifest`
+    /// parses it and `g-mesh plugins list` prints it, so it is the number a
+    /// user sees when diagnosing. `package.json` is what the npm side uses,
+    /// and the lock file records the same version twice more. They have
+    /// already drifted once - the 2.1.0 bump left the lock naming 2.0.0, and
+    /// nothing failed, because `npm ci` checks dependency sync rather than
+    /// the root package's own version field. A wrong number reported to the
+    /// only person who ever looks is the cost, so it is worth one test.
+    ///
+    /// Reading the real files rather than a fixture is the point: a fixture
+    /// would prove the comparison works, not that these four declarations do.
+    #[test]
+    fn every_declaration_of_the_bundled_plugins_version_agrees() {
+        let dir = bundled_typescript_plugin_dir();
+        let manifest = read_manifest(&dir).expect("failed to read the bundled plugin's manifest");
+        let package = json_at(&dir.join("package.json"));
+        let lock = json_at(&dir.join("package-lock.json"));
+
+        let declared = [
+            ("plugin.toml [plugin] plugin_version", manifest.plugin_version.clone()),
+            ("package.json .version", string_at(&package, &["version"])),
+            ("package-lock.json .version", string_at(&lock, &["version"])),
+            ("package-lock.json .packages[\"\"].version", string_at(&lock, &["packages", "", "version"])),
+        ];
+
+        let (first_source, first_version) = &declared[0];
+        for (source, version) in &declared[1..] {
+            assert_eq!(
+                version, first_version,
+                "the bundled plugin's version has drifted: {first_source} says {first_version}, \
+                 {source} says {version}. Bump package.json and plugin.toml together, and \
+                 regenerate the lock with `npm install --package-lock-only`."
+            );
+        }
+    }
+
+    /// The version that actually leaves the plugin at runtime, reported by
+    /// `sendHandshake` in `plugins/typescript/src/index.ts`.
+    ///
+    /// No longer a declaration of its own - `scripts/generate-version.js`
+    /// writes it from `package.json` on every build - so this test now asks
+    /// the question that survives that: whether the manifest core reads
+    /// *without* running a plugin agrees with what the running plugin says.
+    /// Those two can still drift, because `plugin.toml` is read by
+    /// `g-mesh plugins list` on plugins that were never built and so cannot
+    /// be derived from anything at runtime.
+    ///
+    /// Core prints it when `handshake::verify` refuses a protocol mismatch -
+    /// "protocol version mismatch with typescript plugin (plugin version X)"
+    /// - while `g-mesh plugins list` prints the manifest's copy. The two had
+    /// drifted: the manifest said 2.1.0 and the wire said 0.1.0, so the two
+    /// screens a person consults about one plugin named different versions,
+    /// and the one shown at the worst possible moment was three releases
+    /// stale.
+    ///
+    /// Checked by spawning the real plugin rather than by reading its source:
+    /// what matters is the value that arrives on core's stdin. A source-text
+    /// check would pass just as happily on a build that was never rerun after
+    /// the version changed.
+    #[test]
+    fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
+        let dir = bundled_typescript_plugin_dir();
+        let manifest = read_manifest(&dir).expect("failed to read the bundled plugin's manifest");
+
+        let mut plugin = std::process::Command::new(&manifest.command)
+            .args(&manifest.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn the bundled plugin - is it built? (`npm run build`)");
+        let mut stdout =
+            std::io::BufReader::new(plugin.stdout.take().expect("the plugin has no stdout"));
+        let handshake = crate::protocol::handshake::perform(&mut stdout);
+        drop(plugin.stdin.take());
+        let _ = plugin.kill();
+        let _ = plugin.wait();
+
+        let handshake = handshake.expect("the bundled plugin did not complete a handshake");
+        assert_eq!(
+            handshake.plugin_version, manifest.plugin_version,
+            "the bundled plugin's handshake reports {}, but its plugin.toml declares {} - \
+             the handshake follows package.json (via scripts/generate-version.js), so either \
+             plugin.toml is stale or the plugin needs rebuilding",
+            handshake.plugin_version, manifest.plugin_version
+        );
+    }
+
+    /// The string at a path of keys, so a missing or retyped field fails as
+    /// "this file no longer declares a version there" rather than as a
+    /// comparison against `null`.
+    fn string_at(value: &serde_json::Value, keys: &[&str]) -> String {
+        let mut current = value;
+        for key in keys {
+            current = current
+                .get(key)
+                .unwrap_or_else(|| panic!("no `{}` in the JSON being checked", keys.join(".")));
+        }
+        current
+            .as_str()
+            .unwrap_or_else(|| panic!("`{}` is not a string", keys.join(".")))
+            .to_string()
+    }
+
     #[test]
     fn default_roots_bundled_entry_resolves_to_the_sibling_plugins_directory() {
         let _guard = ENV_LOCK.lock().unwrap();

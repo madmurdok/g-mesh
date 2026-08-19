@@ -1,13 +1,18 @@
 //! `g-mesh clean` driven as a real subprocess, against a real project state
-//! directory under the real `~/.g-mesh/projects/`.
+//! directory under the projects root the run resolves.
 //!
-//! Only the cwd-scoped form is exercised here, on purpose: it is the one that
-//! can be tested end to end while touching nothing but the directory this
-//! test itself caused to exist. `clean expired` and `clean all` are scoped to
-//! *every* project on the machine, so running them against a developer's real
-//! `~/.g-mesh` would delete their work; those forms are covered by the unit
-//! tests in `cli::clean`, which inject a temp projects root and can therefore
-//! delete everything in it safely.
+//! Only forms that delete nothing outside this test's own project are driven
+//! here. `clean expired`, `clean orphaned --force` and `clean all` are scoped
+//! to *every* project under the root, and the root is shared: before task 217
+//! it was the developer's real `~/.g-mesh`, and since then it is one
+//! `G_MESH_HOME` that every test binary in this directory writes into
+//! concurrently. Either way a sweeping delete from here would take out
+//! fixtures that belong to someone else. Those forms are covered by the unit
+//! tests in `cli::clean`, which inject a projects root of their own and can
+//! therefore delete everything in it safely.
+//!
+//! What is still worth driving as a subprocess is the wiring: that the word
+//! reaches the right code path and reports rather than deletes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -163,6 +168,29 @@ fn clean_in_a_never_indexed_directory_asks_for_an_explicit_project_id() {
     assert!(
         stderr.contains("pass an explicit <project-id>"),
         "the error must ask for an id: {stderr}"
+    );
+}
+
+/// `orphaned` end to end, in the form that cannot delete anything: the target
+/// has to parse, reach `cli::clean`, and report. What it decides about each
+/// directory is the unit tests' subject - here the point is that the word is
+/// wired up at all, which no unit test can show.
+#[test]
+fn clean_orphaned_without_force_reports_and_deletes_nothing() {
+    let project = Project::new();
+    project.bootstrap_daemon();
+
+    let reported = project.command(&["clean", "orphaned"]);
+
+    assert!(reported.status.success(), "clean orphaned failed: {}", stderr_of(&reported));
+    let stdout = stdout_of(&reported);
+    assert!(
+        stdout.contains("deleted") || stdout.contains("no project index"),
+        "clean orphaned said nothing about what it found: {stdout}"
+    );
+    assert!(
+        project.state_dir().is_dir(),
+        "this project is still on disk - `clean orphaned` must not have touched its state"
     );
 }
 

@@ -47,7 +47,6 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::net::UnixStream;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::CoreActivity;
@@ -55,6 +54,7 @@ use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
+use crate::ipc::AsyncStream;
 use crate::protocol::types::Position;
 
 mod anchor;
@@ -119,9 +119,13 @@ pub const STILL_INDEXING: &str =
 /// in `tests/` could drift from it silently.
 pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
 
-/// Serves one accepted socket connection as an MCP session until the peer
+/// Serves one accepted connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
 /// connection per MCP client, so a client's session dies with its shim.
+///
+/// `stream` is whatever `crate::ipc` accepted - a `tokio::net::UnixStream` on
+/// Unix, a connected named-pipe instance on Windows. Neither is named here:
+/// `rmcp` only ever needed `AsyncRead + AsyncWrite`.
 ///
 /// `indexing` is consulted per *call*, not per connection, which is what
 /// makes a session opened during the cold-start walk recover on its own: the
@@ -129,7 +133,7 @@ pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
 /// from the first call after the walk commits, with nothing to reconnect and
 /// nothing to re-initialize.
 pub async fn serve_connection(
-    stream: UnixStream,
+    stream: AsyncStream,
     conn: Arc<Mutex<Connection>>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,

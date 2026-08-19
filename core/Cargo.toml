@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "2.7.0"
+version = "2.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -19,7 +19,6 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 flate2 = "1"
 ignore = "0.4"
-libc = "0.2"
 notify = "6"
 # ONNX Runtime bindings for the local embedding model (see src/embedding).
 #
@@ -75,7 +74,45 @@ toml = "0.8"
 # copy of ureq and rustls.
 ureq = { version = "2", default-features = false, features = ["tls", "proxy-from-env"] }
 
+# The three POSIX primitives this crate still reaches for directly, all in
+# `src/process.rs`: `kill(pid, 0)` as a liveness probe, `kill(pid, SIGTERM/
+# SIGKILL)` to stop a daemon, and nothing else. Unix-only since the Windows
+# port - the Windows half of that module answers the same three questions
+# through `windows-sys` instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Windows half of `src/process.rs` (OpenProcess/GetExitCodeProcess for
+# liveness, TerminateProcess to stop a daemon) and of `src/ipc/` (named pipes,
+# which is what AF_UNIX becomes there).
+#
+# Raw FFI rather than the higher-level `windows` crate, and hand-rolled rather
+# than the `interprocess` crate, for reasons `src/ipc/mod.rs` sets out in full:
+# the daemon has to *bind* its endpoint synchronously, before any tokio
+# runtime exists, and the shim needs a half-close - and no local-socket
+# abstraction on crates.io offers both. `windows-sys` is already in this
+# tree's lock file via `tokio`'s own Windows dependencies, so this adds link
+# declarations rather than a new subtree.
+#
+# `Win32_Security` is not used for security descriptors of its own - the pipe
+# is created with the default one on purpose - only because `CreateNamedPipeW`
+# and `CreateFileW` name `SECURITY_ATTRIBUTES` in their signatures.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
+# Also a normal dependency - repeated here because integration tests link
+# against the library's public API plus dev-dependencies only, and
+# `tests/state_isolation.rs` has to spell out the *real* `~/.g-mesh` it must
+# not be writing into.
+dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

@@ -49,11 +49,10 @@ fn node_named(conn: &Mutex<Connection>, name: &str) -> i64 {
 /// well before this function returns, so the next request already exercises
 /// the real crash path without any extra synchronization.
 fn kill_out_of_band(pid: u32) {
-    // SAFETY: `kill` only signals a pid this test itself just read off a
-    // `Child` it owns; no pointers are involved.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-    }
+    // `force_stop` is `SIGKILL` on Unix and `TerminateProcess` on Windows -
+    // the same "no chance to clean up, no chance to be ignored" this test
+    // needs, on either platform.
+    let _ = g_mesh::process::force_stop(pid);
 }
 
 #[test]

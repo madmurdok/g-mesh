@@ -5,8 +5,7 @@ import { bulkIndexProject, toWireNode, type WireEdge, type WireNode } from "./bu
 import { stopSemanticProjects } from "./semantic";
 import { runSemanticPass } from "./semanticPass";
 import { RUN_NODE_FLAG, runNodeScript } from "./runtime";
-
-const PLUGIN_VERSION = "0.1.0"; // keep in sync with package.json's "version"
+import { PLUGIN_VERSION } from "./version.generated";
 
 /** Selects one-shot bulk-index mode instead of the control-plane loop; must
  * stay in sync with core's `daemon::bulk_index::BULK_INDEX_FLAG`. */

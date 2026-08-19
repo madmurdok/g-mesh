@@ -85,8 +85,8 @@ impl Project {
         // The socket file outlives the process it belonged to; leaving it
         // would only prove that the shim handles a stale one, which is not
         // this test's subject.
-        if let Ok(socket) = daemon::socket_path(self.root()) {
-            let _ = std::fs::remove_file(socket);
+        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+            endpoint.clear_stale();
         }
     }
 }
