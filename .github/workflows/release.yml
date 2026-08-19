@@ -383,10 +383,12 @@ jobs:
             echo
             echo '```'
             echo "curl -LO https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
-            echo "sha256sum -c SHA256SUMS   # or: shasum -a 256 -c SHA256SUMS"
+            echo "sha256sum --ignore-missing -c SHA256SUMS   # or: shasum -a 256 --ignore-missing -c SHA256SUMS"
             echo '```'
             echo
-            echo "Each archive also has its own \`.sha256\` next to it, for verifying just one."
+            echo "\`SHA256SUMS\` lists every archive; \`--ignore-missing\` is what keeps it from"
+            echo "reporting the three you did not download as failures. Each archive also has"
+            echo "its own \`.sha256\` beside it if you would rather check just the one."
           } > notes.md
 
           # GitHub's own "what changed" text, fetched through the API and
