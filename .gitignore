@@ -3,3 +3,5 @@
 /dist/
 .DS_Store
 .claude/worktrees/
+# Written by plugins/typescript/scripts/generate-version.js on every build.
+/plugins/typescript/src/version.generated.ts
