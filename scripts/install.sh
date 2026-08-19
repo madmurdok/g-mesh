@@ -272,24 +272,40 @@ detect_target() {
 # ---------------------------------------------------------------------------
 # Version resolution
 
+# Every way of failing to learn the latest version lands here, because the
+# call that establishes it either answers with a tag or it does not - see
+# `resolve_latest_version`. So this cannot claim to know which happened, and
+# ordering the causes by likelihood is the most honest thing it can do.
+#
+# That order changed once a release existed. While the repository had none,
+# "a draft is waiting for someone to press Publish" was the expected state and
+# led. Now that v2.8.0 is out, a caller who reaches this message far more
+# likely hit the unauthenticated API's 60-requests-per-hour limit, or has no
+# route to it at all - both of which the API reports in a way this script
+# cannot tell apart from "no release".
 no_published_release() {
 	cat >&2 <<EOF
-install: g-mesh has no published release to install yet.
+install: could not work out which release to install.
 
-$LATEST_API returned no release. On this repository a release is built as a
-DRAFT and stays invisible - and its download URLs stay 404 - until a human
-reviews and publishes it, so "no latest release" is the expected state
-between a build finishing and someone pressing Publish.
+This asked for the latest published release and got no answer:
+
+  $LATEST_API
+
+Most likely, in this order:
+  - The GitHub API rate-limited you. Unauthenticated calls get 60 per hour
+    per IP, and this looks identical to "no release exists". Set GITHUB_TOKEN
+    to raise the limit, or wait an hour.
+  - You have no route to api.github.com - a proxy, a firewall, or no network.
+  - There genuinely is no published release. Releases here are built as
+    drafts and stay invisible, with their download URLs 404ing, until a human
+    publishes one, so this is the expected state between a build finishing
+    and someone pressing Publish.
 
 What you can do:
-  - Check https://github.com/$REPO/releases. If a draft is waiting there,
-    publishing it makes this command work.
-  - Install a specific version, if you know one exists:
+  - Check https://github.com/$REPO/releases to see what is published.
+  - Install a specific version, skipping the API call entirely:
       curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | sh -s -- --version X.Y.Z
   - Build from source meanwhile: https://github.com/$REPO#build
-
-(If you expected a published release, this can also mean the API was
-unreachable or rate-limited - set GITHUB_TOKEN to raise the limit.)
 EOF
 	exit 1
 }
