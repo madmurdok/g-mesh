@@ -107,6 +107,43 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
 
+/// Nodes declared in a file whose stem is `name` - `DropdownMenuGroup` finds
+/// `.../DropdownMenuGroup.tsx`.
+///
+/// Exists for one failure that looks like a bug to whoever hits it: a default
+/// import binds the exporting file's declaration under whatever local name the
+/// importer chose (`import DropdownMenuGroup from "./DropdownMenuGroup"`), and
+/// that local name is never indexed - see `graph::symbol_links`' module doc,
+/// "the local name never reaches this index at all". So the name a caller is
+/// reading at every use site resolves to nothing, while the declaration it
+/// binds sits in the index under a different name. The file's own name is the
+/// one link between them that the index does hold.
+///
+/// Only ever called on the miss path, which is why a `LIKE` with a leading
+/// wildcard is acceptable here and would not be on a hot one. Case-insensitive
+/// by SQLite's default ASCII `LIKE`, deliberately: `import Foo from "./foo"` is
+/// the same situation.
+pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+    // A name carrying a separator or an extension is not a module stem, and
+    // would turn the patterns below into something that matches far too much.
+    if name.is_empty() || name.contains(['/', '\\', '.']) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM nodes \
+         WHERE (filePath LIKE '%/' || ?1 || '.%' OR filePath LIKE ?1 || '.%') \
+           AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 \
+           AND kind IS NOT 'File' AND kind IS NOT 'Module' \
+         ORDER BY exported DESC, startLine ASC \
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, limit as i64],
+        map_node_row,
+    )?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by file name")
+}
+
 pub fn find_by_qualified_name(
     conn: &Connection,
     qualified_name: &str,
