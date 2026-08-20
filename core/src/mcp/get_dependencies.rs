@@ -18,6 +18,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
 use super::GetDependenciesParams;
@@ -271,20 +272,92 @@ fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<Ca
 
     match anchor {
         Some(node) => from_root(conn, node.id, shape),
-        None => error(format!("g-mesh: no file '{file_path}' found in the index")),
+        None => error(no_file_message(conn, file_path)?),
     }
+}
+
+/// The not-found answer, with what the index can add to it.
+///
+/// The caller who reaches this usually asked about a *package* or a directory
+/// - "which files import from `@excalidraw/math`" - and this tool takes an
+/// exact file path. A bare refusal sends them hunting with Glob for the entry
+/// point, which costs a round trip: measured on g-mesh-bench as
+/// `get_dependencies[57ch] -> Glob -> Glob -> get_dependencies[16267ch]`.
+///
+/// So when the path is a prefix of files that *are* indexed, this names them,
+/// entry point first. Two forms are tried: the path as given
+/// (`packages/math`), then its last segment matched as a directory
+/// (`@excalidraw/math` -> `math`), which is how a workspace package name
+/// relates to its directory in the layouts this meets. The second is offered
+/// as a suggestion and nothing more - a name matching a directory does not
+/// establish that the package lives there.
+///
+/// The specifier itself cannot help: `graph::imports` keeps a placeholder
+/// `Module` node per import specifier, but only for the ones that never
+/// resolved (`react` survives, `@excalidraw/math` became an edge to a file and
+/// its placeholder is gone). So there is nothing to look the package name up
+/// in, which is why this matches paths rather than pretending otherwise.
+fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorData> {
+    const MAX_FILES: usize = 5;
+    let terse = format!("g-mesh: no file '{file_path}' found in the index");
+
+    let under = queries::find_files_under(conn, file_path, MAX_FILES)
+        .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
+    if !under.is_empty() {
+        return Ok(format!(
+            "{terse} - it is not a file. These indexed files sit under it: {}. \
+             This tool walks the import graph from one file, so ask about the entry point.",
+            paths_of(&under),
+        ));
+    }
+
+    // `@excalidraw/math` and the like: the last segment is the directory a
+    // workspace package usually lives in, but this only suggests, never claims.
+    let Some(segment) = file_path.rsplit('/').next().filter(|s| !s.is_empty() && *s != file_path) else {
+        return Ok(terse);
+    };
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, MAX_FILES)
+        .map_err(|e| internal_error("failed to look up files by directory name", e))?;
+    if by_segment.is_empty() {
+        return Ok(terse);
+    }
+    Ok(format!(
+        "{terse} - and it is not a path this index carries. If '{segment}' is the package's \
+         directory, these indexed files are under one named that: {}. This tool walks the import \
+         graph from one file, so ask about the entry point.",
+        paths_of(&by_segment),
+    ))
+}
+
+fn paths_of(nodes: &[NodeRecord]) -> String {
+    nodes.iter().map(|n| n.file_path.clone()).collect::<Vec<_>>().join(", ")
 }
 
 /// A module id is already a node id, so this lookup buys nothing but the
 /// error message: an unknown id would otherwise walk nothing at all and read
 /// as "this module imports nothing", which is the one answer a bounded walk
 /// must never fake.
+///
+/// It falls through to a file lookup because callers reliably put something
+/// else here. `module_id` reads as "the module's name" and sits next to
+/// `file_path` as its documented alternative, so a caller holding
+/// `@excalidraw/math` or `packages/math/src/index.ts` puts *that* in it -
+/// observed in every recorded run of g-mesh-bench's
+/// `ex-deps-package-math-incoming`, which then cost a refusal, a blind Glob
+/// and a second call to get the answer the first one had the input for. A
+/// path that this index carries is an answerable question however the caller
+/// labelled it, and refusing it on a technicality buys nothing.
 fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
     let anchor = queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
 
     match anchor {
         Some(node) => from_root(conn, node.id, shape),
-        None => error(format!("g-mesh: no module '{module_id}' found in the index")),
+        None => match queries::find_file_node(conn, module_id)
+            .map_err(|e| internal_error("failed to look up file", e))?
+        {
+            Some(node) => from_root(conn, node.id, shape),
+            None => error(no_file_message(conn, module_id)?),
+        },
     }
 }
 
@@ -783,5 +856,73 @@ mod tests {
             "an explicit max_depth must be honored exactly, unaffected by this tool's own default"
         );
         assert_eq!(body["truncated"], false);
+    }
+
+    /// The caller asked about a package or a directory, which is what the
+    /// prompt they are answering names. A bare refusal sends them hunting with
+    /// Glob for the entry point - a round trip, and the recorded trace for
+    /// `ex-deps-package-math-incoming` is exactly that hunt.
+    #[test]
+    fn a_directory_prefix_is_told_which_indexed_files_sit_under_it() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/angle.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+
+        let message = no_file_message(&conn, "packages/math").unwrap();
+
+        assert!(message.contains("packages/math/src/index.ts"), "{message}");
+        // Entry point first: it is what a package specifier resolves to, and
+        // what the caller is going to ask about next.
+        let idx = message.find("packages/math/src/index.ts").unwrap();
+        let other = message.find("packages/math/src/angle.ts").unwrap();
+        assert!(idx < other, "the entry point must lead: {message}");
+    }
+
+    /// A workspace package name is not a path at all, so the only handle is
+    /// its last segment matching a directory - offered as a suggestion, since
+    /// a directory of that name does not establish the package lives there.
+    #[test]
+    fn a_package_name_is_offered_the_directory_that_shares_its_last_segment() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+
+        let message = no_file_message(&conn, "@excalidraw/math").unwrap();
+
+        assert!(message.contains("packages/math/src/index.ts"), "{message}");
+        assert!(message.contains("If 'math' is"), "must read as a suggestion: {message}");
+    }
+
+    /// A path matching nothing keeps the short answer. The explanation is only
+    /// worth its length where there is something to explain.
+    #[test]
+    fn a_path_under_which_nothing_is_indexed_keeps_the_terse_answer() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+
+        let message = no_file_message(&conn, "packages/nowhere").unwrap();
+
+        assert_eq!(message, "g-mesh: no file 'packages/nowhere' found in the index");
+    }
+
+    /// Callers put a path in `module_id` - the field reads as "the module's
+    /// name" and is documented as the alternative to `file_path`. Every
+    /// recorded run of the benchmark task that asks about a package did it,
+    /// and paid a refusal plus a blind Glob for the label.
+    #[test]
+    fn a_path_passed_as_a_module_id_is_answered_rather_than_refused() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/excalidraw/viewport.ts")).unwrap();
+        imports(&mut conn, "packages/excalidraw/viewport.ts", "packages/math/src/index.ts");
+
+        let result = from_module(
+            &conn,
+            "packages/math/src/index.ts",
+            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        )
+        .unwrap();
+
+        let body = json_body(&result);
+        assert_eq!(body["results"][0]["filePath"], "packages/excalidraw/viewport.ts");
     }
 }

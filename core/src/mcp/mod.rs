@@ -590,7 +590,9 @@ pub struct GetFileOutlineParams {
 pub struct GetDependenciesParams {
     /// Project-relative path of the file to start from.
     pub file_path: Option<String>,
-    /// Id of the module to start from, as an alternative to `file_path`.
+    /// Opaque node id from a previous result - not a module name or a path.
+    /// For either of those use `file_path`; this accepts one anyway rather
+    /// than refusing on a label.
     pub module_id: Option<String>,
     /// `Outgoing` for what this file imports, `Incoming` for what imports it.
     pub direction: Direction,
