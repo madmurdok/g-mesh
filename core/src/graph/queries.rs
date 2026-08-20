@@ -107,6 +107,87 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
 
+/// Nodes declared in a file whose stem is `name` - `DropdownMenuGroup` finds
+/// `.../DropdownMenuGroup.tsx`.
+///
+/// Exists for one failure that looks like a bug to whoever hits it: a default
+/// import binds the exporting file's declaration under whatever local name the
+/// importer chose (`import DropdownMenuGroup from "./DropdownMenuGroup"`), and
+/// that local name is never indexed - see `graph::symbol_links`' module doc,
+/// "the local name never reaches this index at all". So the name a caller is
+/// reading at every use site resolves to nothing, while the declaration it
+/// binds sits in the index under a different name. The file's own name is the
+/// one link between them that the index does hold.
+///
+/// Only ever called on the miss path, which is why a `LIKE` with a leading
+/// wildcard is acceptable here and would not be on a hot one. Case-insensitive
+/// by SQLite's default ASCII `LIKE`, deliberately: `import Foo from "./foo"` is
+/// the same situation.
+pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+    // A name carrying a separator or an extension is not a module stem, and
+    // would turn the patterns below into something that matches far too much.
+    if name.is_empty() || name.contains(['/', '\\', '.']) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM nodes \
+         WHERE (filePath LIKE '%/' || ?1 || '.%' OR filePath LIKE ?1 || '.%') \
+           AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 \
+           AND kind IS NOT 'File' AND kind IS NOT 'Module' \
+         ORDER BY exported DESC, startLine ASC \
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, limit as i64],
+        map_node_row,
+    )?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by file name")
+}
+
+/// Indexed files sitting under `prefix`, entry points first.
+///
+/// For the caller who asked about a package or a directory rather than a
+/// file: `packages/math` is not a node, but `packages/math/src/index.ts` is,
+/// and it is what they meant. Ordering puts an `index.*` first because that is
+/// what a package specifier resolves to, then shortest path, so the head of
+/// the list is the entry point rather than whichever file sorted first.
+///
+/// Miss path only, like `find_in_file_named` above - a `LIKE` anchored on a
+/// prefix can use no index here and does not need to.
+pub fn find_files_under(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM nodes \
+         WHERE kind = 'File' AND filePath LIKE ?1 || '/%' \
+         ORDER BY (filePath LIKE '%/index.%') DESC, LENGTH(filePath) ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![trimmed, limit as i64], map_node_row)?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up files under a prefix")
+}
+
+/// Indexed files under any directory named `dir`, entry points first.
+///
+/// The second half of the package-name case: `@excalidraw/math` is not a path,
+/// but a directory called `math` exists and holds the files. Matches a path
+/// segment, not a substring - `/math/` - so `mathutils` does not qualify.
+pub fn find_files_ending_in_dir(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+    if dir.is_empty() || dir.contains('/') {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM nodes \
+         WHERE kind = 'File' AND (filePath LIKE '%/' || ?1 || '/%' OR filePath LIKE ?1 || '/%') \
+         ORDER BY (filePath LIKE '%/index.%') DESC, LENGTH(filePath) ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![dir, limit as i64], map_node_row)?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up files by directory name")
+}
+
 pub fn find_by_qualified_name(
     conn: &Connection,
     qualified_name: &str,

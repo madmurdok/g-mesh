@@ -515,20 +515,15 @@ pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead, skipping `find_definition` - resolved
-    /// qualified name first, then bare. If ambiguous, returns `ambiguous:
-    /// true` with ranked candidates; re-call with a candidate's `id` as
-    /// `symbol_id`.
+    /// Anchor by name instead. Qualified name resolved first, then bare; an
+    /// ambiguous name returns ranked candidates to re-call with.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum results (default 20, max 200) - raise it rather than paging
-    /// via `cursor`.
+    /// Maximum results (default 20, max 200) - raise it rather than paging.
     pub limit: Option<u32>,
-    /// Restrict results to rows in these files: project-relative, matched
-    /// exactly as `filePath` appears in this tool's own output (no prefix or
-    /// glob). Answers "which of these files reference this?" in one call.
-    /// Omit or pass `[]` to search the whole project.
+    /// Restrict to rows in these files: project-relative, exactly as
+    /// `filePath` appears in output (no globs). Omit for the whole project.
     pub file_paths: Option<Vec<String>>,
 }
 
@@ -551,21 +546,18 @@ pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead, skipping `find_definition` - resolved
-    /// qualified name first, then bare. If ambiguous, returns `ambiguous:
-    /// true` with ranked candidates; re-call with a candidate's `id` as
-    /// `symbol_id`.
+    /// Anchor by name instead. Qualified name resolved first, then bare; an
+    /// ambiguous name returns ranked candidates to re-call with.
     pub symbol_name: Option<String>,
-    /// Opaque cursor from a previous page. Ignored when `transitive: true` -
-    /// that walk continues via `resume_token`.
+    /// Opaque cursor from a previous page. Ignored when `transitive: true`,
+    /// which continues via `resume_token`.
     pub cursor: Option<String>,
-    /// Maximum results (default 20, max 200) - raise it rather than paging
-    /// via `cursor`. Ignored when `transitive: true`.
+    /// Maximum results (default 20, max 200) - raise it rather than paging.
+    /// Ignored when `transitive: true`.
     pub limit: Option<u32>,
-    /// Restrict results to rows in these files: project-relative, matched
-    /// exactly as `filePath` appears in this tool's own output (no prefix or
-    /// glob). Omit or pass `[]` to search the whole project. Ignored when
-    /// `transitive: true`.
+    /// Restrict to rows in these files: project-relative, exactly as
+    /// `filePath` appears in output (no globs). Omit for the whole project.
+    /// Ignored when `transitive: true`.
     pub file_paths: Option<Vec<String>>,
     /// Walk the whole implementer/extender hierarchy (e.g. a class extending
     /// a class that implements the anchor), up to `max_depth` hops. Absent
@@ -598,7 +590,9 @@ pub struct GetFileOutlineParams {
 pub struct GetDependenciesParams {
     /// Project-relative path of the file to start from.
     pub file_path: Option<String>,
-    /// Id of the module to start from, as an alternative to `file_path`.
+    /// Opaque node id from a previous result - not a module name or a path.
+    /// For either of those use `file_path`; this accepts one anyway rather
+    /// than refusing on a label.
     pub module_id: Option<String>,
     /// `Outgoing` for what this file imports, `Incoming` for what imports it.
     pub direction: Direction,
