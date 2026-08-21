@@ -15,7 +15,6 @@ pub mod semantic;
 pub(crate) mod test_plugin;
 
 use std::fs::{self, File, TryLockError};
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -53,6 +52,23 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// the shim holds that one *while* spawning the daemon, so a daemon waiting
 /// on it would deadlock against the shim waiting for the daemon.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
+
+/// Where the lock's holder records that it has begun serving.
+///
+/// Beside the lock rather than inside it, and the distinction is a portability
+/// bug this cost us: `File::try_lock` is `flock` on Unix and `LockFileEx` on
+/// Windows, and std documents the difference in as many words - "this lock may
+/// be advisory or mandatory... its interactions with other methods, such as
+/// read and write are platform specific". Reading a locked file from a second
+/// handle is fine on Unix and fails on Windows, so a record written into the
+/// lock file was simply invisible there: `serving_owner_in` turned the error
+/// into `None`, every wedged daemon read as `Starting`, and nothing could evict
+/// it. Found by the first `cargo test` ever run on Windows (GM-244).
+///
+/// The property the old design was after survives the move: only the lock's
+/// holder ever writes this file, because it is written after taking the lock
+/// and cleared by whoever takes it next.
+const DAEMON_SERVING_FILE: &str = "daemon.serving";
 
 /// How long the watcher thread waits, after the most recent raw filesystem
 /// event for a given path, before treating that path's burst as settled and
@@ -184,6 +200,10 @@ pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
 
 pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(DAEMON_LOCK_FILE)
+}
+
+fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(DAEMON_SERVING_FILE)
 }
 
 /// Reads a pid out of one of the files above. `None` for a file that isn't
@@ -367,13 +387,13 @@ pub fn run(root: &Path) -> Result<()> {
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
 
-    // And recorded in the lock file too, now that this process is genuinely
+    // And recorded beside the lock too, now that this process is genuinely
     // serving. The pid file above answers "which process is the daemon"; this
     // answers "is the lock's holder still doing the job the lock entitles it
     // to", which is the only question a process that cannot take the lock can
     // usefully ask - and the one nothing could answer before task 184. See
     // `record_serving_owner`.
-    record_serving_owner(&singleton);
+    record_serving_owner(&dir);
 
     // Both idle timers are resolved once, here, from the project's
     // config.toml (or its documented defaults, for a project with none), and
@@ -877,10 +897,11 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     loop {
         match file.try_lock() {
             Ok(()) => {
-                // Emptied the instant it is taken, so the file says "held by a
-                // daemon that is not serving yet" for exactly as long as that
-                // is true - see `record_serving_owner` for the other half.
-                clear_serving_owner(&file, &path);
+                // Cleared the instant the lock is taken, so the state reads
+                // "held by a daemon that is not serving yet" for exactly as
+                // long as that is true - see `record_serving_owner` for the
+                // other half.
+                clear_serving_owner(dir);
                 return Ok(Some(file));
             }
             Err(TryLockError::WouldBlock) => {
@@ -989,9 +1010,9 @@ fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
 /// evicted. Two different questions, and a pid file that could only answer the
 /// first is why `cli::stop` could not see the wedged daemon at all.
 ///
-/// Written into the lock file rather than alongside it so the two can never
-/// disagree: whoever reads it is reading the very file whose lock they just
-/// found held, and only the holder can have written it.
+/// Written *beside* the lock file, not into it - see [`DAEMON_SERVING_FILE`]
+/// for the portability reason, and for why "only the holder can have written
+/// it" still holds.
 ///
 /// Terminated by a newline, and [`serving_owner_in`] refuses a record without
 /// one. Nothing else in the daemon's pid files bothers, and this one has to:
@@ -1004,26 +1025,26 @@ fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
 /// Best-effort, like every other pid-file write in the daemon: the cost of
 /// failing is a wedge that reads as `Starting` and is left alone, which is the
 /// behaviour this project had before the record existed.
-fn record_serving_owner(lock: &File) {
-    if let Err(err) = write_lock_body(lock, format!("{}\n", std::process::id()).as_bytes()) {
-        eprintln!("g-mesh daemon: failed to record itself as the lock's owner: {err}");
+fn record_serving_owner(state_dir: &Path) {
+    let path = serving_owner_path_in(state_dir);
+    if let Err(err) = fs::write(&path, format!("{}\n", std::process::id())) {
+        eprintln!("g-mesh daemon: failed to record itself as the lock's owner in {}: {err}", path.display());
     }
 }
 
-/// Empties the lock file, so a fresh holder does not inherit its predecessor's
-/// claim to be serving.
-fn clear_serving_owner(lock: &File, path: &Path) {
-    if let Err(err) = write_lock_body(lock, b"") {
-        eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display());
+/// Removes the record, so a fresh holder does not inherit its predecessor's
+/// claim to be serving. Called under the lock, which is what makes "only the
+/// holder writes this" true.
+///
+/// A missing file is the same state as an empty one - nothing recorded - so
+/// `NotFound` is not worth reporting.
+fn clear_serving_owner(state_dir: &Path) {
+    let path = serving_owner_path_in(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display()),
     }
-}
-
-fn write_lock_body(lock: &File, body: &[u8]) -> std::io::Result<()> {
-    let mut handle = lock;
-    handle.set_len(0)?;
-    handle.seek(SeekFrom::Start(0))?;
-    handle.write_all(body)?;
-    handle.flush()
 }
 
 /// The pid the lock's holder recorded once it began serving, if any.
@@ -1034,7 +1055,7 @@ fn write_lock_body(lock: &File, body: &[u8]) -> std::io::Result<()> {
 /// daemon's other pid files, with the newline requirement
 /// [`record_serving_owner`] explains added on top.
 pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
-    let recorded = fs::read_to_string(daemon_lock_path_in(state_dir)).ok()?;
+    let recorded = fs::read_to_string(serving_owner_path_in(state_dir)).ok()?;
     recorded.strip_suffix('\n')?.trim().parse().ok()
 }
 
@@ -1130,7 +1151,7 @@ mod tests {
         // recorded while serving must not outlive the lock itself, or a
         // recycled pid would read as a wedged incumbent.
         let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        record_serving_owner(dir.path());
         drop(lock);
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), false).unwrap(),
@@ -1161,8 +1182,8 @@ mod tests {
     #[test]
     fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        let _lock = held_lock(dir.path());
+        record_serving_owner(dir.path());
 
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), false).unwrap(),
@@ -1178,8 +1199,8 @@ mod tests {
     #[test]
     fn a_holder_that_is_still_answering_is_never_wedged() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        let _lock = held_lock(dir.path());
+        record_serving_owner(dir.path());
 
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), true).unwrap(),
@@ -1195,7 +1216,7 @@ mod tests {
     fn a_new_holder_does_not_inherit_its_predecessors_claim_to_be_serving() {
         let dir = tempfile::tempdir().unwrap();
         let first = held_lock(dir.path());
-        record_serving_owner(&first);
+        record_serving_owner(dir.path());
         assert_eq!(serving_owner_in(dir.path()), Some(std::process::id()));
         drop(first);
 
@@ -1210,6 +1231,9 @@ mod tests {
     #[test]
     fn a_lock_file_with_no_record_in_it_is_never_treated_as_wedged() {
         let dir = tempfile::tempdir().unwrap();
+        // The *lock* file: this holds the lock to make the state read as held,
+        // and asserts that a holder with no serving record beside it is
+        // starting up rather than wedged.
         let path = dir.path().join(DAEMON_LOCK_FILE);
         let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
         holder.lock().unwrap();
@@ -1226,7 +1250,7 @@ mod tests {
     #[test]
     fn a_record_without_its_terminating_newline_is_not_a_record() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DAEMON_LOCK_FILE);
+        let path = dir.path().join(DAEMON_SERVING_FILE);
 
         for partial in ["", "1", "12", "1234"] {
             fs::write(&path, partial).unwrap();
