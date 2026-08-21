@@ -372,10 +372,8 @@ impl SpawnReservation<'_> {
             let mut supervisors = self.registry.supervisors.lock().unwrap();
             match &spawned {
                 Ok(supervisor) => {
-                    supervisors.insert(
-                        self.language.clone(),
-                        SupervisorSlot::Running(Arc::clone(supervisor)),
-                    );
+                    supervisors
+                        .insert(self.language.clone(), SupervisorSlot::Running(Arc::clone(supervisor)));
                     Ok(Arc::clone(supervisor))
                 }
                 // A spawn that failed memoizes nothing, so the reservation
@@ -472,10 +470,10 @@ impl PluginRegistry {
     /// their own. `find_definition` uses it to return the source its
     /// coordinates point at.
     ///
-    /// Read-only by design. Nothing outside this module may substitute a root
-    /// - every supervisor a registry spawns is bound to this one, and two
-    /// answers about "the project" disagreeing on which project would be a
-    /// bug with no visible symptom.
+    /// Read-only by design. Nothing outside this module may substitute a root -
+    /// every supervisor a registry spawns is bound to this one, and two answers
+    /// about "the project" disagreeing on which project would be a bug with no
+    /// visible symptom.
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
@@ -582,9 +580,7 @@ impl PluginRegistry {
             Some(SupervisorSlot::Spawning(marker)) => {
                 drop(supervisors);
                 return marker.wait().with_context(|| {
-                    format!(
-                        "the in-progress spawn of the {language} plugin this call waited on failed"
-                    )
+                    format!("the in-progress spawn of the {language} plugin this call waited on failed")
                 });
             }
             None => {}
@@ -603,12 +599,8 @@ impl PluginRegistry {
         supervisors.insert(language.to_string(), SupervisorSlot::Spawning(Arc::clone(&marker)));
         drop(supervisors);
 
-        let mut reservation = SpawnReservation {
-            registry: self,
-            language: language.to_string(),
-            marker,
-            settled: false,
-        };
+        let mut reservation =
+            SpawnReservation { registry: self, language: language.to_string(), marker, settled: false };
         let spawned = PluginSupervisor::start(
             &self.project_root,
             manifest.clone(),
@@ -692,8 +684,7 @@ impl PluginRegistry {
     /// Every discovered language, sorted - for error messages only, where a
     /// stable order is worth the sort.
     fn discovered_languages(&self) -> String {
-        let mut languages: Vec<&str> =
-            self.discovered.manifests.keys().map(String::as_str).collect();
+        let mut languages: Vec<&str> = self.discovered.manifests.keys().map(String::as_str).collect();
         languages.sort_unstable();
         if languages.is_empty() {
             return "none".to_string();
@@ -898,8 +889,7 @@ mod tests {
             .iter()
             .map(|language| {
                 let extension = extension_for(language);
-                let install =
-                    if gated { test_plugin::install_gated } else { test_plugin::install };
+                let install = if gated { test_plugin::install_gated } else { test_plugin::install };
                 install(plugins.path(), language, &[extension.as_str()])
             })
             .collect();
@@ -1363,44 +1353,39 @@ mod tests {
         let (_project, _plugins, dirs, registry) = registry_over_gated(&["python"]);
         let python = &dirs[0];
 
-        let (in_flight, measured): (bool, Option<(usize, bool, Duration)>) =
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    registry.get_or_spawn("python").expect("the fixture plugin must start");
-                });
-                // The process is up and waiting on its gate: the spawn is in
-                // flight, and stays that way until this test says otherwise.
-                let in_flight = spawned_within(python, 1);
+        let (in_flight, measured): (bool, Option<(usize, bool, Duration)>) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                registry.get_or_spawn("python").expect("the fixture plugin must start");
+            });
+            // The process is up and waiting on its gate: the spawn is in
+            // flight, and stays that way until this test says otherwise.
+            let in_flight = spawned_within(python, 1);
 
-                let measured = in_flight.then(|| {
-                    let (reported, reports) = std::sync::mpsc::channel();
-                    let reader = &registry;
-                    scope.spawn(move || {
-                        let started = std::time::Instant::now();
-                        let active = reader.active_supervisors().len();
-                        let pending = reader.has_pending();
-                        let _ = reported.send((active, pending, started.elapsed()));
-                    });
-                    reports.recv_timeout(READER_DEADLINE).ok()
+            let measured = in_flight.then(|| {
+                let (reported, reports) = std::sync::mpsc::channel();
+                let reader = &registry;
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let active = reader.active_supervisors().len();
+                    let pending = reader.has_pending();
+                    let _ = reported.send((active, pending, started.elapsed()));
                 });
-
-                // Before anything is asserted, whatever happened above: a
-                // spawning thread that is never let go never joins, and this
-                // scope would hang instead of failing.
-                test_plugin::open_handshake_gate(python);
-                (in_flight, measured.flatten())
+                reports.recv_timeout(READER_DEADLINE).ok()
             });
 
+            // Before anything is asserted, whatever happened above: a
+            // spawning thread that is never let go never joins, and this
+            // scope would hang instead of failing.
+            test_plugin::open_handshake_gate(python);
+            (in_flight, measured.flatten())
+        });
+
         assert!(in_flight, "the plugin process never started, so no spawn was ever in flight");
-        let (active, pending, elapsed) = measured.expect(
-            "a reader never came back while a spawn was in flight - it is blocked behind it",
-        );
+        let (active, pending, elapsed) =
+            measured.expect("a reader never came back while a spawn was in flight - it is blocked behind it");
         // Nothing is reported yet, which is what proves the reader really did
         // run inside the spawn rather than after it.
-        assert_eq!(
-            active, 0,
-            "a language whose spawn has not finished is not an active supervisor yet"
-        );
+        assert_eq!(active, 0, "a language whose spawn has not finished is not an active supervisor yet");
         assert!(!pending, "a supervisor that does not exist yet has nothing queued");
         assert!(elapsed < READER_BUDGET, "a reader spent most of a spawn waiting: {elapsed:?}");
 
@@ -1421,8 +1406,7 @@ mod tests {
         let python = &dirs[0];
 
         let supervisors: Vec<Arc<PluginSupervisor>> = std::thread::scope(|scope| {
-            let racers: Vec<_> =
-                (0..4).map(|_| scope.spawn(|| registry.get_or_spawn("python"))).collect();
+            let racers: Vec<_> = (0..4).map(|_| scope.spawn(|| registry.get_or_spawn("python"))).collect();
 
             // One racer has reserved the slot and its process is up; the
             // others get a moment to reach the same call before that spawn is
