@@ -71,11 +71,29 @@ pub fn wait_until_indexed(root: &Path) {
     let db = project_dir(root).expect("failed to resolve the state directory").join("index.db");
     let timeout = indexed_timeout();
     let deadline = Instant::now() + timeout;
+    // Kept across attempts so the timeout can say *why* the last read failed.
+    // Treating every failure as "not yet" is right for the transient cases
+    // named above, and it is exactly wrong for a persistent one: a database
+    // that can never be opened looks identical to a walk that has not
+    // finished, forever. Windows spent two CI rounds on that - the daemon log
+    // showed the walk completing while this loop timed out, and the reason it
+    // could not be read was thrown away here.
+    let mut last_error: Option<String>;
     loop {
-        let indexed = Connection::open(&db)
-            .ok()
-            .and_then(|conn| schema::bulk_index_completed(&conn).ok())
-            .unwrap_or(false);
+        last_error = None;
+        let indexed = match Connection::open(&db) {
+            Ok(conn) => match schema::bulk_index_completed(&conn) {
+                Ok(done) => done,
+                Err(err) => {
+                    last_error = Some(format!("reading the marker: {err}"));
+                    false
+                }
+            },
+            Err(err) => {
+                last_error = Some(format!("opening {}: {err}", db.display()));
+                false
+            }
+        };
         if indexed {
             return;
         }
@@ -91,8 +109,16 @@ pub fn wait_until_indexed(root: &Path) {
              G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow - but if a bigger \
              budget changes nothing, no daemon is walking this root at all: check that the shim \
              was not handed an inherited CLAUDE_PROJECT_DIR, and set G_MESH_DAEMON_LOG to see \
-             what the daemon that did start was doing",
-            root.display()
+             what the daemon that did start was doing.{}",
+            root.display(),
+            match &last_error {
+                Some(err) => format!(
+                    "\n\nThe last attempt failed rather than reporting \
+                                      \"not yet\" - which is a third possibility the two above \
+                                      do not cover: {err}"
+                ),
+                None => String::new(),
+            }
         );
         std::thread::sleep(Duration::from_millis(20));
     }
