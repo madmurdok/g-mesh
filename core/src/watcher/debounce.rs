@@ -26,13 +26,30 @@ impl Debouncer {
 
     /// Records a raw watcher event for `path`, resetting its debounce timer.
     pub fn record(&mut self, path: PathBuf) {
-        self.last_seen.insert(path, Instant::now());
+        self.record_at(path, Instant::now());
+    }
+
+    /// [`record`](Self::record) with the clock supplied rather than read - see
+    /// [`drain_ready_at`](Self::drain_ready_at).
+    fn record_at(&mut self, path: PathBuf, now: Instant) {
+        self.last_seen.insert(path, now);
     }
 
     /// Returns every path whose debounce window has elapsed since its last
     /// recorded event, removing them so each ready path fires exactly once.
     pub fn drain_ready(&mut self) -> Vec<PathBuf> {
-        let now = Instant::now();
+        self.drain_ready_at(Instant::now())
+    }
+
+    /// [`drain_ready`](Self::drain_ready) against a supplied clock.
+    ///
+    /// The `_at` pair exists so the tests can decide what time it is instead
+    /// of sleeping: the window is a function of timestamps, and sleeping made
+    /// it a function of the scheduler as well. Both macOS runners failed
+    /// `a_fresh_event_during_the_window_extends_it` this way, on code nobody
+    /// had touched (GM-245) - and it was not one runner's quirk, since the
+    /// same shape failed on x86_64 and aarch64 in different runs.
+    fn drain_ready_at(&mut self, now: Instant) -> Vec<PathBuf> {
         let ready: Vec<PathBuf> = self
             .last_seen
             .iter()
@@ -49,25 +66,38 @@ impl Debouncer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+
+    /// A fixed starting point, so each test states its timeline in
+    /// milliseconds from it rather than sleeping.
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
 
     #[test]
     fn coalesces_rapid_repeated_events_for_the_same_file_into_one_trigger() {
         let mut debouncer = Debouncer::new(Duration::from_millis(50));
         let path = PathBuf::from("a.rs");
 
-        debouncer.record(path.clone());
-        thread::sleep(Duration::from_millis(10));
-        debouncer.record(path.clone());
-        thread::sleep(Duration::from_millis(10));
-        debouncer.record(path.clone());
+        let t0 = Instant::now();
+        debouncer.record_at(path.clone(), t0);
+        debouncer.record_at(path.clone(), at(t0, 10));
+        debouncer.record_at(path.clone(), at(t0, 20));
 
-        assert!(debouncer.drain_ready().is_empty(), "must not fire while events keep resetting the timer");
+        assert!(
+            debouncer.drain_ready_at(at(t0, 60)).is_empty(),
+            "40ms since the last event - still resetting, must not fire"
+        );
 
-        thread::sleep(Duration::from_millis(60));
-        assert_eq!(debouncer.drain_ready(), vec![path], "exactly one trigger for the whole burst");
+        assert_eq!(
+            debouncer.drain_ready_at(at(t0, 70)),
+            vec![path],
+            "exactly one trigger for the whole burst"
+        );
 
-        assert!(debouncer.drain_ready().is_empty(), "an already-drained path must not fire again on its own");
+        assert!(
+            debouncer.drain_ready_at(at(t0, 200)).is_empty(),
+            "an already-drained path must not fire again on its own"
+        );
     }
 
     #[test]
@@ -76,16 +106,19 @@ mod tests {
         let a = PathBuf::from("a.rs");
         let b = PathBuf::from("b.rs");
 
-        debouncer.record(a.clone());
-        thread::sleep(Duration::from_millis(60));
+        let t0 = Instant::now();
+        debouncer.record_at(a.clone(), t0);
         // a's window has elapsed; b's is only just starting - they must not
         // be coalesced together into a single combined trigger.
-        debouncer.record(b.clone());
+        debouncer.record_at(b.clone(), at(t0, 60));
 
-        assert_eq!(debouncer.drain_ready(), vec![a], "only a is ready; b's own window hasn't elapsed yet");
+        assert_eq!(
+            debouncer.drain_ready_at(at(t0, 60)),
+            vec![a],
+            "only a is ready; b's own window hasn't elapsed yet"
+        );
 
-        thread::sleep(Duration::from_millis(60));
-        assert_eq!(debouncer.drain_ready(), vec![b]);
+        assert_eq!(debouncer.drain_ready_at(at(t0, 120)), vec![b]);
     }
 
     #[test]
@@ -93,17 +126,17 @@ mod tests {
         let mut debouncer = Debouncer::new(Duration::from_millis(50));
         let path = PathBuf::from("a.rs");
 
-        debouncer.record(path.clone());
-        thread::sleep(Duration::from_millis(30));
-        debouncer.record(path.clone()); // resets the timer before it would have fired
-        thread::sleep(Duration::from_millis(30));
+        let t0 = Instant::now();
+        debouncer.record_at(path.clone(), t0);
+        // Resets the timer before it would have fired.
+        debouncer.record_at(path.clone(), at(t0, 30));
 
         assert!(
-            debouncer.drain_ready().is_empty(),
-            "30ms since the second record is still under the 50ms window"
+            debouncer.drain_ready_at(at(t0, 60)).is_empty(),
+            "30ms since the second record is still under the 50ms window - and 60ms since the \
+             first, which is what would have fired had the second not reset it"
         );
 
-        thread::sleep(Duration::from_millis(30));
-        assert_eq!(debouncer.drain_ready(), vec![path]);
+        assert_eq!(debouncer.drain_ready_at(at(t0, 80)), vec![path]);
     }
 }
