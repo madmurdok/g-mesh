@@ -570,6 +570,34 @@ temp-directory fixtures, so they care about the environment they run in:
   daemons have no console, so this is the only way to see what one is doing
   during a test run; unset, nothing changes.
 
+### What CI runs, and what is still only local
+
+`.github/workflows/ci.yml` runs on every push to `main`/`release-*` and every
+pull request, and `release.yml` calls the same workflow as a gate — so nothing
+can be published from a commit whose tests have not passed:
+
+- **`cargo test` on all four supported targets**, the same rows `release.yml`
+  builds (`x86_64-apple-darwin`, `aarch64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`). Before this existed
+  the Windows port was verified by compilation alone: no unit test and no
+  integration binary had ever been executed there.
+- **`cargo clippy`**, denying warnings.
+- **shellcheck** over every `*.sh`, at the lowest severity, with the version
+  pinned so a new ShellCheck release cannot turn the gate red on unchanged
+  code.
+
+Still only local, deliberately:
+
+- **The embedding-weights tests**, which stay `#[ignore]`d. 612 MiB per runner
+  on four runners is not a cost worth paying to check that a download works.
+- **`cargo fmt --check`.** The repository has no formatting history to enforce:
+  `rustfmt.toml` now records the style the code is actually written in (see
+  that file for how those values were derived), but 578 hunks still separate
+  the tree from it. Applying them is a one-time reformat of most files and is
+  tracked as its own task, along with the `.git-blame-ignore-revs` entry that
+  should land beside it.
+- **The benchmarks** (`g-mesh-bench`), which cost model spend per run.
+
 ## License
 
 Licensed under either of

@@ -230,7 +230,7 @@ fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
         .iter()
         .map(|(language, manifest)| (language.as_str(), plugin::fingerprint(manifest)))
         .collect();
-    fingerprinted.sort_unstable_by(|(one, _), (other, _)| one.cmp(other));
+    fingerprinted.sort_unstable_by_key(|(one, _)| *one);
 
     let mut hasher = Sha256::new();
     for (language, fingerprint) in &fingerprinted {

@@ -438,8 +438,8 @@ impl PluginSupervisor {
     ///
     /// This is a genuinely different gap from the one
     /// `daemon::indexing_status`'s "Why the incremental-edit watcher path
-    /// does not re-arm this" section (task 111) reasons about. That argument
-    /// - a query blocks on the same mutex a live `apply_file_change` commit
+    /// does not re-arm this" section (task 111) reasons about. That argument -
+    /// a query blocks on the same mutex a live `apply_file_change` commit
     /// holds, so it can only ever read stale-but-consistent data, never torn
     /// data - is about a change the watcher *has already seen* and is in the
     /// middle of applying. It says nothing about a change the watcher never
@@ -452,8 +452,8 @@ impl PluginSupervisor {
     /// separate gap task 111 flagged as worth its own task rather than
     /// folding into `IndexingStatus`, and this method is that task's wiring.
     ///
-    /// Wakes the plugin exactly like [`replay_pending`](Self::replay_pending)
-    /// - spawning it if it is asleep - but only when the mtime/hash
+    /// Wakes the plugin exactly like [`replay_pending`](Self::replay_pending) -
+    /// spawning it if it is asleep - but only when the mtime/hash
     /// comparison actually calls for a reindex; the common case (nothing
     /// changed) resolves off the `indexed_files` table alone and never
     /// touches the plugin lock, matching the two-tier design

@@ -11,6 +11,11 @@ on:
       - main
       - "release-*"
   pull_request:
+  # So `release.yml` can gate on these jobs rather than duplicating them. A
+  # release able to publish artifacts from a commit whose tests never ran is
+  # the state this file exists to end, and the only way to be sure it is the
+  # *same* checks is to call the same workflow.
+  workflow_call:
 
 permissions:
   contents: read
@@ -63,3 +68,97 @@ jobs:
           set -euo pipefail
           git ls-files '*.sh' | sed 's/^/  checking /'
           git ls-files -z '*.sh' | xargs -0 shellcheck -S style
+
+  test:
+    name: cargo test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # The integration suite spawns real daemons, real shims and the real JS/TS
+    # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
+    # and Oniguruma from scratch. Locally the suite alone takes tens of
+    # minutes; this is a deadlock guard, not a target.
+    timeout-minutes: 90
+    strategy:
+      # One platform failing must not hide whether the other three work -
+      # which is the whole point here, since before this job the Windows port
+      # was verified by compilation alone.
+      fail-fast: false
+      matrix:
+        # The same four rows release.yml builds, deliberately: a target that
+        # ships is a target whose tests ran. Kept in step by hand rather than
+        # shared, because the two matrices carry different extra fields and a
+        # merged one would be harder to read than two honest copies.
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -vV
+
+      # `build.rs` runs `npm run build` for the JS/TS plugin, and the
+      # integration tests drive that plugin for real - so this is a test
+      # dependency here, not only a packaging one. Pinned to match release.yml
+      # for the same reason it is pinned there.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
+      # points at /tmp/g-mesh-test-home for everything cargo launches - so a
+      # runner needs no setup for it, and on Windows it resolves against the
+      # current drive. That file is what makes this job safe to run at all:
+      # without it the suite would write into the runner's real home.
+      #
+      # The embedding-weights tests stay `#[ignore]`d. 612 MiB per runner, on
+      # four runners, is not a cost worth paying for a check that a download
+      # works.
+      - name: cargo test
+        shell: bash
+        run: cargo test --manifest-path core/Cargo.toml
+
+  lint:
+    name: cargo clippy
+    runs-on: ubuntu-22.04
+    # One platform, unlike `test`: clippy's findings here are about the code,
+    # not about the target. The cfg'd platform modules are the exception, and
+    # `ipc/windows.rs` is small enough that the Windows `test` job compiling it
+    # is the check that matters for it.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add clippy
+          cargo clippy --version
+
+      # build.rs builds the plugin, so clippy needs Node just as the tests do.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      # `-D warnings`, because a lint that reports and passes is a lint nobody
+      # reads. The tree was brought to zero findings before this was turned on
+      # (44 of them: 36 doc-list continuations, a transmute without
+      # annotations, a seven-field tuple type, and one assertion that was
+      # constant-true and therefore checking nothing).
+      #
+      # `cargo fmt --check` is deliberately NOT here yet - see rustfmt.toml for
+      # why, and GM-241 for what has to land before it can be.
+      - name: cargo clippy
+        run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings

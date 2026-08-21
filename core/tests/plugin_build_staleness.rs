@@ -48,8 +48,8 @@
 //! One consequence of that placement, worth stating because it is not
 //! obvious: while a copy exists, the *bundled* plugin directory it sits in has
 //! different contents, so the generation string a daemon discovering the
-//! bundled plugin would compute moves too. Nothing in the suite observes that
-//! - `cargo test` runs one test binary at a time, each copy is created before
+//! bundled plugin would compute moves too. Nothing in the suite observes that -
+//! `cargo test` runs one test binary at a time, each copy is created before
 //! this file's own daemons start and removed on `Drop` - but a test elsewhere
 //! made to run *concurrently* with this file could see an index of its own go
 //! stale for reasons it never caused.
