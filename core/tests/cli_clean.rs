@@ -7,9 +7,13 @@
 //! it was the developer's real `~/.g-mesh`, and since then it is one
 //! `G_MESH_HOME` that every test binary in this directory writes into
 //! concurrently. Either way a sweeping delete from here would take out
-//! fixtures that belong to someone else. Those forms are covered by the unit
-//! tests in `cli::clean`, which inject a projects root of their own and can
-//! therefore delete everything in it safely.
+//! fixtures that belong to someone else.
+//!
+//! Those forms now live in `cli_clean_sweeping.rs`, which gives each test a
+//! `G_MESH_HOME` of its own so a sweep inside it is safe by construction. The
+//! unit tests in `cli::clean` still cover the classification with an injected
+//! root; what they cannot show, and that file can, is that the word on the
+//! command line reaches that code at all.
 //!
 //! What is still worth driving as a subprocess is the wiring: that the word
 //! reaches the right code path and reports rather than deletes.
