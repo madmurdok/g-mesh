@@ -432,9 +432,9 @@ verified - refusing to install unverified bytes."
 	# The .sha256 file is `<hex>  <basename>`, written by build-targets.sh and
 	# re-checked at publish time by prepare-release-assets.sh; only the digest
 	# matters here, since we know which file we just fetched.
-	_expected="$(awk '{ print $1 }' "$_work/$_asset.sha256" | tr 'A-Z' 'a-z')"
+	_expected="$(awk '{ print $1 }' "$_work/$_asset.sha256" | tr '[:upper:]' '[:lower:]')"
 	[ -n "$_expected" ] || die "the published checksum file for $_asset is empty or malformed - refusing to install unverified bytes"
-	_actual="$(sha256_of "$_work/$_asset" | tr 'A-Z' 'a-z')"
+	_actual="$(sha256_of "$_work/$_asset" | tr '[:upper:]' '[:lower:]')"
 	if [ "$_expected" != "$_actual" ]; then
 		die "checksum mismatch for $_asset - NOTHING was installed.
   expected: $_expected
@@ -508,6 +508,13 @@ this binary."
 		;;
 	*)
 		_rc='your shell profile'
+		# The tildes below are deliberate and must not become $HOME: this
+		# string is printed for a human to read, as the trailing comment on
+		# a sample `export PATH` line. "~/.zshrc" is how a person refers to
+		# that file; expanding it to /Users/someone/.zshrc would make the
+		# advice longer and no clearer, and this script never opens any of
+		# these paths - it says outright that it does not edit rc files.
+		# shellcheck disable=SC2088
 		case "$(basename "${SHELL:-sh}")" in
 		zsh) _rc="~/.zshrc" ;;
 		bash) _rc="~/.bashrc (macOS: ~/.bash_profile)" ;;
