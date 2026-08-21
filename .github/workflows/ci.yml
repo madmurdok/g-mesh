@@ -72,6 +72,8 @@ jobs:
   test:
     name: cargo test (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    env:
+      RUST_VERSION: "1.97.1"
     # The integration suite spawns real daemons, real shims and the real JS/TS
     # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
     # and Oniguruma from scratch. Locally the suite alone takes tens of
@@ -100,11 +102,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned, not `stable`, and this run is why: clippy gained a lint between
+      # this pin and the runner's then-current stable, and it turned the gate
+      # red on code nobody had touched. Same reasoning as the ShellCheck pin -
+      # a gate that fails for reasons unrelated to your change is a gate people
+      # stop reading. Bumping this is a deliberate act with its own diff, which
+      # is where the new findings get triaged.
       - name: Install Rust toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
           rustc -vV
 
       # `build.rs` runs `npm run build` for the JS/TS plugin, and the
@@ -114,6 +122,16 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22.x"
+
+      # `build.rs` runs `npm run build` for the plugin, and on a fresh checkout
+      # there is nothing to build *with* - so without this it exits 2, build.rs
+      # downgrades that to a warning ("dist/ may be stale"), the run continues,
+      # and the two tests that drive the real plugin fail much later with
+      # "plugin closed its stdout before sending a handshake". Invisible on a
+      # developer machine, where node_modules has been there since day one.
+      - name: Install the plugin's dependencies
+        working-directory: plugins/typescript
+        run: npm ci
 
       # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
       # points at /tmp/g-mesh-test-home for everything cargo launches - so a
@@ -131,6 +149,8 @@ jobs:
   lint:
     name: cargo clippy
     runs-on: ubuntu-22.04
+    env:
+      RUST_VERSION: "1.97.1"
     # One platform, unlike `test`: clippy's findings here are about the code,
     # not about the target. The cfg'd platform modules are the exception, and
     # `ipc/windows.rs` is small enough that the Windows `test` job compiling it
@@ -139,11 +159,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned, not `stable`, and this run is why: clippy gained a lint between
+      # this pin and the runner's then-current stable, and it turned the gate
+      # red on code nobody had touched. Same reasoning as the ShellCheck pin -
+      # a gate that fails for reasons unrelated to your change is a gate people
+      # stop reading. Bumping this is a deliberate act with its own diff, which
+      # is where the new findings get triaged.
       - name: Install Rust toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
           rustup component add clippy rustfmt
           cargo clippy --version
           cargo fmt --version
@@ -152,6 +178,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22.x"
+
+      - name: Install the plugin's dependencies
+        working-directory: plugins/typescript
+        run: npm ci
 
       # Before clippy, because it is the cheaper failure and the one with an
       # obvious fix: `cargo fmt` and push. The style it enforces is recorded in
