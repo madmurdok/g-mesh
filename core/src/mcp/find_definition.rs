@@ -308,47 +308,6 @@ fn by_file_name(conn: &Connection, name: &str) -> Result<Result<Resolved, CallTo
     .map(Err)
 }
 
-/// The not-found answer, with the one thing the index can add to it.
-///
-/// A bare "no symbol named X found" is true and useless in the case that
-/// produces it most often: `import DropdownMenuGroup from "./DropdownMenuGroup"`
-/// binds the file's default export under a local name, and that local name is
-/// never indexed (`graph::symbol_links`' module doc: "the local name never
-/// reaches this index at all"). So the caller is holding a name that appears at
-/// every use site, gets nothing back, and falls back to grep - having spent a
-/// whole round trip, which at an MCP client's prompt prefix is the most
-/// expensive thing a tool call can waste (measured at 18-22k tokens on
-/// g-mesh-bench, against ~150 for the answer below).
-///
-/// The file's name is the one link the index does hold, so when a file is named
-/// after the queried symbol this says what that file declares. It does not
-/// claim those declarations *are* the symbol - nothing here establishes that,
-/// and this codebase's standing rule is that a missing edge beats a wrong one.
-/// It hands over the evidence and lets the caller re-query by a name that
-/// resolves.
-fn not_found_message(conn: &Connection, name: &str) -> Result<String, ErrorData> {
-    const MAX_SUGGESTIONS: usize = 5;
-    let in_file = queries::find_in_file_named(conn, name, MAX_SUGGESTIONS)
-        .map_err(|e| internal_error("failed to look up nodes by file name", e))?;
-    let Some(first) = in_file.first() else {
-        return Ok(format!("g-mesh: no symbol named '{name}' found"));
-    };
-
-    let declared = in_file
-        .iter()
-        .map(|n| format!("{} ({})", n.name, n.kind))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "g-mesh: no symbol named '{name}' found - no declaration carries that name. \
-         The file {} does, and declares: {declared}. A default import binds a file's \
-         export under whatever local name the importing file chose, and that local name is \
-         not indexed - so a name read at a use site can be absent here while the \
-         declaration it refers to is present under its own name. Re-query by one of those.",
-        first.file_path,
-    ))
-}
-
 /// `find_definition`'s own symbol-name input: the shared resolution above,
 /// with the resolved case formatted as the full node this tool promises.
 fn by_name(conn: &Connection, name: &str, cursor: Option<&str>) -> Result<CallToolResult, ErrorData> {
@@ -571,56 +530,6 @@ mod tests {
         assert_eq!(all_ids.len(), total, "every candidate must appear exactly once across both pages");
     }
 
-    /// The failure this exists for: a file declares one name, default-exports
-    /// it, and every importer binds it under the file's own name - which is
-    /// never indexed (see `graph::symbol_links`). A bare "not found" sends the
-    /// caller to grep having already spent a round trip; the file it is named
-    /// after is the one link the index holds.
-    #[test]
-    fn a_name_that_is_only_a_file_name_gets_told_what_that_file_declares() {
-        let mut conn = setup();
-        upsert_node(
-            &mut conn,
-            NodeRecord::new(
-                "menu_group",
-                "Function",
-                "MenuGroup",
-                "MenuGroup",
-                "src/components/DropdownMenuGroup.tsx",
-                "typescript",
-            ),
-        )
-        .unwrap();
-
-        let message = not_found_message(&conn, "DropdownMenuGroup").unwrap();
-
-        assert!(message.contains("src/components/DropdownMenuGroup.tsx"), "{message}");
-        assert!(message.contains("MenuGroup (Function)"), "{message}");
-    }
-
-    /// A name that is nowhere keeps the short answer. The explanation is only
-    /// worth its length where there is something to explain - charging every
-    /// miss for it would put prose in front of the common case.
-    #[test]
-    fn a_name_that_matches_no_file_keeps_the_terse_answer() {
-        let mut conn = setup();
-        upsert_node(
-            &mut conn,
-            NodeRecord::new(
-                "menu_group",
-                "Function",
-                "MenuGroup",
-                "MenuGroup",
-                "src/components/DropdownMenuGroup.tsx",
-                "typescript",
-            ),
-        )
-        .unwrap();
-
-        let message = not_found_message(&conn, "NoSuchThingAnywhere").unwrap();
-
-        assert_eq!(message, "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
-    }
 
     /// The ladder's contract: every answer says which rung reached it, so a
     /// caller can tell "this is your symbol" from "these might be".
