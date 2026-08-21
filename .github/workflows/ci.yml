@@ -98,6 +98,14 @@ jobs:
             runner: ubuntu-22.04
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
+            # The integration suite's cold-start budget was tuned on a
+            # developer Mac. On this runner one walk overran the 90s default
+            # and failed the binary - and the harness's own message says what
+            # to do about it: raise the budget, and if a bigger one changes
+            # nothing then no daemon is walking that root at all. So this is
+            # the diagnostic step, not a workaround: if Windows still times
+            # out at 300s, the cause is not slowness. See GM-246.
+            indexed_timeout_secs: "300"
 
     steps:
       - uses: actions/checkout@v7
@@ -144,6 +152,11 @@ jobs:
       # works.
       - name: cargo test
         shell: bash
+        env:
+          # Empty on every other row, which leaves the harness's own default in
+          # place - `common::indexed_timeout` falls back when this is unset or
+          # unparsable.
+          G_MESH_TEST_INDEXED_TIMEOUT_SECS: ${{ matrix.indexed_timeout_secs }}
         run: cargo test --manifest-path core/Cargo.toml
 
   lint:
