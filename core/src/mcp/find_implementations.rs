@@ -33,7 +33,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
-use super::{anchor, FindImplementationsParams, SymbolQueryParams};
+use super::{anchor, find_definition, FindImplementationsParams, SymbolQueryParams};
 
 /// The one edge kind both the single-hop and transitive walks follow -
 /// pulled out for the transitive path's own `TraversalOptions`/`ResumeState`
@@ -347,10 +347,16 @@ fn bound_walk(
 fn from_root(
     conn: &Connection,
     anchor_node: &NodeRecord,
+    resolved_by: find_definition::ResolvedBy,
     hint: Option<&'static str>,
     max_depth: Option<u32>,
 ) -> Result<CallToolResult, ErrorData> {
-    let anchor_info = anchor::AnchorInfo::from(anchor_node);
+    // Carries the rung for the same reason the single-hop path does: a caller
+    // must be able to tell an exact resolution from one the ladder suggested,
+    // and `transitive: true` is the same query with a deeper walk, not a
+    // different kind of answer. Only `continued` legitimately has no rung -
+    // a resumed walk carries its anchor rather than resolving one.
+    let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by);
     let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
     if let Some(depth) = max_depth {
@@ -421,7 +427,7 @@ pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementation
     let resolved_by = resolved.by;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, hint, max_depth)
+    from_root(&conn, &anchor, resolved_by, hint, max_depth)
 }
 
 #[cfg(test)]
@@ -577,6 +583,29 @@ mod tests {
         let body = json_body(&dispatch(&conn, params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
+        // The rung travels with the anchor, and this path is where it was
+        // dropped: `dispatch` resolved it for the transitive walk and threw
+        // it away, so `transitive: true` answered without a `resolvedBy`
+        // while the single-hop path beside it carried one. The compiler said
+        // so - an unused-variable warning - which is the only reason it was
+        // caught, since every assertion here passed without it.
+        assert_eq!(body["anchor"]["resolvedBy"], "id");
+    }
+
+    /// The rung has to be the one that actually reached the anchor, not a
+    /// constant: asserting only `resolvedBy`'s presence would pass just as
+    /// well if `from_root` hardcoded a value.
+    #[test]
+    fn a_transitive_walk_reports_the_rung_that_reached_its_anchor() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+        let params = FindImplementationsParams {
+            symbol_name: Some("pkg::Iface".to_string()),
+            transitive: Some(true),
+            ..Default::default()
+        };
+        let body = json_body(&dispatch(&conn, params).unwrap());
+        assert_eq!(body["anchor"]["id"], "interface");
+        assert_eq!(body["anchor"]["resolvedBy"], "qualifiedName", "resolved by qualifiedName, not by id");
     }
 
     /// A resumed walk's caller already received the anchor on the response
