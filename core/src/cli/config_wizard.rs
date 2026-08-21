@@ -285,7 +285,7 @@ mod tests {
 
         let (updated, _) = run_global_wizard(&existing, "n\n30\n");
 
-        assert_eq!(updated.cleanup.enabled, false);
+        assert!(!updated.cleanup.enabled);
         assert_eq!(updated.cleanup.idle_threshold_days, 30);
     }
 
@@ -295,7 +295,7 @@ mod tests {
 
         let (updated, transcript) = run_global_wizard(&existing, "maybe\nyes\n90\n");
 
-        assert_eq!(updated.cleanup.enabled, true);
+        assert!(updated.cleanup.enabled);
         assert!(transcript.contains("please answer y or n"), "{transcript}");
     }
 
@@ -324,7 +324,7 @@ mod tests {
         // dedicated global path test in `config::tests`.
         let existing = GlobalConfig::default();
         let (updated, _) = run_global_wizard(&existing, "n\n45\n");
-        assert_eq!(updated.cleanup.enabled, false);
+        assert!(!updated.cleanup.enabled);
         assert_eq!(updated.cleanup.idle_threshold_days, 45);
     }
 }

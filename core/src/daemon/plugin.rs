@@ -169,8 +169,8 @@ fn launch_command_for(entry: &Path) -> (PathBuf, Vec<String>) {
 /// other callers that predate per-language pid files and only ever meant
 /// "the bundled JS/TS plugin's pid" (see that function's doc comment).
 /// Production code that has to be genuinely multi-language-aware
-/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant
-/// - it lists every `plugin-<language>.pid` file `PluginRegistry` writes
+/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant -
+/// it lists every `plugin-<language>.pid` file `PluginRegistry` writes
 /// instead of assuming this one.
 pub const BUNDLED_LANGUAGE: &str = "typescript";
 

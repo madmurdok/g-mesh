@@ -445,8 +445,8 @@ mod tests {
     /// be derived from anything at runtime.
     ///
     /// Core prints it when `handshake::verify` refuses a protocol mismatch -
-    /// "protocol version mismatch with typescript plugin (plugin version X)"
-    /// - while `g-mesh plugins list` prints the manifest's copy. The two had
+    /// "protocol version mismatch with typescript plugin (plugin version X)" -
+    /// while `g-mesh plugins list` prints the manifest's copy. The two had
     /// drifted: the manifest said 2.1.0 and the wire said 0.1.0, so the two
     /// screens a person consults about one plugin named different versions,
     /// and the one shown at the worst possible moment was three releases
@@ -621,7 +621,7 @@ extensions = [{extensions}]
             ("go", &manifest_toml("go", "1.0.0", &[".foo"])),
         ]);
 
-        let err = discover(&[root.clone()]).unwrap_err();
+        let err = discover(std::slice::from_ref(&root)).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("python"), "{message}");
         assert!(message.contains("go"), "{message}");

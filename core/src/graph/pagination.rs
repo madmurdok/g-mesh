@@ -46,8 +46,8 @@ pub const MAX_RESPONSE_BYTES: usize = 20_000;
 /// The `kind` value a `File` node carries. A `File` node's `qualifiedName`
 /// IS its own project-relative path by construction - see
 /// `plugins/typescript/src/extract.ts`'s `run()`, which sets
-/// `qualifiedName: this.filePath` for the node it emits for the file itself
-/// - so it is byte-identical to that same row's `filePath` in every case,
+/// `qualifiedName: this.filePath` for the node it emits for the file itself -
+/// so it is byte-identical to that same row's `filePath` in every case,
 /// never worth sending twice. Its `startLine`/`startCol` are likewise
 /// always the file's own root syntax node position (`(0, 0)`), meaningless
 /// as a "where in this file" answer. Neither redundancy holds for any other

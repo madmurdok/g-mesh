@@ -30,6 +30,10 @@ use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
+/// One `declarations` row as this test reads it: ordinal, the four span
+/// coordinates, the signature and whether it has a body.
+type DeclarationRow = (i64, i64, i64, i64, i64, Option<String>, bool);
+
 /// The single-language discovery this suite walks with - just the bundled
 /// JS/TS plugin, built by hand from [`bundled_manifest`] rather than through
 /// `daemon::manifest::discover`, so this suite's isolation from whatever else
@@ -122,7 +126,7 @@ fn an_overloaded_symbol_is_stored_as_one_node_with_every_declaration_it_was_writ
              FROM declarations WHERE nodeId = ?1 ORDER BY ordinal",
         )
         .unwrap();
-    let rows: Vec<(i64, i64, i64, i64, i64, Option<String>, bool)> = stmt
+    let rows: Vec<DeclarationRow> = stmt
         .query_map([&parse], |row| {
             Ok((
                 row.get(0)?,

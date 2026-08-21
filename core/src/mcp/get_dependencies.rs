@@ -278,8 +278,8 @@ fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<Ca
 
 /// The not-found answer, with what the index can add to it.
 ///
-/// The caller who reaches this usually asked about a *package* or a directory
-/// - "which files import from `@excalidraw/math`" - and this tool takes an
+/// The caller who reaches this usually asked about a *package* or a directory -
+/// "which files import from `@excalidraw/math`" - and this tool takes an
 /// exact file path. A bare refusal sends them hunting with Glob for the entry
 /// point, which costs a round trip: measured on g-mesh-bench as
 /// `get_dependencies[57ch] -> Glob -> Glob -> get_dependencies[16267ch]`.

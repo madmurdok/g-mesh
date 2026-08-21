@@ -28,6 +28,13 @@ pub struct Endpoint(PathBuf);
 const SUN_PATH_CAPACITY: usize =
     std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
+/// The capacity is derived rather than written down, so this pins the shape it
+/// must have: the two values the manual pages give (104 on macOS, 108 on
+/// Linux) and nothing else. A compile-time assertion rather than a test,
+/// because a platform where this lands somewhere else is one where the
+/// derivation is wrong - that should fail the build, not one test case.
+const _: () = assert!(SUN_PATH_CAPACITY == 104 || SUN_PATH_CAPACITY == 108);
+
 impl Endpoint {
     /// The socket file for a project, as `daemon::endpoint` derives it.
     pub fn at_path(path: PathBuf) -> Self {
@@ -170,17 +177,6 @@ pub type AsyncStream = tokio::net::UnixStream;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The capacity is read off `sockaddr_un` rather than written down, so
-    /// this asserts the shape it must have on any platform: the two values
-    /// the manual pages give (104 on macOS, 108 on Linux) and nothing else.
-    #[test]
-    fn capacity_matches_the_platform() {
-        assert!(
-            SUN_PATH_CAPACITY == 104 || SUN_PATH_CAPACITY == 108,
-            "unexpected sun_path capacity {SUN_PATH_CAPACITY}"
-        );
-    }
 
     #[test]
     fn a_short_path_is_accepted() {
