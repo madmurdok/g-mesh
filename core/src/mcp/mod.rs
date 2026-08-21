@@ -353,7 +353,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
-        find_definition::handle(&self.conn, self.registry.project_root(), params.0)
+        find_definition::handle(&self.conn, self.registry.project_root(), &self.embedding, params.0)
     }
 
     #[tool(
@@ -367,7 +367,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_references::handle(&self.conn, params.0)
+        find_references::handle(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -375,7 +375,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callers(&self.conn, params.0)
+        find_callers_callees::handle_callers(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -383,7 +383,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callees(&self.conn, params.0)
+        find_callers_callees::handle_callees(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(
@@ -397,7 +397,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_implementations::dispatch(&self.conn, params.0)
+        find_implementations::dispatch(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(
