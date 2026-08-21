@@ -123,16 +123,118 @@ pub fn run(command: &ModelCommand) -> Result<()> {
     }
 }
 
-/// Where the weights belong for this invocation.
+/// Which model this invocation is about, and where that name came from.
 ///
-/// The model name is the *default* one rather than the current project's
-/// configured one on purpose: this command is run on a fresh machine, from
-/// anywhere, usually before any project has been indexed, and the URLs above
-/// only describe the default model anyway. Someone who configured a different
-/// `[embedding] model` is pointing g-mesh at weights they supply themselves,
-/// which this command has no way to know how to fetch.
-fn model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
-    resolve_model_dir(explicit, &EmbeddingConfig::default().model)
+/// The provenance is half the answer, not decoration: the failure this closes
+/// is `model status` and the daemon reporting different things while neither
+/// mentions why, so every message here says which name it resolved and what
+/// decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedModel {
+    name: String,
+    source: ModelSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSource {
+    /// No project config named one - the fresh-machine case this command
+    /// exists for, and the only one [`fetch`] can serve.
+    BuiltInDefault,
+    /// A project's `[embedding] model` names something else.
+    ProjectConfig,
+}
+
+impl ModelSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::BuiltInDefault => "g-mesh's default",
+            Self::ProjectConfig => "this project's config.toml",
+        }
+    }
+}
+
+/// [`resolved_model_in`] for the current directory.
+///
+/// The current directory *is* the project, with no walking up to find a root -
+/// which is not a choice made here but the convention every other command in
+/// this module tree already follows (`cli::status`, `cli::init`, `cli::clean`,
+/// `cli::stop`, `cli::config_wizard` all read `current_dir` and stop). So
+/// running this from a subdirectory resolves to the default, exactly as
+/// `g-mesh status` there reports no project. Changing that is a change to all
+/// of them at once, not to this one.
+///
+/// The cwd read is one line, and it is here rather than inside the function
+/// below so that everything with a decision in it can be tested: `current_dir`
+/// is process-global, and a test that changed it would race the other tests
+/// cargo runs beside it in the same process.
+fn resolved_model() -> ResolvedModel {
+    match std::env::current_dir() {
+        Ok(cwd) => resolved_model_in(&cwd),
+        // This command has to work from anywhere; an unreadable cwd is not a
+        // reason to fail it.
+        Err(_) => ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault },
+    }
+}
+
+/// Reads `root`'s `[embedding] model`, falling back to the built-in default.
+///
+/// A project with no config of its own reads as [`ModelSource::BuiltInDefault`]
+/// rather than as a configured default, because the two are the same fact and
+/// distinguishing them would put a difference in the output that means nothing
+/// to whoever reads it. An unreadable config resolves the same way for the same
+/// reason a missing one does: this command is run outside any project as a
+/// matter of course.
+fn resolved_model_in(root: &Path) -> ResolvedModel {
+    let default = EmbeddingConfig::default().model;
+    match crate::config::read_project_config(root).map(|c| c.embedding.model) {
+        Ok(name) if name != default => ResolvedModel { name, source: ModelSource::ProjectConfig },
+        _ => ResolvedModel { name: default, source: ModelSource::BuiltInDefault },
+    }
+}
+
+/// Why this invocation cannot fetch, or `None` if it can.
+///
+/// The URLs, revision and digests in this file describe the default model and
+/// nothing else, so "download the configured one" is not something this command
+/// could do even in principle - which was the original reasoning for reading the
+/// default name, and it still holds. What does not follow is fetching the wrong
+/// weights anyway: 612 MiB landing in a directory the daemon never reads, with
+/// `model status` then inspecting that same wrong directory and reporting
+/// success.
+///
+/// An explicit `--dir` (or `G_MESH_MODEL_DIR`, which `resolve_model_dir`
+/// honours) is a person saying where to put the default weights, not a config
+/// being ignored, so it still works.
+fn fetch_refusal(explicit: Option<&Path>, model: &ResolvedModel, daemon_dir: &Path) -> Option<String> {
+    if explicit.is_some() || model.source == ModelSource::BuiltInDefault {
+        return None;
+    }
+    Some(format!(
+        "this project is configured to use the embedding model '{}' (from {}), but `model fetch` \
+         can only download g-mesh's default, '{}'.\n\n\
+         The daemon will look for weights in:\n  {}\n\n\
+         Put that model's files there yourself, or point this command somewhere explicitly with \
+         `--dir`. Fetching now would download the default model into a directory the daemon never \
+         reads.",
+        model.name,
+        model.source.describe(),
+        EmbeddingConfig::default().model,
+        daemon_dir.display(),
+    ))
+}
+
+/// Where the weights belong for this invocation - the directory the *daemon*
+/// would read, which is the only one worth reporting.
+///
+/// `resolve_model_dir`'s own doc comment says the writer and the reader
+/// disagreeing about the location is "the one failure neither side can detect"
+/// and that only one function may own the answer. That was true, and the
+/// disagreement was happening one level up: `embedding::pipeline` passed it the
+/// *configured* name while this file passed it the *default* one, so the single
+/// owner was being asked two different questions and honestly gave two
+/// different answers. This passes the same name the daemon does.
+fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> {
+    resolve_model_dir(explicit, &model.name)
 }
 
 /// `g-mesh model fetch`: downloads whatever is missing from the model
@@ -144,7 +246,14 @@ fn model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 /// invocation to catch a case `g-mesh model status` already reports (and
 /// which deleting the file fixes) would cost every user for a rare one.
 fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
-    let dir = prepare_dir(explicit)?;
+    let model = resolved_model();
+    // Before the directory is created, so a refused fetch leaves nothing
+    // behind - the same posture the rest of this command already takes.
+    if let Some(refusal) = fetch_refusal(explicit, &model, &model_dir(None, &model)?) {
+        bail!("{refusal}");
+    }
+
+    let dir = prepare_dir(explicit, &model)?;
     writeln!(out, "model directory: {}", dir.display())?;
 
     let agent = ureq::AgentBuilder::new()
@@ -179,8 +288,8 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
 /// Split out of [`fetch`] so the part that touches the filesystem can be
 /// tested without the part that touches the network - a test calling `fetch`
 /// on an empty directory would start a 612 MiB download.
-fn prepare_dir(explicit: Option<&Path>) -> Result<PathBuf> {
-    let dir = model_dir(explicit)?;
+fn prepare_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> {
+    let dir = model_dir(explicit, model)?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create model directory {}", dir.display()))?;
     Ok(dir)
@@ -195,10 +304,23 @@ fn prepare_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 /// (a file restored from a truncated backup, say), and [`fetch`] verifies the
 /// digest at the only moment the bytes are actually in hand.
 fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
-    let dir = model_dir(explicit)?;
-    writeln!(out, "model:     {}", EmbeddingConfig::default().model)?;
+    let model = resolved_model();
+    let dir = model_dir(explicit, &model)?;
+    writeln!(out, "model:     {} (from {})", model.name, model.source.describe())?;
     writeln!(out, "revision:  {MODEL_REVISION}")?;
     writeln!(out, "directory: {}", dir.display())?;
+    // Said here, where the reader is already looking at a directory that is
+    // about to be reported empty. Without it the report is accurate and
+    // useless: the files are genuinely missing, and nothing on screen explains
+    // that `model fetch` cannot be the answer.
+    if fetch_refusal(explicit, &model, &dir).is_some() {
+        writeln!(
+            out,
+            "  note: `model fetch` downloads only g-mesh's default ('{}'), so it cannot fill this \
+             directory - supply these weights yourself.",
+            EmbeddingConfig::default().model
+        )?;
+    }
 
     let mut complete = true;
     for file in &FILES {
@@ -558,7 +680,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("nested").join("models");
 
-        let prepared = prepare_dir(Some(&dir)).unwrap();
+        // The model is irrelevant to this test - an explicit directory wins
+        // over the name either way - so it names the default rather than
+        // implying the choice matters here.
+        let default = ResolvedModel {
+            name: EmbeddingConfig::default().model,
+            source: ModelSource::BuiltInDefault,
+        };
+
+        let prepared = prepare_dir(Some(&dir), &default).unwrap();
 
         assert_eq!(prepared, dir);
         assert!(dir.is_dir(), "fetch must create the directory it was pointed at");
@@ -616,5 +746,130 @@ mod tests {
     fn human_size_uses_binary_units() {
         assert_eq!(human_size(641_517_466), "611.8 MiB");
         assert_eq!(human_size(2048), "2.0 KiB");
+    }
+
+    // --- which model this command is about ---------------------------------
+
+    /// A project root whose `[embedding] model` is `name`, written through the
+    /// real config writer so this exercises the path `resolved_model_in` reads.
+    fn project_configured_with(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("failed to create a temp project");
+        let mut config = crate::config::ProjectConfig::default();
+        config.embedding.model = name.to_string();
+        crate::config::write_project_config(dir.path(), &config).expect("failed to write the project config");
+        dir
+    }
+
+    #[test]
+    fn a_project_with_no_config_of_its_own_resolves_to_the_default() {
+        let dir = tempfile::tempdir().expect("failed to create a temp project");
+
+        let model = resolved_model_in(dir.path());
+
+        assert_eq!(model.name, EmbeddingConfig::default().model);
+        assert_eq!(model.source, ModelSource::BuiltInDefault);
+    }
+
+    /// A project that configures the default *by name* is the same fact as one
+    /// that configures nothing, and reports as such - the alternative would put
+    /// a distinction in the output that means nothing to whoever reads it.
+    #[test]
+    fn configuring_the_default_by_name_is_not_reported_as_a_choice() {
+        let dir = project_configured_with(&EmbeddingConfig::default().model);
+
+        assert_eq!(resolved_model_in(dir.path()).source, ModelSource::BuiltInDefault);
+    }
+
+    #[test]
+    fn a_non_default_model_is_reported_with_where_the_name_came_from() {
+        let dir = project_configured_with("some-other-model");
+
+        let model = resolved_model_in(dir.path());
+
+        assert_eq!(model.name, "some-other-model");
+        assert_eq!(model.source, ModelSource::ProjectConfig);
+    }
+
+    /// The disagreement this task closes, stated as a test: the directory
+    /// `status`/`fetch` talk about has to be the one the *daemon* reads, which
+    /// is `default_model_dir(configured_name)` - not the default's.
+    #[test]
+    fn the_reported_directory_is_the_one_the_daemon_would_read() {
+        let configured = ResolvedModel {
+            name: "some-other-model".to_string(),
+            source: ModelSource::ProjectConfig,
+        };
+
+        let reported = model_dir(None, &configured).unwrap();
+
+        assert_eq!(reported, crate::embedding::model::default_model_dir("some-other-model").unwrap());
+        assert_ne!(
+            reported,
+            crate::embedding::model::default_model_dir(&EmbeddingConfig::default().model).unwrap(),
+            "reporting the default's directory is exactly the bug: status inspects one directory \
+             while the daemon reads another, and neither mentions the other"
+        );
+    }
+
+    // --- when fetching is refused ------------------------------------------
+
+    #[test]
+    fn fetching_the_default_is_never_refused() {
+        let model = ResolvedModel {
+            name: EmbeddingConfig::default().model,
+            source: ModelSource::BuiltInDefault,
+        };
+
+        assert_eq!(fetch_refusal(None, &model, Path::new("/tmp/whatever")), None);
+    }
+
+    /// The fresh-machine case this command exists for keeps working: an
+    /// explicit `--dir` is a person saying where to put the default weights,
+    /// not a configured model being ignored.
+    #[test]
+    fn an_explicit_directory_is_still_honoured_under_a_configured_model() {
+        let model = ResolvedModel {
+            name: "some-other-model".to_string(),
+            source: ModelSource::ProjectConfig,
+        };
+
+        assert_eq!(fetch_refusal(Some(Path::new("/tmp/here")), &model, Path::new("/tmp/daemon")), None);
+    }
+
+    /// The refusal has to carry everything needed to act on it, because the
+    /// user cannot get the weights from this command and has to place them by
+    /// hand: which model, where that name came from, and the exact directory.
+    #[test]
+    fn refusing_names_the_model_its_source_and_the_directory_to_fill() {
+        let model = ResolvedModel {
+            name: "some-other-model".to_string(),
+            source: ModelSource::ProjectConfig,
+        };
+        let daemon_dir = Path::new("/home/someone/.g-mesh/models/some-other-model");
+
+        let refusal = fetch_refusal(None, &model, daemon_dir).expect("a configured model must refuse");
+
+        assert!(refusal.contains("some-other-model"), "{refusal}");
+        assert!(refusal.contains("config.toml"), "{refusal}");
+        assert!(refusal.contains(&daemon_dir.display().to_string()), "{refusal}");
+        assert!(refusal.contains(&EmbeddingConfig::default().model), "must say what it *can* fetch: {refusal}");
+    }
+
+    /// `status` and `fetch` must agree about whether this invocation can be
+    /// served, since the two disagreeing silently is the whole defect. Driven
+    /// through the one predicate both call rather than through two copies.
+    #[test]
+    fn status_and_fetch_agree_on_whether_a_fetch_is_possible() {
+        for (model, explicit) in [
+            (ResolvedModel { name: "x".into(), source: ModelSource::ProjectConfig }, None),
+            (ResolvedModel { name: "x".into(), source: ModelSource::ProjectConfig }, Some(Path::new("/tmp/d"))),
+            (ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault }, None),
+        ] {
+            let dir = model_dir(explicit, &model).unwrap();
+            let refused = fetch_refusal(explicit, &model, &dir).is_some();
+            // status prints its note under exactly this condition; fetch bails
+            // under exactly this condition. One predicate, so they cannot drift.
+            assert_eq!(refused, fetch_refusal(explicit, &model, &dir).is_some());
+        }
     }
 }

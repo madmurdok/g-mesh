@@ -123,8 +123,20 @@ That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
 file is checked against a pinned SHA-256 and only then moved into place, so an
 interrupted download leaves a `.partial` you can delete, never a truncated
 `model.onnx` that loads as garbage. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
-put it elsewhere; the command and the loader share one resolution function, so
-they cannot disagree.
+put it elsewhere; the command and the loader share one resolution function, and
+now pass it the same model name too — they used to share the function and hand
+it different arguments, which is a way of disagreeing that sharing a function
+does not prevent.
+
+That matters if you set `[embedding] model` to something other than the
+default. The model directory is named after the model, so the daemon reads
+`~/.g-mesh/models/<your-model>/` — and `model fetch` can only download the
+default, whose URLs and digests are the only ones pinned here. Rather than
+fetch the wrong weights into a directory nothing reads, it refuses inside such
+a project and names the directory you need to fill yourself; `model status`
+reports that same directory, says which model name it resolved and where the
+name came from, and notes that fetching cannot fill it. Outside a project, and
+with an explicit `--dir`, both behave exactly as before.
 
 The download is HTTPS from the binary itself — no `curl`, no Python, no
 Hugging Face CLI. `core/scripts/fetch-embedding-model.sh` does the same
