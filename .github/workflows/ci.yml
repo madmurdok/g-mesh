@@ -148,20 +148,31 @@ jobs:
       # for. Windows' first integration binary times out waiting for a walk
       # that a 300s budget did not help, so something is not starting rather
       # than running slowly (GM-246).
+      # Windows only. `.cargo/config.toml` sets `/tmp/g-mesh-test-home`, which
+      # is not an absolute path there but a *drive-relative* one: it resolves
+      # against whatever drive the process is on. The test binary runs from the
+      # D: checkout and the detached daemon it spawns need not, so the two got
+      # different state roots - the daemon indexed into its own while the test
+      # waited forever on an index.db that was never going to appear (GM-246).
+      # `force = false` in that file means this explicit value wins.
+      #
+      # A separate step rather than an `env:` expression, because the other
+      # platforms must have this variable *absent*, not empty: cargo's
+      # `force = false` treats an empty-but-present variable as already set and
+      # would leave the state root pointing at nothing.
+      #
+      # Scoped to one platform after applying it to all four moved the macOS
+      # state root onto the work volume and turned `cold_start_grace_wait` red
+      # on both macOS runners, which had been green one commit earlier.
+      - name: Point Windows at an absolute state root
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: echo "G_MESH_HOME=${{ runner.temp }}/g-mesh-test-home" >> "$GITHUB_ENV"
+
       - name: cargo test
         shell: bash
         env:
           G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
-          # Absolute, with a drive letter. `.cargo/config.toml` sets
-          # `/tmp/g-mesh-test-home`, which on Windows is not an absolute path
-          # at all but a *drive-relative* one: it resolves against whatever
-          # drive the process happens to be on. The test binary runs from the
-          # D: checkout and the detached daemon it spawns need not, so the two
-          # resolved different state roots - the daemon indexed into its own
-          # and the test waited forever on an index.db that was never going to
-          # appear. `force = false` there means this explicit value wins
-          # (GM-246).
-          G_MESH_HOME: ${{ runner.temp }}/g-mesh-test-home
         run: cargo test --manifest-path core/Cargo.toml
 
       - name: What the daemons were doing
