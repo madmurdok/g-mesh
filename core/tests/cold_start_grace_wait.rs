@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::daemon::bulk_index::WALK_DELAY_ENV;
-use g_mesh::mcp::INDEXING_GRACE_WINDOW;
+use g_mesh::mcp::{GRACE_WINDOW_ENV, INDEXING_GRACE_WINDOW};
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -68,6 +68,12 @@ const BOOTSTRAP_BUDGET: Duration = Duration::from_millis(2_000);
 /// is the whole point of the rewrite: the old shape had the daemon doing the
 /// sleeping, where an overshoot pushed completion past the window entirely.
 const RELEASE_AFTER_THE_CALL: Duration = Duration::from_millis(40);
+
+/// The grace window these tests run against, wide enough that a loaded runner
+/// finishing its post-walk work is never what decides the outcome. The
+/// assertions below are written against this rather than against the product's
+/// own constant, which stays what it is for real calls.
+const TEST_GRACE_WINDOW: Duration = Duration::from_millis(5_000);
 
 /// Held open far longer than [`INDEXING_GRACE_WINDOW`] could ever absorb, so
 /// the call made immediately after connecting is guaranteed to still be
@@ -161,7 +167,7 @@ async fn connect_with(
     project: &Project,
     hold_the_walk_open: Duration,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    connect_holding(project, hold_the_walk_open, None).await
+    connect_holding(project, hold_the_walk_open, None, INDEXING_GRACE_WINDOW).await
 }
 
 /// [`connect_with`], optionally gating the walk's completion on a file the
@@ -170,6 +176,7 @@ async fn connect_holding(
     project: &Project,
     hold_the_walk_open: Duration,
     hold_file: Option<&Path>,
+    grace_window: Duration,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
@@ -182,6 +189,12 @@ async fn connect_holding(
                 g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV,
                 hold_file.map(|p| p.as_os_str().to_owned()).unwrap_or_default(),
             )
+            // Per-connection, because the two tests here want opposite
+            // things from it: one needs a window wide enough that a loaded
+            // runner's post-walk work never decides the outcome, the other
+            // needs the product's own narrow one so a walk that outlasts it is
+            // refused promptly.
+            .env(GRACE_WINDOW_ENV, grace_window.as_millis().to_string())
             // This suite is about grace-window/bootstrap timing, not
             // embeddings - the fixture's one function has a signature, which
             // is embeddable text, so without this the walk would pay a real
@@ -249,7 +262,7 @@ async fn a_walk_that_finishes_inside_the_grace_window_is_served_the_real_answer(
     let hold_file = project.root().join(".g-mesh-hold-the-walk");
     std::fs::write(&hold_file, b"").expect("failed to plant the walk-hold file");
 
-    let client = connect_holding(&project, Duration::ZERO, Some(&hold_file)).await;
+    let client = connect_holding(&project, Duration::ZERO, Some(&hold_file), TEST_GRACE_WINDOW).await;
     project.wait_until_the_graph_holds("connect");
 
     // Dispatched first, released second: the call is in the grace wait before
@@ -297,7 +310,7 @@ async fn a_walk_that_finishes_inside_the_grace_window_is_served_the_real_answer(
     // was a registry at all - and a bound of one grace window is meaningful
     // rather than machine-dependent.
     assert!(
-        elapsed < INDEXING_GRACE_WINDOW,
+        elapsed < TEST_GRACE_WINDOW,
         "a call that waited the full grace window and beyond did not get closed by the walk finishing: {elapsed:?}"
     );
 

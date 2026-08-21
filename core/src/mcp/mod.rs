@@ -120,6 +120,33 @@ pub const STILL_INDEXING: &str =
 /// in `tests/` could drift from it silently.
 pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
 
+/// Overrides [`INDEXING_GRACE_WINDOW`] for tests, in milliseconds.
+///
+/// The acceptance tests assert that a call arriving just before completion is
+/// *served rather than refused*. That is a statement about the mechanism, and
+/// 150ms is a product decision about a race - but a test asserting the first
+/// against the second is also asserting that the machine finishes its
+/// post-walk work inside 150ms, which is a property of the runner and not of
+/// the code. On GitHub's macOS runners it does not hold: the walk is released,
+/// and import linking, symbol linking and the semantic pass still take longer
+/// than the window (GM-245).
+///
+/// Same shape and the same justification as `bulk_index::WALK_DELAY_ENV`:
+/// test-only scaffolding on the one property a test cannot otherwise pin, read
+/// once here rather than threaded through every caller.
+pub const GRACE_WINDOW_ENV: &str = "G_MESH_INDEXING_GRACE_WINDOW_MS";
+
+/// [`INDEXING_GRACE_WINDOW`], or [`GRACE_WINDOW_ENV`] when it names a number.
+/// An unparsable value falls back to the constant rather than failing a real
+/// call over a typo in a debugging variable.
+pub fn indexing_grace_window() -> Duration {
+    std::env::var(GRACE_WINDOW_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(INDEXING_GRACE_WINDOW)
+}
+
 /// Serves one accepted connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
 /// connection per MCP client, so a client's session dies with its shim.
@@ -305,7 +332,7 @@ impl GMeshMcpServer {
         if !self.indexing.is_indexing() {
             return None;
         }
-        if self.indexing.wait_ready(INDEXING_GRACE_WINDOW).await {
+        if self.indexing.wait_ready(indexing_grace_window()).await {
             return None;
         }
         Some(tool_result::error(STILL_INDEXING))
