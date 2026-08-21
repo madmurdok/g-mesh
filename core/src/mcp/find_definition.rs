@@ -10,6 +10,7 @@ use rmcp::ErrorData;
 use rusqlite::{Connection, Row};
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
@@ -117,6 +118,24 @@ struct DefinitionCandidate {
     /// Signature over docstring when both exist - it's denser and more
     /// identifying in a ranked list than prose.
     preview: Option<String>,
+}
+
+impl From<super::search_code::SearchResult> for DefinitionCandidate {
+    /// `preview` is `None` rather than fetched: a semantic hit is already
+    /// being offered as a guess, and paying an extra query per candidate to
+    /// dress a guess up would spend payload on the rung least likely to be
+    /// right. The `id` is what the caller needs, and re-querying it returns
+    /// the declaration's own source (GM-231) - which is a better preview than
+    /// a signature and costs nothing until the caller asks for it.
+    fn from(hit: super::search_code::SearchResult) -> Self {
+        Self {
+            id: hit.symbol_id,
+            qualified_name: hit.qualified_name,
+            file_path: hit.file_path,
+            kind: hit.kind,
+            preview: None,
+        }
+    }
 }
 
 /// The standard cursor-pagination envelope, serialized: `Page<T>` itself
@@ -239,6 +258,10 @@ pub(super) enum ResolvedBy {
     /// file's declarations, offered because a default import binds an export
     /// under a local name this index never sees.
     FileName,
+    /// Nothing structural matched, and the semantic index scored these highly
+    /// enough to be worth offering. The one rung whose answers are similarity,
+    /// not resolution - see [`by_semantic_neighbours`].
+    SemanticNeighbours,
 }
 
 /// A resolved anchor and the rung that reached it.
@@ -261,6 +284,7 @@ pub(super) struct Resolved {
 /// bespoke enum so every call site is the same two-line `match`.
 pub(super) fn resolve_symbol_name(
     conn: &Connection,
+    embedding: Option<&EmbeddingPipeline>,
     name: &str,
     cursor: Option<&str>,
 ) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
@@ -274,7 +298,7 @@ pub(super) fn resolve_symbol_name(
         .map_err(|e| internal_error("failed to look up node by name", e))?;
 
     match matches.len() {
-        0 => by_file_name(conn, name),
+        0 => by_file_name(conn, embedding, name),
         1 => Ok(Ok(Resolved {
             node: matches.into_iter().next().expect("len checked above"),
             by: ResolvedBy::Name,
@@ -294,6 +318,104 @@ pub(super) fn resolve_symbol_name(
     }
 }
 
+/// The similarity cutoff, from `g-mesh-bench`'s
+/// `docs/results/v0.21.0-semantic-threshold-calibration.md`.
+///
+/// Measured over both corpora, with the right-answer set read from the
+/// benchmark's own task oracles so it could not be tuned to flatter the
+/// result: right answers score a median 0.684 (p10 0.615), queries with no
+/// right answer a median 0.423 (p90 0.535). At 0.60 that keeps 20 of the 21
+/// findable answers and admits 1 of 54 negatives.
+///
+/// 0.55 has *identical* recall and twice the false positives; 0.65 costs 23
+/// points of recall and gains nothing. The choice is flat across 0.56-0.64,
+/// which is the part worth knowing: this does not need re-tuning as the index
+/// shifts, and a change here should be justified by a re-run of that script
+/// rather than by taste.
+const SEMANTIC_THRESHOLD: f64 = 0.60;
+
+/// How many neighbours to offer. The calibration found the correct hit ranked
+/// first in 19 of 21 cases, so a long list would be payload without value.
+const SEMANTIC_CANDIDATES: usize = 3;
+
+/// Whether `name` is a module specifier rather than a symbol name.
+///
+/// Checked *before* the score, because the score cannot catch this. Package
+/// specifiers are the only kind of junk query that approaches the threshold -
+/// `@excalidraw/element` scores 0.699 - and the reason is structural: only doc
+/// comments and signatures are embedded, so a specifier has nothing to match
+/// and similarity is computed against unrelated text. The same string scores
+/// 0.566 against an index where that package does not exist at all, which is
+/// the proof that the score describes the query's shape and not the corpus.
+///
+/// Raising the threshold to 0.70 would exclude it too, and cost 42 points of
+/// recall to do so. This costs nothing, and specifiers already have a rung of
+/// their own - `get_dependencies`' path matching.
+fn is_module_specifier(name: &str) -> bool {
+    name.starts_with('@') || name.contains('/')
+}
+
+/// The rung between "no file carries this name either" and a refusal: ask the
+/// semantic index, and offer what it returns as *candidates*.
+///
+/// # Why this exists
+///
+/// Measured against a fully indexed excalidraw, with no model in the loop:
+/// `find_definition("DropdownMenuGroup")` refused while
+/// `search_code("DropdownMenuGroup")` answered correctly on its first result.
+/// The same index, the same question, one tool refusing and the other right -
+/// and the caller pays a whole round trip (18,000-22,000 tokens at an MCP
+/// client's prompt prefix) to discover that the other tool would have worked.
+///
+/// # Candidates, never an answer
+///
+/// Similarity is not resolution, and this codebase's rule is that a missing
+/// edge beats a wrong one. The calibration makes the reason concrete: `AppState`
+/// returns `createAppState` at 0.845 and `ExcalidrawImperativeAPI` returns
+/// `App#createExcalidrawAPI` at 0.839 - closely related declarations,
+/// confidently scored, not the thing asked for. A confident wrong answer is
+/// worse than a refusal; a labelled "did you mean" is not. So this returns the
+/// same page shape the ambiguous and file-name rungs already use, with its own
+/// `resolvedBy`, and every candidate carries the `id` to re-query with.
+///
+/// # When it stays silent
+///
+/// No model (`embed_query` is `None` on a machine that never downloaded the
+/// 612 MiB weights), a specifier-shaped query, or nothing scoring above
+/// [`SEMANTIC_THRESHOLD`]: all three fall through to the terse refusal this
+/// rung was added in front of, never to an error.
+fn by_semantic_neighbours(
+    conn: &Connection,
+    embedding: Option<&EmbeddingPipeline>,
+    name: &str,
+) -> Option<Result<CallToolResult, ErrorData>> {
+    if is_module_specifier(name) {
+        return None;
+    }
+    let query = embedding?.embed_query(name)?;
+    let page = super::search_code::search(conn, &query, SEMANTIC_CANDIDATES, None).ok()?;
+    let results: Vec<DefinitionCandidate> = page
+        .results
+        .into_iter()
+        .filter(|hit| hit.score >= SEMANTIC_THRESHOLD)
+        .map(DefinitionCandidate::from)
+        .collect();
+    if results.is_empty() {
+        return None;
+    }
+
+    Some(success(&FileNamePage {
+        resolved_by: ResolvedBy::SemanticNeighbours,
+        ambiguous: false,
+        explanation: format!(
+            "Nothing is named '{name}'. These are the closest declarations by meaning, not by \
+             name - they may be what you meant, or may merely be nearby. Check one before \
+             relying on it, and re-query by its id."
+        ),
+        results,
+    }))
+}
+
 /// The last rung before a refusal: no declaration carries the name, but a file
 /// does.
 ///
@@ -307,12 +429,23 @@ pub(super) fn resolve_symbol_name(
 /// `ambiguous: false`, because these are not several readings of one name -
 /// they are what a differently-named thing declares. The rung label is what
 /// says so.
-fn by_file_name(conn: &Connection, name: &str) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
+fn by_file_name(
+    conn: &Connection,
+    embedding: Option<&EmbeddingPipeline>,
+    name: &str,
+) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
     const MAX_SUGGESTIONS: usize = 5;
     let in_file = queries::find_in_file_named(conn, name, MAX_SUGGESTIONS)
         .map_err(|e| internal_error("failed to look up nodes by file name", e))?;
     if in_file.is_empty() {
-        return error(format!("g-mesh: no symbol named '{name}' found")).map(Err);
+        // The last rung before giving up. It returns `None` for every way of
+        // having nothing useful to say - no model, a specifier-shaped query,
+        // nothing scoring high enough - so the terse refusal below stays the
+        // answer in all of them.
+        return match by_semantic_neighbours(conn, embedding, name) {
+            Some(page) => page.map(Err),
+            None => error(format!("g-mesh: no symbol named '{name}' found")).map(Err),
+        };
     }
 
     let file_path = in_file[0].file_path.clone();
@@ -345,10 +478,11 @@ fn by_file_name(conn: &Connection, name: &str) -> Result<Result<Resolved, CallTo
 fn by_name(
     conn: &Connection,
     project_root: Option<&Path>,
+    embedding: Option<&EmbeddingPipeline>,
     name: &str,
     cursor: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
-    match resolve_symbol_name(conn, name, cursor)? {
+    match resolve_symbol_name(conn, embedding, name, cursor)? {
         Ok(resolved) => {
             success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root))
         }
@@ -359,6 +493,7 @@ fn by_name(
 pub(super) fn handle(
     conn: &Arc<Mutex<Connection>>,
     project_root: &Path,
+    embedding: &EmbeddingPipeline,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -371,7 +506,7 @@ pub(super) fn handle(
         (Some(file_path), Some(position), _) => {
             by_position(&conn, project_root, &file_path, position.line, position.col)
         }
-        (None, None, Some(name)) => by_name(&conn, project_root, &name, params.cursor.as_deref()),
+        (None, None, Some(name)) => by_name(&conn, project_root, Some(embedding), &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {
             error("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again")
         }
@@ -458,7 +593,9 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
@@ -495,7 +632,10 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap(),
+        );
         assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
         assert_eq!(body["filePath"], "target.ts");
     }
@@ -513,7 +653,9 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap();
         let body = json_body(&result);
         assert_eq!(body["id"], "n1");
         assert_eq!(body["qualifiedName"], "pkg_a::run");
@@ -536,7 +678,9 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap();
         let body = json_body(&result);
         assert_eq!(body["id"], "n2");
         assert_eq!(body["qualifiedName"], "pkg_b::run");
@@ -552,7 +696,9 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -566,7 +712,9 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap();
         assert!(error_text(&result).contains("symbol_name"));
     }
 
@@ -591,7 +739,7 @@ mod tests {
             cursor: None,
             include_source: None,
         };
-        let first = handle(&conn, &no_sources(), first_params).unwrap();
+        let first = handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), first_params).unwrap();
         let first_body = json_body(&first);
         let first_results = first_body["results"].as_array().unwrap();
         assert_eq!(first_results.len(), CANDIDATE_PAGE_SIZE);
@@ -605,7 +753,7 @@ mod tests {
             cursor: Some(cursor),
             include_source: None,
         };
-        let second = handle(&conn, &no_sources(), second_params).unwrap();
+        let second = handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), second_params).unwrap();
         let second_body = json_body(&second);
         let second_results = second_body["results"].as_array().unwrap();
         assert_eq!(second_results.len(), 1, "the one remaining candidate must land on the second page");
@@ -629,10 +777,10 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
             .unwrap();
 
-        let by_qualified = json_body(&by_name(&conn, None, "pkg::run", None).unwrap());
+        let by_qualified = json_body(&by_name(&conn, None, None, "pkg::run", None).unwrap());
         assert_eq!(by_qualified["resolvedBy"], "qualifiedName");
 
-        let by_bare = json_body(&by_name(&conn, None, "run", None).unwrap());
+        let by_bare = json_body(&by_name(&conn, None, None, "run", None).unwrap());
         assert_eq!(by_bare["resolvedBy"], "name");
     }
 
@@ -655,7 +803,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = json_body(&by_name(&conn, None, "DropdownMenuGroup", None).unwrap());
+        let body = json_body(&by_name(&conn, None, None, "DropdownMenuGroup", None).unwrap());
 
         assert_eq!(body["resolvedBy"], "fileName");
         // Not an ambiguity: these are not competing readings of one name, they
@@ -677,7 +825,7 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
             .unwrap();
 
-        let result = by_name(&conn, None, "NoSuchThingAnywhere", None).unwrap();
+        let result = by_name(&conn, None, None, "NoSuchThingAnywhere", None).unwrap();
 
         assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
     }
@@ -691,7 +839,7 @@ mod tests {
             upsert_node(&mut conn, NodeRecord::new(id, "Function", "run", "run", file, "rust")).unwrap();
         }
 
-        let body = json_body(&by_name(&conn, None, "run", None).unwrap());
+        let body = json_body(&by_name(&conn, None, None, "run", None).unwrap());
 
         assert_eq!(body["ambiguous"], true);
         assert_eq!(body["resolvedBy"], "nameAmbiguous");
@@ -713,7 +861,7 @@ mod tests {
         let mut node = node_with_span("n1", name, &format!("pkg::{name}"), "a/lib.rs", (span.1, 0));
         node.start_line = span.0;
         upsert_node(&mut conn, node).unwrap();
-        json_body(&by_name(&conn, Some(project_root), name, None).unwrap())
+        json_body(&by_name(&conn, Some(project_root), None, name, None).unwrap())
     }
 
     /// The point of the whole change: the answer to "where is this defined"
@@ -751,8 +899,11 @@ mod tests {
             include_source: include,
         };
 
-        let opted_out = json_body(&handle(&conn, project.path(), params(Some(false))).unwrap());
-        let default_on = json_body(&handle(&conn, project.path(), params(None)).unwrap());
+        let opted_out = json_body(
+            &handle(&conn, project.path(), &EmbeddingPipeline::disabled(), params(Some(false))).unwrap(),
+        );
+        let default_on =
+            json_body(&handle(&conn, project.path(), &EmbeddingPipeline::disabled(), params(None)).unwrap());
 
         assert!(opted_out["source"].is_null(), "include_source: false must omit it");
         assert!(!default_on["source"].is_null(), "omitting the flag must default to on");
@@ -788,5 +939,116 @@ mod tests {
         let text = body["source"]["text"].as_str().expect("a snippet");
         assert_eq!(text.lines().count(), source::MAX_LINES);
         assert_eq!(body["source"]["omittedLines"], 22, "the cut says exactly how much is missing");
+    }
+
+    // --- the semantic rung -------------------------------------------------
+
+    /// Vectors are inserted directly rather than produced by the real model,
+    /// so these tests pin the *rung's* logic - threshold, guard, page shape -
+    /// and not the model's opinions, which GMB-133 measured separately.
+    fn insert_vector(conn: &Connection, node_id: &str, embedding: &[f32]) {
+        crate::storage::vectors::insert(conn, node_id, embedding, "test-model").unwrap();
+    }
+
+    /// A query vector identical to the stored one scores 1.0; an orthogonal
+    /// one scores 0.0. Two dimensions is enough to place a hit on either side
+    /// of the threshold deliberately.
+    fn setup_with_vectors() -> Connection {
+        crate::storage::vectors::register_extension();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        schema::apply(&conn).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("near", "Function", "near", "pkg::near", "a.rs", "rust"))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_specifier_shaped_query_is_declined_before_the_score_is_consulted() {
+        // No embedding pipeline at all, so if the guard did not fire first
+        // this would still return None - which is why the guard is asserted
+        // directly rather than through the tool.
+        assert!(is_module_specifier("@excalidraw/math"), "a scoped package is a specifier");
+        assert!(is_module_specifier("packages/element/src/index.ts"), "a path is a specifier");
+        assert!(!is_module_specifier("DropdownMenuGroup"), "a plain identifier is not");
+        assert!(!is_module_specifier("AppState"), "nor is a type name");
+    }
+
+    /// The measured reason this guard exists: `@excalidraw/element` scores
+    /// 0.699 - above the threshold - while being junk, because only doc
+    /// comments and signatures are embedded and a specifier has nothing to
+    /// match. Score alone cannot catch it, so shape has to.
+    #[test]
+    fn a_specifier_is_refused_tersely_even_though_it_would_out_score_the_threshold() {
+        let conn = setup_with_vectors();
+        insert_vector(&conn, "near", &[1.0, 0.0]);
+
+        // Reached through the ladder, so this exercises the real miss path.
+        let result = by_name(&conn, None, None, "@excalidraw/element", None).unwrap();
+
+        assert_eq!(error_text(&result), "g-mesh: no symbol named '@excalidraw/element' found");
+    }
+
+    #[test]
+    fn without_an_embedding_pipeline_the_answer_is_exactly_what_it_was_before() {
+        let conn = setup_with_vectors();
+        insert_vector(&conn, "near", &[1.0, 0.0]);
+
+        let result = by_name(&conn, None, None, "NoSuchThingAnywhere", None).unwrap();
+
+        assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
+    }
+
+    /// The threshold is the whole safety property, so it is asserted on both
+    /// sides with the same fixture: one vector, two queries, one accepted and
+    /// one refused purely on similarity.
+    #[test]
+    fn the_threshold_decides_between_candidates_and_a_refusal() {
+        let conn = setup_with_vectors();
+        insert_vector(&conn, "near", &[1.0, 0.0]);
+
+        // Cosine 1.0 - comfortably above SEMANTIC_THRESHOLD.
+        let accepted =
+            super::super::search_code::search(&conn, &[1.0, 0.0], SEMANTIC_CANDIDATES, None).unwrap();
+        assert!(
+            accepted.results[0].score >= SEMANTIC_THRESHOLD,
+            "the fixture must place this above the threshold: {}",
+            accepted.results[0].score
+        );
+
+        // Cosine 0.0 - below it, so the rung must stay silent.
+        let rejected =
+            super::super::search_code::search(&conn, &[0.0, 1.0], SEMANTIC_CANDIDATES, None).unwrap();
+        assert!(
+            rejected.results[0].score < SEMANTIC_THRESHOLD,
+            "the fixture must place this below the threshold: {}",
+            rejected.results[0].score
+        );
+    }
+
+    /// A candidate page, not a resolution - the distinction the whole rung
+    /// rests on. Asserted on the wire shape, because that is what a caller
+    /// reads: a caller that cannot tell a suggestion from an answer is exactly
+    /// what makes a confident wrong hit worse than a refusal.
+    #[test]
+    fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
+        let page = FileNamePage {
+            resolved_by: ResolvedBy::SemanticNeighbours,
+            ambiguous: false,
+            explanation: "…".to_string(),
+            results: vec![DefinitionCandidate {
+                id: "near".to_string(),
+                qualified_name: "pkg::near".to_string(),
+                file_path: "a.rs".to_string(),
+                kind: "Function".to_string(),
+                preview: None,
+            }],
+        };
+
+        let body: serde_json::Value = serde_json::from_str(&serde_json::to_string(&page).unwrap()).unwrap();
+
+        assert_eq!(body["resolvedBy"], "semanticNeighbours", "the rung must name itself");
+        assert_eq!(body["ambiguous"], false, "these are not competing readings of one name");
+        assert_eq!(body["results"][0]["id"], "near", "the handle to re-query with must be present");
     }
 }

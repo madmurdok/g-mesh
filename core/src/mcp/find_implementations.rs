@@ -26,6 +26,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
@@ -139,11 +140,12 @@ fn list_implementations(
 
 pub(super) fn handle(
     conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let resolved = match anchor::resolve(&conn, &params)? {
+    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -412,6 +414,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// concept, by construction rather than by parallel maintenance.
 pub(super) fn dispatch(
     conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
     let FindImplementationsParams {
@@ -442,11 +445,11 @@ pub(super) fn dispatch(
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
 
     if !transitive.unwrap_or(false) {
-        return handle(conn, symbol_params);
+        return handle(conn, embedding, symbol_params);
     }
 
     let conn = conn.lock().unwrap();
-    let resolved = match anchor::resolve(&conn, &symbol_params)? {
+    let resolved = match anchor::resolve(&conn, Some(embedding), &symbol_params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -517,7 +520,7 @@ mod tests {
     fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(
@@ -592,7 +595,7 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -615,7 +618,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 1);
         assert_eq!(
             body["allUnresolved"], true,
@@ -645,7 +649,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
     }
@@ -655,7 +660,8 @@ mod tests {
     fn the_single_hop_response_echoes_the_resolved_anchor() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
         assert_eq!(body["anchor"]["kind"], "Type");
@@ -674,7 +680,7 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
         // The rung travels with the anchor, and this path is where it was
@@ -697,7 +703,7 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["resolvedBy"], "qualifiedName", "resolved by qualifiedName, not by id");
     }
@@ -762,6 +768,7 @@ mod tests {
         let by_id = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -769,6 +776,7 @@ mod tests {
         let by_name = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -796,7 +804,7 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -868,7 +876,7 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -895,7 +903,7 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -920,7 +928,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert!(
             body.get("hint").is_none(),
             "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
@@ -960,7 +969,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, params).unwrap();
+            let result = handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
@@ -990,6 +999,7 @@ mod tests {
         let via_handle = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -997,6 +1007,7 @@ mod tests {
         let via_dispatch = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1023,6 +1034,7 @@ mod tests {
         let absent = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1033,6 +1045,7 @@ mod tests {
         let explicit_false = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(false),
@@ -1046,6 +1059,7 @@ mod tests {
         let walked = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(true),
@@ -1110,7 +1124,7 @@ mod tests {
             max_depth: Some(2),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let reached: Vec<(String, u64)> = body["results"]
             .as_array()
@@ -1254,6 +1268,7 @@ mod tests {
 
         let with_symbol_id = dispatch(
             &conn,
+            &EmbeddingPipeline::disabled(),
             FindImplementationsParams {
                 symbol_id: Some("interface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -1265,6 +1280,7 @@ mod tests {
 
         let with_symbol_name = dispatch(
             &conn,
+            &EmbeddingPipeline::disabled(),
             FindImplementationsParams {
                 symbol_name: Some("Iface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -1276,6 +1292,7 @@ mod tests {
 
         let with_transitive_only = dispatch(
             &conn,
+            &EmbeddingPipeline::disabled(),
             FindImplementationsParams {
                 transitive: Some(true),
                 resume_token: Some("whatever".to_string()),
@@ -1313,7 +1330,7 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored transitive call must still carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");

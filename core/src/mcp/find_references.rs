@@ -11,6 +11,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 
@@ -149,11 +150,12 @@ fn list_references(
 
 pub(super) fn handle(
     conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let resolved = match anchor::resolve(&conn, &params)? {
+    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -330,6 +332,7 @@ mod tests {
         let callers = json_body(
             &super::super::find_callers_callees::handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -348,8 +351,12 @@ mod tests {
         );
 
         let references = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
@@ -391,6 +398,7 @@ mod tests {
         let body = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     limit: Some(1),
@@ -436,8 +444,12 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let body = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(body["hasMore"], false, "precondition: the page is complete");
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -470,8 +482,12 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let body = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(body["hasMore"], false);
         let files =
@@ -506,6 +522,7 @@ mod tests {
         let body = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(vec!["a.ts".to_string()]),
@@ -579,8 +596,12 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let body = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -725,7 +746,7 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -794,7 +815,7 @@ mod tests {
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
@@ -834,7 +855,7 @@ mod tests {
             file_paths: Some(vec!["a.rs".to_string()]),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
         assert_eq!(results[0]["referencingSymbolId"], "in_scope");
@@ -865,12 +886,17 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let omitted = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let explicit_empty = json_body(
             &handle(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(Vec::new()),
@@ -893,7 +919,7 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -926,7 +952,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every row unresolved must set the response-level marker");
     }
@@ -962,7 +989,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(
             body["allUnresolved"], false,
@@ -988,7 +1016,8 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "target");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::run");
         assert_eq!(body["anchor"]["kind"], "Function");
@@ -1014,12 +1043,20 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let by_id = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let by_name = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         // Everything but `resolvedBy` must match: the walk, the results and the
         // anchor are properties of the node, however the caller addressed it.
@@ -1044,7 +1081,7 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1053,7 +1090,7 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1083,7 +1120,7 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -1106,7 +1143,8 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert!(
             body.get("hint").is_none(),
             "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
@@ -1149,7 +1187,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, params).unwrap();
+            let result = handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["referencingSymbolId"].as_str().unwrap().to_string()));

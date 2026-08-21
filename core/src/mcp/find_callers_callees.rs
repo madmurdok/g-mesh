@@ -14,6 +14,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
@@ -209,11 +210,12 @@ struct CalleePage {
 
 pub(super) fn handle_callers(
     conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let resolved = match anchor::resolve(&conn, &params)? {
+    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -265,11 +267,12 @@ pub(super) fn handle_callers(
 
 pub(super) fn handle_callees(
     conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let resolved = match anchor::resolve(&conn, &params)? {
+    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -358,7 +361,8 @@ mod tests {
     fn find_callers_of_b_returns_exactly_a_not_c_not_itself() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "B has exactly one caller, not the transitive chain");
@@ -369,7 +373,8 @@ mod tests {
     fn find_callees_of_b_returns_exactly_c_not_a() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "B has exactly one callee, not the transitive chain");
@@ -407,6 +412,7 @@ mod tests {
         let body = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -448,7 +454,8 @@ mod tests {
     fn callers_of_a_root_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("a".to_string()), ..Default::default() };
-        let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -475,7 +482,9 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body = json_body(
+            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every caller unresolved must set the response-level marker");
     }
@@ -499,7 +508,9 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body = json_body(
+            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(
             body["allUnresolved"], false,
@@ -511,7 +522,8 @@ mod tests {
     fn callees_of_a_leaf_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("c".to_string()), ..Default::default() };
-        let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -527,6 +539,7 @@ mod tests {
         let callers = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -539,6 +552,7 @@ mod tests {
         let callees = json_body(
             &handle_callees(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -556,6 +570,7 @@ mod tests {
         let callers = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -566,6 +581,7 @@ mod tests {
         let callees = json_body(
             &handle_callees(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -600,6 +616,7 @@ mod tests {
         let ambiguous = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -625,7 +642,7 @@ mod tests {
             symbol_id: Some(picked["id"].as_str().expect("a candidate carries its id").to_string()),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, params).unwrap());
+        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert!(body.get("ambiguous").is_none(), "an id is never ambiguous");
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "only the chosen candidate's callers, never a union across candidates");
@@ -650,12 +667,16 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
-        let ambiguous = json_body(&handle_callers(&conn, by_name).unwrap());
+        let ambiguous = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), by_name).unwrap());
         assert_eq!(ambiguous["ambiguous"], true);
 
         // Re-asking by qualifiedName here is the loop: it is the same query.
         let requalified = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
-        assert_eq!(json_body(&handle_callers(&conn, requalified).unwrap())["ambiguous"], true);
+        assert_eq!(
+            json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), requalified).unwrap())
+                ["ambiguous"],
+            true
+        );
 
         let mut ids: Vec<&str> =
             ambiguous["results"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
@@ -667,7 +688,7 @@ mod tests {
         );
 
         let params = SymbolQueryParams { symbol_id: Some("run_b".to_string()), ..Default::default() };
-        let body = json_body(&handle_callers(&conn, params).unwrap());
+        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap()[0]["callerSymbolId"], "caller_b");
     }
 
@@ -676,7 +697,8 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -685,7 +707,8 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result =
+            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -778,7 +801,7 @@ mod tests {
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, params).unwrap());
+        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
@@ -800,6 +823,7 @@ mod tests {
         let omitted = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -807,6 +831,7 @@ mod tests {
         let explicit_empty = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams {
                     symbol_id: Some("b".to_string()),
                     file_paths: Some(Vec::new()),
@@ -850,7 +875,7 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, params).unwrap());
+        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -885,6 +910,7 @@ mod tests {
         let callers = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -899,6 +925,7 @@ mod tests {
         let callees = json_body(
             &handle_callees(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -920,6 +947,7 @@ mod tests {
         let callers = json_body(
             &handle_callers(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -929,6 +957,7 @@ mod tests {
         let callees = json_body(
             &handle_callees(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -963,7 +992,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle_callees(&conn, params).unwrap();
+            let result = handle_callees(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["calleeSymbolId"].as_str().unwrap().to_string()));
