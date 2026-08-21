@@ -486,6 +486,15 @@ that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
 would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
 installer, not to the binary.
 
+One constraint comes with it: the daemon's socket lives under that root, and a
+Unix domain socket address holds at most 104 bytes of path on macOS (108 on
+Linux) — so a `G_MESH_HOME` nested deeply enough pushes
+`<root>/projects/<hash>/daemon.sock` past the limit and no daemon can listen
+there at all. g-mesh refuses such a root up front, naming the path and both
+numbers, rather than starting a daemon that dies on `bind` and leaving you
+with a connection timeout ten seconds later. The default `~/.g-mesh` is
+nowhere near it; only a deliberately relocated root can reach it.
+
 Upgrading g-mesh does not need that, though: an index records which build of
 the indexing pipeline filled it — core's own generation *and* a digest of the
 JS/TS plugin's compiled output — and an index that no longer matches is wiped

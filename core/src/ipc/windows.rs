@@ -108,6 +108,15 @@ impl Endpoint {
         Self(OsString::from(format!(r"\\.\pipe\g-mesh-{id}")))
     }
 
+    /// Always reachable: a pipe name is built from the project hash, so it is
+    /// a fixed short length no matter how deep the state directory sits. The
+    /// Unix counterpart has a real limit to check (`SUN_PATH_CAPACITY`); this
+    /// is a no-op for the same reason [`Self::unlink_if_stale`] is, so the
+    /// shim can check unconditionally rather than branch on the platform.
+    pub fn check_length(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Nothing to unlink: a pipe name lives exactly as long as an open handle
     /// to it, so there is no such thing as one left behind by a dead daemon.
     /// Kept as a no-op so the callers that have to clear a Unix socket file

@@ -20,10 +20,48 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint(PathBuf);
 
+/// How many bytes of path an AF_UNIX address can hold, including the trailing
+/// NUL: 104 on macOS, 108 on Linux.
+///
+/// Derived from the struct rather than written down, because the two platforms
+/// differ and a hardcoded 104 would silently under-report on Linux.
+const SUN_PATH_CAPACITY: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
 impl Endpoint {
     /// The socket file for a project, as `daemon::endpoint` derives it.
     pub fn at_path(path: PathBuf) -> Self {
         Self(path)
+    }
+
+    /// Whether this path fits in an AF_UNIX address at all.
+    ///
+    /// Nothing checked this until a state root deep enough to overrun it was
+    /// made reachable on purpose: `G_MESH_HOME` is a documented override, and
+    /// pointing it somewhere nested produces a socket path over the limit.
+    /// What the caller then saw was the shim's bootstrap timeout ten seconds
+    /// later, carrying the OS's own `path must be shorter than SUN_LEN` and
+    /// naming no fix - ten seconds per call, spent retrying a connect that
+    /// could never succeed, against a daemon that had already died on bind.
+    ///
+    /// The default `~/.g-mesh` is nowhere near the limit, which is why this
+    /// went unnoticed: only a deliberately relocated state root reaches it.
+    pub fn check_length(&self) -> Result<(), String> {
+        let len = self.0.as_os_str().len();
+        // The stored path is NUL-terminated inside the address, so the usable
+        // capacity is one byte short of the field.
+        if len < SUN_PATH_CAPACITY {
+            return Ok(());
+        }
+        Err(format!(
+            "g-mesh: the socket path is {len} bytes, and this platform allows at most {} \n\
+             \n  {}\n\n\
+             A Unix domain socket address cannot hold a longer path, so no daemon can listen \
+             here. This is reachable only with G_MESH_HOME pointing at a deep directory - set it \
+             somewhere shorter (the default ~/.g-mesh is well inside the limit).",
+            SUN_PATH_CAPACITY - 1,
+            self.0.display(),
+        ))
     }
 
     /// The socket file itself, for the callers that still have to treat it as
@@ -98,6 +136,12 @@ pub struct Listener(UnixListener);
 
 impl Listener {
     pub fn bind(endpoint: &Endpoint) -> io::Result<Self> {
+        // Checked before the syscall so the daemon's own stderr says what is
+        // wrong and what to do, rather than leaving the OS's `SUN_LEN` string
+        // as the only account of it.
+        if let Err(message) = endpoint.check_length() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
         UnixListener::bind(&endpoint.0).map(Self)
     }
 
@@ -122,3 +166,61 @@ impl AsyncListener {
 
 /// One accepted connection, as `rmcp` consumes it (`AsyncRead + AsyncWrite`).
 pub type AsyncStream = tokio::net::UnixStream;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capacity is read off `sockaddr_un` rather than written down, so
+    /// this asserts the shape it must have on any platform: the two values
+    /// the manual pages give (104 on macOS, 108 on Linux) and nothing else.
+    #[test]
+    fn capacity_matches_the_platform() {
+        assert!(
+            SUN_PATH_CAPACITY == 104 || SUN_PATH_CAPACITY == 108,
+            "unexpected sun_path capacity {SUN_PATH_CAPACITY}"
+        );
+    }
+
+    #[test]
+    fn a_short_path_is_accepted() {
+        assert!(Endpoint::at_path(PathBuf::from("/tmp/g-mesh/daemon.sock")).check_length().is_ok());
+    }
+
+    /// The boundary in both directions, because an off-by-one here fails in
+    /// the expensive direction: an endpoint waved through is a daemon that
+    /// dies on bind, ten seconds after the shim commits to it.
+    #[test]
+    fn the_limit_is_the_last_byte_that_leaves_room_for_the_nul() {
+        let longest_usable = "/".repeat(SUN_PATH_CAPACITY - 1);
+        assert_eq!(longest_usable.len(), SUN_PATH_CAPACITY - 1);
+        assert!(Endpoint::at_path(PathBuf::from(&longest_usable)).check_length().is_ok());
+
+        let one_too_long = "/".repeat(SUN_PATH_CAPACITY);
+        assert!(Endpoint::at_path(PathBuf::from(one_too_long)).check_length().is_err());
+    }
+
+    /// The message is the whole point of the check - the OS already refuses
+    /// the bind, it just refuses it uninformatively - so it must name the
+    /// offending path, both numbers, and the override that is the only way
+    /// to get here.
+    #[test]
+    fn the_message_says_what_to_do_about_it() {
+        let path = format!("/{}/daemon.sock", "deep".repeat(40));
+        let message = Endpoint::at_path(PathBuf::from(&path)).check_length().unwrap_err();
+        assert!(message.contains(&path), "must name the path: {message}");
+        assert!(message.contains(&path.len().to_string()), "must give the actual length: {message}");
+        assert!(message.contains("G_MESH_HOME"), "must name the way out: {message}");
+    }
+
+    /// Bind refuses it too, and with the same message rather than the OS's -
+    /// the daemon's stderr is the only account of the failure a log-reading
+    /// caller ever gets.
+    #[test]
+    fn bind_refuses_an_over_long_path_before_the_syscall() {
+        let endpoint = Endpoint::at_path(PathBuf::from(format!("/{}/daemon.sock", "deep".repeat(40))));
+        let error = Listener::bind(&endpoint).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("G_MESH_HOME"), "{error}");
+    }
+}
