@@ -61,22 +61,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// only needs to be long enough that it is never itself the bottleneck.
 const BOOTSTRAP_BUDGET: Duration = Duration::from_millis(2_000);
 
-/// Total time the walk is held open past its last commit, for the case where
-/// it must finish *inside* the grace window. Comfortably longer than
-/// [`INDEXING_GRACE_WINDOW`] on its own - what keeps the call inside the
-/// window is not this number but [`SLEEP_BEFORE_THE_CALL`], which eats most
-/// of it before the call is ever dispatched.
-const WALK_HELD_OPEN_WITHIN_GRACE: Duration = Duration::from_millis(400);
-
-/// How long this test sleeps after observing the walk's last commit and
-/// before dispatching its tool call. Subtracted from
-/// [`WALK_HELD_OPEN_WITHIN_GRACE`], what is left over
-/// (`WALK_HELD_OPEN_WITHIN_GRACE` - `SLEEP_BEFORE_THE_CALL` = 90ms) is the
-/// most time that can possibly remain before `mark_ready` when the call is
-/// dispatched - comfortably inside [`INDEXING_GRACE_WINDOW`] (150ms), with
-/// 60ms of headroom against the timeout and 90ms of headroom against the
-/// "did this even wait" floor the test asserts on the other side.
-const SLEEP_BEFORE_THE_CALL: Duration = Duration::from_millis(310);
+/// How long the grace-window test leaves its call waiting before releasing the
+/// walk. Only the *test* sleeps here, and only between dispatching a call and
+/// letting the walk finish - so a machine that oversleeps makes the call take
+/// longer, never makes the walk finish too late to be caught. That asymmetry
+/// is the whole point of the rewrite: the old shape had the daemon doing the
+/// sleeping, where an overshoot pushed completion past the window entirely.
+const RELEASE_AFTER_THE_CALL: Duration = Duration::from_millis(40);
 
 /// Held open far longer than [`INDEXING_GRACE_WINDOW`] could ever absorb, so
 /// the call made immediately after connecting is guaranteed to still be
@@ -170,6 +161,16 @@ async fn connect_with(
     project: &Project,
     hold_the_walk_open: Duration,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    connect_holding(project, hold_the_walk_open, None).await
+}
+
+/// [`connect_with`], optionally gating the walk's completion on a file the
+/// caller deletes instead of on a duration the daemon sleeps.
+async fn connect_holding(
+    project: &Project,
+    hold_the_walk_open: Duration,
+    hold_file: Option<&Path>,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.arg("mcp-shim")
@@ -177,6 +178,10 @@ async fn connect_with(
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", BOOTSTRAP_BUDGET.as_millis().to_string())
             .env(WALK_DELAY_ENV, hold_the_walk_open.as_millis().to_string())
+            .env(
+                g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV,
+                hold_file.map(|p| p.as_os_str().to_owned()).unwrap_or_default(),
+            )
             // This suite is about grace-window/bootstrap timing, not
             // embeddings - the fixture's one function has a signature, which
             // is embeddable text, so without this the walk would pay a real
@@ -235,13 +240,31 @@ fn body(result: &CallToolResult) -> Value {
 #[tokio::test]
 async fn a_walk_that_finishes_inside_the_grace_window_is_served_the_real_answer() {
     let project = Project::new();
-    let client = connect_with(&project, WALK_HELD_OPEN_WITHIN_GRACE).await;
+    // The walk's completion is this test's own action now, not a duration the
+    // daemon sleeps. Two sleeps whose *difference* had to land inside a 150ms
+    // window is what made this test fail on all three non-Windows CI runners:
+    // a loaded machine stretches the daemon's hold past the window, leaving
+    // the call to be refused for reasons the grace-wait mechanism has nothing
+    // to do with (GM-245).
+    let hold_file = project.root().join(".g-mesh-hold-the-walk");
+    std::fs::write(&hold_file, b"").expect("failed to plant the walk-hold file");
 
+    let client = connect_holding(&project, Duration::ZERO, Some(&hold_file)).await;
     project.wait_until_the_graph_holds("connect");
-    tokio::time::sleep(SLEEP_BEFORE_THE_CALL).await;
 
+    // Dispatched first, released second: the call is in the grace wait before
+    // the walk can finish, by construction rather than by arithmetic.
     let call_started = Instant::now();
-    let result = find_definition(&client, "connect").await;
+    let call = find_definition(&client, "connect");
+    let release = async {
+        // Long enough that the call is demonstrably waiting rather than being
+        // answered instantly - the floor asserted below - and far enough
+        // inside the window that overshooting it by a scheduler's worth of
+        // slop still leaves room.
+        tokio::time::sleep(RELEASE_AFTER_THE_CALL).await;
+        std::fs::remove_file(&hold_file).expect("failed to release the walk");
+    };
+    let (result, ()) = tokio::join!(call, release);
     let elapsed = call_started.elapsed();
 
     assert_ne!(
