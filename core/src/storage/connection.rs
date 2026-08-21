@@ -52,8 +52,7 @@ pub fn open(root: &Path) -> Result<Connection> {
     let db_path = dir.join("index.db");
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("failed to enable WAL mode")?;
+    conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;
     Ok(conn)
 }
 
@@ -74,9 +73,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open(tmp.path()).unwrap();
 
-        let mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .unwrap();
+        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0)).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
 
         let expected_db = project_dir(tmp.path()).unwrap().join("index.db");

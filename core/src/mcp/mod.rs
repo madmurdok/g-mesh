@@ -271,9 +271,9 @@ impl GMeshMcpServer {
         let task_path = owned_path.clone();
         match tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path)).await {
             Ok(Ok(_)) => {}
-            Ok(Err(err)) => eprintln!(
-                "g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}"
-            ),
+            Ok(Err(err)) => {
+                eprintln!("g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}")
+            }
             Err(err) => eprintln!("g-mesh daemon: the staleness-check task failed: {err}"),
         }
     }

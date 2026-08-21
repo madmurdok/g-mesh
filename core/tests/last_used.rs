@@ -14,8 +14,8 @@ use std::thread;
 use std::time::Duration;
 
 use g_mesh::daemon;
-use g_mesh::ipc;
 use g_mesh::gc::last_used::{self, LastUsed};
+use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -78,11 +78,7 @@ impl Drop for Project {
             // Silenced: a test that killed its own daemon leaves a pid file
             // behind, and "no such process" here is the expected case, not a
             // failure worth printing into the test output.
-            let _ = Command::new("kill")
-                .arg("-9")
-                .arg(pid.trim())
-                .stderr(Stdio::null())
-                .status();
+            let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
@@ -105,21 +101,24 @@ fn spawn_daemon(root: &Path) -> Child {
 /// advanced by the tool handlers, which is what "a request was handled"
 /// means here.
 fn call_a_tool(endpoint: &ipc::Endpoint) {
-    let stream = ipc::Stream::connect(endpoint)
-        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let stream =
+        ipc::Stream::connect(endpoint).unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
     let mut writer = stream.try_clone().expect("failed to clone the daemon connection");
     let mut reader = BufReader::new(stream);
 
-    send(&mut writer, &json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "g-mesh-last-used-tests", "version": "0" },
-        },
-    }));
+    send(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "g-mesh-last-used-tests", "version": "0" },
+            },
+        }),
+    );
     let initialized = receive(&mut reader);
     assert_eq!(
         initialized["result"]["serverInfo"]["name"], "g-mesh",
@@ -127,17 +126,17 @@ fn call_a_tool(endpoint: &ipc::Endpoint) {
     );
     send(&mut writer, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
-    send(&mut writer, &json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": { "name": "get_file_outline", "arguments": { "file_path": "a.ts" } },
-    }));
-    let called = receive(&mut reader);
-    assert!(
-        called["result"].is_object(),
-        "the tool call must have been handled, got: {called}"
+    send(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_file_outline", "arguments": { "file_path": "a.ts" } },
+        }),
     );
+    let called = receive(&mut reader);
+    assert!(called["result"].is_object(), "the tool call must have been handled, got: {called}");
 }
 
 fn send<W: Write>(writer: &mut W, message: &Value) {
@@ -149,9 +148,8 @@ fn receive<R: Read>(reader: &mut BufReader<R>) -> Value {
     let frame = read_ndjson_frame(reader)
         .unwrap_or_else(|e| panic!("cannot read a response: {e:#}"))
         .expect("the daemon closed the connection instead of answering");
-    serde_json::from_slice(&frame).unwrap_or_else(|e| {
-        panic!("response is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame))
-    })
+    serde_json::from_slice(&frame)
+        .unwrap_or_else(|e| panic!("response is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame)))
 }
 
 #[test]

@@ -37,9 +37,7 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::{Context, Result};
 
-use crate::config::{
-    self, CleanupConfig, EmbeddingConfig, GlobalConfig, PluginConfig, ProjectConfig,
-};
+use crate::config::{self, CleanupConfig, EmbeddingConfig, GlobalConfig, PluginConfig, ProjectConfig};
 
 /// Runs the wizard against real stdin/stdout and writes the result to the
 /// project config (`global: false`) or the global config (`global: true`).
@@ -56,8 +54,7 @@ pub fn run(global: bool) -> Result<()> {
         writeln!(stdout, "g-mesh: wrote {}", path.display())?;
     } else {
         let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
-        let existing =
-            config::read_project_config(&cwd).context("failed to read project config")?;
+        let existing = config::read_project_config(&cwd).context("failed to read project config")?;
         let updated = wizard_project(&existing, &mut reader, &mut stdout)?;
         config::write_project_config(&cwd, &updated).context("failed to write project config")?;
         let path = config::project_config_path(&cwd)?;
@@ -84,10 +81,7 @@ pub fn wizard_project<R: BufRead, W: Write>(
         writer,
         "  jina-embeddings-v2-base-code (default) - balanced speed and accuracy, good for most codebases"
     )?;
-    writeln!(
-        writer,
-        "  a larger model trades slower, more memory-hungry embedding for better accuracy"
-    )?;
+    writeln!(writer, "  a larger model trades slower, more memory-hungry embedding for better accuracy")?;
     let model = prompt_string(reader, writer, "Embedding model", &existing.embedding.model)?;
 
     let idle_timeout_minutes = prompt_u64(

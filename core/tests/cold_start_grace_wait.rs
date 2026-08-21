@@ -191,16 +191,19 @@ async fn connect_with(
     }))
     .expect("failed to spawn the shim");
 
-    ().serve(transport).await.expect("the shim must reach the daemon while its cold-start walk is still running")
+    ().serve(transport)
+        .await
+        .expect("the shim must reach the daemon while its cold-start walk is still running")
 }
 
-async fn find_definition(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>, name: &str) -> CallToolResult {
+async fn find_definition(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+) -> CallToolResult {
     client
-        .call_tool(
-            CallToolRequestParams::new("find_definition").with_arguments(
-                json!({ "symbol_name": name }).as_object().cloned().expect("arguments literal is an object"),
-            ),
-        )
+        .call_tool(CallToolRequestParams::new("find_definition").with_arguments(
+            json!({ "symbol_name": name }).as_object().cloned().expect("arguments literal is an object"),
+        ))
         .await
         .expect("tools/call must return a result, not a protocol failure")
 }

@@ -139,9 +139,8 @@ pub fn run(
     // language's ingest loop, not per language.
     {
         let mut conn = conn.lock().unwrap();
-        summary.linked_imports = imports::link_all(&mut conn)
-            .context("failed to link the walk's resolved imports")?
-            .linked_edges;
+        summary.linked_imports =
+            imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?.linked_edges;
         summary.linked_symbols = symbol_links::link_all(&mut conn)
             .context("failed to link the walk's cross-file symbol usages")?
             .linked_edges;
@@ -205,8 +204,7 @@ fn walk_one_language(
 /// Honors [`WALK_DELAY_ENV`]. A no-op unless it is set to a number, which is
 /// every real run.
 fn hold_the_walk_open_for_tests() {
-    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok())
-    else {
+    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok()) else {
         return;
     };
     eprintln!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
@@ -350,16 +348,14 @@ mod tests {
     #[test]
     fn a_whole_stream_lands_in_sqlite() {
         let conn = setup_conn();
-        let stream = format!(
-            "{}\n{}\n{}\n",
-            node_line("n1"),
-            node_line("n2"),
-            edge_line("e1", "n1", "n2")
-        );
+        let stream = format!("{}\n{}\n{}\n", node_line("n1"), node_line("n2"), edge_line("e1", "n1", "n2"));
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 });
+        assert_eq!(
+            summary,
+            BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 }
+        );
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
         let name: String = conn
@@ -379,7 +375,10 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 });
+        assert_eq!(
+            summary,
+            BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 }
+        );
         assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
     }
 

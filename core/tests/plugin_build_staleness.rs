@@ -58,9 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use g_mesh::daemon::{
-    self, manifest::PLUGIN_ROOTS_OVERRIDE_ENV, plugin::PLUGIN_PATH_ENV,
-};
+use g_mesh::daemon::{self, manifest::PLUGIN_ROOTS_OVERRIDE_ENV, plugin::PLUGIN_PATH_ENV};
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -239,8 +237,7 @@ impl Project {
 
     fn daemon_pid(&self) -> u32 {
         let path = daemon::pid_path(self.root()).expect("failed to resolve the pid file path");
-        daemon::read_pid_file(&path)
-            .unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
+        daemon::read_pid_file(&path).unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
     }
 
     /// The generation the index says it was filled by. The plugin's half of it

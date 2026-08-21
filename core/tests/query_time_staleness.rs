@@ -121,9 +121,7 @@ fn body(result: &CallToolResult) -> Value {
 /// against whatever was on disk and in the state directory at that moment.
 async fn outline_symbol_names(project: &Project) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(project.root())
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(project.root()).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -136,11 +134,9 @@ async fn outline_symbol_names(project: &Project) -> Vec<String> {
     wait_until_indexed(project.root());
 
     let result = client
-        .call_tool(
-            CallToolRequestParams::new("get_file_outline").with_arguments(
-                json!({ "file_path": FILE }).as_object().cloned().expect("arguments literal is an object"),
-            ),
-        )
+        .call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+            json!({ "file_path": FILE }).as_object().cloned().expect("arguments literal is an object"),
+        ))
         .await
         .expect("tools/call failed");
     let page = body(&result);
@@ -148,7 +144,12 @@ async fn outline_symbol_names(project: &Project) -> Vec<String> {
     client.cancel().await.expect("failed to shut the client down");
     project.stop();
 
-    page["results"].as_array().expect("results is not an array").iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+    page["results"]
+        .as_array()
+        .expect("results is not an array")
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[tokio::test]

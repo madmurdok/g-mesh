@@ -63,8 +63,7 @@ use crate::watcher::staleness::mtime_millis;
 /// plugins/typescript/src/extract.ts. Anything else on disk is not a file this
 /// project's index is ever expected to cover, so counting it would make
 /// coverage look permanently broken.
-const SOURCE_EXTENSIONS: [&str; 8] =
-    ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"];
+const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"];
 
 /// Directory names excluded whatever `.gitignore` says, mirroring
 /// `HARD_EXCLUDED_DIRS` in plugins/typescript/src/ignorePolicy.ts - the walk here
@@ -230,12 +229,9 @@ pub fn run() -> Result<()> {
 
 /// Gathers every field of the report for `project_root`.
 pub fn collect(project_root: &Path) -> Result<Report> {
-    let state_dir = project_dir(project_root)
-        .context("failed to resolve the project's state directory")?;
-    let project_id = state_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let project_id =
+        state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     let core = core_state(project_root)?;
     Ok(Report {
@@ -252,8 +248,8 @@ pub fn collect(project_root: &Path) -> Result<Report> {
 }
 
 fn core_state(project_root: &Path) -> Result<CoreState> {
-    let recorded = daemon::read_pid_file(&daemon::pid_path(project_root)?)
-        .filter(|&pid| daemon::is_process_alive(pid));
+    let recorded =
+        daemon::read_pid_file(&daemon::pid_path(project_root)?).filter(|&pid| daemon::is_process_alive(pid));
     let Some(pid) = recorded else {
         // No pid file, or one left behind by a daemon that crashed or was
         // killed - which used to end the enquiry. It no longer can: a daemon
@@ -357,11 +353,9 @@ pub fn index_status(project_root: &Path, db_path: &Path) -> Result<IndexStatus> 
     // recovering a WAL an abandoned daemon left behind needs write access,
     // and a missing database must never be conjured into existence by a
     // command that only reports. Nothing here writes.
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("failed to open the project index at {}", db_path.display()))?;
+    let conn =
+        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+            .with_context(|| format!("failed to open the project index at {}", db_path.display()))?;
 
     let indexed_files = indexed_file_paths(&conn)?;
     let baselines = recorded_baselines(&conn)?;
@@ -422,10 +416,7 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<SourceFile>> {
         .require_git(false)
         .follow_links(false)
         .filter_entry(|entry| {
-            !entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| HARD_EXCLUDED_DIRS.contains(&name))
+            !entry.file_name().to_str().is_some_and(|name| HARD_EXCLUDED_DIRS.contains(&name))
         })
         .build();
 
@@ -529,12 +520,7 @@ pub fn render(report: &Report) -> String {
         );
     } else {
         for plugin in &report.plugins {
-            let _ = writeln!(
-                out,
-                "  plugin ({}):     {}",
-                plugin.language,
-                describe_plugin(plugin.state)
-            );
+            let _ = writeln!(out, "  plugin ({}):     {}", plugin.language, describe_plugin(plugin.state));
         }
     }
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
@@ -549,7 +535,8 @@ pub fn render(report: &Report) -> String {
     let daemon_alive = !matches!(report.core, CoreState::NotRunning);
     if !index.bulk_indexed {
         if daemon_alive {
-            let _ = writeln!(out, "  index:           building now - first walk in progress, nothing to restart");
+            let _ =
+                writeln!(out, "  index:           building now - first walk in progress, nothing to restart");
         } else {
             let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
         }
@@ -580,10 +567,7 @@ pub fn render(report: &Report) -> String {
         if index.semantic_pass_completed {
             let _ = writeln!(out, "  semantic pass:   complete");
         } else {
-            let _ = writeln!(
-                out,
-                "  semantic pass:   never completed - run `g-mesh reindex` to repair it"
-            );
+            let _ = writeln!(out, "  semantic pass:   never completed - run `g-mesh reindex` to repair it");
         }
     }
 
@@ -1043,10 +1027,7 @@ mod tests {
             reports,
             vec![
                 PluginReport { language: "python".to_string(), state: PluginState::Active { pid: live } },
-                PluginReport {
-                    language: "typescript".to_string(),
-                    state: PluginState::Active { pid: live }
-                },
+                PluginReport { language: "typescript".to_string(), state: PluginState::Active { pid: live } },
             ],
             "sorted by language, and the dead go.pid dropped rather than reported: {reports:?}"
         );
@@ -1111,10 +1092,7 @@ mod tests {
         incumbent.plugin = format!("{}-before", incumbent.plugin);
         build_stamp::write(&daemon::build_stamp_path_in(state.path()), &incumbent).unwrap();
 
-        assert_eq!(
-            build_state(CoreState::Running { pid: 1 }, state.path()),
-            BuildState::PluginChanged
-        );
+        assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::PluginChanged);
         let described = describe_build(BuildState::PluginChanged).unwrap();
         assert!(!described.contains("older than this g-mesh"), "{described}");
     }
@@ -1128,10 +1106,7 @@ mod tests {
         assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
         // Still comparable for a daemon that is up but not answering on its
         // socket: the stamp is published before the bind, not after.
-        assert_eq!(
-            build_state(CoreState::NotAccepting { pid: 1 }, state.path()),
-            BuildState::Current
-        );
+        assert_eq!(build_state(CoreState::NotAccepting { pid: 1 }, state.path()), BuildState::Current);
     }
 
     #[test]

@@ -27,8 +27,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
-use g_mesh::ipc;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
+use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use rusqlite::{Connection, OpenFlags};
@@ -118,8 +118,7 @@ impl Project {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
         )
         .expect("the index must exist by now");
-        conn.query_row("SELECT value FROM meta WHERE key = 'bulkIndexedAt'", [], |row| row.get(0))
-            .ok()
+        conn.query_row("SELECT value FROM meta WHERE key = 'bulkIndexedAt'", [], |row| row.get(0)).ok()
     }
 }
 
@@ -225,8 +224,8 @@ fn recorded_pid(path: &Path) -> u32 {
 /// `tests/common` entry would be shared state between suites that have no
 /// other reason to agree).
 fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
-    let stream = ipc::Stream::connect(endpoint)
-        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let stream =
+        ipc::Stream::connect(endpoint).unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -244,16 +243,19 @@ fn converse(stream: ipc::Stream, requests: Vec<Value>) -> Result<Vec<Value>, Str
     let mut writer = stream.try_clone().map_err(|e| format!("cannot clone the daemon connection: {e}"))?;
     let mut reader = BufReader::new(stream);
 
-    send(&mut writer, &json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "g-mesh-idle-lifecycle-tests", "version": "0" },
-        },
-    }))?;
+    send(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "g-mesh-idle-lifecycle-tests", "version": "0" },
+            },
+        }),
+    )?;
     let initialized = receive(&mut reader)?;
     if initialized["result"]["serverInfo"]["name"] != "g-mesh" {
         return Err(format!("unexpected initialize response: {initialized}"));
@@ -299,8 +301,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     project.write("src/alpha.ts", "export function alpha(): number {\n  return 1;\n}\n");
     project.write("src/beta.ts", "export function beta(): number {\n  return 2;\n}\n");
 
-    let mut daemon_process =
-        Daemon::spawn(project.root(), PLUGIN_IDLE, CORE_IDLE_EFFECTIVELY_NEVER);
+    let mut daemon_process = Daemon::spawn(project.root(), PLUGIN_IDLE, CORE_IDLE_EFFECTIVELY_NEVER);
 
     let plugin_pid_file = daemon::plugin_pid_path(project.root()).unwrap();
     let core_pid_file = daemon::pid_path(project.root()).unwrap();
@@ -378,11 +379,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
         // Only reachable if this call arrived before the watcher had queued
         // the change; the replay happens before a call answers, so once it is
         // queued one call is enough.
-        assert!(
-            Instant::now() < deadline,
-            "the queued change was never replayed:\n{}",
-            daemon_process.log()
-        );
+        assert!(Instant::now() < deadline, "the queued change was never replayed:\n{}", daemon_process.log());
         thread::sleep(Duration::from_millis(100));
     }
 
@@ -406,11 +403,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
         "a wake must replay only the queue, and a rescan would have brought src/beta.ts with \
          it: {replayed:?}"
     );
-    assert_eq!(
-        project.bulk_indexed_at(),
-        bulk_indexed_at,
-        "a wake must not re-run the cold-start walk"
-    );
+    assert_eq!(project.bulk_indexed_at(), bulk_indexed_at, "a wake must not re-run the cold-start walk");
 
     // --- through all of which the core was the same process --------------
     assert!(daemon_process.is_running(), "the core must not have exited at any point");
@@ -427,8 +420,7 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
 
     // The plugin's timeout is out of reach here on purpose: whatever ends this
     // daemon, it is not the timer the other test is about.
-    let mut daemon_process =
-        Daemon::spawn(project.root(), Duration::from_secs(600), CORE_IDLE);
+    let mut daemon_process = Daemon::spawn(project.root(), Duration::from_secs(600), CORE_IDLE);
     wait_until_indexed(project.root());
     // Captured right after indexing, before anything else in this test can
     // spend wall-clock time - what makes `started_waiting.elapsed()` below a

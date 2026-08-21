@@ -48,10 +48,7 @@ const SEMANTIC_TIMEOUT: Duration = Duration::from_secs(45);
 /// the way, so `barrel.someExport` and `realName` are never the same name in
 /// any one file, and nothing written at the use site names the declaration.
 const FILES: [(&str, &str); 5] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#),
     (
         "src/mod.ts",
         r#"export function someExport(): number {
@@ -152,9 +149,7 @@ async fn find_callers_reaches_a_caller_that_went_through_a_namespace_import() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

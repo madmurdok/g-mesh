@@ -125,21 +125,15 @@ impl IdleTimeouts {
     /// project with no config.toml resolves to exactly what this module
     /// produced before config existed.
     pub fn from_config(config: &ProjectConfig) -> Self {
-        let plugin_default =
-            Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
-        let core_default =
-            Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
+        let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
+        let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
             plugin: parse_timeout(
                 std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
                 plugin_default,
                 PLUGIN_IDLE_ENV,
             ),
-            core: parse_timeout(
-                std::env::var(CORE_IDLE_ENV).ok().as_deref(),
-                core_default,
-                CORE_IDLE_ENV,
-            ),
+            core: parse_timeout(std::env::var(CORE_IDLE_ENV).ok().as_deref(), core_default, CORE_IDLE_ENV),
         }
     }
 
@@ -399,9 +393,9 @@ impl PluginSupervisor {
                 // One unreadable file must not cost the rest of the queue its
                 // replay; it is reported and the walk carries on, matching how
                 // a live watcher event's failure is handled.
-                Err(err) => eprintln!(
-                    "g-mesh daemon: failed to replay queued change to {file_path}: {err:#}"
-                ),
+                Err(err) => {
+                    eprintln!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
+                }
             }
         }
         Ok(replayed)

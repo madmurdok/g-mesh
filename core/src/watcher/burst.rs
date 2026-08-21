@@ -94,8 +94,7 @@ mod tests {
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
     }
 
     /// Registers a real SQLite `commit_hook` on `conn` and returns a counter
@@ -154,7 +153,10 @@ mod tests {
         assert!(!batcher.flush_if_ready(&mut conn).unwrap(), "must not flush before the window elapses");
 
         thread::sleep(Duration::from_millis(60));
-        assert!(batcher.flush_if_ready(&mut conn).unwrap(), "an isolated change flushes on its own after one window");
+        assert!(
+            batcher.flush_if_ready(&mut conn).unwrap(),
+            "an isolated change flushes on its own after one window"
+        );
 
         assert_eq!(commits.load(Ordering::SeqCst), 1);
         assert_eq!(count(&conn, "nodes"), 1);

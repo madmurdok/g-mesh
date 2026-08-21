@@ -38,9 +38,7 @@ pub fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     };
 
     let mut body = vec![0u8; len];
-    reader
-        .read_exact(&mut body)
-        .with_context(|| format!("failed to read {len}-byte frame body"))?;
+    reader.read_exact(&mut body).with_context(|| format!("failed to read {len}-byte frame body"))?;
     Ok(Some(body))
 }
 
@@ -58,9 +56,7 @@ fn read_content_length<R: BufRead>(reader: &mut R) -> Result<Option<usize>> {
 
     loop {
         let mut line = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .context("failed to read frame header")?;
+        let read = reader.read_until(b'\n', &mut line).context("failed to read frame header")?;
         if read == 0 {
             if !started {
                 return Ok(None);
@@ -77,14 +73,12 @@ fn read_content_length<R: BufRead>(reader: &mut R) -> Result<Option<usize>> {
             break;
         }
 
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| anyhow!("malformed frame header line: {line:?}"))?;
+        let (name, value) =
+            line.split_once(':').ok_or_else(|| anyhow!("malformed frame header line: {line:?}"))?;
         if name.trim().eq_ignore_ascii_case(CONTENT_LENGTH) {
             let value = value.trim();
-            let len = value
-                .parse::<usize>()
-                .with_context(|| format!("invalid Content-Length value: {value:?}"))?;
+            let len =
+                value.parse::<usize>().with_context(|| format!("invalid Content-Length value: {value:?}"))?;
             content_length = Some(len);
         }
     }
@@ -106,9 +100,7 @@ mod tests {
         ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: Some(RequestId::Number(7)),
-            message: ControlMessage::Reindex {
-                file_path: "src/lib.rs".to_string(),
-            },
+            message: ControlMessage::Reindex { file_path: "src/lib.rs".to_string() },
         }
     }
 
@@ -116,9 +108,7 @@ mod tests {
         ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
-            message: ControlMessage::FileChanged {
-                file_path: "src/main.rs".to_string(),
-            },
+            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string() },
         }
     }
 
@@ -179,10 +169,7 @@ mod tests {
 
         let received: ControlEnvelope = read_message(&mut reader).unwrap().unwrap();
         assert_eq!(request(), received);
-        assert!(
-            reader.get_ref().reads > 1,
-            "test must actually exercise partial reads"
-        );
+        assert!(reader.get_ref().reads > 1, "test must actually exercise partial reads");
     }
 
     #[test]
@@ -237,12 +224,12 @@ mod tests {
     #[test]
     fn malformed_frames_are_errors_not_panics() {
         let cases: &[&[u8]] = &[
-            b"\r\n{}",                                 // no Content-Length
-            b"Content-Length: nope\r\n\r\n{}",         // unparsable length
-            b"Content-Length 2\r\n\r\n{}",             // header without a colon
-            b"Content-Length: 64\r\n\r\n{}",           // body shorter than announced
-            b"Content-Length: 99999999999\r\n\r\n{}",  // body over the size limit
-            b"Content-Length: 2\r\n",                  // EOF inside the header block
+            b"\r\n{}",                                // no Content-Length
+            b"Content-Length: nope\r\n\r\n{}",        // unparsable length
+            b"Content-Length 2\r\n\r\n{}",            // header without a colon
+            b"Content-Length: 64\r\n\r\n{}",          // body shorter than announced
+            b"Content-Length: 99999999999\r\n\r\n{}", // body over the size limit
+            b"Content-Length: 2\r\n",                 // EOF inside the header block
         ];
 
         for case in cases {

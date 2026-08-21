@@ -132,8 +132,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
             if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
+                let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
             }
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
@@ -171,14 +170,8 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
 
     assert!(output.contains(&format!("daemon core: pid {core}")), "{output}");
     assert!(output.contains(&format!("plugin (typescript): pid {plugin}")), "{output}");
-    assert!(
-        !daemon::is_process_alive(core),
-        "the daemon core (pid {core}) is still running after stop"
-    );
-    assert!(
-        !daemon::is_process_alive(plugin),
-        "the plugin (pid {plugin}) was orphaned by stop"
-    );
+    assert!(!daemon::is_process_alive(core), "the daemon core (pid {core}) is still running after stop");
+    assert!(!daemon::is_process_alive(plugin), "the plugin (pid {plugin}) was orphaned by stop");
     assert!(!project.is_listening(), "the daemon endpoint must be released");
     #[cfg(unix)]
     assert!(!project.socket().exists(), "the daemon socket file must be removed");
@@ -215,10 +208,7 @@ fn stopping_a_project_with_no_daemon_running_is_a_clean_no_op() {
 
     let output = project.stop();
 
-    assert!(
-        output.contains("no daemon is running"),
-        "expected a no-op message, got:\n{output}"
-    );
+    assert!(output.contains("no daemon is running"), "expected a no-op message, got:\n{output}");
     // The assertion that matters is the exit status, which `Project::stop`
     // already required to be a success.
 }
@@ -233,10 +223,7 @@ fn stopping_an_already_stopped_project_is_a_clean_no_op() {
 
     let output = project.stop();
 
-    assert!(
-        output.contains("no daemon is running"),
-        "expected a no-op message, got:\n{output}"
-    );
+    assert!(output.contains("no daemon is running"), "expected a no-op message, got:\n{output}");
 }
 
 /// A daemon that was killed rather than stopped leaves its pid files behind.
@@ -247,11 +234,7 @@ fn stop_clears_the_state_a_crashed_daemon_left_behind() {
     let project = Project::new();
     let (core, plugin) = project.bootstrap_daemon();
 
-    Command::new("kill")
-        .arg("-9")
-        .arg(core.to_string())
-        .status()
-        .expect("failed to kill the daemon");
+    Command::new("kill").arg("-9").arg(core.to_string()).status().expect("failed to kill the daemon");
     wait_for("the daemon to die", || !daemon::is_process_alive(core));
     // The plugin exits by itself when its core's end of its stdin closes.
     wait_for("the plugin to exit with its core", || !daemon::is_process_alive(plugin));
@@ -259,10 +242,7 @@ fn stop_clears_the_state_a_crashed_daemon_left_behind() {
 
     let output = project.stop();
 
-    assert!(
-        output.contains("no daemon is running"),
-        "expected a no-op message, got:\n{output}"
-    );
+    assert!(output.contains("no daemon is running"), "expected a no-op message, got:\n{output}");
     assert!(!project.pid_file().exists(), "the stale daemon pid file must be cleared");
     assert!(!project.plugin_pid_file().exists(), "the stale plugin pid file must be cleared");
     #[cfg(unix)]

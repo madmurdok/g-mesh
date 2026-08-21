@@ -53,13 +53,7 @@ fn map_edge_row(row: &Row) -> rusqlite::Result<EdgeRecord> {
 }
 
 pub fn upsert_node(conn: &mut Connection, node: NodeRecord) -> Result<()> {
-    write::apply_diff(
-        conn,
-        &Diff {
-            upsert_nodes: vec![node],
-            ..Default::default()
-        },
-    )
+    write::apply_diff(conn, &Diff { upsert_nodes: vec![node], ..Default::default() })
 }
 
 pub fn get_node(conn: &Connection, id: &str) -> Result<Option<NodeRecord>> {
@@ -97,12 +91,12 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
         )?,
     };
     let rows = match file_path {
-        Some(fp) => stmt.query_map(
-            params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, fp],
-            map_node_row,
-        )?,
-        None => stmt
-            .query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND], map_node_row)?,
+        Some(fp) => {
+            stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, fp], map_node_row)?
+        }
+        None => {
+            stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND], map_node_row)?
+        }
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
@@ -233,7 +227,12 @@ pub fn find_file_node(conn: &Connection, file_path: &str) -> Result<Option<NodeR
 /// position (a `File` spans the whole file, a `Function` inside it spans
 /// just itself) - ordering by span size ascending picks the smallest one
 /// first, which is always the most specific.
-pub fn find_by_position(conn: &Connection, file_path: &str, line: u32, col: u32) -> Result<Option<NodeRecord>> {
+pub fn find_by_position(
+    conn: &Connection,
+    file_path: &str,
+    line: u32,
+    col: u32,
+) -> Result<Option<NodeRecord>> {
     let (line, col) = (line as i64, col as i64);
     conn.query_row(
         "SELECT * FROM nodes \
@@ -252,13 +251,7 @@ pub fn find_by_position(conn: &Connection, file_path: &str, line: u32, col: u32)
 }
 
 pub fn upsert_edge(conn: &mut Connection, edge: EdgeRecord) -> Result<()> {
-    write::apply_diff(
-        conn,
-        &Diff {
-            upsert_edges: vec![edge],
-            ..Default::default()
-        },
-    )
+    write::apply_diff(conn, &Diff { upsert_edges: vec![edge], ..Default::default() })
 }
 
 pub fn get_edge(conn: &Connection, id: &str) -> Result<Option<EdgeRecord>> {
@@ -268,13 +261,7 @@ pub fn get_edge(conn: &Connection, id: &str) -> Result<Option<EdgeRecord>> {
 }
 
 pub fn delete_edge(conn: &mut Connection, id: &str) -> Result<()> {
-    write::apply_diff(
-        conn,
-        &Diff {
-            delete_edge_ids: vec![id.to_string()],
-            ..Default::default()
-        },
-    )
+    write::apply_diff(conn, &Diff { delete_edge_ids: vec![id.to_string()], ..Default::default() })
 }
 
 #[cfg(test)]
@@ -292,7 +279,8 @@ mod tests {
     #[test]
     fn insert_then_lookup_by_id() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust"))
+            .unwrap();
 
         let found = get_node(&conn, "n1").unwrap().unwrap();
         assert_eq!(found.name, "foo");
@@ -304,9 +292,13 @@ mod tests {
     #[test]
     fn upsert_overwrites_existing_node() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "renamed", "m::renamed", "src/lib.rs", "rust"))
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust"))
             .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("n1", "Function", "renamed", "m::renamed", "src/lib.rs", "rust"),
+        )
+        .unwrap();
 
         let found = get_node(&conn, "n1").unwrap().unwrap();
         assert_eq!(found.name, "renamed");
@@ -319,9 +311,12 @@ mod tests {
     #[test]
     fn delete_removes_node_and_incident_edges() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "bar", "m::bar", "src/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n3", "Function", "baz", "m::baz", "src/lib.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "bar", "m::bar", "src/lib.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n3", "Function", "baz", "m::baz", "src/lib.rs", "rust"))
+            .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e1", "n1", "n2", "CALLS", "tree-sitter", false)).unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e2", "n3", "n1", "CALLS", "tree-sitter", false)).unwrap();
 
@@ -337,11 +332,19 @@ mod tests {
     #[test]
     fn find_file_node_looks_up_by_file_path_not_name() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("file1", "File", "lib.rs", "src/lib.rs", "src/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("fn1", "Function", "run", "pkg::run", "src/lib.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file1", "File", "lib.rs", "src/lib.rs", "src/lib.rs", "rust"),
+        )
+        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("fn1", "Function", "run", "pkg::run", "src/lib.rs", "rust"))
+            .unwrap();
 
         let found = find_file_node(&conn, "src/lib.rs").unwrap().unwrap();
-        assert_eq!(found.id, "file1", "must return the File node, not the unrelated symbol sharing its filePath");
+        assert_eq!(
+            found.id, "file1",
+            "must return the File node, not the unrelated symbol sharing its filePath"
+        );
 
         assert!(find_file_node(&conn, "missing.rs").unwrap().is_none());
     }
@@ -349,8 +352,10 @@ mod tests {
     #[test]
     fn delete_edge_removes_only_that_edge() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "bar", "m::bar", "src/lib.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "bar", "m::bar", "src/lib.rs", "rust"))
+            .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e1", "n1", "n2", "CALLS", "tree-sitter", false)).unwrap();
 
         delete_edge(&mut conn, "e1").unwrap();
@@ -363,10 +368,15 @@ mod tests {
     #[test]
     fn name_and_qualified_name_lookup_returns_all_ambiguous_matches() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b/lib.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n3", "Function", "other", "pkg_a::other", "a/lib.rs", "rust"))
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a/lib.rs", "rust"))
             .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b/lib.rs", "rust"))
+            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("n3", "Function", "other", "pkg_a::other", "a/lib.rs", "rust"),
+        )
+        .unwrap();
 
         let by_name = find_by_name(&conn, "run", None).unwrap();
         assert_eq!(by_name.len(), 2, "ambiguous name must return every matching node");
@@ -380,7 +390,13 @@ mod tests {
         assert_eq!(by_qualified[0].id, "n1");
     }
 
-    fn node_with_span(id: &str, kind: &str, file_path: &str, start: (i64, i64), end: (i64, i64)) -> NodeRecord {
+    fn node_with_span(
+        id: &str,
+        kind: &str,
+        file_path: &str,
+        start: (i64, i64),
+        end: (i64, i64),
+    ) -> NodeRecord {
         let mut node = NodeRecord::new(id, kind, id, id, file_path, "rust");
         node.start_line = start.0;
         node.start_col = start.1;

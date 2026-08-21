@@ -184,16 +184,19 @@ where
 fn list_tools<W: Write, R: Read>(mut writer: W, reader: R) -> Result<Vec<String>, String> {
     let mut reader = BufReader::new(reader);
 
-    send(&mut writer, &json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "g-mesh-shim-tests", "version": "0" },
-        },
-    }))?;
+    send(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "g-mesh-shim-tests", "version": "0" },
+            },
+        }),
+    )?;
     let initialized = receive(&mut reader)?;
     if initialized["result"]["serverInfo"]["name"] != "g-mesh" {
         return Err(format!("unexpected initialize response: {initialized}"));
@@ -206,10 +209,8 @@ fn list_tools<W: Write, R: Read>(mut writer: W, reader: R) -> Result<Vec<String>
         .as_array()
         .ok_or_else(|| format!("tools/list did not return a tool array: {listed}"))?;
 
-    let mut names: Vec<String> = tools
-        .iter()
-        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-        .collect();
+    let mut names: Vec<String> =
+        tools.iter().filter_map(|tool| tool["name"].as_str().map(str::to_string)).collect();
     names.sort();
     Ok(names)
 }
@@ -223,9 +224,8 @@ fn receive<R: Read>(reader: &mut BufReader<R>) -> Result<Value, String> {
     let frame = read_ndjson_frame(reader)
         .map_err(|e| format!("cannot read a response: {e:#}"))?
         .ok_or("the peer closed the connection instead of answering")?;
-    serde_json::from_slice(&frame).map_err(|e| {
-        format!("response is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame))
-    })
+    serde_json::from_slice(&frame)
+        .map_err(|e| format!("response is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame)))
 }
 
 /// One MCP probe through the shim's stdio, then waits for it to exit - the
@@ -256,8 +256,8 @@ fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
 
 /// One MCP probe over the daemon endpoint directly, bypassing the shim.
 fn round_trip_over_socket(endpoint: &ipc::Endpoint) -> Vec<String> {
-    let stream = ipc::Stream::connect(endpoint)
-        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let stream =
+        ipc::Stream::connect(endpoint).unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
     let writer = stream.try_clone().expect("failed to clone the daemon connection");
     mcp_tool_names(writer, stream)
 }
@@ -309,11 +309,8 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
     // that died with its parent.
     assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
 
-    let alive = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .expect("failed to signal the daemon");
+    let alive =
+        Command::new("kill").arg("-0").arg(pid.to_string()).status().expect("failed to signal the daemon");
     assert!(alive.success(), "daemon pid {pid} is no longer alive");
 }
 
@@ -329,14 +326,8 @@ fn shim_prefers_claude_project_dir_env_over_cwd() {
     let mut shim = spawn_shim_with_project_dir_env(cwd_decoy.root(), env_project.root());
     assert_tool_surface(&round_trip_through_shim(&mut shim));
 
-    assert!(
-        env_project.is_listening(),
-        "the daemon must have bootstrapped for CLAUDE_PROJECT_DIR, not cwd"
-    );
-    assert!(
-        !cwd_decoy.is_listening(),
-        "cwd must be ignored once CLAUDE_PROJECT_DIR is set"
-    );
+    assert!(env_project.is_listening(), "the daemon must have bootstrapped for CLAUDE_PROJECT_DIR, not cwd");
+    assert!(!cwd_decoy.is_listening(), "cwd must be ignored once CLAUDE_PROJECT_DIR is set");
 }
 
 /// The regression guard for task 192, and deliberately a check on this
@@ -451,10 +442,7 @@ fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
     assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
     assert_eq!(project.daemon_pid(), pid, "a second daemon must never have taken over");
 
-    let alive = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .expect("failed to signal the daemon");
+    let alive =
+        Command::new("kill").arg("-0").arg(pid.to_string()).status().expect("failed to signal the daemon");
     assert!(alive.success(), "daemon pid {pid} is no longer alive");
 }

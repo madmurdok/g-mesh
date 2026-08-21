@@ -32,12 +32,13 @@
 # halves the diff on its own. It is what keeps a struct literal or a call that
 # fits on one line on one line, which is how this code is written throughout.
 #
-# WHAT IS STILL OUTSTANDING
+# APPLIED
 #
-# 578 hunks remain. This file makes `cargo fmt` behave sensibly; it does not
-# make `cargo fmt --check` pass. Actually applying it is a separate, one-time
-# reformat touching most files, which belongs in its own commit with a
-# `.git-blame-ignore-revs` entry beside it - and until that lands, CI checks
-# formatting on nothing. See GM-241.
+# The 578 hunks these settings implied were applied in one commit that touched
+# nothing else (91 files), recorded in `.git-blame-ignore-revs` so `git blame`
+# skips it, and `cargo fmt --check` is enforced in CI from that point on. If you
+# change a value here, expect to re-run `cargo fmt` and add the resulting commit
+# to that file too - a formatter recorded but not checked drifts straight back,
+# which is the state this repository was in before GM-241.
 max_width = 110
 use_small_heuristics = "Max"

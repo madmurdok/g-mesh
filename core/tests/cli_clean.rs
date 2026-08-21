@@ -87,8 +87,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
             if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
+                let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
             }
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
@@ -129,11 +128,7 @@ fn clean_deletes_the_cwds_project_state_directory() {
     let cleaned = project.command(&["clean"]);
 
     assert!(cleaned.status.success(), "clean failed: {}", stderr_of(&cleaned));
-    assert!(
-        stdout_of(&cleaned).contains("deleted project"),
-        "unexpected output: {}",
-        stdout_of(&cleaned)
-    );
+    assert!(stdout_of(&cleaned).contains("deleted project"), "unexpected output: {}", stdout_of(&cleaned));
     assert!(!state_dir.exists(), "the project's state directory must be gone");
 }
 
@@ -169,10 +164,7 @@ fn clean_in_a_never_indexed_directory_asks_for_an_explicit_project_id() {
 
     assert!(!cleaned.status.success(), "there is nothing here to clean");
     let stderr = stderr_of(&cleaned);
-    assert!(
-        stderr.contains("pass an explicit <project-id>"),
-        "the error must ask for an id: {stderr}"
-    );
+    assert!(stderr.contains("pass an explicit <project-id>"), "the error must ask for an id: {stderr}");
 }
 
 /// `orphaned` end to end, in the form that cannot delete anything: the target

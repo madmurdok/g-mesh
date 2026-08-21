@@ -35,9 +35,9 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
-use rusqlite::Connection;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
@@ -183,13 +183,14 @@ async fn connect_with(
         .expect("the shim must reach the daemon while its cold-start walk is still running")
 }
 
-async fn find_definition(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>, name: &str) -> CallToolResult {
+async fn find_definition(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+) -> CallToolResult {
     client
-        .call_tool(
-            CallToolRequestParams::new("find_definition").with_arguments(
-                json!({ "symbol_name": name }).as_object().cloned().expect("arguments literal is an object"),
-            ),
-        )
+        .call_tool(CallToolRequestParams::new("find_definition").with_arguments(
+            json!({ "symbol_name": name }).as_object().cloned().expect("arguments literal is an object"),
+        ))
         .await
         .expect("tools/call must return a result, not a protocol failure")
 }
@@ -210,7 +211,8 @@ fn body(result: &CallToolResult) -> Value {
 /// three times over, and the client is served throughout - first the honest
 /// refusal, then, on the very same session, the real answer.
 #[tokio::test]
-async fn a_walk_that_outlasts_the_bootstrap_timeout_is_answered_with_still_indexing_rather_than_losing_the_client() {
+async fn a_walk_that_outlasts_the_bootstrap_timeout_is_answered_with_still_indexing_rather_than_losing_the_client(
+) {
     let project = Project::new();
     let started = Instant::now();
     let client = connect_with_a_slow_walk(&project).await;

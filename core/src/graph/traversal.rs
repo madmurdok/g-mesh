@@ -228,10 +228,8 @@ pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<Traversa
         }
     };
 
-    let reached: Vec<VisitedNode> = nodes
-        .iter()
-        .map(|r| VisitedNode { id: r.node.id.clone(), depth: r.depth })
-        .collect();
+    let reached: Vec<VisitedNode> =
+        nodes.iter().map(|r| VisitedNode { id: r.node.id.clone(), depth: r.depth }).collect();
     // Every row this call produced was reported, so the edges it walked are
     // exactly the hops a resumed call must not offer a second time.
     let walked: Vec<String> = edges.iter().map(|e| e.id.clone()).collect();
@@ -267,8 +265,7 @@ pub fn traverse(conn: &Connection, options: TraversalOptions) -> Result<Traversa
 /// results of a call chain is a plain union - nothing is reported twice.
 pub fn resume(conn: &Connection, token: &str, exploration_budget: u32) -> Result<TraversalResult> {
     let state = resume_token::decode(token)?;
-    let seeds =
-        serde_json::to_string(&state.visited).expect("resume state is always serializable");
+    let seeds = serde_json::to_string(&state.visited).expect("resume state is always serializable");
     let walked = serde_json::to_string(&state.walked).expect("resume state is always serializable");
     let already_returned: HashSet<&str> = state.visited.iter().map(|v| v.id.as_str()).collect();
 
@@ -391,17 +388,11 @@ fn run_walk(
 /// The deepest level the walk expanded - what a `maxDepth` caller re-roots on.
 /// Empty for every other cause: a frontier is only meaningful when depth, not
 /// something else, is what stopped the walk.
-fn frontier_nodes(
-    truncated_by: Option<TruncatedBy>,
-    reached: &[VisitedNode],
-    max_depth: u32,
-) -> Vec<String> {
+fn frontier_nodes(truncated_by: Option<TruncatedBy>, reached: &[VisitedNode], max_depth: u32) -> Vec<String> {
     match truncated_by {
-        Some(TruncatedBy::MaxDepth) => reached
-            .iter()
-            .filter(|v| v.depth == max_depth)
-            .map(|v| v.id.clone())
-            .collect(),
+        Some(TruncatedBy::MaxDepth) => {
+            reached.iter().filter(|v| v.depth == max_depth).map(|v| v.id.clone()).collect()
+        }
         _ => Vec::new(),
     }
 }

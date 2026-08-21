@@ -164,7 +164,11 @@ mod tests {
             let path = self.root().join(id);
             std::fs::create_dir_all(&path).unwrap();
             let conn = Connection::open(path.join("index.db")).unwrap();
-            crate::storage::schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+            crate::storage::schema::ensure_current(
+                &conn,
+                &crate::daemon::registry::fixture_indexer_version(),
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
                 rusqlite::params![format!("-{idle_days} days")],

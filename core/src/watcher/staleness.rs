@@ -181,8 +181,8 @@ enum Decision {
 
 fn decide(conn: &Connection, project_root: &Path, file_path: &str) -> Result<Decision> {
     let full_path = project_root.join(file_path);
-    let metadata = fs::metadata(&full_path)
-        .with_context(|| format!("failed to stat {}", full_path.display()))?;
+    let metadata =
+        fs::metadata(&full_path).with_context(|| format!("failed to stat {}", full_path.display()))?;
     let current_mtime = mtime_millis(&metadata)
         .with_context(|| format!("failed to read mtime of {}", full_path.display()))?;
 
@@ -197,8 +197,8 @@ fn decide(conn: &Connection, project_root: &Path, file_path: &str) -> Result<Dec
 
     // mtime disagreed (or there's no prior record at all) - fall back to
     // reading the file and hashing its content.
-    let current_hash = hash_file(&full_path)
-        .with_context(|| format!("failed to hash {}", full_path.display()))?;
+    let current_hash =
+        hash_file(&full_path).with_context(|| format!("failed to hash {}", full_path.display()))?;
 
     if let Some(record) = &prior {
         if record.content_hash == current_hash {
@@ -218,12 +218,7 @@ fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<Inde
     conn.query_row(
         "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = ?1",
         params![file_path],
-        |row| {
-            Ok(IndexedFileRecord {
-                mtime_millis: row.get(0)?,
-                content_hash: row.get(1)?,
-            })
-        },
+        |row| Ok(IndexedFileRecord { mtime_millis: row.get(0)?, content_hash: row.get(1)? }),
     )
     .optional()
     .context("failed to query indexed_files")
@@ -271,11 +266,11 @@ fn hash_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::jsonrpc::{read_message, write_message};
     use crate::protocol::types::{
         ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, NodeKind, Position, Range,
         WireNode, JSONRPC_VERSION,
     };
-    use crate::protocol::jsonrpc::{read_message, write_message};
     use crate::storage::schema;
     use std::io::BufReader;
     use std::sync::mpsc;

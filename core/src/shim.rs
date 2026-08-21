@@ -374,8 +374,7 @@ fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("failed to open bootstrap lock file {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to take the bootstrap lock on {}", path.display()))?;
+    file.lock().with_context(|| format!("failed to take the bootstrap lock on {}", path.display()))?;
     Ok(file)
 }
 

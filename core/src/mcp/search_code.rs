@@ -222,7 +222,11 @@ mod tests {
             cursor = page.next_cursor;
         }
 
-        assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"], "every match must appear exactly once, most similar first");
+        assert_eq!(
+            seen,
+            vec!["n0", "n1", "n2", "n3", "n4"],
+            "every match must appear exactly once, most similar first"
+        );
     }
 
     /// `handle`'s own contract when no model is loaded: a tool-level error
@@ -315,8 +319,10 @@ mod tests {
 
         let conn = Arc::new(Mutex::new(conn));
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
-        let params =
-            SearchCodeParams { query: "load the contents of a file from the filesystem".to_string(), ..Default::default() };
+        let params = SearchCodeParams {
+            query: "load the contents of a file from the filesystem".to_string(),
+            ..Default::default()
+        };
         let body = json_body(&handle(&conn, &embedding, params).unwrap());
 
         let results = body["results"].as_array().unwrap();

@@ -126,10 +126,7 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
         }
     };
 
-    assert!(
-        !status.success(),
-        "a discover() conflict must fail daemon startup, not exit cleanly: {status}"
-    );
+    assert!(!status.success(), "a discover() conflict must fail daemon startup, not exit cleanly: {status}");
 
     let mut stderr = String::new();
     use std::io::Read;

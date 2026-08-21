@@ -147,7 +147,10 @@ fn list_references(
     Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor))
 }
 
-pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle(
+    conn: &Arc<Mutex<Connection>>,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
     let resolved = match anchor::resolve(&conn, &params)? {
@@ -163,12 +166,21 @@ pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
-    let page = list_references(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to find references", e))?;
+    let page = list_references(
+        &conn,
+        &anchor.id,
+        &anchor.file_path,
+        &file_paths,
+        page_size,
+        params.cursor.as_deref(),
+    )
+    .map_err(|e| internal_error("failed to find references", e))?;
 
-    let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
-        .map_err(|e| internal_error("failed to tally referencing files", e))?;
-    let files = pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
+    let tally =
+        pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
+            .map_err(|e| internal_error("failed to tally referencing files", e))?;
+    let files =
+        pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
 
     success(&ReferencePage {
         anchor: anchor_info,
@@ -214,13 +226,29 @@ mod tests {
     #[test]
     fn referenced_from_three_files_returns_all_three_across_small_pages() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
 
         // Page size of 1 against 3 references forces 3 pages, well past the
         // acceptance criteria's "small page size... multiple pages" bar.
@@ -237,7 +265,11 @@ mod tests {
         }
 
         seen.sort();
-        assert_eq!(seen, vec!["caller_a", "caller_b", "caller_c"], "all three usage sites must come back, once each");
+        assert_eq!(
+            seen,
+            vec!["caller_a", "caller_b", "caller_c"],
+            "all three usage sites must come back, once each"
+        );
     }
 
     /// Regression: `find_references` used to filter on `e.kind =
@@ -251,30 +283,74 @@ mod tests {
     #[test]
     fn in_file_callers_are_references_too() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "requireTask", "tasks::requireTask", "tasks.ts", "typescript"))
-            .unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "setTaskPriority", "tasks::setTaskPriority", "tasks.ts", "typescript"))
-            .unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "splitTask", "tasks::splitTask", "tasks.ts", "typescript"))
-            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "target",
+                "Function",
+                "requireTask",
+                "tasks::requireTask",
+                "tasks.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "caller_a",
+                "Function",
+                "setTaskPriority",
+                "tasks::setTaskPriority",
+                "tasks.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "caller_b",
+                "Function",
+                "splitTask",
+                "tasks::splitTask",
+                "tasks.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
         // Exactly what bulk indexing writes for two same-file calls: CALLS
         // edges and no REFERENCES edge at all.
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let callers = json_body(&super::super::find_callers_callees::handle_callers(
-            &conn,
-            SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-        )
-        .unwrap());
-        let mut caller_ids: Vec<&str> =
-            callers["results"].as_array().unwrap().iter().map(|r| r["callerSymbolId"].as_str().unwrap()).collect();
+        let callers = json_body(
+            &super::super::find_callers_callees::handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
+        );
+        let mut caller_ids: Vec<&str> = callers["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["callerSymbolId"].as_str().unwrap())
+            .collect();
         caller_ids.sort();
-        assert_eq!(caller_ids, vec!["caller_a", "caller_b"], "precondition: find_callers sees both in-file callers");
+        assert_eq!(
+            caller_ids,
+            vec!["caller_a", "caller_b"],
+            "precondition: find_callers sees both in-file callers"
+        );
 
-        let references =
-            json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        let references = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
+        );
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
             .unwrap()
@@ -282,7 +358,10 @@ mod tests {
             .map(|r| r["referencingSymbolId"].as_str().unwrap())
             .collect();
         reference_ids.sort();
-        assert_eq!(reference_ids, caller_ids, "find_references must return at least every caller find_callers returns");
+        assert_eq!(
+            reference_ids, caller_ids,
+            "find_references must return at least every caller find_callers returns"
+        );
         assert_eq!(references["results"][0]["referenceKind"], "CALLS");
     }
 
@@ -293,16 +372,32 @@ mod tests {
     #[test]
     fn files_tally_covers_every_file_even_when_the_page_is_truncated() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
         for (i, file) in ["a.ts", "a.ts", "a.ts", "b.ts", "c.ts"].iter().enumerate() {
             let id = format!("caller_{i}");
             upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
         let body = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(1), ..Default::default() }).unwrap(),
+            &handle(
+                &conn,
+                SymbolQueryParams {
+                    symbol_id: Some("target".to_string()),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 1, "precondition: limit 1 shows a single row");
         assert_eq!(body["hasMore"], true, "precondition: four more references are behind the cursor");
@@ -324,18 +419,32 @@ mod tests {
     #[test]
     fn files_tally_is_omitted_when_the_rows_already_are_the_file_answer() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
         for (i, file) in ["a.ts", "b.ts"].iter().enumerate() {
             let id = format!("caller_{i}");
             upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let body = json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        let body = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
+        );
         assert_eq!(body["hasMore"], false, "precondition: the page is complete");
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
-        assert!(body.get("files").is_none(), "a one-row-per-file complete page must not repeat itself as a tally: {body}");
+        assert!(
+            body.get("files").is_none(),
+            "a one-row-per-file complete page must not repeat itself as a tally: {body}"
+        );
     }
 
     /// Same gate from the other side: a complete page whose rows repeat files
@@ -344,17 +453,29 @@ mod tests {
     #[test]
     fn files_tally_is_sent_when_a_complete_page_repeats_files() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
         for (i, file) in ["a.ts", "a.ts", "b.ts"].iter().enumerate() {
             let id = format!("caller_{i}");
             upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let body = json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        let body = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
+        );
         assert_eq!(body["hasMore"], false);
-        let files = body["files"].as_array().expect("three rows over two files leave real deduplication to do");
+        let files =
+            body["files"].as_array().expect("three rows over two files leave real deduplication to do");
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "a.ts");
         assert_eq!(files[0]["refs"], 2);
@@ -366,11 +487,19 @@ mod tests {
     #[test]
     fn files_tally_respects_the_file_paths_scope() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
         for (i, file) in ["a.ts", "a.ts", "b.ts"].iter().enumerate() {
             let id = format!("caller_{i}");
             upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, &id, *file, "typescript")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
@@ -385,7 +514,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let files = body["files"].as_array().expect("two in-scope rows in one file still leave deduplication to do");
+        let files =
+            body["files"].as_array().expect("two in-scope rows in one file still leave deduplication to do");
         assert_eq!(files.len(), 1, "b.ts is out of scope and must not appear in the tally: {body}");
         assert_eq!(files[0]["path"], "a.ts");
     }
@@ -397,9 +527,12 @@ mod tests {
     #[test]
     fn supertype_usages_are_references_too() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("base", "Type", "Base", "pkg::Base", "base.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("sub", "Type", "Sub", "pkg::Sub", "sub.ts", "typescript")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_sub", "sub", "base", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("base", "Type", "Base", "pkg::Base", "base.ts", "typescript"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("sub", "Type", "Sub", "pkg::Sub", "sub.ts", "typescript"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_sub", "sub", "base", "SUPERTYPE_OF", "tree-sitter", true))
+            .unwrap();
 
         let page = list_references(&conn, "base", "base.ts", &[], 10, None).unwrap();
         assert_eq!(page.results.len(), 1);
@@ -418,16 +551,37 @@ mod tests {
     #[test]
     fn a_file_kind_referencing_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "index.ts", "src/index.ts", "src/index.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.ts", "typescript"))
-            .unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file", "File", "index.ts", "src/index.ts", "src/index.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_file", "file", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_caller", "caller", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let body =
-            json_body(&handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap());
+        let body = json_body(
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
+        );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
 
@@ -435,14 +589,28 @@ mod tests {
             assert!(row.get("name").is_none(), "the name field must never be present on any row: {row}");
         }
 
-        let file_row = results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
-        assert!(file_row.get("qualifiedName").is_none(), "qualifiedName duplicates filePath for a File-kind row: {file_row}");
-        assert!(file_row.get("startLine").is_none(), "startLine is meaningless for a File-kind row: {file_row}");
-        assert!(file_row.get("startCol").is_none(), "startCol is meaningless for a File-kind row: {file_row}");
+        let file_row =
+            results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
+        assert!(
+            file_row.get("qualifiedName").is_none(),
+            "qualifiedName duplicates filePath for a File-kind row: {file_row}"
+        );
+        assert!(
+            file_row.get("startLine").is_none(),
+            "startLine is meaningless for a File-kind row: {file_row}"
+        );
+        assert!(
+            file_row.get("startCol").is_none(),
+            "startCol is meaningless for a File-kind row: {file_row}"
+        );
         assert_eq!(file_row["filePath"], "src/index.ts");
 
-        let symbol_row = results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
-        assert_eq!(symbol_row["qualifiedName"], "pkg::caller", "a symbol-kind row must still carry its qualifiedName");
+        let symbol_row =
+            results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
+        assert_eq!(
+            symbol_row["qualifiedName"], "pkg::caller",
+            "a symbol-kind row must still carry its qualifiedName"
+        );
         assert_eq!(symbol_row["startLine"], 0, "a symbol-kind row must still carry its startLine");
         assert_eq!(symbol_row["startCol"], 0, "a symbol-kind row must still carry its startCol");
     }
@@ -452,11 +620,27 @@ mod tests {
     #[test]
     fn defines_and_exports_edges_are_not_references() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "tasks.ts", "tasks.ts", "tasks.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "requireTask", "tasks::requireTask", "tasks.ts", "typescript"))
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file", "File", "tasks.ts", "tasks.ts", "tasks.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "target",
+                "Function",
+                "requireTask",
+                "tasks::requireTask",
+                "tasks.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_def", "file", "target", "DEFINES", "tree-sitter", true))
             .unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_def", "file", "target", "DEFINES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_exp", "file", "target", "EXPORTS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_exp", "file", "target", "EXPORTS", "tree-sitter", true))
+            .unwrap();
 
         let page = list_references(&conn, "target", "tasks.ts", &[], 10, None).unwrap();
         assert!(page.results.is_empty(), "a symbol's own declaration site is not a reference to it");
@@ -467,13 +651,32 @@ mod tests {
     #[test]
     fn mixed_edge_kinds_paginate_as_a_single_stream() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "caller", "pkg::caller", "a.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("user", "Function", "user", "pkg::user", "b.ts", "typescript")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("sub", "Type", "Sub", "pkg::Sub", "c.ts", "typescript")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_call", "caller", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_ref", "user", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_sup", "sub", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "run", "pkg::run", "target.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("caller", "Function", "caller", "pkg::caller", "a.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("user", "Function", "user", "pkg::user", "b.ts", "typescript"),
+        )
+        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("sub", "Type", "Sub", "pkg::Sub", "c.ts", "typescript"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_call", "caller", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_ref", "user", "target", "REFERENCES", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_sup", "sub", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
@@ -488,7 +691,11 @@ mod tests {
         }
 
         seen.sort();
-        assert_eq!(seen, vec!["caller", "sub", "user"], "every usage kind comes back exactly once across pages");
+        assert_eq!(
+            seen,
+            vec!["caller", "sub", "user"],
+            "every usage kind comes back exactly once across pages"
+        );
     }
 
     /// A caller-supplied `limit` above the default page size must actually
@@ -496,15 +703,28 @@ mod tests {
     #[test]
     fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
         for i in 0..25 {
             let id = format!("caller_{i}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "REFERENCES", "tree-sitter", true)).unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust"),
+            )
+            .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "REFERENCES", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            limit: Some(25),
+            ..Default::default()
+        };
         let body = json_body(&handle(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -523,25 +743,50 @@ mod tests {
     #[test]
     fn scoping_to_five_known_files_returns_exactly_the_ones_that_reference_it() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "pointFrom", "pkg::pointFrom", "target.ts", "typescript")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("target", "Function", "pointFrom", "pkg::pointFrom", "target.ts", "typescript"),
+        )
+        .unwrap();
 
         let known_files = ["trail1.ts", "trail2.ts", "trail3.ts", "trail4.ts", "trail5.ts"];
         for (i, file) in known_files.iter().enumerate() {
             let id = format!("known_{i}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "typescript")).unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "typescript"),
+            )
+            .unwrap();
             // Only the first three known files actually reference the target;
             // trail4/trail5 are known candidates that turn out not to call it.
             if i < 3 {
-                upsert_edge(&mut conn, EdgeRecord::new(format!("e_known_{i}"), &id, "target", "REFERENCES", "tree-sitter", true))
-                    .unwrap();
+                upsert_edge(
+                    &mut conn,
+                    EdgeRecord::new(format!("e_known_{i}"), &id, "target", "REFERENCES", "tree-sitter", true),
+                )
+                .unwrap();
             }
         }
         // A reference from outside the known set - must never appear in a
         // scoped answer, however many other unrelated files reference the
         // symbol too.
-        upsert_node(&mut conn, NodeRecord::new("outsider", "Function", "outsider", "pkg::outsider", "unrelated.ts", "typescript"))
-            .unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_outsider", "outsider", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "outsider",
+                "Function",
+                "outsider",
+                "pkg::outsider",
+                "unrelated.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_outsider", "outsider", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
 
         let conn = Arc::new(Mutex::new(conn));
         let params = SymbolQueryParams {
@@ -566,11 +811,22 @@ mod tests {
     #[test]
     fn scoping_find_references_excludes_a_referencing_file_outside_the_scope() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("in_scope", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("out_of_scope", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "in_scope", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "out_of_scope", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("in_scope", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("out_of_scope", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "in_scope", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "out_of_scope", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams {
@@ -590,31 +846,51 @@ mod tests {
     #[test]
     fn omitting_file_paths_behaves_identically_to_before_this_change() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let omitted = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
         );
         let explicit_empty = json_body(
             &handle(
                 &conn,
-                SymbolQueryParams { symbol_id: Some("target".to_string()), file_paths: Some(Vec::new()), ..Default::default() },
+                SymbolQueryParams {
+                    symbol_id: Some("target".to_string()),
+                    file_paths: Some(Vec::new()),
+                    ..Default::default()
+                },
             )
             .unwrap(),
         );
-        assert_eq!(omitted, explicit_empty, "an explicit empty file_paths array must answer exactly as omitting it does");
+        assert_eq!(
+            omitted, explicit_empty,
+            "an explicit empty file_paths array must answer exactly as omitting it does"
+        );
         assert_eq!(omitted["results"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn zero_references_is_an_empty_page_not_an_error() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
@@ -632,11 +908,22 @@ mod tests {
     #[test]
     fn a_page_where_every_reference_is_unresolved_is_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", false)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", false),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
@@ -650,18 +937,37 @@ mod tests {
     #[test]
     fn a_page_with_at_least_one_resolved_reference_is_not_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", false)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", false),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", false),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
-        assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
+        assert_eq!(
+            body["allUnresolved"], false,
+            "one resolved row among several unresolved ones must clear the marker"
+        );
     }
 
     /// The point of task #190: the response itself says what it anchored on,
@@ -671,9 +977,15 @@ mod tests {
     #[test]
     fn the_response_echoes_the_resolved_anchor() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
@@ -690,16 +1002,24 @@ mod tests {
     #[test]
     fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let by_id = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+            &handle(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() })
+                .unwrap(),
         );
         let by_name = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() }).unwrap(),
+            &handle(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() })
+                .unwrap(),
         );
         // Everything but `resolvedBy` must match: the walk, the results and the
         // anchor are properties of the node, however the caller addressed it.
@@ -722,7 +1042,8 @@ mod tests {
     #[test]
     fn unknown_symbol_name_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
+        let params =
+            SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -730,7 +1051,8 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
+        let params =
+            SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -746,8 +1068,18 @@ mod tests {
     #[test]
     fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"))
-            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "file",
+                "File",
+                "connection.ts",
+                "src/connection.ts",
+                "src/connection.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
@@ -755,7 +1087,11 @@ mod tests {
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
-        assert_eq!(body["results"].as_array().unwrap().len(), 0, "a File anchor still answers as an empty page, not an error");
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            0,
+            "a File anchor still answers as an empty page, not an error"
+        );
         assert_eq!(body["hasMore"], false);
         assert_eq!(body["allUnresolved"], false);
     }
@@ -766,29 +1102,53 @@ mod tests {
     #[test]
     fn a_normal_symbol_anchor_never_carries_a_hint_field() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
-        assert!(body.get("hint").is_none(), "hint must be entirely absent, not null, on a normal symbol anchor: {body}");
+        assert!(
+            body.get("hint").is_none(),
+            "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
+        );
     }
 
     #[test]
     fn handle_paginates_across_cursor_continuation() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
+            let params = SymbolQueryParams {
+                symbol_id: Some("target".to_string()),
+                cursor: cursor.clone(),
+                ..Default::default()
+            };
             let result = handle(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();

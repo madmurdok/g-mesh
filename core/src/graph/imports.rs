@@ -85,8 +85,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
                 Ok(Placeholder { id: row.get(0)?, target_path: row.get(1)? })
             })
             .context("failed to scan for resolved import placeholders")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read resolved import placeholders")?
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("failed to read resolved import placeholders")?
     };
 
     link(conn, placeholders)
@@ -109,12 +108,18 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
     let mut placeholders: Vec<Placeholder> = diff
         .upsert_nodes
         .iter()
-        .filter(|node| node.kind == MODULE_KIND && node.native_kind.as_deref() == Some(RESOLVED_MODULE_NATIVE_KIND))
+        .filter(|node| {
+            node.kind == MODULE_KIND && node.native_kind.as_deref() == Some(RESOLVED_MODULE_NATIVE_KIND)
+        })
         .map(|node| Placeholder { id: node.id.clone(), target_path: node.qualified_name.clone() })
         .collect();
 
-    let added_files: Vec<&str> =
-        diff.upsert_nodes.iter().filter(|node| node.kind == FILE_KIND).map(|node| node.file_path.as_str()).collect();
+    let added_files: Vec<&str> = diff
+        .upsert_nodes
+        .iter()
+        .filter(|node| node.kind == FILE_KIND)
+        .map(|node| node.file_path.as_str())
+        .collect();
     if !added_files.is_empty() {
         // Indexed by idx_nodes_qualifiedName, so this is a lookup per added
         // file rather than a scan of the index.
@@ -164,8 +169,9 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         let mut incident = tx
             .prepare("SELECT COUNT(*) FROM edges WHERE fromId = ?1 OR toId = ?1")
             .context("failed to prepare the incident-edge count")?;
-        let mut drop_placeholder =
-            tx.prepare("DELETE FROM nodes WHERE id = ?1").context("failed to prepare the placeholder delete")?;
+        let mut drop_placeholder = tx
+            .prepare("DELETE FROM nodes WHERE id = ?1")
+            .context("failed to prepare the placeholder delete")?;
 
         for placeholder in placeholders {
             let target: Option<String> = find_file
@@ -177,8 +183,9 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
             // placeholder exactly as it is *is* the graceful fallback.
             let Some(target_id) = target else { continue };
 
-            summary.linked_edges +=
-                repoint.execute(params![target_id, placeholder.id]).context("failed to repoint an import edge")?;
+            summary.linked_edges += repoint
+                .execute(params![target_id, placeholder.id])
+                .context("failed to repoint an import edge")?;
 
             let remaining: i64 = incident
                 .query_row(params![placeholder.id], |row| row.get(0))
@@ -281,8 +288,7 @@ mod tests {
         let summary = link_all(&mut conn).unwrap();
 
         assert_eq!(summary, LinkSummary { linked_edges: 1, dropped_placeholders: 1 });
-        let (to_id, resolved) =
-            edge_target(&conn, "edge:src/index.ts:mod:src/index.ts:src/db/connection.ts");
+        let (to_id, resolved) = edge_target(&conn, "edge:src/index.ts:mod:src/index.ts:src/db/connection.ts");
         assert_eq!(to_id, "file:src/db/connection.ts", "the edge must point at the target's File node");
         assert!(resolved, "a path-resolved import is resolved, even though it is still tree-sitter-sourced");
         assert_eq!(count(&conn, "nodes"), 2, "the placeholder must be gone once nothing points at it");
@@ -392,7 +398,10 @@ mod tests {
 
         let placeholder = placeholder_node("a.ts", "b.ts", RESOLVED_MODULE_NATIVE_KIND);
         let diff = Diff {
-            upsert_nodes: vec![file_node("a.ts"), placeholder_node("a.ts", "b.ts", RESOLVED_MODULE_NATIVE_KIND)],
+            upsert_nodes: vec![
+                file_node("a.ts"),
+                placeholder_node("a.ts", "b.ts", RESOLVED_MODULE_NATIVE_KIND),
+            ],
             upsert_edges: vec![import_edge("a.ts", &placeholder)],
             ..Default::default()
         };

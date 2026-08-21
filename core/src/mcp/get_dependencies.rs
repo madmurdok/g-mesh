@@ -227,7 +227,8 @@ fn bound_walk(
         kept_ids.contains(child.as_str()).then_some(e.id)
     }));
 
-    let token = resume_token::encode(&ResumeState { direction, edge_kind, max_depth, max_fanout, visited, walked });
+    let token =
+        resume_token::encode(&ResumeState { direction, edge_kind, max_depth, max_fanout, visited, walked });
 
     DependencyWalk {
         results: dtos.into_iter().take(cut).collect(),
@@ -262,13 +263,14 @@ fn from_root(conn: &Connection, root: String, shape: &WalkShape) -> Result<CallT
     let (direction, edge_kind, max_depth, max_fanout) =
         (options.direction, options.edge_kind.clone(), options.max_depth, options.max_fanout);
 
-    let result =
-        traversal::traverse(conn, options).map_err(|e| internal_error("failed to walk the import graph", e))?;
+    let result = traversal::traverse(conn, options)
+        .map_err(|e| internal_error("failed to walk the import graph", e))?;
     success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new()))
 }
 
 fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
-    let anchor = queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
+    let anchor =
+        queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
     match anchor {
         Some(node) => from_root(conn, node.id, shape),
@@ -348,7 +350,8 @@ fn paths_of(nodes: &[NodeRecord]) -> String {
 /// path that this index carries is an answerable question however the caller
 /// labelled it, and refusing it on a technicality buys nothing.
 fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
-    let anchor = queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
+    let anchor =
+        queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
 
     match anchor {
         Some(node) => from_root(conn, node.id, shape),
@@ -369,18 +372,29 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
     // internally) purely to read the walk's shape back out for `bound_walk` -
     // cheap, and keeps `traversal`'s public surface free of a getter that
     // exists for one caller.
-    let state = resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
-    let ResumeState { direction, edge_kind, max_depth, max_fanout, visited: prior_visited, walked: prior_walked } =
-        state;
+    let state =
+        resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
+    let ResumeState {
+        direction,
+        edge_kind,
+        max_depth,
+        max_fanout,
+        visited: prior_visited,
+        walked: prior_walked,
+    } = state;
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the import walk", e))?;
     success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked))
 }
 
-pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle(
+    conn: &Arc<Mutex<Connection>>,
+    params: GetDependenciesParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
-    let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } = params;
+    let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
+        params;
     let shape = WalkShape { direction, max_depth, max_fanout };
 
     match (resume_token, file_path, module_id) {
@@ -434,7 +448,11 @@ mod tests {
 
     /// `from` imports `to`, i.e. the edge points the way the dependency does.
     fn imports(conn: &mut Connection, from: &str, to: &str) {
-        upsert_edge(conn, EdgeRecord::new(format!("e_{from}_{to}"), from, to, "IMPORTS", "tree-sitter", true)).unwrap();
+        upsert_edge(
+            conn,
+            EdgeRecord::new(format!("e_{from}_{to}"), from, to, "IMPORTS", "tree-sitter", true),
+        )
+        .unwrap();
     }
 
     /// a.rs -> b.rs -> c.rs, the chain both direction tests read in opposite
@@ -512,10 +530,16 @@ mod tests {
     #[test]
     fn the_anchor_itself_is_not_reported_as_its_own_dependency() {
         let conn = import_chain();
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+        );
 
-        let ids: Vec<&str> = body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert!(!ids.contains(&"a.rs"), "the depth-0 anchor must not appear among its own dependencies: {ids:?}");
+        let ids: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(
+            !ids.contains(&"a.rs"),
+            "the depth-0 anchor must not appear among its own dependencies: {ids:?}"
+        );
     }
 
     /// A placeholder must not borrow the importing file's path on the way
@@ -527,10 +551,13 @@ mod tests {
         upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
         imports(&mut conn, "a.rs", "mod_zod");
 
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+        );
         let rows = body["results"].as_array().unwrap();
 
-        let module = rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
+        let module =
+            rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
         assert!(module["filePath"].is_null(), "a module placeholder has no file of its own: {module}");
         assert_eq!(module["qualifiedName"], "zod", "the specifier is all there is left to act on");
 
@@ -551,17 +578,26 @@ mod tests {
         upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
         imports(&mut conn, "a.rs", "mod_zod");
 
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+        );
         let rows = body["results"].as_array().unwrap();
 
         let files: Vec<&serde_json::Value> = rows.iter().filter(|r| r["kind"] == "File").collect();
         assert!(!files.is_empty());
         for file in files {
-            assert!(file.get("qualifiedName").is_none(), "a File row must not repeat its own filePath as qualifiedName: {file}");
+            assert!(
+                file.get("qualifiedName").is_none(),
+                "a File row must not repeat its own filePath as qualifiedName: {file}"
+            );
         }
 
-        let module = rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
-        assert_eq!(module["qualifiedName"], "zod", "a Module row has no filePath, so qualifiedName must stay");
+        let module =
+            rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
+        assert_eq!(
+            module["qualifiedName"], "zod",
+            "a Module row has no filePath, so qualifiedName must stay"
+        );
     }
 
     /// `name` never carries information `qualifiedName` doesn't already have
@@ -574,7 +610,9 @@ mod tests {
         upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
         imports(&mut conn, "a.rs", "mod_zod");
 
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+        );
         let rows = body["results"].as_array().unwrap();
         assert!(!rows.is_empty());
         for row in rows {
@@ -586,11 +624,15 @@ mod tests {
     fn only_import_edges_are_walked() {
         let mut conn = import_chain();
         upsert_node(&mut conn, file("d.rs")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_call", "a.rs", "d.rs", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_call", "a.rs", "d.rs", "CALLS", "tree-sitter", true))
+            .unwrap();
 
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+        );
 
-        let ids: Vec<&str> = body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["b.rs", "c.rs"], "a CALLS edge is not a dependency: {ids:?}");
     }
 
@@ -676,7 +718,11 @@ mod tests {
         assert_eq!(reached(&body), vec![("b.rs".to_string(), 1)]);
         assert_eq!(body["truncated"], true);
         assert_eq!(body["truncatedBy"], "maxDepth");
-        assert_eq!(body["frontierNodes"], serde_json::json!(["b.rs"]), "the level to re-root the same call on");
+        assert_eq!(
+            body["frontierNodes"],
+            serde_json::json!(["b.rs"]),
+            "the level to re-root the same call on"
+        );
         assert!(body["resumeToken"].is_null(), "a depth cut is re-rooted, not resumed");
     }
 
@@ -692,13 +738,18 @@ mod tests {
             imports(&mut conn, "a.rs", path);
         }
 
-        let params = GetDependenciesParams { max_fanout: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
+        let params =
+            GetDependenciesParams { max_fanout: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
         let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
 
         assert_eq!(body["results"].as_array().unwrap().len(), 1, "one of the three imports, and a warning");
         assert_eq!(body["truncated"], true);
         assert_eq!(body["truncatedBy"], "maxFanout");
-        assert_eq!(body["frontierNodes"].as_array().unwrap().len(), 0, "a fanout cut is paginated, not re-rooted");
+        assert_eq!(
+            body["frontierNodes"].as_array().unwrap().len(),
+            0,
+            "a fanout cut is paginated, not re-rooted"
+        );
         assert!(body["resumeToken"].is_null());
     }
 
@@ -728,23 +779,42 @@ mod tests {
         let mut diff = Diff { upsert_nodes: vec![file("a.rs")], ..Default::default() };
         for i in 0..wide {
             let path = format!("dep{i:05}.rs");
-            diff.upsert_edges.push(EdgeRecord::new(format!("e{i:05}"), "a.rs", &path, "IMPORTS", "tree-sitter", true));
+            diff.upsert_edges.push(EdgeRecord::new(
+                format!("e{i:05}"),
+                "a.rs",
+                &path,
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            ));
             diff.upsert_nodes.push(file(&path));
         }
         write::apply_diff(&mut conn, &diff).unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at("a.rs", Direction::Outgoing) };
+        let params =
+            GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at("a.rs", Direction::Outgoing) };
         let first = json_body(&handle(&conn, params).unwrap());
 
         let first_len = first["results"].as_array().unwrap().len();
-        assert!(first_len > 0 && first_len < wide, "one response must not hold all {wide} dependencies: {first_len}");
+        assert!(
+            first_len > 0 && first_len < wide,
+            "one response must not hold all {wide} dependencies: {first_len}"
+        );
         assert_eq!(first["truncated"], true);
         assert_eq!(first["truncatedBy"], "responseSize");
-        assert_eq!(first["frontierNodes"].as_array().unwrap().len(), 0, "a size cut is resumed, not re-rooted");
+        assert_eq!(
+            first["frontierNodes"].as_array().unwrap().len(),
+            0,
+            "a size cut is resumed, not re-rooted"
+        );
 
-        let mut all: Vec<String> =
-            first["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        let mut all: Vec<String> = first["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
         let mut token = first["resumeToken"].as_str().map(str::to_string);
         let mut calls = 1;
 
@@ -760,12 +830,20 @@ mod tests {
             };
             let body = json_body(&handle(&conn, resumed).unwrap());
             calls += 1;
-            all.extend(body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            all.extend(
+                body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()),
+            );
             token = body["resumeToken"].as_str().map(str::to_string);
-            assert!(calls < 50, "the chain must converge, not re-explore itself forever: {calls} calls so far");
+            assert!(
+                calls < 50,
+                "the chain must converge, not re-explore itself forever: {calls} calls so far"
+            );
         }
 
-        assert!(calls > 2, "a page far smaller than {wide} deps must take more than one resume: only {calls} calls");
+        assert!(
+            calls > 2,
+            "a page far smaller than {wide} deps must take more than one resume: only {calls} calls"
+        );
 
         let mut deduped = all.clone();
         deduped.sort();
@@ -789,13 +867,21 @@ mod tests {
         let mut diff = Diff { upsert_nodes: vec![file(core)], ..Default::default() };
         for i in 0..wide {
             let path = format!("packages/consumer{i:05}/src/index.ts");
-            diff.upsert_edges.push(EdgeRecord::new(format!("e{i:05}"), &path, core, "IMPORTS", "tree-sitter", true));
+            diff.upsert_edges.push(EdgeRecord::new(
+                format!("e{i:05}"),
+                &path,
+                core,
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            ));
             diff.upsert_nodes.push(file(&path));
         }
         write::apply_diff(&mut conn, &diff).unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at(core, Direction::Incoming) };
+        let params =
+            GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at(core, Direction::Incoming) };
         let body = json_body(&handle(&conn, params).unwrap());
 
         let results = body["results"].as_array().unwrap();
@@ -804,7 +890,10 @@ mod tests {
         assert_eq!(body["truncated"], true);
         assert_eq!(body["truncatedBy"], "responseSize");
         let raw_len = serde_json::to_vec(results).unwrap().len();
-        assert!(raw_len <= pagination::MAX_RESPONSE_BYTES, "the truncated page itself must respect the budget: {raw_len}");
+        assert!(
+            raw_len <= pagination::MAX_RESPONSE_BYTES,
+            "the truncated page itself must respect the budget: {raw_len}"
+        );
 
         let token = body["resumeToken"].as_str().expect("a size cut must carry a resume token").to_string();
         let resumed = GetDependenciesParams {
@@ -848,11 +937,17 @@ mod tests {
         assert_eq!(defaulted["truncatedBy"], "maxDepth");
         assert_eq!(defaulted["frontierNodes"], serde_json::json!(["c.rs"]));
 
-        let explicit = GetDependenciesParams { max_depth: Some(4), ..anchored_at("a.rs", Direction::Outgoing) };
+        let explicit =
+            GetDependenciesParams { max_depth: Some(4), ..anchored_at("a.rs", Direction::Outgoing) };
         let body = json_body(&handle(&conn, explicit).unwrap());
         assert_eq!(
             reached(&body),
-            vec![("b.rs".to_string(), 1), ("c.rs".to_string(), 2), ("d.rs".to_string(), 3), ("e.rs".to_string(), 4)],
+            vec![
+                ("b.rs".to_string(), 1),
+                ("c.rs".to_string(), 2),
+                ("d.rs".to_string(), 3),
+                ("e.rs".to_string(), 4)
+            ],
             "an explicit max_depth must be honored exactly, unaffected by this tool's own default"
         );
         assert_eq!(body["truncated"], false);

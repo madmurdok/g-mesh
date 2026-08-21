@@ -126,12 +126,7 @@ mod tests {
 
     #[test]
     fn parses_mixed_node_and_edge_lines_including_crlf() {
-        let stream = format!(
-            "{}\r\n{}\n{}\n",
-            node_json("n1"),
-            edge_json("e1", "n1", "n2"),
-            node_json("n2")
-        );
+        let stream = format!("{}\r\n{}\n{}\n", node_json("n1"), edge_json("e1", "n1", "n2"), node_json("n2"));
         let reader = NdjsonReader::new(Cursor::new(stream.into_bytes()));
         let items: Vec<BulkItem> = reader.map(|r| r.unwrap()).collect();
 

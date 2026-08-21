@@ -76,7 +76,12 @@ pub(super) struct Snippet {
 /// was edited since the last walk. A definition's coordinates are still a
 /// correct, useful answer without its text, so a missing snippet degrades the
 /// response instead of failing the call.
-pub(super) fn read_span(project_root: &Path, file_path: &str, start_line: i64, end_line: i64) -> Option<Snippet> {
+pub(super) fn read_span(
+    project_root: &Path,
+    file_path: &str,
+    start_line: i64,
+    end_line: i64,
+) -> Option<Snippet> {
     if start_line < 0 || end_line < start_line {
         return None;
     }
@@ -161,7 +166,8 @@ mod tests {
         let body: String = (0..MAX_LINES + 30).map(|n| format!("line {n}\n")).collect();
         let (dir, file) = project(&body);
 
-        let snippet = read_span(dir.path(), &file, 0, (MAX_LINES + 29) as i64).expect("the span is inside the file");
+        let snippet =
+            read_span(dir.path(), &file, 0, (MAX_LINES + 29) as i64).expect("the span is inside the file");
 
         assert_eq!(snippet.text.lines().count(), MAX_LINES);
         assert_eq!(snippet.omitted_lines, Some(30));

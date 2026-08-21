@@ -51,8 +51,17 @@ fn list_calls(
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<CallSite>> {
-    let page = pagination::paginate_edges(conn, anchor_id, direction, &["CALLS"], file_paths, anchor_file_path, page_size, cursor)
-        .context("failed to paginate CALLS edges")?;
+    let page = pagination::paginate_edges(
+        conn,
+        anchor_id,
+        direction,
+        &["CALLS"],
+        file_paths,
+        anchor_file_path,
+        page_size,
+        cursor,
+    )
+    .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());
     for pagination::ScoredEdge { edge, locality } in page.results {
@@ -71,7 +80,12 @@ fn list_calls(
     // Intermediate page, ahead of the EdgeRow/bound_page step each handle_*
     // does next - that step computes the real `all_unresolved` marker from
     // each row's `resolved` bit, so this one is a placeholder nothing reads.
-    Ok(pagination::Page { results, has_more: page.has_more, next_cursor: page.next_cursor, all_unresolved: false })
+    Ok(pagination::Page {
+        results,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: false,
+    })
 }
 
 /// Wire shape for `find_callers`: the calling function on the other end of
@@ -193,7 +207,10 @@ struct CalleePage {
     hint: Option<&'static str>,
 }
 
-pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle_callers(
+    conn: &Arc<Mutex<Connection>>,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
     let resolved = match anchor::resolve(&conn, &params)? {
@@ -209,8 +226,16 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
-    let page = list_calls(&conn, &anchor.id, &anchor.file_path, &file_paths, Direction::Incoming, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to find callers", e))?;
+    let page = list_calls(
+        &conn,
+        &anchor.id,
+        &anchor.file_path,
+        &file_paths,
+        Direction::Incoming,
+        page_size,
+        params.cursor.as_deref(),
+    )
+    .map_err(|e| internal_error("failed to find callers", e))?;
 
     let rows = page
         .results
@@ -224,7 +249,8 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to tally calling files", e))?;
-    let files = pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
+    let files =
+        pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
 
     success(&CallerPage {
         anchor: anchor_info,
@@ -237,7 +263,10 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
     })
 }
 
-pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle_callees(
+    conn: &Arc<Mutex<Connection>>,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
     let resolved = match anchor::resolve(&conn, &params)? {
@@ -253,8 +282,16 @@ pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
-    let page = list_calls(&conn, &anchor.id, &anchor.file_path, &file_paths, Direction::Outgoing, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to find callees", e))?;
+    let page = list_calls(
+        &conn,
+        &anchor.id,
+        &anchor.file_path,
+        &file_paths,
+        Direction::Outgoing,
+        page_size,
+        params.cursor.as_deref(),
+    )
+    .map_err(|e| internal_error("failed to find callees", e))?;
 
     let rows = page
         .results
@@ -349,15 +386,30 @@ mod tests {
     #[test]
     fn a_file_kind_caller_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "main.rs", "src/main.rs", "src/main.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file", "File", "main.rs", "src/main.rs", "src/main.rs", "rust"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("caller", "Function", "caller", "pkg::caller", "caller.rs", "rust"),
+        )
+        .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let body = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() }).unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -366,14 +418,28 @@ mod tests {
             assert!(row.get("name").is_none(), "the name field must never be present on any row: {row}");
         }
 
-        let file_row = results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
-        assert!(file_row.get("qualifiedName").is_none(), "qualifiedName duplicates filePath for a File-kind row: {file_row}");
-        assert!(file_row.get("startLine").is_none(), "startLine is meaningless for a File-kind row: {file_row}");
-        assert!(file_row.get("startCol").is_none(), "startCol is meaningless for a File-kind row: {file_row}");
+        let file_row =
+            results.iter().find(|r| r["kind"] == "File").expect("the File-kind row must be present");
+        assert!(
+            file_row.get("qualifiedName").is_none(),
+            "qualifiedName duplicates filePath for a File-kind row: {file_row}"
+        );
+        assert!(
+            file_row.get("startLine").is_none(),
+            "startLine is meaningless for a File-kind row: {file_row}"
+        );
+        assert!(
+            file_row.get("startCol").is_none(),
+            "startCol is meaningless for a File-kind row: {file_row}"
+        );
         assert_eq!(file_row["filePath"], "src/main.rs");
 
-        let symbol_row = results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
-        assert_eq!(symbol_row["qualifiedName"], "pkg::caller", "a symbol-kind row must still carry its qualifiedName");
+        let symbol_row =
+            results.iter().find(|r| r["kind"] == "Function").expect("the Function-kind row must be present");
+        assert_eq!(
+            symbol_row["qualifiedName"], "pkg::caller",
+            "a symbol-kind row must still carry its qualifiedName"
+        );
         assert_eq!(symbol_row["startLine"], 0, "a symbol-kind row must still carry its startLine");
         assert_eq!(symbol_row["startCol"], 0, "a symbol-kind row must still carry its startCol");
     }
@@ -397,11 +463,16 @@ mod tests {
     #[test]
     fn a_page_where_every_caller_is_unresolved_is_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", false)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", false))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
@@ -412,18 +483,28 @@ mod tests {
     #[test]
     fn a_page_with_at_least_one_resolved_caller_is_not_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "CALLS", "tree-sitter", false)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", false))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "CALLS", "tree-sitter", false))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(&handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
-        assert_eq!(body["allUnresolved"], false, "one resolved row among several unresolved ones must clear the marker");
+        assert_eq!(
+            body["allUnresolved"], false,
+            "one resolved row among several unresolved ones must clear the marker"
+        );
     }
 
     #[test]
@@ -444,7 +525,11 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(callers["anchor"]["id"], "b");
         assert_eq!(callers["anchor"]["qualifiedName"], "pkg::b");
@@ -452,7 +537,11 @@ mod tests {
         assert_eq!(callers["anchor"]["filePath"], "b.rs");
 
         let callees = json_body(
-            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+            &handle_callees(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(callees["anchor"]["id"], "b");
         assert_eq!(callees["anchor"]["qualifiedName"], "pkg::b");
@@ -465,15 +554,21 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(callers["results"].as_array().unwrap().len(), 1);
         assert_eq!(callers["results"][0]["callerSymbolId"], "a");
 
         let callees = json_body(
-            &handle_callees(&conn, SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle_callees(
+                &conn,
+                SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(callees["results"].as_array().unwrap().len(), 1);
         assert_eq!(callees["results"][0]["calleeSymbolId"], "c");
@@ -488,19 +583,31 @@ mod tests {
     #[test]
     fn an_ambiguous_symbol_name_returns_candidates_instead_of_walking_either() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("run_a", "Function", "run", "pkg_a::run", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("run_b", "Function", "run", "pkg_b::run", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "ca", "pkg::ca", "ca.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "run_a", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run_a", "Function", "run", "pkg_a::run", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run_b", "Function", "run", "pkg_b::run", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "ca", "pkg::ca", "ca.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "run_a", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true))
+            .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let ambiguous = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
-        assert_eq!(ambiguous["ambiguous"], true, "the candidate page must be distinguishable from a results page");
+        assert_eq!(
+            ambiguous["ambiguous"], true,
+            "the candidate page must be distinguishable from a results page"
+        );
         let candidates = ambiguous["results"].as_array().unwrap();
         let mut names: Vec<&str> = candidates.iter().map(|c| c["qualifiedName"].as_str().unwrap()).collect();
         names.sort();
@@ -512,7 +619,8 @@ mod tests {
 
         // The follow-up the caller is expected to make - and it must answer
         // for the one symbol it picked, not for both.
-        let picked = candidates.iter().find(|c| c["qualifiedName"] == "pkg_b::run").expect("candidate pkg_b::run");
+        let picked =
+            candidates.iter().find(|c| c["qualifiedName"] == "pkg_b::run").expect("candidate pkg_b::run");
         let params = SymbolQueryParams {
             symbol_id: Some(picked["id"].as_str().expect("a candidate carries its id").to_string()),
             ..Default::default()
@@ -535,8 +643,10 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("run_a", "Function", "run", "run", "a.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("run_b", "Function", "run", "run", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "cb", "pkg::cb", "cb.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true))
+            .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
@@ -544,14 +654,17 @@ mod tests {
         assert_eq!(ambiguous["ambiguous"], true);
 
         // Re-asking by qualifiedName here is the loop: it is the same query.
-        let requalified =
-            SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
+        let requalified = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
         assert_eq!(json_body(&handle_callers(&conn, requalified).unwrap())["ambiguous"], true);
 
         let mut ids: Vec<&str> =
             ambiguous["results"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["run_a", "run_b"], "the ids must survive even when nothing else tells them apart");
+        assert_eq!(
+            ids,
+            vec!["run_a", "run_b"],
+            "the ids must survive even when nothing else tells them apart"
+        );
 
         let params = SymbolQueryParams { symbol_id: Some("run_b".to_string()), ..Default::default() };
         let body = json_body(&handle_callers(&conn, params).unwrap());
@@ -561,7 +674,8 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callers() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
+        let params =
+            SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callers(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -569,7 +683,8 @@ mod tests {
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error_for_callees() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
+        let params =
+            SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callees(&Arc::new(Mutex::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -582,18 +697,27 @@ mod tests {
     #[test]
     fn called_by_three_functions_returns_all_three_across_small_pages() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "caller_a", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c", "caller_c", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_calls(&conn, "target", "target.rs", &[], Direction::Incoming, 1, cursor.as_deref()).unwrap();
+            let page =
+                list_calls(&conn, "target", "target.rs", &[], Direction::Incoming, 1, cursor.as_deref())
+                    .unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|c| c.node.id));
             if !page.has_more {
@@ -603,7 +727,11 @@ mod tests {
         }
 
         seen.sort();
-        assert_eq!(seen, vec!["caller_a", "caller_b", "caller_c"], "all three callers must come back, once each");
+        assert_eq!(
+            seen,
+            vec!["caller_a", "caller_b", "caller_c"],
+            "all three callers must come back, once each"
+        );
     }
 
     /// Same membership-test shape as `find_references`'s benchmark repro, but
@@ -614,19 +742,35 @@ mod tests {
     #[test]
     fn scoping_find_callers_to_a_known_file_set_returns_only_the_callers_within_it() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
 
         let known_files = ["k1.rs", "k2.rs", "k3.rs", "k4.rs"];
         for (i, file) in known_files.iter().enumerate() {
             let id = format!("known_{i}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "rust")).unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), *file, "rust"),
+            )
+            .unwrap();
             if i < 3 {
-                upsert_edge(&mut conn, EdgeRecord::new(format!("e_known_{i}"), &id, "target", "CALLS", "tree-sitter", true))
-                    .unwrap();
+                upsert_edge(
+                    &mut conn,
+                    EdgeRecord::new(format!("e_known_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+                )
+                .unwrap();
             }
         }
-        upsert_node(&mut conn, NodeRecord::new("outsider", "Function", "outsider", "pkg::outsider", "unrelated.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_outsider", "outsider", "target", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("outsider", "Function", "outsider", "pkg::outsider", "unrelated.rs", "rust"),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_outsider", "outsider", "target", "CALLS", "tree-sitter", true),
+        )
+        .unwrap();
 
         let conn = Arc::new(Mutex::new(conn));
         let params = SymbolQueryParams {
@@ -638,7 +782,11 @@ mod tests {
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
-        assert_eq!(file_paths, vec!["k1.rs", "k2.rs", "k3.rs"], "must return exactly the known files that call the target");
+        assert_eq!(
+            file_paths,
+            vec!["k1.rs", "k2.rs", "k3.rs"],
+            "must return exactly the known files that call the target"
+        );
     }
 
     /// Omitting `file_paths` must be indistinguishable from a call made
@@ -650,16 +798,27 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let omitted = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let explicit_empty = json_body(
             &handle_callers(
                 &conn,
-                SymbolQueryParams { symbol_id: Some("b".to_string()), file_paths: Some(Vec::new()), ..Default::default() },
+                SymbolQueryParams {
+                    symbol_id: Some("b".to_string()),
+                    file_paths: Some(Vec::new()),
+                    ..Default::default()
+                },
             )
             .unwrap(),
         );
-        assert_eq!(omitted, explicit_empty, "an explicit empty file_paths array must answer exactly as omitting it does");
+        assert_eq!(
+            omitted, explicit_empty,
+            "an explicit empty file_paths array must answer exactly as omitting it does"
+        );
         assert_eq!(omitted["results"].as_array().unwrap().len(), 1);
     }
 
@@ -669,15 +828,28 @@ mod tests {
     #[test]
     fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
         for i in 0..25 {
             let id = format!("caller_{i}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true)).unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Function", &id, format!("pkg::{id}"), "a.rs", "rust"),
+            )
+            .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "CALLS", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            limit: Some(25),
+            ..Default::default()
+        };
         let body = json_body(&handle_callers(&conn, params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -696,23 +868,43 @@ mod tests {
     #[test]
     fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies_for_both_directions() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"))
-            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "file",
+                "File",
+                "connection.ts",
+                "src/connection.ts",
+                "src/connection.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let callers = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() }).unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
-        let callers_hint = callers["hint"].as_str().expect("a File-anchored find_callers call must carry a hint");
+        let callers_hint =
+            callers["hint"].as_str().expect("a File-anchored find_callers call must carry a hint");
         assert!(callers_hint.contains("get_dependencies"), "{callers_hint}");
         assert_eq!(callers["results"].as_array().unwrap().len(), 0);
         assert_eq!(callers["hasMore"], false);
         assert_eq!(callers["allUnresolved"], false);
 
         let callees = json_body(
-            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() }).unwrap(),
+            &handle_callees(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
-        let callees_hint = callees["hint"].as_str().expect("a File-anchored find_callees call must carry a hint");
+        let callees_hint =
+            callees["hint"].as_str().expect("a File-anchored find_callees call must carry a hint");
         assert!(callees_hint.contains("get_dependencies"), "{callees_hint}");
         assert_eq!(callees["results"].as_array().unwrap().len(), 0);
         assert_eq!(callees["hasMore"], false);
@@ -726,12 +918,20 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+            &handle_callers(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert!(callers.get("hint").is_none(), "hint must be entirely absent, not null: {callers}");
 
         let callees = json_body(
-            &handle_callees(&conn, SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() }).unwrap(),
+            &handle_callees(
+                &conn,
+                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert!(callees.get("hint").is_none(), "hint must be entirely absent, not null: {callees}");
     }
@@ -739,19 +939,30 @@ mod tests {
     #[test]
     fn handle_callees_paginates_across_cursor_continuation() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("callee_a", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("callee_b", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("callee_c", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "target", "callee_a", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "target", "callee_b", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "target", "callee_c", "CALLS", "tree-sitter", true)).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("callee_a", "Function", "a", "pkg::a", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("callee_b", "Function", "b", "pkg::b", "b.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("callee_c", "Function", "c", "pkg::c", "c.rs", "rust"))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_a", "target", "callee_a", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b", "target", "callee_b", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c", "target", "callee_c", "CALLS", "tree-sitter", true))
+            .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
+            let params = SymbolQueryParams {
+                symbol_id: Some("target".to_string()),
+                cursor: cursor.clone(),
+                ..Default::default()
+            };
             let result = handle_callees(&conn, params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
@@ -764,6 +975,10 @@ mod tests {
         }
 
         seen.sort();
-        assert_eq!(seen, vec!["callee_a", "callee_b", "callee_c"], "all three callees must come back, once each");
+        assert_eq!(
+            seen,
+            vec!["callee_a", "callee_b", "callee_c"],
+            "all three callees must come back, once each"
+        );
     }
 }

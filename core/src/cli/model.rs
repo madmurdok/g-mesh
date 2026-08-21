@@ -172,7 +172,9 @@ fn resolved_model() -> ResolvedModel {
         Ok(cwd) => resolved_model_in(&cwd),
         // This command has to work from anywhere; an unreadable cwd is not a
         // reason to fail it.
-        Err(_) => ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault },
+        Err(_) => {
+            ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault }
+        }
     }
 }
 
@@ -377,22 +379,15 @@ fn download(agent: &ureq::Agent, file: &RemoteFile, dest: &Path) -> Result<()> {
     }
     result?;
 
-    fs::rename(&partial, dest).with_context(|| {
-        format!("failed to move {} into place as {}", partial.display(), dest.display())
-    })
+    fs::rename(&partial, dest)
+        .with_context(|| format!("failed to move {} into place as {}", partial.display(), dest.display()))
 }
 
 /// Streams the response into `partial`, hashing as it goes, and fails if what
 /// arrived is not byte-for-byte what [`MODEL_REVISION`] pins.
 fn download_to_partial(agent: &ureq::Agent, file: &RemoteFile, partial: &Path) -> Result<()> {
-    let url = format!(
-        "https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{}",
-        file.remote_path
-    );
-    let response = agent
-        .get(&url)
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
+    let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{}", file.remote_path);
+    let response = agent.get(&url).call().with_context(|| format!("failed to download {url}"))?;
 
     let mut source = response.into_reader();
     let mut sink =
@@ -410,8 +405,7 @@ fn download_to_partial(agent: &ureq::Agent, file: &RemoteFile, partial: &Path) -
             break;
         }
         hasher.update(&buffer[..read]);
-        sink.write_all(&buffer[..read])
-            .with_context(|| format!("failed to write {}", partial.display()))?;
+        sink.write_all(&buffer[..read]).with_context(|| format!("failed to write {}", partial.display()))?;
         written += read as u64;
         progress.report(written);
     }
@@ -494,7 +488,12 @@ impl Progress {
                 return;
             }
             self.last_drawn = Instant::now();
-            eprint!("\r  {} / {} ({}%)   ", human_size(written), human_size(self.total), self.percent(written));
+            eprint!(
+                "\r  {} / {} ({}%)   ",
+                human_size(written),
+                human_size(self.total),
+                self.percent(written)
+            );
         } else {
             let decile = self.percent(written) / 10;
             if decile > self.last_decile {
@@ -599,11 +598,7 @@ mod tests {
                 "the script does not fetch {}",
                 file.remote_path
             );
-            assert!(
-                FETCH_SCRIPT.contains(file.local_name),
-                "the script does not write {}",
-                file.local_name
-            );
+            assert!(FETCH_SCRIPT.contains(file.local_name), "the script does not write {}", file.local_name);
         }
         // The repo is spelled `jinaai/${MODEL_NAME}` in the script, so only
         // the halves it actually contains are checked.
@@ -683,10 +678,8 @@ mod tests {
         // The model is irrelevant to this test - an explicit directory wins
         // over the name either way - so it names the default rather than
         // implying the choice matters here.
-        let default = ResolvedModel {
-            name: EmbeddingConfig::default().model,
-            source: ModelSource::BuiltInDefault,
-        };
+        let default =
+            ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault };
 
         let prepared = prepare_dir(Some(&dir), &default).unwrap();
 
@@ -795,10 +788,8 @@ mod tests {
     /// is `default_model_dir(configured_name)` - not the default's.
     #[test]
     fn the_reported_directory_is_the_one_the_daemon_would_read() {
-        let configured = ResolvedModel {
-            name: "some-other-model".to_string(),
-            source: ModelSource::ProjectConfig,
-        };
+        let configured =
+            ResolvedModel { name: "some-other-model".to_string(), source: ModelSource::ProjectConfig };
 
         let reported = model_dir(None, &configured).unwrap();
 
@@ -815,10 +806,8 @@ mod tests {
 
     #[test]
     fn fetching_the_default_is_never_refused() {
-        let model = ResolvedModel {
-            name: EmbeddingConfig::default().model,
-            source: ModelSource::BuiltInDefault,
-        };
+        let model =
+            ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault };
 
         assert_eq!(fetch_refusal(None, &model, Path::new("/tmp/whatever")), None);
     }
@@ -828,10 +817,8 @@ mod tests {
     /// not a configured model being ignored.
     #[test]
     fn an_explicit_directory_is_still_honoured_under_a_configured_model() {
-        let model = ResolvedModel {
-            name: "some-other-model".to_string(),
-            source: ModelSource::ProjectConfig,
-        };
+        let model =
+            ResolvedModel { name: "some-other-model".to_string(), source: ModelSource::ProjectConfig };
 
         assert_eq!(fetch_refusal(Some(Path::new("/tmp/here")), &model, Path::new("/tmp/daemon")), None);
     }
@@ -841,10 +828,8 @@ mod tests {
     /// hand: which model, where that name came from, and the exact directory.
     #[test]
     fn refusing_names_the_model_its_source_and_the_directory_to_fill() {
-        let model = ResolvedModel {
-            name: "some-other-model".to_string(),
-            source: ModelSource::ProjectConfig,
-        };
+        let model =
+            ResolvedModel { name: "some-other-model".to_string(), source: ModelSource::ProjectConfig };
         let daemon_dir = Path::new("/home/someone/.g-mesh/models/some-other-model");
 
         let refusal = fetch_refusal(None, &model, daemon_dir).expect("a configured model must refuse");
@@ -852,7 +837,10 @@ mod tests {
         assert!(refusal.contains("some-other-model"), "{refusal}");
         assert!(refusal.contains("config.toml"), "{refusal}");
         assert!(refusal.contains(&daemon_dir.display().to_string()), "{refusal}");
-        assert!(refusal.contains(&EmbeddingConfig::default().model), "must say what it *can* fetch: {refusal}");
+        assert!(
+            refusal.contains(&EmbeddingConfig::default().model),
+            "must say what it *can* fetch: {refusal}"
+        );
     }
 
     /// `status` and `fetch` must agree about whether this invocation can be
@@ -862,8 +850,14 @@ mod tests {
     fn status_and_fetch_agree_on_whether_a_fetch_is_possible() {
         for (model, explicit) in [
             (ResolvedModel { name: "x".into(), source: ModelSource::ProjectConfig }, None),
-            (ResolvedModel { name: "x".into(), source: ModelSource::ProjectConfig }, Some(Path::new("/tmp/d"))),
-            (ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault }, None),
+            (
+                ResolvedModel { name: "x".into(), source: ModelSource::ProjectConfig },
+                Some(Path::new("/tmp/d")),
+            ),
+            (
+                ResolvedModel { name: EmbeddingConfig::default().model, source: ModelSource::BuiltInDefault },
+                None,
+            ),
         ] {
             let dir = model_dir(explicit, &model).unwrap();
             let refused = fetch_refusal(explicit, &model, &dir).is_some();

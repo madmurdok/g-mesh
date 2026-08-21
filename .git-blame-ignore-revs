@@ -1,0 +1,16 @@
+# Revisions to skip when running `git blame`, because they changed layout and
+# nothing else. Enable once per clone:
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub and recent git read this file automatically for blame views.
+
+# style: apply the recorded rustfmt style
+#
+# The first `cargo fmt` this repository ever had. It could not run before:
+# there was no rustfmt.toml, rustfmt's default max_width is 100, and this code
+# is written at ~110 columns - so the check failed on 99 of ~100 files and
+# running it would have rewritten nearly all of them. GM-221 recovered the
+# intended style by measurement (see rustfmt.toml) and this commit applied it,
+# across 91 files, touching nothing else.
+670aed0d4c1987ec780f345b4e2b93996556b041

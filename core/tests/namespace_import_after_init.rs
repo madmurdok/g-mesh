@@ -49,10 +49,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// walk resolves this on its own). Both live in the same file so that a
 /// difference between them cannot be a difference between two files' fates.
 const FILES: [(&str, &str); 3] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#),
     (
         "src/mod.ts",
         r#"export function someExport(): number {
@@ -104,8 +101,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), daemon::plugin_pid_path(self.root()).unwrap()] {
             if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    StdCommand::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
+                let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
             }
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -146,11 +142,8 @@ async fn a_project_prepared_with_init_answers_find_callers_through_a_namespace_i
     let project = Project::new();
     let root = project.root().to_path_buf();
 
-    let init = StdCommand::new(BIN)
-        .arg("init")
-        .current_dir(&root)
-        .output()
-        .expect("failed to run `g-mesh init`");
+    let init =
+        StdCommand::new(BIN).arg("init").current_dir(&root).output().expect("failed to run `g-mesh init`");
     assert!(
         init.status.success(),
         "`g-mesh init` failed with {}: {}",
@@ -158,10 +151,7 @@ async fn a_project_prepared_with_init_answers_find_callers_through_a_namespace_i
         String::from_utf8_lossy(&init.stderr)
     );
     let stdout = String::from_utf8(init.stdout).expect("init output is not valid UTF-8");
-    assert!(
-        stdout.contains("semantic:   pass complete"),
-        "init must report the pass it now runs:\n{stdout}"
-    );
+    assert!(stdout.contains("semantic:   pass complete"), "init must report the pass it now runs:\n{stdout}");
 
     // Nothing polls here, and that is the assertion. `init` returned, so by
     // its own contract the index is ready - and the daemon this shim
@@ -170,9 +160,7 @@ async fn a_project_prepared_with_init_answers_find_callers_through_a_namespace_i
     // to appear later. They are in the index `init` built, or they are absent
     // for good.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
