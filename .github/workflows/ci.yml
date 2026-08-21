@@ -1,0 +1,65 @@
+# Checks that run on every change, as against `release.yml`, which builds four
+# targets and only fires on a tag, a manual dispatch, or a PR touching the
+# pipeline itself. A lint that only runs during a release is a lint that tells
+# you about a mistake after it shipped.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "release-*"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-22.04
+    env:
+      SHELLCHECK_VERSION: v0.11.0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than taken from the runner image. ShellCheck adds checks
+      # between releases, so an unpinned lint turns red on code nobody touched,
+      # on a day nobody chose - and the first thing anyone does with a gate that
+      # fails for reasons unrelated to their change is stop reading it. Bumping
+      # this line is then a deliberate act with its own diff, which is where the
+      # new findings can be triaged.
+      - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL "$url" | tar -xJ
+          sudo install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # Every script in the repo, found rather than listed: a list is a thing
+      # to forget to update, and this repository went from one script to six in
+      # two days.
+      #
+      # The dialect comes from each file's shebang, so `install.sh` is checked
+      # as POSIX sh and the rest as bash without a flag saying so - which also
+      # means a script whose shebang is wrong is caught by being checked as the
+      # wrong shell.
+      #
+      # `-S style` is the lowest severity, so info- and style-level findings
+      # fail too. Optional checks (`-o all`) are deliberately *not* enabled:
+      # they add 515 findings here, 481 of them SC2250/SC2292 (require ${braces}
+      # everywhere, prefer [[ ]] over [ ]) which is a whole-codebase rewrite for
+      # no defect, and the 14 SC2310s are all deliberate predicates - `have
+      # curl` in an `if` is asking whether curl exists, so `set -e` being
+      # disabled inside the condition is the point rather than an accident.
+      - name: Check every shell script
+        run: |
+          set -euo pipefail
+          git ls-files '*.sh' | sed 's/^/  checking /'
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S style
