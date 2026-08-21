@@ -293,8 +293,7 @@ fn the_stored_vector_matches_embedding_the_doc_comment_and_signature_directly() 
     let stored: Vec<u8> = conn
         .query_row("SELECT embedding FROM vectors WHERE nodeId = ?1", [&documented], |row| row.get(0))
         .unwrap();
-    let stored: Vec<f32> =
-        stored.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let stored: Vec<f32> = stored.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
 
     assert_eq!(stored, expected, "the stored vector must be exactly the model's output for doc+signature");
 }
