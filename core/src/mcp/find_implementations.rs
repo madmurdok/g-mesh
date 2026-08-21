@@ -140,12 +140,16 @@ fn list_implementations(
 pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match anchor::resolve(&conn, &params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, &params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    // Destructured here so everything below still reads the node directly,
+    // while `resolved.by` stays available for the response's `resolvedBy`.
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::from(&anchor);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -410,10 +414,12 @@ pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementation
     }
 
     let conn = conn.lock().unwrap();
-    let anchor = match anchor::resolve(&conn, &symbol_params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, &symbol_params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
     from_root(&conn, &anchor, hint, max_depth)
 }
@@ -622,7 +628,21 @@ mod tests {
         let by_name = json_body(
             &handle(&conn, SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() }).unwrap(),
         );
-        assert_eq!(by_name, by_id, "a name that resolves to one node must answer exactly as its id does");
+        // Everything but `resolvedBy` must match: the walk, the results and the
+        // anchor are properties of the node, however the caller addressed it.
+        // `resolvedBy` is the one field that exists to differ - it reports the
+        // rung, and the two calls took different rungs to the same node.
+        let strip = |mut body: serde_json::Value| {
+            body["anchor"].as_object_mut().expect("an anchor object").remove("resolvedBy");
+            body
+        };
+        assert_eq!(
+            strip(by_name.clone()),
+            strip(by_id.clone()),
+            "a name that resolves to one node must answer exactly as its id does"
+        );
+        assert_eq!(by_id["anchor"]["resolvedBy"], "id");
+        assert_eq!(by_name["anchor"]["resolvedBy"], "name");
         assert_eq!(by_name["results"][0]["implementingSymbolId"], "class_a");
     }
 

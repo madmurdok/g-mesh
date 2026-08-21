@@ -39,6 +39,17 @@ struct DefinitionNode {
     end_col: i64,
     signature: Option<String>,
     doc_comment: Option<String>,
+    /// Which rung of the ladder reached this - see [`ResolvedBy`]. Absent on a
+    /// file+position lookup, which cannot be anything but exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_by: Option<ResolvedBy>,
+}
+
+impl DefinitionNode {
+    /// The node with the rung that reached it, for the name-addressed path.
+    fn resolved(node: NodeRecord, by: ResolvedBy) -> Self {
+        Self { resolved_by: Some(by), ..Self::from(node) }
+    }
 }
 
 impl From<NodeRecord> for DefinitionNode {
@@ -55,6 +66,7 @@ impl From<NodeRecord> for DefinitionNode {
             end_col: n.end_col,
             signature: n.signature,
             doc_comment: n.doc_comment,
+            resolved_by: None,
         }
     }
 }
@@ -94,9 +106,27 @@ struct CandidatePage {
     /// to sniff item fields to tell "here are your callers" from "say which
     /// symbol you meant".
     ambiguous: bool,
+    /// Which rung produced this page - always `nameAmbiguous` here. Present so
+    /// a caller reads one field to tell an ambiguity from the other kind of
+    /// candidate page (`fileName`), rather than inferring it from `ambiguous`.
+    resolved_by: ResolvedBy,
     results: Vec<DefinitionCandidate>,
     has_more: bool,
     next_cursor: Option<String>,
+}
+
+/// The file-name rung's page. Shares `{ambiguous, resolvedBy, results}` with
+/// [`CandidatePage`] so a caller re-queries either the same way, and adds the
+/// one thing that page cannot carry: why a name that is plainly in the source
+/// resolved to nothing here.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileNamePage {
+    resolved_by: ResolvedBy,
+    /// Always `false`: these are not competing readings of one name.
+    ambiguous: bool,
+    explanation: String,
+    results: Vec<DefinitionCandidate>,
 }
 
 /// Ranks candidates by inbound `REFERENCES`+`CALLS` edge count, descending -
@@ -153,6 +183,38 @@ fn by_position(conn: &Connection, file_path: &str, line: u32, col: u32) -> Resul
     }
 }
 
+/// Which rung of the resolution ladder produced an answer - see
+/// `docs/architecture/symbol-resolution-ladder.md`.
+///
+/// Echoed on every response so a *suggestion* can never be read as a
+/// *resolution*. `Id`, `QualifiedName` and `Name` establish that this is the
+/// symbol asked for; `NameAmbiguous` and `FileName` establish only that these
+/// are candidates worth re-querying. Without the label the two are
+/// indistinguishable in the response, and this codebase's standing rule is
+/// that a missing edge beats a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum ResolvedBy {
+    /// An exact node id, given by the caller.
+    Id,
+    /// An exact `qualifiedName` - how a caller re-queries a candidate it picked.
+    QualifiedName,
+    /// A bare name matching exactly one declaration.
+    Name,
+    /// A bare name matching several: the page is ranked candidates, not an answer.
+    NameAmbiguous,
+    /// No declaration carries the name, but a file does - so these are that
+    /// file's declarations, offered because a default import binds an export
+    /// under a local name this index never sees.
+    FileName,
+}
+
+/// A resolved anchor and the rung that reached it.
+pub(super) struct Resolved {
+    pub(super) node: NodeRecord,
+    pub(super) by: ResolvedBy,
+}
+
 /// Resolves a symbol name to the single node it names: an exact
 /// qualifiedName match is tried first as a fast path (this is how a caller
 /// re-queries a candidate it picked off a previous ambiguous page), then
@@ -169,24 +231,28 @@ pub(super) fn resolve_symbol_name(
     conn: &Connection,
     name: &str,
     cursor: Option<&str>,
-) -> Result<Result<NodeRecord, CallToolResult>, ErrorData> {
+) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
     let mut exact = queries::find_by_qualified_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
     if exact.len() == 1 {
-        return Ok(Ok(exact.remove(0)));
+        return Ok(Ok(Resolved { node: exact.remove(0), by: ResolvedBy::QualifiedName }));
     }
 
     let matches =
         queries::find_by_name(conn, name, None).map_err(|e| internal_error("failed to look up node by name", e))?;
 
     match matches.len() {
-        0 => error(not_found_message(conn, name)?).map(Err),
-        1 => Ok(Ok(matches.into_iter().next().expect("len checked above"))),
+        0 => by_file_name(conn, name),
+        1 => Ok(Ok(Resolved {
+            node: matches.into_iter().next().expect("len checked above"),
+            by: ResolvedBy::Name,
+        })),
         _ => {
             let page = find_candidates_by_name(conn, name, cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
             success(&CandidatePage {
                 ambiguous: true,
+                resolved_by: ResolvedBy::NameAmbiguous,
                 results: page.results,
                 has_more: page.has_more,
                 next_cursor: page.next_cursor,
@@ -194,6 +260,52 @@ pub(super) fn resolve_symbol_name(
             .map(Err)
         }
     }
+}
+
+/// The last rung before a refusal: no declaration carries the name, but a file
+/// does.
+///
+/// 2.9.0 answered this case with prose in the error text and measured well -
+/// `ex-default-export-dropdownmenu-group` went from 4 turns to 2. This returns
+/// the same facts as the candidate page the ambiguous rung already produces,
+/// because the caller then has one contract to know rather than two: re-query
+/// by a candidate's `id`. The prose said "re-query by one of those"; the page
+/// *is* those.
+///
+/// `ambiguous: false`, because these are not several readings of one name -
+/// they are what a differently-named thing declares. The rung label is what
+/// says so.
+fn by_file_name(conn: &Connection, name: &str) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
+    const MAX_SUGGESTIONS: usize = 5;
+    let in_file = queries::find_in_file_named(conn, name, MAX_SUGGESTIONS)
+        .map_err(|e| internal_error("failed to look up nodes by file name", e))?;
+    if in_file.is_empty() {
+        return error(format!("g-mesh: no symbol named '{name}' found")).map(Err);
+    }
+
+    let file_path = in_file[0].file_path.clone();
+    success(&FileNamePage {
+        resolved_by: ResolvedBy::FileName,
+        ambiguous: false,
+        explanation: format!(
+            "No declaration is named '{name}'. The file {file_path} is, and declares these. A \
+             default import binds a file's export under whatever local name the importing file \
+             chose, and that local name is not indexed - so a name read at a use site can be \
+             absent here while the declaration it refers to is present under its own name. \
+             Re-query by one of these ids."
+        ),
+        results: in_file
+            .iter()
+            .map(|n| DefinitionCandidate {
+                id: n.id.clone(),
+                qualified_name: n.qualified_name.clone(),
+                file_path: n.file_path.clone(),
+                kind: n.kind.clone(),
+                preview: n.signature.clone().or_else(|| n.doc_comment.clone()),
+            })
+            .collect(),
+    })
+    .map(Err)
 }
 
 /// The not-found answer, with the one thing the index can add to it.
@@ -241,7 +353,7 @@ fn not_found_message(conn: &Connection, name: &str) -> Result<String, ErrorData>
 /// with the resolved case formatted as the full node this tool promises.
 fn by_name(conn: &Connection, name: &str, cursor: Option<&str>) -> Result<CallToolResult, ErrorData> {
     match resolve_symbol_name(conn, name, cursor)? {
-        Ok(node) => success(&DefinitionNode::from(node)),
+        Ok(resolved) => success(&DefinitionNode::resolved(resolved.node, resolved.by)),
         Err(finished) => Ok(finished),
     }
 }
@@ -508,5 +620,87 @@ mod tests {
         let message = not_found_message(&conn, "NoSuchThingAnywhere").unwrap();
 
         assert_eq!(message, "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
+    }
+
+    /// The ladder's contract: every answer says which rung reached it, so a
+    /// caller can tell "this is your symbol" from "these might be".
+    #[test]
+    fn an_exact_name_reports_the_rung_that_resolved_it() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"),
+        )
+        .unwrap();
+
+        let by_qualified = json_body(&by_name(&conn, "pkg::run", None).unwrap());
+        assert_eq!(by_qualified["resolvedBy"], "qualifiedName");
+
+        let by_bare = json_body(&by_name(&conn, "run", None).unwrap());
+        assert_eq!(by_bare["resolvedBy"], "name");
+    }
+
+    /// The rung 2.9.0 shipped as prose in an error, now the same facts in the
+    /// shape the ambiguous rung already uses - so a caller has one contract to
+    /// know (re-query by a candidate's id) rather than two.
+    #[test]
+    fn a_name_only_a_file_carries_returns_that_files_declarations_as_candidates() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "menu_group",
+                "Function",
+                "MenuGroup",
+                "MenuGroup",
+                "src/components/DropdownMenuGroup.tsx",
+                "typescript",
+            ),
+        )
+        .unwrap();
+
+        let body = json_body(&by_name(&conn, "DropdownMenuGroup", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        // Not an ambiguity: these are not competing readings of one name, they
+        // are what a differently-named thing declares. The rung says which.
+        assert_eq!(body["ambiguous"], false);
+        assert_eq!(body["results"][0]["id"], "menu_group");
+        assert_eq!(body["results"][0]["qualifiedName"], "MenuGroup");
+        assert!(
+            body["explanation"].as_str().expect("an explanation").contains("default import"),
+            "the page has to say why a name that is plainly in the source resolved to nothing: {body}"
+        );
+    }
+
+    /// A name that is nowhere keeps the short refusal. A page of candidates
+    /// with nothing in it would be a worse answer than saying so.
+    #[test]
+    fn a_name_matching_neither_a_declaration_nor_a_file_is_still_refused() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"),
+        )
+        .unwrap();
+
+        let result = by_name(&conn, "NoSuchThingAnywhere", None).unwrap();
+
+        assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
+    }
+
+    /// The ambiguous rung keeps its own label, so the three candidate-shaped
+    /// answers stay distinguishable by one field rather than by sniffing.
+    #[test]
+    fn an_ambiguous_name_labels_its_page_as_the_ambiguity_it_is() {
+        let mut conn = setup();
+        for (id, file) in [("a", "a.rs"), ("b", "b.rs")] {
+            upsert_node(&mut conn, NodeRecord::new(id, "Function", "run", "run", file, "rust")).unwrap();
+        }
+
+        let body = json_body(&by_name(&conn, "run", None).unwrap());
+
+        assert_eq!(body["ambiguous"], true);
+        assert_eq!(body["resolvedBy"], "nameAmbiguous");
     }
 }
