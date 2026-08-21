@@ -28,7 +28,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
     ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    ("find_definition", &["symbol_name", "file_path", "position", "cursor"]),
+    ("find_definition", &["symbol_name", "file_path", "position", "cursor", "include_source"]),
     (
         "find_implementations",
         &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "transitive", "max_depth", "resume_token"],

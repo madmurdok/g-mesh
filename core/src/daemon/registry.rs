@@ -466,6 +466,20 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
+    /// The canonicalized project root, for the one caller that needs to read
+    /// the project's files rather than route a request about them: the MCP
+    /// server, whose handlers answer out of the index and so have no root of
+    /// their own. `find_definition` uses it to return the source its
+    /// coordinates point at.
+    ///
+    /// Read-only by design. Nothing outside this module may substitute a root
+    /// - every supervisor a registry spawns is bound to this one, and two
+    /// answers about "the project" disagreeing on which project would be a
+    /// bug with no visible symptom.
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
     /// Builds a registry over `discovered`. Spawns nothing - see this
     /// module's doc comment.
     pub fn new(

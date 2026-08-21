@@ -2,6 +2,7 @@
 //! so that file stays pure tool-router wiring - this is where the actual
 //! "name or position -> node(s)" decision lives.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::CallToolResult;
@@ -14,6 +15,7 @@ use crate::graph::queries;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::NodeRecord;
 
+use super::source;
 use super::tool_result::{error, internal_error, success};
 use super::FindDefinitionParams;
 
@@ -43,12 +45,35 @@ struct DefinitionNode {
     /// file+position lookup, which cannot be anything but exact.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolved_by: Option<ResolvedBy>,
+    /// The declaration's own text - see [`source`] for why this is worth its
+    /// payload and how it is bounded.
+    ///
+    /// Absent when the caller opted out with `include_source: false`, or when
+    /// the file cannot be read at those coordinates (deleted, or edited since
+    /// the walk). Coordinates without text are still a correct answer, so a
+    /// snippet that cannot be produced is omitted rather than failing the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<source::Snippet>,
 }
 
 impl DefinitionNode {
     /// The node with the rung that reached it, for the name-addressed path.
     fn resolved(node: NodeRecord, by: ResolvedBy) -> Self {
         Self { resolved_by: Some(by), ..Self::from(node) }
+    }
+
+    /// Attaches the declaration's text, if a root was given and the file can
+    /// still be read at these coordinates.
+    ///
+    /// `None` for the root means the caller passed `include_source: false` -
+    /// the opt-out and the failure both land here, deliberately: from the
+    /// response's point of view they are the same thing, a node without a
+    /// snippet, and giving them two different shapes would make every consumer
+    /// handle two cases to learn nothing.
+    fn with_source(mut self, project_root: Option<&Path>) -> Self {
+        self.source = project_root
+            .and_then(|root| source::read_span(root, &self.file_path, self.start_line, self.end_line));
+        self
     }
 }
 
@@ -67,6 +92,7 @@ impl From<NodeRecord> for DefinitionNode {
             signature: n.signature,
             doc_comment: n.doc_comment,
             resolved_by: None,
+            source: None,
         }
     }
 }
@@ -173,12 +199,18 @@ fn find_candidates_by_name(
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
 /// construction, so the answer is a single node, never a candidate list.
-fn by_position(conn: &Connection, file_path: &str, line: u32, col: u32) -> Result<CallToolResult, ErrorData> {
+fn by_position(
+    conn: &Connection,
+    project_root: Option<&Path>,
+    file_path: &str,
+    line: u32,
+    col: u32,
+) -> Result<CallToolResult, ErrorData> {
     let found = queries::find_by_position(conn, file_path, line, col)
         .map_err(|e| internal_error("failed to resolve file+position", e))?;
 
     match found {
-        Some(node) => success(&DefinitionNode::from(node)),
+        Some(node) => success(&DefinitionNode::from(node).with_source(project_root)),
         None => error(format!("g-mesh: no symbol found at {file_path}:{line}:{col}")),
     }
 }
@@ -310,19 +342,34 @@ fn by_file_name(conn: &Connection, name: &str) -> Result<Result<Resolved, CallTo
 
 /// `find_definition`'s own symbol-name input: the shared resolution above,
 /// with the resolved case formatted as the full node this tool promises.
-fn by_name(conn: &Connection, name: &str, cursor: Option<&str>) -> Result<CallToolResult, ErrorData> {
+fn by_name(
+    conn: &Connection,
+    project_root: Option<&Path>,
+    name: &str,
+    cursor: Option<&str>,
+) -> Result<CallToolResult, ErrorData> {
     match resolve_symbol_name(conn, name, cursor)? {
-        Ok(resolved) => success(&DefinitionNode::resolved(resolved.node, resolved.by)),
+        Ok(resolved) => success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root)),
         Err(finished) => Ok(finished),
     }
 }
 
-pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: FindDefinitionParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle(
+    conn: &Arc<Mutex<Connection>>,
+    project_root: &Path,
+    params: FindDefinitionParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
+    // Defaults to on. The snippet is the point of the field - a caller who
+    // wants coordinates alone has to say so, rather than every caller having
+    // to ask for the thing that saves them a round trip.
+    let project_root = params.include_source.unwrap_or(true).then_some(project_root);
 
     match (params.file_path, params.position, params.symbol_name) {
-        (Some(file_path), Some(position), _) => by_position(&conn, &file_path, position.line, position.col),
-        (None, None, Some(name)) => by_name(&conn, &name, params.cursor.as_deref()),
+        (Some(file_path), Some(position), _) => {
+            by_position(&conn, project_root, &file_path, position.line, position.col)
+        }
+        (None, None, Some(name)) => by_name(&conn, project_root, &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {
             error("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again")
         }
@@ -340,6 +387,15 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::EdgeRecord;
+
+    /// A project root with nothing in it, for the tests that are about
+    /// resolution rather than about source. Every snippet lookup under it
+    /// misses, so `source` is absent and these assertions read exactly as
+    /// they did before the field existed - which is the point: adding the
+    /// field must not quietly change what they are testing.
+    fn no_sources() -> std::path::PathBuf {
+        std::env::temp_dir().join("g-mesh-tests-with-no-sources")
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -388,8 +444,9 @@ mod tests {
             file_path: None,
             position: None,
             cursor: None,
+            include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
@@ -422,8 +479,9 @@ mod tests {
             file_path: None,
             position: None,
             cursor: None,
+            include_source: None,
         };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap());
         assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
         assert_eq!(body["filePath"], "target.ts");
     }
@@ -439,8 +497,9 @@ mod tests {
             file_path: Some("a/lib.rs".to_string()),
             position: Some(crate::protocol::types::Position { line: 2, col: 0 }),
             cursor: None,
+            include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["id"], "n1");
         assert_eq!(body["qualifiedName"], "pkg_a::run");
@@ -458,8 +517,9 @@ mod tests {
             file_path: None,
             position: None,
             cursor: None,
+            include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["id"], "n2");
         assert_eq!(body["qualifiedName"], "pkg_b::run");
@@ -473,16 +533,17 @@ mod tests {
             file_path: None,
             position: None,
             cursor: None,
+            include_source: None,
         };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
     #[test]
     fn neither_name_nor_position_is_a_tool_level_error() {
         let conn = setup();
-        let params = FindDefinitionParams { symbol_name: None, file_path: None, position: None, cursor: None };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let params = FindDefinitionParams { symbol_name: None, file_path: None, position: None, cursor: None, include_source: None };
+        let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         assert!(error_text(&result).contains("symbol_name"));
     }
 
@@ -500,8 +561,8 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let first_params =
-            FindDefinitionParams { symbol_name: Some("run".to_string()), file_path: None, position: None, cursor: None };
-        let first = handle(&conn, first_params).unwrap();
+            FindDefinitionParams { symbol_name: Some("run".to_string()), file_path: None, position: None, cursor: None, include_source: None };
+        let first = handle(&conn, &no_sources(), first_params).unwrap();
         let first_body = json_body(&first);
         let first_results = first_body["results"].as_array().unwrap();
         assert_eq!(first_results.len(), CANDIDATE_PAGE_SIZE);
@@ -513,8 +574,9 @@ mod tests {
             file_path: None,
             position: None,
             cursor: Some(cursor),
+            include_source: None,
         };
-        let second = handle(&conn, second_params).unwrap();
+        let second = handle(&conn, &no_sources(), second_params).unwrap();
         let second_body = json_body(&second);
         let second_results = second_body["results"].as_array().unwrap();
         assert_eq!(second_results.len(), 1, "the one remaining candidate must land on the second page");
@@ -542,10 +604,10 @@ mod tests {
         )
         .unwrap();
 
-        let by_qualified = json_body(&by_name(&conn, "pkg::run", None).unwrap());
+        let by_qualified = json_body(&by_name(&conn, None, "pkg::run", None).unwrap());
         assert_eq!(by_qualified["resolvedBy"], "qualifiedName");
 
-        let by_bare = json_body(&by_name(&conn, "run", None).unwrap());
+        let by_bare = json_body(&by_name(&conn, None, "run", None).unwrap());
         assert_eq!(by_bare["resolvedBy"], "name");
     }
 
@@ -568,7 +630,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = json_body(&by_name(&conn, "DropdownMenuGroup", None).unwrap());
+        let body = json_body(&by_name(&conn, None, "DropdownMenuGroup", None).unwrap());
 
         assert_eq!(body["resolvedBy"], "fileName");
         // Not an ambiguity: these are not competing readings of one name, they
@@ -593,7 +655,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = by_name(&conn, "NoSuchThingAnywhere", None).unwrap();
+        let result = by_name(&conn, None, "NoSuchThingAnywhere", None).unwrap();
 
         assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
     }
@@ -607,9 +669,102 @@ mod tests {
             upsert_node(&mut conn, NodeRecord::new(id, "Function", "run", "run", file, "rust")).unwrap();
         }
 
-        let body = json_body(&by_name(&conn, "run", None).unwrap());
+        let body = json_body(&by_name(&conn, None, "run", None).unwrap());
 
         assert_eq!(body["ambiguous"], true);
         assert_eq!(body["resolvedBy"], "nameAmbiguous");
+    }
+
+    // --- the declaration's source ------------------------------------------
+
+    /// A project whose one file really contains `body`, so the snippet is read
+    /// off disk exactly as a real answer would read it.
+    fn project_with(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("failed to create a temp project");
+        std::fs::create_dir_all(dir.path().join("a")).expect("failed to create the fixture directory");
+        std::fs::write(dir.path().join("a/lib.rs"), body).expect("failed to write the fixture");
+        dir
+    }
+
+    fn definition_of(name: &str, project_root: &std::path::Path, span: (i64, i64)) -> serde_json::Value {
+        let mut conn = setup();
+        let mut node = node_with_span("n1", name, &format!("pkg::{name}"), "a/lib.rs", (span.1, 0));
+        node.start_line = span.0;
+        upsert_node(&mut conn, node).unwrap();
+        json_body(&by_name(&conn, Some(project_root), name, None).unwrap())
+    }
+
+    /// The point of the whole change: the answer to "where is this defined"
+    /// carries what is there, so the caller does not spend a round trip - worth
+    /// 18,000-22,000 tokens at this tool's prompt prefix - reading it.
+    #[test]
+    fn a_definition_carries_the_declarations_own_source() {
+        let project = project_with("mod a;\nfn run() {\n    work();\n}\nfn other() {}\n");
+
+        let body = definition_of("run", project.path(), (1, 3));
+
+        assert_eq!(body["source"]["text"], "fn run() {\n    work();\n}");
+        assert_eq!(body["source"]["firstLine"], 2, "1-based, as an editor shows it");
+        assert!(body["source"]["omittedLines"].is_null(), "a complete snippet says nothing about omissions");
+        // The coordinates are still there and still 0-based: the snippet is an
+        // addition, not a replacement, and anything doing arithmetic on
+        // startLine must keep working.
+        assert_eq!(body["startLine"], 1);
+    }
+
+    #[test]
+    fn include_source_false_leaves_the_response_exactly_as_it_was() {
+        let project = project_with("fn run() {\n    work();\n}\n");
+        let mut conn = setup();
+        let mut node = node_with_span("n1", "run", "pkg::run", "a/lib.rs", (2, 0));
+        node.start_line = 0;
+        upsert_node(&mut conn, node).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let params = |include| FindDefinitionParams {
+            symbol_name: Some("run".to_string()),
+            file_path: None,
+            position: None,
+            cursor: None,
+            include_source: include,
+        };
+
+        let opted_out = json_body(&handle(&conn, project.path(), params(Some(false))).unwrap());
+        let default_on = json_body(&handle(&conn, project.path(), params(None)).unwrap());
+
+        assert!(opted_out["source"].is_null(), "include_source: false must omit it");
+        assert!(!default_on["source"].is_null(), "omitting the flag must default to on");
+        assert_eq!(opted_out["id"], default_on["id"], "nothing else about the answer changes");
+        assert_eq!(opted_out["startLine"], default_on["startLine"]);
+    }
+
+    /// The index outliving the file it describes is ordinary - a file edited
+    /// or deleted since the last walk. Coordinates are still a correct answer,
+    /// so the snippet goes missing rather than the call failing.
+    #[test]
+    fn a_definition_whose_file_no_longer_matches_still_answers_with_coordinates() {
+        let project = project_with("fn run() {}\n");
+
+        // The node claims lines 40-45; the file has one line.
+        let body = definition_of("run", project.path(), (40, 45));
+
+        assert_eq!(body["qualifiedName"], "pkg::run", "the definition still resolves");
+        assert_eq!(body["startLine"], 40);
+        assert!(body["source"].is_null(), "a snippet that cannot be read honestly is absent");
+    }
+
+    /// The cap has to be exercised on a real declaration, and the truncation
+    /// has to be visible: a caller reading a cut body as a complete one draws
+    /// conclusions from code that is not there.
+    #[test]
+    fn a_declaration_past_the_cap_is_cut_visibly() {
+        let long: String = (0..source::MAX_LINES + 20).map(|n| format!("    let x{n} = {n};\n")).collect();
+        let project = project_with(&format!("fn run() {{\n{long}}}\n"));
+
+        let body = definition_of("run", project.path(), (0, (source::MAX_LINES + 21) as i64));
+
+        let text = body["source"]["text"].as_str().expect("a snippet");
+        assert_eq!(text.lines().count(), source::MAX_LINES);
+        assert_eq!(body["source"]["omittedLines"], 22, "the cut says exactly how much is missing");
     }
 }
