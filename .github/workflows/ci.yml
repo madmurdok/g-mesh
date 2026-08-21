@@ -144,21 +144,27 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          rustup component add clippy
+          rustup component add clippy rustfmt
           cargo clippy --version
+          cargo fmt --version
 
       # build.rs builds the plugin, so clippy needs Node just as the tests do.
       - uses: actions/setup-node@v6
         with:
           node-version: "22.x"
 
+      # Before clippy, because it is the cheaper failure and the one with an
+      # obvious fix: `cargo fmt` and push. The style it enforces is recorded in
+      # rustfmt.toml, recovered by measurement rather than picked - see that
+      # file. A formatter written down but not checked drifts straight back,
+      # which is the state this repository was in until GM-241.
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path core/Cargo.toml --check
+
       # `-D warnings`, because a lint that reports and passes is a lint nobody
       # reads. The tree was brought to zero findings before this was turned on
       # (44 of them: 36 doc-list continuations, a transmute without
       # annotations, a seven-field tuple type, and one assertion that was
       # constant-true and therefore checking nothing).
-      #
-      # `cargo fmt --check` is deliberately NOT here yet - see rustfmt.toml for
-      # why, and GM-241 for what has to land before it can be.
       - name: cargo clippy
         run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings

@@ -593,21 +593,20 @@ can be published from a commit whose tests have not passed:
   `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`). Before this existed
   the Windows port was verified by compilation alone: no unit test and no
   integration binary had ever been executed there.
-- **`cargo clippy`**, denying warnings.
+- **`cargo fmt --check`** and **`cargo clippy`**, the latter denying warnings.
 - **shellcheck** over every `*.sh`, at the lowest severity, with the version
   pinned so a new ShellCheck release cannot turn the gate red on unchanged
   code.
+
+Formatting is enforced against `rustfmt.toml`, whose values were recovered by
+measurement rather than picked — that file shows the working. The one-time
+reformat that made the check passable is listed in `.git-blame-ignore-revs`, so
+`git blame` skips straight past it.
 
 Still only local, deliberately:
 
 - **The embedding-weights tests**, which stay `#[ignore]`d. 612 MiB per runner
   on four runners is not a cost worth paying to check that a download works.
-- **`cargo fmt --check`.** The repository has no formatting history to enforce:
-  `rustfmt.toml` now records the style the code is actually written in (see
-  that file for how those values were derived), but 578 hunks still separate
-  the tree from it. Applying them is a one-time reformat of most files and is
-  tracked as its own task, along with the `.git-blame-ignore-revs` entry that
-  should land beside it.
 - **The benchmarks** (`g-mesh-bench`), which cost model spend per run.
 
 ## License
