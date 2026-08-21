@@ -31,13 +31,19 @@ const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
     ("find_definition", &["symbol_name", "file_path", "position", "cursor", "include_source"]),
     (
         "find_implementations",
-        &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "transitive", "max_depth", "resume_token"],
+        &[
+            "symbol_id",
+            "symbol_name",
+            "cursor",
+            "limit",
+            "file_paths",
+            "transitive",
+            "max_depth",
+            "resume_token",
+        ],
     ),
     ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    (
-        "get_dependencies",
-        &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"],
-    ),
+    ("get_dependencies", &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"]),
     ("get_file_outline", &["file_path", "cursor", "limit"]),
     ("search_code", &["query", "cursor", "limit"]),
 ];
@@ -110,9 +116,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // Same spawn shape the MCP client of a real editor uses: the project
     // directory as cwd is the shim's entire notion of project identity.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
 
@@ -140,11 +144,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
         for param in params {
             assert!(properties.contains_key(*param), "{name} is missing parameter `{param}`");
         }
-        assert_eq!(
-            properties.len(),
-            params.len(),
-            "{name} publishes unexpected parameters: {properties:?}"
-        );
+        assert_eq!(properties.len(), params.len(), "{name} publishes unexpected parameters: {properties:?}");
         assert!(
             tool.description.as_ref().is_some_and(|d| !d.is_empty()),
             "{name} has no description for an agent to choose it by"
@@ -170,10 +170,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // after it is the strongest form of that assertion.
     let pid = project.daemon_pid();
     assert!(is_alive(pid), "the daemon died during the session");
-    let listed_again = client
-        .list_tools(None)
-        .await
-        .expect("the session must survive a failed tool call");
+    let listed_again = client.list_tools(None).await.expect("the session must survive a failed tool call");
     assert_eq!(listed_again.tools.len(), EXPECTED_TOOLS.len());
 
     client.cancel().await.expect("failed to shut the client down");

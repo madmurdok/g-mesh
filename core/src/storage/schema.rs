@@ -411,10 +411,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables.sort();
-        assert_eq!(
-            tables,
-            vec!["declarations", "edges", "indexed_files", "meta", "nodes", "vectors"]
-        );
+        assert_eq!(tables, vec!["declarations", "edges", "indexed_files", "meta", "nodes", "vectors"]);
 
         let indexes: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
@@ -423,12 +420,9 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        for expected in [
-            "idx_nodes_filePath",
-            "idx_nodes_qualifiedName",
-            "idx_edges_fromId",
-            "idx_edges_toId",
-        ] {
+        for expected in
+            ["idx_nodes_filePath", "idx_nodes_qualifiedName", "idx_edges_fromId", "idx_edges_toId"]
+        {
             assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
         }
     }
@@ -444,11 +438,9 @@ mod tests {
         .unwrap();
 
         let (name, kind): (String, String) = conn
-            .query_row(
-                "SELECT name, kind FROM nodes WHERE id = 'n1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row("SELECT name, kind FROM nodes WHERE id = 'n1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap();
         assert_eq!(name, "foo");
         assert_eq!(kind, "Function");
@@ -477,11 +469,9 @@ mod tests {
         .unwrap();
 
         let (kind, resolved): (String, bool) = conn
-            .query_row(
-                "SELECT kind, resolved FROM edges WHERE id = 'e1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row("SELECT kind, resolved FROM edges WHERE id = 'e1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap();
         assert_eq!(kind, "CALLS");
         assert!(!resolved);
@@ -505,7 +495,9 @@ mod tests {
         .unwrap();
 
         let mut stmt = conn
-            .prepare("SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = 'n1' ORDER BY ordinal")
+            .prepare(
+                "SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = 'n1' ORDER BY ordinal",
+            )
             .unwrap();
         let rows: Vec<(i64, String, bool)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -596,9 +588,8 @@ mod tests {
         let reindex_needed = ensure_current(&conn, GENERATION).unwrap();
         assert!(reindex_needed);
 
-        let version: String = conn
-            .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
-            .unwrap();
+        let version: String =
+            conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
@@ -648,10 +639,7 @@ mod tests {
     fn a_walked_index_still_owes_its_semantic_pass_until_one_is_recorded() {
         let conn = setup();
         assert!(ensure_current(&conn, GENERATION).unwrap());
-        assert!(
-            !semantic_pass_completed(&conn).unwrap(),
-            "a fresh index has had no semantic pass either"
-        );
+        assert!(!semantic_pass_completed(&conn).unwrap(), "a fresh index has had no semantic pass either");
 
         record_bulk_index(&conn).unwrap();
         assert!(bulk_index_completed(&conn).unwrap());
@@ -766,7 +754,10 @@ mod tests {
         let indexer: String =
             conn.query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(indexer, GENERATION);
-        assert!(!ensure_current(&conn, GENERATION).unwrap(), "the stamp it just wrote must satisfy its own check");
+        assert!(
+            !ensure_current(&conn, GENERATION).unwrap(),
+            "the stamp it just wrote must satisfy its own check"
+        );
     }
 
     /// Task 116: the generation that filled an index names the plugin build as
@@ -811,9 +802,8 @@ mod tests {
         )
         .unwrap();
 
-        let version: String = conn
-            .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
-            .unwrap();
+        let version: String =
+            conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(version, "1");
     }
 }

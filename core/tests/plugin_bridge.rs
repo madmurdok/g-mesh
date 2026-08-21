@@ -85,11 +85,8 @@ fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() 
     wait_for("the daemon (and its JS/TS plugin) to start", || pid_file.exists());
 
     let fixture = project.root().join("fixture.ts");
-    fs::write(
-        &fixture,
-        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
-    )
-    .expect("failed to write the fixture file");
+    fs::write(&fixture, "export function add(a: number, b: number): number {\n  return a + b;\n}\n")
+        .expect("failed to write the fixture file");
 
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     wait_for("the plugin's file-change diff to be committed to the SQLite index", || {
@@ -108,7 +105,10 @@ fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() 
         })
         .unwrap();
     assert_eq!(kind, "Function", "the real tree-sitter extraction must classify `add` as a Function node");
-    assert_eq!(file_path, "fixture.ts", "the node's filePath must be the project-relative path, not absolute");
+    assert_eq!(
+        file_path, "fixture.ts",
+        "the node's filePath must be the project-relative path, not absolute"
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -134,9 +134,7 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
 
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     let count = |sql: &str| -> i64 {
-        Connection::open(&db_path)
-            .and_then(|conn| conn.query_row(sql, [], |row| row.get(0)))
-            .unwrap_or(0)
+        Connection::open(&db_path).and_then(|conn| conn.query_row(sql, [], |row| row.get(0))).unwrap_or(0)
     };
 
     // The whole fixture is re-written until the index answers, rather than
@@ -155,11 +153,8 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
     let mut edits = 0;
     loop {
         edits += 1;
-        fs::write(
-            project.root().join("tsconfig.json"),
-            "{ \"compilerOptions\": { \"strict\": true } }\n",
-        )
-        .unwrap();
+        fs::write(project.root().join("tsconfig.json"), "{ \"compilerOptions\": { \"strict\": true } }\n")
+            .unwrap();
         fs::write(project.root().join("a.ts"), "export function mutate(): \"a\" {\n  return \"a\";\n}\n")
             .unwrap();
         fs::write(project.root().join("b.ts"), "export function mutate(): \"b\" {\n  return \"b\";\n}\n")

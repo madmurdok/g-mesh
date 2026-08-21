@@ -144,8 +144,7 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
             _ => None,
         },
     };
-    let state_dir = project_dir(project_root)
-        .context("failed to resolve the project's state directory")?;
+    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
     let plugin_pids: Vec<(String, u32)> = daemon::registry::discovered_pid_files(&state_dir)
         .into_iter()
         .filter_map(|(language, path)| live_pid(&path).map(|pid| (language, pid)))
@@ -161,14 +160,12 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
     for (language, pid) in plugin_pids {
         // Only worth waiting on if a core was just taken away from it; an
         // already-orphaned plugin has nothing left to notice.
-        let exited_by_itself =
-            outcome.core.is_some() && wait_until_gone(pid, PLUGIN_EXIT_TIMEOUT);
+        let exited_by_itself = outcome.core.is_some() && wait_until_gone(pid, PLUGIN_EXIT_TIMEOUT);
         let stopped = if exited_by_itself {
             Stopped::ExitedWithCore { pid }
         } else {
-            terminate(pid, TERMINATION_TIMEOUT).with_context(|| {
-                format!("failed to stop the {language} plugin (pid {pid})")
-            })?
+            terminate(pid, TERMINATION_TIMEOUT)
+                .with_context(|| format!("failed to stop the {language} plugin (pid {pid})"))?
         };
         outcome.plugins.push((language, stopped));
     }
@@ -236,8 +233,7 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 /// daemon crashed, and it must not delete the socket of a daemon that is
 /// somehow still serving (e.g. one whose pid file was removed by hand).
 fn tidy_state_files(project_root: &Path) -> Result<()> {
-    let state_dir = project_dir(project_root)
-        .context("failed to resolve the project's state directory")?;
+    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
     let mut paths = vec![daemon::pid_path(project_root)?];
     paths.extend(daemon::registry::discovered_pid_files(&state_dir).into_iter().map(|(_, path)| path));
     for path in paths {
@@ -282,12 +278,7 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         }
     }
     for (language, plugin) in &outcome.plugins {
-        let _ = writeln!(
-            out,
-            "  plugin ({language}): pid {} ({})",
-            plugin.pid(),
-            describe(*plugin)
-        );
+        let _ = writeln!(out, "  plugin ({language}): pid {} ({})", plugin.pid(), describe(*plugin));
     }
     out
 }
@@ -478,7 +469,10 @@ mod tests {
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
         assert!(rendered.contains("plugin (go): pid 222 (exited with its core)"), "{rendered}");
-        assert!(rendered.contains("plugin (typescript): pid 333 (killed after ignoring SIGTERM)"), "{rendered}");
+        assert!(
+            rendered.contains("plugin (typescript): pid 333 (killed after ignoring SIGTERM)"),
+            "{rendered}"
+        );
     }
 
     #[test]

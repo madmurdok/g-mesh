@@ -98,7 +98,10 @@ mod tests {
         debouncer.record(path.clone()); // resets the timer before it would have fired
         thread::sleep(Duration::from_millis(30));
 
-        assert!(debouncer.drain_ready().is_empty(), "30ms since the second record is still under the 50ms window");
+        assert!(
+            debouncer.drain_ready().is_empty(),
+            "30ms since the second record is still under the 50ms window"
+        );
 
         thread::sleep(Duration::from_millis(30));
         assert_eq!(debouncer.drain_ready(), vec![path]);

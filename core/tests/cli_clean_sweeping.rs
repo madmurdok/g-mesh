@@ -211,7 +211,8 @@ fn a_sweep_runs_against_a_root_of_its_own_not_the_shared_one() {
     let home = Home::new();
     let project = Project::new(&home);
 
-    let shared = g_mesh::storage::connection::projects_root().expect("failed to resolve the shared projects root");
+    let shared =
+        g_mesh::storage::connection::projects_root().expect("failed to resolve the shared projects root");
     assert!(
         !home.projects_root().starts_with(&shared),
         "this test's home ({}) is inside the shared root ({})",
@@ -273,7 +274,10 @@ fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
         // what makes the state behind it an orphan.
         state
     };
-    assert!(orphan_state.is_dir(), "deleting the project directory must not remove its state - that is what makes it an orphan");
+    assert!(
+        orphan_state.is_dir(),
+        "deleting the project directory must not remove its state - that is what makes it an orphan"
+    );
     assert_eq!(home.project_count(), 2, "both projects must have state before the sweep");
 
     let swept = live.command(&["clean", "orphaned", "--force"]);

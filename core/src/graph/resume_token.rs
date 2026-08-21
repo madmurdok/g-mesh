@@ -89,9 +89,7 @@ pub fn encode(state: &ResumeState) -> String {
 pub fn decode(raw: &str) -> Result<ResumeState> {
     let compressed = BASE64_STANDARD.decode(raw).context("invalid resume token encoding")?;
     let mut json = Vec::new();
-    GzDecoder::new(&compressed[..])
-        .read_to_end(&mut json)
-        .context("invalid resume token compression")?;
+    GzDecoder::new(&compressed[..]).read_to_end(&mut json).context("invalid resume token compression")?;
     serde_json::from_slice(&json).context("invalid resume token payload")
 }
 

@@ -145,10 +145,10 @@ pub enum Vintage {
 /// before this check existed, rather than guess.
 pub fn of_running_process() -> Result<BuildStamp> {
     let exe = std::env::current_exe().context("failed to resolve this process's executable")?;
-    let metadata = fs::metadata(&exe)
-        .with_context(|| format!("failed to stat the executable at {}", exe.display()))?;
-    let exe_mtime_millis = mtime_millis(&metadata)
-        .with_context(|| format!("failed to read the mtime of {}", exe.display()))?;
+    let metadata =
+        fs::metadata(&exe).with_context(|| format!("failed to stat the executable at {}", exe.display()))?;
+    let exe_mtime_millis =
+        mtime_millis(&metadata).with_context(|| format!("failed to read the mtime of {}", exe.display()))?;
     // Infallible on purpose, unlike the two above: a plugin that cannot be
     // read at all resolves to `FINGERPRINT_UNAVAILABLE`, which compares equal
     // to the same answer from anyone else, so an install with no readable
@@ -247,11 +247,7 @@ mod tests {
     }
 
     fn stamp_with_plugin(exe: &str, mtime: i64, plugin: &str) -> BuildStamp {
-        BuildStamp {
-            exe: PathBuf::from(exe),
-            exe_mtime_millis: mtime,
-            plugin: plugin.to_string(),
-        }
+        BuildStamp { exe: PathBuf::from(exe), exe_mtime_millis: mtime, plugin: plugin.to_string() }
     }
 
     #[test]
@@ -301,10 +297,7 @@ mod tests {
             ("empty", ""),
             ("no-mtime", "exe=/bin/g-mesh\nplugin_fingerprint=ab\n"),
             ("no-exe", "exe_mtime_millis=42\nplugin_fingerprint=ab\n"),
-            (
-                "mtime-not-a-number",
-                "exe=/bin/g-mesh\nexe_mtime_millis=soon\nplugin_fingerprint=ab\n",
-            ),
+            ("mtime-not-a-number", "exe=/bin/g-mesh\nexe_mtime_millis=soon\nplugin_fingerprint=ab\n"),
             ("not-key-values", "g-mesh 0.5.0\n"),
             // The shape every daemon started before task 116 published: a
             // complete account of the executable and none at all of the
@@ -403,8 +396,8 @@ mod tests {
     /// someone to go and look at the wrong thing.
     #[test]
     fn each_verdict_is_described_in_its_own_words() {
-        let described = [Vintage::Current, Vintage::Outdated, Vintage::PluginChanged, Vintage::Unknown]
-            .map(describe);
+        let described =
+            [Vintage::Current, Vintage::Outdated, Vintage::PluginChanged, Vintage::Unknown].map(describe);
         let unique: std::collections::HashSet<_> = described.iter().collect();
         assert_eq!(unique.len(), described.len(), "{described:?}");
     }

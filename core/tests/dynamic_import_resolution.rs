@@ -140,24 +140,24 @@ async fn get_dependencies_resolves_a_foldable_computed_specifier_and_none_for_an
     // longer implies a built index - the walk's own completion marker is what
     // does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
     wait_until_indexed(&root);
 
     let result = client
-        .call_tool(CallToolRequestParams::new("get_dependencies").with_arguments(
-            json!({
-                "file_path": "src/index.ts",
-                "direction": "Outgoing",
-            })
-            .as_object()
-            .cloned()
-            .expect("arguments literal is an object"),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("get_dependencies").with_arguments(
+                json!({
+                    "file_path": "src/index.ts",
+                    "direction": "Outgoing",
+                })
+                .as_object()
+                .cloned()
+                .expect("arguments literal is an object"),
+            ),
+        )
         .await
         .expect("tools/call failed");
     let result = body(&result);

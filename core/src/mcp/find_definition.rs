@@ -270,8 +270,8 @@ pub(super) fn resolve_symbol_name(
         return Ok(Ok(Resolved { node: exact.remove(0), by: ResolvedBy::QualifiedName }));
     }
 
-    let matches =
-        queries::find_by_name(conn, name, None).map_err(|e| internal_error("failed to look up node by name", e))?;
+    let matches = queries::find_by_name(conn, name, None)
+        .map_err(|e| internal_error("failed to look up node by name", e))?;
 
     match matches.len() {
         0 => by_file_name(conn, name),
@@ -349,7 +349,9 @@ fn by_name(
     cursor: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
     match resolve_symbol_name(conn, name, cursor)? {
-        Ok(resolved) => success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root)),
+        Ok(resolved) => {
+            success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root))
+        }
         Err(finished) => Ok(finished),
     }
 }
@@ -404,7 +406,13 @@ mod tests {
         conn
     }
 
-    fn node_with_span(id: &str, name: &str, qualified_name: &str, file_path: &str, end: (i64, i64)) -> NodeRecord {
+    fn node_with_span(
+        id: &str,
+        name: &str,
+        qualified_name: &str,
+        file_path: &str,
+        end: (i64, i64),
+    ) -> NodeRecord {
         let mut node = NodeRecord::new(id, "Function", name, qualified_name, file_path, "rust");
         node.end_line = end.0;
         node.end_col = end.1;
@@ -434,10 +442,14 @@ mod tests {
         upsert_node(&mut conn, node_with_span("n2", "run", "pkg_b::run", "b/lib.rs", (5, 0))).unwrap();
         // A third, unrelated node calls n2 twice so its inbound CALLS count
         // outranks n1's zero - exercises the ranking, not just presence.
-        upsert_node(&mut conn, NodeRecord::new("caller1", "Function", "caller1", "pkg_c::caller1", "c/lib.rs", "rust"))
-            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("caller1", "Function", "caller1", "pkg_c::caller1", "c/lib.rs", "rust"),
+        )
+        .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e1", "caller1", "n2", "CALLS", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e2", "caller1", "n2", "REFERENCES", "tree-sitter", true)).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e2", "caller1", "n2", "REFERENCES", "tree-sitter", true))
+            .unwrap();
 
         let params = FindDefinitionParams {
             symbol_name: Some("run".to_string()),
@@ -450,7 +462,10 @@ mod tests {
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
-        assert_eq!(results[0]["qualifiedName"], "pkg_b::run", "the higher inbound-edge count must rank first");
+        assert_eq!(
+            results[0]["qualifiedName"], "pkg_b::run",
+            "the higher inbound-edge count must rank first"
+        );
         assert_eq!(results[1]["qualifiedName"], "pkg_a::run");
     }
 
@@ -463,10 +478,9 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, node_with_span("n1", "mutate", "mutate", "target.ts", (5, 0))).unwrap();
 
-        for (id, native_kind, file) in [
-            ("pending", "pending_symbol", "caller.ts"),
-            ("reexported", "reexport", "index.ts"),
-        ] {
+        for (id, native_kind, file) in
+            [("pending", "pending_symbol", "caller.ts"), ("reexported", "reexport", "index.ts")]
+        {
             let mut placeholder =
                 NodeRecord::new(id, "Module", "mutate", "target.ts#mutate", file, "typescript");
             placeholder.native_kind = Some(native_kind.to_string());
@@ -503,7 +517,10 @@ mod tests {
         let body = json_body(&result);
         assert_eq!(body["id"], "n1");
         assert_eq!(body["qualifiedName"], "pkg_a::run");
-        assert!(body.get("results").is_none(), "an unambiguous file+position query must not be wrapped in a list");
+        assert!(
+            body.get("results").is_none(),
+            "an unambiguous file+position query must not be wrapped in a list"
+        );
     }
 
     #[test]
@@ -542,7 +559,13 @@ mod tests {
     #[test]
     fn neither_name_nor_position_is_a_tool_level_error() {
         let conn = setup();
-        let params = FindDefinitionParams { symbol_name: None, file_path: None, position: None, cursor: None, include_source: None };
+        let params = FindDefinitionParams {
+            symbol_name: None,
+            file_path: None,
+            position: None,
+            cursor: None,
+            include_source: None,
+        };
         let result = handle(&Arc::new(Mutex::new(conn)), &no_sources(), params).unwrap();
         assert!(error_text(&result).contains("symbol_name"));
     }
@@ -556,12 +579,18 @@ mod tests {
         let total = CANDIDATE_PAGE_SIZE + 1;
         for i in 0..total {
             let id = format!("n{i}");
-            upsert_node(&mut conn, node_with_span(&id, "run", &format!("pkg{i}::run"), "a/lib.rs", (5, 0))).unwrap();
+            upsert_node(&mut conn, node_with_span(&id, "run", &format!("pkg{i}::run"), "a/lib.rs", (5, 0)))
+                .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let first_params =
-            FindDefinitionParams { symbol_name: Some("run".to_string()), file_path: None, position: None, cursor: None, include_source: None };
+        let first_params = FindDefinitionParams {
+            symbol_name: Some("run".to_string()),
+            file_path: None,
+            position: None,
+            cursor: None,
+            include_source: None,
+        };
         let first = handle(&conn, &no_sources(), first_params).unwrap();
         let first_body = json_body(&first);
         let first_results = first_body["results"].as_array().unwrap();
@@ -592,17 +621,13 @@ mod tests {
         assert_eq!(all_ids.len(), total, "every candidate must appear exactly once across both pages");
     }
 
-
     /// The ladder's contract: every answer says which rung reached it, so a
     /// caller can tell "this is your symbol" from "these might be".
     #[test]
     fn an_exact_name_reports_the_rung_that_resolved_it() {
         let mut conn = setup();
-        upsert_node(
-            &mut conn,
-            NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"),
-        )
-        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
+            .unwrap();
 
         let by_qualified = json_body(&by_name(&conn, None, "pkg::run", None).unwrap());
         assert_eq!(by_qualified["resolvedBy"], "qualifiedName");
@@ -649,11 +674,8 @@ mod tests {
     #[test]
     fn a_name_matching_neither_a_declaration_nor_a_file_is_still_refused() {
         let mut conn = setup();
-        upsert_node(
-            &mut conn,
-            NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"),
-        )
-        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
+            .unwrap();
 
         let result = by_name(&conn, None, "NoSuchThingAnywhere", None).unwrap();
 

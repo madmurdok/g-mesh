@@ -36,10 +36,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// of them going through a second barrel of its own.
 const FILES: [(&str, &str); 7] = [
     ("package.json", r#"{ "name": "fixture-root", "private": true, "workspaces": ["packages/*"] }"#),
-    (
-        "packages/element/package.json",
-        r#"{ "name": "@fixture/element", "main": "./dist/prod/index.js" }"#,
-    ),
+    ("packages/element/package.json", r#"{ "name": "@fixture/element", "main": "./dist/prod/index.js" }"#),
     (
         "packages/element/src/index.ts",
         r#"export * from "./mutateElement";
@@ -152,9 +149,7 @@ async fn find_callers_reaches_a_caller_that_imported_through_a_barrel() {
     // handshake no longer implies a built index - the walk's own completion
     // marker is what does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

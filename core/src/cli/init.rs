@@ -147,13 +147,13 @@ pub fn run(agents: &[AgentTarget]) -> Result<()> {
 pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     let stop_outcome = stop::stop(project_root)?;
 
-    let state_dir = connection::project_dir(project_root)
-        .context("failed to resolve the project's state directory")?;
+    let state_dir =
+        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
-    let config_path = config::project_config_path(project_root)
-        .context("failed to resolve the project's config path")?;
+    let config_path =
+        config::project_config_path(project_root).context("failed to resolve the project's config path")?;
     let config_written = !config_path.exists();
     if config_written {
         config::write_project_config(project_root, &ProjectConfig::default())
@@ -167,11 +167,10 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     // start throws away the index this command just paid to build. Same
     // discovery `daemon::run`'s own cold start uses; the walk below takes this
     // same value rather than repeating the scan.
-    let discovered = manifest::discover(&manifest::default_roots())
-        .context("failed to discover language plugins")?;
+    let discovered =
+        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
 
-    let conn = connection::open(project_root)
-        .context("failed to open the project's SQLite index")?;
+    let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
     schema::ensure_current(&conn, &registry::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?;
     let already_indexed = schema::bulk_index_completed(&conn)
@@ -193,20 +192,15 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let already_semantic_passed = schema::semantic_pass_completed(&conn)
             .context("failed to check whether the project's semantic pass has completed")?;
         if !already_semantic_passed {
-            let canonical_root = project_root.canonicalize().with_context(|| {
-                format!("failed to canonicalize project root {}", project_root.display())
-            })?;
+            let canonical_root = project_root
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
             let conn = Arc::new(Mutex::new(conn));
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
             let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-            let semantic_outcome = semantic::run_once(
-                &canonical_root,
-                &state_dir,
-                &conn,
-                &discovered,
-                &embedding_pipeline,
-            );
+            let semantic_outcome =
+                semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
             match &semantic_outcome {
                 Ok(ran) => semantic_pass_ran = *ran,
                 Err(err) => eprintln!(
@@ -221,16 +215,16 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         }
         None
     } else {
-        let canonical_root = project_root.canonicalize().with_context(|| {
-            format!("failed to canonicalize project root {}", project_root.display())
-        })?;
+        let canonical_root = project_root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
         let conn = Arc::new(Mutex::new(conn));
         // Read back rather than assumed from `ProjectConfig::default()`: a
         // pre-existing config.toml (the `!config_written` case) may name a
         // different model, and this walk has to honor whatever is actually
         // configured, exactly like `daemon::run`'s own cold start.
-        let project_config = config::read_project_config(project_root)
-            .context("failed to read the project's config.toml")?;
+        let project_config =
+            config::read_project_config(project_root).context("failed to read the project's config.toml")?;
         let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
@@ -328,16 +322,14 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
                     if outcome.agent_instructions.claude_md_written {
                         let _ = writeln!(out, "  CLAUDE.md:  wrote the @AGENTS.md bridge line");
                     } else {
-                        let _ =
-                            writeln!(out, "  CLAUDE.md:  already bridges to AGENTS.md - left untouched");
+                        let _ = writeln!(out, "  CLAUDE.md:  already bridges to AGENTS.md - left untouched");
                     }
                 }
                 AgentTarget::Gemini => {
                     if outcome.agent_instructions.gemini_md_written {
                         let _ = writeln!(out, "  GEMINI.md:  wrote the @AGENTS.md bridge line");
                     } else {
-                        let _ =
-                            writeln!(out, "  GEMINI.md:  already bridges to AGENTS.md - left untouched");
+                        let _ = writeln!(out, "  GEMINI.md:  already bridges to AGENTS.md - left untouched");
                     }
                 }
             }
@@ -483,10 +475,7 @@ mod tests {
             rendered.contains("AGENTS.md:  already had the g-mesh snippet - left untouched"),
             "{rendered}"
         );
-        assert!(
-            rendered.contains("CLAUDE.md:  already bridges to AGENTS.md - left untouched"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("CLAUDE.md:  already bridges to AGENTS.md - left untouched"), "{rendered}");
         assert!(!rendered.contains("GEMINI.md"), "Gemini was never requested: {rendered}");
     }
 }

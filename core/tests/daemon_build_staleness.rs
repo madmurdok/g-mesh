@@ -94,8 +94,7 @@ impl Project {
     /// here ultimately turns on.
     fn daemon_pid(&self) -> u32 {
         let path = daemon::pid_path(self.root()).expect("failed to resolve the pid file path");
-        daemon::read_pid_file(&path)
-            .unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
+        daemon::read_pid_file(&path).unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
     }
 }
 
@@ -130,9 +129,7 @@ fn body(result: &CallToolResult) -> Value {
 /// which is the whole subject of this file.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(project.root())
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(project.root()).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -177,7 +174,8 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
 /// restart that has already been arranged.
 fn make_the_index_look_like_an_older_generations_work(index: &Path) {
     let conn = Connection::open(index).expect("failed to open the project index");
-    let removed = conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
+    let removed =
+        conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
     assert!(removed > 0, "the fixture must have had import edges to strip");
     let restamped = conn
         .execute("UPDATE meta SET indexer_version = '0' WHERE id = 1", [])

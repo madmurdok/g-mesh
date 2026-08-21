@@ -108,12 +108,7 @@ pub enum Outcome {
     /// carried unconditionally so `render` never has to reconstruct it) -
     /// from `cleanup.idleThresholdDays`, not necessarily the documented
     /// default.
-    DeletedMany {
-        scope: Scope,
-        ids: Vec<String>,
-        skipped_running: Vec<String>,
-        idle_threshold_days: u64,
-    },
+    DeletedMany { scope: Scope, ids: Vec<String>, skipped_running: Vec<String>, idle_threshold_days: u64 },
     /// `clean all` without `--force`: a count, and nothing touched.
     WouldDelete { count: usize },
     /// `clean orphaned` ran. `deleted` is false when `--force` was not given,
@@ -146,13 +141,8 @@ pub fn run(args: &CleanArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     let root = projects_root().context("failed to resolve ~/.g-mesh/projects")?;
     let idle_threshold_days = config::read_global_config()?.cleanup.idle_threshold_days;
-    let outcome = clean(
-        &Target::parse(args.target.as_deref()),
-        args.force,
-        &root,
-        &cwd,
-        idle_threshold_days,
-    )?;
+    let outcome =
+        clean(&Target::parse(args.target.as_deref()), args.force, &root, &cwd, idle_threshold_days)?;
     print!("{}", render(&outcome));
     Ok(())
 }
@@ -195,9 +185,7 @@ enum CwdScoped {
 }
 
 fn cwd_project_id(cwd: &Path) -> Result<String> {
-    project_hash(cwd).with_context(|| {
-        format!("failed to derive a project id for {}", cwd.display())
-    })
+    project_hash(cwd).with_context(|| format!("failed to derive a project id for {}", cwd.display()))
 }
 
 fn clean_one(id: &str, projects_root: &Path, scoped: CwdScoped) -> Result<Outcome> {
@@ -218,9 +206,7 @@ fn clean_one(id: &str, projects_root: &Path, scoped: CwdScoped) -> Result<Outcom
     }
 
     if daemon_is_running(&path) {
-        bail!(
-            "a daemon is still serving project `{id}` - run `g-mesh stop` in that project first"
-        );
+        bail!("a daemon is still serving project `{id}` - run `g-mesh stop` in that project first");
     }
 
     delete(&path)?;
@@ -303,10 +289,7 @@ fn clean_orphaned(force: bool, projects_root: &Path) -> Result<Outcome> {
     let mut legacy = 0;
 
     for candidate in candidates(projects_root)? {
-        let entry = || Orphan {
-            id: candidate.id.clone(),
-            root: candidate.root.clone().unwrap_or_default(),
-        };
+        let entry = || Orphan { id: candidate.id.clone(), root: candidate.root.clone().unwrap_or_default() };
         match root_state(candidate.root.as_deref()) {
             RootState::Live => continue,
             RootState::Legacy => legacy += 1,
@@ -377,8 +360,8 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
         return Ok(Vec::new());
     }
 
-    let entries = fs::read_dir(projects_root)
-        .with_context(|| format!("failed to read {}", projects_root.display()))?;
+    let entries =
+        fs::read_dir(projects_root).with_context(|| format!("failed to read {}", projects_root.display()))?;
 
     let mut candidates = Vec::new();
     for entry in entries {
@@ -393,9 +376,7 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
         candidates.push(Candidate {
             // A directory whose index cannot be read at all still counts as a
             // project - it just has no idle time, so only `all` will take it.
-            idle: last_used::read_from_project_dir(&path)
-                .unwrap_or(None)
-                .map(|record| record.idle),
+            idle: last_used::read_from_project_dir(&path).unwrap_or(None).map(|record| record.idle),
             daemon_running: daemon_is_running(&path),
             root: daemon::identity::read_project_root(&path),
             id,
@@ -420,8 +401,7 @@ fn daemon_is_running(state_dir: &Path) -> bool {
 }
 
 fn delete(path: &Path) -> Result<()> {
-    fs::remove_dir_all(path)
-        .with_context(|| format!("failed to delete {}", path.display()))
+    fs::remove_dir_all(path).with_context(|| format!("failed to delete {}", path.display()))
 }
 
 /// Renders an outcome as the text the command prints.
@@ -562,7 +542,11 @@ mod tests {
         fn add(&self, id: &str, idle_days: u64) -> PathBuf {
             let path = self.add_empty(id);
             let conn = Connection::open(path.join("index.db")).unwrap();
-            crate::storage::schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+            crate::storage::schema::ensure_current(
+                &conn,
+                &crate::daemon::registry::fixture_indexer_version(),
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
                 rusqlite::params![format!("-{idle_days} days")],
@@ -588,8 +572,7 @@ mod tests {
         /// Marks a project as served by a live daemon, using this test
         /// process's own pid - which is unquestionably alive.
         fn mark_daemon_running(&self, id: &str) {
-            fs::write(self.root().join(id).join("daemon.pid"), std::process::id().to_string())
-                .unwrap();
+            fs::write(self.root().join(id).join("daemon.pid"), std::process::id().to_string()).unwrap();
         }
 
         fn exists(&self, id: &str) -> bool {
@@ -643,10 +626,7 @@ mod tests {
         assert_eq!(Target::parse(Some("expired")), Target::Expired);
         assert_eq!(Target::parse(Some("orphaned")), Target::Orphaned);
         assert_eq!(Target::parse(Some("all")), Target::All);
-        assert_eq!(
-            Target::parse(Some("a1b2c3d4e5f6a7b8")),
-            Target::Project("a1b2c3d4e5f6a7b8".to_string())
-        );
+        assert_eq!(Target::parse(Some("a1b2c3d4e5f6a7b8")), Target::Project("a1b2c3d4e5f6a7b8".to_string()));
     }
 
     #[test]
@@ -681,8 +661,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
 
         for id in ["..", "../not-a-g-mesh-directory", "/etc", "a/b", "."] {
-            let err = clean_in(&projects, Target::Project(id.to_string()), false)
-                .unwrap_err_or_else(id);
+            let err = clean_in(&projects, Target::Project(id.to_string()), false).unwrap_err_or_else(id);
             assert!(err.contains("is not a project id"), "`{id}` was refused for the wrong reason: {err}");
         }
 
@@ -711,8 +690,7 @@ mod tests {
         projects.add(&id, 1);
 
         let outcome =
-            clean(&Target::Cwd, false, projects.root(), cwd.path(), default_idle_threshold_days())
-                .unwrap();
+            clean(&Target::Cwd, false, projects.root(), cwd.path(), default_idle_threshold_days()).unwrap();
 
         assert!(matches!(outcome, Outcome::Deleted { id: ref got, .. } if *got == id));
         assert!(!projects.exists(&id));
@@ -750,8 +728,7 @@ mod tests {
         // move if the threshold were still hard-coded.
         projects.add("aaaa1111", 10);
 
-        let outcome =
-            clean_in_with_threshold(&projects, Target::Expired, false, 5).unwrap();
+        let outcome = clean_in_with_threshold(&projects, Target::Expired, false, 5).unwrap();
 
         match outcome {
             Outcome::DeletedMany { ids, idle_threshold_days, .. } => {
@@ -893,18 +870,12 @@ mod tests {
         let cwd = unrelated_cwd();
 
         assert_eq!(
-            clean(&Target::All, false, &never_created, cwd.path(), default_idle_threshold_days())
-                .unwrap(),
+            clean(&Target::All, false, &never_created, cwd.path(), default_idle_threshold_days()).unwrap(),
             Outcome::WouldDelete { count: 0 }
         );
-        let outcome = clean(
-            &Target::Expired,
-            false,
-            &never_created,
-            cwd.path(),
-            default_idle_threshold_days(),
-        )
-        .unwrap();
+        let outcome =
+            clean(&Target::Expired, false, &never_created, cwd.path(), default_idle_threshold_days())
+                .unwrap();
         assert!(matches!(outcome, Outcome::DeletedMany { ref ids, .. } if ids.is_empty()));
     }
 
@@ -961,11 +932,7 @@ mod tests {
         projects.mark_daemon_running("eeee5555");
         fs::remove_dir(&served).unwrap();
 
-        OrphanFixture {
-            projects,
-            _live_root: live_root,
-            _surviving_parent: surviving_parent,
-        }
+        OrphanFixture { projects, _live_root: live_root, _surviving_parent: surviving_parent }
     }
 
     /// The acceptance criterion: exactly the state whose project is gone is
@@ -977,8 +944,7 @@ mod tests {
 
         let outcome = clean_in(&fixture.projects, Target::Orphaned, true).unwrap();
 
-        let Outcome::Orphaned { deleted, orphaned, skipped_running, unreachable, legacy } = outcome
-        else {
+        let Outcome::Orphaned { deleted, orphaned, skipped_running, unreachable, legacy } = outcome else {
             panic!("expected an orphaned outcome, got {outcome:?}");
         };
         assert!(deleted);

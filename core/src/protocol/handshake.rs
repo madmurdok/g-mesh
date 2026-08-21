@@ -55,7 +55,10 @@ mod tests {
         let bad = CURRENT_PROTOCOL_VERSION + 1;
         let err = verify(&handshake(bad)).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains(&CURRENT_PROTOCOL_VERSION.to_string()), "error must name the expected version: {message}");
+        assert!(
+            message.contains(&CURRENT_PROTOCOL_VERSION.to_string()),
+            "error must name the expected version: {message}"
+        );
         assert!(message.contains(&bad.to_string()), "error must name the actual version: {message}");
         assert!(message.contains("typescript"));
     }

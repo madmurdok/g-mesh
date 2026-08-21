@@ -192,8 +192,9 @@ mod tests {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1, "re-embedding must overwrite, not accumulate");
 
-        let version: String =
-            conn.query_row("SELECT embeddingVersion FROM vectors WHERE nodeId = 'alpha'", [], |row| row.get(0)).unwrap();
+        let version: String = conn
+            .query_row("SELECT embeddingVersion FROM vectors WHERE nodeId = 'alpha'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, "v2");
     }
 

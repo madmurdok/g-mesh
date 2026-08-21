@@ -149,8 +149,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     let tx = conn.transaction().context("failed to start transaction")?;
 
     for id in &diff.delete_edge_ids {
-        tx.execute("DELETE FROM edges WHERE id = ?1", params![id])
-            .context("failed to delete edge")?;
+        tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
     }
     for id in &diff.delete_node_ids {
         // Explicitly, rather than leaning on the child table's ON DELETE
@@ -160,8 +159,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         // these rows would be handed to whoever next takes this node's id.
         tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's declarations")?;
-        tx.execute("DELETE FROM nodes WHERE id = ?1", params![id])
-            .context("failed to delete node")?;
+        tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
     }
     for node in &diff.upsert_nodes {
         tx.execute(
@@ -276,8 +274,7 @@ mod tests {
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
     }
 
     #[test]
@@ -343,7 +340,9 @@ mod tests {
     /// hasBody) - the fields the acceptance criteria names.
     fn declarations_of(conn: &Connection, node_id: &str) -> Vec<(i64, Option<String>, bool)> {
         let mut stmt = conn
-            .prepare("SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = ?1 ORDER BY ordinal")
+            .prepare(
+                "SELECT ordinal, signature, hasBody FROM declarations WHERE nodeId = ?1 ORDER BY ordinal",
+            )
             .unwrap();
         stmt.query_map(params![node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -495,7 +494,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(count(&conn, "nodes"), 0);
-        assert_eq!(count(&conn, "declarations"), 0, "orphaned rows would be handed to the next node with this id");
+        assert_eq!(
+            count(&conn, "declarations"),
+            0,
+            "orphaned rows would be handed to the next node with this id"
+        );
     }
 
     #[test]
@@ -514,9 +517,8 @@ mod tests {
         )
         .unwrap();
 
-        let unbound: Option<i64> = conn
-            .query_row("SELECT toDeclaration FROM edges WHERE id = 'e1'", [], |row| row.get(0))
-            .unwrap();
+        let unbound: Option<i64> =
+            conn.query_row("SELECT toDeclaration FROM edges WHERE id = 'e1'", [], |row| row.get(0)).unwrap();
         assert_eq!(unbound, None, "the structural pass binds no declaration");
 
         // The semantic pass' shape: the same edge re-sent under its own id,

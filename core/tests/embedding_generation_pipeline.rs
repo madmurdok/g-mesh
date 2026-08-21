@@ -231,7 +231,11 @@ fn the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded() {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
-    assert_eq!((doc_comment, signature), (None, None), "sanity check: this fixture's File node has neither field");
+    assert_eq!(
+        (doc_comment, signature),
+        (None, None),
+        "sanity check: this fixture's File node has neither field"
+    );
 
     assert!(!vector_row_exists(&conn, &file), "a node with neither field must not get a vector row");
 

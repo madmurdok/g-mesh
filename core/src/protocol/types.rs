@@ -157,9 +157,13 @@ pub enum ControlMessage {
     // struct variant's own fields - each variant needs its own rename_all
     // to get filePath instead of file_path in "params".
     #[serde(rename_all = "camelCase")]
-    Reindex { file_path: String },
+    Reindex {
+        file_path: String,
+    },
     #[serde(rename_all = "camelCase")]
-    FileChanged { file_path: String },
+    FileChanged {
+        file_path: String,
+    },
     Status,
     /// Asks the plugin's semantic layer to re-answer what the structural
     /// (tree-sitter) pass could only guess at, and reply with the edges it
@@ -173,7 +177,9 @@ pub enum ControlMessage {
     /// second case, and means "everything indexed so far", not "nothing":
     /// a request with nothing to do would not be worth a round trip.
     #[serde(rename_all = "camelCase")]
-    SemanticPass { file_paths: Vec<String> },
+    SemanticPass {
+        file_paths: Vec<String>,
+    },
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -250,10 +256,7 @@ mod tests {
             name: "foo".to_string(),
             qualified_name: "mod::foo".to_string(),
             file_path: "src/lib.rs".to_string(),
-            range: Range {
-                start: Position { line: 1, col: 0 },
-                end: Position { line: 3, col: 1 },
-            },
+            range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: Some("fn foo()".to_string()),
             exported: true,
             doc_comment: None,
@@ -377,9 +380,7 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: Some(RequestId::Number(1)),
-            message: ControlMessage::Reindex {
-                file_path: "src/lib.rs".to_string(),
-            },
+            message: ControlMessage::Reindex { file_path: "src/lib.rs".to_string() },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -392,9 +393,7 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
-            message: ControlMessage::FileChanged {
-                file_path: "src/main.rs".to_string(),
-            },
+            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string() },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -447,10 +446,7 @@ mod tests {
                 name: "foo".to_string(),
                 qualified_name: "mod::foo".to_string(),
                 file_path: "src/lib.rs".to_string(),
-                range: Range {
-                    start: Position { line: 1, col: 0 },
-                    end: Position { line: 3, col: 1 },
-                },
+                range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
                 signature: None,
                 exported: true,
                 doc_comment: None,

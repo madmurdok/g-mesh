@@ -183,8 +183,7 @@ pub(crate) fn empty_index() -> Mutex<Connection> {
 }
 
 fn manifest(language: &str, extensions: &[&str]) -> String {
-    let extensions =
-        extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+    let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
     format!(
         r#"
 [plugin]

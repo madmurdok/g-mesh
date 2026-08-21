@@ -121,7 +121,11 @@ pub fn longest_prefix_fitting<T: Serialize>(items: &[T], budget: usize) -> Optio
 /// completely unchanged, `has_more`/`next_cursor` included: this is pure
 /// headroom for the rare oversized page, never a new default behavior for
 /// the common one.
-pub fn bound_page<T: Serialize>(rows: Vec<EdgeRow<T>>, has_more: bool, next_cursor: Option<String>) -> Page<T> {
+pub fn bound_page<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+) -> Page<T> {
     bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES)
 }
 
@@ -142,7 +146,12 @@ fn bound_page_within<T: Serialize>(
     let items: Vec<&T> = rows.iter().map(|r| &r.item).collect();
     let Some(cut) = longest_prefix_fitting(&items, budget) else {
         let all_unresolved = rows.iter().all(|r| !r.resolved);
-        return Page { results: rows.into_iter().map(|r| r.item).collect(), has_more, next_cursor, all_unresolved };
+        return Page {
+            results: rows.into_iter().map(|r| r.item).collect(),
+            has_more,
+            next_cursor,
+            all_unresolved,
+        };
     };
 
     // Computed over the surviving prefix, not the pre-truncation `rows`: the
@@ -307,7 +316,9 @@ pub fn tally_edge_files(
 
     let mut stmt = conn.prepare(&sql)?;
     let tally = stmt
-        .query_map(sql_params.as_slice(), |row| Ok(FileTally { path: row.get("filePath")?, refs: row.get("refs")? }))?
+        .query_map(sql_params.as_slice(), |row| {
+            Ok(FileTally { path: row.get("filePath")?, refs: row.get("refs")? })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to tally edge files")?;
     Ok(tally)
@@ -455,24 +466,21 @@ pub fn paginate_edges(
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows: Vec<(EdgeRecord, i64)> = stmt
-        .query_map(
-            sql_params.as_slice(),
-            |row| {
-                let locality: i64 = row.get("locality")?;
-                Ok((
-                    EdgeRecord {
-                        id: row.get("id")?,
-                        from_id: row.get("fromId")?,
-                        to_id: row.get("toId")?,
-                        kind: row.get("kind")?,
-                        source: row.get("source")?,
-                        resolved: row.get("resolved")?,
-                        to_declaration: row.get("toDeclaration")?,
-                    },
-                    locality,
-                ))
-            },
-        )?
+        .query_map(sql_params.as_slice(), |row| {
+            let locality: i64 = row.get("locality")?;
+            Ok((
+                EdgeRecord {
+                    id: row.get("id")?,
+                    from_id: row.get("fromId")?,
+                    to_id: row.get("toId")?,
+                    kind: row.get("kind")?,
+                    source: row.get("source")?,
+                    resolved: row.get("resolved")?,
+                    to_declaration: row.get("toDeclaration")?,
+                },
+                locality,
+            ))
+        })?
         .collect::<rusqlite::Result<_>>()
         .context("failed to paginate edges")?;
 
@@ -481,11 +489,7 @@ pub fn paginate_edges(
 
     let next_cursor = has_more.then(|| {
         let (edge, locality) = rows.last().expect("has_more implies at least one row");
-        encode_cursor(&StructuralCursor {
-            resolved: edge.resolved,
-            locality: *locality,
-            id: edge.id.clone(),
-        })
+        encode_cursor(&StructuralCursor { resolved: edge.resolved, locality: *locality, id: edge.id.clone() })
     });
 
     Ok(Page {
@@ -541,7 +545,10 @@ pub fn paginate_defines(
 
     let mut stmt = conn.prepare(sql)?;
     let mut rows: Vec<NodeRecord> = stmt
-        .query_map(params![file_node_id, has_cursor, cursor_line, cursor_col, cursor_id, limit], crate::graph::queries::map_node_row)?
+        .query_map(
+            params![file_node_id, has_cursor, cursor_line, cursor_col, cursor_id, limit],
+            crate::graph::queries::map_node_row,
+        )?
         .collect::<rusqlite::Result<_>>()
         .context("failed to paginate DEFINES edges")?;
 
@@ -550,7 +557,11 @@ pub fn paginate_defines(
 
     let next_cursor = has_more.then(|| {
         let last = rows.last().expect("has_more implies at least one row");
-        encode_cursor(&SourceOrderCursor { start_line: last.start_line, start_col: last.start_col, id: last.id.clone() })
+        encode_cursor(&SourceOrderCursor {
+            start_line: last.start_line,
+            start_col: last.start_col,
+            id: last.id.clone(),
+        })
     });
 
     // No per-row resolved concept here - `DEFINES` rows are a file's own
@@ -732,7 +743,9 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 2, cursor.as_deref()).unwrap();
+            let page =
+                paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 2, cursor.as_deref())
+                    .unwrap();
             seen.extend(page.results.iter().map(|e| e.edge.id.clone()));
 
             // Simulate a background reindex inserting a new low-priority edge
@@ -754,7 +767,10 @@ mod tests {
         for id in &original {
             assert_eq!(seen.iter().filter(|s| *s == id).count(), 1, "row {id} must appear exactly once");
         }
-        assert!(seen.contains(&"e_intruder".to_string()), "the new lowest-priority row lands on the final page");
+        assert!(
+            seen.contains(&"e_intruder".to_string()),
+            "the new lowest-priority row lands on the final page"
+        );
         assert_eq!(seen.len(), 6);
     }
 
@@ -767,9 +783,14 @@ mod tests {
         make_edge(&conn, "e_in", "root", "in_scope", true);
         make_edge(&conn, "e_out", "root", "out_of_scope", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs"], "a.rs", 10, None).unwrap();
+        let page =
+            paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs"], "a.rs", 10, None).unwrap();
         let ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
-        assert_eq!(ids, vec!["e_in"], "only the row whose other endpoint is in the scoped file set must come back");
+        assert_eq!(
+            ids,
+            vec!["e_in"],
+            "only the row whose other endpoint is in the scoped file set must come back"
+        );
     }
 
     #[test]
@@ -783,7 +804,9 @@ mod tests {
         make_edge(&conn, "e_two", "root", "in_two", true);
         make_edge(&conn, "e_out", "root", "out", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs", "c.rs"], "a.rs", 10, None).unwrap();
+        let page =
+            paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs", "c.rs"], "a.rs", 10, None)
+                .unwrap();
         let mut ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["e_one", "e_two"], "every file in the scope set must contribute its rows");
@@ -799,10 +822,14 @@ mod tests {
         make_edge(&conn, "e_near", "root", "near", true);
 
         let scoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
-        let unscoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let unscoped =
+            paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
         let scoped_ids: Vec<&str> = scoped.results.iter().map(|e| e.edge.id.as_str()).collect();
         let unscoped_ids: Vec<&str> = unscoped.results.iter().map(|e| e.edge.id.as_str()).collect();
-        assert_eq!(scoped_ids, unscoped_ids, "an empty file_paths slice must return the exact same rows as omitting it");
+        assert_eq!(
+            scoped_ids, unscoped_ids,
+            "an empty file_paths slice must return the exact same rows as omitting it"
+        );
         assert_eq!(scoped_ids, vec!["e_near", "e_far"]);
     }
 
@@ -828,7 +855,17 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &["scoped.rs"], "a.rs", 1, cursor.as_deref()).unwrap();
+            let page = paginate_edges(
+                &conn,
+                "root",
+                Direction::Outgoing,
+                &[],
+                &["scoped.rs"],
+                "a.rs",
+                1,
+                cursor.as_deref(),
+            )
+            .unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one scoped row per page");
             seen.extend(page.results.iter().map(|e| e.edge.id.clone()));
             if !page.has_more {
@@ -875,7 +912,11 @@ mod tests {
 
         let page = paginate_defines(&conn, "file", 10, None).unwrap();
         let ids: Vec<&str> = page.results.iter().map(|n| n.id.as_str()).collect();
-        assert_eq!(ids, vec!["first", "second", "third"], "must come back in source order, not insertion order");
+        assert_eq!(
+            ids,
+            vec!["first", "second", "third"],
+            "must come back in source order, not insertion order"
+        );
         assert!(!page.has_more);
     }
 
@@ -900,25 +941,28 @@ mod tests {
             cursor = page.next_cursor;
         }
 
-        assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"], "must return every symbol exactly once, in source order");
+        assert_eq!(
+            seen,
+            vec!["n0", "n1", "n2", "n3", "n4"],
+            "must return every symbol exactly once, in source order"
+        );
     }
 
     #[test]
     fn score_pagination_orders_by_score_descending() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE scored (id TEXT PRIMARY KEY, score REAL, label TEXT)").unwrap();
-        conn.execute("INSERT INTO scored VALUES ('a', 0.5, 'low'), ('b', 0.9, 'high'), ('c', 0.7, 'mid')", [])
-            .unwrap();
-
-        let page = paginate_by_score::<String>(
-            &conn,
-            "SELECT id, score, label FROM scored",
-            &[],
-            10,
-            None,
-            |row| Ok((row.get::<_, String>("label")?, row.get("score")?, row.get("id")?)),
+        conn.execute(
+            "INSERT INTO scored VALUES ('a', 0.5, 'low'), ('b', 0.9, 'high'), ('c', 0.7, 'mid')",
+            [],
         )
         .unwrap();
+
+        let page =
+            paginate_by_score::<String>(&conn, "SELECT id, score, label FROM scored", &[], 10, None, |row| {
+                Ok((row.get::<_, String>("label")?, row.get("score")?, row.get("id")?))
+            })
+            .unwrap();
 
         assert_eq!(page.results, vec!["high", "mid", "low"]);
         assert!(!page.has_more);
@@ -931,11 +975,21 @@ mod tests {
     }
 
     fn edge_row(id: &str, blob_len: usize) -> EdgeRow<Item> {
-        EdgeRow { item: Item { id: id.to_string(), blob: "x".repeat(blob_len) }, resolved: true, locality: 0, edge_id: format!("e_{id}") }
+        EdgeRow {
+            item: Item { id: id.to_string(), blob: "x".repeat(blob_len) },
+            resolved: true,
+            locality: 0,
+            edge_id: format!("e_{id}"),
+        }
     }
 
     fn edge_row_resolved(id: &str, resolved: bool) -> EdgeRow<Item> {
-        EdgeRow { item: Item { id: id.to_string(), blob: String::new() }, resolved, locality: 0, edge_id: format!("e_{id}") }
+        EdgeRow {
+            item: Item { id: id.to_string(), blob: String::new() },
+            resolved,
+            locality: 0,
+            edge_id: format!("e_{id}"),
+        }
     }
 
     #[test]
@@ -967,7 +1021,11 @@ mod tests {
         let cursor = page.next_cursor.expect("a byte-truncated page must carry a resumable cursor");
 
         let raw = serde_json::to_vec(&page.results).unwrap();
-        assert!(raw.len() <= MAX_RESPONSE_BYTES, "the truncated page itself must respect the budget: {}", raw.len());
+        assert!(
+            raw.len() <= MAX_RESPONSE_BYTES,
+            "the truncated page itself must respect the budget: {}",
+            raw.len()
+        );
 
         // The cursor must resume right after the last row actually returned,
         // not an arbitrary or off-by-one boundary.

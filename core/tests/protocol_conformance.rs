@@ -134,8 +134,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     let report = check_control_plane_output(&core_wrote);
     assert!(report.is_conformant(), "{:?}", report.violations);
 
-    let sent: ControlEnvelope =
-        read_message(&mut BufReader::new(Cursor::new(core_wrote))).unwrap().unwrap();
+    let sent: ControlEnvelope = read_message(&mut BufReader::new(Cursor::new(core_wrote))).unwrap().unwrap();
     let recorded: ControlEnvelope =
         read_message(&mut BufReader::new(Cursor::new(fixture("semantic_pass_request.rpc"))))
             .unwrap()

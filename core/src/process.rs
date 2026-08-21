@@ -131,9 +131,8 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
-        DETACHED_PROCESS, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_TERMINATE,
+        GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
 
     /// The exit code a terminated daemon is recorded with. Nothing reads it -
@@ -230,11 +229,8 @@ mod tests {
 
     #[test]
     fn a_reaped_child_is_not_alive() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .expect("failed to spawn a test process");
+        let mut child =
+            Command::new("sh").arg("-c").arg("exit 0").spawn().expect("failed to spawn a test process");
         let pid = child.id();
         child.wait().expect("failed to reap the test process");
 

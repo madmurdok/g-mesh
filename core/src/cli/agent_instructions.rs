@@ -301,8 +301,7 @@ mod tests {
     fn apply_with_claude_and_gemini_writes_agents_md_once_plus_both_bridges() {
         let project = project();
 
-        let outcome =
-            apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
+        let outcome = apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
 
         assert!(outcome.agents_md_written);
         assert!(outcome.claude_md_written);
@@ -320,8 +319,7 @@ mod tests {
         let project = project();
         apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
 
-        let outcome =
-            apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
+        let outcome = apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
 
         assert!(!outcome.agents_md_written);
         assert!(!outcome.claude_md_written);

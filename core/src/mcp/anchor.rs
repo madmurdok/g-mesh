@@ -130,7 +130,8 @@ pub(super) fn file_anchor_hint(node: &NodeRecord) -> Option<&'static str> {
 }
 
 fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
-    let anchor = queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
+    let anchor =
+        queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
     match anchor {
         Some(node) => Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id })),
         None => error(format!("g-mesh: no symbol with id '{symbol_id}' found")).map(Err),
@@ -211,8 +212,10 @@ mod tests {
     #[test]
     fn symbol_name_resolution_prefers_an_exact_qualified_name() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b.rs", "rust"))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_name: Some("pkg_b::run".to_string()), ..Default::default() };
         let node = expect_node(resolve(&conn, &params));

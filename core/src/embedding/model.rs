@@ -205,10 +205,8 @@ impl EmbeddingModel {
     /// product, which is what the vector store and `search_code` want, and
     /// costs nothing because cosine similarity ignores magnitude anyway.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|err| anyhow!("failed to tokenize input: {err}"))?;
+        let encoding =
+            self.tokenizer.encode(text, true).map_err(|err| anyhow!("failed to tokenize input: {err}"))?;
 
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
         let mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| i64::from(m)).collect();
@@ -361,9 +359,8 @@ mod tests {
 
     fn load_test_model() -> EmbeddingModel {
         let dir = test_model_dir();
-        EmbeddingModel::load(&dir).unwrap_or_else(|err| {
-            panic!("could not load the real model from {}: {err:#}", dir.display())
-        })
+        EmbeddingModel::load(&dir)
+            .unwrap_or_else(|err| panic!("could not load the real model from {}: {err:#}", dir.display()))
     }
 
     // -----------------------------------------------------------------------
@@ -400,10 +397,7 @@ mod tests {
     fn an_explicit_directory_wins_over_the_env_override_and_the_default() {
         let explicit = Path::new("/somewhere/else");
         assert_eq!(resolve_model_dir(Some(explicit), "some-model").unwrap(), explicit);
-        assert_eq!(
-            resolve_model_dir(None, "some-model").unwrap(),
-            default_model_dir("some-model").unwrap()
-        );
+        assert_eq!(resolve_model_dir(None, "some-model").unwrap(), default_model_dir("some-model").unwrap());
     }
 
     #[test]
@@ -549,9 +543,11 @@ mod tests {
         let model = load_test_model();
 
         let query = model.embed("read a file from disk and return its contents as a string").unwrap();
-        let matching =
-            model.embed("fn read_to_string(path: &Path) -> io::Result<String> { fs::read_to_string(path) }").unwrap();
-        let other = model.embed("fn spawn_worker_thread(pool: &ThreadPool) { pool.execute(|| {}); }").unwrap();
+        let matching = model
+            .embed("fn read_to_string(path: &Path) -> io::Result<String> { fs::read_to_string(path) }")
+            .unwrap();
+        let other =
+            model.embed("fn spawn_worker_thread(pool: &ThreadPool) { pool.execute(|| {}); }").unwrap();
 
         let hit = cosine_similarity(&query, &matching);
         let miss = cosine_similarity(&query, &other);

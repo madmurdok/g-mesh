@@ -87,10 +87,7 @@ export function useNumber(): number {
 "#;
 
 const FILES: [(&str, &str); 3] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#),
     ("lib.ts", LIB),
     ("use.ts", USE),
 ];
@@ -169,9 +166,7 @@ async fn an_overloaded_function_resolves_correctly_through_the_real_mcp_tools() 
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -212,7 +207,11 @@ async fn an_overloaded_function_resolves_correctly_through_the_real_mcp_tools() 
     let outline = body(&outline);
     let outline_rows = outline["results"].as_array().expect("results is not an array");
     let parse_rows: Vec<&Value> = outline_rows.iter().filter(|r| r["name"] == "parse").collect();
-    assert_eq!(parse_rows.len(), 1, "an overloaded function must be listed exactly once, not dropped or split: {outline}");
+    assert_eq!(
+        parse_rows.len(),
+        1,
+        "an overloaded function must be listed exactly once, not dropped or split: {outline}"
+    );
     let signature = parse_rows[0]["signature"].as_str().expect("parse's outline row has no signature");
     assert_ne!(
         signature, "parse(input: string | number, radix?: number): unknown",

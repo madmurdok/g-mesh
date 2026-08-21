@@ -31,10 +31,9 @@ pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let violations = reader
         .enumerate()
         .filter_map(|(i, result)| {
-            result.err().map(|e| Violation {
-                context: format!("NDJSON line {}", i + 1),
-                message: e.to_string(),
-            })
+            result
+                .err()
+                .map(|e| Violation { context: format!("NDJSON line {}", i + 1), message: e.to_string() })
         })
         .collect();
     ConformanceReport { violations }
