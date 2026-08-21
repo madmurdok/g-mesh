@@ -65,6 +65,7 @@ mod find_references;
 mod get_dependencies;
 mod get_file_outline;
 mod search_code;
+mod source;
 mod tool_result;
 
 /// What every tool answers while the daemon's cold-start bulk walk is still
@@ -340,7 +341,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_definition",
-        description = "Find where a symbol is defined. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it."
+        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates."
     )]
     async fn find_definition(
         &self,
@@ -352,7 +353,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
-        find_definition::handle(&self.conn, params.0)
+        find_definition::handle(&self.conn, self.registry.project_root(), params.0)
     }
 
     #[tool(
@@ -501,6 +502,9 @@ pub struct FindDefinitionParams {
     pub position: Option<Position>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
+    /// Whether to return the declaration's source alongside its coordinates.
+    /// Defaults to true; pass false when you genuinely only want the position.
+    pub include_source: Option<bool>,
 }
 
 /// find_references/find_callers/find_callees/find_implementations differ only
