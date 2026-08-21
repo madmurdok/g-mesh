@@ -37,7 +37,7 @@ use super::SymbolQueryParams;
 /// page or tool-level error - to hand straight back unchanged. The outer
 /// `Err` stays reserved for genuine protocol-level failures, as everywhere
 /// else in this module tree.
-pub(super) type Anchor = Result<Result<NodeRecord, CallToolResult>, ErrorData>;
+pub(super) type Anchor = Result<Result<find_definition::Resolved, CallToolResult>, ErrorData>;
 
 /// What `symbol_name`/`symbol_id` resolved to, echoed back on every response
 /// of the four tools built on [`resolve`] (`find_references`, `find_callers`,
@@ -70,6 +70,20 @@ pub(super) struct AnchorInfo {
     pub(super) kind: String,
     pub(super) file_path: String,
     pub(super) start_line: i64,
+    /// Which rung of the resolution ladder reached this anchor - see
+    /// [`find_definition::ResolvedBy`]. Absent when built from a bare node
+    /// (a resumed walk, where the anchor is carried rather than resolved).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resolved_by: Option<find_definition::ResolvedBy>,
+}
+
+impl AnchorInfo {
+    /// The anchor with the rung that reached it - what a freshly-resolved walk
+    /// echoes, so a caller can tell an exact resolution from a suggestion it
+    /// was handed.
+    pub(super) fn with_rung(node: &NodeRecord, by: find_definition::ResolvedBy) -> Self {
+        Self { resolved_by: Some(by), ..Self::from(node) }
+    }
 }
 
 impl From<&NodeRecord> for AnchorInfo {
@@ -80,6 +94,7 @@ impl From<&NodeRecord> for AnchorInfo {
             kind: node.kind.clone(),
             file_path: node.file_path.clone(),
             start_line: node.start_line,
+            resolved_by: None,
         }
     }
 }
@@ -117,7 +132,7 @@ pub(super) fn file_anchor_hint(node: &NodeRecord) -> Option<&'static str> {
 fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
     let anchor = queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
     match anchor {
-        Some(node) => Ok(Ok(node)),
+        Some(node) => Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id })),
         None => error(format!("g-mesh: no symbol with id '{symbol_id}' found")).map(Err),
     }
 }
@@ -148,14 +163,22 @@ mod tests {
     /// business.
     fn expect_finished(anchor: Anchor) -> CallToolResult {
         match anchor.expect("resolution must not fail at the protocol level") {
-            Ok(node) => panic!("expected a finished result, got the resolved node {}", node.id),
+            Ok(resolved) => {
+                panic!("expected a finished result, got the resolved node {}", resolved.node.id)
+            }
             Err(result) => result,
         }
     }
 
     fn expect_node(anchor: Anchor) -> NodeRecord {
+        expect_resolved(anchor).node
+    }
+
+    /// The node *and* the rung that reached it - what a test asserting the
+    /// ladder's behaviour needs, as against one that only wants the node.
+    fn expect_resolved(anchor: Anchor) -> find_definition::Resolved {
         match anchor.expect("resolution must not fail at the protocol level") {
-            Ok(node) => node,
+            Ok(resolved) => resolved,
             Err(result) => panic!("expected a resolved node, got {:?}", result.content),
         }
     }

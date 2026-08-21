@@ -196,12 +196,16 @@ struct CalleePage {
 pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match anchor::resolve(&conn, &params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, &params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    // Destructured here so everything below still reads the node directly,
+    // while `resolved.by` stays available for the response's `resolvedBy`.
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::from(&anchor);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -236,12 +240,16 @@ pub(super) fn handle_callers(conn: &Arc<Mutex<Connection>>, params: SymbolQueryP
 pub(super) fn handle_callees(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match anchor::resolve(&conn, &params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, &params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    // Destructured here so everything below still reads the node directly,
+    // while `resolved.by` stays available for the response's `resolvedBy`.
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::from(&anchor);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
