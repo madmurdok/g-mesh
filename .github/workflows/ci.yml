@@ -152,6 +152,16 @@ jobs:
         shell: bash
         env:
           G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
+          # Absolute, with a drive letter. `.cargo/config.toml` sets
+          # `/tmp/g-mesh-test-home`, which on Windows is not an absolute path
+          # at all but a *drive-relative* one: it resolves against whatever
+          # drive the process happens to be on. The test binary runs from the
+          # D: checkout and the detached daemon it spawns need not, so the two
+          # resolved different state roots - the daemon indexed into its own
+          # and the test waited forever on an index.db that was never going to
+          # appear. `force = false` there means this explicit value wins
+          # (GM-246).
+          G_MESH_HOME: ${{ runner.temp }}/g-mesh-test-home
         run: cargo test --manifest-path core/Cargo.toml
 
       - name: What the daemons were doing
