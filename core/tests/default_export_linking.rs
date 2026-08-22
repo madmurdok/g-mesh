@@ -177,7 +177,9 @@ async fn usages_of_a_renamed_default_import_reach_the_class_it_really_names() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

@@ -282,7 +282,10 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let entry = project.plugin.entry();
     let root = project.plugin.root.clone();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env(PLUGIN_PATH_ENV, &entry)

@@ -146,10 +146,33 @@ pub fn wait_until_indexed(root: &Path) {
 /// see it is used from the crate that does not include this one.
 #[allow(dead_code)]
 pub fn kill_and_wait(pid: u32) {
-    let _ =
-        StdCommand::new("kill").arg("-9").arg(pid.to_string()).stderr(std::process::Stdio::null()).status();
+    force_kill(pid);
     let deadline = Instant::now() + Duration::from_secs(5);
     while daemon::is_process_alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(not(windows))]
+fn force_kill(pid: u32) {
+    let _ =
+        StdCommand::new("kill").arg("-9").arg(pid.to_string()).stderr(std::process::Stdio::null()).status();
+}
+
+/// `kill -9` is not merely unavailable on Windows - it is a *different
+/// program*. The one Git for Windows ships speaks MSYS pids, not Win32 ones,
+/// so handing it a native pid gets `kill: 1840: No such process` and nothing
+/// dies. That is not hypothetical: it is in the CI log of every Windows run
+/// this suite has ever had, which means teardown there has been a no-op since
+/// the port and every integration test leaked its daemon (GM-249).
+///
+/// `/T` as well as `/F`, so the plugin child the daemon spawned goes with it -
+/// on Unix the process group makes that automatic and here it does not.
+#[cfg(windows)]
+fn force_kill(pid: u32) {
+    let _ = StdCommand::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }

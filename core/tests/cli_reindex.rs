@@ -197,7 +197,12 @@ fn body(result: &CallToolResult) -> Value {
 /// changed.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(TokioCommand::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim").current_dir(project.root()).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
+            .current_dir(project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

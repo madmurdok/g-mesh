@@ -199,7 +199,14 @@ jobs:
       # test process is what hangs, and the place to look is runtime shutdown
       # waiting on a blocking read.
       #
-      # 240s each: the test's own SEMANTIC_TIMEOUT is 45s, so anything past ~90s
+      # Answered, and the theory was wrong: both variants timed out at 240s, so
+      # nothing about the pipe mattered - the test *process* is what does not
+      # exit (run 32574798143). Kept, shortened, and given a process list,
+      # because it is now the cheapest check that the fix holds: a fast exit
+      # means it does, and if it does not, the survivors say which handle is
+      # still open without costing another run to find out.
+      #
+      # 120s each: the test's own SEMANTIC_TIMEOUT is 45s, so anything past ~90s
       # is the hang and not the test being slow.
       #
       # Non-gating by construction - it records exit codes rather than
@@ -230,12 +237,12 @@ jobs:
           echo "G_MESH_HOME=${G_MESH_HOME:-<unset>}"
 
           start=$SECONDS
-          timeout -k 10 240 "$bin" > "${RUNNER_TEMP}/probe-file.out" 2>&1
+          timeout -k 10 120 "$bin" > "${RUNNER_TEMP}/probe-file.out" 2>&1
           a=$?
           a_elapsed=$((SECONDS - start))
 
           start=$SECONDS
-          timeout -k 10 240 bash -c 'set -o pipefail; "$1" 2>&1 | cat > "$2"' _ "$bin" "${RUNNER_TEMP}/probe-pipe.out"
+          timeout -k 10 120 bash -c 'set -o pipefail; "$1" 2>&1 | cat > "$2"' _ "$bin" "${RUNNER_TEMP}/probe-pipe.out"
           b=$?
           b_elapsed=$((SECONDS - start))
 
@@ -248,6 +255,12 @@ jobs:
           echo
           echo "=== B's output ==="
           cat "${RUNNER_TEMP}/probe-pipe.out" || true
+          echo
+          # Who is still standing. A surviving `g-mesh` here is the whole
+          # diagnosis if the exits above were not prompt.
+          echo "=== g-mesh processes still alive ==="
+          tasklist //FI "IMAGENAME eq g-mesh.exe" || true
+          tasklist //FI "IMAGENAME eq node.exe" || true
 
       # A *step* timeout rather than a smaller job one, because the two bound
       # different things: the job budget has to cover a cold build that
