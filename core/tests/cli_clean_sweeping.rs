@@ -51,20 +51,27 @@ struct Home {
 impl Home {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        // Deliberately short, and deliberately not `tempfile::tempdir()`. A
-        // daemon binds `<home>/projects/<hash>/daemon.sock`, and an AF_UNIX
-        // address holds 104 bytes of path on macOS; the system temp directory
-        // there is `/var/folders/<..>/<..>/T/`, some 50 bytes before anything
-        // of ours, which would leave the socket path riding the limit. `/tmp`
-        // is the same choice, and the same reasoning, as `.cargo/config.toml`
-        // makes for the shared root. Since GM-220 an over-long path is at
-        // least a clear refusal naming the limit rather than a bind failure -
-        // but the point is not to produce one.
-        let dir = PathBuf::from(format!(
-            "/tmp/gm-sweep-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // On Unix: deliberately short, and deliberately not
+        // `tempfile::tempdir()`. A daemon binds
+        // `<home>/projects/<hash>/daemon.sock`, and an AF_UNIX address holds
+        // 104 bytes of path on macOS; the system temp directory there is
+        // `/var/folders/<..>/<..>/T/`, some 50 bytes before anything of ours,
+        // which would leave the socket path riding the limit. Since GM-220 an
+        // over-long path is at least a clear refusal naming the limit rather
+        // than a bind failure - but the point is not to produce one.
+        //
+        // That budget is Unix's alone, and so is `/tmp`. On Windows the
+        // transport is a named pipe, so there is no path length to protect -
+        // and `/tmp/...` is not even an absolute path there but a *drive-
+        // relative* one, resolved against whatever drive each process happens
+        // to be on. This binary runs from the checkout's drive and the daemon
+        // it spawns need not, which is how the two came to disagree about
+        // where the state root was and every sweep here timed out waiting for
+        // a pid file that was being written somewhere else (GM-252). The
+        // identical mistake, in `.cargo/config.toml`, is what GM-246 was.
+        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
+        let dir =
+            base.join(format!("gm-sweep-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
         Self { dir }
     }
