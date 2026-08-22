@@ -10,6 +10,11 @@ on:
     branches:
       - main
       - "release-*"
+      # Experiment branches too. "Is nextest affordable on the runners" was
+      # answerable only on the runners - the local measurement said no and was
+      # measuring the local machine - and without this line, answering it
+      # meant landing the question on a release branch first (GM-253).
+      - "experiment/*"
   pull_request:
   # So `release.yml` can gate on these jobs rather than duplicating them. A
   # release able to publish artifacts from a commit whose tests never ran is
@@ -70,10 +75,11 @@ jobs:
           git ls-files -z '*.sh' | xargs -0 shellcheck -S style
 
   test:
-    name: cargo test (${{ matrix.target }})
+    name: tests (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     env:
       RUST_VERSION: "1.97.1"
+      NEXTEST_VERSION: "0.9.143"
     # The integration suite spawns real daemons, real shims and the real JS/TS
     # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
     # and Oniguruma from scratch. A deadlock guard, not a target.
@@ -137,6 +143,27 @@ jobs:
         working-directory: plugins/typescript
         run: npm ci
 
+      # Pinned and fetched directly, like ShellCheck and for the same reason:
+      # a gate that changes underneath you is a gate people stop reading.
+      # Fetched rather than taken from a third-party action, so the only
+      # things this pipeline trusts are the ones it names.
+      #
+      # `windows-tar` is nextest's own variant for extracting with tar rather
+      # than a zip tool, which is what lets one bash step serve all four
+      # runners.
+      - name: Install cargo-nextest ${{ env.NEXTEST_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)   slug=linux ;;
+            macOS)   slug=mac ;;
+            Windows) slug=windows-tar ;;
+            *) echo "unrecognised runner OS: ${{ runner.os }}"; exit 1 ;;
+          esac
+          curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/${slug}" | tar -xz -C "${HOME}/.cargo/bin"
+          cargo nextest --version
+
       # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
       # points at /tmp/g-mesh-test-home for everything cargo launches - so a
       # runner needs no setup for it, and on Windows it resolves against the
@@ -173,131 +200,36 @@ jobs:
         shell: bash
         run: echo "G_MESH_HOME=${{ runner.temp }}/g-mesh-test-home" >> "$GITHUB_ENV"
 
-      # GM-249. Windows' first integration binary asserts at 45s, unwinds, and
-      # runs its teardown - the daemon log shows the fixture files being deleted
-      # after the last served call - and then `cargo test` sits for another 37
-      # minutes saying nothing. A process that has finished its teardown and
-      # still will not let its parent go points at a handle rather than at the
-      # test.
-      #
-      # The theory: the daemon is a *grandchild* - the test spawns the shim, the
-      # shim spawns a detached daemon - and it inherits the test binary's
-      # stdout/stderr pipe. `cargo test` reads that pipe to EOF; the grandchild
-      # holds the write end; EOF never comes. Unix does not show this because
-      # the daemon redirects its stdio when it detaches.
-      #
-      # Two runs of the same binary decide it, and the pair is the point - one
-      # alone would only be suggestive:
-      #
-      #   A. output redirected to a *file*. A file handle has no reader waiting
-      #      on EOF, so nothing can block on one being held open.
-      #   B. output through a *pipe*, which is what cargo gives it.
-      #
-      # A fast and B slow proves the pipe, and localises the fix to how the
-      # daemon detaches its stdio on Windows. Both fast means the hang needs
-      # cargo itself to reproduce. Both slow refutes the theory outright: the
-      # test process is what hangs, and the place to look is runtime shutdown
-      # waiting on a blocking read.
-      #
-      # Answered, and the theory was wrong: both variants timed out at 240s, so
-      # nothing about the pipe mattered - the test *process* is what does not
-      # exit (run 32574798143). Kept, shortened, and given a process list,
-      # because it is now the cheapest check that the fix holds: a fast exit
-      # means it does, and if it does not, the survivors say which handle is
-      # still open without costing another run to find out.
-      #
-      # 120s each: the test's own SEMANTIC_TIMEOUT is 45s, so anything past ~90s
-      # is the hang and not the test being slow.
-      #
-      # Non-gating by construction - it records exit codes rather than
-      # propagating them - because a diagnostic that can turn the build red
-      # teaches people to delete it.
-      - name: Probe what holds the test binary open
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        env:
-          G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-probe-daemon.log
-        run: |
-          set +e
-          set -uo pipefail
-
-          # Git for Windows ships GNU coreutils, but say so plainly if this
-          # image does not - otherwise a missing `timeout` reads as exit 127
-          # from the test binary and sends the next person hunting the wrong
-          # thing.
-          command -v timeout || echo "!! no timeout(1) on this image - the exit codes below will be meaningless"
-
-          cargo test --manifest-path core/Cargo.toml --no-run
-          bin=$(ls -t core/target/debug/deps/ambiguous_reexport_linking-*.exe | head -1)
-          if [ -z "$bin" ]; then
-            echo "!! no ambiguous_reexport_linking binary was built - nothing to probe"
-            exit 0
-          fi
-          echo "probing: $bin"
-          echo "G_MESH_HOME=${G_MESH_HOME:-<unset>}"
-
-          start=$SECONDS
-          timeout -k 10 120 "$bin" > "${RUNNER_TEMP}/probe-file.out" 2>&1
-          a=$?
-          a_elapsed=$((SECONDS - start))
-
-          start=$SECONDS
-          timeout -k 10 120 bash -c 'set -o pipefail; "$1" 2>&1 | cat > "$2"' _ "$bin" "${RUNNER_TEMP}/probe-pipe.out"
-          b=$?
-          b_elapsed=$((SECONDS - start))
-
-          echo "=== A: stdout to a file  -> exit=${a} after ${a_elapsed}s"
-          echo "=== B: stdout to a pipe  -> exit=${b} after ${b_elapsed}s"
-          echo "(124 means the probe's own timeout killed it; 101 is a normal test failure)"
-          echo
-          echo "=== A's output ==="
-          cat "${RUNNER_TEMP}/probe-file.out" || true
-          echo
-          echo "=== B's output ==="
-          cat "${RUNNER_TEMP}/probe-pipe.out" || true
-          echo
-          # Who is still standing. A surviving `g-mesh` here is the whole
-          # diagnosis if the exits above were not prompt.
-          echo "=== g-mesh processes still alive ==="
-          tasklist //FI "IMAGENAME eq g-mesh.exe" || true
-          tasklist //FI "IMAGENAME eq node.exe" || true
-
       # A *step* timeout rather than a smaller job one, because the two bound
       # different things: the job budget has to cover a cold build that
       # compiles ONNX Runtime, SQLite and Oniguruma from scratch, while the
       # tests themselves finish in about three minutes on a healthy platform.
       # Windows spent 37 of its 45 minutes hung and produced nothing, so the
       # useful budget is the one on the part that hangs (GM-249).
-      - name: cargo test
+      #
+      # A backstop now rather than the only bound: nextest terminates an
+      # individual hung test at 210s and *names* it, which is the diagnosis
+      # this timeout could never give - a step killed here is reported as
+      # cancelled and prints nothing. Demonstrated rather than assumed: a test
+      # written to sleep forever comes back as `TIMEOUT [8.066s]
+      # g-mesh::zz_hang_probe a_test_that_never_finishes`.
+      - name: cargo nextest run
         timeout-minutes: 15
         shell: bash
         env:
           G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
-          # Splits the Windows hang three ways with one line of log: whether
-          # the request reached the daemon, whether it got through `prepare`,
-          # or whether it died on the way back. On for every platform so the
-          # three that work provide the shape a healthy trace has to compare
-          # against (GM-246).
-          G_MESH_TRACE_CALLS: "1"
-        # `--no-fail-fast`, because cargo otherwise stops at the first binary
-        # that fails and every binary after it goes unreported. Windows has ~35
-        # integration binaries whose result has never been seen once, for
-        # exactly that reason - the same blind spot this job was created to
-        # remove, one level down. It changes nothing on a green run.
-        #
-        # `cargo nextest run` was tried here for its per-test timeout and is
-        # not in use, but the reason is *unsettled*, not decided (GM-253). The
-        # numbers that argued against it were taken on a developer machine
-        # where exec'ing a test binary out of `target/debug/deps/` costs ~4s
-        # at 0.00s of CPU - not the code, not the binary's size, and not the
-        # machine's memory: a byte-identical copy of the same file elsewhere
-        # execs in 0.03s, measured interleaved with the original. nextest
-        # starts one process per test where `cargo test` starts one per
-        # binary, so that stall is multiplied by 714 instead of by 38 - the
-        # comparison was dominated by a local pathology that has nothing to do
-        # with either tool. It has to be re-run on the runners, which is where
-        # the decision applies.
-        run: cargo test --manifest-path core/Cargo.toml --no-fail-fast
+          # `G_MESH_TRACE_CALLS` is deliberately *not* set here any more. It
+          # did its job - splitting the Windows hang three ways by whether a
+          # call reached `prepare`, got through it, or died on the way back
+          # (GM-246) - and then cost something: two lines per tool call filled
+          # the log's last 200 lines with 183 trace lines, crowding out the
+          # daemon activity the step below exists to show. Turn it back on for
+          # a specific question, not as a standing setting.
+        # `fail-fast = false` and the per-test timeout live in
+        # core/.config/nextest.toml rather than here, so they hold however the
+        # suite is invoked. That file also carries the measurement that chose
+        # this tool over `cargo test`, and the local one that got it wrong.
+        run: cargo nextest run --manifest-path core/Cargo.toml
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
       # reported as *cancelled*, and `failure()` does not fire for it - so the
@@ -307,16 +239,13 @@ jobs:
         if: always()
         shell: bash
         run: |
-          for log in "${{ runner.temp }}/g-mesh-probe-daemon.log" \
-                     "${{ runner.temp }}/g-mesh-daemon.log"; do
-            if [ -f "$log" ]; then
-              echo "=== $log: $(wc -l < "$log") lines ==="
-              tail -200 "$log"
-            else
-              echo "=== no daemon log at $log - nothing ever wrote one, which is itself the answer"
-            fi
-            echo
-          done
+          log="${{ runner.temp }}/g-mesh-daemon.log"
+          if [ -f "$log" ]; then
+            echo "=== $(wc -l < "$log") lines ==="
+            tail -200 "$log"
+          else
+            echo "no daemon log at $log - nothing ever wrote one, which is itself the answer"
+          fi
 
   lint:
     name: cargo clippy
