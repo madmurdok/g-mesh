@@ -147,6 +147,27 @@ pub fn indexing_grace_window() -> Duration {
         .unwrap_or(INDEXING_GRACE_WINDOW)
 }
 
+/// Names a step of request handling in the daemon's log, when
+/// [`TRACE_CALLS_ENV`] is set.
+///
+/// Every tool call funnels through `prepare`, so tracing its entry and exit
+/// splits a hang three ways with one line of output: nothing logged means the
+/// request never reached the daemon, an entry without a matching exit means it
+/// hung inside `prepare`, and both means it hung in the handler or on the way
+/// back. Windows currently hangs somewhere in there and the log is the only
+/// window into a detached daemon (GM-246).
+///
+/// Off unless asked for: a line per call would bury the log's real content on
+/// a busy daemon.
+fn trace_call(what: &str) {
+    if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
+        eprintln!("g-mesh daemon: {what}");
+    }
+}
+
+/// Turns on [`trace_call`]. Any non-empty value.
+pub const TRACE_CALLS_ENV: &str = "G_MESH_TRACE_CALLS";
+
 /// Serves one accepted connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
 /// connection per MCP client, so a client's session dies with its shim.
@@ -224,11 +245,14 @@ impl GMeshMcpServer {
     /// 3. The replay last, so the rows this call is about to read already
     ///    include every change made while the plugin was asleep.
     async fn prepare(&self) -> Option<Result<CallToolResult, ErrorData>> {
+        trace_call("prepare: entered");
         if let Some(not_ready) = self.still_indexing().await {
+            trace_call("prepare: refused, still indexing");
             return Some(not_ready);
         }
         self.mark_used();
         self.replay_queued_changes().await;
+        trace_call("prepare: done");
         None
     }
 

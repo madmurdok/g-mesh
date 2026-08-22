@@ -177,6 +177,12 @@ jobs:
         shell: bash
         env:
           G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
+          # Splits the Windows hang three ways with one line of log: whether
+          # the request reached the daemon, whether it got through `prepare`,
+          # or whether it died on the way back. On for every platform so the
+          # three that work provide the shape a healthy trace has to compare
+          # against (GM-246).
+          G_MESH_TRACE_CALLS: "1"
         run: cargo test --manifest-path core/Cargo.toml
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
