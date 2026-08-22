@@ -21,6 +21,8 @@ use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -87,7 +89,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         if self.pid_file().exists() {
             let pid = self.daemon_pid();
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            common::kill_and_wait(pid);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
@@ -309,9 +311,7 @@ fn shim_bootstraps_a_detached_daemon_when_none_is_running() {
     // that died with its parent.
     assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
 
-    let alive =
-        Command::new("kill").arg("-0").arg(pid.to_string()).status().expect("failed to signal the daemon");
-    assert!(alive.success(), "daemon pid {pid} is no longer alive");
+    assert!(daemon::is_process_alive(pid), "daemon pid {pid} is no longer alive");
 }
 
 #[test]
@@ -442,7 +442,5 @@ fn two_concurrent_shim_bootstraps_produce_exactly_one_daemon() {
     assert_tool_surface(&round_trip_over_socket(&project.endpoint()));
     assert_eq!(project.daemon_pid(), pid, "a second daemon must never have taken over");
 
-    let alive =
-        Command::new("kill").arg("-0").arg(pid.to_string()).status().expect("failed to signal the daemon");
-    assert!(alive.success(), "daemon pid {pid} is no longer alive");
+    assert!(daemon::is_process_alive(pid), "daemon pid {pid} is no longer alive");
 }

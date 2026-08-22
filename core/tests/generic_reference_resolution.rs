@@ -20,7 +20,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -97,9 +96,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }

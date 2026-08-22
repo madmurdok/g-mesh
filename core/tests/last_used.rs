@@ -74,12 +74,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            // Silenced: a test that killed its own daemon leaves a pid file
-            // behind, and "no such process" here is the expected case, not a
-            // failure worth printing into the test output.
-            let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
 }

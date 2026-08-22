@@ -138,9 +138,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);

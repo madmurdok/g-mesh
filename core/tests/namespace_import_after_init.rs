@@ -29,7 +29,7 @@
 //! and a run where only it comes back is exactly the regression.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -100,9 +100,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), daemon::plugin_pid_path(self.root()).unwrap()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);

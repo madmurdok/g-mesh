@@ -40,7 +40,6 @@
 //! this machine's scheduling noise happens to be that run.
 
 use std::path::Path;
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -53,6 +52,8 @@ use rmcp::ServiceExt;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::process::Command;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -139,11 +140,7 @@ impl Project {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         if let Ok(endpoint) = daemon::endpoint(self.root()) {

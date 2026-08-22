@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -86,9 +88,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
