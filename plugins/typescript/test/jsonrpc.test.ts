@@ -79,9 +79,55 @@ test("headers other than Content-Length are ignored", () => {
   assert.equal(frames[0].toString("utf8"), "{}");
 });
 
-test("a header line without Content-Length throws instead of hanging", () => {
+test("a header block without Content-Length throws instead of hanging", () => {
   const reader = new FrameReader();
-  assert.throws(() => reader.push(Buffer.from("\r\n{}")));
+  // A real header line, then the blank line that ends the block - which is
+  // what makes this malformed. The input used to be a bare "\r\n{}", but that
+  // has no header line in it at all, so it exercised the padding case rather
+  // than the one the name describes.
+  assert.throws(() => reader.push(Buffer.from("X-Whatever: 1\r\n\r\n{}")));
+});
+
+// tsserver announces `1 + len` and then writes `${json}${os.EOL}`
+// (TypeScript 5.9's `formatMessage`). On Unix those agree; on Windows EOL is
+// two bytes, so every frame overruns its own length by one and leaves a
+// stray "\n" in front of the next header block. That one byte is what took
+// down every semantic-pass test on Windows (GM-248).
+function windowsTsserverFrame(message: unknown): Buffer {
+  const json = JSON.stringify(message);
+  const len = Buffer.byteLength(json, "utf8");
+  return Buffer.from(`Content-Length: ${1 + len}\r\n\r\n${json}\r\n`, "utf8");
+}
+
+test("consecutive tsserver frames parse despite Windows' off-by-one length", () => {
+  const first = { seq: 1, type: "response", command: "open", success: true };
+  const second = { seq: 2, type: "response", command: "quickinfo", success: true };
+  const reader = new FrameReader();
+
+  const frames = reader.push(
+    Buffer.concat([windowsTsserverFrame(first), windowsTsserverFrame(second)]),
+  );
+
+  assert.equal(frames.length, 2);
+  // The body carries the leading "\r" of the EOL tsserver miscounted, which
+  // JSON.parse tolerates as trailing whitespace - the point is that the
+  // *second* frame is still found.
+  assert.deepEqual(JSON.parse(frames[0].toString("utf8")), first);
+  assert.deepEqual(JSON.parse(frames[1].toString("utf8")), second);
+});
+
+test("padding between frames is tolerated even when split across chunks", () => {
+  const body = '{"ok":true}';
+  const reader = new FrameReader();
+
+  assert.deepEqual(reader.push(Buffer.from(`Content-Length: ${body.length}\r\n\r\n${body}`)), [
+    Buffer.from(body),
+  ]);
+  assert.deepEqual(reader.push(Buffer.from("\r")), []);
+  assert.deepEqual(reader.push(Buffer.from("\n\r\n")), []);
+  assert.deepEqual(reader.push(Buffer.from(`Content-Length: ${body.length}\r\n\r\n${body}`)), [
+    Buffer.from(body),
+  ]);
 });
 
 test("a malformed header line (no colon) throws", () => {
