@@ -20,6 +20,11 @@
 //! usual Cargo reason: a subdirectory module is compiled into the test
 //! binaries that ask for it, not built as a test binary of its own.
 
+// Each integration test file is its own crate, so cargo warns about anything
+// this module offers that *that* crate does not happen to use. Every item
+// here is unused by someone, and none of them is dead.
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
@@ -141,15 +146,30 @@ pub fn wait_until_indexed(root: &Path) {
 /// `cli_stop.rs`'s `wait_for("the daemon to die", ...)`), just applied to a
 /// test's hand-rolled kill.
 ///
-/// `allow(dead_code)`: each integration test file is its own crate, and only
-/// two of this module's many consumers hand-roll a kill; cargo has no way to
-/// see it is used from the crate that does not include this one.
-#[allow(dead_code)]
 pub fn kill_and_wait(pid: u32) {
     force_kill(pid);
     let deadline = Instant::now() + Duration::from_secs(5);
     while daemon::is_process_alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kills whatever process a pid file names, if it names one that is still
+/// running. The three ways a pid file disappoints - absent, empty, or holding
+/// something that is not a number - are all the same non-event to a teardown,
+/// and they all happen: a test that killed its own daemon leaves the file
+/// behind, and a daemon that has created the file but not yet written to it
+/// leaves it empty for a window long enough that CI has caught it (GM-242).
+///
+/// The point of routing every test's teardown through here rather than
+/// hand-rolling `kill -9`: on Windows the hand-rolled version killed nothing
+/// at all, and a surviving daemon holds an inherited handle to its parent's
+/// stdout pipe - so the *test process* could not exit either, long after its
+/// own teardown had finished (GM-249).
+#[allow(dead_code)]
+pub fn kill_pid_file(path: &Path) {
+    if let Some(pid) = daemon::read_pid_file(path) {
+        kill_and_wait(pid);
     }
 }
 
@@ -166,12 +186,15 @@ fn force_kill(pid: u32) {
 /// this suite has ever had, which means teardown there has been a no-op since
 /// the port and every integration test leaked its daemon (GM-249).
 ///
-/// `/T` as well as `/F`, so the plugin child the daemon spawned goes with it -
-/// on Unix the process group makes that automatic and here it does not.
+/// `/F` without `/T`, deliberately: this stands in for `kill -9` on one
+/// process, and a tree kill would be a different promise. Teardown does not
+/// need it - it kills the plugin's pid file separately - and one test asserts
+/// that the plugin exits *by itself* when its core dies, which a tree kill
+/// would make trivially true.
 #[cfg(windows)]
 fn force_kill(pid: u32) {
     let _ = StdCommand::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .args(["/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

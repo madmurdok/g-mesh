@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -131,9 +133,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ = Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
@@ -234,7 +234,7 @@ fn stop_clears_the_state_a_crashed_daemon_left_behind() {
     let project = Project::new();
     let (core, plugin) = project.bootstrap_daemon();
 
-    Command::new("kill").arg("-9").arg(core.to_string()).status().expect("failed to kill the daemon");
+    common::kill_and_wait(core);
     wait_for("the daemon to die", || !daemon::is_process_alive(core));
     // The plugin exits by itself when its core's end of its stdin closes.
     wait_for("the plugin to exit with its core", || !daemon::is_process_alive(plugin));

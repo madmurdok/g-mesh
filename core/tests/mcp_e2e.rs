@@ -9,7 +9,6 @@
 //! stays pinned by something that does not share the server's own code.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -19,6 +18,8 @@ use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
 use serde_json::json;
 use tokio::process::Command;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,7 +81,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         if self.pid_file().exists() {
             let pid = self.daemon_pid();
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).status();
+            common::kill_and_wait(pid);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
@@ -89,12 +90,7 @@ impl Drop for Project {
 }
 
 fn is_alive(pid: u32) -> bool {
-    StdCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .expect("failed to signal a process")
-        .success()
+    daemon::is_process_alive(pid)
 }
 
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
