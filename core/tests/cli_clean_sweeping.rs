@@ -187,6 +187,21 @@ impl Drop for Project<'_> {
     }
 }
 
+/// Removes a directory and does not return until it is actually gone, which
+/// is not the same thing as `remove_dir_all` returning `Ok`. See its one
+/// caller for why the difference matters.
+fn delete_until_gone(path: &Path) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let _ = fs::remove_dir_all(path);
+        if !path.exists() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{} could not be deleted within {TIMEOUT:?}", path.display());
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -274,13 +289,19 @@ fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
     let live = Project::new(&home);
     let live_state = live.ready_to_be_swept();
 
-    let orphan_state = {
+    let (orphan_state, orphan_root) = {
         let orphan = Project::new(&home);
         let state = orphan.ready_to_be_swept();
-        // Dropping the project deletes its temp directory, which is exactly
-        // what makes the state behind it an orphan.
-        state
+        (state, orphan.root().to_path_buf())
     };
+    // Dropping the project is what *asks* for its temp directory to go, and
+    // `TempDir` swallows the answer. On Windows the answer is sometimes no:
+    // a directory cannot be removed while a handle to anything inside it is
+    // still closing, and this one was a daemon's working directory moments
+    // ago. Leaving that unchecked cost a whole CI run to diagnose, because
+    // the sweep then correctly reported no orphans and the test blamed the
+    // sweep (GM-252).
+    delete_until_gone(&orphan_root);
     assert!(
         orphan_state.is_dir(),
         "deleting the project directory must not remove its state - that is what makes it an orphan"
