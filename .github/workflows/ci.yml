@@ -284,6 +284,22 @@ jobs:
         # integration binaries whose result has never been seen once, for
         # exactly that reason - the same blind spot this job was created to
         # remove, one level down. It changes nothing on a green run.
+        #
+        # `cargo test` and not `cargo nextest run`, which was tried for its
+        # per-test timeout and measured rather than adopted (GM-253). nextest
+        # runs one process per test, and this binary costs ~5s to *start* -
+        # 68.7 MB of debug symbols over ONNX Runtime, SQLite and Oniguruma,
+        # with the test itself taking 0.00s. Multiplied by 714 tests that is
+        # the whole difference:
+        #
+        #   cargo test, all 714 tests ............ 689s, 0 failures
+        #   nextest, the 93 integration ones ..... 881s, 2 failures
+        #
+        # Thirteen percent of the suite, taking longer than all of it, and
+        # failing two tests to contention that pass here. A `[test-groups]`
+        # limit does not help: what dominates is the 621 *cheap* unit tests
+        # paying a process start each. Do not re-propose this without new
+        # numbers - the measurement is cheap and it is in the task.
         run: cargo test --manifest-path core/Cargo.toml --no-fail-fast
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
