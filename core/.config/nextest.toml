@@ -1,0 +1,63 @@
+# How the test suite is run (GM-253). `core/` is its own cargo workspace root -
+# there is no manifest above it - which is why this lives here rather than at
+# the repository root; nextest resolves this path against the workspace.
+#
+# Adopted on the runners' evidence, against run 32588238433's `cargo test`
+# step, after a local comparison said the opposite and was wrong. That one
+# measured a ~4s exec stall belonging to one developer machine's
+# `target/debug/deps/` - a byte-identical copy of the same binary elsewhere
+# exec'd in 0.03s - which nextest pays once per test and `cargo test` pays
+# once per binary, so it measured the stall multiplied by 19, not the tool.
+#
+#                   nextest   cargo test
+#   linux              162s         180s
+#   windows            130s         137s
+#   x86_64-darwin      240s         509s
+#   aarch64            184s         161s
+#
+# 714 tests passing on all four, no leaks reported, and faster on three of
+# them. aarch64 pays 23s for what the rest of this file buys.
+
+[profile.default]
+# Same reason `--no-fail-fast` is passed today: cargo otherwise stops at the
+# first failing binary and every binary after it goes unreported, which is the
+# blind spot that hid ~35 Windows binaries for weeks (GM-246).
+fail-fast = false
+
+# The whole point of the experiment. libtest has no per-test timeout, so a
+# hung test can only be bounded by a budget on the entire step - and a step
+# killed that way is reported as *cancelled* and prints nothing. GM-249 was
+# one hung test that cost two runs and ninety minutes to identify.
+#
+# 210s is not a round number: it sits above this suite's own longest honest
+# wait. The worst legitimate case is `common::wait_until_indexed` spending its
+# full `DEFAULT_INDEXED_TIMEOUT_SECS` of 90s and then a semantic poll loop
+# spending its `SEMANTIC_TIMEOUT` - 60s in `overload_call_binding`, the
+# largest - so 150s before the test's own assertion fires. Terminating below
+# that would replace a precise "timed out waiting for X" panic with an opaque
+# kill, which is worse than having no timeout at all.
+slow-timeout = { period = "30s", terminate-after = 7 }
+
+# Deliberately absent: `retries`. Three load-dependent races surfaced this
+# week only because CI reported them; a retry policy would have hidden all
+# three and left the wait-predicate defect underneath them in place.
+
+# `cargo test` runs one binary at a time; nextest runs `num-cpus` tests from
+# anywhere in the suite at once. Each of these integration tests spawns a real
+# detached daemon and a real Node plugin, and the first unconfigured run
+# failed 23 tests that pass under `cargo test` - contention reported as
+# failure. `kind(test)` is exactly the `core/tests/*.rs` targets, as against
+# `kind(lib)`'s 621 cheap unit tests, which keep the full width.
+[test-groups]
+daemon-spawning = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'daemon-spawning'
+
+# One unit test spawns processes too and asserts on *when* they start relative
+# to one another, which is the first thing load destroys. It belongs with the
+# heavy set despite living in the lib.
+[[profile.default.overrides]]
+filter = 'test(two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
+test-group = 'daemon-spawning'
