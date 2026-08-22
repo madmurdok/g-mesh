@@ -285,21 +285,16 @@ jobs:
         # exactly that reason - the same blind spot this job was created to
         # remove, one level down. It changes nothing on a green run.
         #
-        # `cargo test` and not `cargo nextest run`, which was tried for its
-        # per-test timeout and measured rather than adopted (GM-253). nextest
-        # runs one process per test, and this binary costs ~5s to *start* -
-        # 68.7 MB of debug symbols over ONNX Runtime, SQLite and Oniguruma,
-        # with the test itself taking 0.00s. Multiplied by 714 tests that is
-        # the whole difference:
-        #
-        #   cargo test, all 714 tests ............ 689s, 0 failures
-        #   nextest, the 93 integration ones ..... 881s, 2 failures
-        #
-        # Thirteen percent of the suite, taking longer than all of it, and
-        # failing two tests to contention that pass here. A `[test-groups]`
-        # limit does not help: what dominates is the 621 *cheap* unit tests
-        # paying a process start each. Do not re-propose this without new
-        # numbers - the measurement is cheap and it is in the task.
+        # `cargo nextest run` was tried here for its per-test timeout and is
+        # not in use, but the reason is *unsettled*, not decided (GM-253). The
+        # numbers that argued against it were taken on a developer machine
+        # with 30 MB of free pages and a load average of 8 on 8 cores, where
+        # exec'ing a 68 MB debug binary costs seconds of page-in with 0.00s of
+        # CPU. nextest starts one process per test, so memory pressure is
+        # exactly the condition that punishes it hardest - the comparison was
+        # biased by the thing being compared. It has to be re-run on the
+        # runners, which is where the decision applies and where the machine
+        # is clean.
         run: cargo test --manifest-path core/Cargo.toml --no-fail-fast
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
