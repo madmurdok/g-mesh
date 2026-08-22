@@ -180,7 +180,10 @@ async fn connect_holding(
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(&root)
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", BOOTSTRAP_BUDGET.as_millis().to_string())
