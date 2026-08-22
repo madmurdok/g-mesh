@@ -10,6 +10,11 @@ on:
     branches:
       - main
       - "release-*"
+      # EXPERIMENT branches trigger CI too, so a question like "is nextest
+      # affordable on the runners" can be answered without putting the answer
+      # on a release branch first (GM-253). `push` resolves this file at the
+      # pushed ref, so this line only exists where it is needed.
+      - "experiment/*"
   pull_request:
   # So `release.yml` can gate on these jobs rather than duplicating them. A
   # release able to publish artifacts from a commit whose tests never ran is
@@ -74,6 +79,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RUST_VERSION: "1.97.1"
+      NEXTEST_VERSION: "0.9.143"
     # The integration suite spawns real daemons, real shims and the real JS/TS
     # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
     # and Oniguruma from scratch. A deadlock guard, not a target.
@@ -136,6 +142,23 @@ jobs:
       - name: Install the plugin's dependencies
         working-directory: plugins/typescript
         run: npm ci
+
+      # Pinned and fetched directly, like ShellCheck, and for the same reason.
+      # `windows-tar` is nextest's own variant for extracting with tar rather
+      # than a zip tool, which is what lets one bash step serve all four
+      # runners.
+      - name: Install cargo-nextest ${{ env.NEXTEST_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)   slug=linux ;;
+            macOS)   slug=mac ;;
+            Windows) slug=windows-tar ;;
+            *) echo "unrecognised runner OS: ${{ runner.os }}"; exit 1 ;;
+          esac
+          curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/${slug}" | tar -xz -C "${HOME}/.cargo/bin"
+          cargo nextest --version
 
       # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
       # points at /tmp/g-mesh-test-home for everything cargo launches - so a
@@ -268,7 +291,7 @@ jobs:
       # tests themselves finish in about three minutes on a healthy platform.
       # Windows spent 37 of its 45 minutes hung and produced nothing, so the
       # useful budget is the one on the part that hangs (GM-249).
-      - name: cargo test
+      - name: cargo nextest run
         timeout-minutes: 15
         shell: bash
         env:
@@ -297,7 +320,14 @@ jobs:
         # comparison was dominated by a local pathology that has nothing to do
         # with either tool. It has to be re-run on the runners, which is where
         # the decision applies.
-        run: cargo test --manifest-path core/Cargo.toml --no-fail-fast
+        # EXPERIMENT (GM-253): the same suite under nextest, compared against
+        # run 32588238433, green on all four targets under `cargo test`.
+        # Baseline for the `cargo test` step there:
+        #   linux 180s | windows 137s | x86_64-darwin 509s | aarch64 161s
+        # Judge on three things: wall clock against those, any test that fails
+        # here and passes there, and whether a hung test is terminated *and
+        # named* - the only thing the tool was wanted for.
+        run: cargo nextest run --manifest-path core/Cargo.toml
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
       # reported as *cancelled*, and `failure()` does not fire for it - so the
