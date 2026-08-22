@@ -288,13 +288,15 @@ jobs:
         # `cargo nextest run` was tried here for its per-test timeout and is
         # not in use, but the reason is *unsettled*, not decided (GM-253). The
         # numbers that argued against it were taken on a developer machine
-        # with 30 MB of free pages and a load average of 8 on 8 cores, where
-        # exec'ing a 68 MB debug binary costs seconds of page-in with 0.00s of
-        # CPU. nextest starts one process per test, so memory pressure is
-        # exactly the condition that punishes it hardest - the comparison was
-        # biased by the thing being compared. It has to be re-run on the
-        # runners, which is where the decision applies and where the machine
-        # is clean.
+        # where exec'ing a test binary out of `target/debug/deps/` costs ~4s
+        # at 0.00s of CPU - not the code, not the binary's size, and not the
+        # machine's memory: a byte-identical copy of the same file elsewhere
+        # execs in 0.03s, measured interleaved with the original. nextest
+        # starts one process per test where `cargo test` starts one per
+        # binary, so that stall is multiplied by 714 instead of by 38 - the
+        # comparison was dominated by a local pathology that has nothing to do
+        # with either tool. It has to be re-run on the runners, which is where
+        # the decision applies.
         run: cargo test --manifest-path core/Cargo.toml --no-fail-fast
 
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
