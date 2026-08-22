@@ -489,9 +489,25 @@ pub fn run(root: &Path) -> Result<()> {
         });
     }
 
-    // Cold start only, and before the watcher: a bulk walk racing incremental
-    // updates could commit its own (older) parse of a file over one the
-    // watcher had just refreshed. Connections accepted while this runs are
+    // Registered here, before the walk, and deliberately not *drained* until
+    // after it. The two are separable and conflating them cost a lost edit:
+    // `ProjectWatcher` is backed by an mpsc channel, so from this line on the
+    // OS watch exists and every event queues up whether or not anyone is
+    // reading. What the ordering below protects against is the walk racing
+    // incremental *processing*, and that only begins when the consumer thread
+    // further down starts calling `next_change` - so the guarantee is
+    // untouched while the window closes.
+    //
+    // The window was real. Between the walk finishing its enumeration and the
+    // watcher existing, an edit had no observer at all and was dropped until
+    // something touched the file again - during cold start only, and narrow,
+    // but wide enough that one integration test caught it five times in a day
+    // on a loaded runner (GM-250), and wide enough to lose a user's edit.
+    let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
+
+    // Cold start only, and before the watcher is *drained*: a bulk walk racing
+    // incremental updates could commit its own (older) parse of a file over
+    // one the watcher had just refreshed. Connections accepted while this runs are
     // answered with `mcp`'s "still indexing" error rather than off the batches
     // committed so far, so a client's query is never answered off a half-built
     // graph - the same promise the old "bind only once this returns" ordering
@@ -631,7 +647,6 @@ pub fn run(root: &Path) -> Result<()> {
         }
     }
 
-    let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
     {
         let conn = Arc::clone(&conn);
         let registry = Arc::clone(&registry);

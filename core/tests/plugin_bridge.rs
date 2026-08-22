@@ -71,6 +71,65 @@ fn wait_for_within(what: &str, timeout: Duration, mut ready: impl FnMut() -> boo
     panic!("timed out waiting for {what}");
 }
 
+/// How many nodes the index holds under a given name. `Ok(0)` for a database
+/// that is not there yet or has no schema, because both are ordinary states
+/// while a daemon is still starting.
+fn nodes_named(db_path: &Path, name: &str) -> i64 {
+    let Ok(conn) = Connection::open(db_path) else {
+        return 0;
+    };
+    conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = ?1", [name], |row| row.get(0)).unwrap_or(0)
+}
+
+/// An edit made after the cold-start walk has committed but before the daemon
+/// reaches the watcher used to have no observer at all: it was dropped, and
+/// stayed dropped until something touched the file again. Narrow - cold start
+/// only - and still wide enough that one test caught it five times in a day on
+/// a loaded runner, and wide enough to lose a real edit (GM-250).
+///
+/// Deterministic rather than lucky: `WALK_HOLD_FILE_ENV` holds the walk open
+/// at exactly that point, since the hold sits after enumeration and linking
+/// and immediately before `bulk_index::run` returns. Waiting for the walk's
+/// own fixture to appear in the index proves enumeration is over, so the write
+/// below lands inside the window every time rather than on a slow machine.
+#[test]
+fn an_edit_made_while_the_cold_start_walk_is_finishing_is_not_lost() {
+    let project = Project::new();
+    fs::write(project.root().join("seed.ts"), "export function seeded(): void {}\n")
+        .expect("failed to write the seed file");
+
+    let hold = project.root().join(".g-mesh-hold-the-walk");
+    fs::write(&hold, b"").expect("failed to plant the walk-hold file");
+
+    let mut daemon = Command::new(BIN)
+        .arg("daemon")
+        .arg("--project-root")
+        .arg(project.root())
+        .env(g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV, &hold)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon");
+
+    let db_path = project_dir(project.root()).unwrap().join("index.db");
+    wait_for("the cold-start walk to commit its own fixture", || nodes_named(&db_path, "seeded") > 0);
+
+    // Inside the window: the walk is finished but still held, so the daemon
+    // has not reached anything downstream of it.
+    fs::write(project.root().join("late.ts"), "export function late_arrival(): void {}\n")
+        .expect("failed to write the late file");
+
+    fs::remove_file(&hold).expect("failed to release the walk");
+
+    wait_for("the edit made during the walk to reach the index", || {
+        nodes_named(&db_path, "late_arrival") > 0
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
 #[test]
 fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() {
     let project = Project::new();
