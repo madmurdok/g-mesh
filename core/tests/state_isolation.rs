@@ -56,11 +56,7 @@ fn a_spawned_g_mesh_resolves_the_same_isolated_state_root() {
         .current_dir(project.path())
         .output()
         .expect("failed to run g-mesh status");
-    assert!(
-        output.status.success(),
-        "g-mesh status failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "g-mesh status failed: {}", String::from_utf8_lossy(&output.stderr));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let reported = state_directory_line(&stdout)

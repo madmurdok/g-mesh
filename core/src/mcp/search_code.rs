@@ -26,18 +26,18 @@ use super::SearchCodeParams;
 /// One matched symbol, ranked by similarity to the query.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchResult {
-    symbol_id: String,
-    qualified_name: String,
-    kind: String,
-    file_path: String,
+pub(super) struct SearchResult {
+    pub(super) symbol_id: String,
+    pub(super) qualified_name: String,
+    pub(super) kind: String,
+    pub(super) file_path: String,
     start_line: i64,
     start_col: i64,
     /// Cosine similarity to the query, in `[-1.0, 1.0]` (in practice close to
     /// `[0.0, 1.0]` for related code text - both sides are L2-normalized, so
     /// this is exactly `1 - cosine_distance`). Higher is more similar; this
     /// is also the column `paginate_by_score` orders and pages by.
-    score: f64,
+    pub(super) score: f64,
 }
 
 /// The standard cursor-pagination envelope, serialized: `Page<T>` itself
@@ -56,8 +56,11 @@ struct SearchPage {
 
 /// Ranks every embedded node against `query` and paginates the result.
 /// Split out from `handle` so tests can drive it with a small `page_size`
-/// without needing a page-size field on the public tool parameters.
-fn search(
+/// without needing a page-size field on the public tool parameters - and,
+/// since the resolution ladder's semantic rung was added, so that rung asks
+/// the same question this tool does rather than growing a second copy of the
+/// SQL that would drift from it.
+pub(super) fn search(
     conn: &Connection,
     query: &[f32],
     page_size: usize,
@@ -222,7 +225,11 @@ mod tests {
             cursor = page.next_cursor;
         }
 
-        assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"], "every match must appear exactly once, most similar first");
+        assert_eq!(
+            seen,
+            vec!["n0", "n1", "n2", "n3", "n4"],
+            "every match must appear exactly once, most similar first"
+        );
     }
 
     /// `handle`'s own contract when no model is loaded: a tool-level error
@@ -315,8 +322,10 @@ mod tests {
 
         let conn = Arc::new(Mutex::new(conn));
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
-        let params =
-            SearchCodeParams { query: "load the contents of a file from the filesystem".to_string(), ..Default::default() };
+        let params = SearchCodeParams {
+            query: "load the contents of a file from the filesystem".to_string(),
+            ..Default::default()
+        };
         let body = json_body(&handle(&conn, &embedding, params).unwrap());
 
         let results = body["results"].as_array().unwrap();

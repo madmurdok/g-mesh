@@ -151,8 +151,20 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  # The gate. Calling ci.yml rather than restating its steps is the point: a
+  # copy would drift, and a release gated on a *drifted* copy of the tests is
+  # worse than one gated on nothing, because it looks like it was checked.
+  #
+  # This costs the release a full test run on four platforms before the first
+  # artifact is compiled. That is the trade being made deliberately: until now
+  # this workflow could publish four binaries from a commit no test had ever
+  # been executed against, on any platform.
+  tests:
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: ${{ matrix.target }}
+    needs: tests
     runs-on: ${{ matrix.runner }}
     # A full build compiles ONNX Runtime bindings, bundled SQLite and Oniguruma
     # from scratch (no cache is used - a release build should not be able to

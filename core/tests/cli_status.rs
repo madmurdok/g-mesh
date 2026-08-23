@@ -44,8 +44,7 @@ struct GlobalConfigGuard {
 impl GlobalConfigGuard {
     fn set(cfg: &GlobalConfig) -> Self {
         let lock = GLOBAL_CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let path =
-            config::global_config_path().expect("failed to resolve the global config path");
+        let path = config::global_config_path().expect("failed to resolve the global config path");
         let original = std::fs::read_to_string(&path).ok();
         config::write_global_config(cfg).expect("failed to write the global config");
         Self { path, original, _lock: lock }
@@ -126,15 +125,14 @@ impl Project {
     /// GC warning's threshold would have.
     fn backdate_last_used(&self, idle_days: u64) {
         std::fs::create_dir_all(self.state_dir()).expect("failed to create the state directory");
-        let conn = Connection::open(self.state_dir().join("index.db"))
-            .expect("failed to open index.db");
+        let conn = Connection::open(self.state_dir().join("index.db")).expect("failed to open index.db");
         // The same generation a daemon would stamp this index with (see
         // `daemon::registry::indexer_version`), computed the same way from the
         // plugins actually installed - so a daemon started against this
         // project afterwards finds it current and leaves the backdated
         // `lastUsed` this fixture is about alone, instead of wiping it.
-        let discovered = manifest::discover(&manifest::default_roots())
-            .expect("failed to discover language plugins");
+        let discovered =
+            manifest::discover(&manifest::default_roots()).expect("failed to discover language plugins");
         schema::ensure_current(&conn, &registry::indexer_version(&discovered))
             .expect("failed to initialize the schema");
         conn.execute(
@@ -148,10 +146,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
@@ -214,10 +209,7 @@ fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project
     assert_contains(&status, "dirty files:     0 awaiting reindex");
     assert_contains(&status, "syntax errors:   1 file(s)");
     assert_contains(&status, "broken.ts");
-    assert!(
-        !status.contains("never fully walked"),
-        "the project has been fully walked:\n{status}"
-    );
+    assert!(!status.contains("never fully walked"), "the project has been fully walked:\n{status}");
     // The stamp the daemon wrote at startup, read back off disk by the
     // command rather than asked of the daemon.
     assert_contains(&status, "just now");
@@ -293,8 +285,7 @@ fn status_warns_about_a_project_idle_past_the_threshold() {
     });
     let project = Project::new();
     project.backdate_last_used(100);
-    let project_id =
-        project.state_dir().file_name().unwrap().to_string_lossy().into_owned();
+    let project_id = project.state_dir().file_name().unwrap().to_string_lossy().into_owned();
 
     let status = project.status();
 

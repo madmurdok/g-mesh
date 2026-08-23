@@ -48,8 +48,8 @@
 //! One consequence of that placement, worth stating because it is not
 //! obvious: while a copy exists, the *bundled* plugin directory it sits in has
 //! different contents, so the generation string a daemon discovering the
-//! bundled plugin would compute moves too. Nothing in the suite observes that
-//! - `cargo test` runs one test binary at a time, each copy is created before
+//! bundled plugin would compute moves too. Nothing in the suite observes that -
+//! `cargo test` runs one test binary at a time, each copy is created before
 //! this file's own daemons start and removed on `Drop` - but a test elsewhere
 //! made to run *concurrently* with this file could see an index of its own go
 //! stale for reasons it never caused.
@@ -58,9 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use g_mesh::daemon::{
-    self, manifest::PLUGIN_ROOTS_OVERRIDE_ENV, plugin::PLUGIN_PATH_ENV,
-};
+use g_mesh::daemon::{self, manifest::PLUGIN_ROOTS_OVERRIDE_ENV, plugin::PLUGIN_PATH_ENV};
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -239,8 +237,7 @@ impl Project {
 
     fn daemon_pid(&self) -> u32 {
         let path = daemon::pid_path(self.root()).expect("failed to resolve the pid file path");
-        daemon::read_pid_file(&path)
-            .unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
+        daemon::read_pid_file(&path).unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
     }
 
     /// The generation the index says it was filled by. The plugin's half of it
@@ -257,11 +254,7 @@ impl Drop for Project {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -285,7 +278,10 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let entry = project.plugin.entry();
     let root = project.plugin.root.clone();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .env(PLUGIN_PATH_ENV, &entry)

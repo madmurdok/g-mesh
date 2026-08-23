@@ -30,7 +30,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::Duration;
 
 use g_mesh::daemon;
@@ -80,11 +79,7 @@ impl Project {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         if let Ok(endpoint) = daemon::endpoint(self.root()) {
@@ -121,7 +116,10 @@ fn body(result: &CallToolResult) -> Value {
 /// against whatever was on disk and in the state directory at that moment.
 async fn outline_symbol_names(project: &Project) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
@@ -136,11 +134,9 @@ async fn outline_symbol_names(project: &Project) -> Vec<String> {
     wait_until_indexed(project.root());
 
     let result = client
-        .call_tool(
-            CallToolRequestParams::new("get_file_outline").with_arguments(
-                json!({ "file_path": FILE }).as_object().cloned().expect("arguments literal is an object"),
-            ),
-        )
+        .call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+            json!({ "file_path": FILE }).as_object().cloned().expect("arguments literal is an object"),
+        ))
         .await
         .expect("tools/call failed");
     let page = body(&result);
@@ -148,7 +144,12 @@ async fn outline_symbol_names(project: &Project) -> Vec<String> {
     client.cancel().await.expect("failed to shut the client down");
     project.stop();
 
-    page["results"].as_array().expect("results is not an array").iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+    page["results"]
+        .as_array()
+        .expect("results is not an array")
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[tokio::test]

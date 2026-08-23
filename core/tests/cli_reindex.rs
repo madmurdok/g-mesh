@@ -120,15 +120,17 @@ impl Project {
     /// the index's own account of what it covers.
     fn indexed_file_paths(&self) -> Vec<String> {
         let conn = Connection::open(self.index_path()).expect("failed to open the project index");
-        let mut statement =
-            conn.prepare("SELECT DISTINCT filePath FROM nodes ORDER BY filePath").unwrap();
-        statement.query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        let mut statement = conn.prepare("SELECT DISTINCT filePath FROM nodes ORDER BY filePath").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
     }
 
     fn node_id_exists(&self, id: &str) -> bool {
         let conn = Connection::open(self.index_path()).expect("failed to open the project index");
-        conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [id], |row| row.get::<_, i64>(0))
-            .unwrap()
+        conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [id], |row| row.get::<_, i64>(0)).unwrap()
             > 0
     }
 }
@@ -136,10 +138,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
@@ -177,7 +176,8 @@ fn corrupt_the_index(index: &Path) {
         [PHANTOM_NODE_ID],
     )
     .expect("failed to plant a phantom node");
-    let removed = conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
+    let removed =
+        conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
     assert!(removed > 0, "the fixture must have had import edges to strip");
 }
 
@@ -195,7 +195,10 @@ fn body(result: &CallToolResult) -> Value {
 /// changed.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(TokioCommand::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
@@ -262,7 +265,10 @@ async fn reindex_against_a_deliberately_stale_index_rebuilds_it_to_match_disk() 
     assert!(!daemon::is_process_alive(daemon_pid), "reindex must stop the daemon it found running");
 
     // The phantom node is gone: the table was thrown away, not patched.
-    assert!(!project.node_id_exists(PHANTOM_NODE_ID), "a wiped index must not still answer for a deleted file");
+    assert!(
+        !project.node_id_exists(PHANTOM_NODE_ID),
+        "a wiped index must not still answer for a deleted file"
+    );
 
     // Every file actually on disk is covered, and nothing else is.
     assert_eq!(

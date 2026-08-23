@@ -1,0 +1,301 @@
+# Checks that run on every change, as against `release.yml`, which builds four
+# targets and only fires on a tag, a manual dispatch, or a PR touching the
+# pipeline itself. A lint that only runs during a release is a lint that tells
+# you about a mistake after it shipped.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "release-*"
+      # Experiment branches too. "Is nextest affordable on the runners" was
+      # answerable only on the runners - the local measurement said no and was
+      # measuring the local machine - and without this line, answering it
+      # meant landing the question on a release branch first (GM-253).
+      - "experiment/*"
+  pull_request:
+  # So `release.yml` can gate on these jobs rather than duplicating them. A
+  # release able to publish artifacts from a commit whose tests never ran is
+  # the state this file exists to end, and the only way to be sure it is the
+  # *same* checks is to call the same workflow.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-22.04
+    env:
+      SHELLCHECK_VERSION: v0.11.0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than taken from the runner image. ShellCheck adds checks
+      # between releases, so an unpinned lint turns red on code nobody touched,
+      # on a day nobody chose - and the first thing anyone does with a gate that
+      # fails for reasons unrelated to their change is stop reading it. Bumping
+      # this line is then a deliberate act with its own diff, which is where the
+      # new findings can be triaged.
+      - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL "$url" | tar -xJ
+          sudo install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # Every script in the repo, found rather than listed: a list is a thing
+      # to forget to update, and this repository went from one script to six in
+      # two days.
+      #
+      # The dialect comes from each file's shebang, so `install.sh` is checked
+      # as POSIX sh and the rest as bash without a flag saying so - which also
+      # means a script whose shebang is wrong is caught by being checked as the
+      # wrong shell.
+      #
+      # `-S style` is the lowest severity, so info- and style-level findings
+      # fail too. Optional checks (`-o all`) are deliberately *not* enabled:
+      # they add 515 findings here, 481 of them SC2250/SC2292 (require ${braces}
+      # everywhere, prefer [[ ]] over [ ]) which is a whole-codebase rewrite for
+      # no defect, and the 14 SC2310s are all deliberate predicates - `have
+      # curl` in an `if` is asking whether curl exists, so `set -e` being
+      # disabled inside the condition is the point rather than an accident.
+      - name: Check every shell script
+        run: |
+          set -euo pipefail
+          git ls-files '*.sh' | sed 's/^/  checking /'
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S style
+
+  test:
+    name: tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUST_VERSION: "1.97.1"
+      NEXTEST_VERSION: "0.9.143"
+    # The integration suite spawns real daemons, real shims and the real JS/TS
+    # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
+    # and Oniguruma from scratch. A deadlock guard, not a target.
+    #
+    # 45 rather than 90: a healthy run finishes in about five minutes on Linux
+    # and macOS, so 90 only bought a longer wait for the same answer - Windows
+    # hung for the whole budget and produced nothing usable. Fail sooner and
+    # collect the log instead.
+    timeout-minutes: 45
+    strategy:
+      # One platform failing must not hide whether the other three work -
+      # which is the whole point here, since before this job the Windows port
+      # was verified by compilation alone.
+      fail-fast: false
+      matrix:
+        # The same four rows release.yml builds, deliberately: a target that
+        # ships is a target whose tests ran. Kept in step by hand rather than
+        # shared, because the two matrices carry different extra fields and a
+        # merged one would be harder to read than two honest copies.
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned, not `stable`, and this run is why: clippy gained a lint between
+      # this pin and the runner's then-current stable, and it turned the gate
+      # red on code nobody had touched. Same reasoning as the ShellCheck pin -
+      # a gate that fails for reasons unrelated to your change is a gate people
+      # stop reading. Bumping this is a deliberate act with its own diff, which
+      # is where the new findings get triaged.
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustc -vV
+
+      # `build.rs` runs `npm run build` for the JS/TS plugin, and the
+      # integration tests drive that plugin for real - so this is a test
+      # dependency here, not only a packaging one. Pinned to match release.yml
+      # for the same reason it is pinned there.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      # `build.rs` runs `npm run build` for the plugin, and on a fresh checkout
+      # there is nothing to build *with* - so without this it exits 2, build.rs
+      # downgrades that to a warning ("dist/ may be stale"), the run continues,
+      # and the two tests that drive the real plugin fail much later with
+      # "plugin closed its stdout before sending a handshake". Invisible on a
+      # developer machine, where node_modules has been there since day one.
+      - name: Install the plugin's dependencies
+        working-directory: plugins/typescript
+        run: npm ci
+
+      # Pinned and fetched directly, like ShellCheck and for the same reason:
+      # a gate that changes underneath you is a gate people stop reading.
+      # Fetched rather than taken from a third-party action, so the only
+      # things this pipeline trusts are the ones it names.
+      #
+      # `windows-tar` is nextest's own variant for extracting with tar rather
+      # than a zip tool, which is what lets one bash step serve all four
+      # runners.
+      - name: Install cargo-nextest ${{ env.NEXTEST_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)   slug=linux ;;
+            macOS)   slug=mac ;;
+            Windows) slug=windows-tar ;;
+            *) echo "unrecognised runner OS: ${{ runner.os }}"; exit 1 ;;
+          esac
+          curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/${slug}" | tar -xz -C "${HOME}/.cargo/bin"
+          cargo nextest --version
+
+      # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
+      # points at /tmp/g-mesh-test-home for everything cargo launches - so a
+      # runner needs no setup for it, and on Windows it resolves against the
+      # current drive. That file is what makes this job safe to run at all:
+      # without it the suite would write into the runner's real home.
+      #
+      # The embedding-weights tests stay `#[ignore]`d. 612 MiB per runner, on
+      # four runners, is not a cost worth paying for a check that a download
+      # works.
+      # A detached daemon has no console, so this file is the only account of
+      # what one was doing. Cheap to always collect and only printed on
+      # failure - and it is the step the harness's own timeout message asks
+      # for. Windows' first integration binary times out waiting for a walk
+      # that a 300s budget did not help, so something is not starting rather
+      # than running slowly (GM-246).
+      # Windows only. `.cargo/config.toml` sets `/tmp/g-mesh-test-home`, which
+      # is not an absolute path there but a *drive-relative* one: it resolves
+      # against whatever drive the process is on. The test binary runs from the
+      # D: checkout and the detached daemon it spawns need not, so the two got
+      # different state roots - the daemon indexed into its own while the test
+      # waited forever on an index.db that was never going to appear (GM-246).
+      # `force = false` in that file means this explicit value wins.
+      #
+      # A separate step rather than an `env:` expression, because the other
+      # platforms must have this variable *absent*, not empty: cargo's
+      # `force = false` treats an empty-but-present variable as already set and
+      # would leave the state root pointing at nothing.
+      #
+      # Scoped to one platform after applying it to all four moved the macOS
+      # state root onto the work volume and turned `cold_start_grace_wait` red
+      # on both macOS runners, which had been green one commit earlier.
+      - name: Point Windows at an absolute state root
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: echo "G_MESH_HOME=${{ runner.temp }}/g-mesh-test-home" >> "$GITHUB_ENV"
+
+      # A *step* timeout rather than a smaller job one, because the two bound
+      # different things: the job budget has to cover a cold build that
+      # compiles ONNX Runtime, SQLite and Oniguruma from scratch, while the
+      # tests themselves finish in about three minutes on a healthy platform.
+      # Windows spent 37 of its 45 minutes hung and produced nothing, so the
+      # useful budget is the one on the part that hangs (GM-249).
+      #
+      # A backstop now rather than the only bound: nextest terminates an
+      # individual hung test at 210s and *names* it, which is the diagnosis
+      # this timeout could never give - a step killed here is reported as
+      # cancelled and prints nothing. Demonstrated rather than assumed: a test
+      # written to sleep forever comes back as `TIMEOUT [8.066s]
+      # g-mesh::zz_hang_probe a_test_that_never_finishes`.
+      - name: cargo nextest run
+        timeout-minutes: 15
+        shell: bash
+        env:
+          G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
+          # `G_MESH_TRACE_CALLS` is deliberately *not* set here any more. It
+          # did its job - splitting the Windows hang three ways by whether a
+          # call reached `prepare`, got through it, or died on the way back
+          # (GM-246) - and then cost something: two lines per tool call filled
+          # the log's last 200 lines with 183 trace lines, crowding out the
+          # daemon activity the step below exists to show. Turn it back on for
+          # a specific question, not as a standing setting.
+        # `fail-fast = false` and the per-test timeout live in
+        # core/.config/nextest.toml rather than here, so they hold however the
+        # suite is invoked. That file also carries the measurement that chose
+        # this tool over `cargo test`, and the local one that got it wrong.
+        run: cargo nextest run --manifest-path core/Cargo.toml
+
+      # `always()`, not `failure()`: a job killed by `timeout-minutes` is
+      # reported as *cancelled*, and `failure()` does not fire for it - so the
+      # one run where the log mattered most produced none. Windows hung for the
+      # full 90 minutes and this step was skipped (GM-246).
+      - name: What the daemons were doing
+        if: always()
+        shell: bash
+        run: |
+          log="${{ runner.temp }}/g-mesh-daemon.log"
+          if [ -f "$log" ]; then
+            echo "=== $(wc -l < "$log") lines ==="
+            tail -200 "$log"
+          else
+            echo "no daemon log at $log - nothing ever wrote one, which is itself the answer"
+          fi
+
+  lint:
+    name: cargo clippy
+    runs-on: ubuntu-22.04
+    env:
+      RUST_VERSION: "1.97.1"
+    # One platform, unlike `test`: clippy's findings here are about the code,
+    # not about the target. The cfg'd platform modules are the exception, and
+    # `ipc/windows.rs` is small enough that the Windows `test` job compiling it
+    # is the check that matters for it.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned, not `stable`, and this run is why: clippy gained a lint between
+      # this pin and the runner's then-current stable, and it turned the gate
+      # red on code nobody had touched. Same reasoning as the ShellCheck pin -
+      # a gate that fails for reasons unrelated to your change is a gate people
+      # stop reading. Bumping this is a deliberate act with its own diff, which
+      # is where the new findings get triaged.
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup component add clippy rustfmt
+          cargo clippy --version
+          cargo fmt --version
+
+      # build.rs builds the plugin, so clippy needs Node just as the tests do.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      - name: Install the plugin's dependencies
+        working-directory: plugins/typescript
+        run: npm ci
+
+      # Before clippy, because it is the cheaper failure and the one with an
+      # obvious fix: `cargo fmt` and push. The style it enforces is recorded in
+      # rustfmt.toml, recovered by measurement rather than picked - see that
+      # file. A formatter written down but not checked drifts straight back,
+      # which is the state this repository was in until GM-241.
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path core/Cargo.toml --check
+
+      # `-D warnings`, because a lint that reports and passes is a lint nobody
+      # reads. The tree was brought to zero findings before this was turned on
+      # (44 of them: 36 doc-list continuations, a transmute without
+      # annotations, a seven-field tuple type, and one assertion that was
+      # constant-true and therefore checking nothing).
+      - name: cargo clippy
+        run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings

@@ -94,8 +94,7 @@ impl Project {
     /// here ultimately turns on.
     fn daemon_pid(&self) -> u32 {
         let path = daemon::pid_path(self.root()).expect("failed to resolve the pid file path");
-        daemon::read_pid_file(&path)
-            .unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
+        daemon::read_pid_file(&path).unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
     }
 }
 
@@ -104,11 +103,7 @@ impl Drop for Project {
         for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
-                let _ = StdCommand::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                common::kill_and_wait(pid);
             }
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -130,7 +125,10 @@ fn body(result: &CallToolResult) -> Value {
 /// which is the whole subject of this file.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
@@ -177,7 +175,8 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
 /// restart that has already been arranged.
 fn make_the_index_look_like_an_older_generations_work(index: &Path) {
     let conn = Connection::open(index).expect("failed to open the project index");
-    let removed = conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
+    let removed =
+        conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
     assert!(removed > 0, "the fixture must have had import edges to strip");
     let restamped = conn
         .execute("UPDATE meta SET indexer_version = '0' WHERE id = 1", [])

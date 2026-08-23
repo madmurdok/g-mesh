@@ -27,7 +27,6 @@
 //! keeps so.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -54,10 +53,7 @@ const SEMANTIC_TIMEOUT: Duration = Duration::from_secs(45);
 /// source order wins - which is exactly the fact tree-sitter's structural
 /// layer cannot see and the semantic pass exists to supply.
 const FILES: [(&str, &str); 5] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#),
     ("a.ts", "export function mutate(): \"a\" {\n  return \"a\";\n}\n"),
     ("b.ts", "export function mutate(): \"b\" {\n  return \"b\";\n}\n"),
     ("index.ts", "export * from \"./a\";\nexport * from \"./b\";\n"),
@@ -98,9 +94,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }
@@ -121,9 +115,9 @@ async fn find_callers_resolves_through_an_ambiguous_export_star_barrel() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -143,13 +137,12 @@ async fn find_callers_resolves_through_an_ambiguous_export_star_barrel() {
     assert_eq!(definition["ambiguous"], json!(true), "expected two same-named declarations: {definition}");
     let candidates = definition["results"].as_array().expect("results is not an array");
     assert_eq!(candidates.len(), 2, "both `mutate` declarations must be indexed: {definition}");
-    let a_branch_id = candidates
-        .iter()
-        .find(|c| c["filePath"].as_str() == Some("a.ts"))
-        .expect("no candidate in a.ts")["id"]
-        .as_str()
-        .expect("candidate has no id")
-        .to_string();
+    let a_branch_id =
+        candidates.iter().find(|c| c["filePath"].as_str() == Some("a.ts")).expect("no candidate in a.ts")
+            ["id"]
+            .as_str()
+            .expect("candidate has no id")
+            .to_string();
 
     // Step 2: find_callers by that symbol_id, polled until the semantic pass
     // has resolved which branch `caller.ts`'s import actually binds to.

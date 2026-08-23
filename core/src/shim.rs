@@ -136,6 +136,17 @@ enum Incumbent {
 /// build that has been replaced.
 fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
     let endpoint = daemon::endpoint(root)?;
+    // Checked before anything is attempted, because every step below assumes
+    // the endpoint is one a daemon could listen on. An over-long AF_UNIX path
+    // fails only at the daemon's `bind`, in a detached child whose stderr
+    // goes to a log the caller is not reading - so without this the shim
+    // spawns a daemon that dies instantly, then spends the full
+    // `LISTEN_TIMEOUT` retrying a connect that cannot ever succeed, and
+    // reports a timeout rather than the reason.
+    if let Err(message) = endpoint.check_length() {
+        bail!("{message}");
+    }
+
     // A missing endpoint, a refused connection and (on Unix) a socket left
     // behind by a dead daemon are all just "no daemon running" as far as the
     // shim cares.
@@ -363,8 +374,7 @@ fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("failed to open bootstrap lock file {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to take the bootstrap lock on {}", path.display()))?;
+    file.lock().with_context(|| format!("failed to take the bootstrap lock on {}", path.display()))?;
     Ok(file)
 }
 

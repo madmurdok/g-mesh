@@ -25,6 +25,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
@@ -37,7 +38,7 @@ use super::SymbolQueryParams;
 /// page or tool-level error - to hand straight back unchanged. The outer
 /// `Err` stays reserved for genuine protocol-level failures, as everywhere
 /// else in this module tree.
-pub(super) type Anchor = Result<Result<NodeRecord, CallToolResult>, ErrorData>;
+pub(super) type Anchor = Result<Result<find_definition::Resolved, CallToolResult>, ErrorData>;
 
 /// What `symbol_name`/`symbol_id` resolved to, echoed back on every response
 /// of the four tools built on [`resolve`] (`find_references`, `find_callers`,
@@ -70,6 +71,20 @@ pub(super) struct AnchorInfo {
     pub(super) kind: String,
     pub(super) file_path: String,
     pub(super) start_line: i64,
+    /// Which rung of the resolution ladder reached this anchor - see
+    /// [`find_definition::ResolvedBy`]. Absent when built from a bare node
+    /// (a resumed walk, where the anchor is carried rather than resolved).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resolved_by: Option<find_definition::ResolvedBy>,
+}
+
+impl AnchorInfo {
+    /// The anchor with the rung that reached it - what a freshly-resolved walk
+    /// echoes, so a caller can tell an exact resolution from a suggestion it
+    /// was handed.
+    pub(super) fn with_rung(node: &NodeRecord, by: find_definition::ResolvedBy) -> Self {
+        Self { resolved_by: Some(by), ..Self::from(node) }
+    }
 }
 
 impl From<&NodeRecord> for AnchorInfo {
@@ -80,17 +95,24 @@ impl From<&NodeRecord> for AnchorInfo {
             kind: node.kind.clone(),
             file_path: node.file_path.clone(),
             start_line: node.start_line,
+            resolved_by: None,
         }
     }
 }
 
-pub(super) fn resolve(conn: &Connection, params: &SymbolQueryParams) -> Anchor {
+pub(super) fn resolve(
+    conn: &Connection,
+    embedding: Option<&EmbeddingPipeline>,
+    params: &SymbolQueryParams,
+) -> Anchor {
     // Mirrors `find_definition::handle`'s alternation check: both addressing
     // modes are optional in the schema because JSON Schema cannot say
     // "exactly one of these", so the tool says it instead.
     match (params.symbol_id.as_deref(), params.symbol_name.as_deref()) {
         (Some(symbol_id), None) => by_id(conn, symbol_id),
-        (None, Some(name)) => find_definition::resolve_symbol_name(conn, name, params.cursor.as_deref()),
+        (None, Some(name)) => {
+            find_definition::resolve_symbol_name(conn, embedding, name, params.cursor.as_deref())
+        }
         (Some(_), Some(_)) => error("g-mesh: give either `symbol_id` or `symbol_name`, not both").map(Err),
         (None, None) => {
             error("g-mesh: give either `symbol_id`, or `symbol_name` to have it resolved by name").map(Err)
@@ -115,9 +137,10 @@ pub(super) fn file_anchor_hint(node: &NodeRecord) -> Option<&'static str> {
 }
 
 fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
-    let anchor = queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
+    let anchor =
+        queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
     match anchor {
-        Some(node) => Ok(Ok(node)),
+        Some(node) => Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id })),
         None => error(format!("g-mesh: no symbol with id '{symbol_id}' found")).map(Err),
     }
 }
@@ -148,14 +171,22 @@ mod tests {
     /// business.
     fn expect_finished(anchor: Anchor) -> CallToolResult {
         match anchor.expect("resolution must not fail at the protocol level") {
-            Ok(node) => panic!("expected a finished result, got the resolved node {}", node.id),
+            Ok(resolved) => {
+                panic!("expected a finished result, got the resolved node {}", resolved.node.id)
+            }
             Err(result) => result,
         }
     }
 
     fn expect_node(anchor: Anchor) -> NodeRecord {
+        expect_resolved(anchor).node
+    }
+
+    /// The node *and* the rung that reached it - what a test asserting the
+    /// ladder's behaviour needs, as against one that only wants the node.
+    fn expect_resolved(anchor: Anchor) -> find_definition::Resolved {
         match anchor.expect("resolution must not fail at the protocol level") {
-            Ok(node) => node,
+            Ok(resolved) => resolved,
             Err(result) => panic!("expected a resolved node, got {:?}", result.content),
         }
     }
@@ -163,7 +194,7 @@ mod tests {
     #[test]
     fn neither_addressing_mode_is_a_tool_level_error() {
         let conn = setup();
-        let result = expect_finished(resolve(&conn, &SymbolQueryParams::default()));
+        let result = expect_finished(resolve(&conn, None, &SymbolQueryParams::default()));
         let text = error_text(&result);
         assert!(text.contains("symbol_id"), "{text}");
         assert!(text.contains("symbol_name"), "{text}");
@@ -181,18 +212,20 @@ mod tests {
         };
         // Resolving both to the same node would still be a silent contract
         // violation, so it must fail rather than quietly prefer one.
-        let result = expect_finished(resolve(&conn, &params));
+        let result = expect_finished(resolve(&conn, None, &params));
         assert!(error_text(&result).contains("not both"));
     }
 
     #[test]
     fn symbol_name_resolution_prefers_an_exact_qualified_name() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n1", "Function", "run", "pkg_a::run", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "run", "pkg_b::run", "b.rs", "rust"))
+            .unwrap();
 
         let params = SymbolQueryParams { symbol_name: Some("pkg_b::run".to_string()), ..Default::default() };
-        let node = expect_node(resolve(&conn, &params));
+        let node = expect_node(resolve(&conn, None, &params));
         assert_eq!(node.id, "n2", "a qualifiedName must resolve even while the bare name is ambiguous");
     }
 }

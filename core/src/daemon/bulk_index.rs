@@ -76,6 +76,24 @@ const BATCH_ITEMS: usize = 2_000;
 /// answer (`no symbol named ... found`) all by itself.
 pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
 
+/// Path whose *deletion* releases the finished walk, for the tests that need
+/// the moment of completion to be an event they cause rather than a duration
+/// they hope for.
+///
+/// [`WALK_DELAY_ENV`] turns "the walk is about to finish" into a knob, and for
+/// most tests that is enough. It is not enough when the assertion is about a
+/// call landing inside `mcp::INDEXING_GRACE_WINDOW`, because the knob is a
+/// `sleep` in the *daemon*: a loaded machine can stretch a 400ms hold to 700
+/// and leave more time before completion than the window can absorb, so the
+/// call is refused and the test fails for a reason that has nothing to do with
+/// the grace-wait mechanism. That is what happened on all three non-Windows
+/// CI runners (GM-245).
+///
+/// With this, the test creates the file, lets the walk reach it, dispatches
+/// its call, and then deletes the file - so completion happens *after* the
+/// call is in flight by construction, not by arithmetic on two sleeps.
+pub const WALK_HOLD_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_FILE";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BulkIndexSummary {
     pub nodes: usize,
@@ -139,9 +157,8 @@ pub fn run(
     // language's ingest loop, not per language.
     {
         let mut conn = conn.lock().unwrap();
-        summary.linked_imports = imports::link_all(&mut conn)
-            .context("failed to link the walk's resolved imports")?
-            .linked_edges;
+        summary.linked_imports =
+            imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?.linked_edges;
         summary.linked_symbols = symbol_links::link_all(&mut conn)
             .context("failed to link the walk's cross-file symbol usages")?
             .linked_edges;
@@ -205,8 +222,26 @@ fn walk_one_language(
 /// Honors [`WALK_DELAY_ENV`]. A no-op unless it is set to a number, which is
 /// every real run.
 fn hold_the_walk_open_for_tests() {
-    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok())
-    else {
+    // The file gate first: a test that uses it wants the release to be its own
+    // action, and a stray delay on top would only blur that.
+    if let Some(path) = std::env::var_os(WALK_HOLD_FILE_ENV).filter(|p| !p.is_empty()) {
+        let path = std::path::PathBuf::from(path);
+        eprintln!(
+            "g-mesh daemon: holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
+            path.display()
+        );
+        // Polled rather than watched: this is test-only scaffolding, the wait
+        // is milliseconds, and a filesystem watcher here would be a second
+        // mechanism to get wrong. Bounded so a test that forgets to release it
+        // fails as a test timeout rather than wedging the daemon forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        return;
+    }
+
+    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok()) else {
         return;
     };
     eprintln!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
@@ -350,16 +385,14 @@ mod tests {
     #[test]
     fn a_whole_stream_lands_in_sqlite() {
         let conn = setup_conn();
-        let stream = format!(
-            "{}\n{}\n{}\n",
-            node_line("n1"),
-            node_line("n2"),
-            edge_line("e1", "n1", "n2")
-        );
+        let stream = format!("{}\n{}\n{}\n", node_line("n1"), node_line("n2"), edge_line("e1", "n1", "n2"));
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 });
+        assert_eq!(
+            summary,
+            BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 }
+        );
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
         let name: String = conn
@@ -379,7 +412,10 @@ mod tests {
 
         let summary = ingest_str(&stream, &conn).unwrap();
 
-        assert_eq!(summary, BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 });
+        assert_eq!(
+            summary,
+            BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 }
+        );
         assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
     }
 

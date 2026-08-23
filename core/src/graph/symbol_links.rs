@@ -292,12 +292,7 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
                 // under that file and nothing else.
                 waiting_placeholders(
                     &mut waiting_on_file,
-                    params![
-                        MODULE_KIND,
-                        PENDING_SYMBOL_NATIVE_KIND,
-                        format!("{file}#"),
-                        format!("{file}$")
-                    ],
+                    params![MODULE_KIND, PENDING_SYMBOL_NATIVE_KIND, format!("{file}#"), format!("{file}$")],
                 )?
             } else {
                 waiting_placeholders(
@@ -334,14 +329,9 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
 /// qualifiedName, name)` column order every waiting-placeholder lookup here
 /// uses. Rows that do not fit the `<file>#<name>` convention are skipped
 /// rather than guessed at, as in [`Placeholder::parse`].
-fn waiting_placeholders(
-    stmt: &mut Statement,
-    params: &[&dyn rusqlite::ToSql],
-) -> Result<Vec<Placeholder>> {
+fn waiting_placeholders(stmt: &mut Statement, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Placeholder>> {
     let rows = stmt
-        .query_map(params, |row| {
-            Ok(Placeholder::parse(row.get(0)?, &row.get::<_, String>(1)?, row.get(2)?))
-        })
+        .query_map(params, |row| Ok(Placeholder::parse(row.get(0)?, &row.get::<_, String>(1)?, row.get(2)?)))
         .context("failed to look up placeholders waiting on a new export")?;
 
     let mut found = Vec::new();
@@ -372,10 +362,7 @@ fn is_reexport(kind: &str, native_kind: Option<&str>) -> bool {
 ///
 /// Bounded like the downward walk, and for the same reasons: a visited set for
 /// cycles, [`MAX_REEXPORT_DEPTH`] for length.
-fn republished_addresses(
-    conn: &Connection,
-    seeds: Vec<(String, String)>,
-) -> Result<Vec<(String, String)>> {
+fn republished_addresses(conn: &Connection, seeds: Vec<(String, String)>) -> Result<Vec<(String, String)>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
@@ -420,8 +407,7 @@ fn republished_addresses(
                 let (reexporter, published) = row.context("failed to read a re-exporter")?;
                 // A whole-module re-export publishes what it forwards under
                 // the same name; a named one under its own.
-                let published =
-                    if published == REEXPORT_ALL_NAME { name.clone() } else { published };
+                let published = if published == REEXPORT_ALL_NAME { name.clone() } else { published };
                 next.push((reexporter, published));
             }
         }
@@ -607,10 +593,9 @@ fn exported_symbols(
 /// it passes the one being looked for straight through.
 fn reexport_hops(stmt: &mut Statement, file: &str, name: &str) -> Result<Vec<(String, String)>> {
     let rows = stmt
-        .query_map(
-            params![file, MODULE_KIND, REEXPORT_NATIVE_KIND, name, REEXPORT_ALL_NAME],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
+        .query_map(params![file, MODULE_KIND, REEXPORT_NATIVE_KIND, name, REEXPORT_ALL_NAME], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .context("failed to look up a file's re-exports")?;
 
     let mut hops = Vec::new();
@@ -645,8 +630,7 @@ mod tests {
     }
 
     fn symbol(file: &str, name: &str, kind: &str, exported: bool) -> NodeRecord {
-        let mut node =
-            NodeRecord::new(format!("{kind}:{file}:{name}"), kind, name, name, file, "typescript");
+        let mut node = NodeRecord::new(format!("{kind}:{file}:{name}"), kind, name, name, file, "typescript");
         node.exported = exported;
         node
     }
@@ -695,12 +679,7 @@ mod tests {
         usage_edge_from(from, kind, placeholder, "tree-sitter")
     }
 
-    fn usage_edge_from(
-        from: &str,
-        kind: &str,
-        placeholder: &NodeRecord,
-        source: &str,
-    ) -> EdgeRecord {
+    fn usage_edge_from(from: &str, kind: &str, placeholder: &NodeRecord, source: &str) -> EdgeRecord {
         EdgeRecord::new(
             format!("edge:{from}:{kind}:{}", placeholder.id),
             from,
@@ -738,8 +717,7 @@ mod tests {
     /// Which layer last answered for an edge - the other half of what a
     /// semantic upgrade changes about a row.
     fn edge_source(conn: &Connection, edge_id: &str) -> String {
-        conn.query_row("SELECT source FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0))
-            .unwrap()
+        conn.query_row("SELECT source FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0)).unwrap()
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
@@ -824,10 +802,7 @@ mod tests {
         let mut conn = setup();
         apply_diff(
             &mut conn,
-            &Diff {
-                upsert_nodes: vec![symbol("caller.ts", "run", "Function", true)],
-                ..Default::default()
-            },
+            &Diff { upsert_nodes: vec![symbol("caller.ts", "run", "Function", true)], ..Default::default() },
         )
         .unwrap();
         let edge = seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "generated.ts", "mutate");
@@ -1008,10 +983,7 @@ mod tests {
         let mut conn = setup();
         apply_diff(
             &mut conn,
-            &Diff {
-                upsert_nodes: vec![symbol("caller.ts", "run", "Function", true)],
-                ..Default::default()
-            },
+            &Diff { upsert_nodes: vec![symbol("caller.ts", "run", "Function", true)], ..Default::default() },
         )
         .unwrap();
         let edge = seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "target.ts", "mutate");
@@ -1066,7 +1038,10 @@ mod tests {
 
         let placeholder = placeholder_node("caller.ts", "target.ts", "mutate");
         let diff = Diff {
-            upsert_nodes: vec![symbol("caller.ts", "run", "Function", true), placeholder_node("caller.ts", "target.ts", "mutate")],
+            upsert_nodes: vec![
+                symbol("caller.ts", "run", "Function", true),
+                placeholder_node("caller.ts", "target.ts", "mutate"),
+            ],
             upsert_edges: vec![usage_edge("Function:caller.ts:run", "CALLS", &placeholder)],
             ..Default::default()
         };
@@ -1333,17 +1308,13 @@ mod tests {
             }
             nodes.push(symbol(&format!("barrel{hops}.ts"), "mutate", "Function", true));
             apply_diff(&mut conn, &Diff { upsert_nodes: nodes, ..Default::default() }).unwrap();
-            let edge =
-                seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "barrel0.ts", "mutate");
+            let edge = seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "barrel0.ts", "mutate");
             (conn, edge)
         }
 
         let (mut at_cap, edge) = chain(MAX_REEXPORT_DEPTH);
         assert_eq!(link_all(&mut at_cap).unwrap(), LinkSummary { linked_edges: 1 });
-        assert_eq!(
-            edge_target(&at_cap, &edge).0,
-            format!("Function:barrel{MAX_REEXPORT_DEPTH}.ts:mutate")
-        );
+        assert_eq!(edge_target(&at_cap, &edge).0, format!("Function:barrel{MAX_REEXPORT_DEPTH}.ts:mutate"));
 
         let (mut past_cap, edge) = chain(MAX_REEXPORT_DEPTH + 1);
         assert_eq!(link_all(&mut past_cap).unwrap(), LinkSummary::default());
@@ -1494,11 +1465,7 @@ mod tests {
         let placeholder = placeholder_node("app.ts", "mod.ts", "someExport");
         let edge = usage_edge_from("Function:app.ts:run", "CALLS", &placeholder, "ts-compiler");
         let edge_id = edge.id.clone();
-        let diff = Diff {
-            upsert_nodes: vec![placeholder],
-            upsert_edges: vec![edge],
-            ..Default::default()
-        };
+        let diff = Diff { upsert_nodes: vec![placeholder], upsert_edges: vec![edge], ..Default::default() };
         apply_diff(&mut conn, &diff).unwrap();
 
         assert_eq!(link_diff(&mut conn, &diff).unwrap(), LinkSummary { linked_edges: 1 });
@@ -1535,11 +1502,7 @@ mod tests {
         let placeholder = placeholder_node("app.ts", "barrel.ts", "someExport");
         let edge = usage_edge_from("Function:app.ts:run", "CALLS", &placeholder, "ts-compiler");
         let edge_id = edge.id.clone();
-        let diff = Diff {
-            upsert_nodes: vec![placeholder],
-            upsert_edges: vec![edge],
-            ..Default::default()
-        };
+        let diff = Diff { upsert_nodes: vec![placeholder], upsert_edges: vec![edge], ..Default::default() };
         apply_diff(&mut conn, &diff).unwrap();
 
         assert_eq!(link_diff(&mut conn, &diff).unwrap(), LinkSummary { linked_edges: 1 });

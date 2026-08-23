@@ -86,17 +86,16 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // this index is re-stamped with is derived from it
     // (`daemon::registry::indexer_version`): stamping anything else here would
     // have the next daemon start wipe the index this command just rebuilt.
-    let discovered = manifest::discover(&manifest::default_roots())
-        .context("failed to discover language plugins")?;
+    let discovered =
+        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
 
-    let conn = connection::open(project_root)
-        .context("failed to open the project's SQLite index")?;
+    let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
     schema::reset(&conn, &registry::indexer_version(&discovered))
         .context("failed to reset the project's index")?;
 
-    let canonical_root = project_root.canonicalize().with_context(|| {
-        format!("failed to canonicalize project root {}", project_root.display())
-    })?;
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
     let conn = Arc::new(Mutex::new(conn));
     // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
     // for a cold start - a reindex is that same walk, run early.
@@ -108,8 +107,8 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     schema::record_bulk_index(&conn.lock().unwrap())
         .context("failed to record that the project was fully reindexed")?;
 
-    let state_dir = connection::project_dir(project_root)
-        .context("failed to resolve the project's state directory")?;
+    let state_dir =
+        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
     let mut semantic_pass_ran = false;
     let semantic_outcome =
         semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
@@ -137,10 +136,7 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "g-mesh: reindexed {}", project_root.display());
     if outcome.daemon_was_running {
-        let _ = writeln!(
-            out,
-            "  daemon:  stopped for the rebuild - the next tool call starts a fresh one"
-        );
+        let _ = writeln!(out, "  daemon:  stopped for the rebuild - the next tool call starts a fresh one");
     }
     let _ = writeln!(
         out,

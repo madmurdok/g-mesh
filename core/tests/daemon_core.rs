@@ -103,8 +103,8 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 /// It all happens on a helper thread so a daemon that stops answering fails
 /// the test with a timeout instead of hanging it forever.
 fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
-    let stream = ipc::Stream::connect(endpoint)
-        .unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
+    let stream =
+        ipc::Stream::connect(endpoint).unwrap_or_else(|e| panic!("failed to connect to {endpoint}: {e}"));
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -119,20 +119,22 @@ fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
 }
 
 fn converse(stream: ipc::Stream, requests: Vec<Value>) -> Result<Vec<Value>, String> {
-    let mut writer =
-        stream.try_clone().map_err(|e| format!("cannot clone the daemon connection: {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| format!("cannot clone the daemon connection: {e}"))?;
     let mut reader = BufReader::new(stream);
 
-    send(&mut writer, &json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "g-mesh-daemon-tests", "version": "0" },
-        },
-    }))?;
+    send(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "g-mesh-daemon-tests", "version": "0" },
+            },
+        }),
+    )?;
     let initialized = receive(&mut reader)?;
     if initialized["result"]["serverInfo"]["name"] != "g-mesh" {
         return Err(format!("unexpected initialize response: {initialized}"));
@@ -179,8 +181,7 @@ fn tool_payload(response: &Value) -> Value {
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool call returned no text content: {response}"));
-    serde_json::from_str(text)
-        .unwrap_or_else(|e| panic!("tool payload is not JSON ({e}): {text}"))
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("tool payload is not JSON ({e}): {text}"))
 }
 
 fn symbol_names(response: &Value) -> Vec<String> {
@@ -336,10 +337,8 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     wait_for("the second daemon to start listening", || pid_file.exists());
 
     let endpoint = daemon::endpoint(project.root()).unwrap();
-    let responses = mcp_session(
-        &endpoint,
-        vec![outline_request(1, "src/first.ts"), outline_request(2, "src/second.ts")],
-    );
+    let responses =
+        mcp_session(&endpoint, vec![outline_request(1, "src/first.ts"), outline_request(2, "src/second.ts")]);
 
     assert_eq!(
         responses[0]["result"]["isError"], false,
@@ -362,7 +361,10 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let third_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = 'third'", [], |row| row.get(0)).unwrap();
-    assert_eq!(third_count, 0, "a file nothing queried must not appear, or the restart walked the project after all");
+    assert_eq!(
+        third_count, 0,
+        "a file nothing queried must not appear, or the restart walked the project after all"
+    );
 
     let _ = second_daemon.kill();
     let _ = second_daemon.wait();
@@ -381,10 +383,7 @@ fn unknown_method_gets_a_json_rpc_error_not_a_crash() {
     // the session down with it.
     let responses = mcp_session(
         &endpoint,
-        vec![
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "not_a_real_method" }),
-            tools_list_request(2),
-        ],
+        vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "not_a_real_method" }), tools_list_request(2)],
     );
 
     assert_eq!(responses[0]["error"]["code"], -32601);
@@ -426,9 +425,7 @@ fn a_rejected_tool_call_reports_an_error_result_rather_than_failing_the_session(
     // errors opaquely, so what went wrong has to travel as content.
     assert_eq!(responses[0]["result"]["isError"], true);
     assert!(
-        responses[0]["result"]["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("file_path")),
+        responses[0]["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("file_path")),
         "the error must name what the call was missing: {}",
         responses[0]
     );

@@ -158,8 +158,7 @@ fn round_trip<R: BufRead, W: Write>(
     let method = method_name(&message);
     let request =
         ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: Some(request_id.clone()), message };
-    write_message(writer, &request)
-        .with_context(|| format!("failed to write {method} request to plugin"))?;
+    write_message(writer, &request).with_context(|| format!("failed to write {method} request to plugin"))?;
 
     let response: FileChangeResponse = read_message(reader)
         .with_context(|| format!("failed to read plugin's {method} response"))?
@@ -526,17 +525,14 @@ mod tests {
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
 
-        let name: String = conn
-            .query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
-            .unwrap();
+        let name: String =
+            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
         assert_eq!(name, "foo");
-        let start_line: i64 = conn
-            .query_row("SELECT startLine FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
-            .unwrap();
+        let start_line: i64 =
+            conn.query_row("SELECT startLine FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
         assert_eq!(start_line, 1);
-        let edge_kind: String = conn
-            .query_row("SELECT kind FROM edges WHERE id = 'e1'", [], |row| row.get(0))
-            .unwrap();
+        let edge_kind: String =
+            conn.query_row("SELECT kind FROM edges WHERE id = 'e1'", [], |row| row.get(0)).unwrap();
         assert_eq!(edge_kind, "CALLS");
     }
 
@@ -818,16 +814,19 @@ mod tests {
         let structural = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: request_id.clone(),
-            result: FileChangeDiff {
-                upsert_nodes: vec![canned_node("n1")],
-                ..Default::default()
-            },
+            result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
         };
 
         // `None`: the stub answers the reparse and then goes away, which is
         // what a plugin whose semantic layer died looks like from here.
-        let plugin =
-            spawn_stub_plugin(plugin_reader, plugin_writer, "src/lib.rs", request_id.clone(), structural, None);
+        let plugin = spawn_stub_plugin(
+            plugin_reader,
+            plugin_writer,
+            "src/lib.rs",
+            request_id.clone(),
+            structural,
+            None,
+        );
 
         let mut buf_reader = BufReader::new(core_reader);
         let outcome = apply_file_change(
@@ -852,8 +851,7 @@ mod tests {
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
         let mut conn = setup_conn();
 
-        let plugin =
-            spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default());
+        let plugin = spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default());
 
         let mut buf_reader = BufReader::new(core_reader);
         apply_semantic_pass(

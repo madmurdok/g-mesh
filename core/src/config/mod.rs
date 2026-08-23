@@ -213,12 +213,11 @@ pub fn write_global_config(config: &GlobalConfig) -> Result<()> {
 /// defaults".
 fn read_toml_or_default<T: Default + DeserializeOwned>(path: &Path) -> Result<T> {
     match fs::read_to_string(path) {
-        Ok(contents) => toml::from_str(&contents)
-            .with_context(|| format!("failed to parse config at {}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(err) => {
-            Err(err).with_context(|| format!("failed to read config at {}", path.display()))
+        Ok(contents) => {
+            toml::from_str(&contents).with_context(|| format!("failed to parse config at {}", path.display()))
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(err) => Err(err).with_context(|| format!("failed to read config at {}", path.display())),
     }
 }
 
@@ -227,10 +226,8 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     }
-    let contents =
-        toml::to_string_pretty(value).context("failed to serialize config to TOML")?;
-    fs::write(path, contents)
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
+    let contents = toml::to_string_pretty(value).context("failed to serialize config to TOML")?;
+    fs::write(path, contents).with_context(|| format!("failed to write config at {}", path.display()))?;
     Ok(())
 }
 
@@ -282,8 +279,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        let config =
-            GlobalConfig { cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 } };
+        let config = GlobalConfig { cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 } };
         write_toml(&path, &config).unwrap();
 
         let read_back: GlobalConfig = read_toml_or_default(&path).unwrap();

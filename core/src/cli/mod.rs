@@ -397,9 +397,7 @@ mod tests {
     #[test]
     fn help_lists_every_human_facing_command_and_hides_the_daemon() {
         let help = Cli::command().render_help().to_string();
-        for name in
-            ["init", "config", "status", "reindex", "plugins", "model", "clean", "stop", "mcp-shim"]
-        {
+        for name in ["init", "config", "status", "reindex", "plugins", "model", "clean", "stop", "mcp-shim"] {
             assert!(help.contains(name), "`--help` must mention `{name}`:\n{help}");
         }
 
@@ -410,9 +408,6 @@ mod tests {
             .find(|sub| sub.get_name() == "daemon")
             .expect("the daemon subcommand must still exist")
             .clone();
-        assert!(
-            daemon.is_hide_set(),
-            "the shim's private daemon entry point must stay out of --help"
-        );
+        assert!(daemon.is_hide_set(), "the shim's private daemon entry point must stay out of --help");
     }
 }

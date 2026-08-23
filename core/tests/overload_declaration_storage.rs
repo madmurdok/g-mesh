@@ -30,6 +30,10 @@ use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
+/// One `declarations` row as this test reads it: ordinal, the four span
+/// coordinates, the signature and whether it has a body.
+type DeclarationRow = (i64, i64, i64, i64, i64, Option<String>, bool);
+
 /// The single-language discovery this suite walks with - just the bundled
 /// JS/TS plugin, built by hand from [`bundled_manifest`] rather than through
 /// `daemon::manifest::discover`, so this suite's isolation from whatever else
@@ -111,9 +115,8 @@ fn an_overloaded_symbol_is_stored_as_one_node_with_every_declaration_it_was_writ
     let parse = node_id(&conn, "parse");
 
     // One node, as tsserver's own outline has it - not one per declaration.
-    let parse_nodes: i64 = conn
-        .query_row("SELECT COUNT(*) FROM nodes WHERE name = 'parse'", [], |row| row.get(0))
-        .unwrap();
+    let parse_nodes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = 'parse'", [], |row| row.get(0)).unwrap();
     assert_eq!(parse_nodes, 1);
 
     let mut stmt = conn
@@ -122,17 +125,9 @@ fn an_overloaded_symbol_is_stored_as_one_node_with_every_declaration_it_was_writ
              FROM declarations WHERE nodeId = ?1 ORDER BY ordinal",
         )
         .unwrap();
-    let rows: Vec<(i64, i64, i64, i64, i64, Option<String>, bool)> = stmt
+    let rows: Vec<DeclarationRow> = stmt
         .query_map([&parse], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
         })
         .unwrap()
         .collect::<rusqlite::Result<_>>()
@@ -147,15 +142,7 @@ fn an_overloaded_symbol_is_stored_as_one_node_with_every_declaration_it_was_writ
         vec![
             (0, 1, 7, 1, 47, Some("parse(input: string): string[]".to_string()), false),
             (1, 2, 7, 2, 61, Some("parse(input: number, radix?: number): number".to_string()), false),
-            (
-                2,
-                3,
-                7,
-                5,
-                1,
-                Some("parse(input: string | number, radix?: number): any".to_string()),
-                true
-            ),
+            (2, 3, 7, 5, 1, Some("parse(input: string | number, radix?: number): any".to_string()), true),
         ]
     );
 
@@ -199,9 +186,8 @@ fn a_freshly_built_index_reads_schema_version_7() {
     let project = Project::new();
     let conn = project.walk();
 
-    let version: String = conn
-        .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
-        .unwrap();
+    let version: String =
+        conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, "7");
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
@@ -224,8 +210,7 @@ fn the_plugins_own_ndjson_mentions_declarations_only_for_the_overloaded_node() {
     assert!(output.status.success(), "the plugin's bulk index exited with {}", output.status);
 
     let stdout = String::from_utf8(output.stdout).expect("the plugin's stream must be UTF-8");
-    let mentioning: Vec<&str> =
-        stdout.lines().filter(|line| line.contains("declarations")).collect();
+    let mentioning: Vec<&str> = stdout.lines().filter(|line| line.contains("declarations")).collect();
 
     assert_eq!(mentioning.len(), 1, "exactly one node in this file has more than one declaration");
     assert!(mentioning[0].contains("\"name\":\"parse\""), "{}", mentioning[0]);

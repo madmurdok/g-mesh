@@ -149,7 +149,10 @@ impl EmbeddingPipeline {
                 node.signature.as_deref(),
                 &self.config.model,
             ) {
-                eprintln!("g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded", node.id);
+                eprintln!(
+                    "g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded",
+                    node.id
+                );
             }
         }
         Ok(())

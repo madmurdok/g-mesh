@@ -123,8 +123,20 @@ That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
 file is checked against a pinned SHA-256 and only then moved into place, so an
 interrupted download leaves a `.partial` you can delete, never a truncated
 `model.onnx` that loads as garbage. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
-put it elsewhere; the command and the loader share one resolution function, so
-they cannot disagree.
+put it elsewhere; the command and the loader share one resolution function, and
+now pass it the same model name too — they used to share the function and hand
+it different arguments, which is a way of disagreeing that sharing a function
+does not prevent.
+
+That matters if you set `[embedding] model` to something other than the
+default. The model directory is named after the model, so the daemon reads
+`~/.g-mesh/models/<your-model>/` — and `model fetch` can only download the
+default, whose URLs and digests are the only ones pinned here. Rather than
+fetch the wrong weights into a directory nothing reads, it refuses inside such
+a project and names the directory you need to fill yourself; `model status`
+reports that same directory, says which model name it resolved and where the
+name came from, and notes that fetching cannot fill it. Outside a project, and
+with an explicit `--dir`, both behave exactly as before.
 
 The download is HTTPS from the binary itself — no `curl`, no Python, no
 Hugging Face CLI. `core/scripts/fetch-embedding-model.sh` does the same
@@ -331,13 +343,14 @@ than a server capability description does):
 - No manual indexing command exists or is needed. The g-mesh daemon bootstraps and indexes a project automatically on its first tool call in that project's directory. On first use in a new project, just issue any g-mesh call (e.g. `get_file_outline` on a source file) to trigger indexing, then proceed.
 - How to use the tools:
   - `get_file_outline(file_path)` — list a file's top-level symbols before reading it in full, or to find the right symbol name to query next.
-  - `find_definition(symbol_name)` or `find_definition(file_path, position)` — resolve a symbol to its definition and get its `symbol_id`. Not required before the tools below — they accept `symbol_name` directly, skip this call when the name is likely unambiguous, and their response's `anchor` field ({id, qualifiedName, kind, filePath, startLine}) already gives the declaration site. Call `find_definition` first only when you expect ambiguity.
+  - `find_definition(symbol_name)` or `find_definition(file_path, position)` — resolve a symbol to its definition and get its `symbol_id`. **The response carries the declaration's own source in `source.text`, so do not follow it with a Read or Grep of that file — the code you were about to look at is already in the answer.** A long declaration is cut at a line/char cap and says so in `source.omittedLines`; only then is reading the file worth a turn. Pass `include_source: false` if you genuinely want coordinates alone. Not required before the tools below — they accept `symbol_name` directly, skip this call when the name is likely unambiguous, and their response's `anchor` field ({id, qualifiedName, kind, filePath, startLine}) already gives the declaration site. Call `find_definition` first only when you expect ambiguity.
   - `find_references(symbol_name or symbol_id)` — every usage of a symbol across the project; use before renaming or removing something.
   - `find_callers(symbol_name or symbol_id)` / `find_callees(...)` — walk the call graph up or down from a function.
   - `find_implementations(symbol_name or symbol_id)` — concrete types implementing an interface/abstract class.
   - `get_dependencies(file_path, direction: Outgoing|Incoming)` — walk the import graph (what a file imports / what imports it); use for impact analysis before changing a shared module.
   - `search_code(query)` — free-text semantic search over doc comments and signatures, ranked by similarity. Default to this as your *first* move on a "find the function/bug that does X" prompt when no symbol name is given — not something to reach for only after Grep has already failed a few times. Measured: on a bug-hunt task with no named symbol, reps that called `search_code` first converged in 8-11 turns; the one rep that skipped it and grep-guessed regex patterns from turn 1 took 15 turns for the same final answer (g-mesh-bench, `ex-implement-mutateelement-elbow-zero-position`). Skip it only for a symbol whose name you already know — `find_definition`/`find_references` are cheaper and exact there. Needs the project's embedding model available; if it errors saying semantic search is unavailable, fall back to grep or the structural tools instead.
   - If a `symbol_name` turns out ambiguous, the result carries `ambiguous: true` with a ranked candidate list — re-query using a candidate's `id` as `symbol_id`, not its `qualifiedName` (the same qualifiedName can name more than one declaration).
+  - **Read `resolvedBy` before trusting a result.** `id`/`qualifiedName`/`name` mean the symbol was resolved exactly. `nameAmbiguous`/`fileName`/`semanticNeighbours` mean the answer is *candidates* — pick one by `id` and re-query. `semanticNeighbours` is the weakest: nothing structural matched, so these are the nearest declarations *by meaning*, and a closely-related-but-wrong one can score as high as the right one (measured: `AppState` returns `createAppState` at 0.845). Check the candidate before you build on it. Getting candidates back is still cheaper than the tool refusing and you re-asking another way, which is why they are offered at all.
 - Typical flow: call `find_references`/`find_callers`/`find_callees`/`find_implementations` directly with `symbol_name` when it's likely unique — their `anchor` field already carries the declaration site, so only call `find_definition` first if you expect ambiguity. Use `get_file_outline` first if you don't already know the right symbol name.
 - A `find_references`/`find_callers`/`find_callees`/`find_implementations` result is complete for the question it answers when: it was anchored by `symbol_id` or an unambiguous `symbol_name` (same guarantee either way), every row shows `resolved: true`, and the response has no `allUnresolved: true` flag — don't re-verify that with grep/Read. As of g-mesh 0.8.x, `resolved: false` is a narrow, accurate signal (only edges whose target is in another file g-mesh couldn't confirm — same-file edges are always `resolved: true`, matched against declarations actually in scope), not a blanket disclaimer, so still check: a row that shows `resolved: false` (check that row, not the whole list), a response with `allUnresolved: true` (the whole page is unconfirmed), or anything the result doesn't claim to cover at all — e.g. whether other, similarly-named symbols exist elsewhere, or a method call reached through a variable receiver (`x.foo()`, which produces no edge by design). Measured on real g-mesh-bench runs after the 0.8.x same-file-resolution fix: mean cost dropped ~38% and mean turns ~35% on the task this was tested on, with the remaining tool calls answering things g-mesh genuinely doesn't cover rather than re-checking it — but grep/Read still earn their keep on the cases above, so don't suppress those.
 - Resolving an ambiguous name (the bullet above on `ambiguous: true` candidates) to a specific `symbol_id` doesn't reopen the completeness question: a `find_references`/`find_callers`/`find_callees`/`find_implementations` page anchored by that `symbol_id` carries the exact same `resolved: true`/no-`allUnresolved` guarantee as an unambiguous `symbol_name` query. Once you've picked the right candidate, treat its result as final — don't grep/Read each returned call site file-by-file to reconfirm it's "really" that symbol and not the same-named other one, and don't run a second, broad text search across the repo to check for anything the query might have missed. Both duplicate work the tool has already resolved, the same way re-verifying a plain unambiguous result would.
@@ -486,6 +499,15 @@ that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
 would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
 installer, not to the binary.
 
+One constraint comes with it: the daemon's socket lives under that root, and a
+Unix domain socket address holds at most 104 bytes of path on macOS (108 on
+Linux) — so a `G_MESH_HOME` nested deeply enough pushes
+`<root>/projects/<hash>/daemon.sock` past the limit and no daemon can listen
+there at all. g-mesh refuses such a root up front, naming the path and both
+numbers, rather than starting a daemon that dies on `bind` and leaving you
+with a connection timeout ten seconds later. The default `~/.g-mesh` is
+nowhere near it; only a deliberately relocated root can reach it.
+
 Upgrading g-mesh does not need that, though: an index records which build of
 the indexing pipeline filled it — core's own generation *and* a digest of the
 JS/TS plugin's compiled output — and an index that no longer matches is wiped
@@ -560,6 +582,33 @@ temp-directory fixtures, so they care about the environment they run in:
   stderr (and its plugins') to that file instead of discarding it. Detached
   daemons have no console, so this is the only way to see what one is doing
   during a test run; unset, nothing changes.
+
+### What CI runs, and what is still only local
+
+`.github/workflows/ci.yml` runs on every push to `main`/`release-*` and every
+pull request, and `release.yml` calls the same workflow as a gate — so nothing
+can be published from a commit whose tests have not passed:
+
+- **`cargo test` on all four supported targets**, the same rows `release.yml`
+  builds (`x86_64-apple-darwin`, `aarch64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`). Before this existed
+  the Windows port was verified by compilation alone: no unit test and no
+  integration binary had ever been executed there.
+- **`cargo fmt --check`** and **`cargo clippy`**, the latter denying warnings.
+- **shellcheck** over every `*.sh`, at the lowest severity, with the version
+  pinned so a new ShellCheck release cannot turn the gate red on unchanged
+  code.
+
+Formatting is enforced against `rustfmt.toml`, whose values were recovered by
+measurement rather than picked — that file shows the working. The one-time
+reformat that made the check passable is listed in `.git-blame-ignore-revs`, so
+`git blame` skips straight past it.
+
+Still only local, deliberately:
+
+- **The embedding-weights tests**, which stay `#[ignore]`d. 612 MiB per runner
+  on four runners is not a cost worth paying to check that a download works.
+- **The benchmarks** (`g-mesh-bench`), which cost model spend per run.
 
 ## License
 

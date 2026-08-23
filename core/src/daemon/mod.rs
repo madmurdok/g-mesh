@@ -15,7 +15,6 @@ pub mod semantic;
 pub(crate) mod test_plugin;
 
 use std::fs::{self, File, TryLockError};
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -54,6 +53,23 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// on it would deadlock against the shim waiting for the daemon.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
+/// Where the lock's holder records that it has begun serving.
+///
+/// Beside the lock rather than inside it, and the distinction is a portability
+/// bug this cost us: `File::try_lock` is `flock` on Unix and `LockFileEx` on
+/// Windows, and std documents the difference in as many words - "this lock may
+/// be advisory or mandatory... its interactions with other methods, such as
+/// read and write are platform specific". Reading a locked file from a second
+/// handle is fine on Unix and fails on Windows, so a record written into the
+/// lock file was simply invisible there: `serving_owner_in` turned the error
+/// into `None`, every wedged daemon read as `Starting`, and nothing could evict
+/// it. Found by the first `cargo test` ever run on Windows (GM-244).
+///
+/// The property the old design was after survives the move: only the lock's
+/// holder ever writes this file, because it is written after taking the lock
+/// and cleared by whoever takes it next.
+const DAEMON_SERVING_FILE: &str = "daemon.serving";
+
 /// How long the watcher thread waits, after the most recent raw filesystem
 /// event for a given path, before treating that path's burst as settled and
 /// asking the plugin to reparse it - the window
@@ -89,8 +105,7 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 /// for why the second cannot be a file.
 pub fn endpoint(root: &Path) -> Result<ipc::Endpoint> {
     let dir = project_dir(root)?;
-    endpoint_in(&dir)
-        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))
+    endpoint_in(&dir).with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))
 }
 
 /// [`endpoint`] resolved from an already-known state directory rather than
@@ -185,6 +200,10 @@ pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
 
 pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(DAEMON_LOCK_FILE)
+}
+
+fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(DAEMON_SERVING_FILE)
 }
 
 /// Reads a pid out of one of the files above. `None` for a file that isn't
@@ -294,8 +313,8 @@ pub fn run(root: &Path) -> Result<()> {
     // `G_MESH_PLUGIN_ROOTS_OVERRIDE` replaces both standard roots wholesale,
     // so a test can hand this a fixture directory instead of touching the
     // real `~/.g-mesh/plugins/`.
-    let discovered = manifest::discover(&manifest::default_roots())
-        .context("failed to discover language plugins")?;
+    let discovered =
+        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
 
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     // The generation names every discovered plugin's build as well as core's
@@ -368,20 +387,20 @@ pub fn run(root: &Path) -> Result<()> {
     fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
 
-    // And recorded in the lock file too, now that this process is genuinely
+    // And recorded beside the lock too, now that this process is genuinely
     // serving. The pid file above answers "which process is the daemon"; this
     // answers "is the lock's holder still doing the job the lock entitles it
     // to", which is the only question a process that cannot take the lock can
     // usefully ask - and the one nothing could answer before task 184. See
     // `record_serving_owner`.
-    record_serving_owner(&singleton);
+    record_serving_owner(&dir);
 
     // Both idle timers are resolved once, here, from the project's
     // config.toml (or its documented defaults, for a project with none), and
     // handed to everything that has to honor them - see `daemon::lifecycle`
     // for what each one governs.
-    let project_config = crate::config::read_project_config(root)
-        .context("failed to read the project's config.toml")?;
+    let project_config =
+        crate::config::read_project_config(root).context("failed to read the project's config.toml")?;
     let timeouts = IdleTimeouts::from_config(&project_config);
 
     // Not loaded here, not even in the background: `EmbeddingPipeline::load`
@@ -440,8 +459,7 @@ pub fn run(root: &Path) -> Result<()> {
     // Decided from a fact recorded on disk, not from how this start went, so
     // a restart against an already-walked project (the common case) is `ready`
     // from its first instant and no caller ever sees "still indexing" for it.
-    let indexing =
-        if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
+    let indexing = if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
 
     // The accept loop moves to a thread of its own so the walk below can run
     // alongside it. It, not this function, is the daemon's real main loop;
@@ -460,14 +478,36 @@ pub fn run(root: &Path) -> Result<()> {
         let indexing = indexing.clone();
         let embedding = Arc::clone(&embedding);
         thread::spawn(move || {
-            let _ = accept_result
-                .send(serve_forever(listener, conn, registry, core_activity, indexing, embedding));
+            let _ = accept_result.send(serve_forever(
+                listener,
+                conn,
+                registry,
+                core_activity,
+                indexing,
+                embedding,
+            ));
         });
     }
 
-    // Cold start only, and before the watcher: a bulk walk racing incremental
-    // updates could commit its own (older) parse of a file over one the
-    // watcher had just refreshed. Connections accepted while this runs are
+    // Registered here, before the walk, and deliberately not *drained* until
+    // after it. The two are separable and conflating them cost a lost edit:
+    // `ProjectWatcher` is backed by an mpsc channel, so from this line on the
+    // OS watch exists and every event queues up whether or not anyone is
+    // reading. What the ordering below protects against is the walk racing
+    // incremental *processing*, and that only begins when the consumer thread
+    // further down starts calling `next_change` - so the guarantee is
+    // untouched while the window closes.
+    //
+    // The window was real. Between the walk finishing its enumeration and the
+    // watcher existing, an edit had no observer at all and was dropped until
+    // something touched the file again - during cold start only, and narrow,
+    // but wide enough that one integration test caught it five times in a day
+    // on a loaded runner (GM-250), and wide enough to lose a user's edit.
+    let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
+
+    // Cold start only, and before the watcher is *drained*: a bulk walk racing
+    // incremental updates could commit its own (older) parse of a file over
+    // one the watcher had just refreshed. Connections accepted while this runs are
     // answered with `mcp`'s "still indexing" error rather than off the batches
     // committed so far, so a client's query is never answered off a half-built
     // graph - the same promise the old "bind only once this returns" ordering
@@ -591,7 +631,9 @@ pub fn run(root: &Path) -> Result<()> {
         );
         let semantic_outcome = semantic::run_with_registry(&registry, &conn);
         match &semantic_outcome {
-            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete"),
+            Ok(true) => {
+                eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete")
+            }
             Ok(false) => {}
             Err(err) => eprintln!(
                 "g-mesh daemon: retrying the semantic pass failed ({err:#}) - \
@@ -605,7 +647,6 @@ pub fn run(root: &Path) -> Result<()> {
         }
     }
 
-    let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
     {
         let conn = Arc::clone(&conn);
         let registry = Arc::clone(&registry);
@@ -693,10 +734,7 @@ fn stand_down(root: &Path) -> Result<()> {
         // the failed acquisition and this check, which is a bootstrap that
         // arrived a moment too early rather than a fault: the next one wins.
         DaemonLock::Free | DaemonLock::Serving | DaemonLock::Starting => {
-            eprintln!(
-                "g-mesh daemon: another daemon already serves {} - exiting",
-                root.display()
-            );
+            eprintln!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
             Ok(())
         }
     }
@@ -782,15 +820,11 @@ fn serve_forever(
         .context("failed to build the daemon's async runtime")?;
 
     runtime.block_on(async move {
-        let mut listener = listener
-            .into_async()
-            .context("failed to register the daemon endpoint with the async runtime")?;
+        let mut listener =
+            listener.into_async().context("failed to register the daemon endpoint with the async runtime")?;
 
         loop {
-            let stream = listener
-                .accept()
-                .await
-                .context("failed to accept a daemon connection")?;
+            let stream = listener.accept().await.context("failed to accept a daemon connection")?;
             let conn = Arc::clone(&conn);
             let registry = Arc::clone(&registry);
             let indexing = indexing.clone();
@@ -804,15 +838,8 @@ fn serve_forever(
                 // Dropped when this session ends, whichever way it ends, which
                 // is also what restarts the core's idle clock.
                 let _attached = attached;
-                if let Err(err) = mcp::serve_connection(
-                    stream,
-                    conn,
-                    registry,
-                    core_activity,
-                    indexing,
-                    embedding,
-                )
-                .await
+                if let Err(err) =
+                    mcp::serve_connection(stream, conn, registry, core_activity, indexing, embedding).await
                 {
                     eprintln!("g-mesh daemon: connection ended: {err:#}");
                 }
@@ -885,10 +912,11 @@ fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     loop {
         match file.try_lock() {
             Ok(()) => {
-                // Emptied the instant it is taken, so the file says "held by a
-                // daemon that is not serving yet" for exactly as long as that
-                // is true - see `record_serving_owner` for the other half.
-                clear_serving_owner(&file, &path);
+                // Cleared the instant the lock is taken, so the state reads
+                // "held by a daemon that is not serving yet" for exactly as
+                // long as that is true - see `record_serving_owner` for the
+                // other half.
+                clear_serving_owner(dir);
                 return Ok(Some(file));
             }
             Err(TryLockError::WouldBlock) => {
@@ -997,9 +1025,9 @@ fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
 /// evicted. Two different questions, and a pid file that could only answer the
 /// first is why `cli::stop` could not see the wedged daemon at all.
 ///
-/// Written into the lock file rather than alongside it so the two can never
-/// disagree: whoever reads it is reading the very file whose lock they just
-/// found held, and only the holder can have written it.
+/// Written *beside* the lock file, not into it - see [`DAEMON_SERVING_FILE`]
+/// for the portability reason, and for why "only the holder can have written
+/// it" still holds.
 ///
 /// Terminated by a newline, and [`serving_owner_in`] refuses a record without
 /// one. Nothing else in the daemon's pid files bothers, and this one has to:
@@ -1012,26 +1040,26 @@ fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
 /// Best-effort, like every other pid-file write in the daemon: the cost of
 /// failing is a wedge that reads as `Starting` and is left alone, which is the
 /// behaviour this project had before the record existed.
-fn record_serving_owner(lock: &File) {
-    if let Err(err) = write_lock_body(lock, format!("{}\n", std::process::id()).as_bytes()) {
-        eprintln!("g-mesh daemon: failed to record itself as the lock's owner: {err}");
+fn record_serving_owner(state_dir: &Path) {
+    let path = serving_owner_path_in(state_dir);
+    if let Err(err) = fs::write(&path, format!("{}\n", std::process::id())) {
+        eprintln!("g-mesh daemon: failed to record itself as the lock's owner in {}: {err}", path.display());
     }
 }
 
-/// Empties the lock file, so a fresh holder does not inherit its predecessor's
-/// claim to be serving.
-fn clear_serving_owner(lock: &File, path: &Path) {
-    if let Err(err) = write_lock_body(lock, b"") {
-        eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display());
+/// Removes the record, so a fresh holder does not inherit its predecessor's
+/// claim to be serving. Called under the lock, which is what makes "only the
+/// holder writes this" true.
+///
+/// A missing file is the same state as an empty one - nothing recorded - so
+/// `NotFound` is not worth reporting.
+fn clear_serving_owner(state_dir: &Path) {
+    let path = serving_owner_path_in(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display()),
     }
-}
-
-fn write_lock_body(lock: &File, body: &[u8]) -> std::io::Result<()> {
-    let mut handle = lock;
-    handle.set_len(0)?;
-    handle.seek(SeekFrom::Start(0))?;
-    handle.write_all(body)?;
-    handle.flush()
 }
 
 /// The pid the lock's holder recorded once it began serving, if any.
@@ -1042,7 +1070,7 @@ fn write_lock_body(lock: &File, body: &[u8]) -> std::io::Result<()> {
 /// daemon's other pid files, with the newline requirement
 /// [`record_serving_owner`] explains added on top.
 pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
-    let recorded = fs::read_to_string(daemon_lock_path_in(state_dir)).ok()?;
+    let recorded = fs::read_to_string(serving_owner_path_in(state_dir)).ok()?;
     recorded.strip_suffix('\n')?.trim().parse().ok()
 }
 
@@ -1132,16 +1160,13 @@ mod tests {
     #[test]
     fn an_unheld_lock_reads_as_free() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            inspect_daemon_lock_in(dir.path(), false).unwrap(),
-            DaemonLock::Free
-        );
+        assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Free);
 
         // Including once a daemon has held it and let it go - the pid it
         // recorded while serving must not outlive the lock itself, or a
         // recycled pid would read as a wedged incumbent.
         let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        record_serving_owner(dir.path());
         drop(lock);
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), false).unwrap(),
@@ -1172,14 +1197,12 @@ mod tests {
     #[test]
     fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        let _lock = held_lock(dir.path());
+        record_serving_owner(dir.path());
 
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), false).unwrap(),
-            DaemonLock::Wedged {
-                pid: std::process::id()
-            },
+            DaemonLock::Wedged { pid: std::process::id() },
             "a live holder that was serving and answers nothing is the wedge, and it must be \
              named by pid so `stop` and the shim can act on it"
         );
@@ -1191,8 +1214,8 @@ mod tests {
     #[test]
     fn a_holder_that_is_still_answering_is_never_wedged() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = held_lock(dir.path());
-        record_serving_owner(&lock);
+        let _lock = held_lock(dir.path());
+        record_serving_owner(dir.path());
 
         assert_eq!(
             inspect_daemon_lock_in(dir.path(), true).unwrap(),
@@ -1208,20 +1231,13 @@ mod tests {
     fn a_new_holder_does_not_inherit_its_predecessors_claim_to_be_serving() {
         let dir = tempfile::tempdir().unwrap();
         let first = held_lock(dir.path());
-        record_serving_owner(&first);
+        record_serving_owner(dir.path());
         assert_eq!(serving_owner_in(dir.path()), Some(std::process::id()));
         drop(first);
 
         let _second = held_lock(dir.path());
-        assert_eq!(
-            serving_owner_in(dir.path()),
-            None,
-            "taking the lock clears the record"
-        );
-        assert_eq!(
-            inspect_daemon_lock_in(dir.path(), false).unwrap(),
-            DaemonLock::Starting
-        );
+        assert_eq!(serving_owner_in(dir.path()), None, "taking the lock clears the record");
+        assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
     }
 
     /// A lock file from a build that predates the record reads as `Starting` -
@@ -1230,20 +1246,15 @@ mod tests {
     #[test]
     fn a_lock_file_with_no_record_in_it_is_never_treated_as_wedged() {
         let dir = tempfile::tempdir().unwrap();
+        // The *lock* file: this holds the lock to make the state read as held,
+        // and asserts that a holder with no serving record beside it is
+        // starting up rather than wedged.
         let path = dir.path().join(DAEMON_LOCK_FILE);
-        let holder = File::options()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .unwrap();
+        let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
         holder.lock().unwrap();
 
         assert_eq!(serving_owner_in(dir.path()), None);
-        assert_eq!(
-            inspect_daemon_lock_in(dir.path(), false).unwrap(),
-            DaemonLock::Starting
-        );
+        assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
     }
 
     /// The record is what decides whether a live process gets signalled, so a
@@ -1254,7 +1265,7 @@ mod tests {
     #[test]
     fn a_record_without_its_terminating_newline_is_not_a_record() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DAEMON_LOCK_FILE);
+        let path = dir.path().join(DAEMON_SERVING_FILE);
 
         for partial in ["", "1", "12", "1234"] {
             fs::write(&path, partial).unwrap();
@@ -1276,7 +1287,9 @@ mod tests {
     /// the registry is done with them. Mirrors `daemon::registry`'s own
     /// `registry_over` test fixture, which is private to that module and so
     /// not reusable from here directly.
-    fn registry_over(languages: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+    fn registry_over(
+        languages: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -1288,8 +1301,8 @@ mod tests {
             })
             .collect();
 
-        let discovered = manifest::discover(&[plugins.path().to_path_buf()])
-            .expect("the fixtures must discover cleanly");
+        let discovered =
+            manifest::discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
         let root = project.path().canonicalize().expect("failed to canonicalize the fixture project root");
         let state_dir =
             project_dir(project.path()).expect("failed to resolve the fixture project's state directory");
@@ -1440,4 +1453,3 @@ mod tests {
         );
     }
 }
-

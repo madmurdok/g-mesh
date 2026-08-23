@@ -9,7 +9,6 @@
 //! stays pinned by something that does not share the server's own code.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -20,6 +19,8 @@ use rmcp::ServiceExt;
 use serde_json::json;
 use tokio::process::Command;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -28,16 +29,22 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
     ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
     ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    ("find_definition", &["symbol_name", "file_path", "position", "cursor"]),
+    ("find_definition", &["symbol_name", "file_path", "position", "cursor", "include_source"]),
     (
         "find_implementations",
-        &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "transitive", "max_depth", "resume_token"],
+        &[
+            "symbol_id",
+            "symbol_name",
+            "cursor",
+            "limit",
+            "file_paths",
+            "transitive",
+            "max_depth",
+            "resume_token",
+        ],
     ),
     ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    (
-        "get_dependencies",
-        &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"],
-    ),
+    ("get_dependencies", &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"]),
     ("get_file_outline", &["file_path", "cursor", "limit"]),
     ("search_code", &["query", "cursor", "limit"]),
 ];
@@ -74,7 +81,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         if self.pid_file().exists() {
             let pid = self.daemon_pid();
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).status();
+            common::kill_and_wait(pid);
         }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
@@ -83,12 +90,7 @@ impl Drop for Project {
 }
 
 fn is_alive(pid: u32) -> bool {
-    StdCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .expect("failed to signal a process")
-        .success()
+    daemon::is_process_alive(pid)
 }
 
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
@@ -110,9 +112,9 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // Same spawn shape the MCP client of a real editor uses: the project
     // directory as cwd is the shim's entire notion of project identity.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
 
@@ -140,11 +142,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
         for param in params {
             assert!(properties.contains_key(*param), "{name} is missing parameter `{param}`");
         }
-        assert_eq!(
-            properties.len(),
-            params.len(),
-            "{name} publishes unexpected parameters: {properties:?}"
-        );
+        assert_eq!(properties.len(), params.len(), "{name} publishes unexpected parameters: {properties:?}");
         assert!(
             tool.description.as_ref().is_some_and(|d| !d.is_empty()),
             "{name} has no description for an agent to choose it by"
@@ -170,10 +168,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // after it is the strongest form of that assertion.
     let pid = project.daemon_pid();
     assert!(is_alive(pid), "the daemon died during the session");
-    let listed_again = client
-        .list_tools(None)
-        .await
-        .expect("the session must survive a failed tool call");
+    let listed_again = client.list_tools(None).await.expect("the session must survive a failed tool call");
     assert_eq!(listed_again.tools.len(), EXPECTED_TOOLS.len());
 
     client.cancel().await.expect("failed to shut the client down");

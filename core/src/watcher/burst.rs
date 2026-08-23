@@ -42,20 +42,35 @@ impl BurstBatcher {
     /// batcher tracks one shared timer for the whole batch, not per-path -
     /// it's accepted purely so callers can identify/trace which file each
     /// diff came from.
-    pub fn record(&mut self, _path: PathBuf, diff: Diff) {
+    pub fn record(&mut self, path: PathBuf, diff: Diff) {
+        self.record_at(path, diff, Instant::now());
+    }
+
+    /// [`record`](Self::record) with the clock supplied rather than read.
+    ///
+    /// The three `_at` methods exist so the tests can decide *what time it is*
+    /// instead of sleeping and hoping. The window logic is a function of
+    /// timestamps; sleeping made it a function of the scheduler too, and the
+    /// `aarch64-apple-darwin` runner overshot a 30ms sleep past a 50ms window
+    /// and failed a test that is not about sleeping at all (GM-245).
+    fn record_at(&mut self, _path: PathBuf, diff: Diff, now: Instant) {
         self.pending.upsert_nodes.extend(diff.upsert_nodes);
         self.pending.delete_node_ids.extend(diff.delete_node_ids);
         self.pending.upsert_edges.extend(diff.upsert_edges);
         self.pending.delete_edge_ids.extend(diff.delete_edge_ids);
-        self.last_seen = Some(Instant::now());
+        self.last_seen = Some(now);
     }
 
     /// True once there is at least one pending diff *and* the shared
     /// window has elapsed since the last recorded event - the trailing-edge
     /// condition meaning the burst has gone quiet and is safe to flush.
     pub fn ready_to_flush(&self) -> bool {
+        self.ready_to_flush_at(Instant::now())
+    }
+
+    fn ready_to_flush_at(&self, now: Instant) -> bool {
         match self.last_seen {
-            Some(seen) => !self.pending.is_empty() && Instant::now().duration_since(seen) >= self.window,
+            Some(seen) => !self.pending.is_empty() && now.duration_since(seen) >= self.window,
             None => false,
         }
     }
@@ -67,7 +82,11 @@ impl BurstBatcher {
     /// isn't ready yet, mirroring `Debouncer::drain_ready`'s "returns and
     /// clears only when ready" pattern.
     pub fn flush_if_ready(&mut self, conn: &mut Connection) -> Result<bool> {
-        if !self.ready_to_flush() {
+        self.flush_if_ready_at(conn, Instant::now())
+    }
+
+    fn flush_if_ready_at(&mut self, conn: &mut Connection, now: Instant) -> Result<bool> {
+        if !self.ready_to_flush_at(now) {
             return Ok(false);
         }
         let diff = std::mem::take(&mut self.pending);
@@ -84,7 +103,6 @@ mod tests {
     use crate::storage::write::NodeRecord;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::thread;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -94,8 +112,7 @@ mod tests {
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
     }
 
     /// Registers a real SQLite `commit_hook` on `conn` and returns a counter
@@ -113,6 +130,14 @@ mod tests {
         counter
     }
 
+    /// A fixed starting point, so every test below states its timeline in
+    /// milliseconds from it instead of sleeping. `Instant` has no public
+    /// constructor, so "now" is read exactly once per test and offset from -
+    /// which is enough: nothing here compares against the real clock again.
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
     fn node_diff(id: &str) -> Diff {
         Diff {
             upsert_nodes: vec![NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust")],
@@ -126,19 +151,19 @@ mod tests {
         let commits = install_commit_counter(&conn);
         let mut batcher = BurstBatcher::new(Duration::from_millis(50));
 
+        let t0 = Instant::now();
         for i in 0..50 {
             let id = format!("n{i}");
-            batcher.record(PathBuf::from(format!("file{i}.rs")), node_diff(&id));
+            batcher.record_at(PathBuf::from(format!("file{i}.rs")), node_diff(&id), at(t0, i));
         }
 
         assert!(
-            !batcher.flush_if_ready(&mut conn).unwrap(),
-            "burst is still within the window, must not flush yet"
+            !batcher.flush_if_ready_at(&mut conn, at(t0, 60)).unwrap(),
+            "11ms since the last of the fifty is still inside the 50ms window"
         );
         assert_eq!(commits.load(Ordering::SeqCst), 0);
 
-        thread::sleep(Duration::from_millis(60));
-        assert!(batcher.flush_if_ready(&mut conn).unwrap());
+        assert!(batcher.flush_if_ready_at(&mut conn, at(t0, 100)).unwrap());
 
         assert_eq!(commits.load(Ordering::SeqCst), 1, "all 50 files' diffs must land in exactly one commit");
         assert_eq!(count(&conn, "nodes"), 50, "no node from the combined diff may be dropped or truncated");
@@ -150,11 +175,17 @@ mod tests {
         let commits = install_commit_counter(&conn);
         let mut batcher = BurstBatcher::new(Duration::from_millis(50));
 
-        batcher.record(PathBuf::from("a.rs"), node_diff("n1"));
-        assert!(!batcher.flush_if_ready(&mut conn).unwrap(), "must not flush before the window elapses");
+        let t0 = Instant::now();
+        batcher.record_at(PathBuf::from("a.rs"), node_diff("n1"), t0);
+        assert!(
+            !batcher.flush_if_ready_at(&mut conn, at(t0, 49)).unwrap(),
+            "must not flush before the window elapses"
+        );
 
-        thread::sleep(Duration::from_millis(60));
-        assert!(batcher.flush_if_ready(&mut conn).unwrap(), "an isolated change flushes on its own after one window");
+        assert!(
+            batcher.flush_if_ready_at(&mut conn, at(t0, 50)).unwrap(),
+            "an isolated change flushes on its own after exactly one window"
+        );
 
         assert_eq!(commits.load(Ordering::SeqCst), 1);
         assert_eq!(count(&conn, "nodes"), 1);
@@ -166,21 +197,23 @@ mod tests {
         let commits = install_commit_counter(&conn);
         let mut batcher = BurstBatcher::new(Duration::from_millis(50));
 
-        batcher.record(PathBuf::from("a.rs"), node_diff("n1"));
-        thread::sleep(Duration::from_millis(60));
+        let t0 = Instant::now();
+        batcher.record_at(PathBuf::from("a.rs"), node_diff("n1"), t0);
         assert!(
-            batcher.flush_if_ready(&mut conn).unwrap(),
+            batcher.flush_if_ready_at(&mut conn, at(t0, 50)).unwrap(),
             "a's window elapsed with nothing else pending, so it must flush on its own"
         );
         assert_eq!(commits.load(Ordering::SeqCst), 1);
 
         // b arrives well after a already flushed - it must not be held open
         // waiting to be combined with something that already left.
-        batcher.record(PathBuf::from("b.rs"), node_diff("n2"));
-        assert!(!batcher.flush_if_ready(&mut conn).unwrap(), "b's own window hasn't elapsed yet");
+        batcher.record_at(PathBuf::from("b.rs"), node_diff("n2"), at(t0, 60));
+        assert!(
+            !batcher.flush_if_ready_at(&mut conn, at(t0, 90)).unwrap(),
+            "b's own window hasn't elapsed yet"
+        );
 
-        thread::sleep(Duration::from_millis(60));
-        assert!(batcher.flush_if_ready(&mut conn).unwrap());
+        assert!(batcher.flush_if_ready_at(&mut conn, at(t0, 120)).unwrap());
 
         assert_eq!(commits.load(Ordering::SeqCst), 2, "two separate commits, not coalesced into one");
         assert_eq!(count(&conn, "nodes"), 2);
@@ -192,18 +225,18 @@ mod tests {
         let commits = install_commit_counter(&conn);
         let mut batcher = BurstBatcher::new(Duration::from_millis(50));
 
-        batcher.record(PathBuf::from("a.rs"), node_diff("n1"));
-        thread::sleep(Duration::from_millis(30));
-        batcher.record(PathBuf::from("b.rs"), node_diff("n2")); // resets the shared timer before it would have fired
-        thread::sleep(Duration::from_millis(30));
+        let t0 = Instant::now();
+        batcher.record_at(PathBuf::from("a.rs"), node_diff("n1"), t0);
+        // Resets the shared timer before it would have fired.
+        batcher.record_at(PathBuf::from("b.rs"), node_diff("n2"), at(t0, 30));
 
         assert!(
-            !batcher.flush_if_ready(&mut conn).unwrap(),
-            "30ms since the second record is still under the 50ms window"
+            !batcher.flush_if_ready_at(&mut conn, at(t0, 60)).unwrap(),
+            "30ms since the second record is still under the 50ms window - and 60ms since the \
+             first, which is what would have flushed had the second not reset the timer"
         );
 
-        thread::sleep(Duration::from_millis(30));
-        assert!(batcher.flush_if_ready(&mut conn).unwrap());
+        assert!(batcher.flush_if_ready_at(&mut conn, at(t0, 80)).unwrap());
 
         assert_eq!(commits.load(Ordering::SeqCst), 1, "both files combined into a single commit");
         assert_eq!(count(&conn, "nodes"), 2);

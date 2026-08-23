@@ -159,19 +159,14 @@ pub struct PluginManifest {
 pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
 
-    let contents = fs::read_to_string(&manifest_path).with_context(|| {
-        format!("failed to read plugin manifest at {}", manifest_path.display())
-    })?;
-    let raw: RawManifest = toml::from_str(&contents).with_context(|| {
-        format!("failed to parse plugin manifest at {}", manifest_path.display())
-    })?;
+    let contents = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read plugin manifest at {}", manifest_path.display()))?;
+    let raw: RawManifest = toml::from_str(&contents)
+        .with_context(|| format!("failed to parse plugin manifest at {}", manifest_path.display()))?;
     let plugin = raw.plugin;
 
     let dir_name = dir.file_name().and_then(|name| name.to_str()).with_context(|| {
-        format!(
-            "plugin manifest directory {} has no valid (UTF-8) directory name",
-            dir.display()
-        )
+        format!("plugin manifest directory {} has no valid (UTF-8) directory name", dir.display())
     })?;
     if plugin.language != dir_name {
         bail!(
@@ -246,9 +241,8 @@ pub fn discover(roots: &[PathBuf]) -> Result<DiscoveredPlugins> {
         };
 
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!("failed to read plugin discovery root {}", root.display())
-            })?;
+            let entry =
+                entry.with_context(|| format!("failed to read plugin discovery root {}", root.display()))?;
             let dir = entry.path();
             if !dir.is_dir() || !dir.join(MANIFEST_FILE_NAME).is_file() {
                 continue;
@@ -388,8 +382,8 @@ mod tests {
     }
 
     fn json_at(path: &Path) -> serde_json::Value {
-        let contents = fs::read_to_string(path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let contents =
+            fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
         serde_json::from_str(&contents)
             .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
     }
@@ -445,8 +439,8 @@ mod tests {
     /// be derived from anything at runtime.
     ///
     /// Core prints it when `handshake::verify` refuses a protocol mismatch -
-    /// "protocol version mismatch with typescript plugin (plugin version X)"
-    /// - while `g-mesh plugins list` prints the manifest's copy. The two had
+    /// "protocol version mismatch with typescript plugin (plugin version X)" -
+    /// while `g-mesh plugins list` prints the manifest's copy. The two had
     /// drifted: the manifest said 2.1.0 and the wire said 0.1.0, so the two
     /// screens a person consults about one plugin named different versions,
     /// and the one shown at the worst possible moment was three releases
@@ -468,8 +462,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("failed to spawn the bundled plugin - is it built? (`npm run build`)");
-        let mut stdout =
-            std::io::BufReader::new(plugin.stdout.take().expect("the plugin has no stdout"));
+        let mut stdout = std::io::BufReader::new(plugin.stdout.take().expect("the plugin has no stdout"));
         let handshake = crate::protocol::handshake::perform(&mut stdout);
         drop(plugin.stdin.take());
         let _ = plugin.kill();
@@ -495,10 +488,7 @@ mod tests {
                 .get(key)
                 .unwrap_or_else(|| panic!("no `{}` in the JSON being checked", keys.join(".")));
         }
-        current
-            .as_str()
-            .unwrap_or_else(|| panic!("`{}` is not a string", keys.join(".")))
-            .to_string()
+        current.as_str().unwrap_or_else(|| panic!("`{}` is not a string", keys.join("."))).to_string()
     }
 
     #[test]
@@ -580,8 +570,7 @@ mod tests {
     /// `plugin_version` (used to tell two same-language manifests apart),
     /// and `extensions` (used to construct routing conflicts).
     fn manifest_toml(language: &str, plugin_version: &str, extensions: &[&str]) -> String {
-        let extensions =
-            extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+        let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
         format!(
             r#"
 [plugin]
@@ -602,10 +591,8 @@ extensions = [{extensions}]
 
     #[test]
     fn a_language_in_an_earlier_root_shadows_the_same_language_in_a_later_root() {
-        let (_root1, root1) =
-            discovery_root(&[("python", &manifest_toml("python", "1.0.0", &[".py"]))]);
-        let (_root2, root2) =
-            discovery_root(&[("python", &manifest_toml("python", "2.0.0", &[".py"]))]);
+        let (_root1, root1) = discovery_root(&[("python", &manifest_toml("python", "1.0.0", &[".py"]))]);
+        let (_root2, root2) = discovery_root(&[("python", &manifest_toml("python", "2.0.0", &[".py"]))]);
 
         let discovered = discover(&[root1, root2]).unwrap();
 
@@ -621,7 +608,7 @@ extensions = [{extensions}]
             ("go", &manifest_toml("go", "1.0.0", &[".foo"])),
         ]);
 
-        let err = discover(&[root.clone()]).unwrap_err();
+        let err = discover(std::slice::from_ref(&root)).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("python"), "{message}");
         assert!(message.contains("go"), "{message}");
@@ -721,10 +708,7 @@ ignore = ["node_modules"]
 
         let err = read_manifest(&dir).unwrap_err();
         let message = format!("{err:#}");
-        assert!(
-            message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
-            "{message}"
-        );
+        assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
     }
 
     #[test]
@@ -748,10 +732,7 @@ extensions = [".py"]
 
         let err = read_manifest(&dir).unwrap_err();
         let message = format!("{err:#}");
-        assert!(
-            message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
-            "{message}"
-        );
+        assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
         assert!(message.contains("plugin_version"), "{message}");
     }
 

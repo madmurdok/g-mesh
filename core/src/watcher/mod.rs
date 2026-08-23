@@ -48,10 +48,7 @@ impl ProjectWatcher {
     /// reproducible on this dev platform (inotify is Linux-only) or
     /// portably/non-flakily in CI.
     #[cfg(test)]
-    fn new_simulating_watch_error(
-        root: impl AsRef<Path>,
-        simulated_error: notify::Error,
-    ) -> Result<Self> {
+    fn new_simulating_watch_error(root: impl AsRef<Path>, simulated_error: notify::Error) -> Result<Self> {
         Self::new_inner(root, Some(simulated_error))
     }
 
@@ -62,9 +59,10 @@ impl ProjectWatcher {
         // non-canonical root would make every relative-path match against
         // reported events silently fail, so canonicalize once up front and
         // use that form everywhere.
-        let root = root.as_ref().canonicalize().with_context(|| {
-            format!("failed to canonicalize project root {}", root.as_ref().display())
-        })?;
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize project root {}", root.as_ref().display()))?;
         let root = root.as_path();
 
         let mut builder = GitignoreBuilder::new(root);
@@ -273,8 +271,7 @@ mod tests {
         fs::create_dir(&affected).unwrap();
         let affected = affected.canonicalize().unwrap();
 
-        let simulated =
-            notify::Error::new(notify::ErrorKind::MaxFilesWatch).add_path(affected.clone());
+        let simulated = notify::Error::new(notify::ErrorKind::MaxFilesWatch).add_path(affected.clone());
 
         let watcher = ProjectWatcher::new_simulating_watch_error(tmp.path(), simulated)
             .expect("a MaxFilesWatch error must trigger a polling fallback, not a hard failure");
@@ -298,9 +295,6 @@ mod tests {
         let simulated = notify::Error::new(notify::ErrorKind::PathNotFound);
 
         let result = ProjectWatcher::new_simulating_watch_error(tmp.path(), simulated);
-        assert!(
-            result.is_err(),
-            "a non-watch-limit error must not be silently swallowed by the fallback"
-        );
+        assert!(result.is_err(), "a non-watch-limit error must not be silently swallowed by the fallback");
     }
 }

@@ -68,7 +68,10 @@ impl PluginStatus {
 /// the rest of this module's public types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginOutcome {
-    Loaded { version: String, status: PluginStatus },
+    Loaded {
+        version: String,
+        status: PluginStatus,
+    },
     /// In place of a version/status pair - see this module's doc comment.
     Error(String),
 }
@@ -144,8 +147,8 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
     };
 
     for entry in entries {
-        let entry = entry
-            .with_context(|| format!("failed to read plugin discovery root {}", root.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read plugin discovery root {}", root.display()))?;
         let dir = entry.path();
         if !dir.is_dir() || !dir.join(MANIFEST_FILE_NAME).is_file() {
             continue;
@@ -210,9 +213,8 @@ mod tests {
     /// confusingly, since `include_str!` bakes the manifest into the test
     /// binary and cargo only notices an edit by mtime.
     fn bundled_plugin_version() -> String {
-        BUNDLED_JS_TS_MANIFEST
-            .parse::<toml::Value>()
-            .expect("the bundled manifest must be valid TOML")["plugin"]["plugin_version"]
+        BUNDLED_JS_TS_MANIFEST.parse::<toml::Value>().expect("the bundled manifest must be valid TOML")
+            ["plugin"]["plugin_version"]
             .as_str()
             .expect("plugin_version must be a string")
             .to_string()
@@ -281,13 +283,11 @@ mod tests {
     /// just because one entry is broken.
     #[test]
     fn a_malformed_manifest_is_listed_with_an_error_instead_of_aborting_the_scan() {
-        let (_root, root) = fixture_root(&[
-            ("typescript", BUNDLED_JS_TS_MANIFEST),
-            ("broken", "this is not [ valid toml"),
-        ]);
+        let (_root, root) =
+            fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST), ("broken", "this is not [ valid toml")]);
 
-        let plugins =
-            list_from_roots(&[(root, PluginStatus::Bundled)]).expect("a bad manifest must not abort the scan");
+        let plugins = list_from_roots(&[(root, PluginStatus::Bundled)])
+            .expect("a bad manifest must not abort the scan");
 
         assert_eq!(plugins.len(), 2, "{plugins:?}");
 

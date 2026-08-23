@@ -125,21 +125,15 @@ impl IdleTimeouts {
     /// project with no config.toml resolves to exactly what this module
     /// produced before config existed.
     pub fn from_config(config: &ProjectConfig) -> Self {
-        let plugin_default =
-            Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
-        let core_default =
-            Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
+        let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
+        let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
             plugin: parse_timeout(
                 std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
                 plugin_default,
                 PLUGIN_IDLE_ENV,
             ),
-            core: parse_timeout(
-                std::env::var(CORE_IDLE_ENV).ok().as_deref(),
-                core_default,
-                CORE_IDLE_ENV,
-            ),
+            core: parse_timeout(std::env::var(CORE_IDLE_ENV).ok().as_deref(), core_default, CORE_IDLE_ENV),
         }
     }
 
@@ -399,9 +393,9 @@ impl PluginSupervisor {
                 // One unreadable file must not cost the rest of the queue its
                 // replay; it is reported and the walk carries on, matching how
                 // a live watcher event's failure is handled.
-                Err(err) => eprintln!(
-                    "g-mesh daemon: failed to replay queued change to {file_path}: {err:#}"
-                ),
+                Err(err) => {
+                    eprintln!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
+                }
             }
         }
         Ok(replayed)
@@ -438,8 +432,8 @@ impl PluginSupervisor {
     ///
     /// This is a genuinely different gap from the one
     /// `daemon::indexing_status`'s "Why the incremental-edit watcher path
-    /// does not re-arm this" section (task 111) reasons about. That argument
-    /// - a query blocks on the same mutex a live `apply_file_change` commit
+    /// does not re-arm this" section (task 111) reasons about. That argument -
+    /// a query blocks on the same mutex a live `apply_file_change` commit
     /// holds, so it can only ever read stale-but-consistent data, never torn
     /// data - is about a change the watcher *has already seen* and is in the
     /// middle of applying. It says nothing about a change the watcher never
@@ -452,8 +446,8 @@ impl PluginSupervisor {
     /// separate gap task 111 flagged as worth its own task rather than
     /// folding into `IndexingStatus`, and this method is that task's wiring.
     ///
-    /// Wakes the plugin exactly like [`replay_pending`](Self::replay_pending)
-    /// - spawning it if it is asleep - but only when the mtime/hash
+    /// Wakes the plugin exactly like [`replay_pending`](Self::replay_pending) -
+    /// spawning it if it is asleep - but only when the mtime/hash
     /// comparison actually calls for a reindex; the common case (nothing
     /// changed) resolves off the `indexed_files` table alone and never
     /// touches the plugin lock, matching the two-tier design

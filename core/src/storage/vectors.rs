@@ -45,9 +45,16 @@ pub fn register_extension() {
         // `test_rusqlite_auto_extension`, which registers it the same way);
         // the transmute only recovers that signature from the crate's
         // `extern "C"` declaration, which itself has none.
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        // Spelled out rather than inferred: this is the signature being
+        // recovered, and an unannotated transmute to a function pointer is a
+        // reader's dead end.
+        type InitFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *const std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        let init = std::mem::transmute::<*const (), InitFn>(sqlite_vec::sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(init));
     });
 }
 
@@ -185,8 +192,9 @@ mod tests {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1, "re-embedding must overwrite, not accumulate");
 
-        let version: String =
-            conn.query_row("SELECT embeddingVersion FROM vectors WHERE nodeId = 'alpha'", [], |row| row.get(0)).unwrap();
+        let version: String = conn
+            .query_row("SELECT embeddingVersion FROM vectors WHERE nodeId = 'alpha'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, "v2");
     }
 

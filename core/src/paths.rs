@@ -43,7 +43,16 @@ pub fn g_mesh_home() -> Result<PathBuf> {
 /// simultaneously reading - which is the exact class of shared-mutable-state
 /// bug this module exists to end.
 fn home_from(override_dir: Option<OsString>) -> Result<PathBuf> {
-    if let Some(dir) = override_dir {
+    // An empty value reads as "not set", not as "the empty path". Nothing ever
+    // means to put the state root at a relative nowhere, and the failure it
+    // produces is quiet: every project directory would resolve under the
+    // current working directory, differently for each process that asked.
+    //
+    // Not hypothetical - a CI expression that yields `''` on the platforms it
+    // does not apply to would set exactly this, and cargo's `force = false`
+    // treats an empty-but-present variable as already set, so `.cargo/config
+    // .toml`'s own value would not fill the gap either.
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
     let home = dirs::home_dir().context("could not resolve home directory")?;
@@ -58,6 +67,15 @@ mod tests {
     fn the_default_home_is_dot_g_mesh_in_the_users_home_directory() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(home_from(None).unwrap(), home.join(".g-mesh"));
+    }
+
+    /// An empty override is the same as none: a state root at the empty path
+    /// would resolve every project directory relative to the current working
+    /// directory, which differs per process and fails silently.
+    #[test]
+    fn an_empty_override_falls_back_to_the_default_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(home_from(Some(OsString::new())).unwrap(), home.join(".g-mesh"));
     }
 
     /// Whatever the override names is taken verbatim - no `.g-mesh` appended,

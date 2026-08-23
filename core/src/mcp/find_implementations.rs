@@ -26,6 +26,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
@@ -33,7 +34,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
-use super::{anchor, FindImplementationsParams, SymbolQueryParams};
+use super::{anchor, find_definition, FindImplementationsParams, SymbolQueryParams};
 
 /// The one edge kind both the single-hop and transitive walks follow -
 /// pulled out for the transitive path's own `TraversalOptions`/`ResumeState`
@@ -137,20 +138,35 @@ fn list_implementations(
     Ok(pagination::bound_page(rows, page.has_more, page.next_cursor))
 }
 
-pub(super) fn handle(conn: &Arc<Mutex<Connection>>, params: SymbolQueryParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle(
+    conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
 
-    let anchor = match anchor::resolve(&conn, &params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    // Destructured here so everything below still reads the node directly,
+    // while `resolved.by` stays available for the response's `resolvedBy`.
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::from(&anchor);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
-    let page = list_implementations(&conn, &anchor.id, &anchor.file_path, &file_paths, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to find implementations", e))?;
+    let page = list_implementations(
+        &conn,
+        &anchor.id,
+        &anchor.file_path,
+        &file_paths,
+        page_size,
+        params.cursor.as_deref(),
+    )
+    .map_err(|e| internal_error("failed to find implementations", e))?;
 
     success(&ImplementationPage {
         anchor: anchor_info,
@@ -299,14 +315,18 @@ fn bound_walk(
     if let Some(id) = anchor_id {
         visited.push(VisitedNode { id, depth: 0 });
     }
-    visited.extend(dtos[..cut].iter().map(|d| VisitedNode { id: d.implementing_symbol_id.clone(), depth: d.depth }));
+    visited.extend(
+        dtos[..cut].iter().map(|d| VisitedNode { id: d.implementing_symbol_id.clone(), depth: d.depth }),
+    );
 
     let kept_ids: HashSet<&str> = dtos[..cut].iter().map(|d| d.implementing_symbol_id.as_str()).collect();
     let mut walked = prior_walked;
     // `Direction::Incoming`: the child this walk expanded through is always
     // the edge's `from_id` (the implementing/extending type) - see this
     // file's own module doc for the `SUPERTYPE_OF` direction convention.
-    walked.extend(result.edges.into_iter().filter_map(|e| kept_ids.contains(e.from_id.as_str()).then_some(e.id)));
+    walked.extend(
+        result.edges.into_iter().filter_map(|e| kept_ids.contains(e.from_id.as_str()).then_some(e.id)),
+    );
 
     let token = resume_token::encode(&ResumeState {
         direction: Direction::Incoming,
@@ -343,10 +363,16 @@ fn bound_walk(
 fn from_root(
     conn: &Connection,
     anchor_node: &NodeRecord,
+    resolved_by: find_definition::ResolvedBy,
     hint: Option<&'static str>,
     max_depth: Option<u32>,
 ) -> Result<CallToolResult, ErrorData> {
-    let anchor_info = anchor::AnchorInfo::from(anchor_node);
+    // Carries the rung for the same reason the single-hop path does: a caller
+    // must be able to tell an exact resolution from one the ladder suggested,
+    // and `transitive: true` is the same query with a deeper walk, not a
+    // different kind of answer. Only `continued` legitimately has no rung -
+    // a resumed walk carries its anchor rather than resolving one.
+    let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by);
     let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
     if let Some(depth) = max_depth {
@@ -370,7 +396,8 @@ fn from_root(
 /// edges to walk, so a walk that reached a truncation cause worth resuming
 /// could never have started from one - there is no real case this drops.
 fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData> {
-    let state = resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
+    let state =
+        resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
     let ResumeState { max_depth, max_fanout, visited: prior_visited, walked: prior_walked, .. } = state;
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
@@ -385,9 +412,21 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// struct's shared fields - which is what makes the single-hop response
 /// byte-identical to what it was before this file gained a `transitive`
 /// concept, by construction rather than by parallel maintenance.
-pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementationsParams) -> Result<CallToolResult, ErrorData> {
-    let FindImplementationsParams { symbol_id, symbol_name, cursor, limit, file_paths, transitive, max_depth, resume_token } =
-        params;
+pub(super) fn dispatch(
+    conn: &Arc<Mutex<Connection>>,
+    embedding: &EmbeddingPipeline,
+    params: FindImplementationsParams,
+) -> Result<CallToolResult, ErrorData> {
+    let FindImplementationsParams {
+        symbol_id,
+        symbol_name,
+        cursor,
+        limit,
+        file_paths,
+        transitive,
+        max_depth,
+        resume_token,
+    } = params;
 
     if let Some(token) = resume_token {
         // An anchor or `transitive` next to a token is a contradiction, not a
@@ -406,16 +445,18 @@ pub(super) fn dispatch(conn: &Arc<Mutex<Connection>>, params: FindImplementation
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
 
     if !transitive.unwrap_or(false) {
-        return handle(conn, symbol_params);
+        return handle(conn, embedding, symbol_params);
     }
 
     let conn = conn.lock().unwrap();
-    let anchor = match anchor::resolve(&conn, &symbol_params)? {
-        Ok(node) => node,
+    let resolved = match anchor::resolve(&conn, Some(embedding), &symbol_params)? {
+        Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
+    let resolved_by = resolved.by;
+    let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, hint, max_depth)
+    from_root(&conn, &anchor, resolved_by, hint, max_depth)
 }
 
 #[cfg(test)]
@@ -453,11 +494,25 @@ mod tests {
     /// supertype convention: ClassA -> Interface, ClassB -> ClassA.
     fn setup_chain() -> Connection {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("class_a", "Type", "ClassA", "pkg::ClassA", "a.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("class_b", "Type", "ClassB", "pkg::ClassB", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a_iface", "class_a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b_a", "class_b", "class_a", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("class_a", "Type", "ClassA", "pkg::ClassA", "a.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("class_b", "Type", "ClassB", "pkg::ClassB", "b.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a_iface", "class_a", "interface", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b_a", "class_b", "class_a", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
         conn
     }
 
@@ -465,10 +520,14 @@ mod tests {
     fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1, "the interface has exactly one direct implementor, not the transitive subclass");
+        assert_eq!(
+            results.len(),
+            1,
+            "the interface has exactly one direct implementor, not the transitive subclass"
+        );
         assert_eq!(results[0]["implementingSymbolId"], "class_a");
     }
 
@@ -482,23 +541,46 @@ mod tests {
     #[test]
     fn a_file_kind_implementing_row_omits_qualified_name_and_position_but_keeps_them_for_symbol_kind_rows() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "weird.rs", "src/weird.rs", "src/weird.rs", "rust")).unwrap();
-        upsert_node(&mut conn, NodeRecord::new("class_a", "Type", "ClassA", "pkg::ClassA", "a.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_file", "file", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_class", "class_a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("file", "File", "weird.rs", "src/weird.rs", "src/weird.rs", "rust"),
+        )
+        .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("class_a", "Type", "ClassA", "pkg::ClassA", "a.rs", "rust"))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_file", "file", "interface", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_class", "class_a", "interface", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
 
         let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None).unwrap();
         assert_eq!(page.results.len(), 2);
 
-        let file_row = page.results.iter().find(|r| r.kind == "File").expect("the File-kind row must be present");
+        let file_row =
+            page.results.iter().find(|r| r.kind == "File").expect("the File-kind row must be present");
         assert!(file_row.qualified_name.is_none(), "qualifiedName duplicates filePath for a File-kind row");
         assert!(file_row.start_line.is_none(), "startLine is meaningless for a File-kind row");
         assert!(file_row.start_col.is_none(), "startCol is meaningless for a File-kind row");
         assert_eq!(file_row.file_path, "src/weird.rs");
 
-        let symbol_row = page.results.iter().find(|r| r.kind == "Type").expect("the Type-kind row must be present");
-        assert_eq!(symbol_row.qualified_name.as_deref(), Some("pkg::ClassA"), "a symbol-kind row must still carry its qualifiedName");
+        let symbol_row =
+            page.results.iter().find(|r| r.kind == "Type").expect("the Type-kind row must be present");
+        assert_eq!(
+            symbol_row.qualified_name.as_deref(),
+            Some("pkg::ClassA"),
+            "a symbol-kind row must still carry its qualifiedName"
+        );
         assert_eq!(symbol_row.start_line, Some(0), "a symbol-kind row must still carry its startLine");
         assert_eq!(symbol_row.start_col, Some(0), "a symbol-kind row must still carry its startCol");
     }
@@ -506,10 +588,14 @@ mod tests {
     #[test]
     fn zero_implementations_is_an_empty_page_not_an_error() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -519,27 +605,52 @@ mod tests {
     #[test]
     fn a_page_where_every_implementor_is_unresolved_is_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", false)).unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", false),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 1);
-        assert_eq!(body["allUnresolved"], true, "every implementor unresolved must set the response-level marker");
+        assert_eq!(
+            body["allUnresolved"], true,
+            "every implementor unresolved must set the response-level marker"
+        );
     }
 
     #[test]
     fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_b", "Type", "B", "pkg::B", "b.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "impl_b", "interface", "SUPERTYPE_OF", "tree-sitter", false)).unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "impl_a", "interface", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "impl_b", "interface", "SUPERTYPE_OF", "tree-sitter", false),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
     }
@@ -549,7 +660,8 @@ mod tests {
     fn the_single_hop_response_echoes_the_resolved_anchor() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
         assert_eq!(body["anchor"]["kind"], "Type");
@@ -568,9 +680,32 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
+        // The rung travels with the anchor, and this path is where it was
+        // dropped: `dispatch` resolved it for the transitive walk and threw
+        // it away, so `transitive: true` answered without a `resolvedBy`
+        // while the single-hop path beside it carried one. The compiler said
+        // so - an unused-variable warning - which is the only reason it was
+        // caught, since every assertion here passed without it.
+        assert_eq!(body["anchor"]["resolvedBy"], "id");
+    }
+
+    /// The rung has to be the one that actually reached the anchor, not a
+    /// constant: asserting only `resolvedBy`'s presence would pass just as
+    /// well if `from_root` hardcoded a value.
+    #[test]
+    fn a_transitive_walk_reports_the_rung_that_reached_its_anchor() {
+        let conn = Arc::new(Mutex::new(setup_chain()));
+        let params = FindImplementationsParams {
+            symbol_name: Some("pkg::Iface".to_string()),
+            transitive: Some(true),
+            ..Default::default()
+        };
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        assert_eq!(body["anchor"]["id"], "interface");
+        assert_eq!(body["anchor"]["resolvedBy"], "qualifiedName", "resolved by qualifiedName, not by id");
     }
 
     /// A resumed walk's caller already received the anchor on the response
@@ -585,12 +720,23 @@ mod tests {
     fn a_resumed_transitive_walk_does_not_repeat_the_anchor() {
         let wide: usize = 600;
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         for i in 0..wide {
             let id = format!("impl{i:05}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
-                .unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust"),
+            )
+            .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true),
+            )
+            .unwrap();
         }
 
         let anchor_node = queries::get_node(&conn, "interface").unwrap().expect("anchor node must exist");
@@ -601,12 +747,16 @@ mod tests {
         options.max_fanout = 10_000;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let first = bound_walk(result, max_depth, max_fanout, Some(anchor_info), None, Vec::new(), Vec::new());
+        let first =
+            bound_walk(result, max_depth, max_fanout, Some(anchor_info), None, Vec::new(), Vec::new());
         assert!(first.anchor.is_some(), "the first page of a fresh walk still carries the anchor");
         let token = first.resume_token.expect("this wide a fanout must truncate and hand back a token");
 
         let resumed = json_body(&continued(&conn, &token).unwrap());
-        assert!(resumed.get("anchor").is_none(), "a resumed page must not repeat the anchor, not even as null: {resumed}");
+        assert!(
+            resumed.get("anchor").is_none(),
+            "a resumed page must not repeat the anchor, not even as null: {resumed}"
+        );
     }
 
     /// Anchoring by name must reach the same node the id does - here the
@@ -616,34 +766,71 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let by_id = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() })
-                .unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let by_name = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() }).unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
-        assert_eq!(by_name, by_id, "a name that resolves to one node must answer exactly as its id does");
+        // Everything but `resolvedBy` must match: the walk, the results and the
+        // anchor are properties of the node, however the caller addressed it.
+        // `resolvedBy` is the one field that exists to differ - it reports the
+        // rung, and the two calls took different rungs to the same node.
+        let strip = |mut body: serde_json::Value| {
+            body["anchor"].as_object_mut().expect("an anchor object").remove("resolvedBy");
+            body
+        };
+        assert_eq!(
+            strip(by_name.clone()),
+            strip(by_id.clone()),
+            "a name that resolves to one node must answer exactly as its id does"
+        );
+        assert_eq!(by_id["anchor"]["resolvedBy"], "id");
+        assert_eq!(by_name["anchor"]["resolvedBy"], "name");
         assert_eq!(by_name["results"][0]["implementingSymbolId"], "class_a");
     }
 
     #[test]
     fn unknown_symbol_id_is_a_tool_level_error() {
         let conn = setup();
-        let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let params =
+            SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
     #[test]
     fn implemented_by_three_types_returns_all_three_across_small_pages() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust"))
+            .unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_b", "Type", "B", "pkg::B", "b.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_c", "Type", "C", "pkg::C", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "impl_b", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "impl_c", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "impl_a", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "impl_b", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_c", "impl_c", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
@@ -658,7 +845,11 @@ mod tests {
         }
 
         seen.sort();
-        assert_eq!(seen, vec!["impl_a", "impl_b", "impl_c"], "all three implementors must come back, once each");
+        assert_eq!(
+            seen,
+            vec!["impl_a", "impl_b", "impl_c"],
+            "all three implementors must come back, once each"
+        );
     }
 
     /// A caller-supplied `limit` above the default page size must actually
@@ -666,16 +857,26 @@ mod tests {
     #[test]
     fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust"))
+            .unwrap();
         for i in 0..25 {
             let id = format!("impl_{i}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "a.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{i}"), &id, "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "a.rs", "rust"))
+                .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{i}"), &id, "target", "SUPERTYPE_OF", "tree-sitter", true),
+            )
+            .unwrap();
         }
         let conn = Arc::new(Mutex::new(conn));
 
-        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let params = SymbolQueryParams {
+            symbol_id: Some("target".to_string()),
+            limit: Some(25),
+            ..Default::default()
+        };
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -687,16 +888,30 @@ mod tests {
     #[test]
     fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"))
-            .unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new(
+                "file",
+                "File",
+                "connection.ts",
+                "src/connection.ts",
+                "src/connection.ts",
+                "typescript",
+            ),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body = json_body(&handle(&conn, params).unwrap());
+        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
-        assert_eq!(body["results"].as_array().unwrap().len(), 0, "a File anchor still answers as an empty page, not an error");
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            0,
+            "a File anchor still answers as an empty page, not an error"
+        );
         assert_eq!(body["hasMore"], false);
         assert_eq!(body["allUnresolved"], false);
     }
@@ -706,30 +921,55 @@ mod tests {
     #[test]
     fn a_normal_symbol_anchor_never_carries_a_hint_field() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
-        assert!(body.get("hint").is_none(), "hint must be entirely absent, not null, on a normal symbol anchor: {body}");
+        let body =
+            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        assert!(
+            body.get("hint").is_none(),
+            "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
+        );
     }
 
     #[test]
     fn handle_paginates_across_cursor_continuation() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust"))
+            .unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_b", "Type", "B", "pkg::B", "b.rs", "rust")).unwrap();
         upsert_node(&mut conn, NodeRecord::new("impl_c", "Type", "C", "pkg::C", "c.rs", "rust")).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_a", "impl_a", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b", "impl_b", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c", "impl_c", "target", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a", "impl_a", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_b", "impl_b", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_c", "impl_c", "target", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let params = SymbolQueryParams { symbol_id: Some("target".to_string()), cursor: cursor.clone(), ..Default::default() };
-            let result = handle(&conn, params).unwrap();
+            let params = SymbolQueryParams {
+                symbol_id: Some("target".to_string()),
+                cursor: cursor.clone(),
+                ..Default::default()
+            };
+            let result = handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
@@ -757,14 +997,26 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let via_handle = json_body(
-            &handle(&conn, SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() }).unwrap(),
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         let via_dispatch = json_body(
-            &dispatch(&conn, FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() })
-                .unwrap(),
+            &dispatch(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
 
-        assert_eq!(via_dispatch, via_handle, "transitive absent must be byte-identical to the pre-existing shape");
+        assert_eq!(
+            via_dispatch, via_handle,
+            "transitive absent must be byte-identical to the pre-existing shape"
+        );
         assert!(via_dispatch.get("truncated").is_none());
         assert!(via_dispatch.get("truncatedBy").is_none());
         assert!(via_dispatch.get("frontierNodes").is_none());
@@ -780,8 +1032,12 @@ mod tests {
         let conn = Arc::new(Mutex::new(setup_chain()));
 
         let absent = json_body(
-            &dispatch(&conn, FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() })
-                .unwrap(),
+            &dispatch(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
+            )
+            .unwrap(),
         );
         assert_eq!(absent["results"].as_array().unwrap().len(), 1, "absent transitive must stay single-hop");
         assert_eq!(absent["results"][0]["implementingSymbolId"], "class_a");
@@ -789,6 +1045,7 @@ mod tests {
         let explicit_false = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(false),
@@ -802,6 +1059,7 @@ mod tests {
         let walked = json_body(
             &dispatch(
                 &conn,
+                &EmbeddingPipeline::disabled(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(true),
@@ -828,14 +1086,29 @@ mod tests {
     /// b (depth 2), c (depth 3), d (depth 4).
     fn setup_deep_chain() -> Connection {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         for id in ["a", "b", "c", "d"] {
-            upsert_node(&mut conn, NodeRecord::new(id, "Type", id, format!("pkg::{id}"), format!("{id}.rs"), "rust")).unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(id, "Type", id, format!("pkg::{id}"), format!("{id}.rs"), "rust"),
+            )
+            .unwrap();
         }
-        upsert_edge(&mut conn, EdgeRecord::new("e_a_iface", "a", "interface", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_b_a", "b", "a", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_c_b", "c", "b", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_d_c", "d", "c", "SUPERTYPE_OF", "tree-sitter", true)).unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_a_iface", "a", "interface", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_b_a", "b", "a", "SUPERTYPE_OF", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_c_b", "c", "b", "SUPERTYPE_OF", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_d_c", "d", "c", "SUPERTYPE_OF", "tree-sitter", true))
+            .unwrap();
         conn
     }
 
@@ -851,7 +1124,7 @@ mod tests {
             max_depth: Some(2),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let reached: Vec<(String, u64)> = body["results"]
             .as_array()
@@ -876,11 +1149,19 @@ mod tests {
     #[test]
     fn a_max_fanout_cut_reports_max_fanout_with_no_continuation_field() {
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         for id in ["a", "b", "c"] {
-            upsert_node(&mut conn, NodeRecord::new(id, "Type", id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e_{id}"), id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
+            upsert_node(&mut conn, NodeRecord::new(id, "Type", id, format!("pkg::{id}"), "impl.rs", "rust"))
                 .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{id}"), id, "interface", "SUPERTYPE_OF", "tree-sitter", true),
+            )
+            .unwrap();
         }
 
         let mut options = TraversalOptions::new("interface", Direction::Incoming);
@@ -909,12 +1190,23 @@ mod tests {
     fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_implementor_once() {
         let wide: usize = 600;
         let mut conn = setup();
-        upsert_node(&mut conn, NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust")).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("interface", "Type", "Iface", "pkg::Iface", "iface.rs", "rust"),
+        )
+        .unwrap();
         for i in 0..wide {
             let id = format!("impl{i:05}");
-            upsert_node(&mut conn, NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust")).unwrap();
-            upsert_edge(&mut conn, EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true))
-                .unwrap();
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Type", &id, format!("pkg::{id}"), "impl.rs", "rust"),
+            )
+            .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i:05}"), &id, "interface", "SUPERTYPE_OF", "tree-sitter", true),
+            )
+            .unwrap();
         }
 
         let mut options = TraversalOptions::new("interface", Direction::Incoming);
@@ -925,7 +1217,11 @@ mod tests {
         let first = bound_walk(result, max_depth, max_fanout, None, None, Vec::new(), Vec::new());
 
         assert!(!first.results.is_empty(), "at least one row must come back");
-        assert!(first.results.len() < wide, "one response must not hold all {wide} implementors: {}", first.results.len());
+        assert!(
+            first.results.len() < wide,
+            "one response must not hold all {wide} implementors: {}",
+            first.results.len()
+        );
         assert!(first.truncated);
         assert_eq!(first.truncated_by, Some("responseSize"));
         assert!(first.frontier_nodes.is_empty(), "a size cut is resumed, not re-rooted");
@@ -937,12 +1233,24 @@ mod tests {
         while let Some(t) = token {
             let body = json_body(&continued(&conn, &t).unwrap());
             calls += 1;
-            all.extend(body["results"].as_array().unwrap().iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
+            all.extend(
+                body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()),
+            );
             token = body["resumeToken"].as_str().map(str::to_string);
-            assert!(calls < 50, "the chain must converge, not re-explore itself forever: {calls} calls so far");
+            assert!(
+                calls < 50,
+                "the chain must converge, not re-explore itself forever: {calls} calls so far"
+            );
         }
 
-        assert!(calls > 2, "a page far smaller than {wide} implementors must take more than one resume: only {calls} calls");
+        assert!(
+            calls > 2,
+            "a page far smaller than {wide} implementors must take more than one resume: only {calls} calls"
+        );
 
         let mut deduped = all.clone();
         deduped.sort();
@@ -960,6 +1268,7 @@ mod tests {
 
         let with_symbol_id = dispatch(
             &conn,
+            &EmbeddingPipeline::disabled(),
             FindImplementationsParams {
                 symbol_id: Some("interface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -971,6 +1280,7 @@ mod tests {
 
         let with_symbol_name = dispatch(
             &conn,
+            &EmbeddingPipeline::disabled(),
             FindImplementationsParams {
                 symbol_name: Some("Iface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -982,7 +1292,12 @@ mod tests {
 
         let with_transitive_only = dispatch(
             &conn,
-            FindImplementationsParams { transitive: Some(true), resume_token: Some("whatever".to_string()), ..Default::default() },
+            &EmbeddingPipeline::disabled(),
+            FindImplementationsParams {
+                transitive: Some(true),
+                resume_token: Some("whatever".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(error_text(&with_transitive_only).contains("resume_token"));
@@ -998,18 +1313,32 @@ mod tests {
         let mut conn = setup();
         upsert_node(
             &mut conn,
-            NodeRecord::new("file", "File", "connection.ts", "src/connection.ts", "src/connection.ts", "typescript"),
+            NodeRecord::new(
+                "file",
+                "File",
+                "connection.ts",
+                "src/connection.ts",
+                "src/connection.ts",
+                "typescript",
+            ),
         )
         .unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let params =
-            FindImplementationsParams { symbol_id: Some("file".to_string()), transitive: Some(true), ..Default::default() };
-        let body = json_body(&dispatch(&conn, params).unwrap());
+        let params = FindImplementationsParams {
+            symbol_id: Some("file".to_string()),
+            transitive: Some(true),
+            ..Default::default()
+        };
+        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored transitive call must still carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
-        assert_eq!(body["results"].as_array().unwrap().len(), 0, "a File anchor still answers as an empty walk, not an error");
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            0,
+            "a File anchor still answers as an empty walk, not an error"
+        );
         assert_eq!(body["truncated"], false);
         assert!(body["resumeToken"].is_null());
     }

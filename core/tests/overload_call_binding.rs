@@ -144,11 +144,8 @@ fn each_call_of_an_overloaded_function_is_stored_against_the_overload_it_binds()
     let mut edits = 0;
     let found = loop {
         edits += 1;
-        fs::write(
-            project.root().join("tsconfig.json"),
-            "{ \"compilerOptions\": { \"strict\": true } }\n",
-        )
-        .unwrap();
+        fs::write(project.root().join("tsconfig.json"), "{ \"compilerOptions\": { \"strict\": true } }\n")
+            .unwrap();
         fs::write(project.root().join("lib.ts"), LIB).unwrap();
         fs::write(project.root().join("use.ts"), use_source(edits)).unwrap();
         thread::sleep(Duration::from_millis(250));

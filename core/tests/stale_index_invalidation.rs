@@ -113,7 +113,10 @@ fn body(result: &CallToolResult) -> Value {
 /// daemon that had to make its own decision about the index on disk.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
             .current_dir(project.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
@@ -158,7 +161,8 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
 /// day resolved no module specifier at all and so never produced them.
 fn strip_import_edges(index: &Path) {
     let conn = Connection::open(index).expect("failed to open the project index");
-    let removed = conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
+    let removed =
+        conn.execute("DELETE FROM edges WHERE kind = 'IMPORTS'", []).expect("failed to strip edges");
     assert!(removed > 0, "the fixture must have had import edges to strip");
 }
 

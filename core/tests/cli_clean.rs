@@ -7,9 +7,13 @@
 //! it was the developer's real `~/.g-mesh`, and since then it is one
 //! `G_MESH_HOME` that every test binary in this directory writes into
 //! concurrently. Either way a sweeping delete from here would take out
-//! fixtures that belong to someone else. Those forms are covered by the unit
-//! tests in `cli::clean`, which inject a projects root of their own and can
-//! therefore delete everything in it safely.
+//! fixtures that belong to someone else.
+//!
+//! Those forms now live in `cli_clean_sweeping.rs`, which gives each test a
+//! `G_MESH_HOME` of its own so a sweep inside it is safe by construction. The
+//! unit tests in `cli::clean` still cover the classification with an injected
+//! root; what they cannot show, and that file can, is that the word on the
+//! command line reaches that code at all.
 //!
 //! What is still worth driving as a subprocess is the wiring: that the word
 //! reaches the right code path and reports rather than deletes.
@@ -21,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -82,10 +88,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         for path in [self.pid_file(), self.plugin_pid_file()] {
-            if let Ok(pid) = std::fs::read_to_string(&path) {
-                let _ =
-                    Command::new("kill").arg("-9").arg(pid.trim()).stderr(Stdio::null()).status();
-            }
+            common::kill_pid_file(&path);
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
     }
@@ -125,11 +128,7 @@ fn clean_deletes_the_cwds_project_state_directory() {
     let cleaned = project.command(&["clean"]);
 
     assert!(cleaned.status.success(), "clean failed: {}", stderr_of(&cleaned));
-    assert!(
-        stdout_of(&cleaned).contains("deleted project"),
-        "unexpected output: {}",
-        stdout_of(&cleaned)
-    );
+    assert!(stdout_of(&cleaned).contains("deleted project"), "unexpected output: {}", stdout_of(&cleaned));
     assert!(!state_dir.exists(), "the project's state directory must be gone");
 }
 
@@ -165,10 +164,7 @@ fn clean_in_a_never_indexed_directory_asks_for_an_explicit_project_id() {
 
     assert!(!cleaned.status.success(), "there is nothing here to clean");
     let stderr = stderr_of(&cleaned);
-    assert!(
-        stderr.contains("pass an explicit <project-id>"),
-        "the error must ask for an id: {stderr}"
-    );
+    assert!(stderr.contains("pass an explicit <project-id>"), "the error must ask for an id: {stderr}");
 }
 
 /// `orphaned` end to end, in the form that cannot delete anything: the target

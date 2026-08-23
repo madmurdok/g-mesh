@@ -17,7 +17,6 @@
 //! to date, which `core/build.rs` keeps so.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -48,10 +47,7 @@ const SEMANTIC_TIMEOUT: Duration = Duration::from_secs(45);
 /// the way, so `barrel.someExport` and `realName` are never the same name in
 /// any one file, and nothing written at the use site names the declaration.
 const FILES: [(&str, &str); 5] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["src"] }"#),
     (
         "src/mod.ts",
         r#"export function someExport(): number {
@@ -109,9 +105,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }
@@ -152,9 +146,9 @@ async fn find_callers_reaches_a_caller_that_went_through_a_namespace_import() {
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");

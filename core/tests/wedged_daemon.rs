@@ -98,10 +98,7 @@ impl Project {
         let _ = shim.wait();
 
         let core = read_pid(&self.pid_file());
-        assert!(
-            daemon::is_process_alive(core),
-            "the daemon must be up before it is wedged"
-        );
+        assert!(daemon::is_process_alive(core), "the daemon must be up before it is wedged");
         core
     }
 
@@ -125,18 +122,11 @@ impl Project {
     fn wedge(&self) -> u32 {
         let pid = self.bootstrap_core();
 
-        for path in [
-            self.socket(),
-            self.pid_file(),
-            daemon::build_stamp_path(self.root()).unwrap(),
-        ] {
+        for path in [self.socket(), self.pid_file(), daemon::build_stamp_path(self.root()).unwrap()] {
             let _ = std::fs::remove_file(&path);
         }
 
-        assert!(
-            daemon::is_process_alive(pid),
-            "the wedged daemon must still be alive"
-        );
+        assert!(daemon::is_process_alive(pid), "the wedged daemon must still be alive");
         assert!(
             !daemon::is_listening(self.root()).unwrap(),
             "the wedged daemon must be unreachable - that is what makes it a wedge"
@@ -213,14 +203,8 @@ fn status_names_the_wedged_daemon_instead_of_reporting_nothing_running() {
 
     assert_eq!(report.core, CoreState::Wedged { pid });
     let rendered = status::render(&report);
-    assert!(
-        rendered.contains(&format!("wedged (pid {pid})")),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("g-mesh stop"),
-        "the report must say what to do:\n{rendered}"
-    );
+    assert!(rendered.contains(&format!("wedged (pid {pid})")), "{rendered}");
+    assert!(rendered.contains("g-mesh stop"), "the report must say what to do:\n{rendered}");
 }
 
 /// `stop` used to report "no daemon is running" while the daemon it could not
@@ -234,28 +218,16 @@ fn stop_clears_a_wedged_daemon_that_no_pid_file_names() {
 
     let output = project.stop();
 
-    assert!(
-        output.contains(&format!("daemon core: pid {pid}")),
-        "{output}"
-    );
+    assert!(output.contains(&format!("daemon core: pid {pid}")), "{output}");
     assert!(
         output.contains("still holding this project's daemon lock"),
         "stop must explain why nothing could reach it:\n{output}"
     );
-    assert!(
-        !daemon::is_process_alive(pid),
-        "the wedged daemon (pid {pid}) is still running"
-    );
-    assert_eq!(
-        daemon::inspect_daemon_lock(project.root()).unwrap(),
-        DaemonLock::Free
-    );
+    assert!(!daemon::is_process_alive(pid), "the wedged daemon (pid {pid}) is still running");
+    assert_eq!(daemon::inspect_daemon_lock(project.root()).unwrap(), DaemonLock::Free);
 
     let replacement = project.bootstrap_core();
-    assert_ne!(
-        replacement, pid,
-        "a genuinely new daemon must be serving the project"
-    );
+    assert_ne!(replacement, pid, "a genuinely new daemon must be serving the project");
 }
 
 /// The end-to-end acceptance criterion: an MCP client's shim, arriving at a
@@ -280,10 +252,7 @@ fn a_shim_bootstrap_recovers_a_wedged_project_rather_than_timing_out() {
         !daemon::is_process_alive(wedged),
         "the wedged daemon (pid {wedged}) must have been cleared, not left holding the lock"
     );
-    assert_eq!(
-        daemon::inspect_daemon_lock(project.root()).unwrap(),
-        DaemonLock::Serving
-    );
+    assert_eq!(daemon::inspect_daemon_lock(project.root()).unwrap(), DaemonLock::Serving);
 }
 
 /// The other half of that line, and the one the singleton lock exists for: a
@@ -300,19 +269,9 @@ fn a_serving_daemon_is_reused_by_a_second_shim_and_never_evicted() {
     let _ = second.kill();
     let _ = second.wait();
 
-    assert!(
-        daemon::is_process_alive(incumbent),
-        "a serving daemon must survive another shim's arrival"
-    );
-    assert_eq!(
-        read_pid(&project.pid_file()),
-        incumbent,
-        "no replacement may have taken over"
-    );
-    assert_eq!(
-        daemon::inspect_daemon_lock(project.root()).unwrap(),
-        DaemonLock::Serving
-    );
+    assert!(daemon::is_process_alive(incumbent), "a serving daemon must survive another shim's arrival");
+    assert_eq!(read_pid(&project.pid_file()), incumbent, "no replacement may have taken over");
+    assert_eq!(daemon::inspect_daemon_lock(project.root()).unwrap(), DaemonLock::Serving);
 }
 
 /// A daemon started by hand against a wedged project must not take over - the
@@ -332,15 +291,9 @@ fn a_daemon_started_over_a_wedged_one_fails_fast_and_names_the_pid() {
         .expect("failed to run the daemon");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    assert!(
-        !output.status.success(),
-        "taking over a wedged project must be a failure:\n{stderr}"
-    );
+    assert!(!output.status.success(), "taking over a wedged project must be a failure:\n{stderr}");
     assert!(stderr.contains(&format!("pid {wedged}")), "{stderr}");
-    assert!(
-        stderr.contains("g-mesh stop"),
-        "the diagnostic must say what to do:\n{stderr}"
-    );
+    assert!(stderr.contains("g-mesh stop"), "the diagnostic must say what to do:\n{stderr}");
     assert!(
         daemon::is_process_alive(wedged),
         "the singleton lock must still exclude the newcomer - a daemon may not evict its own way in"

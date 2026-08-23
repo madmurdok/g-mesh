@@ -65,6 +65,7 @@ mod find_references;
 mod get_dependencies;
 mod get_file_outline;
 mod search_code;
+mod source;
 mod tool_result;
 
 /// What every tool answers while the daemon's cold-start bulk walk is still
@@ -118,6 +119,54 @@ pub const STILL_INDEXING: &str =
 /// assert real elapsed time against this number, and a copy hand-maintained
 /// in `tests/` could drift from it silently.
 pub const INDEXING_GRACE_WINDOW: Duration = Duration::from_millis(150);
+
+/// Overrides [`INDEXING_GRACE_WINDOW`] for tests, in milliseconds.
+///
+/// The acceptance tests assert that a call arriving just before completion is
+/// *served rather than refused*. That is a statement about the mechanism, and
+/// 150ms is a product decision about a race - but a test asserting the first
+/// against the second is also asserting that the machine finishes its
+/// post-walk work inside 150ms, which is a property of the runner and not of
+/// the code. On GitHub's macOS runners it does not hold: the walk is released,
+/// and import linking, symbol linking and the semantic pass still take longer
+/// than the window (GM-245).
+///
+/// Same shape and the same justification as `bulk_index::WALK_DELAY_ENV`:
+/// test-only scaffolding on the one property a test cannot otherwise pin, read
+/// once here rather than threaded through every caller.
+pub const GRACE_WINDOW_ENV: &str = "G_MESH_INDEXING_GRACE_WINDOW_MS";
+
+/// [`INDEXING_GRACE_WINDOW`], or [`GRACE_WINDOW_ENV`] when it names a number.
+/// An unparsable value falls back to the constant rather than failing a real
+/// call over a typo in a debugging variable.
+pub fn indexing_grace_window() -> Duration {
+    std::env::var(GRACE_WINDOW_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(INDEXING_GRACE_WINDOW)
+}
+
+/// Names a step of request handling in the daemon's log, when
+/// [`TRACE_CALLS_ENV`] is set.
+///
+/// Every tool call funnels through `prepare`, so tracing its entry and exit
+/// splits a hang three ways with one line of output: nothing logged means the
+/// request never reached the daemon, an entry without a matching exit means it
+/// hung inside `prepare`, and both means it hung in the handler or on the way
+/// back. Windows currently hangs somewhere in there and the log is the only
+/// window into a detached daemon (GM-246).
+///
+/// Off unless asked for: a line per call would bury the log's real content on
+/// a busy daemon.
+fn trace_call(what: &str) {
+    if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
+        eprintln!("g-mesh daemon: {what}");
+    }
+}
+
+/// Turns on [`trace_call`]. Any non-empty value.
+pub const TRACE_CALLS_ENV: &str = "G_MESH_TRACE_CALLS";
 
 /// Serves one accepted connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
@@ -196,11 +245,14 @@ impl GMeshMcpServer {
     /// 3. The replay last, so the rows this call is about to read already
     ///    include every change made while the plugin was asleep.
     async fn prepare(&self) -> Option<Result<CallToolResult, ErrorData>> {
+        trace_call("prepare: entered");
         if let Some(not_ready) = self.still_indexing().await {
+            trace_call("prepare: refused, still indexing");
             return Some(not_ready);
         }
         self.mark_used();
         self.replay_queued_changes().await;
+        trace_call("prepare: done");
         None
     }
 
@@ -270,9 +322,9 @@ impl GMeshMcpServer {
         let task_path = owned_path.clone();
         match tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path)).await {
             Ok(Ok(_)) => {}
-            Ok(Err(err)) => eprintln!(
-                "g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}"
-            ),
+            Ok(Err(err)) => {
+                eprintln!("g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}")
+            }
             Err(err) => eprintln!("g-mesh daemon: the staleness-check task failed: {err}"),
         }
     }
@@ -304,7 +356,7 @@ impl GMeshMcpServer {
         if !self.indexing.is_indexing() {
             return None;
         }
-        if self.indexing.wait_ready(INDEXING_GRACE_WINDOW).await {
+        if self.indexing.wait_ready(indexing_grace_window()).await {
             return None;
         }
         Some(tool_result::error(STILL_INDEXING))
@@ -340,7 +392,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_definition",
-        description = "Find where a symbol is defined. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it."
+        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates."
     )]
     async fn find_definition(
         &self,
@@ -352,7 +404,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
-        find_definition::handle(&self.conn, params.0)
+        find_definition::handle(&self.conn, self.registry.project_root(), &self.embedding, params.0)
     }
 
     #[tool(
@@ -366,7 +418,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_references::handle(&self.conn, params.0)
+        find_references::handle(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -374,7 +426,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callers(&self.conn, params.0)
+        find_callers_callees::handle_callers(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -382,7 +434,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callees(&self.conn, params.0)
+        find_callers_callees::handle_callees(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(
@@ -396,7 +448,7 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_implementations::dispatch(&self.conn, params.0)
+        find_implementations::dispatch(&self.conn, &self.embedding, params.0)
     }
 
     #[tool(
@@ -501,6 +553,9 @@ pub struct FindDefinitionParams {
     pub position: Option<Position>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
+    /// Whether to return the declaration's source alongside its coordinates.
+    /// Defaults to true; pass false when you genuinely only want the position.
+    pub include_source: Option<bool>,
 }
 
 /// find_references/find_callers/find_callees/find_implementations differ only

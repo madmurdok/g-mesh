@@ -107,8 +107,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let harness =
-            Self { project: tempfile::tempdir().unwrap(), aux: tempfile::tempdir().unwrap() };
+        let harness = Self { project: tempfile::tempdir().unwrap(), aux: tempfile::tempdir().unwrap() };
         fs::write(harness.plugin_path(), STUB_PLUGIN).unwrap();
         fs::write(harness.method_log(), "").unwrap();
         fs::write(harness.root().join("seed.ts"), "export const seed = 1;\n").unwrap();
@@ -176,11 +175,7 @@ impl Harness {
 
     /// Every control method the stub has been asked for so far, in order.
     fn methods(&self) -> Vec<String> {
-        fs::read_to_string(self.method_log())
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        fs::read_to_string(self.method_log()).unwrap_or_default().lines().map(str::to_string).collect()
     }
 
     fn wait_for(&self, what: &str, mut ready: impl FnMut(&[String]) -> bool) -> Vec<String> {
@@ -221,10 +216,7 @@ fn core_asks_for_a_semantic_pass_once_the_bulk_index_is_built() {
 
     let bulk = position_of(&methods, "bulkIndex").expect("the stub's bulk-index mode must have run");
     let pass = position_of(&methods, "semanticPass").unwrap();
-    assert!(
-        bulk < pass,
-        "the pass must follow the walk it upgrades, not race it: {methods:?}"
-    );
+    assert!(bulk < pass, "the pass must follow the walk it upgrades, not race it: {methods:?}");
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -240,9 +232,7 @@ fn core_asks_for_a_semantic_pass_after_each_incremental_reparse() {
     // Let the cold-start pass happen first, so what is counted afterwards can
     // only have come from the watcher.
     let after_startup = harness
-        .wait_for("the daemon to finish starting up", |methods| {
-            methods.iter().any(|m| m == "semanticPass")
-        })
+        .wait_for("the daemon to finish starting up", |methods| methods.iter().any(|m| m == "semanticPass"))
         .len();
 
     // Re-edited until the watcher answers, rather than written once. The

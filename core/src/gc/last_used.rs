@@ -114,11 +114,9 @@ pub fn read_from_project_dir(project_dir: &Path) -> Result<Option<LastUsed>> {
     // abandoned projects a GC scan most wants to look at. Nothing is written.
     // `SQLITE_OPEN_CREATE` is left out so a scan can never conjure an index
     // for a directory that had none.
-    let conn = Connection::open_with_flags(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("failed to open the project index at {}", db_path.display()))?;
+    let conn =
+        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+            .with_context(|| format!("failed to open the project index at {}", db_path.display()))?;
 
     if !has_meta_table(&conn)? {
         return Ok(None);
@@ -128,11 +126,9 @@ pub fn read_from_project_dir(project_dir: &Path) -> Result<Option<LastUsed>> {
 
 fn has_meta_table(conn: &Connection) -> Result<bool> {
     let found: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'", [], |row| {
+            row.get(0)
+        })
         .optional()
         .context("failed to inspect the project index's schema")?;
     Ok(found.is_some())
@@ -187,23 +183,18 @@ mod tests {
     #[test]
     fn idle_duration_is_measured_from_the_recorded_stamp() {
         let conn = setup();
-        conn.execute("UPDATE meta SET lastUsed = datetime('now', '-90 days') WHERE id = 1", [])
-            .unwrap();
+        conn.execute("UPDATE meta SET lastUsed = datetime('now', '-90 days') WHERE id = 1", []).unwrap();
 
         let idle = read(&conn).unwrap().unwrap().idle;
         let ninety_days = Duration::from_secs(90 * 24 * 60 * 60);
         // A minute of slack for the query's own clock reads, nothing more.
-        assert!(
-            idle.abs_diff(ninety_days) < Duration::from_secs(60),
-            "expected ~90 days idle, got {idle:?}"
-        );
+        assert!(idle.abs_diff(ninety_days) < Duration::from_secs(60), "expected ~90 days idle, got {idle:?}");
     }
 
     #[test]
     fn a_stamp_in_the_future_reads_as_zero_idle_rather_than_going_negative() {
         let conn = setup();
-        conn.execute("UPDATE meta SET lastUsed = datetime('now', '+7 days') WHERE id = 1", [])
-            .unwrap();
+        conn.execute("UPDATE meta SET lastUsed = datetime('now', '+7 days') WHERE id = 1", []).unwrap();
 
         assert_eq!(read(&conn).unwrap().unwrap().idle, Duration::ZERO);
     }

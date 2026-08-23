@@ -122,9 +122,8 @@ pub(crate) fn plugin_entry_path() -> PathBuf {
 /// one. `None` in a checkout, which is the case that falls through to the
 /// compile-time path above.
 fn installed_plugin_executable() -> Option<PathBuf> {
-    let candidate = crate::daemon::manifest::installed_bundled_root()?
-        .join(BUNDLED_LANGUAGE)
-        .join(BUNDLED_PLUGIN_EXE);
+    let candidate =
+        crate::daemon::manifest::installed_bundled_root()?.join(BUNDLED_LANGUAGE).join(BUNDLED_PLUGIN_EXE);
     candidate.is_file().then_some(candidate)
 }
 
@@ -169,8 +168,8 @@ fn launch_command_for(entry: &Path) -> (PathBuf, Vec<String>) {
 /// other callers that predate per-language pid files and only ever meant
 /// "the bundled JS/TS plugin's pid" (see that function's doc comment).
 /// Production code that has to be genuinely multi-language-aware
-/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant
-/// - it lists every `plugin-<language>.pid` file `PluginRegistry` writes
+/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant -
+/// it lists every `plugin-<language>.pid` file `PluginRegistry` writes
 /// instead of assuming this one.
 pub const BUNDLED_LANGUAGE: &str = "typescript";
 
@@ -247,17 +246,15 @@ pub fn bundled_manifest() -> PluginManifest {
 /// bump, which is exactly what that constant remains for - the two halves are
 /// complementary, not redundant.
 pub fn fingerprint(manifest: &PluginManifest) -> String {
-    digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(
-        |err| {
-            eprintln!(
-                "g-mesh: could not fingerprint the {} plugin at {}: {err:#} - \
+    digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(|err| {
+        eprintln!(
+            "g-mesh: could not fingerprint the {} plugin at {}: {err:#} - \
                  a change to its extraction logic will not be noticed",
-                manifest.language,
-                manifest.manifest_dir.display()
-            );
-            FINGERPRINT_UNAVAILABLE.to_string()
-        },
-    )
+            manifest.language,
+            manifest.manifest_dir.display()
+        );
+        FINGERPRINT_UNAVAILABLE.to_string()
+    })
 }
 
 /// [`fingerprint`] for [`bundled_manifest`], memoized for the process's
@@ -350,14 +347,11 @@ fn collect_fingerprinted_files(
     ignore: &[String],
     out: &mut Vec<(String, PathBuf)>,
 ) -> Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let file_type = entry.file_type().with_context(|| format!("failed to stat {}", path.display()))?;
         if file_type.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -374,11 +368,7 @@ fn collect_fingerprinted_files(
             // build emitted.
             continue;
         }
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
         out.push((relative, path));
     }
     Ok(())
@@ -427,25 +417,14 @@ impl PluginState {
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| {
-                format!(
-                    "failed to spawn {} plugin ({})",
-                    manifest.language,
-                    manifest.command.display()
-                )
+                format!("failed to spawn {} plugin ({})", manifest.language, manifest.command.display())
             })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .context("plugin child process has no stdout")?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("plugin child process has no stdin")?;
+        let stdout = child.stdout.take().context("plugin child process has no stdout")?;
+        let stdin = child.stdin.take().context("plugin child process has no stdin")?;
 
         let mut reader = BufReader::new(stdout);
-        let handshake =
-            handshake::perform(&mut reader).context("plugin handshake failed")?;
+        let handshake = handshake::perform(&mut reader).context("plugin handshake failed")?;
 
         // No precedent before N plugins existed to compare against - see
         // `docs/architecture/plugin-modularity.md`'s Interfaces section.
@@ -711,7 +690,12 @@ impl PluginProcess {
         apply_semantic_pass(reader, writer, &mut conn, file_paths, id, embedding)
     }
 
-    fn send_one(&self, conn: &Mutex<Connection>, file_path: &str, embedding: &EmbeddingPipeline) -> Result<()> {
+    fn send_one(
+        &self,
+        conn: &Mutex<Connection>,
+        file_path: &str,
+        embedding: &EmbeddingPipeline,
+    ) -> Result<()> {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
         // response answering the wrong request, not a globally unique one.
@@ -774,9 +758,7 @@ impl PluginProcess {
         let pid = fresh.child.id();
         *self.state.lock().unwrap() = fresh;
         if let Err(err) = fs::write(&self.pid_file, pid.to_string()) {
-            eprintln!(
-                "g-mesh daemon: could not update the plugin pid file after relaunch: {err:#}"
-            );
+            eprintln!("g-mesh daemon: could not update the plugin pid file after relaunch: {err:#}");
         }
         Ok(())
     }
@@ -904,11 +886,8 @@ mod tests {
         emit(dir.path(), &[("node_modules/pkg/index.js", "module.exports = {};")]);
         assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
 
-        fs::write(
-            dir.path().join("node_modules/pkg/index.js"),
-            "module.exports = { changed: true };",
-        )
-        .unwrap();
+        fs::write(dir.path().join("node_modules/pkg/index.js"), "module.exports = { changed: true };")
+            .unwrap();
         assert_eq!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
     }
 

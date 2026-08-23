@@ -1,0 +1,44 @@
+# The style this codebase is already written in, written down.
+#
+# WHY THIS FILE EXISTS
+#
+# It did not, and the omission was not free: `cargo fmt --check` failed on 99
+# of the ~100 Rust files in the repository - not because they were sloppy, but
+# because rustfmt's default `max_width` is 100 and this code was written at
+# roughly 110-120. So "formatted" was never a fact about this repository, and
+# `cargo fmt` was a command nobody could safely run: it would have rewritten
+# essentially every file.
+#
+# HOW THESE VALUES WERE CHOSEN
+#
+# Empirically, by running `cargo fmt --check` under candidate settings and
+# counting the hunks each produced - the aim being to recover the intended
+# style rather than to impose one:
+#
+#   default (100, Default heuristics)  1362 hunks
+#   110 + Default                      1195
+#   125 + Default                       918
+#   100 + Max                           758
+#   105 + Max                           624
+#   110 + Max                           578   <- here
+#   115 + Max                           615
+#   120 + Max                           637
+#
+# The curve has a floor around 110 and rises on both sides, which is the shape
+# of a real preference rather than an arbitrary one: narrower splits lines the
+# authors kept together, wider joins lines they deliberately broke.
+#
+# `use_small_heuristics = "Max"` matters more than the width - it more than
+# halves the diff on its own. It is what keeps a struct literal or a call that
+# fits on one line on one line, which is how this code is written throughout.
+#
+# APPLIED
+#
+# The 578 hunks these settings implied were applied in one commit that touched
+# nothing else (91 files), recorded in `.git-blame-ignore-revs` so `git blame`
+# skips it, and `cargo fmt --check` is enforced in CI from that point on. If you
+# change a value here, expect to re-run `cargo fmt` and add the resulting commit
+# to that file too - a formatter recorded but not checked drifts straight back,
+# which is the state this repository was in before GM-241.
+max_width = 110
+use_small_heuristics = "Max"

@@ -20,6 +20,11 @@
 //! usual Cargo reason: a subdirectory module is compiled into the test
 //! binaries that ask for it, not built as a test binary of its own.
 
+// Each integration test file is its own crate, so cargo warns about anything
+// this module offers that *that* crate does not happen to use. Every item
+// here is unused by someone, and none of them is dead.
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
@@ -71,11 +76,29 @@ pub fn wait_until_indexed(root: &Path) {
     let db = project_dir(root).expect("failed to resolve the state directory").join("index.db");
     let timeout = indexed_timeout();
     let deadline = Instant::now() + timeout;
+    // Kept across attempts so the timeout can say *why* the last read failed.
+    // Treating every failure as "not yet" is right for the transient cases
+    // named above, and it is exactly wrong for a persistent one: a database
+    // that can never be opened looks identical to a walk that has not
+    // finished, forever. Windows spent two CI rounds on that - the daemon log
+    // showed the walk completing while this loop timed out, and the reason it
+    // could not be read was thrown away here.
+    let mut last_error: Option<String>;
     loop {
-        let indexed = Connection::open(&db)
-            .ok()
-            .and_then(|conn| schema::bulk_index_completed(&conn).ok())
-            .unwrap_or(false);
+        last_error = None;
+        let indexed = match Connection::open(&db) {
+            Ok(conn) => match schema::bulk_index_completed(&conn) {
+                Ok(done) => done,
+                Err(err) => {
+                    last_error = Some(format!("reading the marker: {err}"));
+                    false
+                }
+            },
+            Err(err) => {
+                last_error = Some(format!("opening {}: {err}", db.display()));
+                false
+            }
+        };
         if indexed {
             return;
         }
@@ -91,8 +114,16 @@ pub fn wait_until_indexed(root: &Path) {
              G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow - but if a bigger \
              budget changes nothing, no daemon is walking this root at all: check that the shim \
              was not handed an inherited CLAUDE_PROJECT_DIR, and set G_MESH_DAEMON_LOG to see \
-             what the daemon that did start was doing",
-            root.display()
+             what the daemon that did start was doing.{}",
+            root.display(),
+            match &last_error {
+                Some(err) => format!(
+                    "\n\nThe last attempt failed rather than reporting \
+                                      \"not yet\" - which is a third possibility the two above \
+                                      do not cover: {err}"
+                ),
+                None => String::new(),
+            }
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -115,14 +146,56 @@ pub fn wait_until_indexed(root: &Path) {
 /// `cli_stop.rs`'s `wait_for("the daemon to die", ...)`), just applied to a
 /// test's hand-rolled kill.
 ///
-/// `allow(dead_code)`: each integration test file is its own crate, and only
-/// two of this module's many consumers hand-roll a kill; cargo has no way to
-/// see it is used from the crate that does not include this one.
-#[allow(dead_code)]
 pub fn kill_and_wait(pid: u32) {
-    let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).stderr(std::process::Stdio::null()).status();
+    force_kill(pid);
     let deadline = Instant::now() + Duration::from_secs(5);
     while daemon::is_process_alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Kills whatever process a pid file names, if it names one that is still
+/// running. The three ways a pid file disappoints - absent, empty, or holding
+/// something that is not a number - are all the same non-event to a teardown,
+/// and they all happen: a test that killed its own daemon leaves the file
+/// behind, and a daemon that has created the file but not yet written to it
+/// leaves it empty for a window long enough that CI has caught it (GM-242).
+///
+/// The point of routing every test's teardown through here rather than
+/// hand-rolling `kill -9`: on Windows the hand-rolled version killed nothing
+/// at all, and a surviving daemon holds an inherited handle to its parent's
+/// stdout pipe - so the *test process* could not exit either, long after its
+/// own teardown had finished (GM-249).
+#[allow(dead_code)]
+pub fn kill_pid_file(path: &Path) {
+    if let Some(pid) = daemon::read_pid_file(path) {
+        kill_and_wait(pid);
+    }
+}
+
+#[cfg(not(windows))]
+fn force_kill(pid: u32) {
+    let _ =
+        StdCommand::new("kill").arg("-9").arg(pid.to_string()).stderr(std::process::Stdio::null()).status();
+}
+
+/// `kill -9` is not merely unavailable on Windows - it is a *different
+/// program*. The one Git for Windows ships speaks MSYS pids, not Win32 ones,
+/// so handing it a native pid gets `kill: 1840: No such process` and nothing
+/// dies. That is not hypothetical: it is in the CI log of every Windows run
+/// this suite has ever had, which means teardown there has been a no-op since
+/// the port and every integration test leaked its daemon (GM-249).
+///
+/// `/F` without `/T`, deliberately: this stands in for `kill -9` on one
+/// process, and a tree kill would be a different promise. Teardown does not
+/// need it - it kills the plugin's pid file separately - and one test asserts
+/// that the plugin exits *by itself* when its core dies, which a tree kill
+/// would make trivially true.
+#[cfg(windows)]
+fn force_kill(pid: u32) {
+    let _ = StdCommand::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }

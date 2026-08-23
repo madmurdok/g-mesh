@@ -42,7 +42,6 @@
 //! keeps so.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -87,10 +86,7 @@ export function useNumber(): number {
 "#;
 
 const FILES: [(&str, &str); 3] = [
-    (
-        "tsconfig.json",
-        r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#,
-    ),
+    ("tsconfig.json", r#"{ "compilerOptions": { "strict": true, "target": "ES2020" }, "include": ["."] }"#),
     ("lib.ts", LIB),
     ("use.ts", USE),
 ];
@@ -125,9 +121,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }
@@ -169,9 +163,9 @@ async fn an_overloaded_function_resolves_correctly_through_the_real_mcp_tools() 
     let root = project.root().to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
@@ -212,7 +206,11 @@ async fn an_overloaded_function_resolves_correctly_through_the_real_mcp_tools() 
     let outline = body(&outline);
     let outline_rows = outline["results"].as_array().expect("results is not an array");
     let parse_rows: Vec<&Value> = outline_rows.iter().filter(|r| r["name"] == "parse").collect();
-    assert_eq!(parse_rows.len(), 1, "an overloaded function must be listed exactly once, not dropped or split: {outline}");
+    assert_eq!(
+        parse_rows.len(),
+        1,
+        "an overloaded function must be listed exactly once, not dropped or split: {outline}"
+    );
     let signature = parse_rows[0]["signature"].as_str().expect("parse's outline row has no signature");
     assert_ne!(
         signature, "parse(input: string | number, radix?: number): unknown",

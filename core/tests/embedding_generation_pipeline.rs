@@ -231,7 +231,11 @@ fn the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded() {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
-    assert_eq!((doc_comment, signature), (None, None), "sanity check: this fixture's File node has neither field");
+    assert_eq!(
+        (doc_comment, signature),
+        (None, None),
+        "sanity check: this fixture's File node has neither field"
+    );
 
     assert!(!vector_row_exists(&conn, &file), "a node with neither field must not get a vector row");
 
@@ -289,8 +293,7 @@ fn the_stored_vector_matches_embedding_the_doc_comment_and_signature_directly() 
     let stored: Vec<u8> = conn
         .query_row("SELECT embedding FROM vectors WHERE nodeId = ?1", [&documented], |row| row.get(0))
         .unwrap();
-    let stored: Vec<f32> =
-        stored.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let stored: Vec<f32> = stored.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
 
     assert_eq!(stored, expected, "the stored vector must be exactly the model's output for doc+signature");
 }

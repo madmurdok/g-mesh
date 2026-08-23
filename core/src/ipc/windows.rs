@@ -63,16 +63,16 @@ use std::time::{Duration, Instant};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -106,6 +106,15 @@ impl Endpoint {
     /// directory is named after (`daemon::endpoint` passes it in).
     pub fn named(id: &str) -> Self {
         Self(OsString::from(format!(r"\\.\pipe\g-mesh-{id}")))
+    }
+
+    /// Always reachable: a pipe name is built from the project hash, so it is
+    /// a fixed short length no matter how deep the state directory sits. The
+    /// Unix counterpart has a real limit to check (`SUN_PATH_CAPACITY`); this
+    /// is a no-op for the same reason [`Self::unlink_if_stale`] is, so the
+    /// shim can check unconditionally rather than branch on the platform.
+    pub fn check_length(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// Nothing to unlink: a pipe name lives exactly as long as an open handle

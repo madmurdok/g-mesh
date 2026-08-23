@@ -28,7 +28,6 @@
 //! `npm run build` there whenever this crate is built.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -94,9 +93,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(self.pid_file()) {
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.trim()).status();
-        }
+        common::kill_pid_file(&self.pid_file());
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }
@@ -140,24 +137,26 @@ async fn get_dependencies_resolves_a_foldable_computed_specifier_and_none_for_an
     // longer implies a built index - the walk's own completion marker is what
     // does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
-        cmd.arg("mcp-shim")
-            .current_dir(&root)
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
     wait_until_indexed(&root);
 
     let result = client
-        .call_tool(CallToolRequestParams::new("get_dependencies").with_arguments(
-            json!({
-                "file_path": "src/index.ts",
-                "direction": "Outgoing",
-            })
-            .as_object()
-            .cloned()
-            .expect("arguments literal is an object"),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("get_dependencies").with_arguments(
+                json!({
+                    "file_path": "src/index.ts",
+                    "direction": "Outgoing",
+                })
+                .as_object()
+                .cloned()
+                .expect("arguments literal is an object"),
+            ),
+        )
         .await
         .expect("tools/call failed");
     let result = body(&result);

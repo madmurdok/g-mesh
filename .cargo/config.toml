@@ -34,9 +34,23 @@
 # discovers config by walking up from the current directory, and both `cargo
 # test` from here and the documented `cd core && cargo test` have to find it.
 #
-# On Windows the value lands at `<current drive>\tmp\g-mesh-test-home`, which
-# is unlovely but harmless: named pipes have no path-length limit, so a Windows
-# developer who would rather keep it elsewhere can just export `G_MESH_HOME`.
+# ON WINDOWS THIS VALUE IS NOT ABSOLUTE, AND THAT IS NOT HARMLESS
+#
+# `/tmp/...` carries no drive letter, so Windows resolves it against whatever
+# drive the *process* is on: `<current drive>\tmp\g-mesh-test-home`. Two
+# processes on different drives therefore get two different state roots.
+#
+# This comment used to call that "unlovely but harmless". It is not. In CI the
+# test binary ran from the D: checkout while the daemon it spawned resolved
+# elsewhere, so the daemon indexed into one root and the test waited on an
+# `index.db` in another that was never going to appear - which presented as
+# "the cold-start walk never finished" and cost two rounds of diagnosis before
+# the real error was surfaced (GM-246).
+#
+# `force = false` below is what makes the fix possible: an explicitly exported
+# `G_MESH_HOME` wins over this. `.github/workflows/ci.yml` exports an absolute
+# one with a drive letter, and a Windows developer running the suite locally
+# should do the same.
 #
 # KNOW THIS: cargo applies `[env]` to `cargo run` and build scripts too, not
 # only to tests. A `cargo run -- init` inside this repository therefore indexes
