@@ -315,6 +315,42 @@ fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
     assert!(live_state.is_dir(), "the live project's state must survive: {}", stdout_of(&swept));
 }
 
+/// GM-247's acceptance criterion in one test: a discarded error has to reach
+/// the message, not just change the outcome.
+///
+/// A pid file that cannot be read is not "no daemon" - it is "I cannot tell",
+/// and the two lead to opposite actions where one of them is a deletion.
+/// `read_pid_file` collapsed both into `None`, so a state directory whose
+/// liveness was unknowable was swept as though it were idle.
+///
+/// A directory in the pid file's place is the portable way to make the read
+/// fail: it is an error on every platform, it is not `NotFound`, and nothing
+/// this suite writes could produce it by accident.
+#[test]
+fn a_state_directory_whose_pid_file_cannot_be_read_is_never_swept() {
+    let home = Home::new();
+    let project = Project::new(&home);
+    let state = project.ready_to_be_swept();
+
+    let pid_file = project.pid_file();
+    let _ = fs::remove_file(&pid_file);
+    fs::create_dir(&pid_file).expect("failed to put a directory where the pid file goes");
+
+    let swept = project.command(&["clean", "all", "--force"]);
+
+    assert!(swept.status.success(), "clean all --force failed: {}", stderr_of(&swept));
+    assert!(
+        state.is_dir(),
+        "a project whose liveness cannot be determined must survive the sweep: {}",
+        stdout_of(&swept)
+    );
+    assert!(
+        stderr_of(&swept).contains("cannot read"),
+        "the reason must reach the operator, not only the outcome: {}",
+        stderr_of(&swept)
+    );
+}
+
 /// `clean all --force` end to end. Its scope is the whole root, so the test
 /// that proves it needs more than one project in that root - with a single
 /// project it is indistinguishable from `clean`.
