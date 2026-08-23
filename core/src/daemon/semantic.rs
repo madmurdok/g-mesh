@@ -168,9 +168,7 @@ pub fn run_once(
     // large project that is minutes during which the only way anything outside
     // this process - `cli::status`, `cli::stop`, a test's teardown - can name
     // the checker holding a project open is this file.
-    if let Err(err) = std::fs::write(&pid_file, process.pid().to_string()) {
-        eprintln!("g-mesh: failed to write plugin pid file {}: {err}", pid_file.display());
-    }
+    super::write_pid_file(&pid_file, process.pid());
 
     let outcome = process.semantic_pass(conn, Vec::new(), embedding);
 

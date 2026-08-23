@@ -757,9 +757,7 @@ impl PluginProcess {
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         *self.state.lock().unwrap() = fresh;
-        if let Err(err) = fs::write(&self.pid_file, pid.to_string()) {
-            eprintln!("g-mesh daemon: could not update the plugin pid file after relaunch: {err:#}");
-        }
+        super::write_pid_file(&self.pid_file, pid);
         Ok(())
     }
 }
