@@ -1731,6 +1731,46 @@ thing surfaced there is worth recording here:
   result shape, pagination) but not a new *connection*. Not implemented, not
   scoped further here — recorded as a candidate for a future release.
 
+  **Decided (task GM-198, 2026-08-23): not building it, and the reasons are
+  measured rather than argued.** This paragraph had sat undecided for two
+  release cycles, which was the one thing the task ruled out.
+
+  *The cost is now a number.* GM-188 measured the tool-schema tax against a
+  real `tools/list`: 9,191 bytes, 5,543 cache-creation tokens per isolated
+  run, averaging ~693 tokens per tool. A diagnostics tool with file and symbol
+  anchoring, pagination and a new result shape lands in that range — call it
+  ~600 tokens, **a 12% increase in a tax every user pays on every isolated run
+  whether they call the tool or not**. GM-188 also established that the tax is
+  58% prose and effectively irreducible, so this is not a cost that can later
+  be optimised away.
+
+  *The freshness semantics are a genuine departure, not a detail.* Every other
+  tool answers from an index that is stable between edits and carries a
+  completeness contract — `resolved`, `truncated`, `hasMore` — that tells a
+  caller when an answer can be trusted without re-verifying it. Diagnostics
+  change with every keystroke and have no meaningful `resolved`. Reusing that
+  vocabulary would mislead; omitting it would make this the one tool whose
+  answers carry no completeness signal. Neither is free, and the task was
+  explicit that this had to be *stated* rather than silently chosen.
+
+  *And there is no measured demand.* g-mesh-bench has no diagnostics task, so
+  the benefit is an assertion. The precedent is fresh and unflattering: GM-234
+  shipped the semantic rung, after which probing every `find_definition` call
+  across twelve bench runs found the rung fires for exactly one query in the
+  entire corpus — a benchmark would have measured nothing. Building on
+  parity-with-serena reasoning is how that happens.
+
+  *What would overturn this, concretely.* A bench task where an agent must
+  answer "what is wrong with this file" against a known diagnostic, run across
+  `baseline`, `serena-configured` (which has the capability) and
+  `gmesh-configured`. If serena wins decisively, the capability is worth ~600
+  tokens; if baseline handles it by running `tsc --noEmit` or reading the file,
+  it is not. **That experiment cannot be run today**: the harness can only seed
+  files through `oracle.holdoutFiles`, which `testRunner.ts` applies *after* the
+  agent has run, so there is no way to put a file with a known type error in
+  front of it. Measuring the demand therefore requires a harness change first —
+  which is the honest next step, and is cheaper than the tool.
+
 The rest of Serena's 52 tools were looked at and not carried forward, for
 reasons distinct enough to note rather than lump together: ~13 `jet_brains_*`
 tools are a second backend for the *same* 5 LSP tools above (a duplication

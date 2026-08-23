@@ -44,7 +44,7 @@ struct DefinitionNode {
     doc_comment: Option<String>,
     /// Which rung of the ladder reached this - see [`ResolvedBy`]. Absent on a
     /// file+position lookup, which cannot be anything but exact.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     resolved_by: Option<ResolvedBy>,
     /// The declaration's own text - see [`source`] for why this is worth its
     /// payload and how it is bounded.
@@ -154,6 +154,7 @@ struct CandidatePage {
     /// Which rung produced this page - always `nameAmbiguous` here. Present so
     /// a caller reads one field to tell an ambiguity from the other kind of
     /// candidate page (`fileName`), rather than inferring it from `ambiguous`.
+    #[serde(skip_serializing)]
     resolved_by: ResolvedBy,
     results: Vec<DefinitionCandidate>,
     has_more: bool,
@@ -167,6 +168,7 @@ struct CandidatePage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileNamePage {
+    #[serde(skip_serializing)]
     resolved_by: ResolvedBy,
     /// Always `false`: these are not competing readings of one name.
     ambiguous: bool,
