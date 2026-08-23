@@ -89,6 +89,14 @@ pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
 /// been running since before that install - which is why the staleness check
 /// lives here rather than in the daemon (see [`connect_or_bootstrap`]).
 pub fn run() -> Result<()> {
+    // Before anything is spawned, and unconditionally rather than beside the
+    // one spawn that needed it: this shim's stdin and stdout *are* the MCP
+    // channel, and nothing it ever starts has any business holding them. On
+    // Windows they would otherwise be inherited whatever a child's own stdio
+    // is set to, leaving the client unable to see this process close (see
+    // `process::keep_our_stdio_from_children`). A no-op on Unix.
+    process::keep_our_stdio_from_children();
+
     let root = resolve_project_root()?;
     let stream = connect_or_bootstrap(&root)?;
     proxy(stream)
