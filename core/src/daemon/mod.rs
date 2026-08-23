@@ -208,9 +208,67 @@ fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
 
 /// Reads a pid out of one of the files above. `None` for a file that isn't
 /// there or doesn't hold a pid - both mean "nothing recorded", which is what
-/// every caller does with them anyway.
+/// every best-effort caller does with them anyway.
+///
+/// Use [`read_pid_file_result`] instead wherever "nothing recorded" and "could
+/// not tell" must lead to different actions - most of all where the difference
+/// decides whether something is deleted.
 pub fn read_pid_file(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    read_pid_file_result(path).ok().flatten()
+}
+
+/// The same read, keeping the one distinction [`read_pid_file`] throws away:
+/// a file that is *not there* against a file that could not be read.
+///
+/// Those are the same value and opposite facts. A caller deciding whether a
+/// project is idle enough to delete reads the first as "safe" - and read the
+/// second as "safe" too, because the error had been collapsed into `None` one
+/// line earlier. This is the third time in one batch that a discarded error
+/// was the whole answer (GM-247), and the only one where the cost was a
+/// deletion rather than a confusing message.
+///
+/// A present but unparseable file stays `Ok(None)`: that is the documented
+/// meaning of "nothing recorded" and several callers depend on it, and since
+/// [`write_pid_file`] renames a complete file into place, anything this
+/// process wrote is either absent or parseable.
+pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents.trim().parse().ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Records a pid where [`read_pid_file`] will find it, atomically: written to
+/// a sibling temporary and renamed into place, so a concurrent reader sees
+/// either the previous contents or the complete new ones and never an
+/// in-between.
+///
+/// The in-between was real and cost a run. `fs::write` truncates before it
+/// writes, so a reader that had waited for the file to *exist* could still
+/// read zero bytes from it - which `read_pid_file` correctly reports as
+/// "nothing recorded", and which every caller then reads as "no daemon" or
+/// "no plugin" (GM-242). Waiting longer cannot fix that; only making the file
+/// never observable half-written can. `cli::model`'s weights download already
+/// uses the same rename-into-place shape for the same reason.
+///
+/// The temporary is named after the writing process, so two daemons racing to
+/// record different pids cannot corrupt each other's temporary - only the
+/// final rename is contended, and a rename is the thing that is atomic.
+///
+/// Best-effort, like every other pid-file write in the daemon: a reader that
+/// finds nothing degrades to "nothing recorded", which they all already
+/// handle.
+pub fn write_pid_file(path: &Path, pid: u32) {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    if let Err(err) = fs::write(&temporary, format!("{pid}\n")) {
+        eprintln!("g-mesh daemon: failed to write pid file {}: {err}", temporary.display());
+        return;
+    }
+    if let Err(err) = fs::rename(&temporary, path) {
+        eprintln!("g-mesh daemon: failed to put pid file {} in place: {err}", path.display());
+        let _ = fs::remove_file(&temporary);
+    }
 }
 
 /// Whether a process with this pid currently exists - [`crate::process::is_alive`]
@@ -384,8 +442,7 @@ pub fn run(root: &Path) -> Result<()> {
     // the tests that wait on it - it just no longer also means "and the index
     // is complete", which `meta.bulkIndexedAt` is the record of.
     let pid_file = dir.join(PID_FILE);
-    fs::write(&pid_file, std::process::id().to_string())
-        .with_context(|| format!("failed to write pid file {}", pid_file.display()))?;
+    write_pid_file(&pid_file, std::process::id());
 
     // And recorded beside the lock too, now that this process is genuinely
     // serving. The pid file above answers "which process is the daemon"; this
@@ -1041,10 +1098,7 @@ fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
 /// failing is a wedge that reads as `Starting` and is left alone, which is the
 /// behaviour this project had before the record existed.
 fn record_serving_owner(state_dir: &Path) {
-    let path = serving_owner_path_in(state_dir);
-    if let Err(err) = fs::write(&path, format!("{}\n", std::process::id())) {
-        eprintln!("g-mesh daemon: failed to record itself as the lock's owner in {}: {err}", path.display());
-    }
+    write_pid_file(&serving_owner_path_in(state_dir), std::process::id());
 }
 
 /// Removes the record, so a fresh holder does not inherit its predecessor's
@@ -1076,6 +1130,42 @@ pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The property the whole of GM-242 turns on: a reader that waits for the
+    /// file to exist can never then read nothing out of it. Written as a loop
+    /// because a single pass would pass just as well against the old
+    /// truncate-then-write, which is only observable in the gap.
+    #[test]
+    fn a_pid_file_is_never_observable_empty_between_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+
+        for pid in 1..=50u32 {
+            write_pid_file(&path, pid);
+            assert_eq!(
+                read_pid_file(&path),
+                Some(pid),
+                "rewriting a pid file must never leave it unreadable"
+            );
+        }
+    }
+
+    /// The rename has to actually happen. A helper that wrote the temporary
+    /// and failed to move it would satisfy the test above on the first
+    /// iteration and leave litter behind for ever after.
+    #[test]
+    fn writing_a_pid_file_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pid_file(&dir.path().join("daemon.pid"), 4321);
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "daemon.pid")
+            .collect();
+        assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
+    }
     use super::*;
 
     /// Forces the exact shape of task 165's race deterministically, instead

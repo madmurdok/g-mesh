@@ -66,6 +66,69 @@ const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
 /// below meaningful - the bytes at this commit cannot legitimately change.
 const MODEL_REVISION: &str = "516f4baf13dec4ddddda8631e019b5737c8bc250";
 
+/// Where the weights are fetched from, tried in order.
+///
+/// Upstream stays first among the built-ins deliberately. The mirror exists
+/// for availability, not for provenance: keeping Hugging Face as the source
+/// everyone normally touches means the project never quietly becomes the
+/// origin of weights it only redistributes. The cost of that choice is that a
+/// fallback nobody exercises can rot, which is why the fallback has a test of
+/// its own rather than only a comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// Hugging Face, addressed the way it addresses itself: repository,
+    /// revision, then the path inside the repository.
+    Upstream,
+    /// Any host serving the two files side by side under one prefix - a
+    /// corporate mirror, a GitHub release's assets (which are flat under their
+    /// tag), or a directory served for a test.
+    Flat(String),
+}
+
+impl Source {
+    fn url(&self, file: &RemoteFile) -> String {
+        match self {
+            Self::Upstream => {
+                format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{}", file.remote_path)
+            }
+            Self::Flat(base) => format!("{}/{}", base.trim_end_matches('/'), file.local_name),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Upstream => format!("{MODEL_REPO}@{}", &MODEL_REVISION[..7]),
+            Self::Flat(base) => base.clone(),
+        }
+    }
+}
+
+/// Points `model fetch` somewhere else. Prepended to the built-in list rather
+/// than replacing it, so an unreachable mirror degrades to a slower download
+/// instead of a failed one - and the output names both, so nobody who set this
+/// to keep traffic inside their network finds out silently that it did not.
+const BASE_URL_ENV: &str = "G_MESH_MODEL_BASE_URL";
+
+/// The sources to try, in order.
+fn sources() -> Vec<Source> {
+    let override_base = std::env::var_os(BASE_URL_ENV).filter(|value| !value.is_empty());
+    sources_from(override_base.as_ref().map(|value| value.to_string_lossy()).as_deref())
+}
+
+/// The ordering decision on its own, so it can be tested without touching the
+/// environment. `std::env::set_var` is process-global and cargo runs tests in
+/// threads, so a test that set the variable would race every other test in the
+/// binary - and the failure would look like flakiness rather than like a test
+/// reaching outside itself.
+fn sources_from(override_base: Option<&str>) -> Vec<Source> {
+    let mut sources = Vec::new();
+    if let Some(base) = override_base.filter(|value| !value.is_empty()) {
+        sources.push(Source::Flat(base.to_string()));
+    }
+    sources.push(Source::Upstream);
+    sources
+}
+
 /// How long to wait for the connection itself. Deliberately *not* a deadline
 /// on the whole request: 612 MiB over a slow link legitimately takes many
 /// minutes, and a total timeout would turn a working download into a failure
@@ -264,6 +327,7 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
         .user_agent(concat!("g-mesh/", env!("CARGO_PKG_VERSION")))
         .build();
 
+    let sources = sources();
     for file in &FILES {
         let dest = dir.join(file.local_name);
         if dest.exists() {
@@ -272,12 +336,12 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
         }
         writeln!(
             out,
-            "downloading {} ({}) from {MODEL_REPO}@{}",
+            "downloading {} ({}) from {}",
             file.local_name,
             human_size(file.size),
-            &MODEL_REVISION[..7]
+            sources[0].describe()
         )?;
-        download(&agent, file, &dest)?;
+        download(&agent, file, &dest, &sources, out)?;
         writeln!(out, "  verified {}", file.local_name)?;
     }
 
@@ -368,25 +432,53 @@ fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
 /// failed attempt deletes its own `.partial` instead of leaving debris. A
 /// process killed mid-download still leaves a `.partial`; that is the point -
 /// it is not a name anything else looks for.
-fn download(agent: &ureq::Agent, file: &RemoteFile, dest: &Path) -> Result<()> {
+fn download(
+    agent: &ureq::Agent,
+    file: &RemoteFile,
+    dest: &Path,
+    sources: &[Source],
+    out: &mut impl Write,
+) -> Result<()> {
     let partial = dest.with_file_name(format!("{}.partial", file.local_name));
-    let result = download_to_partial(agent, file, &partial);
-    if result.is_err() {
-        // Best-effort: if this fails too there is nothing useful left to do,
-        // and the message about *why* the download failed is worth more than
-        // one about the leftover file.
-        let _ = fs::remove_file(&partial);
-    }
-    result?;
 
-    fs::rename(&partial, dest)
-        .with_context(|| format!("failed to move {} into place as {}", partial.display(), dest.display()))
+    // Every attempt is kept, not just the last. One generic "download failed"
+    // for a list of sources is the same mistake as one generic "not indexed"
+    // for a list of reasons: it names the symptom of the last try and hides
+    // that the others were tried at all (GM-247's shape, in a different file).
+    let mut failures = Vec::new();
+    for source in sources {
+        match download_to_partial(agent, file, &partial, source) {
+            Ok(()) => {
+                if !failures.is_empty() {
+                    writeln!(out, "  fetched from {} instead", source.describe())?;
+                }
+                return fs::rename(&partial, dest).with_context(|| {
+                    format!("failed to move {} into place as {}", partial.display(), dest.display())
+                });
+            }
+            Err(err) => {
+                // Best-effort: if this fails too there is nothing useful left
+                // to do, and the message about *why* the download failed is
+                // worth more than one about the leftover file.
+                let _ = fs::remove_file(&partial);
+                writeln!(out, "  {} failed: {err:#}", source.describe())?;
+                failures.push(format!("{}: {err:#}", source.describe()));
+            }
+        }
+    }
+
+    bail!("could not download {} from any source.\n  {}", file.local_name, failures.join("\n  "))
 }
 
 /// Streams the response into `partial`, hashing as it goes, and fails if what
 /// arrived is not byte-for-byte what [`MODEL_REVISION`] pins.
-fn download_to_partial(agent: &ureq::Agent, file: &RemoteFile, partial: &Path) -> Result<()> {
-    let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{}", file.remote_path);
+fn download_to_partial(
+    agent: &ureq::Agent,
+    file: &RemoteFile,
+    partial: &Path,
+    source: &Source,
+) -> Result<()> {
+    let url = source.url(file);
     let response = agent.get(&url).call().with_context(|| format!("failed to download {url}"))?;
 
     let mut source = response.into_reader();
@@ -530,6 +622,108 @@ mod tests {
     /// file rather than a copy.
     const FETCH_SCRIPT: &str = include_str!("../../scripts/fetch-embedding-model.sh");
 
+    /// Serves `body` once at `/<name>` and then stops. Enough HTTP for `ureq`
+    /// to read a body, and no dependency to add for it.
+    fn serve_once(body: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind a test server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch);
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = socket.write_all(body);
+                let _ = socket.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A port nothing is listening on. Bound and released, so it is free and
+    /// refuses immediately rather than hanging until `CONNECT_TIMEOUT`.
+    fn dead_source() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    const TEST_BODY: &[u8] = b"the bytes a mirror would serve\n";
+    /// sha256 of TEST_BODY, computed rather than written from memory - the
+    /// first attempt at this constant was invented, and the test caught it by
+    /// failing exactly where a substituted mirror would. That is the property
+    /// worth having: the fallback is verified the same way the real download
+    /// is, and a fallback that skipped the digest check would be worse than no
+    /// fallback at all.
+    const TEST_DIGEST: &str = "602a7f1475de6cea8eeee903327a0e3d402620c8f277f075d4fcdc9f068fc6a9";
+
+    fn test_file() -> RemoteFile {
+        RemoteFile {
+            remote_path: "onnx/model.onnx",
+            local_name: "mirrored.bin",
+            size: TEST_BODY.len() as u64,
+            sha256: TEST_DIGEST,
+        }
+    }
+
+    #[test]
+    fn an_override_is_tried_first_and_upstream_still_follows_it() {
+        assert_eq!(sources_from(None), vec![Source::Upstream]);
+        assert_eq!(
+            sources_from(Some("https://mirror.example/g-mesh")),
+            vec![Source::Flat("https://mirror.example/g-mesh".to_string()), Source::Upstream],
+            "an override must not remove the fallback - an unreachable mirror should cost a \
+             slower download, not a failed one"
+        );
+        assert_eq!(sources_from(Some("")), vec![Source::Upstream], "an empty override is not a source");
+    }
+
+    #[test]
+    fn a_flat_source_addresses_the_file_by_the_name_it_lands_under() {
+        let file = test_file();
+        assert_eq!(
+            Source::Flat("https://example.test/weights/".to_string()).url(&file),
+            "https://example.test/weights/mirrored.bin",
+            "a trailing slash on the base must not produce a doubled one"
+        );
+        assert!(Source::Upstream.url(&file).ends_with("/onnx/model.onnx"), "upstream keeps its own shape");
+    }
+
+    /// The acceptance criterion of GM-214: with the primary unreachable, the
+    /// download transparently succeeds from the secondary, the digest is still
+    /// checked, and the output names both.
+    #[test]
+    fn an_unreachable_primary_falls_through_to_the_next_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let agent = ureq::AgentBuilder::new().build();
+        let sources = vec![Source::Flat(dead_source()), Source::Flat(serve_once(TEST_BODY))];
+        let mut out = Vec::new();
+
+        download(&agent, &test_file(), &dest, &sources, &mut out).expect("the fallback must succeed");
+
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY, "the bytes must be the ones the digest pins");
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("failed:"), "the failed attempt must be named: {said}");
+        assert!(said.contains("fetched from"), "the source that worked must be named: {said}");
+    }
+
+    #[test]
+    fn every_attempt_is_named_when_none_of_them_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = ureq::AgentBuilder::new().build();
+        let (first, second) = (dead_source(), dead_source());
+        let sources = vec![Source::Flat(first.clone()), Source::Flat(second.clone())];
+
+        let err = download(&agent, &test_file(), &dir.path().join("x.bin"), &sources, &mut Vec::new())
+            .expect_err("no source could have served this");
+
+        let report = format!("{err:#}");
+        assert!(report.contains(&first), "the first attempt must be in the error: {report}");
+        assert!(report.contains(&second), "the second attempt must be in the error: {report}");
+    }
+
     fn fetch_output(dir: &Path) -> String {
         let mut out = Vec::new();
         fetch(Some(dir), &mut out).unwrap();
@@ -605,6 +799,20 @@ mod tests {
         let (owner, name) = MODEL_REPO.split_once('/').unwrap();
         assert!(FETCH_SCRIPT.contains(owner), "the script uses a different model owner");
         assert!(FETCH_SCRIPT.contains(name), "the script uses a different model name");
+    }
+
+    /// The override is only useful if both ways of fetching honour it, and a
+    /// variable name is exactly the kind of thing that agrees on the day it is
+    /// written and drifts afterwards. Checked here for the same reason the
+    /// revision above is: the script is a second implementation of this
+    /// command, and the two have to be kept in step by something.
+    #[test]
+    fn the_shell_script_reads_the_same_override_variable() {
+        assert!(
+            FETCH_SCRIPT.contains(BASE_URL_ENV),
+            "the script does not honour {BASE_URL_ENV}, so the two ways of fetching \
+             the weights would disagree about where they come from"
+        );
     }
 
     /// The URLs here only describe the default model, so the directory this

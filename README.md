@@ -128,6 +128,23 @@ now pass it the same model name too — they used to share the function and hand
 it different arguments, which is a way of disagreeing that sharing a function
 does not prevent.
 
+`G_MESH_MODEL_BASE_URL` points the download somewhere else — a mirror inside
+your network, or a GitHub release's assets, anything serving `model.onnx` and
+`tokenizer.json` side by side under one prefix. It is *prepended* to the
+sources rather than replacing them, so an unreachable mirror costs a slower
+download instead of a failed one, and the output names every attempt: if you
+set this to keep traffic off the public internet, you will be told when it
+went there anyway rather than finding out later. `core/scripts/fetch-embedding-model.sh`
+reads the same variable, and a test asserts the two never drift apart on it.
+
+Safe by construction, which is why it is offered at all: the SHA-256 of both
+files is pinned into the binary and checked before anything is moved into
+place, so a mirror cannot serve different bytes than upstream. A substituted
+asset fails the same check a corrupted download already fails. Adding a second
+source therefore buys availability without spending any trust — and upstream
+stays first among the built-ins, so the project never quietly becomes the
+origin of weights it only redistributes.
+
 That matters if you set `[embedding] model` to something other than the
 default. The model directory is named after the model, so the daemon reads
 `~/.g-mesh/models/<your-model>/` — and `model fetch` can only download the

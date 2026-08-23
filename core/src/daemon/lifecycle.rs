@@ -285,7 +285,7 @@ impl PluginSupervisor {
     ) -> Result<Arc<Self>> {
         let process = PluginProcess::spawn(project_root, &manifest, pid_file.clone())
             .with_context(|| format!("failed to start the {} plugin", manifest.language))?;
-        write_pid_file(&pid_file, process.pid());
+        super::write_pid_file(&pid_file, process.pid());
 
         Ok(Arc::new(Self {
             project_root: project_root.to_path_buf(),
@@ -367,7 +367,7 @@ impl PluginSupervisor {
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
-            write_pid_file(&self.pid_file, process.pid());
+            super::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
 
@@ -469,7 +469,7 @@ impl PluginSupervisor {
                         self.manifest.language
                     )
                 })?;
-            write_pid_file(&self.pid_file, process.pid());
+            super::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
         self.touch();
@@ -685,14 +685,6 @@ fn release_state_files(state_dir: &Path) {
     // `ipc::windows`.
     if let Some(endpoint) = super::endpoint_in(state_dir) {
         endpoint.clear_stale();
-    }
-}
-
-/// Best-effort, like every other pid-file write in the daemon: tooling that
-/// reads it degrades to "nothing recorded", which it already handles.
-fn write_pid_file(path: &Path, pid: u32) {
-    if let Err(err) = fs::write(path, pid.to_string()) {
-        eprintln!("g-mesh daemon: failed to write plugin pid file {}: {err}", path.display());
     }
 }
 

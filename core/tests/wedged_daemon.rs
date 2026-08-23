@@ -93,7 +93,17 @@ impl Project {
     /// can reach.
     fn bootstrap_core(&self) -> u32 {
         let mut shim = self.spawn_shim();
-        wait_for("the daemon to bind its socket", || self.pid_file().exists());
+        // Waits for the state every caller is about to *read*, not for a
+        // proxy that becomes true earlier. `Serving` is the daemon having
+        // published itself as the lock's owner, which is exactly the fact
+        // `wedge` below converts into `Wedged` by taking the socket away.
+        // Waiting on the pid file instead returned a few lines too soon, and
+        // the assertion that followed read `Starting` - a legitimate
+        // intermediate state, reported correctly, about a daemon that simply
+        // had not got there yet (GM-254).
+        wait_for("the daemon to publish itself as serving", || {
+            daemon::inspect_daemon_lock(self.root()).ok() == Some(DaemonLock::Serving)
+        });
         let _ = shim.kill();
         let _ = shim.wait();
 

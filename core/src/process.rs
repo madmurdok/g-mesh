@@ -71,6 +71,31 @@ pub fn detach(command: &mut Command) -> &mut Command {
     imp::detach(command)
 }
 
+/// Stops any child this process spawns from receiving copies of its standard
+/// handles, whatever the child's own stdio is set to.
+///
+/// This exists because `Stdio::null()` does not say what it appears to say on
+/// Windows. It sets what the child's STARTUPINFO names, while `CreateProcess`
+/// is called with `bInheritHandles = TRUE` and hands over **every inheritable
+/// handle in the parent** regardless. A shim's stdin and stdout are the MCP
+/// channel and are inheritable, having themselves been inherited from the
+/// client - so a daemon spawned with all three stdio streams pointed at NUL
+/// still ended up holding the client's pipe, and the client could not see the
+/// shim close: EOF never came, because a writer it had never heard of was
+/// still alive (GM-251).
+///
+/// A no-op on Unix, where `CLOEXEC` already means nothing crosses an exec that
+/// was not asked for. Same shape as `ipc::Endpoint::check_length`'s Windows
+/// no-op: the caller states the intent unconditionally and the platform that
+/// has nothing to do does nothing.
+///
+/// Process-wide and permanent, deliberately. The invariant is "this process
+/// never hands its channel to a child", not "not on this one spawn", and a
+/// per-spawn version would be a flag to remember at every future call site.
+pub fn keep_our_stdio_from_children() {
+    imp::keep_our_stdio_from_children()
+}
+
 #[cfg(unix)]
 mod imp {
     use anyhow::{Context, Result};
@@ -120,16 +145,22 @@ mod imp {
         // group away from it.
         command.process_group(0)
     }
+
+    /// Nothing to do: Rust opens its file descriptors `CLOEXEC`, so a child
+    /// gets what `Command`'s stdio names and nothing else.
+    pub fn keep_our_stdio_from_children() {}
 }
 
 #[cfg(windows)]
 mod imp {
     use anyhow::{Context, Result};
-    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, SetHandleInformation, ERROR_ACCESS_DENIED, HANDLE_FLAG_INHERIT, STILL_ACTIVE,
+    };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
         PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -198,6 +229,25 @@ mod imp {
         // `CTRL_C_EVENT` sent to the spawner's group) from also reaching the
         // daemon, which is exactly what `process_group(0)` buys on Unix.
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+    }
+
+    pub fn keep_our_stdio_from_children() {
+        // Failure is ignored on purpose, per handle. A standard handle can be
+        // absent or already non-inheritable - a service with no console, a
+        // redirected stream - and neither is a reason to refuse to start. The
+        // call is a tightening; where there is nothing to tighten there is
+        // nothing to report.
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // SAFETY: the handle comes from this process's own standard
+            // stream, is valid for the duration of the call, and only its
+            // inheritance flag is written - nothing is read through it and no
+            // ownership changes hands.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
     }
 
     fn open(pid: u32, rights: PROCESS_ACCESS_RIGHTS) -> Option<OwnedHandle> {
