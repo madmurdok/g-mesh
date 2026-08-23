@@ -74,7 +74,7 @@ pub(super) struct AnchorInfo {
     /// Which rung of the resolution ladder reached this anchor - see
     /// [`find_definition::ResolvedBy`]. Absent when built from a bare node
     /// (a resumed walk, where the anchor is carried rather than resolved).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub(super) resolved_by: Option<find_definition::ResolvedBy>,
 }
 
