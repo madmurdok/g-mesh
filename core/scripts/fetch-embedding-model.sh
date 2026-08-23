@@ -40,7 +40,17 @@ REVISION="516f4baf13dec4ddddda8631e019b5737c8bc250"
 # and the loader can never disagree about where the weights belong: an explicit
 # argument, else $G_MESH_MODEL_DIR, else the per-user model directory.
 TARGET_DIR="${1:-${G_MESH_MODEL_DIR:-${HOME}/.g-mesh/models/${MODEL_NAME}}}"
-BASE_URL="https://huggingface.co/${REPO}/resolve/${REVISION}"
+
+# Where the weights come from, tried in order - the same rule and the same
+# variable as `g-mesh model fetch` (core/src/cli/model.rs). An override is
+# tried first and upstream still follows it, so an unreachable mirror costs a
+# slower download rather than a failed one.
+#
+# The two are addressed differently on purpose. Upstream is addressed the way
+# Hugging Face addresses itself; an override serves the two files side by side
+# under one prefix, which is the shape of both a corporate mirror and a GitHub
+# release's assets.
+UPSTREAM_URL="https://huggingface.co/${REPO}/resolve/${REVISION}"
 
 mkdir -p "${TARGET_DIR}"
 
@@ -54,9 +64,27 @@ fetch() {
     return
   fi
 
-  echo "downloading ${local_name} from ${REPO}@${REVISION:0:7} ..."
-  curl --fail --location --progress-bar --output "${dest}.partial" "${BASE_URL}/${remote_path}"
-  mv "${dest}.partial" "${dest}"
+  local -a urls=()
+  if [ -n "${G_MESH_MODEL_BASE_URL:-}" ]; then
+    urls+=("${G_MESH_MODEL_BASE_URL%/}/${local_name}")
+  fi
+  urls+=("${UPSTREAM_URL}/${remote_path}")
+
+  local url
+  for url in "${urls[@]}"; do
+    echo "downloading ${local_name} from ${url} ..."
+    if curl --fail --location --progress-bar --output "${dest}.partial" "${url}"; then
+      mv "${dest}.partial" "${dest}"
+      return
+    fi
+    # Every attempt is reported rather than only the last, so "the download
+    # failed" never hides which sources were tried.
+    echo "  ${url} failed" >&2
+    rm -f "${dest}.partial"
+  done
+
+  echo "could not download ${local_name} from any source" >&2
+  exit 1
 }
 
 # The fp32 export, not model_fp16/model_quantized: those trade accuracy for
