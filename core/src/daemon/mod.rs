@@ -208,9 +208,35 @@ fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
 
 /// Reads a pid out of one of the files above. `None` for a file that isn't
 /// there or doesn't hold a pid - both mean "nothing recorded", which is what
-/// every caller does with them anyway.
+/// every best-effort caller does with them anyway.
+///
+/// Use [`read_pid_file_result`] instead wherever "nothing recorded" and "could
+/// not tell" must lead to different actions - most of all where the difference
+/// decides whether something is deleted.
 pub fn read_pid_file(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    read_pid_file_result(path).ok().flatten()
+}
+
+/// The same read, keeping the one distinction [`read_pid_file`] throws away:
+/// a file that is *not there* against a file that could not be read.
+///
+/// Those are the same value and opposite facts. A caller deciding whether a
+/// project is idle enough to delete reads the first as "safe" - and read the
+/// second as "safe" too, because the error had been collapsed into `None` one
+/// line earlier. This is the third time in one batch that a discarded error
+/// was the whole answer (GM-247), and the only one where the cost was a
+/// deletion rather than a confusing message.
+///
+/// A present but unparseable file stays `Ok(None)`: that is the documented
+/// meaning of "nothing recorded" and several callers depend on it, and since
+/// [`write_pid_file`] renames a complete file into place, anything this
+/// process wrote is either absent or parseable.
+pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents.trim().parse().ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Records a pid where [`read_pid_file`] will find it, atomically: written to

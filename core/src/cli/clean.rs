@@ -394,10 +394,25 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
 /// than assuming one hardcoded plugin - a live Python plugin orphaned by a
 /// dead core must stop this project from being cleaned up exactly as much as
 /// a live JS/TS one always has.
+/// A pid file that cannot be read counts as running, and says so. The two
+/// answers this function has to give are "delete it" and "leave it alone", and
+/// only one of them is reversible - so "I could not tell" belongs with the
+/// safe one. Collapsing the error into `None` put it with the other (GM-247).
 fn daemon_is_running(state_dir: &Path) -> bool {
     let mut pid_files = vec![daemon::pid_path_in(state_dir)];
     pid_files.extend(daemon::registry::discovered_pid_files(state_dir).into_iter().map(|(_, path)| path));
-    pid_files.iter().filter_map(|path| daemon::read_pid_file(path)).any(daemon::is_process_alive)
+    pid_files.iter().any(|path| match daemon::read_pid_file_result(path) {
+        Ok(Some(pid)) => daemon::is_process_alive(pid),
+        Ok(None) => false,
+        Err(err) => {
+            eprintln!(
+                "g-mesh: cannot read {} ({err}) - treating this project as still running, \
+                 because deleting the state of a live one is the mistake that cannot be undone",
+                path.display()
+            );
+            true
+        }
+    })
 }
 
 fn delete(path: &Path) -> Result<()> {
