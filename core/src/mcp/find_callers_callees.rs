@@ -189,6 +189,58 @@ struct CallerPage {
     /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// See [`ExcludedReferences`] - absent, not zero, when the walk left
+    /// nothing behind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_references: Option<ExcludedReferences>,
+}
+
+/// What a `CALLS` walk left behind, disclosed at the response level.
+///
+/// `find_callers`/`find_callees` walk `CALLS` edges only, and a `CALLS` edge
+/// exists only where the call site sits lexically inside a named, tracked
+/// function. A call written at a file's top level, or inside an anonymous
+/// callback that is not itself a tracked symbol - `it("...", () => { f() })` in
+/// a test file is the canonical shape - produces a `REFERENCES` edge instead,
+/// which this walk never sees.
+///
+/// That is by design and documented, but the documentation lives in the
+/// caller's prompt while the *answer* says `hasMore: false` and nothing else.
+/// A page that is complete for the question it answers still reads as complete
+/// for the question that was asked, and a benchmark run caught exactly that:
+/// a `find_callers` page on `releaseTask` looked whole while omitting three
+/// test files, and the agent went and grepped them up itself.
+///
+/// Only the count travels, never the rows - sending them would turn this tool
+/// into `find_references` and double its payload for a question it was not
+/// asked. And the field is absent, not zero, when nothing was excluded: the
+/// narrow lookup that is most of the traffic must not grow bytes to announce
+/// that nothing was hidden, the same rule `files` follows.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExcludedReferences {
+    count: usize,
+    hint: &'static str,
+}
+
+const EXCLUDED_REFERENCES_HINT: &str =
+    "Usages that are not CALLS edges were excluded - a call at file top level or inside an \
+     anonymous callback (e.g. a test's it(...) body) is one of these. Use find_references for \
+     an exhaustive list.";
+
+/// Counts the `REFERENCES`-kind edges this `CALLS` walk excluded, or `None`
+/// when there were none. Errors are swallowed to `None` on purpose: this is a
+/// disclosure attached to an answer that already succeeded, and failing the
+/// whole call because the footnote could not be computed would trade a good
+/// answer for no answer.
+fn excluded_references(
+    conn: &Connection,
+    anchor_id: &str,
+    direction: Direction,
+    file_paths: &[&str],
+) -> Option<ExcludedReferences> {
+    let count = pagination::count_edges(conn, anchor_id, direction, &["REFERENCES"], file_paths).ok()?;
+    (count > 0).then_some(ExcludedReferences { count, hint: EXCLUDED_REFERENCES_HINT })
 }
 
 #[derive(Serialize)]
@@ -206,6 +258,10 @@ struct CalleePage {
     /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// See [`ExcludedReferences`] - absent, not zero, when the walk left
+    /// nothing behind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_references: Option<ExcludedReferences>,
 }
 
 pub(super) fn handle_callers(
@@ -254,6 +310,8 @@ pub(super) fn handle_callers(
     let files =
         pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
 
+    let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
+
     success(&CallerPage {
         anchor: anchor_info,
         results: bounded.results,
@@ -262,6 +320,7 @@ pub(super) fn handle_callers(
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
         hint,
+        excluded_references: excluded,
     })
 }
 
@@ -306,6 +365,8 @@ pub(super) fn handle_callees(
         .collect();
     let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
 
+    let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths);
+
     success(&CalleePage {
         anchor: anchor_info,
         results: bounded.results,
@@ -313,6 +374,7 @@ pub(super) fn handle_callees(
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
         hint,
+        excluded_references: excluded,
     })
 }
 
@@ -487,6 +549,73 @@ mod tests {
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every caller unresolved must set the response-level marker");
+    }
+
+    /// The benchmark shape, from g-mesh-bench GMB-142: `releaseTask` is called
+    /// from three test files, each call sitting inside an `it("...", () => {})`
+    /// body that is not itself a tracked symbol. Those produce `REFERENCES`
+    /// edges, so the `CALLS` walk cannot see them - and before this field the
+    /// page said `hasMore: false` and left the caller to discover the gap by
+    /// grepping, which is exactly what the measured agent did.
+    #[test]
+    fn a_caller_page_that_excluded_references_discloses_how_many() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("spec", "File", "spec", "spec", "a.test.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_call", "caller", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        // The call inside the anonymous callback: a REFERENCES edge the walk skips.
+        upsert_edge(&mut conn, EdgeRecord::new("e_ref", "spec", "target", "REFERENCES", "tree-sitter", true))
+            .unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(
+            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+        );
+
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            1,
+            "the CALLS walk still returns only the call"
+        );
+        assert_eq!(body["hasMore"], false);
+        assert_eq!(body["excludedReferences"]["count"], 1, "the omitted REFERENCES edge must be disclosed");
+        assert!(
+            body["excludedReferences"]["hint"].as_str().unwrap().contains("find_references"),
+            "the disclosure must name the tool that answers exhaustively",
+        );
+        assert!(
+            body["excludedReferences"]["results"].is_null(),
+            "only the count travels - sending the rows would make this find_references",
+        );
+    }
+
+    /// The narrow lookup that is most of the traffic must not grow bytes to
+    /// announce that nothing was hidden. Absent, not zero - the same rule
+    /// `files` follows.
+    #[test]
+    fn a_caller_page_with_nothing_excluded_omits_the_field_entirely() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("caller", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_call", "caller", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let result =
+            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let raw = json_body(&result).to_string();
+        let body = json_body(&result);
+
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert!(
+            body.get("excludedReferences").is_none(),
+            "the field must be absent, not null or zero, when the walk excluded nothing",
+        );
+        assert!(!raw.contains("excludedReferences"), "and must cost the narrow lookup no bytes at all");
     }
 
     #[test]

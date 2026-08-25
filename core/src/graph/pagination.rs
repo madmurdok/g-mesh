@@ -324,6 +324,60 @@ pub fn tally_edge_files(
     Ok(tally)
 }
 
+/// Counts edges of `edge_kinds` incident on `anchor_node_id` in `direction`,
+/// under the same scope filter [`tally_edge_files`] applies.
+///
+/// Unlike that function this is a plain count with **no cap**. It exists to
+/// answer "how many usages did the walk you were just served leave out", and a
+/// capped answer to that question would understate the very gap it is there to
+/// disclose - the opposite of the file tally, where a bounded summary is the
+/// point and `MAX_FILE_TALLY` is what keeps it from growing without bound.
+pub fn count_edges(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> Result<usize> {
+    let (other_endpoint, this_endpoint) = match direction {
+        Direction::Outgoing => ("toId", "fromId"),
+        Direction::Incoming => ("fromId", "toId"),
+    };
+
+    // `?1` is the anchor id; the kind filter's placeholders continue after it
+    // and the scope filter's after those. Same widening rule as
+    // `tally_edge_files`, minus its `?2` row cap - there is no LIMIT here.
+    let kind_filter = if edge_kinds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+        format!("e.kind IN ({})", placeholders.join(", "))
+    };
+    let scope_filter = if file_paths.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let base = 2 + edge_kinds.len();
+        let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
+        format!("n.filePath IN ({})", placeholders.join(", "))
+    };
+    let sql = format!(
+        "SELECT COUNT(*) \
+         FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
+         WHERE e.{this_endpoint} = ?1 \
+           AND {kind_filter} \
+           AND {scope_filter}"
+    );
+
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor_node_id];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let count: i64 =
+        stmt.query_row(sql_params.as_slice(), |row| row.get(0)).context("failed to count edges")?;
+    Ok(count as usize)
+}
+
 /// Whether a `files` tally is worth sending alongside `results`.
 ///
 /// Two cases, and only two. The page is incomplete (`has_more`), so the rows
