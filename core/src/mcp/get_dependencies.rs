@@ -127,7 +127,31 @@ struct DependencyWalk {
     truncated_by: Option<&'static str>,
     frontier_nodes: Vec<String>,
     resume_token: Option<String>,
+    /// The file this walk actually started from, when that is not the one the
+    /// caller named - see [`entry_point_for`]. Absent (not `null`) whenever
+    /// the anchor was taken literally, which is the overwhelming majority of
+    /// calls and must not pay bytes to say nothing happened.
+    ///
+    /// Always present when a substitution *did* happen, and deliberately so:
+    /// the tool is answering a question adjacent to the one asked, and a
+    /// caller that cannot see which file was chosen cannot tell a right guess
+    /// from a wrong one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_from: Option<ResolvedFrom>,
 }
+
+/// What the caller named, and what it was taken to mean.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedFrom {
+    requested: String,
+    file_path: String,
+    hint: &'static str,
+}
+
+const RESOLVED_FROM_HINT: &str =
+    "The path given is not an indexed file, so the walk started from the single entry point \
+     found under it. Pass that file directly to avoid the substitution.";
 
 /// The wire spelling of each truncation cause, fixed by the contract in
 /// `docs/architecture/g-mesh-v1.md`, plus `bound_walk`'s own `"responseSize"` -
@@ -208,6 +232,9 @@ fn bound_walk(
             truncated_by: result.truncated_by.map(wire_name),
             frontier_nodes: result.frontier_nodes,
             resume_token: result.resume_token,
+            // Set by the anchor arm, which is the only layer that knows
+            // whether the root it handed down was the one the caller named.
+            resolved_from: None,
         };
     };
 
@@ -236,6 +263,7 @@ fn bound_walk(
         truncated_by: Some("responseSize"),
         frontier_nodes: Vec::new(),
         resume_token: Some(token),
+        resolved_from: None,
     }
 }
 
@@ -252,6 +280,19 @@ struct WalkShape {
 /// dials: it bounds what the query engine visits internally, not what the
 /// caller asked to see, so it is always the module default here.
 fn from_root(conn: &Connection, root: String, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+    from_root_reporting(conn, root, shape, None)
+}
+
+/// [`from_root`] for the arm that had to *choose* the root rather than being
+/// handed one - see [`entry_point_for`]. The substitution rides back on the
+/// response instead of being kept quiet, so the caller can see which file the
+/// walk actually ran from.
+fn from_root_reporting(
+    conn: &Connection,
+    root: String,
+    shape: &WalkShape,
+    resolved_from: Option<ResolvedFrom>,
+) -> Result<CallToolResult, ErrorData> {
     let mut options = TraversalOptions::new(root, shape.direction);
     options.edge_kind = Some(IMPORT_EDGE.to_string());
     // `DEFAULT_MAX_DEPTH` here, not `TraversalOptions::new`'s own default -
@@ -265,17 +306,114 @@ fn from_root(conn: &Connection, root: String, shape: &WalkShape) -> Result<CallT
 
     let result = traversal::traverse(conn, options)
         .map_err(|e| internal_error("failed to walk the import graph", e))?;
-    success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new()))
+    let mut walk = bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new());
+    walk.resolved_from = resolved_from;
+    success(&walk)
 }
 
 fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
     let anchor =
         queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
-    match anchor {
-        Some(node) => from_root(conn, node.id, shape),
-        None => error(no_file_message(conn, file_path)?),
+    if let Some(node) = anchor {
+        return from_root(conn, node.id, shape);
     }
+    // Not a file. Before refusing, see whether what was named has exactly one
+    // entry point behind it - `@excalidraw/math` almost always does.
+    if let Some(entry) = entry_point_for(conn, file_path)? {
+        let resolved = ResolvedFrom {
+            requested: file_path.to_string(),
+            file_path: entry.file_path,
+            hint: RESOLVED_FROM_HINT,
+        };
+        return from_root_reporting(conn, entry.id, shape, Some(resolved));
+    }
+    error(no_file_message(conn, file_path)?)
+}
+
+/// How many candidates [`entry_point_for`] asks for. Two would do - the rule
+/// only ever inspects the first and whether a second is also an entry point -
+/// but the same queries back [`no_file_message`], which wants five to list, and
+/// one shared number is worth more than one saved row.
+const ENTRY_POINT_CANDIDATES: usize = 5;
+
+/// The single indexed file a non-file anchor unambiguously stands for, or
+/// `None` when there isn't one.
+///
+/// WHY THIS ANSWERS RATHER THAN REFUSES
+///
+/// This tool takes an exact file path and callers ask about packages. Until
+/// now that mismatch produced a good error message naming the entry point, and
+/// the caller spent a round trip acting on it. Measured over the 2026-08-26
+/// five-repetition benchmark sweep, `ex-deps-package-math-incoming` was the
+/// only task in the registry where the g-mesh arm made *zero* native calls:
+/// two of five repetitions abandoned the tool and grepped the specifier
+/// exactly as the grep-only baseline did, and two more spent a whole `Glob`
+/// turn discovering the path this function can compute. Naming the entry point
+/// and then declining to use it is the part that bought nothing.
+///
+/// THE RULE, AND WHY IT IS THIS STRICT
+///
+/// Both underlying queries order `index.*` first, so "the first candidate is
+/// an entry point and the second is not" is a complete test for *exactly one*
+/// even under their row limit. Anything less unanimous - no entry point, or
+/// two - returns `None` and falls through to the refusal, which lists the
+/// candidates. Guessing between two entry points would be a worse failure than
+/// refusing, because the walk would succeed and answer about the wrong file.
+///
+/// Two forms are tried, in the same order and for the same reasons
+/// [`no_file_message`] tries them: the path as a directory prefix
+/// (`packages/math`), then its last segment as a directory name
+/// (`@excalidraw/math` -> `math`). The second is the weaker inference - a
+/// directory sharing a package's name does not prove the package lives there -
+/// which is why every substitution is reported back on the response rather
+/// than performed silently.
+fn entry_point_for(conn: &Connection, requested: &str) -> Result<Option<EntryPoint>, ErrorData> {
+    let under = queries::find_files_under(conn, requested, ENTRY_POINT_CANDIDATES)
+        .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
+    if let Some(entry) = sole_entry_point(under) {
+        return Ok(Some(entry));
+    }
+
+    let Some(segment) = requested.rsplit('/').next().filter(|s| !s.is_empty() && *s != requested) else {
+        return Ok(None);
+    };
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, ENTRY_POINT_CANDIDATES)
+        .map_err(|e| internal_error("failed to look up files by directory name", e))?;
+    Ok(sole_entry_point(by_segment))
+}
+
+/// The two fields an anchor substitution needs off the chosen node: the id to
+/// walk from, and the path to report. Kept rather than passing `NodeRecord`
+/// around because that type is not `Clone`, and taking ownership of two
+/// `String`s is the whole of what this needs.
+struct EntryPoint {
+    id: String,
+    file_path: String,
+}
+
+/// The first element of an `index.*`-first candidate list, but only when it is
+/// an entry point and nothing after it is - see [`entry_point_for`] for why
+/// the uniqueness half is what makes this safe to act on.
+///
+/// Takes the vector by value so the chosen node's strings can be moved out
+/// rather than copied.
+fn sole_entry_point(candidates: Vec<NodeRecord>) -> Option<EntryPoint> {
+    let first = candidates.first()?;
+    if !is_entry_point(&first.file_path) {
+        return None;
+    }
+    if candidates.get(1).is_some_and(|n| is_entry_point(&n.file_path)) {
+        return None;
+    }
+    let chosen = candidates.into_iter().next()?;
+    Some(EntryPoint { id: chosen.id, file_path: chosen.file_path })
+}
+
+/// Matches the same `%/index.%` shape both candidate queries sort by, so the
+/// rule this module acts on and the ordering it relies on cannot drift apart.
+fn is_entry_point(file_path: &str) -> bool {
+    file_path.rsplit('/').next().is_some_and(|name| name.starts_with("index."))
 }
 
 /// The not-found answer, with what the index can add to it.
@@ -1019,5 +1157,119 @@ mod tests {
 
         let body = json_body(&result);
         assert_eq!(body["results"][0]["filePath"], "packages/excalidraw/viewport.ts");
+    }
+
+    /// GM-259, the measured case. `ex-deps-package-math-incoming` was the only
+    /// registry task where the g-mesh arm made zero native calls: two of five
+    /// repetitions grepped the specifier exactly as the grep-only baseline
+    /// did, and two more spent a `Glob` turn finding the path this resolves.
+    #[test]
+    fn a_package_specifier_with_one_entry_point_is_answered_not_refused() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/math/src/point.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/excalidraw/viewport.ts")).unwrap();
+        imports(&mut conn, "packages/excalidraw/viewport.ts", "packages/math/src/index.ts");
+
+        let result = from_file(
+            &conn,
+            "@excalidraw/math",
+            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        )
+        .unwrap();
+
+        let body = json_body(&result);
+        assert_eq!(body["results"][0]["filePath"], "packages/excalidraw/viewport.ts");
+        assert_eq!(
+            body["resolvedFrom"]["requested"], "@excalidraw/math",
+            "the substitution has to be visible - the tool answered a question adjacent to the one asked",
+        );
+        assert_eq!(body["resolvedFrom"]["filePath"], "packages/math/src/index.ts");
+    }
+
+    /// The directory-prefix form, which is the stronger of the two inferences:
+    /// the caller named a real path, it just is not a file.
+    #[test]
+    fn a_directory_with_one_entry_point_is_answered_too() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/index.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/math/point.ts")).unwrap();
+        upsert_node(&mut conn, file("app/viewport.ts")).unwrap();
+        imports(&mut conn, "app/viewport.ts", "packages/math/index.ts");
+
+        let body = json_body(
+            &from_file(
+                &conn,
+                "packages/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(body["results"][0]["filePath"], "app/viewport.ts");
+        assert_eq!(body["resolvedFrom"]["filePath"], "packages/math/index.ts");
+    }
+
+    /// Two entry points is the case where answering would be worse than
+    /// refusing: the walk would succeed and describe the wrong file. The old
+    /// error, which lists the candidates, is the right outcome.
+    #[test]
+    fn two_entry_points_still_refuse_and_list_the_candidates() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/index.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/math/sub/index.ts")).unwrap();
+
+        let message = error_text(
+            &from_file(
+                &conn,
+                "packages/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert!(message.contains("packages/math/index.ts"), "the candidates are still named: {message}");
+        assert!(message.contains("packages/math/sub/index.ts"), "both of them: {message}");
+    }
+
+    /// No entry point at all - a directory of ordinary modules. Picking the
+    /// shortest path would be a guess with nothing behind it.
+    #[test]
+    fn a_directory_without_an_entry_point_is_not_guessed_at() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/point.ts")).unwrap();
+        upsert_node(&mut conn, file("packages/math/vector.ts")).unwrap();
+
+        let message = error_text(
+            &from_file(
+                &conn,
+                "packages/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert!(message.contains("no file 'packages/math' found"), "{message}");
+    }
+
+    /// An ordinary, exact anchor must stay exactly as it was - including
+    /// paying no bytes for a field about a substitution that did not happen.
+    #[test]
+    fn an_exact_file_anchor_reports_no_substitution() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+        upsert_node(&mut conn, file("app/viewport.ts")).unwrap();
+        imports(&mut conn, "app/viewport.ts", "packages/math/src/index.ts");
+
+        let result = from_file(
+            &conn,
+            "packages/math/src/index.ts",
+            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        )
+        .unwrap();
+        let raw = json_body(&result).to_string();
+
+        assert_eq!(json_body(&result)["results"][0]["filePath"], "app/viewport.ts");
+        assert!(!raw.contains("resolvedFrom"), "no substitution, no field: {raw}");
     }
 }
