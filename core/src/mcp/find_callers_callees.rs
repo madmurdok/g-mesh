@@ -663,7 +663,7 @@ mod tests {
             upsert_node(&mut conn, NodeRecord::new(&id, "File", &id, &id, &path, "rust")).unwrap();
             upsert_edge(
                 &mut conn,
-                EdgeRecord::new(&format!("e_ref{i}"), &id, "target", "REFERENCES", "tree-sitter", true),
+                EdgeRecord::new(format!("e_ref{i}"), &id, "target", "REFERENCES", "tree-sitter", true),
             )
             .unwrap();
         }
@@ -693,8 +693,11 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("helper", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_call", "target", "callee", "CALLS", "tree-sitter", true))
             .unwrap();
-        upsert_edge(&mut conn, EdgeRecord::new("e_ref", "target", "helper", "REFERENCES", "tree-sitter", true))
-            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_ref", "target", "helper", "REFERENCES", "tree-sitter", true),
+        )
+        .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
@@ -702,10 +705,7 @@ mod tests {
         );
 
         assert_eq!(body["excludedReferences"]["count"], 1);
-        assert_eq!(
-            body["excludedReferences"]["files"],
-            serde_json::json!([{ "path": "c.rs", "refs": 1 }]),
-        );
+        assert_eq!(body["excludedReferences"]["files"], serde_json::json!([{ "path": "c.rs", "refs": 1 }]));
     }
 
     /// The narrow lookup that is most of the traffic must not grow bytes to
