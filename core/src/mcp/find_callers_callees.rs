@@ -211,22 +211,54 @@ struct CallerPage {
 /// a `find_callers` page on `releaseTask` looked whole while omitting three
 /// test files, and the agent went and grepped them up itself.
 ///
-/// Only the count travels, never the rows - sending them would turn this tool
-/// into `find_references` and double its payload for a question it was not
-/// asked. And the field is absent, not zero, when nothing was excluded: the
-/// narrow lookup that is most of the traffic must not grow bytes to announce
-/// that nothing was hidden, the same rule `files` follows.
+/// Rows never travel; a *file tally* does. Sending the rows would turn this
+/// tool into `find_references` and double its payload for a question it was
+/// not asked - the original argument, and it still holds. But a bare count
+/// turned out to buy the caller nothing, because what it does with the count
+/// is go and ask which files (GM-258): across 200 measured benchmark runs
+/// `find_callers` was called 44 times, 28 of those responses carried this
+/// disclosure, and seven of the follow-ups were a whole extra turn spent
+/// re-asking the same anchor through `find_references` purely to turn "2
+/// excluded" into two paths. From one such trace, verbatim, between the two
+/// calls: *"it excludes 2 non-CALLS edges … Let me check find_references for
+/// full coverage"* - and the answer it then wrote was a file list.
+///
+/// So `files` carries the names, at ~40 bytes an entry against a reference
+/// row's ~260, capped by `pagination::MAX_EXCLUDED_FILE_TALLY`. `count` stays
+/// exact and uncapped even when the tally is cut, since understating the gap
+/// is the one thing this field must never do; `files_truncated` says so
+/// explicitly rather than leaving the caller to notice that the tally sums to
+/// less than the count.
+///
+/// The field is absent, not zero, when nothing was excluded: the narrow lookup
+/// that is most of the traffic must not grow bytes to announce that nothing
+/// was hidden, the same rule `files` follows.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExcludedReferences {
     count: usize,
+    /// Every file holding one of the excluded usages, highest count first,
+    /// capped at `pagination::MAX_EXCLUDED_FILE_TALLY`.
+    files: Vec<pagination::FileTally>,
+    /// Present only when the cap cut the tally - absent, not `false`, in the
+    /// ordinary case, so a disclosure on a small anchor stays small.
+    #[serde(skip_serializing_if = "is_false")]
+    files_truncated: bool,
     hint: &'static str,
+}
+
+/// `skip_serializing_if` predicate for a `bool` that is only interesting when
+/// true - the same "absent, not false" rule the `Option` fields around it get
+/// from `Option::is_none`.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 const EXCLUDED_REFERENCES_HINT: &str =
     "Usages that are not CALLS edges were excluded - a call at file top level or inside an \
-     anonymous callback (e.g. a test's it(...) body) is one of these. Use find_references for \
-     an exhaustive list.";
+     anonymous callback (e.g. a test's it(...) body) is one of these. `files` here names every \
+     file holding one, so a file-level answer is already complete; call find_references only if \
+     you need the calling symbol or its line.";
 
 /// Counts the `REFERENCES`-kind edges this `CALLS` walk excluded, or `None`
 /// when there were none. Errors are swallowed to `None` on purpose: this is a
@@ -240,7 +272,24 @@ fn excluded_references(
     file_paths: &[&str],
 ) -> Option<ExcludedReferences> {
     let count = pagination::count_edges(conn, anchor_id, direction, &["REFERENCES"], file_paths).ok()?;
-    (count > 0).then_some(ExcludedReferences { count, hint: EXCLUDED_REFERENCES_HINT })
+    if count == 0 {
+        return None;
+    }
+    // A second query on the same predicate rather than deriving the count from
+    // the tally's own sum: the tally is capped and the count must not be, and
+    // reconstructing an uncapped total from a capped `GROUP BY` is exactly the
+    // understatement this disclosure exists to prevent.
+    let files = pagination::tally_edge_files_limited(
+        conn,
+        anchor_id,
+        direction,
+        &["REFERENCES"],
+        file_paths,
+        pagination::MAX_EXCLUDED_FILE_TALLY,
+    )
+    .unwrap_or_default();
+    let files_truncated = files.len() >= pagination::MAX_EXCLUDED_FILE_TALLY;
+    Some(ExcludedReferences { count, files, files_truncated, hint: EXCLUDED_REFERENCES_HINT })
 }
 
 #[derive(Serialize)]
@@ -303,7 +352,7 @@ pub(super) fn handle_callers(
             pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor);
+    let bounded = pagination::bound_page_reserving_two_tallies(rows, page.has_more, page.next_cursor);
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to tally calling files", e))?;
@@ -363,7 +412,7 @@ pub(super) fn handle_callees(
             pagination::EdgeRow { item: CalleeSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page(rows, page.has_more, page.next_cursor);
+    let bounded = pagination::bound_page_reserving_excluded_tally(rows, page.has_more, page.next_cursor);
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths);
 
@@ -582,13 +631,80 @@ mod tests {
         );
         assert_eq!(body["hasMore"], false);
         assert_eq!(body["excludedReferences"]["count"], 1, "the omitted REFERENCES edge must be disclosed");
+        assert_eq!(
+            body["excludedReferences"]["files"],
+            serde_json::json!([{ "path": "a.test.rs", "refs": 1 }]),
+            "GM-258: the file holding the excluded usage travels, since naming it is what the \
+             caller otherwise spends a second call to learn",
+        );
         assert!(
-            body["excludedReferences"]["hint"].as_str().unwrap().contains("find_references"),
-            "the disclosure must name the tool that answers exhaustively",
+            body["excludedReferences"]["filesTruncated"].is_null(),
+            "an untruncated tally must not pay bytes to say so",
         );
         assert!(
             body["excludedReferences"]["results"].is_null(),
-            "only the count travels - sending the rows would make this find_references",
+            "rows still never travel - sending them would make this find_references",
+        );
+    }
+
+    /// GM-258's own bound. `count` is uncapped by design (understating the gap
+    /// is the one thing this field must never do), so past the tally cap the
+    /// two disagree - and the response has to say which of them was cut rather
+    /// than leave the caller to infer it from the arithmetic.
+    #[test]
+    fn a_tally_cut_by_the_cap_says_so_and_leaves_the_count_exact() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        let over = pagination::MAX_EXCLUDED_FILE_TALLY + 3;
+        for i in 0..over {
+            let id = format!("spec{i}");
+            let path = format!("spec{i}.test.rs");
+            upsert_node(&mut conn, NodeRecord::new(&id, "File", &id, &id, &path, "rust")).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(&format!("e_ref{i}"), &id, "target", "REFERENCES", "tree-sitter", true),
+            )
+            .unwrap();
+        }
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(
+            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+        );
+
+        assert_eq!(body["excludedReferences"]["count"], over, "the count stays whole");
+        assert_eq!(
+            body["excludedReferences"]["files"].as_array().unwrap().len(),
+            pagination::MAX_EXCLUDED_FILE_TALLY,
+            "the tally, and only the tally, is what the cap cuts",
+        );
+        assert_eq!(body["excludedReferences"]["filesTruncated"], true);
+    }
+
+    /// The callee side carries the identical field and had no `files` tally of
+    /// its own to model it on, so its wiring is worth pinning separately.
+    #[test]
+    fn a_callee_page_names_the_files_it_excluded_too() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("callee", "Function", "b", "pkg::b", "b.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("helper", "Function", "c", "pkg::c", "c.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_call", "target", "callee", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_ref", "target", "helper", "REFERENCES", "tree-sitter", true))
+            .unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(
+            &handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+        );
+
+        assert_eq!(body["excludedReferences"]["count"], 1);
+        assert_eq!(
+            body["excludedReferences"]["files"],
+            serde_json::json!([{ "path": "c.rs", "refs": 1 }]),
         );
     }
 
