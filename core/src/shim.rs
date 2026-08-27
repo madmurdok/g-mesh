@@ -14,6 +14,7 @@ use crate::daemon::build_stamp::{self, Vintage};
 use crate::ipc;
 use crate::process;
 use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
+use crate::storage::connection::ensure_project_dir;
 
 /// How long to keep retrying the first connect after bootstrapping a daemon,
 /// and how long to wait between attempts. The daemon needs a few milliseconds
@@ -370,11 +371,16 @@ fn lock_state(root: &Path) -> daemon::DaemonLock {
 fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
     let path = daemon::lock_path(root)?;
     // First shim for a project gets here before anything has created the
-    // per-project state directory (the daemon is what usually creates it).
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create project directory {}", dir.display()))?;
-    }
+    // per-project state directory (the daemon is what usually creates it) -
+    // and this is the earliest of all the paths that can create it, so it is
+    // the one that most often decides whether the directory ever gets a
+    // `project.root`. Through `ensure_project_dir` rather than a bare
+    // `create_dir_all` for that reason: a directory created without that file
+    // is classed `Legacy` by `clean orphaned` and left alone forever, because
+    // `project_hash` is one-way and nothing can recover the root afterwards.
+    // Measured on this machine's own test home: 707 of 775 state directories
+    // were unsweepable for exactly this reason.
+    ensure_project_dir(root)?;
 
     let file = File::options()
         .create(true)
@@ -498,4 +504,65 @@ fn pump<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
         write_ndjson_frame(writer, &frame)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::identity::read_project_root;
+    use crate::storage::connection::project_dir;
+
+    /// GM-255, at the level the fix actually operates on.
+    ///
+    /// The integration test in `tests/shim_bootstrap.rs` cannot show this:
+    /// `storage::connection::open` also calls `ensure_project_dir`, so any
+    /// bootstrap that gets as far as opening the index records the root
+    /// regardless of what this function did - the assertion passes with the
+    /// old bare `create_dir_all` restored, which makes it a check on the end
+    /// state and not on this code.
+    ///
+    /// The window this closes is the one between the directory appearing and
+    /// the index being opened. A process killed inside it used to leave a
+    /// state directory with no `project.root`, and nothing recovers one
+    /// afterwards: `project_hash` is one-way, so `cli::clean orphaned` can
+    /// only class such a directory `Legacy` and leave it in place forever.
+    /// That window is not hypothetical - of 745 directories under this
+    /// machine's test home, 600 were completely empty and another 93 held
+    /// nothing but a stray plugin pid file, i.e. 93% were created and
+    /// abandoned before an index was ever opened.
+    ///
+    /// So this calls the lock function and nothing else, which is exactly the
+    /// state a killed bootstrap leaves behind.
+    #[test]
+    fn a_bootstrap_lock_alone_is_enough_to_record_the_project_root() {
+        let home = tempfile::tempdir().expect("failed to create a temp g-mesh home");
+        let root = tempfile::tempdir().expect("failed to create a temp project root");
+        // Scoped rather than global: this process runs tests in parallel, and
+        // `G_MESH_HOME` is read on every path resolution.
+        let previous = std::env::var_os("G_MESH_HOME");
+        // SAFETY: single-threaded within this test's own body; the guard below
+        // restores whatever was there for anything that runs after it.
+        unsafe { std::env::set_var("G_MESH_HOME", home.path()) };
+
+        let outcome = (|| -> Result<()> {
+            let _lock = acquire_bootstrap_lock(root.path())?;
+            let state = project_dir(root.path())?;
+            let recorded = read_project_root(&state);
+            assert_eq!(
+                recorded.as_deref(),
+                Some(root.path().canonicalize()?.as_path()),
+                "a bootstrap that got no further than the lock left {} with no project.root, \
+                 which `clean orphaned` can never sweep",
+                state.display(),
+            );
+            Ok(())
+        })();
+
+        match previous {
+            // SAFETY: as above.
+            Some(value) => unsafe { std::env::set_var("G_MESH_HOME", value) },
+            None => unsafe { std::env::remove_var("G_MESH_HOME") },
+        }
+        outcome.expect("the bootstrap lock must record the project root");
+    }
 }

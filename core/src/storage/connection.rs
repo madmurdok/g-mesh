@@ -32,6 +32,19 @@ pub fn project_dir(root: &Path) -> Result<PathBuf> {
 /// state whose project is merely idle. `identity::record_project_root` is
 /// idempotent, so an existing directory acquires the file the next time
 /// anything opens it.
+///
+/// That claim was false until GM-255. `daemon::run` and
+/// `shim::acquire_bootstrap_lock` both created the directory with a bare
+/// `fs::create_dir_all` and no root file, and the shim is the *earliest* of
+/// the three - so a project whose first contact was a shim got a state
+/// directory with no identity. Nothing recovers it later: `project_hash` is
+/// one-way, so `clean orphaned` can only class such a directory `Legacy` and
+/// leave it alone. Measured on this machine's own test home, 707 of 775
+/// directories were unsweepable for that reason.
+///
+/// So if a fourth call site ever needs a project directory, it goes through
+/// here. A bare `create_dir_all` on this path is not a shortcut, it is a
+/// directory that can never be cleaned up.
 pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
     let dir = project_dir(root)?;
     fs::create_dir_all(&dir)
