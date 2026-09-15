@@ -86,7 +86,7 @@
 //     closes.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import * as path from "node:path";
 
 import { FrameReader } from "./jsonrpc";
@@ -473,6 +473,32 @@ export interface SemanticProjectOptions {
  * **Stopped with the plugin.** `stop()` kills it; so does the module's
  * process-exit hook, so an abrupt teardown cannot orphan a checker.
  */
+/**
+ * `g-mesh plugins check`'s plugin-side marker contract (core's
+ * `cli::plugin_check::session::MARKER_DIR_ENV`, and the README's plugin
+ * authoring section): when the conformance kit runs this plugin it sets this
+ * variable to a directory, and a plugin appends to
+ * [`SEMANTIC_ENGINE_MARKER`] there at the moment it starts its semantic
+ * engine. The kit fails a plugin whose marker already exists when the first
+ * `semanticPass` is sent - an engine started for structural work alone, which
+ * is exactly what would reload a checker core just put to sleep over a memory
+ * limit (docs/architecture/multi-language-plugins.md, "Plugin memory limit").
+ *
+ * Unset in every real run, where this is a no-op.
+ */
+export const PLUGIN_CHECK_MARKER_DIR_ENV = "G_MESH_PLUGIN_CHECK_MARKER_DIR";
+export const SEMANTIC_ENGINE_MARKER = "semantic-engine-started";
+
+function markSemanticEngineStarted(): void {
+  const dir = process.env[PLUGIN_CHECK_MARKER_DIR_ENV];
+  if (dir === undefined || dir === "") return;
+  try {
+    appendFileSync(path.join(dir, SEMANTIC_ENGINE_MARKER), `${process.pid}\n`);
+  } catch {
+    // A conformance-run diagnostic only: never worth failing a query over.
+  }
+}
+
 export class SemanticProject {
   private server: SemanticServer | null = null;
   /**
@@ -520,6 +546,9 @@ export class SemanticProject {
     }
 
     this.options.onLog?.(`starting tsserver for ${this.projectRoot} from ${tsserverPath}`);
+    // Here, where the child is actually spawned - the one place the engine
+    // starts - rather than in the pass that asks, which may have nothing to ask.
+    markSemanticEngineStarted();
     this.server = new SemanticServer(this.projectRoot, {
       tsserverPath,
       args: this.options.args,

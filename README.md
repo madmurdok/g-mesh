@@ -558,6 +558,87 @@ than deleting quietly:
   dead as you work; `clean expired` or `clean all --force` are the blunt
   instruments for what is left.
 
+## Writing a language plugin
+
+A plugin is a directory named after its language, holding a `plugin.toml`
+(`language`, `protocol_version`, `[plugin.spawn]`, `[plugin.languages]
+extensions`, and the optional `[plugin.capabilities]` / `[plugin.workspace]`
+tables) and whatever executable it names. The daemon runs it two ways: once
+as `<command> <args> --bulk-index <project-root>`, whose stdout is one NDJSON
+node/edge per line, and as a long-lived `<command> <args> <project-root>`
+speaking framed JSON-RPC on stdin/stdout — a handshake, then a diff in answer
+to each `fileChanged`, and to each `semanticPass` when the manifest declares
+`semantic_pass = true`. The wire types are `core/src/protocol/types.rs`; the
+design, including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+
+### Checking a plugin: `g-mesh plugins check`
+
+```bash
+g-mesh plugins check <plugin-dir> --fixture <project-dir>
+```
+
+Runs the plugin against a small project in its language the way the daemon
+does — two bulk walks, then one control-plane session — through core's real
+index writes and linker, and prints one line per check: `PASS`, `FAIL` (with
+the offending ids, NDJSON lines or session steps), or `SKIP` with a reason.
+The exit status is non-zero if any check failed. The fixture is copied to a
+scratch directory first (the session edits files) and never modified, and
+the plugin runs with `G_MESH_HOME` pointed into that scratch directory, so
+your own `~/.g-mesh` is never touched. (`g-mesh plugin check`, as the design
+doc spells it, is accepted too.)
+
+The session, in order: `fileChanged` on the file with the most nodes,
+unmodified; again after a whitespace-only edit (one space inserted before
+that file's last newline — an edit after which no range can legitimately
+move); again after emptying the file; again after restoring it; a
+whole-project `semanticPass` if declared; and a final `fileChanged` through
+the manifest's own `semantic_pass` gate. A fixture needs at least one file
+with a newline in it; a few files with a cross-file import, a re-export and
+a call exercise every check. The ones this repo uses are under
+`core/tests/fixtures/plugin_check/`.
+
+| Check | What a plugin must do |
+|---|---|
+| `session` | spawn, handshake with the manifest's protocol version and language, exit 0 from both bulk walks, and answer every request within its timeout |
+| `shape` | emit lines and diffs that parse as protocol v2 after core's normalization; a placeholder `nativeKind` carries a `target` |
+| `stream-order` | in the bulk stream and `fileChanged` diffs, emit an edge only after both its endpoints, and only between nodes of its own file |
+| `same-file-rule` | mark a same-file edge onto a declaration `resolved: true`, and an edge onto a placeholder `resolved: false` |
+| `id-stability.bulk-repeat` | emit identical node and edge ids on two walks of the same tree |
+| `id-stability.whitespace-edit` | answer the whitespace-only edit with an empty diff |
+| `id-stability.deletes-known` | only name ids it emitted earlier in `deleteNodeIds` |
+| `id-stability.incremental-matches-bulk` | derive the same node ids on the `fileChanged` path as on the bulk path |
+| `ownership.defines-exports-from-file` | start every `DEFINES`/`EXPORTS` edge at the file's `File` node |
+| `ownership.language` | give every node the manifest's `language` |
+| `ownership.no-container` | never emit `nativeKind: "container"` — core owns containers |
+| `ownership.diff-stays-in-file` | upsert and delete only the changed file's nodes in its `fileChanged` diff |
+| `capabilities.semantic-pass-undeclared` | (`semantic_pass = false`) never be sent `semanticPass`, and never start a semantic engine |
+| `capabilities.semantic-engine-lazy` | (`semantic_pass = true`) not start its semantic engine before the first `semanticPass` |
+
+`semanticPass` diffs may cross files — a semantic answer legitimately points
+an edge at another file's node — so the stream-order, same-file and
+diff-stays-in-file checks apply to the structural stream only.
+
+**The semantic-engine marker.** The kit sets `G_MESH_PLUGIN_CHECK_MARKER_DIR`
+for every process it spawns. A plugin appends a line to a file named
+`semantic-engine-started` in that directory at the moment it starts its
+semantic engine (launches its language server, loads its type checker), and
+does nothing with the variable otherwise. The lazy-engine check fails if that
+file already exists when the first `semanticPass` is sent. A plugin that never
+writes it is reported `SKIP ... not instrumented`, not passed — no marker is
+no evidence. The bundled TS plugin writes it when it spawns tsserver.
+
+**Timeouts** are the daemon's own: 30s per `fileChanged`, 120s per per-file
+`semanticPass`, and for the whole-project `semanticPass` and each bulk walk
+the larger of 20 minutes and 10s per claimed file. `G_MESH_FILE_CHANGED_TIMEOUT_MS`,
+`G_MESH_SEMANTIC_PASS_FILE_TIMEOUT_MS` and `G_MESH_SEMANTIC_PASS_PROJECT_TIMEOUT_MS`
+override them; a plugin that hangs fails `session` rather than hanging the
+command.
+
+**Protocol v1** fields (`exported` instead of `visibility`, `source` without
+`engine`, a placeholder target packed into `qualifiedName`) still pass `shape`
+with a `WARN` line, because core still accepts them — until the protocol v2
+migration (GM-275) makes them a failure.
+
 ## Run tests
 
 ```bash
