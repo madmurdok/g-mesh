@@ -175,7 +175,12 @@ const PLUGIN_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// falls back to its pre-review flat value is a strictly better failure mode
 /// here than this whole best-effort pass failing outright over a `COUNT(*)`
 /// that could not run.
-fn indexed_file_count(conn: &Mutex<Connection>, language: &str) -> usize {
+///
+/// `pub(crate)` since GM-272: `daemon::workspace_reindex` needs the exact
+/// same per-language file count to scale its own single-language semantic
+/// pass's timeout, for the exact same reason - there is no second
+/// implementation to keep in sync with this one, just a second caller.
+pub(crate) fn indexed_file_count(conn: &Mutex<Connection>, language: &str) -> usize {
     let guard = conn.lock().unwrap();
     let result: rusqlite::Result<i64> = guard.query_row(
         "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND language = ?1",

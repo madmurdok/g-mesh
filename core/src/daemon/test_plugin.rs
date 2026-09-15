@@ -82,6 +82,20 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 /// request that carried an id - see this module's "Counting round trips" doc.
 const REQUEST_LOG: &str = "requests.log";
 
+/// The file each fake plugin process appends one line to per **notification**
+/// it received - a framed message with no `id`, answered with nothing per
+/// JSON-RPC 2.0. Kept apart from [`REQUEST_LOG`] rather than folded into it:
+/// every existing caller of [`requests`]/[`file_changed_requests`] already
+/// assumes each line there is a real id-carrying round trip (GM-270's
+/// `only_the_semantic_pass_capable_language_receives_the_request` among
+/// them), and a notification is a different kind of thing on the wire - it
+/// gets no response frame at all, unlike every entry `REQUEST_LOG` holds.
+/// GM-272 is the first fixture that needs to observe one:
+/// `ControlMessage::WorkspaceChanged` (GM-263) is sent as a notification, and
+/// its whole test-visible existence is "did the plugin see it happen", which
+/// only [`notifications`] can answer.
+const NOTIFICATION_LOG: &str = "notifications.log";
+
 /// Marks that a [`install_stalling`] plugin directory's *very first* framed
 /// request has already been (deliberately) left unanswered - see that
 /// function's doc comment. Written by the process that hits it, and read by
@@ -103,7 +117,44 @@ const STALL_MARKER: &str = "stalled-once.marker";
 /// `semanticPass` request. Use [`install_semantic_pass_capable`] for a
 /// language GM-270's per-language scheduler should ask for a pass.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, false, false)
+    install_inner(root, language, extensions, false, false, false, &[], &[])
+}
+
+/// [`install`], but the manifest also carries a `[plugin.workspace]` table
+/// with `watch_files`/`exclude_dirs` - GM-272's fixture for a language whose
+/// `daemon::registry::PluginRegistry::workspace_language_matches`/
+/// `route_settled_path` must route a settled path to a per-language reindex
+/// (`watch_files`) or refuse to route one at all (`exclude_dirs`), instead of
+/// the ordinary extension routing every other `install*` fixture here
+/// exercises. Each entry in `watch_files` is written into the manifest
+/// exactly as given - an exact name (`"go.mod"`) or a genuine glob
+/// (`"*.csproj"`) both compile the same way through `daemon::manifest::
+/// read_manifest`'s `Glob::new`, so this fixture needs no separate "glob"
+/// variant to test glob matching specifically.
+pub(crate) fn install_with_workspace(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> PathBuf {
+    install_inner(root, language, extensions, false, false, false, watch_files, exclude_dirs)
+}
+
+/// [`install_with_workspace`], but also `[plugin.capabilities] semantic_pass
+/// = true` (like [`install_semantic_pass_capable`]) - GM-272's fixture for
+/// checking that a workspace reindex's semantic phase
+/// (`daemon::workspace_reindex::run`) is asked for, and its
+/// `language_state.semanticPassAt` recorded, exactly for the one language
+/// being reindexed.
+pub(crate) fn install_with_workspace_semantic_pass_capable(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true, watch_files, exclude_dirs)
 }
 
 /// [`install`], but the manifest declares `[plugin.capabilities]
@@ -123,7 +174,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// [`install`] - is what lets a test prove only the capable one ever receives
 /// it.
 pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, false, true)
+    install_inner(root, language, extensions, false, false, true, &[], &[])
 }
 
 /// [`install`], but the plugin does not answer its handshake until
@@ -151,7 +202,7 @@ pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensi
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
 pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, true, false, false)
+    install_inner(root, language, extensions, true, false, false, &[], &[])
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
@@ -196,9 +247,10 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
 /// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
 /// it runs past its budget.
 pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, true, false)
+    install_inner(root, language, extensions, false, true, false, &[], &[])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_inner(
     root: &Path,
     language: &str,
@@ -206,13 +258,18 @@ fn install_inner(
     gated: bool,
     stalling: bool,
     semantic_pass: bool,
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
 ) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
     fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling))
         .expect("failed to write the fake plugin's entry point");
-    fs::write(dir.join("plugin.toml"), manifest(language, extensions, semantic_pass))
-        .expect("failed to write the fake plugin's manifest");
+    fs::write(
+        dir.join("plugin.toml"),
+        manifest(language, extensions, semantic_pass, watch_files, exclude_dirs),
+    )
+    .expect("failed to write the fake plugin's manifest");
     dir
 }
 
@@ -230,6 +287,16 @@ pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
 /// Empty (rather than a panic) before the first one, same as [`spawns`].
 pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(REQUEST_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Every **notification** (a framed message with no `id`) this plugin
+/// directory's process(es) have ever received, oldest first, across every
+/// spawn, as `"<method> <filePath>"` - see [`NOTIFICATION_LOG`]'s own doc
+/// comment for why this is a separate log from [`requests`] rather than the
+/// same one. Empty before the first one, same as [`requests`]/[`spawns`].
+pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugin_dir.join(NOTIFICATION_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
 
@@ -267,9 +334,27 @@ pub(crate) fn empty_index() -> Mutex<Connection> {
 /// explicitly, matching what a real hand-written manifest predating GM-270
 /// looks like - both read the same way through `Capabilities::default`, but
 /// the omitted-table shape is the one this fixture is standing in for.
-fn manifest(language: &str, extensions: &[&str], semantic_pass: bool) -> String {
+fn manifest(
+    language: &str,
+    extensions: &[&str],
+    semantic_pass: bool,
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> String {
     let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
     let capabilities = if semantic_pass { "\n[plugin.capabilities]\nsemantic_pass = true\n" } else { "" };
+    // Omitted entirely when both are empty, matching `daemon::manifest`'s own
+    // "an absent [plugin.workspace] table defaults to all three fields empty"
+    // convention - the ordinary fixture (every `install*` call before
+    // GM-272) still parses to exactly the conservative default it always
+    // did.
+    let workspace = if watch_files.is_empty() && exclude_dirs.is_empty() {
+        String::new()
+    } else {
+        let watch = watch_files.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ");
+        let exclude = exclude_dirs.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
+        format!("\n[plugin.workspace]\nwatch_files = [{watch}]\nexclude_dirs = [{exclude}]\n")
+    };
     format!(
         r#"
 [plugin]
@@ -283,7 +368,7 @@ args = ["./plugin.js"]
 
 [plugin.languages]
 extensions = [{extensions}]
-{capabilities}"#
+{capabilities}{workspace}"#
     )
 }
 
@@ -407,6 +492,12 @@ process.stdin.on("data", (chunk) => {{
       }} else {{
         writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
       }}
+    }} else {{
+      // A notification: no id, no response frame - see
+      // test_plugin.rs's NOTIFICATION_LOG doc comment for why this is a
+      // separate log from REQUEST_LOG above rather than folded into it.
+      const filePath = (request.params && request.params.filePath) || "";
+      fs.appendFileSync(path.join(__dirname, "{NOTIFICATION_LOG}"), request.method + " " + filePath + "\n");
     }}
   }}
 }});

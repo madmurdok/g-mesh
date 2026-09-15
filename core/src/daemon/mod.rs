@@ -13,6 +13,7 @@ pub mod semantic;
 /// anything that ships.
 #[cfg(test)]
 pub(crate) mod test_plugin;
+pub mod workspace_reindex;
 
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -805,13 +806,16 @@ fn watch_and_route_once(
             // answer for into the replay list a sleeping core builds.
             continue;
         }
-        // Routed to whichever language claims this file's extension,
-        // spawning that plugin if this is the first file of its kind
-        // (`daemon::registry::PluginRegistry::file_changed`); applied now if
-        // that plugin is awake, queued for its next wake if it is asleep -
-        // the supervisor it resolves to owns that decision because only it
-        // can read both facts at once.
-        registry.file_changed(conn, file_path);
+        // Routed by `daemon::registry::PluginRegistry::route_settled_path`
+        // (GM-272): a workspace-file match (`[plugin.workspace] watch_files`,
+        // e.g. `go.mod`) triggers that language's per-language reindex
+        // (`daemon::workspace_reindex`); anything else falls back to the
+        // ordinary extension routing this already did before GM-272
+        // (`PluginRegistry::file_changed`) - applied now if that language's
+        // plugin is awake, queued for its next wake if it is asleep, the
+        // supervisor it resolves to owning that decision because only it can
+        // read both facts at once.
+        registry.route_settled_path(conn, file_path);
     }
 }
 

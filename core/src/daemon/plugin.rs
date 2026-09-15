@@ -51,8 +51,10 @@ use sha2::{Digest, Sha256};
 use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
-use crate::protocol::jsonrpc::is_timeout;
-use crate::protocol::types::{RequestId, CURRENT_PROTOCOL_VERSION};
+use crate::protocol::jsonrpc::{is_timeout, write_message};
+use crate::protocol::types::{
+    ControlEnvelope, ControlMessage, RequestId, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
+};
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -1005,6 +1007,51 @@ impl PluginProcess {
         };
         self.relaunch_after_timeout_if_needed(&result);
         result
+    }
+
+    /// Sends the `workspaceChanged` notification for `file_path` - GM-263's
+    /// wire addition, finally used by GM-272's per-language reindex (see
+    /// `docs/architecture/multi-language-plugins.md`'s Interfaces section on
+    /// `ControlMessage::WorkspaceChanged`). A **notification**, not a
+    /// request: `id: None`, no response frame is read, and the caller does
+    /// not block on this plugin acting on it before moving on to the reindex
+    /// that actually repopulates the graph - the design doc is explicit that
+    /// core "follows it with the per-language reindex", not "waits for an
+    /// acknowledgement".
+    ///
+    /// Only ever reached for a plugin whose own manifest declared at least
+    /// one `[plugin.workspace] watch_files` pattern (`daemon::registry
+    /// ::PluginRegistry::workspace_language_matches` is what decided this
+    /// language was even in play), so a plugin that predates this message -
+    /// the bundled TS one, whose `watch_files` is empty - never receives it
+    /// in the first place; see `daemon::workspace_reindex`'s module doc for
+    /// why that is enough and no capability/version check is layered on top.
+    /// A plugin that *did* declare `watch_files` but genuinely does not
+    /// recognize this method (not possible for anything in this repo today,
+    /// but a hand-written third-party manifest could) is expected to ignore
+    /// an unrecognized notification the same way the bundled TS plugin's own
+    /// `handleEnvelope` already does for any method it does not match in its
+    /// `switch` - falling through to "no `id`, so nothing is written back" -
+    /// which is the ordinary, safe behaviour for an unknown JSON-RPC
+    /// notification, not a special case this wire message has to plan
+    /// around.
+    ///
+    /// Best-effort from the caller's point of view: a write failure here
+    /// (the pipe is gone, the process just died) is returned so the caller
+    /// can log it, but it must never abort the reindex that follows - the
+    /// notification is an optimization (the plugin drops a cache it would
+    /// otherwise have to notice is stale on its own), not a precondition for
+    /// correctness, since the reindex rebuilds the plugin's on-disk-derived
+    /// state from scratch regardless of whether this arrived.
+    pub fn notify_workspace_changed(&self, file_path: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::WorkspaceChanged { file_path: file_path.to_string() },
+        };
+        write_message(&mut state.io.writer, &envelope)
+            .context("failed to send the workspaceChanged notification")
     }
 
     /// Shared tail of [`Self::ensure_fresh`]/[`Self::semantic_pass`]: neither
