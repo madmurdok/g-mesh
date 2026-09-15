@@ -152,13 +152,28 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
     }
     for id in &diff.delete_node_ids {
-        // Explicitly, rather than leaning on the child table's ON DELETE
-        // CASCADE: `foreign_keys` is off on the connection the daemon actually
-        // runs on (`storage::connection::open` sets WAL and nothing else), so
-        // the cascade only fires in tests that switch it on. Left orphaned,
-        // these rows would be handed to whoever next takes this node's id.
+        // Explicitly, rather than leaning on the child tables' ON DELETE
+        // CASCADE: `storage::connection::open` switches `foreign_keys` off on
+        // the connection the daemon actually runs on, so the cascade only
+        // fires in tests that switch it on. Left orphaned, declarations would
+        // be handed to whoever next takes this node's id, and a vector would
+        // keep a deleted symbol ranking in `search_code`. A node that is
+        // deleted and re-upserted in the same diff (the plugin's shape for any
+        // changed symbol) loses its vector here and gets a fresh one from
+        // `EmbeddingPipeline::apply`, which embeds every upserted node.
+        //
+        // Edges into the node are deliberately *not* touched. One the plugin
+        // did not re-send because its id did not change (a file's `DEFINES`
+        // into a symbol whose body grew) is valid again the moment the same
+        // id is upserted below; one into a node that is really gone (another
+        // file's call to a deleted symbol) is the documented lazy dangling
+        // edge, repaired when that file is next reindexed. Both are rows a
+        // foreign key would refuse this delete over, which is why enforcement
+        // is off - see `storage::connection::open`.
         tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's declarations")?;
+        tx.execute("DELETE FROM vectors WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's embedding")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
     }
     for node in &diff.upsert_nodes {
@@ -467,8 +482,9 @@ mod tests {
         assert_eq!(count(&conn, "declarations"), 0);
     }
 
-    /// `foreign_keys` is off on the connection the daemon actually runs on, so
-    /// the child table's ON DELETE CASCADE never fires there - the delete has
+    /// `foreign_keys` is switched off on the connection the daemon actually
+    /// runs on (`storage::connection::open`), so the child table's ON DELETE
+    /// CASCADE never fires there - the delete has
     /// to be explicit, or a deleted node's declarations would be inherited by
     /// whatever next claims its id.
     #[test]
@@ -499,6 +515,41 @@ mod tests {
             0,
             "orphaned rows would be handed to the next node with this id"
         );
+    }
+
+    /// The same hazard one table over (GM-293): `vectors`' ON DELETE CASCADE
+    /// is just as inert without enforcement, and an orphaned embedding is
+    /// worse than an orphaned declaration - `search_code` scans `vectors`
+    /// directly, so it would keep ranking a symbol that no longer exists.
+    #[test]
+    fn deleting_a_node_takes_its_vector_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![NodeRecord::new(
+                    "n1",
+                    "Function",
+                    "foo",
+                    "foo",
+                    "src/lib.ts",
+                    "typescript",
+                )],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::storage::vectors::insert(&conn, "n1", &[1.0, 0.0, 0.0], "test-model").unwrap();
+        assert_eq!(count(&conn, "vectors"), 1);
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["n1".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        assert_eq!(count(&conn, "vectors"), 0, "a deleted node's embedding must not outlive it");
     }
 
     #[test]
