@@ -523,6 +523,46 @@ impl PluginRegistry {
         self.discovered.manifests.contains_key(language)
     }
 
+    /// The union of every discovered plugin's own `[plugin.workspace]
+    /// entry_points` (`daemon::manifest::WorkspaceConfig::entry_points`),
+    /// deduplicated - what `mcp::get_dependencies` feeds
+    /// `graph::queries::find_files_under`/`find_files_ending_in_dir` (via
+    /// `entry_point_rank_expr`) so a miss-path directory lookup ranks each
+    /// language's own convention first, instead of the single hardcoded
+    /// `index.*` check GM-273 replaced.
+    ///
+    /// "Every discovered manifest", not "only languages this project's index
+    /// actually has files for" - `discovered` (see this struct's own doc
+    /// comment) is read once at startup, before a single file has been
+    /// indexed, and the distinction would need its own query against
+    /// `nodes.language` on the hot path of every `get_dependencies` miss,
+    /// for an outcome that cannot change which candidate wins: a Rust-only
+    /// repo simply has no file named `index.*` for an unused `entry_points`
+    /// convention to falsely match, so an extra candidate a manifest declares
+    /// costs one more no-op `LIKE` test per scanned row (see
+    /// `entry_point_rank_expr`'s cost section), not a wrong answer.
+    ///
+    /// Deduplicated (not just concatenated) because two plugins are free to
+    /// declare the same literal entry point without that meaning anything -
+    /// `entry_point_rank_expr` only cares about the *set* of strings, and a
+    /// duplicate would otherwise double one candidate's `LIKE` cost in the
+    /// generated SQL for no behavioral difference. Sorted first so that
+    /// dedup, and this method's own output, do not depend on `HashMap`
+    /// iteration order - the same "stable regardless of scan order" property
+    /// [`indexer_version`] already goes out of its way to guarantee for
+    /// `DiscoveredPlugins` as a whole.
+    pub fn entry_points(&self) -> Vec<String> {
+        let mut points: Vec<String> = self
+            .discovered
+            .manifests
+            .values()
+            .flat_map(|m| m.workspace.entry_points.iter().cloned())
+            .collect();
+        points.sort();
+        points.dedup();
+        points
+    }
+
     /// The supervisor for `language`, spawning its plugin if this is the
     /// first time anything has needed it.
     ///
@@ -1145,6 +1185,60 @@ mod tests {
         assert_eq!(registry.language_for("src/App.PYTHON-SRC"), Some("python"));
         assert_eq!(registry.language_for("README.md"), None);
         assert_eq!(registry.language_for("Makefile"), None);
+    }
+
+    /// [`PluginRegistry::entry_points`]'s own test: built directly from
+    /// `PluginManifest` literals rather than [`registry_over`]'s fixture
+    /// plugins - `daemon::test_plugin`'s stub manifests never set
+    /// `[plugin.workspace] entry_points`, and this method's whole job is to
+    /// surface exactly that field. Proves the union-of-discovered-manifests
+    /// plumbing GM-273 wires `mcp::get_dependencies` through (see
+    /// `graph::queries::entry_point_rank_expr`'s doc comment for the other
+    /// end of it), at the layer that actually owns discovery's results.
+    #[test]
+    fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
+        use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
+
+        let manifest = |language: &str, entry_points: &[&str]| PluginManifest {
+            language: language.to_string(),
+            protocol_version: 1,
+            plugin_version: "0.0.0".to_string(),
+            command: PathBuf::from("true"),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            fingerprint_ignore: Vec::new(),
+            manifest_dir: PathBuf::from("/dev/null"),
+            capabilities: Capabilities::default(),
+            workspace: WorkspaceConfig {
+                entry_points: entry_points.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        };
+
+        let mut discovered = DiscoveredPlugins::default();
+        discovered.manifests.insert("typescript".to_string(), manifest("typescript", &["index"]));
+        // Declares the same literal as "typescript" above, on purpose - the
+        // half of this test that proves dedup, not just union.
+        discovered.manifests.insert("also_index".to_string(), manifest("also_index", &["index"]));
+        discovered.manifests.insert("rust".to_string(), manifest("rust", &["mod.rs", "main.rs", "lib.rs"]));
+
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+
+        assert_eq!(
+            registry.entry_points(),
+            vec!["index".to_string(), "lib.rs".to_string(), "main.rs".to_string(), "mod.rs".to_string()],
+            "sorted, deduplicated union of every discovered manifest's own entry_points"
+        );
     }
 
     /// The acceptance criterion for an unclaimed extension: skipped, not an
