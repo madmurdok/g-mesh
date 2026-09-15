@@ -651,31 +651,15 @@ pub fn run(root: &Path) -> Result<()> {
         // its own, which is what baseline's eager, pre-registry spawn timing
         // gave for free and this daemon still needs.
         //
-        // Which plugin this asks, and why only one of them, is
-        // `daemon::semantic`'s to say - as is the reason `cli::init` and
-        // `cli::reindex` now run the very same pass off their own walks
-        // rather than leaving it to a daemon start that will never come.
-        // Spawns the plugin if nothing has needed it yet, same as any other
-        // first touch.
-        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
-        match &semantic_outcome {
-            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
-            Ok(false) => {}
-            Err(err) => eprintln!(
-                "g-mesh daemon: the semantic pass over the freshly built index failed ({err:#}) - \
-                 its edges keep whatever the structural pass resolved"
-            ),
-        }
-        // `Ok(_)` either way - the pass ran, or there was nothing for it to
-        // do (no bundled plugin) - is what `record_semantic_pass`'s own doc
-        // says counts as complete. Only `Err` (the pass was asked for and did
-        // not finish) must leave this unset, so a later start still finds it
-        // owed.
-        if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE) {
-                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
-            }
-        }
+        // Which plugins this asks, and why per language rather than one
+        // hardcoded plugin, is `daemon::semantic`'s to say (GM-270) - as is
+        // the reason `cli::init` and `cli::reindex` now run the very same
+        // pass off their own walks rather than leaving it to a daemon start
+        // that will never come. Spawns each owed language's plugin if
+        // nothing has needed it yet, same as any other first touch; recording
+        // `language_state.semanticPassAt` (and the project-wide roll-up) per
+        // language is `run_with_registry`'s own job now, not this call site's.
+        semantic::run_with_registry(&registry, &conn).log("the freshly built index");
     } else if needs_semantic_pass_retry {
         // The walk this project was owed already happened, in some earlier
         // start or in `cli::init` / `cli::reindex` - `needs_bulk_index` above
@@ -684,26 +668,15 @@ pub fn run(root: &Path) -> Result<()> {
         // (before the watcher, for the same race the comment above this
         // block explains) and against the same registry, so a project whose
         // pass was interrupted gets exactly one more chance at it per daemon
-        // start rather than none.
+        // start rather than none - per language: `run_with_registry` only
+        // ever asks a language that is still owed one (`storage::schema::
+        // owed_semantic_pass_languages`), so a language that already
+        // completed here on some earlier start is not re-run just because
+        // another one still owes its pass.
         eprintln!(
             "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
         );
-        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
-        match &semantic_outcome {
-            Ok(true) => {
-                eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete")
-            }
-            Ok(false) => {}
-            Err(err) => eprintln!(
-                "g-mesh daemon: retrying the semantic pass failed ({err:#}) - \
-                 it will be retried again on the next start"
-            ),
-        }
-        if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE) {
-                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
-            }
-        }
+        semantic::run_with_registry(&registry, &conn).log("the previously-interrupted index");
     }
 
     {

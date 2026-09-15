@@ -381,6 +381,39 @@ pub struct DiscoveredPlugins {
     pub routing: HashMap<String, String>,
 }
 
+/// Every language among `manifests` whose `capabilities.semantic_pass` is
+/// `true`, sorted.
+///
+/// The set `daemon::semantic`'s per-language scheduler (GM-270) asks for a
+/// whole-project pass, generalized from the single hardcoded
+/// `plugin::BUNDLED_LANGUAGE` question it replaces - a manifest that never
+/// mentions `[plugin.capabilities]`, or sets `semantic_pass = false`
+/// explicitly, is excluded by [`Capabilities::default`]'s conservative
+/// default, the same way it was already excluded from ever receiving a
+/// `semanticPass` request at all.
+///
+/// Shared by [`crate::daemon::registry::PluginRegistry::semantic_pass_languages`]
+/// (the live-registry view `daemon::semantic::run_with_registry` asks) and
+/// `daemon::semantic::run_once` (which has a bare `&DiscoveredPlugins` and no
+/// registry to ask), so the same filter and the same sort order back both.
+///
+/// Sorted for determinism, not just tidiness: `manifests` is a `HashMap`, and
+/// `run_once` asks each capable language for its pass *sequentially* (see
+/// that function's own doc comment for why concurrently is deliberately not
+/// done) - an unsorted, hash-order-dependent sequence would make which
+/// language runs first (and therefore which one a shared machine's memory
+/// pressure hits) vary between two otherwise identical runs for no reason
+/// anyone could explain from the outside.
+pub fn semantic_pass_capable_languages(manifests: &HashMap<String, PluginManifest>) -> Vec<String> {
+    let mut languages: Vec<String> = manifests
+        .values()
+        .filter(|manifest| manifest.capabilities.semantic_pass)
+        .map(|manifest| manifest.language.clone())
+        .collect();
+    languages.sort();
+    languages
+}
+
 /// Scans `roots` in order for `<root>/<language-dir>/plugin.toml`, calling
 /// [`read_manifest`] on each one found, then builds the extension routing
 /// table from the results.
@@ -1272,5 +1305,39 @@ watch_files = ["[unclosed"]
             .expect("the real bundled plugin directory must satisfy read_manifest");
 
         assert_eq!(manifest.language, "typescript");
+    }
+
+    /// [`semantic_pass_capable_languages`]'s own acceptance criterion: only
+    /// the manifests that actually declared `capabilities.semantic_pass =
+    /// true` come back, sorted, and a manifest that said nothing (the
+    /// conservative default - see [`Capabilities::default`]) is excluded
+    /// exactly like one that said `false` explicitly.
+    #[test]
+    fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
+        let capable = |language: &str| PluginManifest {
+            language: language.to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            plugin_version: "0.0.0".to_string(),
+            command: PathBuf::from("true"),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            fingerprint_ignore: Vec::new(),
+            manifest_dir: PathBuf::from("/dev/null"),
+            capabilities: Capabilities { semantic_pass: true, ..Capabilities::default() },
+            workspace: WorkspaceConfig::default(),
+        };
+        let not_capable =
+            |language: &str| PluginManifest { capabilities: Capabilities::default(), ..capable(language) };
+
+        let mut manifests = HashMap::new();
+        manifests.insert("rust".to_string(), capable("rust"));
+        manifests.insert("go".to_string(), not_capable("go"));
+        manifests.insert("typescript".to_string(), capable("typescript"));
+
+        assert_eq!(
+            semantic_pass_capable_languages(&manifests),
+            vec!["rust".to_string(), "typescript".to_string()],
+            "go declared no semantic_pass capability and must be excluded; the rest sorted"
+        );
     }
 }

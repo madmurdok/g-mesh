@@ -115,6 +115,10 @@ impl StalenessOutcome {
 /// settling exactly like any other (see that function's own doc comment on
 /// why the semantic pass rides along), so it is bound by the very same
 /// per-method budgets, not a query-time timeout of its own.
+///
+/// `semantic_pass_capable` is forwarded to `apply_file_change` unchanged too
+/// - see that function's own doc comment. The caller (`daemon::plugin::
+/// PluginProcess::ensure_fresh`) is what owns the manifest this comes from.
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -126,6 +130,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     embedding: &EmbeddingPipeline,
     file_changed_timeout: Duration,
     semantic_pass_timeout: Duration,
+    semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<StalenessOutcome> {
     match decide(conn, project_root, file_path)? {
@@ -149,6 +154,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                 embedding,
                 file_changed_timeout,
                 semantic_pass_timeout,
+                semantic_pass_capable,
                 on_timeout,
             )
             .context("failed to synchronously reindex stale file")?;
@@ -434,6 +440,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -483,6 +490,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -524,6 +532,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -569,6 +578,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -606,6 +616,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -656,6 +667,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -697,6 +709,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
