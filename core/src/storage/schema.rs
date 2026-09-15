@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -636,33 +638,147 @@ pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Resul
     Ok(())
 }
 
-/// Marks `language`'s whole-project semantic pass complete, then re-checks
-/// the project-wide roll-up and marks `meta.semanticPassAt` too if every
-/// present language's `language_state.semanticPassAt` is now set. Written
-/// only after `daemon::semantic::run_with_registry` / `run_once` returns
-/// `Ok(_)` - both `Ok(true)` (the pass actually ran) and `Ok(false)` (no
-/// bundled plugin was discovered, so nothing was ever owed) count as
-/// complete, the same way `run_once`'s own doc comment treats a missing
-/// plugin as a legitimate install rather than a failure. An `Err` (the pass
-/// was asked for and did not finish) must never reach this - the caller's
-/// `match` is what enforces that, not this function, which just writes what
-/// it is told.
+/// Whether every *present and semantic-pass-capable* language has recorded
+/// `language_state.semanticPassAt` - [`record_semantic_pass`]'s roll-up
+/// condition, generalized (GM-270) from [`every_present_language_has`]'s
+/// single-column check to skip a present language whose manifest declares
+/// `capabilities.semantic_pass = false`.
 ///
-/// Unlike [`record_bulk_index`], this *does* take a language and writes its
-/// row itself, in the same call: every caller today asks for exactly one
-/// language's pass (`daemon::plugin::BUNDLED_LANGUAGE` - the semantic layer
-/// is only ever run for the bundled JS/TS plugin as of this task; see
-/// `daemon::semantic`'s module doc, and GM-270 for generalizing it) and wants
-/// both effects at once, so there is no separate "every language's pass has
-/// already run" moment the way `daemon::bulk_index::run` provides one for the
-/// walk - each call here *is* the moment one language's pass finished.
-pub fn record_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
-    record_language_semantic_pass(conn, language)?;
-    if every_present_language_has(conn, "semanticPassAt")? {
+/// That skip is the whole point of this being a separate function rather
+/// than `every_present_language_has(conn, "semanticPassAt")` reused as-is: a
+/// language nobody will ever ask for a pass (the design doc's `plugin.toml`
+/// `semantic_pass = false`, the conservative default for a manifest that
+/// says nothing) also never gets a `language_state` row written for that
+/// column - nothing calls [`record_language_semantic_pass`] for it - so the
+/// old, uncapped check would wait on a fact that can never happen and hold
+/// `meta.semanticPassAt` hostage forever. `bulkIndexedAt`'s own roll-up
+/// ([`record_bulk_index`], still built on [`every_present_language_has`]) has
+/// no equivalent gap: every discovered plugin gets walked regardless of its
+/// semantic capability, so every present language does eventually write that
+/// column.
+///
+/// `semantic_pass_languages` is the caller's set of languages whose manifest
+/// declares `capabilities.semantic_pass = true` - this module reads no
+/// capability itself and has no `daemon::manifest` dependency, matching its
+/// existing "pure storage, callers bring the facts" boundary; the caller
+/// (`daemon::semantic`, which already holds the discovered manifests or a
+/// `PluginRegistry` to ask) is what can answer "capable of what".
+///
+/// Vacuously `true` when no present language is in `semantic_pass_languages`
+/// at all - including the empty set, i.e. no discovered plugin anywhere
+/// declares the capability - for the same reason
+/// [`every_present_language_has`] is vacuously `true` on an empty project:
+/// there is nothing to wait on, so a project with no semantic-capable plugin
+/// must not be retried forever by `daemon::mod`'s "pass still owed" check.
+fn every_present_semantic_language_has_passed(
+    conn: &Connection,
+    semantic_pass_languages: &HashSet<String>,
+) -> Result<bool> {
+    Ok(owed_semantic_pass_languages(conn, semantic_pass_languages)?.is_empty())
+}
+
+/// Every language among `semantic_pass_languages` that is currently *owed* a
+/// whole-project semantic pass - present in the index (at least one `File`
+/// node, the same [`present_languages`] definition GM-264's roll-up uses) and
+/// whose `language_state.semanticPassAt` is still `NULL`.
+///
+/// This is the "Owed" definition `daemon::semantic::run_with_registry`/
+/// `run_once` (GM-270) schedule against: asking again for a language whose
+/// pass already completed would repeat real, possibly expensive work (a cold
+/// `rust-analyzer`/`tsserver` load) for no new information, and is exactly
+/// what makes "an interrupted pass for one language is retried without
+/// re-running the other" true rather than aspirational - a retry call only
+/// ever asks the languages this returns, never every capable language again.
+///
+/// A capable language with **no** files in this project yet is not owed
+/// either, the same way it is not part of [`every_present_semantic_language_has_passed`]'s
+/// roll-up: there is nothing for its semantic tier to improve on, so asking
+/// would only cost a plugin spawn (and, for a heavy engine, real memory) for
+/// an empty-diff answer.
+pub fn owed_semantic_pass_languages(
+    conn: &Connection,
+    semantic_pass_languages: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let mut owed = Vec::new();
+    for language in present_languages(conn)? {
+        if !semantic_pass_languages.contains(&language) {
+            continue;
+        }
+        let recorded: Option<Option<String>> = conn
+            .query_row(
+                "SELECT semanticPassAt FROM language_state WHERE language = ?1",
+                params![language],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("failed to read language_state.semanticPassAt for {language}"))?;
+        if !matches!(recorded, Some(Some(_))) {
+            owed.push(language);
+        }
+    }
+    // Sorted: `present_languages` reads `SELECT DISTINCT language FROM
+    // nodes`, which carries no ordering guarantee, but
+    // `daemon::semantic::run_with_registry`/`run_once` schedule the languages
+    // this returns *sequentially* (see that module's doc comment on
+    // "Sequential, not concurrent") - a fixed, sorted order is what makes
+    // which language runs first (and therefore which one a shared machine's
+    // memory pressure hits first) reproducible from run to run, matching
+    // `daemon::manifest::semantic_pass_capable_languages`'s own sort for the
+    // same reason.
+    owed.sort();
+    Ok(owed)
+}
+
+/// Re-checks the project-wide semantic-pass roll-up and marks
+/// `meta.semanticPassAt` if [`every_present_semantic_language_has_passed`]
+/// now says yes - the half of [`record_semantic_pass`] that does not write
+/// any one language's own row, split out so it can be called on its own.
+///
+/// GM-270 needs that split because the roll-up can become true without any
+/// call in the same batch writing a per-language row: a whole-project pass
+/// run (`daemon::semantic::run_with_registry`/`run_once`) asks every
+/// semantic-pass-capable language, and when that set is empty (nothing
+/// discovered declares the capability) or every capable language's row was
+/// already set by an earlier run, the loop over languages never calls
+/// [`record_language_semantic_pass`] at all - yet the roll-up still has to
+/// fire once per run, or a project with no semantic-capable plugin would be
+/// reported as "pass still owed" by `daemon::mod`'s cold-start retry on
+/// every single daemon start, forever.
+pub fn reconcile_semantic_pass_rollup(
+    conn: &Connection,
+    semantic_pass_languages: &HashSet<String>,
+) -> Result<()> {
+    if every_present_semantic_language_has_passed(conn, semantic_pass_languages)? {
         conn.execute("UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1", [])
             .context("failed to record semanticPassAt")?;
     }
     Ok(())
+}
+
+/// Marks `language`'s whole-project semantic pass complete, then re-checks
+/// the roll-up via [`reconcile_semantic_pass_rollup`] - the one-call
+/// convenience for a caller that has exactly one language's completion to
+/// record and wants both effects at once (a test, or a single-language
+/// caller). `daemon::semantic::run_with_registry`/`run_once` iterate many
+/// languages per call, so they use [`record_language_semantic_pass`] and
+/// [`reconcile_semantic_pass_rollup`] separately instead - one row write per
+/// completed language, one roll-up check at the end of the whole run, not one
+/// per language (see that module for why, and for the case with zero
+/// completions this function alone would not reach).
+///
+/// Written only after a caller's own pass attempt for `language` has
+/// actually succeeded - never for an `Err` (the pass was asked for and did
+/// not finish), which must leave `language`'s row unset so the next attempt
+/// retries it. `semantic_pass_languages` is forwarded to
+/// [`reconcile_semantic_pass_rollup`] unchanged - see that function and
+/// [`every_present_semantic_language_has_passed`] for what it is for.
+pub fn record_semantic_pass(
+    conn: &Connection,
+    language: &str,
+    semantic_pass_languages: &HashSet<String>,
+) -> Result<()> {
+    record_language_semantic_pass(conn, language)?;
+    reconcile_semantic_pass_rollup(conn, semantic_pass_languages)
 }
 
 /// Records the project's current active embedding model, so `meta` reflects
@@ -1011,7 +1127,7 @@ mod tests {
              a pass interrupted right after this point is exactly the gap this column exists for"
         );
 
-        record_semantic_pass(&conn, "typescript").unwrap();
+        record_semantic_pass(&conn, "typescript", &HashSet::from(["typescript".to_string()])).unwrap();
         assert!(semantic_pass_completed(&conn).unwrap());
         // Recording the pass must not retroactively touch the walk's own flag.
         assert!(bulk_index_completed(&conn).unwrap());
@@ -1024,7 +1140,7 @@ mod tests {
         let conn = setup();
         ensure_current(&conn, GENERATION).unwrap();
         record_bulk_index(&conn).unwrap();
-        record_semantic_pass(&conn, "typescript").unwrap();
+        record_semantic_pass(&conn, "typescript", &HashSet::from(["typescript".to_string()])).unwrap();
 
         conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
         assert!(ensure_current(&conn, GENERATION).unwrap());
@@ -1235,17 +1351,74 @@ mod tests {
         ensure_current(&conn, GENERATION).unwrap();
         seed_file(&conn, "f1", "go");
         seed_file(&conn, "f2", "rust");
+        let both_capable = HashSet::from(["go".to_string(), "rust".to_string()]);
 
-        record_semantic_pass(&conn, "go").unwrap();
+        record_semantic_pass(&conn, "go", &both_capable).unwrap();
         assert!(
             !semantic_pass_completed(&conn).unwrap(),
             "rust has not had its own pass recorded yet - the roll-up must not fire early"
         );
 
-        record_semantic_pass(&conn, "rust").unwrap();
+        record_semantic_pass(&conn, "rust", &both_capable).unwrap();
         assert!(
             semantic_pass_completed(&conn).unwrap(),
             "both present languages have now had their pass recorded - the roll-up must fire"
+        );
+    }
+
+    /// GM-270's own acceptance criterion: a present language whose manifest
+    /// declares `capabilities.semantic_pass = false` is never asked for a
+    /// pass and must not hold `meta.semanticPassAt` hostage waiting for a
+    /// `language_state` row that will never be written - see
+    /// `every_present_semantic_language_has_passed`'s doc comment.
+    ///
+    /// Discriminates: pass `HashSet::from(["typescript".to_string(),
+    /// "go".to_string()])` (i.e. treat `go` as capable too, the old
+    /// `every_present_language_has`-style behaviour) instead of
+    /// `capable_languages` below, and the final assertion fails, because the
+    /// roll-up would then wait on a `go` row nothing ever writes.
+    #[test]
+    fn a_present_language_without_semantic_pass_capability_does_not_block_the_roll_up() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        // Both languages have files in the index, but only "typescript" is
+        // semantic-pass-capable - "go" here stands in for a discovered plugin
+        // whose manifest never set `capabilities.semantic_pass = true` (the
+        // conservative default), so nothing ever calls
+        // `record_language_semantic_pass` for it.
+        seed_file(&conn, "f1", "typescript");
+        seed_file(&conn, "f2", "go");
+        let capable_languages = HashSet::from(["typescript".to_string()]);
+
+        record_semantic_pass(&conn, "typescript", &capable_languages).unwrap();
+
+        assert!(
+            semantic_pass_completed(&conn).unwrap(),
+            "go is present but not semantic-pass-capable, so it must not gate the roll-up \
+             typescript alone already satisfies"
+        );
+    }
+
+    /// The other half of GM-270's roll-up split: a run that asks *zero*
+    /// semantic-pass-capable languages (nothing discovered declares the
+    /// capability at all) never calls `record_language_semantic_pass` for
+    /// anything, so nothing would ever reconcile the roll-up if
+    /// `reconcile_semantic_pass_rollup` could only be reached through
+    /// `record_semantic_pass`'s per-language call. Called directly, with an
+    /// empty capable set, it still has to mark the project's semantic pass
+    /// complete - vacuously, nothing was ever owed - so `daemon::mod`'s
+    /// "pass still owed" retry does not loop on such a project forever.
+    #[test]
+    fn reconciling_with_no_semantic_pass_capable_language_still_completes_the_roll_up() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        seed_file(&conn, "f1", "go");
+
+        reconcile_semantic_pass_rollup(&conn, &HashSet::new()).unwrap();
+
+        assert!(
+            semantic_pass_completed(&conn).unwrap(),
+            "no discovered language is semantic-pass-capable, so nothing is owed"
         );
     }
 

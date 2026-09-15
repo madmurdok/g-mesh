@@ -96,8 +96,34 @@ const STALL_MARKER: &str = "stalled-once.marker";
 /// Laid out exactly as a real one is (`<root>/<language>/plugin.toml`), so
 /// `daemon::manifest::discover(&[root])` picks it up with no test-only path
 /// through discovery.
+///
+/// No `[plugin.capabilities]` table at all - the same "says nothing" shape a
+/// hand-written manifest predating GM-270 has - so `Capabilities::default`
+/// reads it as `semantic_pass = false`: this fixture's plugin is never sent a
+/// `semanticPass` request. Use [`install_semantic_pass_capable`] for a
+/// language GM-270's per-language scheduler should ask for a pass.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, false)
+    install_inner(root, language, extensions, false, false, false)
+}
+
+/// [`install`], but the manifest declares `[plugin.capabilities]
+/// semantic_pass = true` - GM-270's fixture for a language whose plugin
+/// `daemon::semantic::run_with_registry`/`run_once` must ask for a
+/// whole-project pass, and whose per-file `fileChanged` round trip
+/// (`watcher::apply::apply_file_change`) must be followed by a `semanticPass`
+/// request too.
+///
+/// The fake plugin's own wire behaviour is unchanged either way - it answers
+/// *any* id-carrying request with an empty `{}` diff, `fileChanged` and
+/// `semanticPass` alike (see this module's own doc comment on
+/// [`requests`]/[`file_changed_requests`]) - so this capability changes only
+/// whether core *sends* the `semanticPass` request at all, which is exactly
+/// what GM-270's tests (`requests.log` assertions) are about. Installing two
+/// languages with different capabilities - one via this function, one via
+/// [`install`] - is what lets a test prove only the capable one ever receives
+/// it.
+pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true)
 }
 
 /// [`install`], but the plugin does not answer its handshake until
@@ -125,7 +151,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
 pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, true, false)
+    install_inner(root, language, extensions, true, false, false)
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
@@ -170,15 +196,22 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
 /// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
 /// it runs past its budget.
 pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, true)
+    install_inner(root, language, extensions, false, true, false)
 }
 
-fn install_inner(root: &Path, language: &str, extensions: &[&str], gated: bool, stalling: bool) -> PathBuf {
+fn install_inner(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    gated: bool,
+    stalling: bool,
+    semantic_pass: bool,
+) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
     fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling))
         .expect("failed to write the fake plugin's entry point");
-    fs::write(dir.join("plugin.toml"), manifest(language, extensions))
+    fs::write(dir.join("plugin.toml"), manifest(language, extensions, semantic_pass))
         .expect("failed to write the fake plugin's manifest");
     dir
 }
@@ -227,8 +260,16 @@ pub(crate) fn empty_index() -> Mutex<Connection> {
     Mutex::new(conn)
 }
 
-fn manifest(language: &str, extensions: &[&str]) -> String {
+/// `semantic_pass` controls whether the manifest carries a
+/// `[plugin.capabilities] semantic_pass = true` table at all - see
+/// [`install`]/[`install_semantic_pass_capable`]'s own doc comments. `false`
+/// omits the table entirely rather than writing `semantic_pass = false`
+/// explicitly, matching what a real hand-written manifest predating GM-270
+/// looks like - both read the same way through `Capabilities::default`, but
+/// the omitted-table shape is the one this fixture is standing in for.
+fn manifest(language: &str, extensions: &[&str], semantic_pass: bool) -> String {
     let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+    let capabilities = if semantic_pass { "\n[plugin.capabilities]\nsemantic_pass = true\n" } else { "" };
     format!(
         r#"
 [plugin]
@@ -242,7 +283,7 @@ args = ["./plugin.js"]
 
 [plugin.languages]
 extensions = [{extensions}]
-"#
+{capabilities}"#
     )
 }
 

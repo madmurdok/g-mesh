@@ -70,6 +70,19 @@ use crate::storage::write::{
 /// out `FileChanged` returns early via `?` before the semantic pass is ever
 /// sent) - see [`round_trip`] for what it is for and why this function does
 /// not know how to implement it itself.
+///
+/// `semantic_pass_capable` gates the second round trip entirely: a plugin
+/// whose manifest declares `capabilities.semantic_pass = false` (the
+/// conservative default - see `daemon::manifest::Capabilities::default`)
+/// never receives a `semanticPass` request at all, per the architecture
+/// doc's `plugin.toml additions` ("`false`: core never sends it, and no
+/// empty-diff answer is required"). A plain `bool` rather than the
+/// `Capabilities` type itself: this module is transport-agnostic and knows
+/// nothing about manifests on purpose (see its own doc comment), so the
+/// caller that *does* own the manifest - `daemon::plugin::PluginProcess`,
+/// via its own `manifest.capabilities.semantic_pass` - resolves the
+/// capability and hands down only the one bit this function needs, rather
+/// than this module reaching into `daemon::manifest` for itself.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -80,6 +93,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     embedding: &EmbeddingPipeline,
     file_changed_timeout: Duration,
     semantic_pass_timeout: Duration,
+    semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let file_path = file_path.into();
@@ -93,6 +107,10 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
         file_changed_timeout,
         on_timeout,
     )?;
+
+    if !semantic_pass_capable {
+        return Ok(());
+    }
 
     if let Err(err) = apply_semantic_pass(
         reader,
@@ -731,6 +749,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -792,6 +811,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -834,6 +854,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         );
         plugin.join().unwrap();
@@ -874,6 +895,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -1018,6 +1040,7 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         )
         .unwrap();
@@ -1068,12 +1091,77 @@ mod tests {
             &EmbeddingPipeline::disabled(),
             TEST_TIMEOUT,
             TEST_TIMEOUT,
+            true,
             &mut on_timeout_must_not_fire,
         );
         plugin.join().unwrap();
 
         assert!(outcome.is_ok(), "a lost upgrade must not undo a committed reparse: {outcome:?}");
         assert_eq!(count(&conn, "nodes"), 1, "the structural diff still committed");
+    }
+
+    /// GM-270's acceptance criterion at the unit level: `semantic_pass_capable
+    /// = false` must skip the second round trip entirely, not just ignore its
+    /// answer - a plugin whose manifest never declared
+    /// `capabilities.semantic_pass = true` gets no `semanticPass` request at
+    /// all, per the architecture doc's `plugin.toml additions` ("core never
+    /// sends it, and no empty-diff answer is required").
+    ///
+    /// Discriminates: the stub here is built with `spawn_stub_plugin`'s
+    /// `semantic_diff: None`, which answers only the first (`FileChanged`)
+    /// request and then returns - it never reads a second frame. If this
+    /// function sent `semanticPass` anyway (the pre-GM-270, unconditional
+    /// behaviour), the stub thread would still be blocked reading a request
+    /// nobody is answering when the main thread reaches `plugin.join()`
+    /// below, and the test would hang instead of completing - flip
+    /// `semantic_pass_capable` to `true` here to see it hang.
+    #[test]
+    fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
+        let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+        let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+        let mut conn = setup_conn();
+
+        let request_id = RequestId::Number(6);
+        let structural = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: request_id.clone(),
+            result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
+        };
+
+        // `None`: this stub answers exactly one request and never looks for a
+        // second - the same shape `a_failing_semantic_pass_does_not_fail_the_reparse`
+        // uses for "the semantic layer died", reused here for "was never
+        // asked in the first place".
+        let plugin = spawn_stub_plugin(
+            plugin_reader,
+            plugin_writer,
+            "src/lib.rs",
+            request_id.clone(),
+            structural,
+            None,
+        );
+
+        let mut buf_reader = BufReader::new(core_reader);
+        apply_file_change(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            "src/lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            false,
+            &mut on_timeout_must_not_fire,
+        )
+        .unwrap();
+        plugin.join().unwrap();
+
+        assert_eq!(
+            count(&conn, "nodes"),
+            1,
+            "the structural diff must still commit with no semantic pass sent"
+        );
     }
 
     /// The post-bulk-index shape: nothing to name, so the list is empty and

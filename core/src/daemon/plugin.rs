@@ -139,15 +139,19 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///   already far below the 20-minute floor, so the floor is what it gets, and
 ///   9s of real work disappears into that floor with room to spare.
 ///
-///   File-count scaling is computed over the *whole* index today
-///   (`daemon::semantic::indexed_file_count`), not per language, because
-///   there is no per-language `File`-node accounting yet - `language_state`
-///   (mentioned in this task's own notes) is a later task. GM-270 (the
-///   per-language semantic scheduler) is the natural place to narrow this to
-///   "this language's own files" once that distinction exists; until then, a
-///   multi-language project's timeout is sized off every language's files
-///   combined, which only ever makes the budget *more* generous than a
-///   single language would need.
+///   File-count scaling is computed **per language**
+///   (`daemon::semantic::indexed_file_count`, narrowed by GM-270's
+///   per-language semantic scheduler to `WHERE kind = 'File' AND language =
+///   ?` over `nodes.language`, GM-264's column): each language's own
+///   whole-project pass gets a budget sized off its own files, never
+///   inflated by an unrelated language's files sitting in the same project,
+///   and never starved by them either. Before GM-270 there was no
+///   per-language `File`-node accounting to narrow this against, so a
+///   multi-language project's single (bundled-plugin-only) pass was sized
+///   off every discovered language's files combined - strictly more
+///   generous than a single language needed, never less, which is why that
+///   was safe to ship ahead of the narrowing rather than a correctness bug
+///   in its own right.
 ///
 /// Constants, not configuration (see the task this type was added for): a
 /// project's `config.toml` has no `[plugin.timeouts]` section, and none of
@@ -936,6 +940,7 @@ impl PluginProcess {
                 embedding,
                 self.timeouts.file_changed,
                 self.timeouts.semantic_pass_file,
+                self.manifest.capabilities.semantic_pass,
                 &mut on_timeout,
             )
         };
@@ -1058,6 +1063,7 @@ impl PluginProcess {
             embedding,
             self.timeouts.file_changed,
             self.timeouts.semantic_pass_file,
+            self.manifest.capabilities.semantic_pass,
             &mut on_timeout,
         )
     }

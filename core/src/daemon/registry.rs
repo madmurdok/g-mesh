@@ -112,7 +112,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::DiscoveredPlugins;
+use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
@@ -561,6 +561,20 @@ impl PluginRegistry {
         points.sort();
         points.dedup();
         points
+    }
+
+    /// Every discovered language whose manifest declares
+    /// `capabilities.semantic_pass = true`, sorted - what
+    /// `daemon::semantic::run_with_registry` iterates over to ask each
+    /// language's whole-project semantic pass, generalized (GM-270) from the
+    /// single hardcoded `plugin::BUNDLED_LANGUAGE` question it replaces.
+    ///
+    /// A thin wrapper over `daemon::manifest::semantic_pass_capable_languages`,
+    /// which owns the filter and the sort order (see that function's own doc
+    /// comment) - both shared with `daemon::semantic::run_once`, which has a
+    /// bare `&DiscoveredPlugins` and no registry to ask this of.
+    pub fn semantic_pass_languages(&self) -> Vec<String> {
+        manifest::semantic_pass_capable_languages(&self.discovered.manifests)
     }
 
     /// The supervisor for `language`, spawning its plugin if this is the

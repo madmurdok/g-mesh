@@ -134,7 +134,8 @@ impl Harness {
             format!(
                 "[plugin]\nlanguage = \"typescript\"\nprotocol_version = 1\nplugin_version = \"0.1.0\"\n\n\
                  [plugin.spawn]\ncommand = \"node\"\nargs = [\"{}\"]\n\n\
-                 [plugin.languages]\nextensions = [\".ts\"]\n",
+                 [plugin.languages]\nextensions = [\".ts\"]\n\n\
+                 [plugin.capabilities]\nsemantic_pass = true\n",
                 harness.plugin_path().to_string_lossy().replace('\\', "\\\\"),
             ),
         )
