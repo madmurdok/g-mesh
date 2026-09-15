@@ -42,10 +42,33 @@ export type NodeKind = "File" | "Module" | "Type" | "Function" | "Variable";
 
 export type EdgeKind = "DEFINES" | "IMPORTS" | "CALLS" | "SUPERTYPE_OF" | "REFERENCES" | "EXPORTS";
 
-export type EdgeSource = "tree-sitter" | "ts-compiler";
+/** Mirrors core's `SourceTier` (protocol v2): the closed set queries and
+ * code branch on. The engine that produced an edge (`"tree-sitter"`,
+ * `"ts-compiler"`, ...) is a separate free-text label - see [`ENGINE`] and
+ * `semanticPass.ts`'s own `SEMANTIC_ENGINE`. */
+export type EdgeSource = "syntactic" | "semantic";
 
 /** Everything this module emits comes from the structural pass only. */
-export const EDGE_SOURCE: EdgeSource = "tree-sitter";
+export const EDGE_SOURCE: EdgeSource = "syntactic";
+/** This module's own `engine` label - the tree-sitter structural pass. */
+export const ENGINE = "tree-sitter";
+
+/** Mirrors core's `Visibility` (protocol v2), minus the `Container(key)`
+ * variant no TS/JS node ever needs: a JS/TS file is its own scope, so this
+ * plugin never emits a container-scoped declaration (design doc's Data
+ * Model > Logical containers table: "TS/JS: the file is the scope"). */
+export type Visibility = "public" | "file";
+
+/** Mirrors core's `PlaceholderTarget` (protocol v2). TS/JS placeholders are
+ * always file-scoped (no containers), and always name-keyed (this plugin has
+ * no semantic tier that could send an exact `qualifiedName` key) - so only
+ * the `{ file }` / `{ name }` shapes are ever built here, though the wider
+ * type is what actually crosses the wire. */
+export interface PlaceholderTarget {
+  scope: { file: string } | { container: string };
+  key: { name: string } | { qualifiedName: string };
+  fromContainer?: string;
+}
 
 /**
  * `nativeKind` of an import placeholder whose specifier was resolved to a
@@ -141,6 +164,15 @@ export function pendingSymbolQualifiedName(targetFilePath: string, importedName:
 }
 
 /**
+ * The `target` every placeholder this plugin builds carries (protocol v2):
+ * file-scoped, name-keyed - the only shape a container-less, semantic-tier-less
+ * structural pass ever has grounds to send (see [`PlaceholderTarget`]).
+ */
+export function fileTarget(targetFilePath: string, name: string): PlaceholderTarget {
+  return { scope: { file: targetFilePath }, key: { name } };
+}
+
+/**
  * One declaration of a symbol that has several - an overload signature next
  * to its implementation, an interface or a namespace written across two
  * statements. Mirrors the `DECLARATIONS` child table of "Overloads and merged
@@ -184,7 +216,12 @@ export interface ExtractedNode {
   endLine: number;
   endCol: number;
   signature?: string;
-  exported: boolean;
+  /** Mirrors core's `Visibility` (protocol v2) - `"public"` for `export`ed
+   * declarations, `"file"` otherwise. Replaces the wire v1 `exported: boolean`
+   * field this plugin sent before GM-275 (same two-value mapping, see the
+   * Data Model > Visibility table: TS `export` -> `public`, non-exported
+   * top-level -> `file`). */
+  visibility: Visibility;
   docComment?: string;
   language: string;
   nativeKind?: string;
@@ -207,6 +244,21 @@ export interface ExtractedNode {
    * call site bound, and records that on the edge as `toDeclaration`.
    */
   declarations?: SymbolDeclaration[];
+  /**
+   * What this node is waiting to be linked onto - mirrors core's
+   * `PlaceholderTarget` (protocol v2). Required iff `nativeKind` is one of
+   * the placeholder kinds this file itself addresses by name
+   * (`pending_symbol`, `reexport`, `resolved_module`) - core's
+   * `protocol::conformance` shape check enforces this. Every target this
+   * plugin builds is `{ scope: { file }, key: { name } }`: TS/JS has no
+   * containers and no semantic tier that resolves to an exact
+   * `qualifiedName`, so the wider shape's other cases never appear here (see
+   * [`PlaceholderTarget`]). `external_module` is deliberately exempt - it
+   * names a bare specifier (a package, a Node builtin) that never links to
+   * anything in this project, so it carries no target at all, the same way
+   * core never materializes a node for it.
+   */
+  target?: PlaceholderTarget;
 }
 
 /** Mirrors core's `EdgeRecord`. */
@@ -216,6 +268,11 @@ export interface ExtractedEdge {
   toId: string;
   kind: EdgeKind;
   source: EdgeSource;
+  /** Mirrors core's `WireEdge.engine` (protocol v2) - the free-text engine
+   * label alongside `source`'s closed tier. `"tree-sitter"` for every edge
+   * this module emits ([`ENGINE`]); `semanticPass.ts` emits `"ts-compiler"`
+   * on the edges its own tier answers. */
+  engine: string;
   resolved: boolean;
   /**
    * Which of the target's declarations this call binds, as an ordinal into its
@@ -360,11 +417,27 @@ export class UnsupportedFileError extends Error {
 
 type GrammarKey = "typescript" | "tsx" | "javascript";
 
+/**
+ * The `language` value written to every node this plugin emits, for every
+ * extension it owns (.ts/.tsx/.mts/.cts *and* .js/.jsx/.mjs/.cjs) - the
+ * manifest's own `[plugin] language = "typescript"` is this plugin's
+ * identity, and core keys per-language state (`language_state`, semantic
+ * scheduling, the `ownership.language` conformance check) on the wire
+ * `language` field matching it exactly. A grammar choice below still governs
+ * *which parser* reads a `.js` file - JS syntax is a subset TypeScript's own
+ * grammar does not accept - but that is an internal parsing detail, not a
+ * second language this one manifest speaks on the wire. (Emitting
+ * `"javascript"` for `.js` files, the wire v1 behaviour, would report a
+ * language with no manifest of its own - `daemon::semantic`'s scheduler and
+ * `mcp::instructions`'s present-language listing both key off `nodes.language`
+ * per language and neither would ever find one named "javascript" to
+ * schedule or describe.)
+ */
+const WIRE_LANGUAGE = "typescript";
+
 interface GrammarChoice {
   readonly key: GrammarKey;
   readonly grammar: unknown;
-  /** Value written to a node's `language` column. */
-  readonly language: "typescript" | "javascript";
 }
 
 /**
@@ -377,14 +450,14 @@ function grammarFor(filePath: string): GrammarChoice | null {
     case ".ts":
     case ".mts":
     case ".cts":
-      return { key: "typescript", grammar: TypeScript.typescript, language: "typescript" };
+      return { key: "typescript", grammar: TypeScript.typescript };
     case ".tsx":
-      return { key: "tsx", grammar: TypeScript.tsx, language: "typescript" };
+      return { key: "tsx", grammar: TypeScript.tsx };
     case ".js":
     case ".mjs":
     case ".cjs":
     case ".jsx":
-      return { key: "javascript", grammar: JavaScript, language: "javascript" };
+      return { key: "javascript", grammar: JavaScript };
     default:
       return null;
   }
@@ -527,7 +600,7 @@ export function extractIncremental(
 
   const result = new Extractor(
     filePath,
-    choice.language,
+    WIRE_LANGUAGE,
     tree.rootNode.hasError,
     options?.resolveSpecifier,
   ).run(tree.rootNode);
@@ -793,7 +866,16 @@ interface NodeParams {
   nativeKind?: string;
   signature?: string;
   docComment?: string;
+  /** Request-side flag, translated into [`ExtractedNode.visibility`] by
+   * [`Extractor.addNode`] - kept boolean here rather than threading
+   * `Visibility` through every call site, since every declaration this file
+   * makes is either exported or not (TS/JS has no third, container-scoped
+   * visibility to request). */
   exported?: boolean;
+  /** See [`ExtractedNode.target`]. Only ever set by the three placeholder-
+   * creation call sites ([`Extractor.recordSpecifier`],
+   * [`Extractor.recordReexport`], [`Extractor.importedSymbol`]). */
+  target?: PlaceholderTarget;
 }
 
 /**
@@ -948,7 +1030,7 @@ class Extractor {
     // fields are settled - they cannot be decided from the first declaration
     // alone when the implementation is still three statements away.
     if (existing) {
-      if (params.exported) existing.exported = true;
+      if (params.exported) existing.visibility = "public";
       return existing;
     }
 
@@ -962,13 +1044,14 @@ class Extractor {
       startCol: params.at.startPosition.column,
       endLine: params.at.endPosition.row,
       endCol: params.at.endPosition.column,
-      exported: params.exported ?? false,
+      visibility: params.exported ? "public" : "file",
       language: this.language,
       hasSyntaxErrors: this.hasSyntaxErrors,
     };
     if (params.signature !== undefined) node.signature = params.signature;
     if (params.docComment !== undefined) node.docComment = params.docComment;
     if (params.nativeKind !== undefined) node.nativeKind = params.nativeKind;
+    if (params.target !== undefined) node.target = params.target;
 
     this.nodes.set(id, node);
     return node;
@@ -1074,7 +1157,7 @@ class Extractor {
     }
 
     this.addEdge(this.fileNode.id, "DEFINES", node.id);
-    if (node.exported) this.addEdge(this.fileNode.id, "EXPORTS", node.id);
+    if (node.visibility === "public") this.addEdge(this.fileNode.id, "EXPORTS", node.id);
     return node;
   }
 
@@ -1101,7 +1184,7 @@ class Extractor {
     const id = edgeIdFor(fromId, kind, toId);
     if (this.edges.has(id)) return;
     const resolved = !isPlaceholder(target);
-    this.edges.set(id, { id, fromId, toId, kind, source: EDGE_SOURCE, resolved });
+    this.edges.set(id, { id, fromId, toId, kind, source: EDGE_SOURCE, engine: ENGINE, resolved });
   }
 
   /**
@@ -1121,7 +1204,7 @@ class Extractor {
   }
 
   private markExported(node: ExtractedNode): void {
-    node.exported = true;
+    node.visibility = "public";
     this.addEdge(this.fileNode.id, "EXPORTS", node.id);
   }
 
@@ -1429,12 +1512,21 @@ class Extractor {
    */
   private recordSpecifier(specifier: string, at: SyntaxNode): string | null {
     const resolvedPath = this.resolveSpecifier?.(specifier, this.filePath) ?? null;
+    // `external_module` carries no `target`: it names a bare specifier (a
+    // package, a Node builtin) that never links to anything in this project,
+    // so core never materializes a node for it and there is nothing to
+    // address - see `PLACEHOLDER_NATIVE_KINDS`'s own doc comment and
+    // `protocol::conformance::PLACEHOLDER_NATIVE_KINDS`, which excludes it
+    // for exactly this reason. `resolved_module` addresses the whole target
+    // module (not one export of it), so its key is the same `*` convention
+    // `REEXPORT_ALL_NAME` uses for a whole-module re-export.
     const target = this.addNode({
       kind: "Module",
       name: specifier,
       qualifiedName: resolvedPath ?? specifier,
       at,
       nativeKind: resolvedPath === null ? "external_module" : RESOLVED_MODULE_NATIVE_KIND,
+      target: resolvedPath === null ? undefined : fileTarget(resolvedPath, REEXPORT_ALL_NAME),
     });
     this.addEdge(this.fileNode.id, "IMPORTS", target.id);
     return resolvedPath;
@@ -1514,6 +1606,11 @@ class Extractor {
       qualifiedName: pendingSymbolQualifiedName(targetPath, exportedName),
       at,
       nativeKind: REEXPORT_NATIVE_KIND,
+      // The real declaration this re-export forwards to, not the published
+      // alias: `export { a as b } from "./y"` must target `y#a`, never `b` -
+      // matches `publishedName` disagreeing with `exportedName` exactly when
+      // the export renames.
+      target: fileTarget(targetPath, exportedName),
     });
   }
 
@@ -2559,6 +2656,7 @@ class Extractor {
       qualifiedName: pendingSymbolQualifiedName(binding.targetPath, binding.importedName),
       at: binding.at,
       nativeKind: PENDING_SYMBOL_NATIVE_KIND,
+      target: fileTarget(binding.targetPath, binding.importedName),
     });
   }
 

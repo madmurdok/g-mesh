@@ -15,7 +15,9 @@ import {
   isSupportedFile,
   type ExtractedEdge,
   type ExtractedNode,
+  type PlaceholderTarget,
   type SymbolDeclaration,
+  type Visibility,
 } from "./extract";
 import {
   HARD_EXCLUDED_DIRS,
@@ -92,7 +94,7 @@ export interface WireNode {
   filePath: string;
   range: WireRange;
   signature: string | null;
-  exported: boolean;
+  visibility: Visibility;
   docComment: string | null;
   language: string;
   nativeKind: string | null;
@@ -110,6 +112,9 @@ export interface WireNode {
    * keeps that promise only for a key that is absent.
    */
   declarations?: SymbolDeclaration[];
+  /** See `ExtractedNode.target` - passed through unchanged, present only on
+   * a placeholder node. */
+  target?: PlaceholderTarget;
 }
 
 /** Identical shape to `ExtractedEdge` - passed through unchanged. */
@@ -127,7 +132,7 @@ export function toWireNode(node: ExtractedNode): WireNode {
       end: { line: node.endLine, col: node.endCol },
     },
     signature: node.signature ?? null,
-    exported: node.exported,
+    visibility: node.visibility,
     docComment: node.docComment ?? null,
     language: node.language,
     nativeKind: node.nativeKind ?? null,
@@ -137,8 +142,9 @@ export function toWireNode(node: ExtractedNode): WireNode {
   // the key has to be missing from the object, not merely undefined in it, so
   // that a single-declaration node's line is byte-for-byte what it was before
   // this field existed - and so a caller comparing wire nodes structurally
-  // sees no new property either.
+  // sees no new property either. `target` follows the same convention.
   if (node.declarations !== undefined) wire.declarations = node.declarations;
+  if (node.target !== undefined) wire.target = node.target;
   return wire;
 }
 
