@@ -423,6 +423,29 @@ pub fn find_file_node(conn: &Connection, file_path: &str) -> Result<Option<NodeR
     .context("failed to look up file node")
 }
 
+/// Finds the container node(s) whose own key is exactly `key`, across every
+/// language a container of that key exists in - the counterpart of
+/// [`find_file_node`] for a logical container (a Go import path, a Rust
+/// module path, ... - Data Model > Logical containers) rather than a file.
+/// Used by `get_dependencies::from_file` (GM-267) to let a caller anchor a
+/// walk on a package name directly instead of hunting for one of its files.
+///
+/// A key is only unique *within* a language (`containers.key`'s own `UNIQUE
+/// (language, key)`), so an exact key can legitimately name more than one
+/// container project-wide - a Go package and a Rust module happening to
+/// share the string. This returns every match rather than picking one; the
+/// caller decides what "more than one" means (refuse and name the languages,
+/// for `get_dependencies`). One indexed lookup (`containers.key`'s own
+/// implicit index, part of `UNIQUE (language, key)`) joined back onto
+/// `nodes` by primary key - not a scan of either table.
+pub fn find_containers_by_key(conn: &Connection, key: &str) -> Result<Vec<NodeRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT n.* FROM nodes n JOIN containers c ON c.nodeId = n.id WHERE c.key = ?1 ORDER BY c.language")
+        .context("failed to prepare the container lookup")?;
+    let rows = stmt.query_map(params![key], map_node_row).context("failed to look up containers by key")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read containers by key")
+}
+
 /// Finds the innermost node enclosing a cursor position, e.g. resolving
 /// `find_definition`'s file+position input. Multiple nodes can contain a
 /// position (a `File` spans the whole file, a `Function` inside it spans
