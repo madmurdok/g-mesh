@@ -91,7 +91,24 @@ pub const CURRENT_SCHEMA_VERSION: &str = "7";
 /// changes are different events, and tying the two would both miss changes
 /// (a release that fixes nothing about extraction) and force pointless
 /// reindexes (a release that only touches the CLI).
-pub const CURRENT_INDEXER_VERSION: &str = "1";
+///
+/// # History
+///
+/// Bumped to "2" by GM-293, and not because today's pipeline extracts
+/// anything differently from a clean start. Until then the daemon's
+/// connection enforced foreign keys without anyone knowing (see
+/// `storage::connection::open`), so from the second edit of a file in a
+/// plugin process's lifetime on, the diff was refused and the failure
+/// swallowed - and the query-time staleness check then recorded the new
+/// content hash over the graph that never took the edit. An index that lived
+/// through that is wrong in ways nothing will ever notice on its own: its
+/// `indexed_files` baselines claim the stale files are fresh, so no future
+/// query re-reads them, and a restart trusts it as current. The only repair
+/// is the one this constant already buys - a mismatch in
+/// [`ensure_current`] drops every table and the next daemon start (or
+/// `g-mesh init`) re-walks the project from nothing - so every index built by
+/// an earlier binary is thrown away rather than audited.
+pub const CURRENT_INDEXER_VERSION: &str = "2";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md).
@@ -205,11 +222,14 @@ CREATE TABLE IF NOT EXISTS indexed_files (
 -- One row per node that has been embedded. The relation is 1:0-or-1 (see the
 -- architecture doc's Data Model erDiagram: `NODES ||--o| VECTORS`), so
 -- nodeId is the primary key rather than an ordinary indexed FK column - a
--- re-embed overwrites the row instead of accumulating one. ON DELETE CASCADE
--- so a node going away (a file edit, a deletion) drops its stale embedding
--- with it instead of leaving an orphan a later similarity search could still
--- surface - the same reasoning `declarations` and `edges` already follow for
--- their own FKs into `nodes`.
+-- re-embed overwrites the row instead of accumulating one. A node going away
+-- (a file edit, a deletion) must drop its stale embedding with it instead of
+-- leaving an orphan a later similarity search could still surface. ON DELETE
+-- CASCADE states that intent, but it only runs on a connection that enforces
+-- foreign keys, and the daemon's does not (`storage::connection::open`, and
+-- GM-293 for why) - so every production delete from `nodes` removes the
+-- vector itself (`storage::write::apply_diff`, `graph::imports`), exactly as
+-- it already did for `declarations`.
 --
 -- embedding is sqlite-vec's compact vector format: each dimension as a
 -- 4-byte little-endian float32, back to back, no header - see

@@ -169,6 +169,19 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         let mut incident = tx
             .prepare("SELECT COUNT(*) FROM edges WHERE fromId = ?1 OR toId = ?1")
             .context("failed to prepare the incident-edge count")?;
+        // The placeholder's dependents go first, explicitly: the daemon's
+        // connection does not enforce foreign keys (`storage::connection::
+        // open`), so the DDL's ON DELETE CASCADE never runs there, and rows
+        // left keyed by this id would be inherited by the next node to take
+        // it - the same reason `storage::write::apply_diff` deletes them for
+        // every node a diff removes. A placeholder has none of either today;
+        // this must not depend on that.
+        let mut drop_placeholder_declarations = tx
+            .prepare("DELETE FROM declarations WHERE nodeId = ?1")
+            .context("failed to prepare the placeholder's declaration delete")?;
+        let mut drop_placeholder_vector = tx
+            .prepare("DELETE FROM vectors WHERE nodeId = ?1")
+            .context("failed to prepare the placeholder's embedding delete")?;
         let mut drop_placeholder = tx
             .prepare("DELETE FROM nodes WHERE id = ?1")
             .context("failed to prepare the placeholder delete")?;
@@ -191,6 +204,12 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
                 .query_row(params![placeholder.id], |row| row.get(0))
                 .context("failed to count a placeholder's remaining edges")?;
             if remaining == 0 {
+                drop_placeholder_declarations
+                    .execute(params![placeholder.id])
+                    .context("failed to drop a linked-away placeholder's declarations")?;
+                drop_placeholder_vector
+                    .execute(params![placeholder.id])
+                    .context("failed to drop a linked-away placeholder's embedding")?;
                 summary.dropped_placeholders += drop_placeholder
                     .execute(params![placeholder.id])
                     .context("failed to drop a linked-away placeholder")?;
@@ -499,6 +518,44 @@ mod tests {
                 == 1,
             "a placeholder something still points at must not be deleted out from under it"
         );
+    }
+
+    /// GM-293: dropping a linked-away placeholder is a bare `DELETE FROM
+    /// nodes`, and on the daemon's connection (foreign keys off - see
+    /// `storage::connection::open`) nothing cascades from it. Whatever hangs
+    /// off the placeholder by `nodeId` has to be deleted with it explicitly,
+    /// or it is inherited by the next node to take that id.
+    ///
+    /// Placeholders carry neither declarations nor embeddings today (a
+    /// `Module` has no signature or doc comment to embed), which is exactly
+    /// why this is seeded by hand: the delete must not depend on that staying
+    /// true.
+    #[test]
+    fn dropping_a_placeholder_leaves_no_orphaned_rows_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: vec![file_node("a.ts"), file_node("b.ts")], ..Default::default() },
+        )
+        .unwrap();
+        seed_resolved_import(&mut conn, "a.ts", "b.ts");
+        let placeholder_id = "mod:a.ts:b.ts";
+        conn.execute(
+            "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
+             VALUES (?1, 0, 0, 0, 0, 1, 0)",
+            params![placeholder_id],
+        )
+        .unwrap();
+        crate::storage::vectors::insert(&conn, placeholder_id, &[1.0, 0.0], "test-model").unwrap();
+
+        let summary = link_all(&mut conn).unwrap();
+
+        assert_eq!(summary, LinkSummary { linked_edges: 1, dropped_placeholders: 1 });
+        assert_eq!(count(&conn, "nodes"), 2, "only the two File nodes remain");
+        assert_eq!(count(&conn, "declarations"), 0, "the placeholder's declarations must go with it");
+        assert_eq!(count(&conn, "vectors"), 0, "the placeholder's embedding must go with it");
     }
 
     #[test]
