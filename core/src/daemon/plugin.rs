@@ -715,6 +715,22 @@ impl PluginProcess {
     /// layer logs and treats as best-effort (see `mcp::GMeshMcpServer::
     /// ensure_file_fresh`) rather than something worth relaunching a process
     /// over on a mere freshness check.
+    ///
+    /// The one exception is a reindex that a *live* plugin answered and the
+    /// index refused (GM-293), for the same reason
+    /// [`Self::apply_file_change`] relaunches on it - and here it matters
+    /// more. The plugin has already cached the refused text, so the next
+    /// query's retry would get an empty diff back, succeed, and record the
+    /// new content hash as this file's baseline over a graph that never took
+    /// the edit: stale data marked fresh, surviving a restart. The baseline
+    /// is not written for the failed attempt (`watcher::staleness::
+    /// ensure_fresh` records it only after a successful reindex); the
+    /// relaunch is what makes the retry a full extraction instead of that
+    /// empty diff. The error is still returned, for the MCP layer to log.
+    /// Only [`staleness::ReindexFailed`] qualifies - a file that could not be
+    /// read, or a baseline that could not be written, leaves the plugin's
+    /// cache no further ahead than the index, and a crashed plugin keeps the
+    /// no-relaunch behaviour above.
     pub fn ensure_fresh(
         &self,
         conn: &Mutex<Connection>,
@@ -729,10 +745,40 @@ impl PluginProcess {
         }
 
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let mut state = self.state.lock().unwrap();
-        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
-        let mut conn = conn.lock().unwrap();
-        staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id, embedding)
+        let (result, asked) = {
+            let mut state = self.state.lock().unwrap();
+            let asked = state.child.id();
+            let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
+            let mut conn = conn.lock().unwrap();
+            let result = staleness::ensure_fresh(
+                reader,
+                writer,
+                &mut conn,
+                &self.project_root,
+                file_path,
+                id,
+                embedding,
+            );
+            (result, asked)
+        };
+
+        let Err(err) = result else { return result };
+        let refused_by_the_index = err.downcast_ref::<staleness::ReindexFailed>().is_some()
+            && self.pid() == asked
+            && !self.process_has_exited();
+        if refused_by_the_index {
+            if let Err(relaunch_err) = self.relaunch(&format!(
+                "its query-time reindex of {file_path} could not be applied ({err:#}), so its cached \
+                 copy of that file is ahead of the index - a fresh process re-extracts it in full"
+            )) {
+                eprintln!(
+                    "g-mesh daemon: could not relaunch the {} plugin after a failed query-time \
+                     reindex ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
+                    self.manifest.language
+                );
+            }
+        }
+        Err(err)
     }
 
     /// Asks the plugin's semantic layer to upgrade what the structural pass
@@ -1143,6 +1189,86 @@ mod tests {
             "the refused edit must reach the index on the next reparse - a plugin still caching it \
              would answer with an empty diff and leave `greet` ending on line 2"
         );
+        assert_ne!(plugin.pid(), pid, "the plugin holding the refused text must have been relaunched");
+        assert!(
+            !crate::daemon::is_process_alive(pid),
+            "the replaced plugin must be ended and reaped, not left running or as a zombie"
+        );
+    }
+
+    /// The query-time twin of the test above (GM-293), where getting it wrong
+    /// is worse: a retry that gets an empty diff also *records the baseline*,
+    /// marking the stale graph fresh. So besides the edit reaching the index
+    /// once writes are accepted again, the baseline must name what is on
+    /// disk - and must not have moved for the refused attempt.
+    #[test]
+    fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_edit() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.ts");
+        fs::write(&file, "export function greet(): string {\n  return \"hi\";\n}\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::storage::schema::apply(&conn).unwrap();
+        let conn = Mutex::new(conn);
+        let baseline = |conn: &Mutex<Connection>| -> (i64, String) {
+            conn.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = 'lib.ts'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let on_disk = |path: &Path| -> (i64, String) {
+            let mtime = staleness::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
+            let hash = Sha256::digest(fs::read(path).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
+            (mtime, hash)
+        };
+
+        let plugin =
+            PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
+                .expect("failed to spawn the JS/TS plugin");
+        let embedding = EmbeddingPipeline::disabled();
+        assert_eq!(
+            plugin.ensure_fresh(&conn, "lib.ts", &embedding).unwrap(),
+            StalenessOutcome::ReindexedNoPriorRecord,
+            "a never-indexed file is a cold-cache reparse, which nothing can refuse"
+        );
+        let before = baseline(&conn);
+        let pid = plugin.pid();
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&file, "export function greet(): string {\n  const a = 1;\n  return \"hi\";\n}\n").unwrap();
+        let err = match plugin.ensure_fresh(&conn, "lib.ts", &embedding) {
+            Ok(outcome) => panic!("a reindex the index refused must not be reported as {outcome:?}"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {err}");
+        assert_eq!(baseline(&conn), before, "a refused reindex must not advance the baseline");
+
+        // Whatever refused the write stops refusing it.
+        conn.lock().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            plugin.ensure_fresh(&conn, "lib.ts", &embedding).unwrap(),
+            StalenessOutcome::ReindexedViaHashMismatch,
+            "the file is still stale, so the next query must reindex it"
+        );
+
+        let greet_end: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT endLine FROM nodes WHERE filePath = 'lib.ts' AND name = 'greet'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            greet_end, 3,
+            "the refused edit must reach the index on the retry - a plugin still caching it would \
+             answer with an empty diff, leave `greet` ending on line 2, and have the baseline recorded anyway"
+        );
+        assert_eq!(baseline(&conn), on_disk(&file), "the baseline must now describe the file on disk");
         assert_ne!(plugin.pid(), pid, "the plugin holding the refused text must have been relaunched");
         assert!(
             !crate::daemon::is_process_alive(pid),

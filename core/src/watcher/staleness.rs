@@ -97,6 +97,25 @@ impl StalenessOutcome {
     }
 }
 
+/// The context [`ensure_fresh`] attaches when the reindex itself - the plugin
+/// round trip and its commit - failed, as opposed to anything around it (a
+/// file that could not be stat'ed or hashed, a baseline that could not be
+/// written).
+///
+/// A type rather than only a message so that a caller can ask
+/// `err.downcast_ref::<ReindexFailed>()` instead of matching text:
+/// `daemon::plugin::PluginProcess::ensure_fresh` relaunches its plugin on
+/// exactly this failure and on nothing else (GM-293), because only this one
+/// can leave the plugin's cached copy of the file ahead of the index.
+#[derive(Debug, Clone, Copy)]
+pub struct ReindexFailed;
+
+impl std::fmt::Display for ReindexFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to synchronously reindex stale file")
+    }
+}
+
 /// Compares `file_path` (resolved against `project_root`) against the
 /// baseline recorded in the `indexed_files` table and, on a mismatch,
 /// synchronously reindexes it by calling
@@ -131,7 +150,7 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
             // Genuinely stale (or never indexed) - synchronously reindex
             // before recording the new baseline.
             apply_file_change(reader, writer, conn, file_path, request_id, embedding)
-                .context("failed to synchronously reindex stale file")?;
+                .context(ReindexFailed)?;
             upsert_indexed_file(conn, file_path, mtime, &hash)?;
             Ok(if had_prior_record {
                 StalenessOutcome::ReindexedViaHashMismatch
