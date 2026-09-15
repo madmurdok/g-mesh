@@ -126,9 +126,11 @@ fn seeded_index() -> Connection {
     conn
 }
 
-fn edge(conn: &Connection, id: &str) -> (String, bool) {
-    conn.query_row("SELECT source, resolved FROM edges WHERE id = ?1", [id], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+/// `(source, engine, resolved)` - `source` is the GM-264 tier
+/// (`"syntactic"`/`"semantic"`), `engine` its own column.
+fn edge(conn: &Connection, id: &str) -> (String, String, bool) {
+    conn.query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })
     .unwrap()
 }
@@ -146,8 +148,8 @@ fn edge(conn: &Connection, id: &str) -> (String, bool) {
 #[test]
 fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     let mut conn = seeded_index();
-    assert_eq!(edge(&conn, "e1"), ("tree-sitter".to_string(), false));
-    assert_eq!(edge(&conn, "e2"), ("tree-sitter".to_string(), false));
+    assert_eq!(edge(&conn, "e1"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
+    assert_eq!(edge(&conn, "e2"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
 
     let mut plugin_answer = BufReader::new(Cursor::new(fixture("semantic_pass_upgrade.rpc")));
     let mut core_wrote: Vec<u8> = Vec::new();
@@ -165,16 +167,19 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     )
     .unwrap();
 
-    // e1 is the one the fixture answers for: tree-sitter/false -> ts-compiler/true.
+    // e1 is the one the fixture answers for: syntactic/tree-sitter/false ->
+    // semantic/ts-compiler/true (the fixture is real legacy-v1 plugin output,
+    // so `engine` is derived from its `source` string the same way
+    // `protocol::types::normalize_source`'s legacy branch derives it).
     assert_eq!(
         edge(&conn, "e1"),
-        ("ts-compiler".to_string(), true),
+        ("semantic".to_string(), "ts-compiler".to_string(), true),
         "the answered edge must be confirmed in place"
     );
     // e2 is not in the diff at all, so nothing about it may move.
     assert_eq!(
         edge(&conn, "e2"),
-        ("tree-sitter".to_string(), false),
+        ("syntactic".to_string(), "tree-sitter".to_string(), false),
         "an edge the pass said nothing about must be left exactly as it was"
     );
     let edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();

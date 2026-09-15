@@ -27,10 +27,12 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, SourceTier, Visibility,
-    WireEdge, WireNode, JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
+    SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
-use crate::storage::write::{apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::{
+    apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord,
+};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -275,22 +277,34 @@ fn to_storage_diff(wire: FileChangeDiff) -> Diff {
 /// an NDJSON stream instead of out of a diff response - the two paths must
 /// never disagree about how a wire node becomes a row.
 pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
+    let (visibility, visibility_container) = to_storage_visibility(&node.visibility);
     NodeRecord {
         id: node.id,
         kind: format!("{:?}", node.kind),
         name: node.name,
         qualified_name: node.qualified_name,
-        file_path: node.file_path,
+        file_path: node.file_path.clone(),
         start_line: node.range.start.line as i64,
         start_col: node.range.start.col as i64,
         end_line: node.range.end.line as i64,
         end_col: node.range.end.col as i64,
         signature: node.signature,
-        // GM-264 adds `visibility`/`container`/`target` columns; until then
-        // storage keeps its v1 `exported` boolean, derived from the wire's
-        // richer `Visibility` (Data Model > Visibility: only `Public` is
-        // visible from anywhere, so it alone maps to `true`).
+        // The read-side mirror of the database's `GENERATED ALWAYS exported`
+        // column - see `NodeRecord.exported`'s own doc comment for why this
+        // still has to be set correctly here even though `apply_diff` never
+        // writes it: `graph::symbol_links::link_diff` filters this very
+        // `Diff` in memory, before anything is read back from storage.
         exported: matches!(node.visibility, Visibility::Public),
+        visibility,
+        visibility_container,
+        container: node.container,
+        // `container_parent` has nowhere to go yet: container *nodes* (the
+        // `containers` table's own rows, the only place a parent relationship
+        // is recorded) are not materialized until GM-265 - see
+        // `storage::schema`'s DDL comment on `containers`. Dropped here, the
+        // same way this field was already dropped before GM-264 added
+        // anywhere for `container` itself to land.
+        target: node.target.as_ref().map(to_placeholder_target_record),
         doc_comment: node.doc_comment,
         language: node.language,
         native_kind: node.native_kind,
@@ -315,6 +329,44 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
     }
 }
 
+/// `protocol::types::Visibility` -> `(nodes.visibility, nodes.
+/// visibilityContainer)`. See `storage::schema`'s DDL comment on those two
+/// columns for why the container's key gets its own nullable column rather
+/// than being packed into `visibility` itself.
+fn to_storage_visibility(visibility: &Visibility) -> (String, Option<String>) {
+    match visibility {
+        Visibility::Public => ("public".to_string(), None),
+        Visibility::File => ("file".to_string(), None),
+        Visibility::Container(key) => ("container".to_string(), Some(key.clone())),
+    }
+}
+
+/// `protocol::types::PlaceholderTarget` -> `storage::write::
+/// PlaceholderTargetRecord`. Notably does *not* set a `from_file` - the wire
+/// type has no such field, because it is already available for free as the
+/// placeholder node's own `filePath` (the existing "a placeholder's filePath
+/// is the importing file" convention - `graph::symbol_links`'s module doc),
+/// so `storage::write::apply_diff` fills `placeholder_targets.fromFile` from
+/// `NodeRecord.file_path` directly rather than threading it through this
+/// record - see that table's own DDL comment.
+fn to_placeholder_target_record(target: &PlaceholderTarget) -> PlaceholderTargetRecord {
+    let (scope_kind, scope) = match &target.scope {
+        TargetScope::File(path) => ("file".to_string(), path.clone()),
+        TargetScope::Container(key) => ("container".to_string(), key.clone()),
+    };
+    let (key_kind, key) = match &target.key {
+        TargetKey::Name(name) => ("name".to_string(), name.clone()),
+        TargetKey::QualifiedName(qualified_name) => ("qualifiedName".to_string(), qualified_name.clone()),
+    };
+    PlaceholderTargetRecord {
+        scope_kind,
+        scope,
+        key_kind,
+        key,
+        from_container: target.from_container.clone(),
+    }
+}
+
 /// Wire edge -> storage record; see [`to_node_record`] on why this is shared.
 pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
     let mut record = EdgeRecord::new(
@@ -322,9 +374,19 @@ pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
         edge.from_id,
         edge.to_id,
         edge_kind_wire_value(&edge.kind),
-        edge_source_wire_value(&edge.source),
+        edge_source_tier_wire_value(&edge.source),
         edge.resolved,
     );
+    // `EdgeRecord::new`'s legacy-string inference (`storage::write::
+    // normalize_legacy_source`) sets `.engine` to a copy of the tier string
+    // passed above, which is only ever right for a v1 caller with no real
+    // engine to report. A `WireEdge` always has a real one - GM-263's legacy
+    // normalization already synthesizes `"tree-sitter"`/`"ts-compiler"` for a
+    // v1 sender, so `edge.engine` is populated regardless of which protocol
+    // version produced this edge - so it overwrites the guess here, the same
+    // way `to_declaration` below is set post-construction rather than
+    // threaded through `new`.
+    record.engine = edge.engine;
     record.to_declaration = edge.to_declaration.map(|ordinal| ordinal as i64);
     record
 }
@@ -347,19 +409,16 @@ fn edge_kind_wire_value(kind: &crate::protocol::types::EdgeKind) -> String {
         .unwrap_or_else(|| format!("{kind:?}"))
 }
 
-/// `edges.source` in the schema is still the v1 two-value CHECK constraint
-/// (`'tree-sitter' | 'ts-compiler'`) - GM-264 is what adds real `source`/
-/// `engine` columns matching the wire's `SourceTier`/`engine` split. Until
-/// then this derives the storage string from `SourceTier` alone, exactly
-/// v1's own tier<->engine pairing (every engine that exists today, on the
-/// one bundled plugin, is one specific engine per tier - see the design
-/// doc's Data Model > Edge source migration note). `engine` itself has
-/// nowhere to go yet and is dropped here; nothing downstream of `apply_diff`
-/// reads it back until GM-264 gives it a column.
-fn edge_source_wire_value(source: &SourceTier) -> String {
+/// `SourceTier` -> `edges.source`'s own two values (`storage::schema`'s DDL:
+/// `CHECK (source IN ('syntactic', 'semantic'))`). A direct 1:1 mapping, not
+/// the legacy engine-conflating one `storage::write::normalize_legacy_source`
+/// still carries for callers that only have a v1 string - a `WireEdge`
+/// always has a real, separate `engine` (see [`to_edge_record`]'s own
+/// comment), so the tier alone is all this needs to produce.
+fn edge_source_tier_wire_value(source: &SourceTier) -> String {
     match source {
-        SourceTier::Syntactic => "tree-sitter".to_string(),
-        SourceTier::Semantic => "ts-compiler".to_string(),
+        SourceTier::Syntactic => "syntactic".to_string(),
+        SourceTier::Semantic => "semantic".to_string(),
     }
 }
 
@@ -487,9 +546,13 @@ mod tests {
         }
     }
 
-    fn edge_source_and_resolved(conn: &Connection, id: &str) -> (String, bool) {
-        conn.query_row("SELECT source, resolved FROM edges WHERE id = ?1", [id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+    /// `(source, engine, resolved)` - `source` is the tier
+    /// (`"syntactic"`/`"semantic"`) `edges.source`'s CHECK now enforces,
+    /// `engine` its own new column (`storage::schema`'s DDL comment on
+    /// `edges`).
+    fn edge_source_and_resolved(conn: &Connection, id: &str) -> (String, String, bool) {
+        conn.query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .unwrap()
     }
@@ -561,6 +624,65 @@ mod tests {
             Some(0),
             "ordinal 0 is a binding, not the absence of one"
         );
+    }
+
+    /// The GM-264 wire boundary: a container-scoped, qualifiedName-keyed
+    /// placeholder (the shape only a semantic tier over a containered
+    /// language sends - see `protocol::types`'s own
+    /// `wire_node_v2_shape_round_trips_container_and_target` test) becomes
+    /// the storage-layer `visibility`/`visibility_container`/`container`/
+    /// `target` fields `apply_diff` writes.
+    #[test]
+    fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape() {
+        let mut node = canned_node("n1");
+        node.visibility = Visibility::Container("github.com/x/app/server".to_string());
+        node.container = Some("github.com/x/app/server".to_string());
+        node.native_kind = Some("pending_symbol".to_string());
+        node.target = Some(PlaceholderTarget {
+            scope: TargetScope::Container("github.com/x/app/server".to_string()),
+            key: TargetKey::QualifiedName("Server.Close".to_string()),
+            from_container: Some("github.com/x/app/client".to_string()),
+        });
+
+        let record = to_node_record(node);
+
+        assert!(!record.exported, "container visibility is never Public");
+        assert_eq!(record.visibility, "container");
+        assert_eq!(record.visibility_container.as_deref(), Some("github.com/x/app/server"));
+        assert_eq!(record.container.as_deref(), Some("github.com/x/app/server"));
+        let target = record.target.expect("a pending_symbol with a wire target must keep it");
+        assert_eq!(target.scope_kind, "container");
+        assert_eq!(target.scope, "github.com/x/app/server");
+        assert_eq!(target.key_kind, "qualifiedName");
+        assert_eq!(target.key, "Server.Close");
+        assert_eq!(target.from_container.as_deref(), Some("github.com/x/app/client"));
+    }
+
+    /// The ordinary case: `Visibility::Public` maps to `"public"`/`exported`,
+    /// and an ordinary (non-placeholder) node carries no target at all.
+    #[test]
+    fn to_node_record_maps_public_visibility_and_leaves_target_absent_for_an_ordinary_node() {
+        let record = to_node_record(canned_node("n1"));
+        assert!(record.exported);
+        assert_eq!(record.visibility, "public");
+        assert_eq!(record.visibility_container, None);
+        assert_eq!(record.target, None);
+    }
+
+    /// `to_edge_record`'s own boundary: `engine` comes from the wire's real
+    /// `WireEdge.engine`, not from `EdgeRecord::new`'s legacy-string
+    /// inference off the tier - see `to_edge_record`'s own comment on why the
+    /// guess `::new` makes has to be overwritten.
+    #[test]
+    fn to_edge_record_carries_the_wires_own_engine_rather_than_guessing_one_from_the_tier() {
+        let mut edge = unresolved_edge("e1", "n1", "n2");
+        edge.source = SourceTier::Semantic;
+        edge.engine = "go-types".to_string();
+
+        let record = to_edge_record(edge);
+
+        assert_eq!(record.source, "semantic");
+        assert_eq!(record.engine, "go-types", "a real wire engine must never be collapsed to the tier name");
     }
 
     #[test]
@@ -841,12 +963,12 @@ mod tests {
 
         assert_eq!(
             edge_source_and_resolved(&conn, "e1"),
-            ("ts-compiler".to_string(), true),
+            ("semantic".to_string(), "ts-compiler".to_string(), true),
             "the answered edge must be upgraded in place, not duplicated"
         );
         assert_eq!(
             edge_source_and_resolved(&conn, "e2"),
-            ("tree-sitter".to_string(), false),
+            ("syntactic".to_string(), "tree-sitter".to_string(), false),
             "an edge the pass said nothing about must not change"
         );
         assert_eq!(count(&conn, "edges"), 2, "an upgrade is an update, never an insert");
@@ -903,7 +1025,7 @@ mod tests {
 
         assert_eq!(
             edge_source_and_resolved(&conn, "e1"),
-            ("ts-compiler".to_string(), true),
+            ("semantic".to_string(), "ts-compiler".to_string(), true),
             "the edge the reparse left unresolved must come back upgraded"
         );
         assert_eq!(count(&conn, "edges"), 1);

@@ -150,7 +150,7 @@ fn bound_overload_call_count(db: &Path) -> usize {
     conn.query_row(
         "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.toId
          WHERE e.kind = 'CALLS' AND e.toDeclaration IS NOT NULL
-           AND e.source = 'ts-compiler' AND e.resolved = 1 AND n.name = 'parse'",
+           AND e.source = 'semantic' AND e.resolved = 1 AND n.name = 'parse'",
         [],
         |row| row.get::<_, i64>(0),
     )

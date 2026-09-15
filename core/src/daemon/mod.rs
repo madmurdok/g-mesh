@@ -672,7 +672,7 @@ pub fn run(root: &Path) -> Result<()> {
         // not finish) must leave this unset, so a later start still finds it
         // owed.
         if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE) {
                 eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
             }
         }
@@ -700,7 +700,7 @@ pub fn run(root: &Path) -> Result<()> {
             ),
         }
         if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
+            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE) {
                 eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
             }
         }

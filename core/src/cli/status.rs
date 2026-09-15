@@ -748,6 +748,11 @@ mod tests {
         let conn = fixture.index();
         fixture.index_file(&conn, "a.ts", false);
         fixture.index_file(&conn, "src/b.tsx", false);
+        // GM-264: the roll-up `record_bulk_index` now checks fires only once
+        // every *present* language (here, just "typescript" - `index_file`'s
+        // own doc comment) has its own `language_state.bulkIndexedAt` set -
+        // see `storage::schema::record_bulk_index`'s doc comment.
+        schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
         schema::record_bulk_index(&conn).unwrap();
 
         let status = fixture.status();

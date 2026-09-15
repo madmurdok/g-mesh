@@ -631,7 +631,13 @@ mod tests {
 
     fn symbol(file: &str, name: &str, kind: &str, exported: bool) -> NodeRecord {
         let mut node = NodeRecord::new(format!("{kind}:{file}:{name}"), kind, name, name, file, "typescript");
+        // Both fields, kept in lockstep by hand here the same way every
+        // other `NodeRecord` constructor in this codebase has to - see
+        // `NodeRecord.exported`'s own doc comment on why the database no
+        // longer can disagree with `visibility`, but this in-memory struct
+        // still technically could if only one of the two were set.
         node.exported = exported;
+        node.visibility = if exported { "public" } else { "file" }.to_string();
         node
     }
 
@@ -1203,7 +1209,7 @@ mod tests {
 
         assert_eq!(link_all(&mut conn).unwrap(), LinkSummary::default());
         assert!(!edge_target(&conn, &edge).1);
-        assert_eq!(edge_source(&conn, &edge), "tree-sitter");
+        assert_eq!(edge_source(&conn, &edge), "syntactic");
 
         // What the semantic pass answers, in the shape it answers it: the edge
         // re-sent under its own id (`plugins/typescript/src/semanticPass.ts`), which
@@ -1234,7 +1240,7 @@ mod tests {
         // placeholder, so the two layers cannot fight over it.
         assert_eq!(link_diff(&mut conn, &upgrade).unwrap(), LinkSummary::default());
         assert_eq!(edge_target(&conn, &edge), ("Function:a.ts:mutate".to_string(), true));
-        assert_eq!(edge_source(&conn, &edge), "ts-compiler");
+        assert_eq!(edge_source(&conn, &edge), "semantic");
     }
 
     /// `export * from "./x"` republishes every *named* export of `./x` and
@@ -1476,7 +1482,7 @@ mod tests {
         );
         // Repointing settles *what* the edge points at; it never overwrites who
         // worked it out. An edge a checker answered must keep saying so.
-        assert_eq!(edge_source(&conn, &edge_id), "ts-compiler");
+        assert_eq!(edge_source(&conn, &edge_id), "semantic");
     }
 
     /// The same usage where the module `ns` names is a barrel: the semantic
@@ -1507,7 +1513,7 @@ mod tests {
 
         assert_eq!(link_diff(&mut conn, &diff).unwrap(), LinkSummary { linked_edges: 1 });
         assert_eq!(edge_target(&conn, &edge_id).0, "Function:impl.ts:realName");
-        assert_eq!(edge_source(&conn, &edge_id), "ts-compiler");
+        assert_eq!(edge_source(&conn, &edge_id), "semantic");
     }
 
     #[test]
