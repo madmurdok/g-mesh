@@ -275,7 +275,10 @@ mod tests {
 
     /// `plugins check` takes the plugin directory positionally and requires
     /// `--fixture`; the design doc's singular `plugin check` spelling parses
-    /// to the very same command.
+    /// to the very same command. `--expect` is optional (GM-277) - absent by
+    /// default, since the design doc's own reasoning (report.rs's module
+    /// doc, echoed in `expectations`'s) is that a flag which parses and does
+    /// nothing would read as "expectations passed".
     #[test]
     fn plugins_check_takes_a_plugin_dir_and_a_required_fixture() {
         for group in ["plugins", "plugin"] {
@@ -283,6 +286,7 @@ mod tests {
                 Command::Plugins { command: PluginsCommand::Check(args) } => {
                     assert_eq!(args.plugin_dir, PathBuf::from("plugins/typescript"));
                     assert_eq!(args.fixture, PathBuf::from("/tmp/fixture"));
+                    assert_eq!(args.expect, None);
                 }
                 other => panic!("expected `{group} check`, got {other:?}"),
             }
@@ -290,11 +294,14 @@ mod tests {
 
         let missing = parse(&["plugins", "check", "plugins/typescript"]).expect_err("--fixture is required");
         assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
-        assert!(
-            parse(&["plugins", "check", "plugins/typescript", "--fixture", "/f", "--expect", "e.toml"])
-                .is_err(),
-            "--expect is reserved for GM-277 and must not parse before it does anything"
-        );
+
+        match command_of(&["plugins", "check", "plugins/typescript", "--fixture", "/f", "--expect", "e.toml"])
+        {
+            Command::Plugins { command: PluginsCommand::Check(args) } => {
+                assert_eq!(args.expect, Some(PathBuf::from("e.toml")));
+            }
+            other => panic!("expected `plugins check`, got {other:?}"),
+        }
     }
 
     /// `model` groups its own subcommands the way `plugins` does, and both of

@@ -29,6 +29,7 @@
 //! [`MAX_FINDINGS_SHOWN`] are enough to name the offending ids and lines; the
 //! rest are counted, never silently dropped.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -55,7 +56,15 @@ pub enum Outcome {
 pub struct CheckResult {
     /// Stable, dotted identifier (`id-stability.whitespace-edit`) - what the
     /// README documents and what tests match on.
-    pub id: &'static str,
+    ///
+    /// `Cow<'static, str>` rather than a plain `&'static str`, since GM-277:
+    /// every built-in check's id is still a literal, but an `--expect`
+    /// expectation's id is built at runtime from its position in the file
+    /// (`expectations.callers[2]`) - report.rs's own module doc says why
+    /// these are one-per-expectation-the-fixture-author-wrote rather than
+    /// one-per-kind, and that only works with an owned id. A literal still
+    /// converts for free (`Cow::Borrowed`); only the dynamic ones allocate.
+    pub id: Cow<'static, str>,
     pub outcome: Outcome,
     /// Non-failing observations attached to this check - today only the
     /// legacy-v1 wire-field warning on `shape` (see `checks::shape`).
@@ -91,8 +100,11 @@ impl Report {
     }
 
     /// The failing checks' ids, in report order.
-    pub fn failed_ids(&self) -> Vec<&'static str> {
-        self.results().filter(|r| matches!(r.outcome, Outcome::Fail(_))).map(|r| r.id).collect()
+    pub fn failed_ids(&self) -> Vec<String> {
+        self.results()
+            .filter(|r| matches!(r.outcome, Outcome::Fail(_)))
+            .map(|r| r.id.clone().into_owned())
+            .collect()
     }
 
     pub fn render(&self) -> String {
@@ -164,7 +176,7 @@ mod tests {
     }
 
     fn result(id: &'static str, outcome: Outcome) -> CheckResult {
-        CheckResult { id, outcome, warnings: Vec::new() }
+        CheckResult { id: id.into(), outcome, warnings: Vec::new() }
     }
 
     #[test]

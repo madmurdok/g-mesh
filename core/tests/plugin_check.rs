@@ -30,9 +30,29 @@
 //!
 //! `the_typescript_plugin_passes_on_a_small_typescript_fixture` runs the
 //! bundled TS plugin (built by `core/build.rs`) over
-//! `tests/fixtures/plugin_check/typescript/` - a cross-file import, a
-//! re-export and a call, plus a namespace member use so its semantic pass
-//! actually starts tsserver and the lazy-engine check has a marker to judge.
+//! `../plugins/typescript/conformance/project/` - a cross-file import, both
+//! re-export forms, a namespace member use (so its semantic pass actually
+//! starts tsserver and the lazy-engine check has a marker to judge), an
+//! overloaded function and an interface implementation. This is the same
+//! fixture CI's per-plugin conformance job runs (GM-277's own module doc,
+//! `plugins/typescript/conformance/expect.toml`) - one fixture rather than
+//! two diverging copies, since `core/tests/fixtures/plugin_check/typescript/`
+//! used to exist purely for this test and CI had nothing to iterate.
+//!
+//! # `--expect` (GM-277)
+//!
+//! `the_typescript_plugin_satisfies_its_own_expectations_file` runs the same
+//! fixture with `--expect plugins/typescript/conformance/expect.toml` and
+//! asserts every expectation passes - the acceptance criterion "the TS
+//! fixture passes". The rest of GM-277's own tests
+//! (`a_wrong_expectation_reports_a_readable_diff`,
+//! `an_ambiguous_symbol_fails_with_its_candidates`,
+//! `an_unknown_expectation_key_is_a_hard_parse_error`,
+//! `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`) use small,
+//! purpose-built fixtures of their own - the toy `fake` language for the
+//! three that only exercise `expectations.rs`'s own logic (fast, no tsserver),
+//! and the real TS plugin with a `semantic_pass = false` copy of its manifest
+//! for the one that has to prove a real semantic-only fact.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -64,6 +84,25 @@ const ALL_CHECKS: [&str; 15] = [
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_check")
+}
+
+/// The bundled TS plugin's own directory - `plugins/typescript`, a sibling of
+/// `core/`, named after its manifest's `language` as `read_manifest`
+/// requires.
+fn ts_plugin_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript")
+}
+
+/// The TS plugin's own conformance fixture and expectations file (GM-277) -
+/// `plugins/typescript/conformance/{project,expect.toml}`, the same pair
+/// CI's per-plugin job runs. See this file's module doc for why this is the
+/// one TS fixture rather than a second copy under `tests/fixtures/`.
+fn ts_conformance_project() -> PathBuf {
+    ts_plugin_dir().join("conformance/project")
+}
+
+fn ts_conformance_expect() -> PathBuf {
+    ts_plugin_dir().join("conformance/expect.toml")
 }
 
 /// The fake plugin: a conformant plugin for the toy `.fk` language, plus one
@@ -654,8 +693,7 @@ fn a_bulk_index_that_never_finishes_fails_session_instead_of_hanging() {
 
 #[test]
 fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
-    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript");
-    let run = run_check(&plugin, &fixtures().join("typescript"), &[]);
+    let run = run_check(&ts_plugin_dir(), &ts_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
         let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
@@ -665,4 +703,263 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     // `shape` to warn about (that WARN existed only while the plugin still
     // sent the v1 shape core's normalizing deserializer accepted).
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
+}
+
+// ============================================================================
+// GM-277: `--expect <expect.toml>` - post-linking assertions against the
+// same query code the MCP tools use. See `core/src/cli/plugin_check/
+// expectations.rs`'s own module doc for the decisions these tests check.
+// ============================================================================
+
+/// Like [`run_check`], but for a run given `--expect`: the set of reported
+/// check ids now includes a dynamic `"expectations"` section
+/// (`expectations.callers[0]`, ...) that varies with the expectations file,
+/// so this does not assert the fixed `ALL_CHECKS` set the way `run_check`
+/// does - only that the command ran and captured output to inspect.
+fn run_check_with_expect(plugin_dir: &Path, fixture: &Path, expect: &Path) -> Run {
+    let output = Command::new(BIN)
+        .args(["plugins", "check"])
+        .arg(plugin_dir)
+        .arg("--fixture")
+        .arg(fixture)
+        .arg("--expect")
+        .arg(expect)
+        .output()
+        .expect("failed to run g-mesh plugins check --expect");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut outcomes = BTreeMap::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("  ") else { continue };
+        for verdict in ["PASS", "FAIL", "SKIP"] {
+            if let Some(id) = rest.strip_prefix(verdict).and_then(|r| r.strip_prefix("  ")) {
+                let id = id.split_whitespace().next().unwrap_or_default().to_string();
+                assert!(
+                    outcomes.insert(id.clone(), verdict.to_string()).is_none(),
+                    "{id} reported twice:\n{stdout}"
+                );
+            }
+        }
+    }
+    Run { success: output.status.success(), stdout, outcomes }
+}
+
+/// Writes a small `.fk` fixture project (the toy language `install_fake`'s
+/// plugin speaks - see this file's module doc) into a fresh temp directory,
+/// one file per `(name, contents)` pair, and returns its path.
+fn write_fk_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("failed to create a temp fixture dir");
+    for (name, contents) in files {
+        fs::write(dir.path().join(name), contents).unwrap();
+    }
+    dir
+}
+
+fn write_expect_file(dir: &Path, contents: &str) -> PathBuf {
+    let path = dir.join("expect.toml");
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+/// The TS fixture's own `expect.toml` (`plugins/typescript/conformance/
+/// expect.toml`) passes end to end through the real plugin, tsserver's
+/// semantic pass included - the acceptance criterion "the TS fixture
+/// passes".
+#[test]
+fn the_typescript_plugin_satisfies_its_own_expectations_file() {
+    let run = run_check_with_expect(&ts_plugin_dir(), &ts_conformance_project(), &ts_conformance_expect());
+    assert!(run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+    let expectation_results: Vec<&String> = run
+        .outcomes
+        .keys()
+        .filter(|id| id.starts_with("expectations.") && *id != "expectations.file")
+        .collect();
+    // Every kind in expect.toml is exercised, and none of them silently
+    // vanished from the report.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.references")), "{}", run.stdout);
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.implementations")),
+        "{}",
+        run.stdout
+    );
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.definition")), "{}", run.stdout);
+    for id in expectation_results {
+        assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
+    }
+}
+
+/// A deliberately wrong `[[callers]]` entry - one expected caller that does
+/// not exist ("ghost"), and the real caller ("user") left off `expect` -
+/// fails with a diff naming both the missing and the extra entry, and
+/// nothing else in the report is affected.
+#[test]
+fn a_wrong_expectation_reports_a_readable_diff() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn helper\nfn user\ncall helper\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[callers]]\nsymbol = \"helper\"\nfile = \"a.fk\"\nexpect = [\"a.fk:ghost\"]\n",
+    );
+    let fake = install_fake("none", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+    assert!(!run.success, "a failing expectation must make the command exit non-zero:\n{}", run.stdout);
+    assert_eq!(run.outcome("expectations.callers[0]"), "FAIL", "{}", run.stdout);
+    assert!(run.stdout.contains("expected: {a.fk:ghost}"), "{}", run.stdout);
+    assert!(run.stdout.contains("actual:   {a.fk:user}"), "{}", run.stdout);
+    assert!(run.stdout.contains("missing (expected, not found): a.fk:ghost"), "{}", run.stdout);
+    assert!(run.stdout.contains("extra (found, not expected): a.fk:user"), "{}", run.stdout);
+}
+
+/// Two same-named declarations across files make `symbol_name` resolution
+/// ambiguous - the expectation fails with every candidate's id/
+/// qualifiedName/filePath/kind printed, never a silent pick (decision 3).
+///
+/// The `[[definition]]` and `[[callers]]` kinds are both exercised here
+/// because they disambiguate differently once `file` narrows the candidate
+/// list to one (`expectations.rs`'s module doc, decision 3): the four
+/// `symbol_id`-accepting tools (`callers` among them) re-call by that exact
+/// id and always land on the one candidate meant. `find_definition` has no
+/// `symbol_id` parameter, so its own disambiguated re-call is by
+/// `qualifiedName` - which stays ambiguous here on purpose (both `shared`
+/// declarations share the bare name `qualifiedName` too, the fake
+/// language's convention), so `[[definition]]`'s `file` case is asserted to
+/// still fail, with its own distinct message, rather than silently claimed
+/// to work when it can't.
+#[test]
+fn an_ambiguous_symbol_fails_with_its_candidates() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn shared\n"), ("b.fk", "fn shared\nfn user\ncall shared\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[definition]]\nsymbol = \"shared\"\nexpect = [\"a.fk:shared\"]\n",
+    );
+    let fake = install_fake("none", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+    assert!(!run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.definition[0]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("did not resolve to one symbol (resolvedBy = nameAmbiguous)"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("no `file` was given to disambiguate"), "{}", run.stdout);
+    assert!(run.stdout.contains("filePath=a.fk"), "{}", run.stdout);
+    assert!(run.stdout.contains("filePath=b.fk"), "{}", run.stdout);
+
+    // `find_definition` has no `symbol_id`: narrowing by `file` still leaves
+    // its re-call ambiguous by `qualifiedName` alone, and that failure is
+    // reported rather than silently guessed at.
+    let expect_still_ambiguous = write_expect_file(
+        fixture.path(),
+        "[[definition]]\nsymbol = \"shared\"\nfile = \"a.fk\"\nexpect = [\"a.fk:shared\"]\n",
+    );
+    let run_still_ambiguous = run_check_with_expect(&fake.dir, fixture.path(), &expect_still_ambiguous);
+    assert_eq!(
+        run_still_ambiguous.outcome("expectations.definition[0]"),
+        "FAIL",
+        "{}",
+        run_still_ambiguous.stdout
+    );
+    assert!(
+        run_still_ambiguous.stdout.contains("has no symbol_id parameter to disambiguate further"),
+        "{}",
+        run_still_ambiguous.stdout
+    );
+
+    // `[[callers]]` disambiguates cleanly: it re-calls by the winning
+    // candidate's own `symbol_id`, so `file` alone is enough.
+    let expect_callers = write_expect_file(
+        fixture.path(),
+        "[[callers]]\nsymbol = \"shared\"\nfile = \"b.fk\"\nexpect = [\"b.fk:user\"]\n",
+    );
+    let run_callers = run_check_with_expect(&fake.dir, fixture.path(), &expect_callers);
+    assert_eq!(run_callers.outcome("expectations.callers[0]"), "PASS", "{}", run_callers.stdout);
+}
+
+/// A typo'd key in `expect.toml` is a hard parse error - `expectations.file`
+/// fails with the unknown field named, and no per-expectation check runs at
+/// all (decision 5: typos must not pass silently).
+#[test]
+fn an_unknown_expectation_key_is_a_hard_parse_error() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn helper\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[callers]]\nsymbol = \"helper\"\nexpect = []\nbogus_field = true\n",
+    );
+    let fake = install_fake("none", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+    assert!(!run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.file"), "FAIL", "{}", run.stdout);
+    assert!(run.stdout.contains("bogus_field"), "{}", run.stdout);
+    assert!(run.stdout.contains("unknown field"), "{}", run.stdout);
+    assert!(
+        !run.outcomes.keys().any(|id| id.starts_with("expectations.callers")),
+        "an unparsed file must run no per-expectation check:\n{}",
+        run.stdout
+    );
+}
+
+/// The discrimination case: `[[callers]] symbol = "double"` in the TS
+/// fixture's own `expect.toml` expects a caller reached only through a
+/// namespace import (`import * as m from "./math"; m.double(4)` in
+/// main.ts's `useNamespaceImport`), which the structural pass cannot see at
+/// all - only the semantic pass (tsserver) upgrades it to a real edge. This
+/// test proves that dependency is real, not assumed: it runs the identical
+/// fixture and `expect.toml` against a copy of the TS plugin whose manifest
+/// declares `semantic_pass = false`, so `session::run_session` never sends
+/// `semanticPass` at all, and shows that this one expectation - and only
+/// this one - now fails, missing exactly `useNamespaceImport`. Every other
+/// `[[callers]]` entry (the same-file call, the cross-file import, both
+/// barrel re-export forms - all structural) keeps passing, which is what
+/// proves the failure is specific to the semantic-only case and not a
+/// blanket breakage from disabling the capability.
+#[test]
+fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
+    let plugin = ts_plugin_dir();
+    let scratch = tempfile::tempdir().expect("failed to create a temp dir for the no-semantic-pass plugin");
+    let dir = scratch.path().join("typescript");
+    fs::create_dir_all(&dir).unwrap();
+    // `dist`/`node_modules` are symlinked rather than copied: this plugin is
+    // already built by `core/build.rs`, and copying `node_modules` (tens of
+    // MB) on every test run would be pure waste - only `plugin.toml` needs
+    // to differ.
+    for shared in ["dist", "node_modules"] {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(plugin.join(shared), dir.join(shared)).unwrap();
+        #[cfg(windows)]
+        {
+            let target = plugin.join(shared);
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, dir.join(shared)).unwrap();
+            } else {
+                std::os::windows::fs::symlink_file(&target, dir.join(shared)).unwrap();
+            }
+        }
+    }
+    let manifest = fs::read_to_string(plugin.join("plugin.toml")).unwrap();
+    assert!(manifest.contains("semantic_pass = true"), "the real manifest must still declare it: {manifest}");
+    fs::write(dir.join("plugin.toml"), manifest.replace("semantic_pass = true", "semantic_pass = false"))
+        .unwrap();
+
+    let run = run_check_with_expect(&dir, &ts_conformance_project(), &ts_conformance_expect());
+    assert!(!run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.callers[1]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("missing (expected, not found): src/main.ts:useNamespaceImport"),
+        "{}",
+        run.stdout
+    );
+
+    // Every other expectation - the structural ones - is unaffected.
+    for id in [
+        "expectations.callers[0]",
+        "expectations.callers[2]",
+        "expectations.references[0]",
+        "expectations.implementations[0]",
+        "expectations.imports[0]",
+        "expectations.definition[0]",
+        "expectations.definition[1]",
+    ] {
+        assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
+    }
 }
