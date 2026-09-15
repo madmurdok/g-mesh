@@ -527,6 +527,7 @@ mod tests {
             state_dir,
             discovered,
             None,
+            None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
 

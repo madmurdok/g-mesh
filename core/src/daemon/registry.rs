@@ -157,6 +157,94 @@ pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
+/// Where a language's memory-limit suspension marker is recorded, relative to
+/// the project's state directory (task GM-274, decision 6) - the same
+/// per-language naming convention as [`plugin_pid_file_name`], so
+/// `daemon::lifecycle::PluginSupervisor::suspended_marker_path` can build it
+/// next to that language's own pid file without a second lookup.
+pub(crate) fn plugin_suspended_marker_file_name(language: &str) -> String {
+    format!("plugin-{language}.suspended")
+}
+
+/// Every `plugin-<language>.suspended` marker currently present in
+/// `state_dir`, paired with the language its name encodes and the reason
+/// text `daemon::lifecycle::PluginSupervisor::write_suspended_marker` wrote
+/// into it - [`discovered_pid_files`]'s counterpart for suspension rather
+/// than liveness.
+///
+/// Deliberately independent of [`discovered_pid_files`]: a language
+/// suspended by `[plugin] memoryLimitMb` has *no* pid file by the time
+/// anyone reads this (`PluginSupervisor::check_memory_limit` puts the plugin
+/// to sleep through the same path idle-sleep uses, which removes it - see
+/// `PluginSupervisor::put_to_sleep`), so `cli::status` needs its own listing
+/// to find a suspended language at all, not a field bolted onto a pid-file
+/// row that will already be gone.
+///
+/// Empty - not an error - for a state directory that does not exist or
+/// cannot be listed, matching [`discovered_pid_files`]'s own convention. A
+/// marker that exists but cannot be read is skipped, its reason reported as
+/// `"(unreadable)"` rather than dropping the whole row - unlike a dead pid
+/// (which really does mean "nothing to report"), a marker on disk with no
+/// readable reason is still evidence *something* suspended this language,
+/// and `g-mesh status` should say so rather than silently agreeing with a
+/// stat/read failure.
+pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
+    let mut markers = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir) else { return markers };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
+            let reason = fs::read_to_string(entry.path())
+                .map(|contents| contents.trim().to_string())
+                .unwrap_or_else(|_| "(unreadable)".to_string());
+            markers.push((language.to_string(), reason));
+        }
+    }
+    markers.sort_by(|a, b| a.0.cmp(&b.0));
+    markers
+}
+
+/// Removes every `plugin-<language>.suspended` marker in `state_dir` -
+/// decision 4/5's honest consequence: since config is read once at daemon
+/// startup and never hot-reloaded, "suspended until the daemon restarts or
+/// the config changes" only ever actually clears on a restart in practice
+/// (see `daemon::lifecycle::PluginSupervisor`'s own doc comment on
+/// `semantic_suspended`). This is where that restart takes effect on disk -
+/// called once, early in `daemon::run`, while the project's singleton lock
+/// guarantees no other daemon is serving it (the same guarantee
+/// `endpoint.clear_stale()` right beside it already relies on) - and again by
+/// `cli::stop`'s own state-file cleanup, so a project nothing is serving
+/// never keeps reporting a suspension no daemon remembers deciding.
+///
+/// Best-effort, like every other state-file removal in this daemon: a marker
+/// this fails to remove is stale, not incorrect - the next successful call
+/// (the next start, or the next `stop`) clears it.
+pub fn clear_stale_suspension_markers(state_dir: &Path) {
+    for (_, path) in discovered_suspended_marker_paths(state_dir) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// [`discovered_suspended_markers`]'s sibling for callers that need the path
+/// to remove rather than the reason to display - kept as its own small walk
+/// (rather than reusing `discovered_suspended_markers` and discarding the
+/// reason) so [`clear_stale_suspension_markers`] does not pay for reading
+/// every marker's contents just to delete the file.
+fn discovered_suspended_marker_paths(state_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir) else { return files };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
+            files.push((language.to_string(), entry.path()));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
 /// The generation string an index is stamped with, and the thing
 /// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
 /// generation ([`CURRENT_INDEXER_VERSION`]) and the plugin *builds* that
@@ -444,6 +532,11 @@ pub struct PluginRegistry {
     /// Handed to every supervisor as it is created, so all languages honor
     /// the one `plugin.idleTimeoutMinutes` the project configured.
     idle_timeout: Option<Duration>,
+    /// Handed to every supervisor as it is created, exactly like
+    /// `idle_timeout` beside it - `[plugin] memoryLimitMb` (task GM-274) is
+    /// one number for every language, not a per-language override (see the
+    /// architecture doc's "Plugin memory limit" section for why).
+    memory_limit_mb: Option<u64>,
     /// Shared with every supervisor and with the cold-start bulk walk - one
     /// pipeline, one lazily-loaded model, however many plugins ask it to
     /// embed something.
@@ -495,6 +588,7 @@ impl PluginRegistry {
         state_dir: PathBuf,
         discovered: DiscoveredPlugins,
         idle_timeout: Option<Duration>,
+        memory_limit_mb: Option<u64>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
         Self {
@@ -502,6 +596,7 @@ impl PluginRegistry {
             state_dir,
             discovered,
             idle_timeout,
+            memory_limit_mb,
             embedding,
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
@@ -720,6 +815,7 @@ impl PluginRegistry {
             manifest.clone(),
             self.pid_file_for(language),
             self.idle_timeout,
+            self.memory_limit_mb,
             Arc::clone(&self.embedding),
         );
         reservation.settle(spawned)
@@ -911,6 +1007,47 @@ impl PluginRegistry {
         for supervisor in self.active_supervisors() {
             supervisor.sleep_if_idle();
         }
+    }
+
+    /// Samples every active supervisor's plugin process tree against
+    /// `[plugin] memoryLimitMb` - one call to
+    /// [`PluginSupervisor::check_memory_limit`] per spawned language, on the
+    /// same tick [`sleep_if_idle_all`](Self::sleep_if_idle_all) already runs
+    /// on (`daemon::lifecycle::supervise` calls both, back to back). Run
+    /// independently, exactly like `sleep_if_idle_all`: one language's
+    /// process tree being over the limit (or not) never affects another's own
+    /// check, and a language that was never spawned is not in
+    /// [`active_supervisors`](Self::active_supervisors) at all, so this never
+    /// spawns anything new either.
+    ///
+    /// With `memoryLimitMb` unset for the project, every supervisor's own
+    /// `check_memory_limit` returns before sampling anything (see that
+    /// method's own doc comment) - so this call costs one `Vec` walk over
+    /// already-spawned supervisors and nothing more, which is what keeps "no
+    /// key set means no sampling side effects" true even once this is wired
+    /// into the daemon's real tick.
+    pub fn check_memory_limits_all(&self) {
+        for supervisor in self.active_supervisors() {
+            supervisor.check_memory_limit();
+        }
+    }
+
+    /// Whether `language`'s semantic passes are suspended right now - `false`
+    /// for a language that was never spawned (nothing has ever sampled its
+    /// memory, so it cannot have been suspended) as much as for one that was
+    /// spawned and never went over the limit; both read the same way to this
+    /// call's callers (`daemon::semantic`, `daemon::workspace_reindex`
+    /// indirectly through `PluginSupervisor::semantic_pass`'s own gate - this
+    /// method exists for callers that need the answer *without* going through
+    /// that method, none of which this task adds, but kept `pub` alongside it
+    /// for symmetry with `has_pending`/`active_supervisors` above).
+    pub fn is_semantic_suspended(&self, language: &str) -> bool {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .get(language)
+            .and_then(SupervisorSlot::running)
+            .is_some_and(|supervisor| supervisor.is_semantic_suspended())
     }
 
     /// Stops every active supervisor's plugin regardless of idleness - what
@@ -1127,6 +1264,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
@@ -1414,6 +1552,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
@@ -1914,6 +2053,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );

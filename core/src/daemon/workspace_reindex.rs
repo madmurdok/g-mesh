@@ -552,6 +552,7 @@ mod tests {
             state_dir,
             discovered,
             None,
+            None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
         (project, plugins, alpha_dir, beta_dir, registry)
@@ -736,6 +737,7 @@ mod tests {
             state_dir,
             discovered,
             None,
+            None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
         let conn = test_plugin::empty_index();
@@ -782,6 +784,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );

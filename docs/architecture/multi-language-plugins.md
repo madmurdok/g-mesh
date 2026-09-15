@@ -721,6 +721,83 @@ memoryLimitMb = 4096        # optional; absent (the default) = no limit, idle sl
   if the pass never completed, the receiver gap stays listed for that language, so
   the instructions do not overclaim.
 
+#### Implementation notes (GM-274)
+
+Six decisions this task had to settle rather than infer, recorded here so a
+later change does not have to re-derive them:
+
+1. **Sampling without shelling out: `sysinfo`, not hand-rolled platform code.**
+   `core::daemon::memory::process_tree_rss_mb` uses the `sysinfo` crate
+   (`default-features = false, features = ["system"]` - see the dependency
+   comment on it in `core/Cargo.toml` for the full weighing) rather than
+   `libproc`/`proc_pidinfo` on macOS, `/proc/<pid>/status` on Linux and
+   `Toolhelp32`/`GetProcessMemoryInfo` on Windows by hand. The trade is
+   correctness-per-effort, not dependency aversion: this repo already
+   hand-rolls the *much smaller* unix/libc-vs-windows-sys split in
+   `src/process.rs` (three lines of behaviour each: is this pid alive, kill
+   it), but resident memory of a whole process tree on three platforms is a
+   different order of surface - one already-vetted crate against three
+   bespoke FFI surfaces this project would then have to keep correct with no
+   CI runner exercising all three during ordinary development. Windows is
+   `["system"]`-supported by `sysinfo` too, so sampling is not expected to be
+   a hard no-op there - but this daemon's Windows transport is named pipes
+   rather than the socket every other platform uses, and CI is the only place
+   any of this has been exercised; verified locally on macOS only (see this
+   task's own completion report for what that leaves unverified).
+2. **Descendants are walked fresh, every sample.** No child-pid list is
+   cached anywhere - `process_tree_rss_mb` takes one whole-system snapshot per
+   call and walks parent → children links down from the plugin's own pid. A
+   semantic engine a plugin starts lazily (rust-analyzer, tsserver - see this
+   doc's own "a plugin starts its semantic engine lazily on the first
+   `semanticPass`" note above) is caught by the very next sample once it
+   exists, with nothing to invalidate.
+3. **Sampling interval = the existing idle-check tick**, unchanged by this
+   task: `daemon::lifecycle::IdleTimeouts::tick` - a quarter of the shorter
+   configured idle timeout, clamped to [50ms, 30s], which is a flat 30s under
+   production defaults (`plugin.idleTimeoutMinutes` default 1h).
+   `PluginRegistry::check_memory_limits_all` runs on that same tick, right
+   alongside `sleep_if_idle_all`. **Open question, not solved here**: a spike
+   that crosses `memoryLimitMb` and is gone again (or the plugin crashes)
+   before the next tick samples it is invisible to this mechanism - it is a
+   ceiling on *sustained* growth (a cold `rust-analyzer`/`go/packages` load
+   that keeps climbing), not a guard against a transient spike. A tighter
+   interval, or sampling on a different trigger, is future work.
+4. **"Until the daemon restarts or the config changes" is honestly just
+   "until it restarts".** `config::read_project_config` is read once, at
+   `daemon::run` startup, and nothing in this daemon hot-reloads
+   `config.toml` while it is running - a `memoryLimitMb` edit takes effect on
+   the next start, the same as every other `[plugin]`/`[daemon]` setting
+   already does. So "or the config changes" describes a *coincidence*
+   (whoever edited the config also happens to restart the daemon to pick it
+   up), not a second, independent trigger this implementation watches for.
+5. **Suspension lives in memory, per supervisor, not in the index.**
+   `daemon::lifecycle::PluginSupervisor` gets a `semantic_suspended:
+   AtomicBool`, set once by `check_memory_limit` and never cleared for that
+   supervisor's lifetime - a restart clears it for free by simply not
+   carrying it forward (a fresh supervisor starts unsuspended, exactly as it
+   starts awake). Both gates route through this one flag: the per-file gate
+   (`PluginProcess::apply_file_change`/`ensure_fresh` now take a
+   `semantic_suspended: bool` parameter, ANDed with the manifest's own
+   `capabilities.semantic_pass`) and the whole-project scheduler
+   (`PluginSupervisor::semantic_pass`, which both
+   `daemon::semantic::run_with_registry`/`run_once` and
+   `daemon::workspace_reindex` call through) check it before doing anything
+   else, so neither caller needs to know suspension exists.
+6. **`g-mesh status` learns suspension the same way it learns everything
+   else about a daemon: off disk, never by asking a live one a question**
+   (see `cli::status`'s own module doc). The mechanism is a
+   `plugin-<language>.suspended` marker file next to that language's own
+   `plugin-<language>.pid` (`daemon::registry::plugin_suspended_marker_file_name`),
+   containing the human-readable reason `check_memory_limit` built. It is
+   written the moment a language is suspended and outlives that language's
+   pid file (which idle-sleep's own `put_to_sleep` path already removes) -
+   deliberately independent of the pid-file listing, since a suspended
+   language has no live pid by the time anyone runs `status`. It is cleared
+   in exactly the two places a restart is observable from outside the daemon
+   process: `daemon::run` startup (right beside the existing stale-socket
+   clear, under the same singleton-lock guarantee) and `cli::stop`'s own
+   state-file cleanup (once the core is confirmed not listening).
+
 ## Data Flow
 
 ### Cold start in a mixed Go + Rust repo

@@ -4,6 +4,7 @@ pub mod identity;
 pub mod indexing_status;
 pub mod lifecycle;
 pub mod manifest;
+pub mod memory;
 pub mod plugin;
 pub mod registry;
 pub mod semantic;
@@ -432,6 +433,16 @@ pub fn run(root: &Path) -> Result<()> {
     // Windows this is a no-op, because a pipe name cannot outlive the process
     // that held it - see `ipc::windows`'s header.
     endpoint.clear_stale();
+    // Same guarantee, same reasoning, one line down: a `plugin-<language>.suspended`
+    // marker (task GM-274's memory-limit suspension - see `daemon::lifecycle
+    // ::PluginSupervisor::check_memory_limit`) left behind by a daemon that
+    // is no longer running has nothing to describe any more - "suspended
+    // until the daemon restarts" (the architecture doc's own wording) means
+    // *this* restart, right here, is what clears it. Cleared unconditionally,
+    // like the socket above, rather than only for languages this daemon goes
+    // on to spawn - a marker for a language nothing touches this run is exactly
+    // as stale as one for a language it does.
+    registry::clear_stale_suspension_markers(&dir);
     // Bound here, before the plugin and long before the bulk walk: from this
     // point a shim's `connect()` succeeds (the kernel queues it on the
     // listener's backlog until the accept loop below is up), which is what
@@ -508,6 +519,7 @@ pub fn run(root: &Path) -> Result<()> {
         dir.clone(),
         discovered,
         timeouts.plugin,
+        project_config.plugin.memory_limit_mb,
         Arc::clone(&embedding),
     ));
 
@@ -1380,6 +1392,7 @@ mod tests {
             &root,
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(crate::embedding::EmbeddingPipeline::disabled()),
         );

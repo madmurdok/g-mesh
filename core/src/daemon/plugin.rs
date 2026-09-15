@@ -803,16 +803,29 @@ impl PluginProcess {
     /// that error is a timeout and requeues the file onto its own dirty
     /// queue, to be replayed by whatever next touches this language, exactly
     /// like a file that arrived while the plugin was asleep.
+    /// `semantic_suspended` (task GM-274) is ANDed with this plugin's own
+    /// `manifest.capabilities.semantic_pass` at every round trip this makes
+    /// (directly, and via [`Self::replay_pending`] on the crash-recovery
+    /// path below) - a language whose supervisor found its process tree over
+    /// `memoryLimitMb` never receives a `semanticPass` request through this
+    /// method, whether or not its manifest otherwise declares the capability.
+    /// The caller (`daemon::lifecycle::PluginSupervisor::file_changed`/
+    /// `replay_pending`) is what actually knows whether this language is
+    /// suspended - a fact that outlives any one `PluginProcess`, since a
+    /// suspended language's plugin still gets a *fresh* `PluginProcess` on
+    /// its next wake (see that supervisor's own doc comment) - so it is
+    /// threaded in here rather than read off `self`.
     pub fn apply_file_change(
         &self,
         conn: &Mutex<Connection>,
         file_path: impl Into<String>,
         embedding: &EmbeddingPipeline,
+        semantic_suspended: bool,
     ) -> Result<()> {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
 
-        if let Err(first_err) = self.send_one(conn, &file_path, embedding) {
+        if let Err(first_err) = self.send_one(conn, &file_path, embedding, semantic_suspended) {
             // The plugin's pipes only fail like this when the process behind
             // them is gone. Confirm that before replacing a merely-slow
             // process's live handle out from under it - `process_has_exited`
@@ -838,7 +851,7 @@ impl PluginProcess {
                 return Err(first_err);
             }
 
-            return self.replay_pending(conn, embedding).with_context(|| {
+            return self.replay_pending(conn, embedding, semantic_suspended).with_context(|| {
                 format!(
                     "JS/TS plugin process exited unexpectedly and could not be recovered while applying a change to {file_path}"
                 )
@@ -877,11 +890,16 @@ impl PluginProcess {
     /// file that triggered this replay, still queued behind whatever an
     /// earlier crash may have left too) and picks up exactly where it left
     /// off.
-    fn replay_pending(&self, conn: &Mutex<Connection>, embedding: &EmbeddingPipeline) -> Result<()> {
+    fn replay_pending(
+        &self,
+        conn: &Mutex<Connection>,
+        embedding: &EmbeddingPipeline,
+        semantic_suspended: bool,
+    ) -> Result<()> {
         loop {
             let next = { self.pending.lock().unwrap().first().cloned() };
             let Some(file_path) = next else { return Ok(()) };
-            self.send_one(conn, &file_path, embedding)?;
+            self.send_one(conn, &file_path, embedding, semantic_suspended)?;
             self.remove_pending(&file_path);
         }
     }
@@ -913,11 +931,16 @@ impl PluginProcess {
     /// every other query-time freshness check behind it for no reason. This
     /// query itself is not retried, matching [`Self::apply_file_change`]'s
     /// own reasoning for why a timed-out request must not be resent blind.
+    ///
+    /// `semantic_suspended` gates the semantic half exactly like
+    /// [`Self::apply_file_change`]'s own parameter of the same name - see
+    /// that method's doc comment.
     pub fn ensure_fresh(
         &self,
         conn: &Mutex<Connection>,
         file_path: &str,
         embedding: &EmbeddingPipeline,
+        semantic_suspended: bool,
     ) -> Result<StalenessOutcome> {
         {
             let guard = conn.lock().unwrap();
@@ -942,7 +965,7 @@ impl PluginProcess {
                 embedding,
                 self.timeouts.file_changed,
                 self.timeouts.semantic_pass_file,
-                self.manifest.capabilities.semantic_pass,
+                self.manifest.capabilities.semantic_pass && !semantic_suspended,
                 &mut on_timeout,
             )
         };
@@ -1086,6 +1109,7 @@ impl PluginProcess {
         conn: &Mutex<Connection>,
         file_path: &str,
         embedding: &EmbeddingPipeline,
+        semantic_suspended: bool,
     ) -> Result<()> {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
@@ -1110,7 +1134,7 @@ impl PluginProcess {
             embedding,
             self.timeouts.file_changed,
             self.timeouts.semantic_pass_file,
-            self.manifest.capabilities.semantic_pass,
+            self.manifest.capabilities.semantic_pass && !semantic_suspended,
             &mut on_timeout,
         )
     }

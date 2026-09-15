@@ -117,7 +117,7 @@ const STALL_MARKER: &str = "stalled-once.marker";
 /// `semanticPass` request. Use [`install_semantic_pass_capable`] for a
 /// language GM-270's per-language scheduler should ask for a pass.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, false, false, &[], &[])
+    install_inner(root, language, extensions, false, false, false, false, &[], &[])
 }
 
 /// [`install`], but the manifest also carries a `[plugin.workspace]` table
@@ -138,7 +138,7 @@ pub(crate) fn install_with_workspace(
     watch_files: &[&str],
     exclude_dirs: &[&str],
 ) -> PathBuf {
-    install_inner(root, language, extensions, false, false, false, watch_files, exclude_dirs)
+    install_inner(root, language, extensions, false, false, false, false, watch_files, exclude_dirs)
 }
 
 /// [`install_with_workspace`], but also `[plugin.capabilities] semantic_pass
@@ -154,7 +154,7 @@ pub(crate) fn install_with_workspace_semantic_pass_capable(
     watch_files: &[&str],
     exclude_dirs: &[&str],
 ) -> PathBuf {
-    install_inner(root, language, extensions, false, false, true, watch_files, exclude_dirs)
+    install_inner(root, language, extensions, false, false, true, false, watch_files, exclude_dirs)
 }
 
 /// [`install`], but the manifest declares `[plugin.capabilities]
@@ -174,7 +174,7 @@ pub(crate) fn install_with_workspace_semantic_pass_capable(
 /// [`install`] - is what lets a test prove only the capable one ever receives
 /// it.
 pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, false, true, &[], &[])
+    install_inner(root, language, extensions, false, false, true, false, &[], &[])
 }
 
 /// [`install`], but the plugin does not answer its handshake until
@@ -202,7 +202,7 @@ pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensi
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
 pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, true, false, false, &[], &[])
+    install_inner(root, language, extensions, true, false, false, false, &[], &[])
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
@@ -247,7 +247,31 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
 /// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
 /// it runs past its budget.
 pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false, true, false, &[], &[])
+    install_inner(root, language, extensions, false, true, false, false, &[], &[])
+}
+
+/// [`install_semantic_pass_capable`], but the fake plugin process also
+/// allocates and holds onto a large buffer right after its handshake - task
+/// GM-274's fixture for `[plugin] memoryLimitMb`: a real Node child process
+/// whose resident memory a test can actually put a low configured limit
+/// under, exercised by `daemon::lifecycle::PluginSupervisor::check_memory_limit`'s
+/// own sampling (`daemon::memory::process_tree_rss_mb`), not by a mock.
+///
+/// `semantic_pass` capable (unlike plain [`install`]) so a test using this
+/// fixture can also prove the *other* half of GM-274: once this language is
+/// suspended, no `semanticPass` request reaches it, even though its manifest
+/// says it would otherwise receive one - the discriminating condition every
+/// other capability test in this module already relies on
+/// ([`install_semantic_pass_capable`]'s own doc comment).
+///
+/// 200MB is comfortably above a bare Node process's baseline RSS
+/// (~20-40MB, measured on this repo's own dev machine) and comfortably below
+/// anything that would make this fixture slow or flaky to allocate - the
+/// point is a real, measurable spike a low test-only `memoryLimitMb` (well
+/// under 200MB, well over the idle baseline) can reliably catch, not a
+/// pathological one.
+pub(crate) fn install_memory_hungry(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true, true, &[], &[])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -258,12 +282,13 @@ fn install_inner(
     gated: bool,
     stalling: bool,
     semantic_pass: bool,
+    memory_hungry: bool,
     watch_files: &[&str],
     exclude_dirs: &[&str],
 ) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling))
+    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling, memory_hungry))
         .expect("failed to write the fake plugin's entry point");
     fs::write(
         dir.join("plugin.toml"),
@@ -385,13 +410,28 @@ extensions = [{extensions}]
 /// but skips the `writeFrame` that would answer the one request this plugin
 /// directory has never yet stalled on ([`STALL_MARKER`]) - every other
 /// request, including every one after that, is answered normally.
-fn entry_point(language: &str, gated: bool, stalling: bool) -> String {
+///
+/// `memory_hungry` (see [`install_memory_hungry`]) allocates a large buffer
+/// right after recording the spawn, held in a module-scope `const` for the
+/// rest of the process's life so V8 cannot garbage-collect it out from under
+/// a test sampling this process's RSS - the wire behaviour (handshake,
+/// answering every framed request) is otherwise unchanged.
+fn entry_point(language: &str, gated: bool, stalling: bool, memory_hungry: bool) -> String {
+    let memory_hog = if memory_hungry {
+        "\n// GM-274 fixture (install_memory_hungry): held for this process's whole\n\
+         // lifetime, not just allocated and dropped, so a test's sample actually\n\
+         // sees it.\n\
+         const memoryHog = Buffer.alloc(200 * 1024 * 1024, 1);\n"
+    } else {
+        ""
+    };
     format!(
         r#"// Generated by core/src/daemon/test_plugin.rs - not a real plugin.
 const fs = require("fs");
 const path = require("path");
 
 fs.appendFileSync(path.join(__dirname, "{SPAWN_LOG}"), process.pid + "\n");
+{memory_hog}
 
 // One-shot bulk-index mode (`daemon::bulk_index::run`'s spawn shape:
 // "<command> <args...> --bulk-index <project_root>"): emit a fixed, small

@@ -156,6 +156,33 @@ pub struct PluginReport {
     pub state: PluginState,
 }
 
+/// One language whose semantic passes are suspended right now (task GM-274's
+/// own acceptance criterion: "`g-mesh status` shows suspension per
+/// language") - written by a running daemon's `daemon::lifecycle
+/// ::PluginSupervisor::check_memory_limit` the instant `[plugin]
+/// memoryLimitMb` catches that language's process tree over the limit (see
+/// the architecture doc's "Plugin memory limit" section), and read here the
+/// same way every other runtime fact this command reports is: off disk,
+/// never by asking a live daemon a question (see this module's own doc
+/// comment).
+///
+/// Deliberately its own listing rather than a field on [`PluginReport`]
+/// above: a plugin `check_memory_limit` just suspended has *no* pid file by
+/// the time anyone runs `status` - the same `sleep_now` path idle-sleep
+/// already uses removes it (`PluginSupervisor::put_to_sleep`) - so it is
+/// invisible to [`plugin_reports`] regardless, and a suspension marker is the
+/// only thing that survives to describe it. See
+/// `daemon::registry::discovered_suspended_markers`, this field's source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspendedLanguage {
+    pub language: String,
+    /// The human-readable reason `PluginSupervisor::check_memory_limit`
+    /// recorded when it suspended this language (naming the configured limit
+    /// and the measured figure) - persisted verbatim, because nothing else
+    /// about *why* survives outside the daemon process that decided it.
+    pub reason: String,
+}
+
 /// What the index covers, and what it still owes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStatus {
@@ -208,6 +235,10 @@ pub struct Report {
     /// see [`PluginState`]'s doc comment for what "no pid file" now means
     /// under lazy per-language spawning.
     pub plugins: Vec<PluginReport>,
+    /// Every language currently suspended by `[plugin] memoryLimitMb`, sorted
+    /// by language - see [`SuspendedLanguage`]'s own doc comment for why this
+    /// is independent of `plugins` above.
+    pub suspended_languages: Vec<SuspendedLanguage>,
     pub last_used: Option<LastUsed>,
     pub index: IndexStatus,
 }
@@ -239,6 +270,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         core,
         build: build_state(core, &state_dir),
         plugins: plugin_reports(&state_dir, core),
+        suspended_languages: suspended_language_reports(&state_dir),
         last_used: last_used::read_from_project_dir(&state_dir)
             .context("failed to read the project's lastUsed")?,
         index: index_status(project_root, &state_dir.join("index.db"))?,
@@ -311,6 +343,20 @@ fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
             let pid = daemon::read_pid_file(&path).filter(|&pid| daemon::is_process_alive(pid))?;
             Some(PluginReport { language, state: classify_plugin(pid, core) })
         })
+        .collect()
+}
+
+/// Every `plugin-<language>.suspended` marker in `state_dir`, as
+/// [`SuspendedLanguage`] rows - a thin wrapper over
+/// `daemon::registry::discovered_suspended_markers`, unconditional on `core`
+/// unlike [`plugin_reports`]: a suspension is a fact about this project's
+/// state directory, not about whether a daemon happens to be running to read
+/// it back right now (the marker is what makes that possible in the first
+/// place - see [`SuspendedLanguage`]'s own doc comment).
+fn suspended_language_reports(state_dir: &Path) -> Vec<SuspendedLanguage> {
+    crate::daemon::registry::discovered_suspended_markers(state_dir)
+        .into_iter()
+        .map(|(language, reason)| SuspendedLanguage { language, reason })
         .collect()
 }
 
@@ -521,6 +567,11 @@ pub fn render(report: &Report) -> String {
     } else {
         for plugin in &report.plugins {
             let _ = writeln!(out, "  plugin ({}):     {}", plugin.language, describe_plugin(plugin.state));
+        }
+    }
+    if !report.suspended_languages.is_empty() {
+        for suspended in &report.suspended_languages {
+            let _ = writeln!(out, "  semantic ({}): suspended - {}", suspended.language, suspended.reason);
         }
     }
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
@@ -854,6 +905,7 @@ mod tests {
                 language: "typescript".to_string(),
                 state: PluginState::Active { pid: 4243 },
             }],
+            suspended_languages: Vec::new(),
             last_used: Some(LastUsed {
                 timestamp: "2026-07-31 00:00:00.000".to_string(),
                 idle: Duration::from_secs(3 * 60 * 60),
@@ -893,6 +945,7 @@ mod tests {
             core: CoreState::NotRunning,
             build: BuildState::NotRunning,
             plugins: Vec::new(),
+            suspended_languages: Vec::new(),
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: true,
@@ -930,6 +983,7 @@ mod tests {
                 language: "typescript".to_string(),
                 state: PluginState::Active { pid: 4243 },
             }],
+            suspended_languages: Vec::new(),
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
@@ -967,6 +1021,7 @@ mod tests {
                 language: "typescript".to_string(),
                 state: PluginState::Orphaned { pid: 99 },
             }],
+            suspended_languages: Vec::new(),
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: false,
@@ -1051,6 +1106,7 @@ mod tests {
             core: CoreState::Running { pid: 4242 },
             build: BuildState::Current,
             plugins: Vec::new(),
+            suspended_languages: Vec::new(),
             last_used: None,
             index: IndexStatus {
                 bulk_indexed: true,
@@ -1141,5 +1197,93 @@ mod tests {
         assert_eq!(humanize(Duration::from_secs(45 * 60)), "45 minutes ago");
         assert_eq!(humanize(Duration::from_secs(2 * 60 * 60)), "2 hours ago");
         assert_eq!(humanize(Duration::from_secs(90 * 24 * 60 * 60)), "90 days ago");
+    }
+
+    /// Task GM-274's status acceptance criterion, exercised end to end
+    /// through the real production write path rather than a hand-written
+    /// marker: a real `PluginSupervisor` (over the same memory-hungry fixture
+    /// `daemon::lifecycle`'s own acceptance test uses) whose process tree is
+    /// found over an artificially low `memoryLimitMb` writes a real
+    /// `plugin-<language>.suspended` marker into this project's *actual*
+    /// state directory (`storage::connection::project_dir`, not an arbitrary
+    /// tempdir - the same one `collect` resolves for any project), and
+    /// `status::collect`/`render` - a *separate* process's-worth of code from
+    /// the daemon that wrote it, reading only off disk - reports it.
+    #[test]
+    fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
+        use crate::daemon::lifecycle::PluginSupervisor;
+        use crate::daemon::manifest::read_manifest;
+        use crate::daemon::test_plugin;
+        use crate::embedding::EmbeddingPipeline;
+        use std::sync::Arc;
+
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        let plugin_dir = test_plugin::install_memory_hungry(plugins.path(), "heavy", &[".heavy-src"]);
+        let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+
+        let state_dir = project_dir(project.path()).expect("failed to resolve the state directory");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let pid_file = state_dir.join("plugin-heavy.pid");
+
+        let supervisor = PluginSupervisor::start(
+            project.path(),
+            manifest,
+            pid_file,
+            None,
+            Some(100),
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the fixture plugin must start");
+
+        // The write path this task adds - not a hand-written marker file.
+        supervisor.check_memory_limit();
+        assert!(supervisor.is_semantic_suspended(), "the fixture must actually have suspended");
+
+        let report = collect(project.path()).expect("status must still collect over a suspended project");
+        assert_eq!(report.suspended_languages.len(), 1, "{:?}", report.suspended_languages);
+        assert_eq!(report.suspended_languages[0].language, "heavy");
+        assert!(
+            report.suspended_languages[0].reason.contains("memoryLimitMb"),
+            "{:?}",
+            report.suspended_languages[0]
+        );
+
+        let rendered = render(&report);
+        assert!(rendered.contains("semantic (heavy): suspended"), "{rendered}");
+        assert!(rendered.contains("memoryLimitMb"), "{rendered}");
+
+        supervisor.sleep_now("test cleanup");
+    }
+
+    /// The other half: a project nothing ever suspended reports no suspended
+    /// languages at all, and `render` prints no `semantic (...)` line - the
+    /// ordinary, overwhelmingly common case must not grow a line nobody asked
+    /// for.
+    #[test]
+    fn a_project_with_no_suspension_marker_reports_none() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(suspended_language_reports(state.path()), Vec::new());
+
+        let report = Report {
+            project_root: PathBuf::from("/tmp/project"),
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            core: CoreState::NotRunning,
+            build: BuildState::NotRunning,
+            plugins: Vec::new(),
+            suspended_languages: Vec::new(),
+            last_used: None,
+            index: IndexStatus {
+                bulk_indexed: false,
+                semantic_pass_completed: false,
+                discovered: 0,
+                indexed: 0,
+                dirty: 0,
+                syntax_error_files: Vec::new(),
+            },
+        };
+        let rendered = render(&report);
+        assert!(!rendered.contains("semantic ("), "{rendered}");
     }
 }
