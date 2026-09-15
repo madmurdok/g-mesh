@@ -557,6 +557,17 @@ impl PluginProcess {
     /// including `file_path` itself - against it before returning, rather
     /// than surfacing the crash to the caller. See this module's doc comment
     /// for why that distinction (crash vs. a deliberate stop) matters.
+    ///
+    /// Any other failure - the plugin is alive, but its diff could not be
+    /// committed (a storage error, a link pass that failed) - is returned as
+    /// it is, and the file is dropped from the pending queue. It is *not*
+    /// replayed, and that is the whole of GM-293's fix here: the plugin
+    /// updates its cached copy of a file when it answers, not when core
+    /// commits, so asking the same live process again gets an empty diff back
+    /// and the failure turns into an `Ok(())` that nothing ever logs. That is
+    /// exactly how a foreign-key refusal on every second edit went unseen
+    /// (GM-292). Callers already report what this returns - see
+    /// `daemon::lifecycle::PluginSupervisor::file_changed`.
     pub fn apply_file_change(
         &self,
         conn: &Mutex<Connection>,
@@ -565,16 +576,31 @@ impl PluginProcess {
     ) -> Result<()> {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
+        let sent_to = self.pid();
 
         if let Err(first_err) = self.send_one(conn, &file_path, embedding) {
-            // The plugin's pipes only fail like this when the process behind
-            // them is gone. Confirm that before replacing a merely-slow
-            // process's live handle out from under it - `process_has_exited`
-            // is a non-blocking (if briefly polled) check for exactly that.
+            // A crash shows up here as a failed write or read on the
+            // plugin's pipes. Confirm the process is really gone before
+            // replacing a merely-slow process's live handle out from under it
+            // - `process_has_exited` is a non-blocking (if briefly polled)
+            // check for exactly that.
+            let exited = self.process_has_exited();
             // Another thread may already have won the relaunch race by the
-            // time we check, which is fine: `replay_pending` always sends
-            // against whatever is current, so it recovers either way.
-            if self.process_has_exited() {
+            // time we check - then the current process is alive, but it is
+            // not the one this request died on, and replaying against it is
+            // still the recovery (`replay_pending` always sends against
+            // whatever is current).
+            let relaunched_elsewhere = self.pid() != sent_to;
+            if !exited && !relaunched_elsewhere {
+                // Not a crash, so nothing a relaunch or a replay can fix -
+                // see this method's doc. Dropped from the queue rather than
+                // left in it: a later crash's replay would otherwise stop at
+                // this entry first and fail every recovery behind it.
+                self.remove_pending(&file_path);
+                return Err(first_err)
+                    .with_context(|| format!("failed to apply the plugin's diff for {file_path}"));
+            }
+            if exited {
                 self.relaunch(&first_err)
                     .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
             }
@@ -996,6 +1022,47 @@ mod tests {
             "expected a compiled JS entry point, got {}",
             manifest.args[0]
         );
+    }
+
+    /// GM-293. A diff the *storage* refuses, from a plugin that is alive and
+    /// well, is not a crash - and treating it as one was what hid GM-292 for
+    /// as long as it lasted: the "replay" asked that same live plugin again,
+    /// its cache already held the new text, so it answered with an empty diff
+    /// and the failure came back as `Ok(())`.
+    ///
+    /// The refusal is produced the way production produced it: an index that
+    /// enforces foreign keys (as the daemon's connection silently did before
+    /// this fix), then an edit through a warm plugin cache that deletes and
+    /// re-adds a symbol whose unchanged `DEFINES` edge is not re-sent.
+    #[test]
+    fn a_storage_failure_behind_a_live_plugin_is_returned_rather_than_replayed() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.ts");
+        fs::write(&file, "export function greet(): string {\n  return \"hi\";\n}\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::storage::schema::apply(&conn).unwrap();
+        let conn = Mutex::new(conn);
+
+        let plugin =
+            PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
+                .expect("failed to spawn the JS/TS plugin");
+        let embedding = EmbeddingPipeline::disabled();
+        plugin
+            .apply_file_change(&conn, "lib.ts", &embedding)
+            .expect("a cold cache sends only upserts, which nothing can refuse");
+        let pid = plugin.pid();
+
+        fs::write(&file, "export function greet(): string {\n  const a = 1;\n  return \"hi\";\n}\n").unwrap();
+        let err = match plugin.apply_file_change(&conn, "lib.ts", &embedding) {
+            Ok(()) => panic!("a diff the index refused must not be reported as applied"),
+            Err(err) => format!("{err:#}"),
+        };
+
+        assert!(err.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {err}");
+        assert_eq!(plugin.pid(), pid, "a live plugin must not be relaunched over a storage failure");
+        assert!(plugin.pending.lock().unwrap().is_empty(), "nothing is left queued for a later replay");
     }
 
     /// The check `docs/architecture/plugin-modularity.md`'s Interfaces

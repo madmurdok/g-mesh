@@ -495,6 +495,105 @@ mod tests {
         assert_eq!(name_after, "new_and_improved", "response must reflect the new on-disk content");
     }
 
+    /// GM-293. A reindex that the index refused must leave the previous
+    /// baseline exactly where it was. The baseline is the only thing that
+    /// makes the *next* query try again; writing the new hash over a graph
+    /// that never took the edit is what turned GM-292's silently stale answer
+    /// into a permanently stale one, surviving even a daemon restart.
+    #[test]
+    fn a_reindex_the_index_refuses_leaves_the_previous_baseline_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_on_disk = tmp.path().join("lib.rs");
+        fs::write(&file_on_disk, b"fn old() {}").unwrap();
+        let mut conn = setup_conn();
+
+        // A baseline to preserve: one ordinary, successful reindex first.
+        let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+        let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+        let (invoked_tx, _invoked_rx) = mpsc::channel();
+        let request_id = RequestId::Number(1);
+        let plugin = spawn_stub_plugin(
+            plugin_reader,
+            plugin_writer,
+            "lib.rs",
+            request_id.clone(),
+            diff_response(request_id.clone(), "old"),
+            invoked_tx,
+        );
+        let mut buf_reader = BufReader::new(core_reader);
+        ensure_fresh(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            tmp.path(),
+            "lib.rs",
+            request_id,
+            &EmbeddingPipeline::disabled(),
+        )
+        .unwrap();
+        plugin.join().unwrap();
+        let baseline = |conn: &Connection| -> (i64, String) {
+            conn.query_row(
+                "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = 'lib.rs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = baseline(&conn);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&file_on_disk, b"fn new_and_improved() {}").unwrap();
+
+        // The plugin answers, but with a diff the index cannot take: an edge
+        // onto a node that does not exist, refused by this connection's
+        // foreign keys. No semantic pass follows a failed reparse, so this
+        // stub answers exactly one request.
+        let (mut plugin_reader2, mut core_writer2) = std::io::pipe().unwrap();
+        let (core_reader2, mut plugin_writer2) = std::io::pipe().unwrap();
+        let request_id2 = RequestId::Number(2);
+        let refused = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: request_id2.clone(),
+            result: FileChangeDiff {
+                upsert_nodes: vec![],
+                delete_node_ids: vec![],
+                upsert_edges: vec![crate::protocol::types::WireEdge {
+                    id: "e-dangling".to_string(),
+                    from_id: "n1".to_string(),
+                    to_id: "missing".to_string(),
+                    kind: crate::protocol::types::EdgeKind::Calls,
+                    source: crate::protocol::types::EdgeSource::TreeSitter,
+                    resolved: false,
+                    to_declaration: None,
+                }],
+                delete_edge_ids: vec![],
+            },
+        };
+        let plugin2 = std::thread::spawn(move || {
+            let mut buf_reader = BufReader::new(&mut plugin_reader2);
+            let _: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
+            write_message(&mut plugin_writer2, &refused).unwrap();
+        });
+        let mut buf_reader2 = BufReader::new(core_reader2);
+        let result = ensure_fresh(
+            &mut buf_reader2,
+            &mut core_writer2,
+            &mut conn,
+            tmp.path(),
+            "lib.rs",
+            request_id2,
+            &EmbeddingPipeline::disabled(),
+        );
+        plugin2.join().unwrap();
+
+        assert!(result.is_err(), "a refused reindex must be reported: {result:?}");
+        assert_eq!(baseline(&conn), before, "the stale file's baseline must not be advanced");
+        let name: String =
+            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(name, "old", "nothing of the refused diff was committed");
+    }
+
     #[test]
     fn unchanged_file_hits_the_fast_path_and_never_invokes_the_plugin() {
         let tmp = tempfile::tempdir().unwrap();
