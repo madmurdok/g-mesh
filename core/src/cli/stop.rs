@@ -256,6 +256,16 @@ fn tidy_state_files(project_root: &Path) -> Result<()> {
     if !daemon::is_listening(project_root)? {
         daemon::endpoint(project_root)?.clear_stale();
         let _ = fs::remove_file(daemon::build_stamp_path(project_root)?);
+        // Same condition, same reasoning, one more kind of state that
+        // describes nobody once nothing is serving this project: a
+        // `plugin-<language>.suspended` marker (task GM-274's memory-limit
+        // suspension) says a daemon that ran here once decided to suspend a
+        // language, and once that daemon is confirmed gone, "suspended until
+        // the daemon restarts" (the architecture doc's own wording) has
+        // already happened - `stop` is as much a restart boundary as the next
+        // `daemon::run` clearing the same markers on its own way up (see that
+        // call's own comment).
+        daemon::registry::clear_stale_suspension_markers(&state_dir);
     }
     Ok(())
 }
