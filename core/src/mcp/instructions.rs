@@ -505,6 +505,17 @@ results instead of paging.";
         }
     }
 
+    /// GM-262's own discrimination requirement, and this module's real
+    /// permanent regression guard for it - `ORIGINAL_INSTRUCTIONS` above is
+    /// transcribed independently of `P1`/`P2_TWO_GAPS`/`P3`/`P4_GENERIC`/`P5`,
+    /// so this assertion fails the moment any of those five drifts from what
+    /// `get_info` said before GM-262, not just on a change to the receiver-
+    /// call clause specifically. Proven by mutation, not merely asserted:
+    /// changing one byte of `P4_GENERIC` (`"by design"` to `"by desigm"`)
+    /// while leaving `ORIGINAL_INSTRUCTIONS` untouched turns this failing,
+    /// confirmed by hand while implementing this task and reverted afterward.
+    /// This assertion is what stands in for repeating that procedure on
+    /// every future run, so the constant's own doc comment does not.
     #[test]
     fn ts_only_is_byte_identical_to_the_original_string() {
         let rendered = build(&ts_only());
@@ -513,21 +524,6 @@ results instead of paging.";
             "a TypeScript-only project must read exactly what it did before GM-262"
         );
         assert_eq!(rendered.len(), 1804, "GM-262's own measured baseline");
-    }
-
-    /// GM-262's own discrimination requirement: this test must fail if a
-    /// single character of the generated TS-only text changes. Left in as a
-    /// permanent regression guard - not just a one-off manual check - so a
-    /// future edit to any `P1`..`P5`/`P4_GENERIC` constant that drifts the
-    /// TS-only rendering is caught here rather than only by a human
-    /// remembering to re-run the byte count.
-    #[test]
-    fn ts_only_changes_if_any_constant_does() {
-        let rendered = build(&ts_only());
-        let mut corrupted = ORIGINAL_INSTRUCTIONS.to_string();
-        corrupted.push('!');
-        assert_ne!(rendered, corrupted, "sanity check on the comparison itself, not the code under test");
-        assert_ne!(rendered.len(), corrupted.len());
     }
 
     #[test]
