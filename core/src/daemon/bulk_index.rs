@@ -269,7 +269,7 @@ fn ingest<R: BufRead>(
     for item in NdjsonReader::new(reader) {
         match item {
             Ok(BulkItem::Node(node)) => {
-                batch.upsert_nodes.push(to_node_record(node));
+                batch.upsert_nodes.push(to_node_record(*node));
                 summary.nodes += 1;
             }
             Ok(BulkItem::Edge(edge)) => {
@@ -322,7 +322,9 @@ fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range, WireEdge, WireNode};
+    use crate::protocol::types::{
+        EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
+    };
     use crate::storage::schema;
     use std::io::Cursor;
 
@@ -353,12 +355,15 @@ mod tests {
             file_path: "src/a.ts".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 2, col: 0 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "typescript".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         })
         .unwrap()
     }
@@ -369,7 +374,8 @@ mod tests {
             from_id: from.to_string(),
             to_id: to.to_string(),
             kind: EdgeKind::Calls,
-            source: EdgeSource::TreeSitter,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
         })

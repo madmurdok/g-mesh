@@ -27,8 +27,8 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
-    JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, SourceTier, Visibility,
+    WireEdge, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::write::{apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord};
 
@@ -253,6 +253,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::FileChanged { .. } => "fileChanged",
         ControlMessage::Status => "status",
         ControlMessage::SemanticPass { .. } => "semanticPass",
+        ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
     }
 }
 
@@ -285,7 +286,11 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
         end_line: node.range.end.line as i64,
         end_col: node.range.end.col as i64,
         signature: node.signature,
-        exported: node.exported,
+        // GM-264 adds `visibility`/`container`/`target` columns; until then
+        // storage keeps its v1 `exported` boolean, derived from the wire's
+        // richer `Visibility` (Data Model > Visibility: only `Public` is
+        // visible from anywhere, so it alone maps to `true`).
+        exported: matches!(node.visibility, Visibility::Public),
         doc_comment: node.doc_comment,
         language: node.language,
         native_kind: node.native_kind,
@@ -329,12 +334,12 @@ pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
 /// custom serde attributes are attached to `NodeKind`, so `{:?}` already
 /// gives the exact variant name (e.g. "Function").
 ///
-/// `edges.kind`/`edges.source`, by contrast, have custom serde renames
-/// (`SCREAMING_SNAKE_CASE` / `kebab-case`) - reuse those exact wire strings
-/// by round-tripping through serde_json rather than re-deriving the mapping
-/// by hand, so the storage string always matches what the wire format (and
-/// therefore what the plugin actually sent) says, and any future rename
-/// attribute change on these enums doesn't silently desync this file.
+/// `edges.kind`, by contrast, has a custom serde rename
+/// (`SCREAMING_SNAKE_CASE`) - reuse that exact wire string by round-tripping
+/// through serde_json rather than re-deriving the mapping by hand, so the
+/// storage string always matches what the wire format (and therefore what
+/// the plugin actually sent) says, and any future rename attribute change on
+/// this enum doesn't silently desync this file.
 fn edge_kind_wire_value(kind: &crate::protocol::types::EdgeKind) -> String {
     serde_json::to_value(kind)
         .ok()
@@ -342,18 +347,29 @@ fn edge_kind_wire_value(kind: &crate::protocol::types::EdgeKind) -> String {
         .unwrap_or_else(|| format!("{kind:?}"))
 }
 
-fn edge_source_wire_value(source: &crate::protocol::types::EdgeSource) -> String {
-    serde_json::to_value(source)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{source:?}"))
+/// `edges.source` in the schema is still the v1 two-value CHECK constraint
+/// (`'tree-sitter' | 'ts-compiler'`) - GM-264 is what adds real `source`/
+/// `engine` columns matching the wire's `SourceTier`/`engine` split. Until
+/// then this derives the storage string from `SourceTier` alone, exactly
+/// v1's own tier<->engine pairing (every engine that exists today, on the
+/// one bundled plugin, is one specific engine per tier - see the design
+/// doc's Data Model > Edge source migration note). `engine` itself has
+/// nowhere to go yet and is dropped here; nothing downstream of `apply_diff`
+/// reads it back until GM-264 gives it a column.
+fn edge_source_wire_value(source: &SourceTier) -> String {
+    match source {
+        SourceTier::Syntactic => "tree-sitter".to_string(),
+        SourceTier::Semantic => "ts-compiler".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::jsonrpc::read_message;
-    use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range, WireEdge, WireNode};
+    use crate::protocol::types::{
+        EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
+    };
     use crate::storage::schema;
     use std::io::BufReader;
 
@@ -393,12 +409,15 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         }
     }
 
@@ -461,7 +480,8 @@ mod tests {
             from_id: from.to_string(),
             to_id: to.to_string(),
             kind: EdgeKind::Calls,
-            source: EdgeSource::TreeSitter,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
         }
@@ -561,7 +581,8 @@ mod tests {
                     from_id: "n1".to_string(),
                     to_id: "n2".to_string(),
                     kind: EdgeKind::Calls,
-                    source: EdgeSource::TreeSitter,
+                    source: SourceTier::Syntactic,
+                    engine: "tree-sitter".to_string(),
                     resolved: false,
                     to_declaration: None,
                 }],
@@ -794,7 +815,8 @@ mod tests {
 
         // Only e1 is answered for - e2 is not in the diff at all.
         let mut upgraded = unresolved_edge("e1", "n1", "n2");
-        upgraded.source = EdgeSource::TsCompiler;
+        upgraded.source = SourceTier::Semantic;
+        upgraded.engine = "ts-compiler".to_string();
         upgraded.resolved = true;
         let plugin = spawn_semantic_stub(
             plugin_reader,
@@ -852,7 +874,8 @@ mod tests {
         };
 
         let mut upgraded = unresolved_edge("e1", "n1", "n2");
-        upgraded.source = EdgeSource::TsCompiler;
+        upgraded.source = SourceTier::Semantic;
+        upgraded.engine = "ts-compiler".to_string();
         upgraded.resolved = true;
         let plugin = spawn_stub_plugin(
             plugin_reader,

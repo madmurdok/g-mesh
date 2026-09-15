@@ -1,0 +1,5 @@
+{"id":"n1","kind":"File","name":"main.go","qualifiedName":"main.go","filePath":"main.go","range":{"start":{"line":0,"col":0},"end":{"line":10,"col":0}},"visibility":"file","language":"go","hasSyntaxErrors":false}
+{"id":"n2","kind":"Function","name":"main","qualifiedName":"main","filePath":"main.go","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"visibility":"public","language":"go","nativeKind":"function","container":"github.com/x/app","containerParent":null}
+{"id":"n3","kind":"Module","name":"Run","qualifiedName":"github.com/x/app/server.Run","filePath":"main.go","range":{"start":{"line":1,"col":10},"end":{"line":1,"col":13}},"visibility":"file","language":"go","nativeKind":"pending_symbol","target":{"scope":{"container":"github.com/x/app/server"},"key":{"name":"Run"},"fromContainer":"github.com/x/app"}}
+{"id":"e1","fromId":"n1","toId":"n2","kind":"DEFINES","source":"syntactic","engine":"go-parser","resolved":true}
+{"id":"e2","fromId":"n2","toId":"n3","kind":"CALLS","source":"syntactic","engine":"go-parser","resolved":false}

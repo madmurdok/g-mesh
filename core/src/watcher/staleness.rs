@@ -289,7 +289,7 @@ mod tests {
     use crate::protocol::jsonrpc::{read_message, write_message};
     use crate::protocol::types::{
         ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, NodeKind, Position, Range,
-        WireNode, JSONRPC_VERSION,
+        Visibility, WireNode, JSONRPC_VERSION,
     };
     use crate::storage::schema;
     use std::io::BufReader;
@@ -326,12 +326,15 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         }
     }
 
