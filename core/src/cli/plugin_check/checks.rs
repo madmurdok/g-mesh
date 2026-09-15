@@ -13,8 +13,9 @@
 //! "Constraints" and "Interfaces > Conformance kit".
 //!
 //! - **`session`** - the plugin can be run at all: spawns, handshakes (protocol
-//!   version and language, as the daemon verifies them), finishes both bulk
-//!   walks with exit 0, and answers every request within
+//!   version and language, as the daemon verifies them), finishes every bulk
+//!   walk with exit 0 (two over the fixture, and a third over the tree the
+//!   declaration edit left), commits every diff, and answers every request within
 //!   `RoundTripTimeouts`. Everything else depends on it; a check whose input a
 //!   failed session never produced is skipped, not passed.
 //! - **`shape`** - every bulk line and every response parses as the protocol
@@ -51,6 +52,24 @@
 //!   invisible: a plugin whose incremental path derives ids differently from
 //!   its bulk path never deletes the bulk rows, so every edited file silently
 //!   accumulates duplicates.
+//! - **`id-stability.declaration-edit-applies`** - after `fileChanged` has
+//!   seen a *real* edit of a declaration through a warm cache (a line break
+//!   before the last line of the file's first declaration -
+//!   `session::declaration_edit` has why that one), every node of the file
+//!   that a fresh bulk walk of the edited tree (bulk run 3, committed and
+//!   linked into an index of its own) emits is, if the linked index held it
+//!   before the edit, still there - and at the range bulk run 3 gives it.
+//!   Ids only one side has for any other reason are left to `bulk-repeat` and
+//!   `incremental-matches-bulk`, so one defect still fails one check. Added
+//!   by GM-294. Every other step's edit leaves no symbol
+//!   surviving in a changed form, which is the one shape every user edit has
+//!   and the one GM-292 refused, silently, on every warm edit for a release -
+//!   while this kit, whose in-memory index enforced foreign keys the same
+//!   way, reported the TS plugin conformant. So this fails on either side of
+//!   the contract: a plugin whose diff does not carry what its own bulk path
+//!   says the file now contains, or a core that does not commit it (which,
+//!   being an apply error, surfaces as a `session` failure that skips this
+//!   check - either way the run fails).
 //! - **`ownership.defines-exports-from-file`** - `DEFINES`/`EXPORTS` edges run
 //!   from the file's `File` node. Core writes container `DEFINES` edges
 //!   itself; a plugin's own always start at a file.
@@ -88,10 +107,12 @@
 //! so the check is skipped with that reason rather than passed. A plugin whose
 //! marker appears only after the first `semanticPass` passes.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
-use crate::cli::plugin_check::session::{BulkLine, BulkRun, EditTarget, Exchange, Method, Session};
+use crate::cli::plugin_check::session::{
+    BulkLine, BulkRun, EditTarget, Exchange, Method, Session, StoredRange,
+};
 use crate::daemon::manifest::PluginManifest;
 use crate::protocol::conformance::{
     placeholder_target_violation, plugin_emitted_container_violation, PLACEHOLDER_NATIVE_KINDS,
@@ -107,7 +128,7 @@ use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, WireEdge, WireN
 /// a false claim.
 const EXTERNAL_MODULE_NATIVE_KIND: &str = "external_module";
 
-fn is_placeholder(native_kind: Option<&str>) -> bool {
+pub(crate) fn is_placeholder(native_kind: Option<&str>) -> bool {
     native_kind
         .is_some_and(|kind| PLACEHOLDER_NATIVE_KINDS.contains(&kind) || kind == EXTERNAL_MODULE_NATIVE_KIND)
 }
@@ -120,6 +141,10 @@ pub(crate) struct RunData<'a> {
     /// The edited file's node ids in the index right after the bulk walk was
     /// committed and linked (`session::file_node_ids`).
     pub bulk_file_ids: Option<&'a BTreeSet<String>>,
+    /// The edited file's nodes and ranges in a fresh index that bulk run 3 -
+    /// a walk of the tree after the session's declaration edit - was
+    /// committed and linked into (`session::file_node_ranges`).
+    pub bulk_edited_ranges: Option<&'a BTreeMap<String, StoredRange>>,
     pub session: Option<&'a Session>,
     /// Setup and session failures, in the order they happened.
     pub failures: Vec<String>,
@@ -186,6 +211,7 @@ pub(crate) fn evaluate(run: &RunData) -> Vec<CheckResult> {
         whitespace_edit(run),
         deletes_known(run, &walk),
         incremental_matches_bulk(run),
+        declaration_edit_applies(run),
         structural(run, "ownership.defines-exports-from-file", |findings| {
             bulk_defines_from_file(&bulk1.lines, findings);
             findings.extend(walk.defines.iter().cloned());
@@ -665,6 +691,82 @@ fn incremental_matches_bulk(run: &RunData) -> CheckResult {
     result(ID, verdict(findings))
 }
 
+fn declaration_edit_applies(run: &RunData) -> CheckResult {
+    const ID: &str = "id-stability.declaration-edit-applies";
+    let Some(target) = run.target else {
+        return result(ID, not_reached("a file to edit was chosen"));
+    };
+    let Some(edit) = &target.declaration else {
+        return result(
+            ID,
+            Outcome::Skip(format!(
+                "bulk run 1 emitted no declaration (a node that is neither the File node nor a placeholder) for {:?}, \
+                 so there was nothing to edit",
+                target.file_path
+            )),
+        );
+    };
+    let Some(session) = run.session else {
+        return result(ID, not_reached("the control-plane session started"));
+    };
+    let (Some(edited), Some(restored), Some(through), Some(bulk)) = (
+        session.declaration_edit_ranges.as_ref(),
+        session.restored_file_ids.as_ref(),
+        session.declaration_exchange,
+        run.bulk_edited_ranges,
+    ) else {
+        return result(ID, not_reached("the declaration edit was applied and bulk run 3 read back"));
+    };
+    // Every node id the plugin's own control path delivered, up to and
+    // including its answer to the edit.
+    let sent: HashSet<&str> = session
+        .exchanges
+        .iter()
+        .take(through + 1)
+        .filter(|exchange| exchange.method == Method::FileChanged)
+        .filter_map(|exchange| exchange.response.as_ref()?.diff.as_ref().ok())
+        .flat_map(|diff| diff.upsert_nodes.iter().map(|node| node.id.as_str()))
+        .collect();
+
+    let at = format!(
+        "after fileChanged applied a line break before line {} of {:?} (the last line of {:?})",
+        edit.line, target.file_path, edit.node_name
+    );
+    let show = |(start_line, start_col, end_line, end_col): &StoredRange| {
+        format!("{start_line}:{start_col}-{end_line}:{end_col}")
+    };
+    // Scoped to what no other check already judges, so one defect still fails
+    // one check. Only nodes the plugin's control path itself has delivered are
+    // judged: a bulk row the control path never sends under that id (an id it
+    // spells differently - `incremental-matches-bulk` - or one that differs
+    // between two bulk walks - `bulk-repeat`) keeps its bulk-run-1 range
+    // forever, and reporting that here would report the same defect twice.
+    // What is left is exactly the edit itself - a node the plugin delivered,
+    // that the file had going in and still has coming out, must still be in
+    // the index, at the range the edited file puts it.
+    let mut findings = Vec::new();
+    for (id, range) in bulk {
+        if !sent.contains(id.as_str()) {
+            continue;
+        }
+        match edited.get(id) {
+            None if restored.contains(id) => findings.push(format!(
+                "{at}: node {id:?} was in the index before the edit and a fresh bulk walk of the edited file still \
+                 emits it (at {}), but it is gone from the index - the edit's diff deleted it without re-sending it",
+                show(range)
+            )),
+            Some(stored) if stored != range => findings.push(format!(
+                "{at}: node {id:?} is at {} in the index, but a fresh bulk walk of the edited file puts it at {} - the \
+                 edit's diff did not carry the node's new range, or core did not commit it",
+                show(stored),
+                show(range)
+            )),
+            _ => {}
+        }
+    }
+    result(ID, verdict(findings))
+}
+
 fn diff_stays_in_file(run: &RunData, walk: &DiffWalk) -> CheckResult {
     const ID: &str = "ownership.diff-stays-in-file";
     let answered = run
@@ -808,6 +910,7 @@ mod tests {
             bulk: [&run1, &run2],
             target: None,
             bulk_file_ids: None,
+            bulk_edited_ranges: None,
             session: None,
             failures: Vec::new(),
             marker_exists_at_end: false,
@@ -883,6 +986,7 @@ mod tests {
             bulk: [&run, &run],
             target: None,
             bulk_file_ids: None,
+            bulk_edited_ranges: None,
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end: false,
@@ -901,6 +1005,7 @@ mod tests {
             bulk: [&run, &run],
             target: None,
             bulk_file_ids: None,
+            bulk_edited_ranges: None,
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end,
@@ -926,5 +1031,106 @@ mod tests {
         let Outcome::Fail(findings) = &shape.outcome else { panic!("shape must fail: {shape:?}") };
         assert_eq!(findings.len(), 3, "{findings:?}");
         assert!(shape.warnings.is_empty(), "{:?}", shape.warnings);
+    }
+
+    /// `id-stability.declaration-edit-applies` over hand-built snapshots: the
+    /// index after the edit against bulk run 3's, for the nodes the control
+    /// path delivered (`a` and `f` here). A stale range and a delivered node
+    /// the edit lost are each a finding naming the node. A row the control
+    /// path never delivered under its id (`bulk-only`, the shape an
+    /// `incremental-ids` plugin leaves behind) and an id bulk run 3 emits that
+    /// the index never had (`never-indexed`) are other checks' to report, not
+    /// this one's. Agreement passes; a file with no declaration to edit is
+    /// skipped rather than passed.
+    #[test]
+    fn the_declaration_edit_check_judges_the_ranges_of_delivered_nodes() {
+        use crate::cli::plugin_check::session::DeclarationEdit;
+
+        let manifest = manifest(false);
+        let run = bulk(&conformant_lines());
+        let target = |declaration: Option<DeclarationEdit>| EditTarget {
+            file_path: "a.fk".to_string(),
+            line: 1,
+            original: Vec::new(),
+            edited: Vec::new(),
+            declaration,
+        };
+        let with_edit = target(Some(DeclarationEdit {
+            node_id: "f".to_string(),
+            node_name: "f".to_string(),
+            line: 1,
+            edited: Vec::new(),
+        }));
+        let wire = |id: &str| match BulkItem::parse(&node(id, "Function", "a.fk", None)).unwrap() {
+            BulkItem::Node(node) => *node,
+            _ => unreachable!(),
+        };
+        let ranges = |rows: &[(&str, StoredRange)]| -> BTreeMap<String, StoredRange> {
+            rows.iter().map(|(id, range)| (id.to_string(), *range)).collect()
+        };
+        let outcome = |target: &EditTarget,
+                       indexed: BTreeMap<String, StoredRange>,
+                       bulk: BTreeMap<String, StoredRange>| {
+            let session = Session {
+                exchanges: vec![Exchange {
+                    step: "fileChanged #1".to_string(),
+                    method: Method::FileChanged,
+                    file_paths: vec!["a.fk".to_string()],
+                    response: Some(Response {
+                        diff: Ok(FileChangeDiff {
+                            upsert_nodes: vec![wire("a"), wire("f")],
+                            ..FileChangeDiff::default()
+                        }),
+                    }),
+                }],
+                declaration_exchange: Some(0),
+                restored_file_ids: Some(["a", "f", "bulk-only"].map(str::to_string).into()),
+                declaration_edit_ranges: Some(indexed),
+                ..Session::default()
+            };
+            let data = RunData {
+                manifest: &manifest,
+                bulk: [&run, &run],
+                target: Some(target),
+                bulk_file_ids: None,
+                bulk_edited_ranges: Some(&bulk),
+                session: Some(&session),
+                failures: Vec::new(),
+                marker_exists_at_end: false,
+            };
+            outcome_of(&evaluate(&data), "id-stability.declaration-edit-applies")
+        };
+
+        let fresh = ranges(&[("a", (0, 0, 3, 0)), ("f", (1, 0, 2, 1)), ("bulk-only", (1, 0, 1, 1))]);
+        let agreeing = ranges(&[("a", (0, 0, 3, 0)), ("f", (1, 0, 2, 1)), ("bulk-only", (0, 0, 0, 1))]);
+        assert_eq!(
+            outcome(&with_edit, agreeing, fresh.clone()),
+            Outcome::Pass,
+            "`bulk-only` was never delivered by the control path, so its stale bulk-run-1 range is not judged here"
+        );
+
+        let stale = ranges(&[("a", (0, 0, 2, 0)), ("f", (0, 0, 1, 1)), ("bulk-only", (1, 0, 1, 1))]);
+        let Outcome::Fail(findings) = outcome(&with_edit, stale, fresh.clone()) else {
+            panic!("stale ranges must fail")
+        };
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("node \"f\" is at 0:0-1:1 in the index")), "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("node \"a\" is at 0:0-2:0 in the index")), "{findings:?}");
+
+        let lost = ranges(&[("a", (0, 0, 3, 0)), ("bulk-only", (1, 0, 1, 1))]);
+        let Outcome::Fail(findings) = outcome(&with_edit, lost, fresh.clone()) else {
+            panic!("a lost node must fail")
+        };
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("node \"f\" was in the index before the edit"), "{findings:?}");
+
+        let mut with_a_new_id = fresh.clone();
+        with_a_new_id.insert("never-indexed".to_string(), (9, 0, 9, 1));
+        assert_eq!(outcome(&with_edit, fresh.clone(), with_a_new_id), Outcome::Pass);
+
+        assert!(matches!(
+            outcome(&target(None), fresh.clone(), fresh),
+            Outcome::Skip(reason) if reason.contains("no declaration")
+        ));
     }
 }

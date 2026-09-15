@@ -47,7 +47,7 @@
 //! for go/packages - and a kit that breaks the engine it is meant to observe
 //! would report "not instrumented" for every such plugin. The fixture itself
 //! is copied into the scratch directory before anything runs, because the
-//! whitespace-edit and emptied-file steps write to it.
+//! whitespace-edit, emptied-file and declaration-edit steps write to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -60,6 +60,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use super::checks::is_placeholder;
 use crate::daemon::bulk_index::{self, BulkIndexSummary, BULK_INDEX_FLAG};
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
@@ -71,6 +72,7 @@ use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout};
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
+    WireNode,
 };
 use crate::storage::schema;
 use crate::watcher::apply::{apply_file_change, apply_semantic_pass};
@@ -351,13 +353,30 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
         .collect()
 }
 
-/// A fresh in-memory index, configured like the daemon's own connection
-/// (`storage::connection::open` sets nothing a schema-only in-memory database
-/// needs - notably not `foreign_keys`, so a dangling edge is stored exactly as
-/// the daemon would store it, and it is `checks::stream_order` that reports
-/// it rather than a constraint error that would end the session).
+/// A fresh in-memory index, configured like the daemon's own connection in
+/// the one respect that changes what a diff commits: `foreign_keys` is off,
+/// as `storage::connection::open` sets it (WAL and the vector extension mean
+/// nothing to a schema-only in-memory database). So a dangling edge is
+/// stored exactly as the daemon would store it, and it is
+/// `checks::stream_order` that reports it rather than a constraint error that
+/// would end the session - and a delete plus re-upsert of a symbol whose
+/// unchanged edges were not re-sent commits, as it does in the daemon.
+///
+/// Set explicitly rather than left to the default, which is the mistake
+/// GM-292 was: this comment used to say the daemon's connection "sets
+/// nothing ... notably not `foreign_keys`", on the belief that the default is
+/// off. The bundled SQLite compiles it *on*, so this index enforced foreign
+/// keys the daemon was never meant to. GM-276 worked around it rather than
+/// finding it: the kit's only edits were a whitespace edit (an empty diff),
+/// emptying the file (every edge out of it deleted along with its nodes) and
+/// restoring it (from an extraction with nothing left to keep), and its test
+/// fake upserts changed rows in place because a delete plus re-upsert was
+/// refused. A real declaration edit through the TS
+/// plugin, the shape every user edit has, was never sent. The
+/// declaration-edit step (`id-stability.declaration-edit-applies`) now is.
 pub(crate) fn open_index() -> Result<Mutex<Connection>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
+    conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
     Ok(Mutex::new(conn))
 }
@@ -389,10 +408,33 @@ pub(crate) fn file_node_ids(conn: &Mutex<Connection>, file: &str) -> Result<BTre
     Ok(ids)
 }
 
+/// A node's `(startLine, startCol, endLine, endCol)` as the index stores it.
+pub(crate) type StoredRange = (i64, i64, i64, i64);
+
+/// `file`'s nodes and where the linked index says each one is - read after
+/// the session's declaration edit was applied, and from a fresh index that
+/// bulk run 3 of the edited tree was committed and linked into, for
+/// `id-stability.declaration-edit-applies`. Index against index for the same
+/// reason [`file_node_ids`] is.
+pub(crate) fn file_node_ranges(
+    conn: &Mutex<Connection>,
+    file: &str,
+) -> Result<BTreeMap<String, StoredRange>> {
+    let conn = conn.lock().unwrap();
+    let mut statement =
+        conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
+    let rows = statement
+        .query_map([file], |row| {
+            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 // --- the edited file ----------------------------------------------------------
 
-/// The file the control-plane session edits, and the one whitespace edit made
-/// to it.
+/// The file the control-plane session edits, the one whitespace edit made to
+/// it, and the one declaration edit.
 pub(crate) struct EditTarget {
     /// Project-relative, exactly as the plugin's own `File` node spells it -
     /// which is also what `fileChanged` carries.
@@ -401,6 +443,82 @@ pub(crate) struct EditTarget {
     pub line: usize,
     pub original: Vec<u8>,
     pub edited: Vec<u8>,
+    /// `None` when bulk run 1 gave the file no declaration to edit - see
+    /// [`declaration_edit`].
+    pub declaration: Option<DeclarationEdit>,
+}
+
+/// The session's one *real* edit: a line break inserted into a declaration,
+/// so its range - and, for a declaration that spans lines, its length -
+/// legitimately changes.
+pub(crate) struct DeclarationEdit {
+    /// The node whose last line the break is inserted before.
+    pub node_id: String,
+    pub node_name: String,
+    /// 1-based line the break is inserted before (the node's last line).
+    pub line: usize,
+    pub edited: Vec<u8>,
+}
+
+/// Inserts a line break (the file's own: `\r\n` if its first newline is one)
+/// at the start of the last line of the file's first declaration - the
+/// earliest non-`File`, non-placeholder node bulk run 1 emitted for it, ties
+/// broken by id - or `None` if there is no such node or that line is not in
+/// the file.
+///
+/// # Why this edit
+///
+/// Every other edit the session makes is one no declaration survives in a
+/// changed form: a whitespace edit moves nothing, emptying a file deletes
+/// everything, restoring it re-adds everything. None of them is what a user's
+/// edit is - an existing symbol that is still there, somewhere else or a
+/// different size - which is the shape the TS plugin sends as a delete plus
+/// an upsert of the same id, and the shape GM-292 silently refused on every
+/// warm edit for a whole release without the kit noticing. A break before a
+/// multi-line declaration's last line grows it by one; before a one-line
+/// declaration's only line, it moves it down one; either way every later
+/// range in the file moves too, and the `File` node's end with them.
+///
+/// What the edit legitimately does to anything else - a doc comment that no
+/// longer attaches, a template literal that gains a line - does not matter
+/// here, because the check compares the index after the edit against a fresh
+/// bulk walk of the *edited* tree, not against a prediction. Both sides read
+/// the same bytes; only a plugin whose diff fails to carry what its own bulk
+/// path says the file now contains, or a core that fails to commit it, can
+/// make them disagree.
+pub(crate) fn declaration_edit<'a>(
+    bytes: &[u8],
+    nodes: impl IntoIterator<Item = &'a WireNode>,
+) -> Option<DeclarationEdit> {
+    let first = nodes
+        .into_iter()
+        .filter(|node| node.kind != NodeKind::File && !is_placeholder(node.native_kind.as_deref()))
+        .min_by(|a, b| {
+            (a.range.start.line, a.range.start.col, &a.id).cmp(&(
+                b.range.start.line,
+                b.range.start.col,
+                &b.id,
+            ))
+        })?;
+    let last_line = first.range.end.line as usize;
+    let at = if last_line == 0 {
+        0
+    } else {
+        bytes.iter().enumerate().filter(|(_, byte)| **byte == b'\n').nth(last_line - 1)?.0 + 1
+    };
+    if at > bytes.len() {
+        return None;
+    }
+    let first_newline = bytes.iter().position(|byte| *byte == b'\n');
+    let crlf = first_newline.is_some_and(|newline| newline > 0 && bytes[newline - 1] == b'\r');
+    let mut edited = bytes.to_vec();
+    edited.splice(at..at, if crlf { b"\r\n".to_vec() } else { b"\n".to_vec() });
+    Some(DeclarationEdit {
+        node_id: first.id.clone(),
+        node_name: first.name.clone(),
+        line: last_line + 1,
+        edited,
+    })
 }
 
 /// Inserts one space immediately before the file's last newline (before its
@@ -469,10 +587,23 @@ pub(crate) fn choose_edit_target(
         // `files` iterates in path order, so a strict `>` keeps the first path
         // among equal counts.
         if best.as_ref().is_none_or(|(best_count, _)| count > *best_count) {
-            best = Some((count, EditTarget { file_path: file_path.to_string(), line, original, edited }));
+            best = Some((
+                count,
+                EditTarget { file_path: file_path.to_string(), line, original, edited, declaration: None },
+            ));
         }
     }
-    best.map(|(_, target)| target)
+    // Chosen after the file, not as a criterion for it: the file choice stays
+    // what it was before the declaration edit existed, so every earlier
+    // check keeps judging the same file.
+    best.map(|(_, mut target)| {
+        let nodes = lines.iter().filter_map(|line| match &line.item {
+            Ok(BulkItem::Node(node)) if node.file_path == target.file_path => Some(node.as_ref()),
+            _ => None,
+        });
+        target.declaration = declaration_edit(&target.original, nodes);
+        target
+    })
 }
 
 // --- control plane ------------------------------------------------------------
@@ -519,10 +650,19 @@ pub(crate) struct Session {
     /// Index into `exchanges` of the `fileChanged` sent after emptying the
     /// file - the step that exercises `deleteNodeIds`.
     pub emptied_exchange: Option<usize>,
+    /// Index into `exchanges` of the `fileChanged` sent after the declaration
+    /// edit, once it was answered and committed.
+    pub declaration_exchange: Option<usize>,
     /// The edited file's node ids in the linked index once the file was
     /// restored, before any semantic pass could add to them - compared with
     /// `file_node_ids` right after the bulk walk.
     pub restored_file_ids: Option<BTreeSet<String>>,
+    /// The edited file's nodes and ranges in the linked index once the
+    /// declaration edit (`EditTarget::declaration`) was applied, before any
+    /// semantic pass could add to them - compared with bulk run 3 of the
+    /// edited tree. `None` if that step never ran. The file is left edited on
+    /// disk afterwards, for bulk run 3 to walk.
+    pub declaration_edit_ranges: Option<BTreeMap<String, StoredRange>>,
     /// Whether the semantic-engine marker already existed when the first
     /// `semanticPass` frame was written; `None` if none was ever written.
     pub marker_at_first_semantic_pass: Option<bool>,
@@ -616,14 +756,18 @@ struct Driver<'a> {
 /// 1. `fileChanged` on the unmodified file.
 /// 2. `fileChanged` after the whitespace edit.
 /// 3. `fileChanged` after emptying the file.
-/// 4. `fileChanged` after restoring it - then the index snapshot.
-/// 5. whole-project `semanticPass`, when the manifest declares the capability.
-/// 6. `fileChanged` on the unchanged file, through the manifest's own gate.
+/// 4. `fileChanged` after restoring it - then the index snapshot of its ids.
+/// 5. `fileChanged` after the declaration edit ([`declaration_edit`]), when
+///    the file has a declaration - then the index snapshot of its ranges. The
+///    file stays edited from here on.
+/// 6. whole-project `semanticPass`, when the manifest declares the capability.
+/// 7. `fileChanged` on the unchanged file, through the manifest's own gate.
 ///
-/// Steps 1-4 are sent with the semantic gate closed - the state of a plugin
+/// Steps 1-5 are sent with the semantic gate closed - the state of a plugin
 /// woken for structural work only, which is when a plugin with an eagerly
 /// started engine does the most harm - so the first `semanticPass` the plugin
-/// ever sees is step 5's (or step 6's per-file one).
+/// ever sees is step 6's (or step 7's per-file one). Step labels number the
+/// `fileChanged` requests, not the steps.
 pub(crate) fn run_session(
     manifest: &PluginManifest,
     scratch: &Scratch,
@@ -710,6 +854,34 @@ pub(crate) fn run_session(
         }
     }
 
+    // Through the cache step 4 just warmed with the original text, so the
+    // plugin answers with a diff against it - for the TS plugin, the delete
+    // plus re-upsert of a symbol whose unchanged edges are not re-sent.
+    if let Some(edit) = &target.declaration {
+        let label = format!(
+            "fileChanged #5 ({file} after a line break before line {}, the last line of {:?})",
+            edit.line, edit.node_name
+        );
+        if let Err(err) = fs::write(&workspace_file, &edit.edited) {
+            driver.session.failure =
+                Some(format!("{label}: failed to write {}: {err}", workspace_file.display()));
+            return driver.finish();
+        }
+        let first_exchange = driver.session.exchanges.len();
+        if !driver.step(&label, file, &structural_only) {
+            return driver.finish();
+        }
+        driver.session.declaration_exchange = Some(first_exchange);
+        match file_node_ranges(driver.conn, file) {
+            Ok(ranges) => driver.session.declaration_edit_ranges = Some(ranges),
+            Err(err) => {
+                driver.session.failure =
+                    Some(format!("reading {file}'s node ranges back from the index: {err:#}"));
+                return driver.finish();
+            }
+        }
+    }
+
     if manifest.capabilities.semantic_pass {
         let operation = Operation::WholeProjectSemanticPass { timeout: whole_project_timeout };
         if !driver.step("semanticPass #1 (whole project)", file, &operation) {
@@ -718,7 +890,7 @@ pub(crate) fn run_session(
     }
 
     let gated = Operation::FileChanged { semantic_pass_capable: manifest.capabilities.semantic_pass };
-    let label = format!("fileChanged #5 ({file} unchanged, through the manifest's semantic_pass gate)");
+    let label = format!("fileChanged #6 ({file} unchanged, through the manifest's semantic_pass gate)");
     driver.step(&label, file, &gated);
     driver.finish()
 }
@@ -895,6 +1067,57 @@ mod tests {
     #[test]
     fn a_file_without_any_newline_offers_no_whitespace_edit() {
         assert!(whitespace_edit(b"export const a = 1;").is_none());
+    }
+
+    /// A node as a bulk line would carry it, parsed through the real wire
+    /// type - `(start line, end line)` is all [`declaration_edit`] reads.
+    fn wire_node(id: &str, kind: &str, native_kind: Option<&str>, lines: (u32, u32)) -> WireNode {
+        let extra = native_kind
+            .map(|k| format!(",\"nativeKind\":\"{k}\",\"target\":{{\"scope\":{{\"file\":\"b.fk\"}},\"key\":{{\"name\":\"x\"}}}}"))
+            .unwrap_or_default();
+        let json = format!(
+            "{{\"id\":\"{id}\",\"kind\":\"{kind}\",\"name\":\"{id}\",\"qualifiedName\":\"{id}\",\"filePath\":\"a.fk\",\
+             \"range\":{{\"start\":{{\"line\":{},\"col\":0}},\"end\":{{\"line\":{},\"col\":1}}}},\"visibility\":\"public\",\
+             \"language\":\"fake\"{extra}}}",
+            lines.0, lines.1
+        );
+        match BulkItem::parse(&json).unwrap() {
+            BulkItem::Node(node) => *node,
+            _ => panic!("not a node"),
+        }
+    }
+
+    /// The first declaration by position - not the `File` node, not a
+    /// placeholder, even when those start earlier - and the break goes before
+    /// its *last* line, growing it.
+    #[test]
+    fn the_declaration_edit_breaks_the_first_declarations_last_line() {
+        let nodes = [
+            wire_node("file", "File", None, (0, 4)),
+            wire_node("import", "Module", Some("pending_symbol"), (0, 0)),
+            wire_node("later", "Function", None, (3, 3)),
+            wire_node("first", "Function", None, (1, 2)),
+        ];
+        let edit = declaration_edit(b"import x\nfn first {\n}\nfn later\n", &nodes).unwrap();
+        assert_eq!(edit.node_id, "first");
+        assert_eq!(edit.line, 3);
+        assert_eq!(edit.edited, b"import x\nfn first {\n\n}\nfn later\n");
+    }
+
+    #[test]
+    fn the_declaration_edit_moves_a_one_line_declaration_on_the_first_line_and_keeps_crlf() {
+        let nodes = [wire_node("f", "Function", None, (0, 0))];
+        let edit = declaration_edit(b"fn f\r\nfn g\r\n", &nodes).unwrap();
+        assert_eq!(edit.line, 1);
+        assert_eq!(edit.edited, b"\r\nfn f\r\nfn g\r\n");
+    }
+
+    #[test]
+    fn no_declaration_edit_without_a_declaration_or_past_the_end_of_the_file() {
+        let only_file = [wire_node("file", "File", None, (0, 1))];
+        assert!(declaration_edit(b"a\nb\n", &only_file).is_none());
+        let beyond = [wire_node("f", "Function", None, (0, 9))];
+        assert!(declaration_edit(b"a\nb\n", &beyond).is_none());
     }
 
     #[test]

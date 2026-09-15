@@ -157,6 +157,34 @@ pub fn check(plugin_dir: &Path, fixture: &Path) -> Result<Report> {
         failures.push(failure);
     }
 
+    // Bulk run 3 walks the tree the session left behind - the edited file
+    // still holding its declaration edit - into an index of its own, so the
+    // session's index after that edit has a ground truth that no prediction
+    // of what the edit "should" do is standing in for.
+    let edited_file =
+        target.as_ref().zip(session.as_ref()).filter(|(_, s)| s.declaration_edit_ranges.is_some());
+    let mut bulk3 = None;
+    let mut bulk_edited_ranges = None;
+    if let Some((target, _)) = edited_file {
+        let run = session::run_bulk(&manifest, &scratch, whole_project_timeout);
+        match &run.failure {
+            Some(failure) => failures.push(format!("bulk run 3 (after the declaration edit): {failure}")),
+            None => {
+                let fresh = session::open_index()?;
+                match session::ingest_and_link(&fresh, &run.bytes)
+                    .and_then(|()| session::file_node_ranges(&fresh, &target.file_path))
+                {
+                    Ok(ranges) => bulk_edited_ranges = Some(ranges),
+                    Err(err) => failures.push(format!(
+                        "bulk run 3 (after the declaration edit): committing, linking or reading back its stream \
+                         failed: {err:#}"
+                    )),
+                }
+            }
+        }
+        bulk3 = Some(run);
+    }
+
     let mut notes = vec![format!(
         "timeouts: fileChanged {:?}, per-file semanticPass {:?}, whole-project semanticPass and each bulk run {:?}",
         timeouts.file_changed, timeouts.semantic_pass_file, whole_project_timeout
@@ -166,11 +194,21 @@ pub fn check(plugin_dir: &Path, fixture: &Path) -> Result<Report> {
             "edited file: {} (whitespace-only edit: one space before the last newline, at the end of line {})",
             target.file_path, target.line
         ));
+        notes.push(match &target.declaration {
+            Some(edit) => format!(
+                "declaration edit: a line break before line {} of {}, the last line of {:?} ({})",
+                edit.line, target.file_path, edit.node_name, edit.node_id
+            ),
+            None => {
+                format!("declaration edit: none - bulk run 1 emitted no declaration for {}", target.file_path)
+            }
+        });
     }
     // What the checks below actually looked at, so a pass can be told apart
     // from a check that had nothing to judge (an emptied file whose diff
     // deleted nothing passes `deletes-known` trivially, and says so here).
-    for (index, run) in [&bulk1, &bulk2].into_iter().enumerate() {
+    for (index, run) in [Some(&bulk1), Some(&bulk2), bulk3.as_ref()].into_iter().enumerate() {
+        let Some(run) = run else { continue };
         let nodes = run.lines.iter().filter(|l| matches!(l.item, Ok(BulkItem::Node(_)))).count();
         let edges = run.lines.iter().filter(|l| matches!(l.item, Ok(BulkItem::Edge(_)))).count();
         notes.push(format!("bulk run {}: {nodes} node(s), {edges} edge(s)", index + 1));
@@ -195,6 +233,7 @@ pub fn check(plugin_dir: &Path, fixture: &Path) -> Result<Report> {
         bulk: [&bulk1, &bulk2],
         target: target.as_ref(),
         bulk_file_ids: bulk_file_ids.as_ref(),
+        bulk_edited_ranges: bulk_edited_ranges.as_ref(),
         session: session.as_ref(),
         failures,
         marker_exists_at_end: scratch.semantic_engine_marker().exists(),
