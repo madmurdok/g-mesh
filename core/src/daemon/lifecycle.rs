@@ -442,11 +442,20 @@ impl PluginSupervisor {
     /// In practice this is unreachable at the one call site there is (the
     /// plugin cannot have idled out during its own project's first walk),
     /// which is precisely why it must not be an error.
-    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<bool> {
+    ///
+    /// `file_count` is forwarded to `PluginProcess::semantic_pass` unchanged.
+    /// See that method and `daemon::plugin::RoundTripTimeouts`'s doc comment
+    /// for why the whole-project timeout has to scale with it.
+    pub fn semantic_pass(
+        &self,
+        conn: &Mutex<Connection>,
+        file_paths: Vec<String>,
+        file_count: usize,
+    ) -> Result<bool> {
         let inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return Ok(false) };
         self.touch();
-        process.semantic_pass(conn, file_paths, &self.embedding)?;
+        process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
         Ok(true)
     }
 

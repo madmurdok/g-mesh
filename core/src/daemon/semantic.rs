@@ -104,6 +104,42 @@ use crate::embedding::EmbeddingPipeline;
 /// reason: a plugin that ignores its closed stdin must not hold a command open.
 const PLUGIN_EXIT_GRACE: Duration = Duration::from_millis(500);
 
+/// How many `File` nodes the index currently holds - what
+/// `plugin::RoundTripTimeouts::semantic_pass_project_timeout` scales the
+/// whole-project pass's timeout against, so a real pass on a real-sized
+/// project gets a real budget instead of the flat one this task's review
+/// found too short. See that method and `plugin::RoundTripTimeouts`'s own
+/// doc comment for the measurement behind the scaling.
+///
+/// Counted over the *whole* index, not per language: there is no
+/// per-language `File`-node accounting yet (`language_state` is later work -
+/// see this task's own notes), so every caller here sizes the bundled JS/TS
+/// plugin's timeout off every discovered language's files combined. That can
+/// only make the budget more generous than a single language would need,
+/// never less - GM-270 (the per-language semantic scheduler) is the natural
+/// place to narrow this once the distinction exists.
+///
+/// Returns `0` (which `semantic_pass_project_timeout` reads as "use the
+/// floor") rather than propagating a query failure - a timeout budget that
+/// falls back to its pre-review flat value is a strictly better failure mode
+/// here than this whole best-effort pass failing outright over a `COUNT(*)`
+/// that could not run.
+fn indexed_file_count(conn: &Mutex<Connection>) -> usize {
+    let guard = conn.lock().unwrap();
+    let result: rusqlite::Result<i64> =
+        guard.query_row("SELECT COUNT(*) FROM nodes WHERE kind = 'File'", [], |row| row.get(0));
+    match result {
+        Ok(count) => count.max(0) as usize,
+        Err(err) => {
+            eprintln!(
+                "g-mesh daemon: failed to count indexed files for the semantic-pass timeout ({err:#}) - \
+                 falling back to the flat floor"
+            );
+            0
+        }
+    }
+}
+
 /// Runs the pass over the whole project against a registry that already
 /// exists, spawning the bundled JS/TS plugin if nothing has needed it yet.
 /// Returns whether it actually ran (a sleeping plugin is left asleep - see
@@ -127,9 +163,10 @@ pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) ->
     if !registry.has_manifest(plugin::BUNDLED_LANGUAGE) {
         return Ok(false);
     }
+    let file_count = indexed_file_count(conn);
     registry
         .get_or_spawn(plugin::BUNDLED_LANGUAGE)
-        .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new()))
+        .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new(), file_count))
 }
 
 /// Runs the pass over the whole project for a command that has no registry
@@ -170,7 +207,8 @@ pub fn run_once(
     // the checker holding a project open is this file.
     super::write_pid_file(&pid_file, process.pid());
 
-    let outcome = process.semantic_pass(conn, Vec::new(), embedding);
+    let file_count = indexed_file_count(conn);
+    let outcome = process.semantic_pass(conn, Vec::new(), file_count, embedding);
 
     // Shut down whatever the pass did: a plugin left running behind a command
     // that has returned is a checker holding ~265MB with nothing reading its

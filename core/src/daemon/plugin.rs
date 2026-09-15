@@ -71,45 +71,83 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// is slow" failure mode, and `watcher::apply::round_trip`/
 /// `protocol::jsonrpc::read_message_with_timeout` for the mechanism that
 /// enforces them. Three separate fields, not one shared timeout, because each
-/// covers a different amount of plugin work:
+/// covers a different amount of plugin work - and, as of this task's review
+/// round, two very different evidence bars: [`file_changed`](Self::file_changed)
+/// and [`semantic_pass_file`](Self::semantic_pass_file) below are reasoned
+/// from first principles, not measured; [`semantic_pass_project`]
+/// (Self::semantic_pass_project) is measured, because a flat guess there was
+/// tried first and turned out wrong (see its own section).
 ///
-/// - [`file_changed`](Self::file_changed): one file's structural
-///   (tree-sitter) reparse plus its incremental diff - no type-checking, no
-///   cross-file work. Even a large single file is milliseconds of parsing;
-///   [`DEFAULT_FILE_CHANGED_TIMEOUT`] leaves roughly two orders of magnitude
-///   of slack for OS scheduling noise and a loaded CI box before calling the
-///   plugin wedged rather than merely slow.
-/// - [`semantic_pass_file`](Self::semantic_pass_file): the per-file semantic
-///   upgrade that rides on the very same reparse
-///   (`watcher::apply::apply_file_change`'s own doc comment) - real compiler
-///   work against an already-warm tsserver, but scoped to the handful of
+/// - **`file_changed`**: one file's structural (tree-sitter) reparse plus its
+///   incremental diff - no type-checking, no cross-file work. **Not
+///   measured** - no per-file timing exists anywhere in this repo's indexes
+///   or bench output. The reasoning: even a large single file is
+///   milliseconds of parsing, so [`DEFAULT_FILE_CHANGED_TIMEOUT`] (30s)
+///   leaves roughly two orders of magnitude of slack for OS scheduling noise
+///   and a loaded CI box before calling the plugin wedged rather than merely
+///   slow. Treat this as a guess with a wide margin, not a validated budget.
+/// - **`semantic_pass_file`**: the per-file semantic upgrade that rides on
+///   the very same reparse (`watcher::apply::apply_file_change`'s own doc
+///   comment). **Not measured either** - same gap: the bench indexes this
+///   task's `semantic_pass_project` numbers came from only record the
+///   *whole-project* pass's timestamps (`meta.bulkIndexedAt` /
+///   `meta.semanticPassAt`), never a per-file one. The reasoning: real
+///   compiler work against an already-warm tsserver, scoped to the handful of
 ///   unresolved sites one file could plausibly have introduced, matching the
 ///   per-request budget `docs/architecture/multi-language-plugins.md`'s
 ///   `LspBridge` section already calls for ("Budgets: per-request
-///   timeout..."). [`DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT`] is longer than the
-///   structural budget because it is real type-checking, not parsing, but
-///   still bounded to one file's worth of it.
-/// - [`semantic_pass_project`](Self::semantic_pass_project): the whole-
-///   project pass (`daemon::semantic::run_with_registry`/`run_once`), which
-///   type-checks across every file in the project at once, cold. No direct
-///   measurement of this pass's real duration exists anywhere in this repo as
-///   of this task - what does exist is `g-mesh-v1.md`'s *structural*
-///   (tree-sitter) bulk-walk target of "≤2 minutes on an 8+-core laptop" even
-///   at a ~100k-file/1-2GB scale, and `multi-language-plugins.md`'s own "many
-///   minutes" characterization of a comparable engine's (rust-analyzer's)
-///   cold-load cost on a large workspace. A full semantic pass is real
-///   compiler work across the whole module graph, not a parse, so it is
-///   expected to be substantially slower than the structural walk on any
-///   project large enough to notice - and this repo's own TS conformance
-///   corpus, excalidraw, is 614 files (`g-mesh-v1.md`'s corpus table),
-///   nowhere near the structural target's 100k-file scale, so a real pass
-///   over it is expected to land in low single-digit minutes.
-///   [`DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT`] (20 minutes) is chosen to sit
-///   roughly 10x above that expectation: comfortably clear of any real pass
-///   this daemon is likely to run today, while still being a finite bound -
-///   "never" is exactly the bug this task fixes. If a future measurement on a
-///   real large corpus contradicts this margin, this constant (and this
-///   comment) is what should change, not a one-off override at a call site.
+///   timeout..."). [`DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT`] (120s) is longer
+///   than the structural budget because it is real type-checking, not
+///   parsing, but still bounded to one file's worth of it - again, a guess
+///   with margin, not a validated number.
+/// - **`semantic_pass_project`**: the whole-project pass
+///   (`daemon::semantic::run_with_registry`/`run_once`), which type-checks
+///   across every file in the project at once, cold. This one *is* measured,
+///   and the first version of this comment was wrong to say no measurement
+///   existed - it undersold what `meta.bulkIndexedAt` -> `meta.semanticPassAt`
+///   deltas across a project's own index already record. Source: those
+///   deltas, read across every g-mesh-bench index under `~/.g-mesh/projects`
+///   as of 2026-09-15:
+///
+///   | corpus | n | min | p50 | p90 | max |
+///   |---|---|---|---|---|---|
+///   | excalidraw (658 `File` nodes) | 47 | 56s | 90s | ~163-174s (method-dependent) | **1475s (24.6min)**, under heavy contention from parallel bench runs sharing the machine; other tail samples 778s, 261s, 254s |
+///   | task-tracker-mcp (49 `File` nodes) | 93 | 0s | 1s | 2s | 9s |
+///
+///   The one number that matters most: a real, healthy pass on a
+///   medium-sized repo (excalidraw, 658 files) *already exceeded 20 minutes
+///   once*, even before scaling to a larger corpus. A flat 20-minute timeout
+///   would have killed that exact pass, relaunched the plugin, and had the
+///   next attempt likely die the same way - a project that never finishes
+///   its semantic layer. [`DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT`] therefore
+///   is not the timeout used directly; it is the **floor** a per-project
+///   scaled budget is clamped to, via [`RoundTripTimeouts::
+///   semantic_pass_project_timeout`]: `max(floor, file_count *
+///   `[`SEMANTIC_PASS_PER_FILE_BUDGET`]`)`.
+///     - **Floor: 20 minutes**, kept exactly at its pre-review value - it is
+///       what small/empty projects (few or zero `File` nodes) still get, and
+///       nothing in the measurement above argues for changing it.
+///     - **Per-file budget: 10 seconds.** excalidraw's worst observed rate
+///       under contention is 1475s / 658 files ~= 2.24s/file; 10s/file is
+///       ~4.5x that. Its p50 rate is 90s / 658 files ~= 0.137s/file; 10s/file
+///       is ~73x that. Both margins are deliberately generous: this budget
+///       has to cover a repo this daemon has never actually measured, not
+///       just replay the corpora above.
+///
+///   Task-tracker-mcp's own numbers (max 9s, 49 files) are there to show the
+///   floor is not accidentally starving a small project - 49 * 10s = 490s is
+///   already far below the 20-minute floor, so the floor is what it gets, and
+///   9s of real work disappears into that floor with room to spare.
+///
+///   File-count scaling is computed over the *whole* index today
+///   (`daemon::semantic::indexed_file_count`), not per language, because
+///   there is no per-language `File`-node accounting yet - `language_state`
+///   (mentioned in this task's own notes) is a later task. GM-270 (the
+///   per-language semantic scheduler) is the natural place to narrow this to
+///   "this language's own files" once that distinction exists; until then, a
+///   multi-language project's timeout is sized off every language's files
+///   combined, which only ever makes the budget *more* generous than a
+///   single language would need.
 ///
 /// Constants, not configuration (see the task this type was added for): a
 /// project's `config.toml` has no `[plugin.timeouts]` section, and none of
@@ -118,12 +156,18 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// [`RoundTripTimeouts::from_env`] reads - the same "a test can drive the
 /// real timer instead of faking the subsystem around it" escape hatch
 /// `daemon::lifecycle::PLUGIN_IDLE_ENV` already documents, and for the same
-/// reason: nobody wants a unit test to actually wait 20 minutes to prove a
-/// timeout fires.
+/// reason: nobody wants a unit test to actually wait 20 minutes (or longer,
+/// once file-count scaling is in play) to prove a timeout fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundTripTimeouts {
     pub file_changed: Duration,
     pub semantic_pass_file: Duration,
+    /// The **floor** a real whole-project semanticPass timeout is clamped
+    /// to, not the timeout itself. See
+    /// [`RoundTripTimeouts::semantic_pass_project_timeout`] for the actual
+    /// per-project value, and this type's own doc comment for the
+    /// measurement behind both the floor and the per-file budget it is
+    /// combined with.
     pub semantic_pass_project: Duration,
 }
 
@@ -134,15 +178,24 @@ pub const DEFAULT_FILE_CHANGED_TIMEOUT: Duration = Duration::from_secs(30);
 /// number.
 pub const DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// See [`RoundTripTimeouts`]'s doc comment for the evidence behind this
-/// number.
+/// number. The floor for [`RoundTripTimeouts::semantic_pass_project_timeout`],
+/// not a timeout used as-is - see that method.
 pub const DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How much whole-project semanticPass budget one indexed `File` node buys -
+/// see [`RoundTripTimeouts`]'s doc comment ("Per-file budget: 10 seconds")
+/// for the measurement this is derived from.
+pub const SEMANTIC_PASS_PER_FILE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Test-only override for [`RoundTripTimeouts::file_changed`] - real installs
 /// never set it. See [`RoundTripTimeouts`]'s doc comment.
 pub const FILE_CHANGED_TIMEOUT_ENV: &str = "G_MESH_FILE_CHANGED_TIMEOUT_MS";
 /// Test-only override for [`RoundTripTimeouts::semantic_pass_file`].
 pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_FILE_TIMEOUT_MS";
-/// Test-only override for [`RoundTripTimeouts::semantic_pass_project`].
+/// Test-only override for [`RoundTripTimeouts::semantic_pass_project`] - the
+/// floor, not the scaled timeout (there is no override for the per-file
+/// budget; tests that need a short whole-project timeout pass a small
+/// `file_count` too, since the floor is what dominates at small counts).
 pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_PROJECT_TIMEOUT_MS";
 
 impl Default for RoundTripTimeouts {
@@ -177,6 +230,23 @@ impl RoundTripTimeouts {
                 SEMANTIC_PASS_PROJECT_TIMEOUT_ENV,
             ),
         }
+    }
+
+    /// The timeout to actually give a whole-project semanticPass over a
+    /// project with `file_count` indexed `File` nodes: `self
+    /// .semantic_pass_project` as a floor, and `file_count *
+    /// `[`SEMANTIC_PASS_PER_FILE_BUDGET`]` as a per-project budget, whichever
+    /// is larger - see [`RoundTripTimeouts`]'s doc comment for the
+    /// measurement behind both numbers.
+    ///
+    /// `file_count` is clamped to `u32::MAX` before multiplying (a project
+    /// with that many files is not one this daemon has ever seen, and
+    /// overflowing the multiplication into a wildly wrong, possibly tiny,
+    /// timeout would be a worse failure than merely capping the input).
+    pub fn semantic_pass_project_timeout(&self, file_count: usize) -> Duration {
+        let file_count = u32::try_from(file_count).unwrap_or(u32::MAX);
+        let scaled = SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(file_count);
+        self.semantic_pass_project.max(scaled)
     }
 }
 
@@ -889,13 +959,22 @@ impl PluginProcess {
     /// `semanticPassAt` stays unset, try again later" - a relaunch changes
     /// nothing about that contract, it just means "later" has a live process
     /// to try against instead of a dead one.
+    ///
+    /// `file_count` is the number of indexed `File` nodes the caller already
+    /// knows about (`daemon::semantic::indexed_file_count`), used to scale
+    /// this one request's timeout via [`RoundTripTimeouts::
+    /// semantic_pass_project_timeout`] - see that method and
+    /// [`RoundTripTimeouts`]'s own doc comment for why a flat timeout here is
+    /// wrong for anything past a small project.
     pub fn semantic_pass(
         &self,
         conn: &Mutex<Connection>,
         file_paths: Vec<String>,
+        file_count: usize,
         embedding: &EmbeddingPipeline,
     ) -> Result<()> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let timeout = self.timeouts.semantic_pass_project_timeout(file_count);
         let result = {
             let mut state = self.state.lock().unwrap();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
@@ -908,7 +987,7 @@ impl PluginProcess {
                 file_paths,
                 id,
                 embedding,
-                self.timeouts.semantic_pass_project,
+                timeout,
                 &mut on_timeout,
             )
         };
@@ -1053,6 +1132,47 @@ impl PluginProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GM-271 review round: the floor must win for a project too small for
+    /// the per-file budget to matter - see `RoundTripTimeouts`'s doc comment
+    /// ("Task-tracker-mcp's own numbers... show the floor is not
+    /// accidentally starving a small project"). 49 files (task-tracker-mcp's
+    /// own `File`-node count) * 10s/file = 490s, well under the 20-minute
+    /// (1200s) floor.
+    #[test]
+    fn semantic_pass_project_timeout_uses_the_floor_for_a_small_project() {
+        let timeouts = RoundTripTimeouts::default();
+        assert_eq!(timeouts.semantic_pass_project_timeout(49), timeouts.semantic_pass_project);
+        assert_eq!(timeouts.semantic_pass_project_timeout(0), timeouts.semantic_pass_project);
+    }
+
+    /// The other half: a project large enough that the per-file budget
+    /// exceeds the floor must get the scaled value, not the flat one that
+    /// this task's review measured as too short for excalidraw's own 658
+    /// `File` nodes (a real pass there took as long as 1475s = 24.6min,
+    /// past the 20-minute floor).
+    #[test]
+    fn semantic_pass_project_timeout_scales_past_the_floor_for_a_large_project() {
+        let timeouts = RoundTripTimeouts::default();
+        let file_count = 658;
+        let expected = SEMANTIC_PASS_PER_FILE_BUDGET * file_count;
+        assert!(
+            expected > timeouts.semantic_pass_project,
+            "the fixture must actually exercise the scaled branch, not the floor"
+        );
+        assert_eq!(timeouts.semantic_pass_project_timeout(file_count as usize), expected);
+    }
+
+    /// A pathological file count must not overflow the multiplication into a
+    /// wildly wrong (and, worse, possibly small) `Duration` - it clamps to
+    /// `u32::MAX` files instead, which still comfortably exceeds the floor.
+    #[test]
+    fn semantic_pass_project_timeout_does_not_overflow_on_an_absurd_file_count() {
+        let timeouts = RoundTripTimeouts::default();
+        let huge = timeouts.semantic_pass_project_timeout(usize::MAX);
+        assert!(huge > timeouts.semantic_pass_project);
+        assert_eq!(huge, SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(u32::MAX));
+    }
 
     /// Writes `files` (relative-path, contents pairs) under `dir`, creating
     /// whatever subdirectories they need - the fixture every digest test in
