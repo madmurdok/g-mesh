@@ -478,6 +478,16 @@ impl PluginRegistry {
         &self.project_root
     }
 
+    /// The embedding pipeline every supervisor this registry spawns already
+    /// shares - GM-272's `daemon::workspace_reindex` needs the same `&Arc`
+    /// `daemon::bulk_index::walk_one_language` takes, for the same reason
+    /// every other bulk-index caller does (`EmbeddingPipeline::apply` on each
+    /// committed batch). `pub(crate)`, not `pub`: unlike `project_root`, this
+    /// has no caller outside this daemon module tree.
+    pub(crate) fn embedding(&self) -> &Arc<EmbeddingPipeline> {
+        &self.embedding
+    }
+
     /// Builds a registry over `discovered`. Spawns nothing - see this
     /// module's doc comment.
     pub fn new(
@@ -509,6 +519,56 @@ impl PluginRegistry {
     pub fn language_for(&self, file_path: &str) -> Option<&str> {
         let extension = extension_of(file_path)?;
         self.discovered.routing.get(&extension).map(String::as_str)
+    }
+
+    /// Every language whose manifest routes `file_path` as a **workspace**
+    /// file - GM-272's addition alongside extension routing above, and the
+    /// mechanism `docs/architecture/multi-language-plugins.md`'s "Editing a
+    /// Go file" data-flow paragraph describes for `go.mod`: "`watch_files` ->
+    /// `workspaceChanged` -> per-language reindex".
+    ///
+    /// A language is in the result when **both** hold:
+    ///  - its `[plugin.workspace] watch_files` (`daemon::manifest::
+    ///    WorkspaceConfig::watch_files`, already-compiled globs) matches
+    ///    `file_path`'s **file name alone** - "exact file names (any
+    ///    directory)" per the architecture doc's `plugin.toml additions`
+    ///    section, which is exactly what an exact name is as a `Glob`
+    ///    (`daemon::manifest`'s own doc comment: an exact name needs no
+    ///    separate code path from a genuine glob like `*.csproj`, since both
+    ///    compile through the same `Glob::compile_matcher`);
+    ///  - `file_path` is not [`under_excluded_dir`] of *that same manifest's*
+    ///    `exclude_dirs` - each language's exclusions are its own, matching
+    ///    `[plugin.workspace] exclude_dirs`'s own doc comment ("mirroring
+    ///    the plugin's own walk exclusions").
+    ///
+    /// Sorted, and a `Vec` rather than the first match: nothing in the
+    /// manifest schema forbids two languages from declaring the same
+    /// `watch_files` pattern (a plugin bug, or two plugins that both watch
+    /// `Makefile` for entirely different reasons), and silently routing to
+    /// only one of them would drop the other's reindex with no diagnostic at
+    /// all. Empty is the overwhelmingly common answer - every language whose
+    /// `watch_files` is empty (the bundled TS plugin among them) can never
+    /// appear here, by construction, which is also GM-272's answer to "must
+    /// not break a plugin that does not know `workspaceChanged`": a plugin
+    /// with nothing in `watch_files` is simply never a candidate for this
+    /// routing path, so it is never sent the notification, wakened for the
+    /// reindex, or spawned by it - not a special case, a direct consequence
+    /// of the same emptiness check this docstring already needs.
+    pub fn workspace_language_matches(&self, file_path: &str) -> Vec<String> {
+        let name = file_name_of(file_path);
+        let mut languages: Vec<String> = self
+            .discovered
+            .manifests
+            .values()
+            .filter(|manifest| !manifest.workspace.watch_files.is_empty())
+            .filter(|manifest| {
+                manifest.workspace.watch_files.iter().any(|glob| glob.compile_matcher().is_match(name))
+            })
+            .filter(|manifest| !under_excluded_dir(file_path, &manifest.workspace.exclude_dirs))
+            .map(|manifest| manifest.language.clone())
+            .collect();
+        languages.sort();
+        languages
     }
 
     /// Whether a plugin was discovered for `language` at all - the same
@@ -665,7 +725,36 @@ impl PluginRegistry {
         reservation.settle(spawned)
     }
 
-    /// The watcher thread's entry point, with routing in front of it: hands
+    /// The watcher thread's actual entry point (GM-272): decides, for one
+    /// settled path, whether it is a **workspace** file for some language
+    /// ([`workspace_language_matches`](Self::workspace_language_matches)) or
+    /// an ordinary source file routed by extension
+    /// ([`file_changed`](Self::file_changed)) - never both, and in that
+    /// order, matching the architecture doc's "routes a settled path whose
+    /// file name matches a manifest's watch_files... to that language"
+    /// wording: a workspace match is a *different kind* of event for that
+    /// path (a per-language reindex, not a reparse of the path itself - a
+    /// `go.mod` is never itself an indexable source file), so it supersedes
+    /// extension routing for the same settled path rather than running
+    /// alongside it.
+    ///
+    /// Every matching language is reindexed (see [`workspace_language_matches`](Self::workspace_language_matches)
+    /// on why that can be more than one), each independently - one
+    /// language's reindex failing must not skip another's, the same
+    /// "failures are reported and dropped, never propagated" contract every
+    /// other watcher-thread entry point in this module already has.
+    pub fn route_settled_path(&self, conn: &Mutex<Connection>, file_path: String) {
+        let workspace_languages = self.workspace_language_matches(&file_path);
+        if workspace_languages.is_empty() {
+            self.file_changed(conn, file_path);
+            return;
+        }
+        for language in workspace_languages {
+            self.workspace_file_changed(conn, &language, &file_path);
+        }
+    }
+
+    /// The watcher thread's ordinary (extension-routed) entry point: hands
     /// `file_path` to the supervisor for the language that claims it,
     /// spawning that plugin if this is the first file of its kind.
     ///
@@ -675,6 +764,23 @@ impl PluginRegistry {
     /// dropped" contract `PluginSupervisor::file_changed` already has, for
     /// the same reason: one file the daemon cannot index must not take the
     /// watcher thread, or the other languages, down with it.
+    ///
+    /// GM-272 adds one more silent skip, alongside the existing unclaimed-
+    /// extension one: a file [`under_excluded_dir`] of the claiming
+    /// language's own `[plugin.workspace] exclude_dirs` is not routed at
+    /// all, matching the architecture doc's "watcher should never route to
+    /// it either" for that field, and mirroring
+    /// [`workspace_language_matches`](Self::workspace_language_matches)'s
+    /// identical check on the workspace-routing side - so `dist/bundle.js`
+    /// under the bundled TS plugin's own `exclude_dirs = ["node_modules",
+    /// "dist"]` stops reaching a live plugin process here exactly as it
+    /// already stops being walked by that plugin's own bulk index. Silent,
+    /// not logged via [`unroutable_notice`](Self::unroutable_notice): that
+    /// helper's whole point is naming an extension *nothing* claims, and an
+    /// excluded file's extension is claimed just fine - it is the directory
+    /// that says not to route this one instance of it, which is exactly as
+    /// ordinary and expected as `.gitignore` already is at the filesystem-
+    /// watch layer.
     pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
         let Some(language) = self.language_for(&file_path).map(str::to_string) else {
             if let Some(notice) = self.unroutable_notice(&file_path) {
@@ -683,11 +789,43 @@ impl PluginRegistry {
             return;
         };
 
+        if let Some(manifest) = self.discovered.manifests.get(&language) {
+            if under_excluded_dir(&file_path, &manifest.workspace.exclude_dirs) {
+                return;
+            }
+        }
+
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
             Err(err) => eprintln!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
+            ),
+        }
+    }
+
+    /// Routes one workspace-file match ([`workspace_language_matches`](Self::workspace_language_matches))
+    /// to `language`'s per-language reindex (`daemon::workspace_reindex`),
+    /// spawning that language's supervisor if this is the first file of its
+    /// kind - the workspace-routing counterpart to
+    /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
+    /// with the same "failures are reported and dropped" contract.
+    fn workspace_file_changed(&self, conn: &Mutex<Connection>, language: &str, changed_file: &str) {
+        match self.get_or_spawn(language) {
+            Ok(supervisor) => {
+                if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
+                {
+                    eprintln!(
+                        "g-mesh daemon: failed to reindex the {language} workspace after \
+                         {changed_file} changed: {err:#} - {language}'s index may now be partial \
+                         until the next successful reindex (the same best-effort contract a \
+                         failed cold-start bulk walk already has)"
+                    );
+                }
+            }
+            Err(err) => eprintln!(
+                "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
+                 after {changed_file} changed: {err:#}"
             ),
         }
     }
@@ -897,6 +1035,38 @@ impl PluginRegistry {
 fn extension_of(file_path: &str) -> Option<String> {
     let extension = Path::new(file_path).extension()?.to_str()?;
     Some(format!(".{}", extension.to_lowercase()))
+}
+
+/// `some/dir/go.mod` -> `"go.mod"` - the final path segment, matching the
+/// project-relative, forward-slash-joined convention `relative_wire_path`
+/// (`daemon::mod`) already produces for every path this module ever sees.
+/// A path with no `/` at all (a root-level file) returns itself unchanged.
+fn file_name_of(file_path: &str) -> &str {
+    file_path.rsplit('/').next().unwrap_or(file_path)
+}
+
+/// Whether `file_path` sits under a directory literally named one of
+/// `exclude_dirs`, checked against **every path segment except the file name
+/// itself** - the architecture doc's `[plugin.workspace] exclude_dirs`
+/// ("directory names... matched by exact name, not glob") and this task's
+/// own decision 5 ("match directory NAMES on any path segment, not
+/// prefixes"): `vendor/pkg/build.alpha` is excluded by `exclude_dirs =
+/// ["vendor"]` exactly as `pkg/vendor/build.alpha` is - the excluded name can
+/// sit at any depth, not only as a leading path component - while
+/// `vendored-tools/build.alpha` is **not**, because `"vendored-tools" !=
+/// "vendor"` as a whole segment; a prefix/substring match would wrongly
+/// exclude it.
+///
+/// Empty `exclude_dirs` (the common case - most manifests declare none, and
+/// every fixture that predates GM-272) short-circuits without walking the
+/// path at all.
+fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    let mut segments = file_path.split('/');
+    segments.next_back(); // the file name itself names no directory
+    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
 }
 
 #[cfg(test)]
@@ -1665,5 +1835,189 @@ mod tests {
         assert_eq!(registry.language_for("app.py"), None);
         registry.file_changed(&conn, "app.py".to_string());
         assert!(registry.supervisors.lock().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // GM-272: workspace-file routing (`workspace_language_matches`,
+    // `under_excluded_dir`, `route_settled_path`). The end-to-end "a
+    // matched language actually gets reindexed" acceptance test lives in
+    // `daemon::workspace_reindex`'s own test module, alongside the rest of
+    // the reindex machinery it exercises - what belongs here is the pure
+    // routing *decision*: which language(s) a settled path matches, and
+    // whether `exclude_dirs` rules a match out, both answerable with no
+    // plugin process involved at all.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn file_name_of_returns_the_final_path_segment() {
+        assert_eq!(file_name_of("go.mod"), "go.mod");
+        assert_eq!(file_name_of("a/b/go.mod"), "go.mod");
+        assert_eq!(file_name_of(""), "");
+    }
+
+    #[test]
+    fn under_excluded_dir_matches_a_whole_segment_at_any_depth_never_a_prefix() {
+        let excluded = vec!["vendor".to_string()];
+
+        assert!(under_excluded_dir("vendor/build.alpha", &excluded), "a leading segment must match");
+        assert!(
+            under_excluded_dir("pkg/vendor/deep/build.alpha", &excluded),
+            "a segment at any depth must match, not only a leading one"
+        );
+        assert!(
+            !under_excluded_dir("vendored-tools/build.alpha", &excluded),
+            "a segment that merely starts with the excluded name is not a match - \
+             no prefix matching"
+        );
+        assert!(
+            !under_excluded_dir("build.alpha", &excluded),
+            "the file name itself is never checked as a directory segment"
+        );
+        assert!(
+            !under_excluded_dir("src/vendor.go", &excluded),
+            "the excluded name appearing only in the file name, not as a directory, is not a match"
+        );
+    }
+
+    #[test]
+    fn under_excluded_dir_is_false_with_no_exclude_dirs_configured() {
+        assert!(!under_excluded_dir("vendor/build.alpha", &[]));
+    }
+
+    /// A registry over one fake language installed with `[plugin.workspace]
+    /// watch_files`/`exclude_dirs`, via [`test_plugin::install_with_workspace`],
+    /// the workspace-routing analog of [`registry_over`], which only ever
+    /// installs bare extension-claiming fixtures.
+    fn registry_over_workspace(
+        language: &str,
+        extension: &str,
+        watch_files: &[&str],
+        exclude_dirs: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PluginRegistry) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+
+        let dir = test_plugin::install_with_workspace(
+            plugins.path(),
+            language,
+            &[extension],
+            watch_files,
+            exclude_dirs,
+        );
+
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+        (project, plugins, dir, registry)
+    }
+
+    #[test]
+    fn workspace_language_matches_an_exact_watched_file_name_in_any_directory() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+
+        assert_eq!(registry.workspace_language_matches("go.mod"), vec!["alpha".to_string()]);
+        assert_eq!(
+            registry.workspace_language_matches("nested/dir/go.mod"),
+            vec!["alpha".to_string()],
+            "watch_files matches by file name alone, any directory"
+        );
+        assert!(
+            registry.workspace_language_matches("go.sum").is_empty(),
+            "a different file name must not match"
+        );
+    }
+
+    /// This task's own glob-matching acceptance criterion (e.g. `*.csproj`
+    /// from the architecture doc's paper stress test), reproduced with a
+    /// fixture extension so it exercises the exact same `Glob` compilation
+    /// path a real `*.csproj` pattern would.
+    #[test]
+    fn workspace_language_matches_a_glob_pattern() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("csharp", ".cs-src", &["*.csproj"], &[]);
+
+        assert_eq!(registry.workspace_language_matches("MyProject.csproj"), vec!["csharp".to_string()]);
+        assert_eq!(
+            registry.workspace_language_matches("src/nested/Other.csproj"),
+            vec!["csharp".to_string()]
+        );
+        assert!(
+            registry.workspace_language_matches("MyProject.sln").is_empty(),
+            "a name the glob does not match must not match"
+        );
+    }
+
+    #[test]
+    fn workspace_language_matches_excludes_a_path_under_the_manifests_own_exclude_dirs() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &["vendor"]);
+
+        assert_eq!(
+            registry.workspace_language_matches("go.mod"),
+            vec!["alpha".to_string()],
+            "an ordinary path is still routed"
+        );
+        assert!(
+            registry.workspace_language_matches("vendor/go.mod").is_empty(),
+            "a go.mod-like file under an excluded directory must not be routed at all"
+        );
+    }
+
+    /// A manifest whose `watch_files` is empty (every fixture predating
+    /// GM-272, and the bundled TS plugin itself) never matches anything -
+    /// the construction this module's `notify_workspace_changed` doc comment
+    /// relies on to say a plugin like TS never even reaches the workspace-
+    /// routing path.
+    #[test]
+    fn a_manifest_with_no_watch_files_never_matches_the_workspace_routing() {
+        let (_project, _plugins, _dirs, registry) = registry_over(&["python"]);
+
+        assert!(registry.workspace_language_matches("go.mod").is_empty());
+        assert!(registry.workspace_language_matches("anything").is_empty());
+    }
+
+    #[test]
+    fn route_settled_path_falls_back_to_ordinary_extension_routing_with_no_workspace_match() {
+        let (_project, _plugins, dirs, registry) = registry_over(&["python"]);
+        let conn = test_plugin::empty_index();
+
+        registry.route_settled_path(&conn, "src/app.python-src".to_string());
+
+        assert_eq!(
+            test_plugin::spawns(&dirs[0]).len(),
+            1,
+            "an ordinary source file with no workspace match must still reach the plugin \
+             through extension routing"
+        );
+    }
+
+    #[test]
+    fn file_changed_does_not_route_a_path_under_its_own_languages_exclude_dirs() {
+        let (_project, _plugins, dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &[], &["vendor"]);
+        let conn = test_plugin::empty_index();
+
+        registry.file_changed(&conn, "vendor/thirdparty.alpha-src".to_string());
+        assert!(
+            test_plugin::spawns(&dir).is_empty(),
+            "a file under the claiming language's own exclude_dirs must not be routed at all"
+        );
+
+        registry.file_changed(&conn, "src/app.alpha-src".to_string());
+        assert_eq!(
+            test_plugin::spawns(&dir).len(),
+            1,
+            "an ordinary file of the same language, outside exclude_dirs, must still route"
+        );
     }
 }

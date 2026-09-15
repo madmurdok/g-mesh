@@ -307,6 +307,16 @@ impl PluginSupervisor {
         &self.manifest.language
     }
 
+    /// This supervisor's own manifest - GM-272's `daemon::workspace_reindex`
+    /// needs the full `PluginManifest` (its `command`/`args` for the one-shot
+    /// bulk walk, its `capabilities.semantic_pass`), not just [`language`](Self::language).
+    /// Never a *different* manifest than the one this supervisor was spawned
+    /// with - see this struct's own doc comment on the `manifest` field for
+    /// why that invariant matters.
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
     /// The pid of the plugin process right now, or `None` while it is asleep.
     ///
     /// Changes across a crash relaunch and across a sleep/wake cycle, which is
@@ -457,6 +467,44 @@ impl PluginSupervisor {
         self.touch();
         process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
         Ok(true)
+    }
+
+    /// Runs `f` with this supervisor's own serialization lock held - the same
+    /// lock [`file_changed`](Self::file_changed)/[`replay_pending`](Self::replay_pending)/
+    /// [`ensure_fresh`](Self::ensure_fresh)/[`semantic_pass`](Self::semantic_pass)
+    /// already take, each for the duration of its own single round trip to
+    /// the plugin.
+    ///
+    /// GM-272's per-language workspace reindex (`daemon::workspace_reindex`)
+    /// is the motivating caller: deleting this language's rows and re-walking
+    /// them has to be atomic with respect to an ordinary settled edit to one
+    /// of this language's files, or the two can race - a `fileChanged` diff
+    /// committed between the delete and the re-walk would either resurrect
+    /// what the delete just removed (if the walk's own batches land after
+    /// it) or be silently wiped (if the delete runs after it committed). This
+    /// method is what lets that whole sequence share the *one* lock
+    /// `file_changed` already contends on, instead of inventing a second,
+    /// parallel lock a caller could take in the wrong order against this
+    /// one - see this module's own doc comment ("Lock order") for the rule
+    /// `f` itself must keep honoring if it goes on to touch the connection:
+    /// this lock first, the connection's inside it, never the other way
+    /// round.
+    ///
+    /// `f` is handed the live process, if the plugin is currently awake, so
+    /// it can send that process something (GM-272's `workspaceChanged`
+    /// notification) without a second lookup under the same lock. Nothing
+    /// here wakes a sleeping plugin - matching every other method on this
+    /// type, which treats "not currently needed" as a reason not to spawn a
+    /// process a caller has no real work for right now; a workspace reindex
+    /// still runs its delete/walk/link phase regardless (a fresh one-shot
+    /// process the caller owns, not this supervisor's own `inner.process`,
+    /// per `daemon::bulk_index`'s own reasoning for why a bulk walk is
+    /// always its own process), and the reindex is what actually needs the
+    /// language up to date - not this notification.
+    pub fn with_exclusive_access<T>(&self, f: impl FnOnce(Option<&PluginProcess>) -> T) -> T {
+        let inner = self.inner.lock().unwrap();
+        self.touch();
+        f(inner.process.as_ref())
     }
 
     /// Synchronously brings `file_path` up to date if it has changed since it

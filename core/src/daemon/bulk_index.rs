@@ -177,7 +177,16 @@ pub fn run(
 /// independently readable, and so a failure partway through one language's
 /// walk (an unreadable line, a spawn failure, a nonzero exit) can name that
 /// language directly.
-fn walk_one_language(
+///
+/// `pub(crate)` rather than private since GM-272: `daemon::workspace_reindex`
+/// reuses this exact function, unchanged, to re-walk a *single* language
+/// after its rows were deleted - the same one-shot `--bulk-index` process
+/// this module already spawns for the cold-start walk, just invoked for one
+/// manifest instead of iterated over every discovered one. Nothing about the
+/// batching/commit contract above changes for that caller: a per-language
+/// reindex is still safe to cut anywhere, for the same reason a cold-start
+/// walk is (see this module's own doc comment above [`run`]).
+pub(crate) fn walk_one_language(
     project_root: &Path,
     manifest: &PluginManifest,
     conn: &Mutex<Connection>,
