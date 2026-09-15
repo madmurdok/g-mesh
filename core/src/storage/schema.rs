@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Bumped whenever the DDL below changes in a way that isn't backward
 /// compatible. No migration framework in v1 - a mismatch means a full
@@ -41,7 +41,25 @@ use rusqlite::{Connection, OptionalExtension};
 /// path every other column here has taken; the column is nullable and reset
 /// by a wipe exactly like `bulkIndexedAt`, so a fresh index after the bump
 /// starts owing both facts, not just the new one.
-pub const CURRENT_SCHEMA_VERSION: &str = "7";
+///
+/// Bumped to "8" for GM-264's core graph generalization
+/// (docs/architecture/multi-language-plugins.md, "Chosen Approach" > Core
+/// graph generalization): `containers`, `placeholder_targets` and
+/// `language_state` are new tables, `nodes` gains `container` and
+/// `visibility`/`visibilityContainer` (with `exported` becoming a `GENERATED
+/// ALWAYS` column derived from `visibility` rather than a value `apply_diff`
+/// writes - see that function's own comment on why), and `edges.source`'s
+/// CHECK narrows from the two-value v1 pair (`'tree-sitter' | 'ts-compiler'`)
+/// to the tier alone (`'syntactic' | 'semantic'`), with the engine that used
+/// to be baked into it moving to its own new `engine` column. None of this
+/// is expressible as an `ALTER TABLE` this codebase's "no migration
+/// framework" rule would accept even if it wanted to - the `exported` column
+/// in particular has to be *dropped and recreated* as generated, which
+/// SQLite has no `ALTER TABLE` form for at all - so it takes the version
+/// bump every schema change here has taken, and every existing index pays
+/// the one-time wipe-and-reindex the design doc's Constraints section
+/// accepts for this release.
+pub const CURRENT_SCHEMA_VERSION: &str = "8";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -96,26 +114,77 @@ pub const CURRENT_INDEXER_VERSION: &str = "1";
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md).
 const DDL: &str = r#"
+-- `visibility`/`visibilityContainer` are the storage mirror of
+-- `protocol::types::Visibility` (design doc: Data Model > Visibility).
+-- **Two columns, not one packed string** (`'container:<key>'`), because
+-- GM-266's linker needs "every node visible from container X" to be a plain
+-- indexed equality - `visibilityContainer = ?` - rather than a `LIKE` or a
+-- substring split on every candidate row; a single TEXT column would force
+-- one or the other. `visibility` alone is the enum (`'public' | 'file' |
+-- 'container'`); `visibilityContainer` is NULL except when `visibility =
+-- 'container'`, where it holds the key from `Visibility::Container(key)` -
+-- the same nullable-unless-relevant shape `edges.toDeclaration` already uses
+-- for "this column means nothing until a specific state applies". The
+-- container-scoped check itself (is the requester's own container `key` or a
+-- descendant of it, via `containers.parentKey`) still needs a parent-chain
+-- walk no single `WHERE` clause can express, and that walk is GM-266's to
+-- write - this column only has to make the equality half of it cheap.
+--
+-- DEFAULT 'file' - not 'public' - so a row written by any of this schema's
+-- own tests or by a future writer that has no opinion on visibility lands
+-- exactly where the old `exported INTEGER NOT NULL DEFAULT 0` default did:
+-- unexported. See `exported`'s own comment just below for how the two stay
+-- identical in meaning.
+--
+-- `container` (bottom of the table) is a different fact from
+-- `visibilityContainer`: it is the language-defined unit this *declaration*
+-- is a member of (Data Model > Logical containers - a Go import path, a Rust
+-- module path, ...), while `visibilityContainer` is who may *see* it, and the
+-- two disagree exactly for `pub(crate)`/`pub(super)` (visible from an
+-- ancestor container, declared in a descendant one). Nothing in this task
+-- populates it beyond the flat column and `idx_nodes_container` below -
+-- container *nodes* (the `containers` table's own rows, membership counts,
+-- GC) are GM-265's to materialize, per the design doc's Rollout table.
 CREATE TABLE IF NOT EXISTS nodes (
-    id              TEXT PRIMARY KEY,
-    kind            TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    qualifiedName   TEXT NOT NULL,
-    filePath        TEXT NOT NULL,
-    startLine       INTEGER NOT NULL,
-    startCol        INTEGER NOT NULL,
-    endLine         INTEGER NOT NULL,
-    endCol          INTEGER NOT NULL,
-    signature       TEXT,
-    exported        INTEGER NOT NULL DEFAULT 0,
-    docComment      TEXT,
-    language        TEXT NOT NULL,
-    nativeKind      TEXT,
-    hasSyntaxErrors INTEGER NOT NULL DEFAULT 0
+    id                   TEXT PRIMARY KEY,
+    kind                 TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    qualifiedName        TEXT NOT NULL,
+    filePath             TEXT NOT NULL,
+    startLine            INTEGER NOT NULL,
+    startCol             INTEGER NOT NULL,
+    endLine              INTEGER NOT NULL,
+    endCol               INTEGER NOT NULL,
+    signature            TEXT,
+    visibility           TEXT NOT NULL DEFAULT 'file' CHECK (visibility IN ('public', 'file', 'container')),
+    visibilityContainer  TEXT,
+    -- A `GENERATED ALWAYS ... STORED` column, not a value `apply_diff`
+    -- writes: v1's `exported INTEGER NOT NULL DEFAULT 0` used to be set by
+    -- hand on every upsert, which is exactly the kind of "two places have to
+    -- agree" a future writer forgets - see `storage::write::apply_diff`'s own
+    -- comment on why it no longer accepts this column at all. Deriving it in
+    -- SQLite instead means every reader (`get_file_outline` chief among them
+    -- - see the design doc's Data Model > Visibility: "exported stays as a
+    -- *derived storage column*, so get_file_outline's output does not
+    -- change") gets the same byte-identical `SELECT * FROM nodes` it always
+    -- has, and there is no code path left that *can* disagree with
+    -- `visibility` about whether a node is public.
+    exported             INTEGER NOT NULL GENERATED ALWAYS AS (CASE visibility WHEN 'public' THEN 1 ELSE 0 END) STORED,
+    docComment           TEXT,
+    language             TEXT NOT NULL,
+    nativeKind           TEXT,
+    hasSyntaxErrors      INTEGER NOT NULL DEFAULT 0,
+    container            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_filePath ON nodes(filePath);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualifiedName ON nodes(qualifiedName);
+-- `(language, container)`, matching `containers`' own `UNIQUE (language,
+-- key)` below: a container key is only unique *within* a language (Data
+-- Model > Logical containers table - a Go import path and a Rust module path
+-- can collide as bare strings), so every lookup of "this container's
+-- members" has to filter on both columns together, never `container` alone.
+CREATE INDEX IF NOT EXISTS idx_nodes_container ON nodes(language, container);
 
 -- One row per declaration of a symbol that has more than one - overload
 -- signatures beside their implementation, an interface or a namespace written
@@ -151,18 +220,133 @@ CREATE TABLE IF NOT EXISTS declarations (
 -- `edgeIdFor` in plugins/typescript/src/extract.ts), so one caller calling two
 -- overloads of the same function stores both bindings instead of one
 -- overwriting the other.
+-- `source` was the two-value pair `'tree-sitter' | 'ts-compiler'` through
+-- schema "7" - v1's *tier* and its one bundled engine conflated into a single
+-- CHECK (design doc: Data Model > Edge source). Splitting them is what lets a
+-- Go or Rust plugin report its own engine (`go-types`, `rust-analyzer`, ...)
+-- with no further schema change: `source` narrows to the closed tier alone
+-- (queries and code branch on this, and only this), and `engine` is the free
+-- label everything else moves into - diagnostic only, never matched against
+-- in a `WHERE` clause the way `source` is. Migration is moot in practice
+-- (`tree-sitter` -> `('syntactic', 'tree-sitter')`, `ts-compiler` ->
+-- `('semantic', 'ts-compiler')`), because the schema version bump this table
+-- change is part of wipes and reindexes every existing project regardless -
+-- see `CURRENT_SCHEMA_VERSION`'s own comment.
 CREATE TABLE IF NOT EXISTS edges (
     id            TEXT PRIMARY KEY,
     fromId        TEXT NOT NULL REFERENCES nodes(id),
     toId          TEXT NOT NULL REFERENCES nodes(id),
     kind          TEXT NOT NULL,
-    source        TEXT NOT NULL CHECK (source IN ('tree-sitter', 'ts-compiler')),
+    source        TEXT NOT NULL CHECK (source IN ('syntactic', 'semantic')),
+    engine        TEXT NOT NULL,
     resolved      INTEGER NOT NULL DEFAULT 0,
     toDeclaration INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_fromId ON edges(fromId);
 CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
+
+-- One row per logical container actually present in the index - a Go
+-- package, a Rust module, ... (design doc: Data Model > Logical containers).
+-- `nodeId` is the container's own node (an ordinary `Module` row with
+-- `nativeKind = 'container'`, `filePath = ''` - see the design doc for the
+-- id scheme), not a member; a member points *at* its container through
+-- `nodes.container` above, a plain key string, not a foreign key onto this
+-- table - the two are deliberately not joined by an FK, because nothing in
+-- this task ever writes a row here (see the comment below).
+--
+-- **Not populated by GM-264.** Materializing a node for a key the first time
+-- a member is upserted, maintaining `memberCount`, and GCing an empty
+-- container are all core-owned behaviour the design doc assigns to
+-- `graph::containers`, which does not exist yet (Rollout: GM-265). The table
+-- is created now, with `idx_nodes_container` above, purely so the schema
+-- bump that forces every project to reindex happens exactly once for this
+-- whole area of the design rather than once per table that eventually lands
+-- in it - the same reasoning `storage::vectors`' own DDL comment gives for
+-- why `vectors` shipped in schema "6" ahead of the code that filled it.
+CREATE TABLE IF NOT EXISTS containers (
+    nodeId      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    language    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    parentKey   TEXT,
+    memberCount INTEGER NOT NULL,
+    UNIQUE (language, key)
+);
+
+-- What a placeholder node (`nativeKind` `pending_symbol` | `reexport` |
+-- `resolved_module`) is waiting on - the storage mirror of
+-- `protocol::types::PlaceholderTarget`, and the row form of what used to be
+-- packed into a placeholder's own `qualifiedName` as a `<file>#<name>`
+-- string (design doc: Data Model > Structured placeholder targets;
+-- `graph::symbol_links`' and `graph::imports`' module docs describe the old
+-- convention this replaces on the wire, though **this task changes storage
+-- only** - the linker itself still parses `qualifiedName` exactly as before,
+-- per this task's own scope). `nodeId` is 1:0-or-1 with `nodes` - a
+-- placeholder has exactly one target, an ordinary declaration has none - the
+-- same shape `storage::vectors` already uses for "this node has at most one
+-- of these".
+--
+-- `scopeKind`/`scope` and `keyKind`/`key` are two independent two-valued
+-- facts, not one four-valued column, because the linker contract (design
+-- doc: Interfaces > Linker contract) branches on them independently: a
+-- `name` key can be scoped to either a `file` or a `container`, and so can a
+-- `qualifiedName` key - collapsing the pair into one enum would just move the
+-- branching into a string convention this table exists to get away from.
+--
+-- `fromContainer` is nullable (only a requester with a container has one -
+-- every placeholder from a language with no containers, TS included, leaves
+-- it NULL) and `fromFile` is not (every placeholder has a requesting file,
+-- since `file`-scoped visibility has to be checkable regardless of whether
+-- the *target* is container-scoped). `fromFile` is not part of the wire's
+-- `PlaceholderTarget` struct at all - `apply_diff` fills it from the
+-- placeholder node's own `filePath`, which is already the requester's file
+-- by the existing convention (`graph::symbol_links`' module doc: "filePath is
+-- the *importing* file").
+CREATE TABLE IF NOT EXISTS placeholder_targets (
+    nodeId        TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    scopeKind     TEXT NOT NULL CHECK (scopeKind IN ('file', 'container')),
+    scope         TEXT NOT NULL,
+    keyKind       TEXT NOT NULL CHECK (keyKind IN ('name', 'qualifiedName')),
+    key           TEXT NOT NULL,
+    fromContainer TEXT,
+    fromFile      TEXT NOT NULL
+);
+
+-- The shape every linker lookup needs: "placeholders waiting on (this scope
+-- kind, this scope, this key)" - see `graph::symbol_links`'s "new export in a
+-- file" trigger today, and the design doc's Interfaces > Linker contract
+-- step 1 ("Candidates") for the container-scoped counterpart GM-266 adds.
+CREATE INDEX IF NOT EXISTS idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
+
+-- Per-language index state - the roll-up `meta.bulkIndexedAt`/
+-- `semanticPassAt` are built from (design doc: Data Model > Per-language
+-- index state). One row per language `storage::schema::record_language_
+-- bulk_indexed`/`record_language_semantic_pass` has ever recorded a fact
+-- for - not one row per language *discovered*, so a plugin that was
+-- discovered but never actually walked (nothing routes to it yet) leaves no
+-- row rather than a row of NULLs indistinguishable from "walked, pass owed".
+--
+-- `bulkIndexedAt`/`semanticPassAt` are this table's own per-language mirror
+-- of `meta`'s project-wide columns of the same name, and follow the same
+-- rule: NULL until that language's whole-project fact has completed once,
+-- independent of every other language's. `pluginFingerprint` is
+-- `daemon::plugin::fingerprint`'s digest of the plugin build that produced
+-- the *most recent* `bulkIndexedAt` for this language, when that digest was
+-- readily available at the write site (`daemon::bulk_index::walk_one_
+-- language`, which already holds the manifest); every other writer of this
+-- table (the semantic-pass call sites, which only ever touch the row a bulk
+-- index already created) leaves it untouched. It is not yet read by
+-- anything - `daemon::plugin::fingerprint` is already folded into `meta.
+-- indexer_version` via `daemon::registry::indexer_version`, which is what
+-- actually triggers a reindex today - but it is the natural place a future
+-- per-language staleness check would look, so it is captured now rather than
+-- thrown away at the one site that has it for free.
+CREATE TABLE IF NOT EXISTS language_state (
+    language          TEXT PRIMARY KEY,
+    bulkIndexedAt     TEXT,
+    semanticPassAt    TEXT,
+    pluginFingerprint TEXT
+);
 
 -- bulkIndexedAt is NULL until a full project walk has completed at least
 -- once (see daemon::bulk_index). Deliberately not derived from "are there
@@ -307,12 +491,109 @@ pub fn bulk_index_completed(conn: &Connection) -> Result<bool> {
     Ok(matches!(recorded, Some(Some(_))))
 }
 
-/// Marks the project as fully walked. Written only after the last batch of a
-/// bulk index has been committed, so a crash mid-walk leaves it unset and the
-/// next daemon start redoes the walk (idempotent - every batch is an upsert).
+/// Every language currently "present" in the index, for the roll-up
+/// [`record_bulk_index`]/[`record_semantic_pass`] compute below - defined as
+/// "has at least one `File` node", not "was discovered" or "has a
+/// `language_state` row". A plugin that was *discovered* but never matched a
+/// single file in this project (GM-264's own multi-language test fixtures,
+/// say) would otherwise block the roll-up forever waiting on a fact that
+/// language has no reason to ever record; a `File`-node count is the same
+/// signal `daemon::semantic::indexed_file_count` already uses to size a
+/// pass's timeout, for the same underlying reason - it is the cheapest thing
+/// already in the table that means "this language actually has content
+/// here".
+fn present_languages(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT language FROM nodes WHERE kind = 'File'")
+        .context("failed to prepare the present-language query")?;
+    let rows = stmt.query_map([], |row| row.get(0)).context("failed to query the present languages")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the present language set")
+}
+
+/// Whether every language [`present_languages`] names has a non-NULL
+/// `language_state.<column>` - the shared roll-up condition behind both
+/// [`record_bulk_index`] and [`record_semantic_pass`]. `column` is always one
+/// of this module's own two literal strings (`"bulkIndexedAt"` /
+/// `"semanticPassAt"`), never external input, so interpolating it into the
+/// query text is as safe as it would be to hand-write two near-identical
+/// functions - which this exists to avoid.
+///
+/// Vacuously `true` when no language is present at all (an index with no
+/// `File` nodes yet, or a project none of whose discovered plugins matched
+/// anything): there is nothing to wait on, so the roll-up fires immediately,
+/// exactly like the old unconditional `UPDATE meta SET ... = CURRENT_TIMESTAMP`
+/// this replaces did for the same case.
+fn every_present_language_has(conn: &Connection, column: &str) -> Result<bool> {
+    for language in present_languages(conn)? {
+        let recorded: Option<Option<String>> = conn
+            .query_row(
+                &format!("SELECT {column} FROM language_state WHERE language = ?1"),
+                params![language],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("failed to read language_state.{column} for {language}"))?;
+        if !matches!(recorded, Some(Some(_))) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Upserts `language`'s `language_state.bulkIndexedAt` to now - the per-
+/// language half of [`record_bulk_index`]'s roll-up (design doc: Data Model >
+/// Per-language index state). Called once per language from
+/// `daemon::bulk_index::walk_one_language`, right after that language's own
+/// walk finishes, which is the only place that reliably knows *which*
+/// language just completed - `record_bulk_index` itself, called once after
+/// every language's walk is done, no longer takes a language at all and only
+/// re-checks the roll-up condition.
+///
+/// `plugin_fingerprint` is `daemon::plugin::fingerprint`'s digest of the
+/// plugin build that produced this walk, when the caller has it "readily
+/// available" (this task's own scope note) - `walk_one_language` does,
+/// because it already holds the `PluginManifest`. `None` leaves whatever
+/// `pluginFingerprint` this language already had untouched (via `COALESCE`),
+/// rather than overwriting a real value with a gap - the column has no other
+/// reader yet (see `language_state`'s own DDL comment), so a caller with
+/// nothing to report should not erase what an earlier caller did.
+pub fn record_language_bulk_indexed(
+    conn: &Connection,
+    language: &str,
+    plugin_fingerprint: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO language_state (language, bulkIndexedAt, pluginFingerprint)
+         VALUES (?1, CURRENT_TIMESTAMP, ?2)
+         ON CONFLICT(language) DO UPDATE SET
+            bulkIndexedAt = excluded.bulkIndexedAt,
+            pluginFingerprint = COALESCE(excluded.pluginFingerprint, language_state.pluginFingerprint)",
+        params![language, plugin_fingerprint],
+    )
+    .with_context(|| format!("failed to record that {language} was bulk-indexed"))?;
+    Ok(())
+}
+
+/// Re-checks the project-wide roll-up and, if every present language's
+/// `language_state.bulkIndexedAt` is now set, marks the project as fully
+/// walked. Written only after the last batch of a bulk index has been
+/// committed and every language's own [`record_language_bulk_indexed`] call
+/// has already landed (`daemon::bulk_index::run` walks every discovered
+/// language, in order, before returning - see its own doc comment), so a
+/// crash mid-walk leaves both the per-language row and this roll-up unset,
+/// and the next daemon start redoes the walk (idempotent - every batch is an
+/// upsert).
+///
+/// Takes no language itself, unlike [`record_language_bulk_indexed`]: every
+/// caller here (`daemon::mod`'s cold start, `cli::init`, `cli::reindex`)
+/// calls this exactly once, after *every* language's own walk has already
+/// recorded its row - the fact this function writes is a property of the
+/// whole project, not of any one language, which is what "roll-up" means.
 pub fn record_bulk_index(conn: &Connection) -> Result<()> {
-    conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", [])
-        .context("failed to record bulkIndexedAt")?;
+    if every_present_language_has(conn, "bulkIndexedAt")? {
+        conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+            .context("failed to record bulkIndexedAt")?;
+    }
     Ok(())
 }
 
@@ -336,17 +617,51 @@ pub fn semantic_pass_completed(conn: &Connection) -> Result<bool> {
     Ok(matches!(recorded, Some(Some(_))))
 }
 
-/// Marks the whole-project semantic pass complete. Written only after
-/// `daemon::semantic::run_with_registry` / `run_once` returns `Ok(_)` - both
-/// `Ok(true)` (the pass actually ran) and `Ok(false)` (no bundled plugin was
-/// discovered, so nothing was ever owed) count as complete, the same way
-/// `run_once`'s own doc comment treats a missing plugin as a legitimate
-/// install rather than a failure. An `Err` (the pass was asked for and did
-/// not finish) must never reach this - the caller's `match` is what enforces
-/// that, not this function, which just writes what it is told.
-pub fn record_semantic_pass(conn: &Connection) -> Result<()> {
-    conn.execute("UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1", [])
-        .context("failed to record semanticPassAt")?;
+/// Upserts `language`'s `language_state.semanticPassAt` to now, with no
+/// roll-up check - the per-language half [`record_semantic_pass`] builds on.
+/// Exists as its own function (rather than folded straight into
+/// `record_semantic_pass`) so a test can write one language's row without
+/// tripping the roll-up, the same way [`record_language_bulk_indexed`] is
+/// kept apart from [`record_bulk_index`] - see
+/// `a_two_language_semantic_pass_roll_up_waits_for_the_slower_language`
+/// below for why that separation is what makes the roll-up rule testable at
+/// all.
+pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO language_state (language, semanticPassAt) VALUES (?1, CURRENT_TIMESTAMP)
+         ON CONFLICT(language) DO UPDATE SET semanticPassAt = excluded.semanticPassAt",
+        params![language],
+    )
+    .with_context(|| format!("failed to record that {language}'s semantic pass completed"))?;
+    Ok(())
+}
+
+/// Marks `language`'s whole-project semantic pass complete, then re-checks
+/// the project-wide roll-up and marks `meta.semanticPassAt` too if every
+/// present language's `language_state.semanticPassAt` is now set. Written
+/// only after `daemon::semantic::run_with_registry` / `run_once` returns
+/// `Ok(_)` - both `Ok(true)` (the pass actually ran) and `Ok(false)` (no
+/// bundled plugin was discovered, so nothing was ever owed) count as
+/// complete, the same way `run_once`'s own doc comment treats a missing
+/// plugin as a legitimate install rather than a failure. An `Err` (the pass
+/// was asked for and did not finish) must never reach this - the caller's
+/// `match` is what enforces that, not this function, which just writes what
+/// it is told.
+///
+/// Unlike [`record_bulk_index`], this *does* take a language and writes its
+/// row itself, in the same call: every caller today asks for exactly one
+/// language's pass (`daemon::plugin::BUNDLED_LANGUAGE` - the semantic layer
+/// is only ever run for the bundled JS/TS plugin as of this task; see
+/// `daemon::semantic`'s module doc, and GM-270 for generalizing it) and wants
+/// both effects at once, so there is no separate "every language's pass has
+/// already run" moment the way `daemon::bulk_index::run` provides one for the
+/// walk - each call here *is* the moment one language's pass finished.
+pub fn record_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
+    record_language_semantic_pass(conn, language)?;
+    if every_present_language_has(conn, "semanticPassAt")? {
+        conn.execute("UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+            .context("failed to record semanticPassAt")?;
+    }
     Ok(())
 }
 
@@ -366,9 +681,19 @@ pub fn set_embedding_model(conn: &Connection, model: &str) -> Result<()> {
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         // Children before parents: with `foreign_keys` on, dropping `nodes`
-        // while `declarations`/`edges`/`vectors` still reference it is an
-        // error rather than a cascade.
-        "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files;",
+        // while `declarations`/`edges`/`vectors`/`containers`/
+        // `placeholder_targets` still reference it is an error rather than a
+        // cascade. `language_state` has no FK onto `nodes` at all (it is
+        // keyed by language, not by node), so its position in the list does
+        // not matter - it is dropped here anyway because a version-mismatch
+        // wipe throws away every fact this generation ever recorded, per-
+        // language ones included (see `record_language_bulk_indexed`'s own
+        // comment on why a wipe has to be owed again by every language, not
+        // just the project-wide roll-up).
+        "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
+         DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
+         DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
+         DROP TABLE IF EXISTS language_state;",
     )
     .context("failed to wipe schema")
 }
@@ -411,7 +736,20 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables.sort();
-        assert_eq!(tables, vec!["declarations", "edges", "indexed_files", "meta", "nodes", "vectors"]);
+        assert_eq!(
+            tables,
+            vec![
+                "containers",
+                "declarations",
+                "edges",
+                "indexed_files",
+                "language_state",
+                "meta",
+                "nodes",
+                "placeholder_targets",
+                "vectors",
+            ]
+        );
 
         let indexes: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
@@ -420,9 +758,14 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        for expected in
-            ["idx_nodes_filePath", "idx_nodes_qualifiedName", "idx_edges_fromId", "idx_edges_toId"]
-        {
+        for expected in [
+            "idx_nodes_filePath",
+            "idx_nodes_qualifiedName",
+            "idx_nodes_container",
+            "idx_edges_fromId",
+            "idx_edges_toId",
+            "idx_targets_scope",
+        ] {
             assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
         }
     }
@@ -462,8 +805,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved)
-             VALUES ('e1', 'n1', 'n2', 'CALLS', 'tree-sitter', 0)",
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved)
+             VALUES ('e1', 'n1', 'n2', 'CALLS', 'syntactic', 'tree-sitter', 0)",
             [],
         )
         .unwrap();
@@ -553,9 +896,9 @@ mod tests {
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved, toDeclaration)
-             VALUES ('bound', 'n1', 'n2', 'CALLS', 'ts-compiler', 1, 2),
-                    ('unbound', 'n2', 'n1', 'CALLS', 'tree-sitter', 0, NULL)",
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
+             VALUES ('bound', 'n1', 'n2', 'CALLS', 'semantic', 'ts-compiler', 1, 2),
+                    ('unbound', 'n2', 'n1', 'CALLS', 'syntactic', 'tree-sitter', 0, NULL)",
             [],
         )
         .unwrap();
@@ -594,6 +937,25 @@ mod tests {
 
         let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
         assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
+
+        // GM-264's acceptance criterion at the schema level: an index whose
+        // schema predates this bump (the "0"-tagged meta row seeded above,
+        // standing in for schema "7" and earlier - none of which ever had
+        // these tables or columns) is wiped and rebuilt *with* them, not left
+        // on the old DDL just because the tables it lacked cannot fail an
+        // `INSERT`.
+        for table in ["containers", "placeholder_targets", "language_state"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap_or_else(|err| panic!("{table} must exist on a freshly reset index: {err}"));
+            assert_eq!(count, 0, "{table} must be empty right after the reset");
+        }
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language, visibility, container)
+             VALUES ('n2', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust', 'container', 'pkg')",
+            [],
+        )
+        .unwrap_or_else(|err| panic!("nodes.visibility/container must exist on a freshly reset index: {err}"));
     }
 
     #[test]
@@ -649,7 +1011,7 @@ mod tests {
              a pass interrupted right after this point is exactly the gap this column exists for"
         );
 
-        record_semantic_pass(&conn).unwrap();
+        record_semantic_pass(&conn, "typescript").unwrap();
         assert!(semantic_pass_completed(&conn).unwrap());
         // Recording the pass must not retroactively touch the walk's own flag.
         assert!(bulk_index_completed(&conn).unwrap());
@@ -662,7 +1024,7 @@ mod tests {
         let conn = setup();
         ensure_current(&conn, GENERATION).unwrap();
         record_bulk_index(&conn).unwrap();
-        record_semantic_pass(&conn).unwrap();
+        record_semantic_pass(&conn, "typescript").unwrap();
 
         conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
         assert!(ensure_current(&conn, GENERATION).unwrap());
@@ -805,5 +1167,106 @@ mod tests {
         let version: String =
             conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(version, "1");
+    }
+
+    /// A `File` node for `language`, present so [`present_languages`]/the
+    /// roll-up tests below have something to consider that language
+    /// "present" for.
+    fn seed_file(conn: &Connection, id: &str, language: &str) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, 'File', ?1, ?1, ?1, 0, 0, 0, 0, ?2)",
+            params![id, language],
+        )
+        .unwrap();
+    }
+
+    /// The acceptance criterion: with two languages present, the project-wide
+    /// roll-up must not fire off the first language's own record - only once
+    /// *every* present language has recorded its walk. Discriminates: comment
+    /// out the `every_present_language_has` check inside `record_bulk_index`
+    /// (i.e. have it unconditionally `UPDATE meta ...`) and the first
+    /// `assert!(!...)` below fails, because the roll-up would fire after `go`
+    /// alone.
+    #[test]
+    fn the_bulk_index_roll_up_waits_for_every_present_language() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        seed_file(&conn, "f1", "go");
+        seed_file(&conn, "f2", "rust");
+
+        record_language_bulk_indexed(&conn, "go", Some("fingerprint-go")).unwrap();
+        record_bulk_index(&conn).unwrap();
+        assert!(
+            !bulk_index_completed(&conn).unwrap(),
+            "rust has not recorded its own walk yet - the roll-up must not fire early"
+        );
+
+        record_language_bulk_indexed(&conn, "rust", None).unwrap();
+        record_bulk_index(&conn).unwrap();
+        assert!(
+            bulk_index_completed(&conn).unwrap(),
+            "both present languages have now recorded their walk - the roll-up must fire"
+        );
+
+        let fingerprint: Option<String> = conn
+            .query_row("SELECT pluginFingerprint FROM language_state WHERE language = 'go'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fingerprint.as_deref(), Some("fingerprint-go"));
+        let rust_fingerprint: Option<String> = conn
+            .query_row("SELECT pluginFingerprint FROM language_state WHERE language = 'rust'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rust_fingerprint, None, "a caller with no fingerprint to report must not invent one");
+    }
+
+    /// The same rule, for the semantic-pass roll-up - kept as its own test
+    /// rather than folded into the one above because [`record_semantic_pass`]
+    /// writes its language's own row *and* re-checks the roll-up in the same
+    /// call (see its own doc comment for why that differs from
+    /// `record_bulk_index`), which is exactly the shape worth exercising
+    /// directly rather than assuming it behaves like the other roll-up.
+    #[test]
+    fn the_semantic_pass_roll_up_waits_for_every_present_language() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        seed_file(&conn, "f1", "go");
+        seed_file(&conn, "f2", "rust");
+
+        record_semantic_pass(&conn, "go").unwrap();
+        assert!(
+            !semantic_pass_completed(&conn).unwrap(),
+            "rust has not had its own pass recorded yet - the roll-up must not fire early"
+        );
+
+        record_semantic_pass(&conn, "rust").unwrap();
+        assert!(
+            semantic_pass_completed(&conn).unwrap(),
+            "both present languages have now had their pass recorded - the roll-up must fire"
+        );
+    }
+
+    /// A language `record_language_bulk_indexed`/`record_semantic_pass` never
+    /// heard of - GM-264's actual state of the world, where only `typescript`
+    /// exists - must not block or vacuously satisfy the roll-up for the
+    /// language that *is* present: only `present_languages` (derived from
+    /// `File` nodes actually in the index) is ever consulted.
+    #[test]
+    fn a_language_with_no_present_files_is_not_part_of_the_roll_up() {
+        let conn = setup();
+        ensure_current(&conn, GENERATION).unwrap();
+        seed_file(&conn, "f1", "typescript");
+        // "go" was discovered and even recorded a row (a manifest matching
+        // zero files still gets spawned - see `daemon::bulk_index::run`'s own
+        // doc comment) but has no `File` node, so it must not gate the
+        // roll-up for the language that *is* present.
+        record_language_bulk_indexed(&conn, "go", None).unwrap();
+
+        record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+        record_bulk_index(&conn).unwrap();
+        assert!(bulk_index_completed(&conn).unwrap());
     }
 }

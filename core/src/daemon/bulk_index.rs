@@ -40,9 +40,11 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
+use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
+use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
 
@@ -215,6 +217,30 @@ fn walk_one_language(
     if !status.success() {
         bail!("the {} plugin's bulk index exited with {status}", manifest.language);
     }
+
+    // This language's own half of `record_bulk_index`'s project-wide roll-up
+    // (`storage::schema`'s own doc comment on the two functions has the full
+    // reasoning): `walk_one_language` is the one place that reliably knows
+    // *which* language just finished its walk, so it records that language's
+    // `language_state.bulkIndexedAt` itself, right here, rather than leaving
+    // it to `run`'s caller - which only ever asks for the roll-up as a whole,
+    // once, after every language in this loop is done.
+    //
+    // `plugin::fingerprint(manifest)` is "readily available at the write
+    // site" in exactly the sense this task scopes populating
+    // `pluginFingerprint` to: `manifest` is already in hand here, and
+    // `daemon::registry::indexer_version` already computes the very same
+    // digest over every discovered plugin at daemon startup - so recomputing
+    // it for this one language costs nothing this walk was not already going
+    // to pay for elsewhere in spirit, and it is the one write site this
+    // column has today (see `language_state`'s own DDL comment on who else,
+    // if anyone, would fill it).
+    schema::record_language_bulk_indexed(
+        &conn.lock().unwrap(),
+        &manifest.language,
+        Some(&plugin::fingerprint(manifest)),
+    )
+    .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
 
     Ok(())
 }

@@ -225,11 +225,11 @@ async fn usages_of_a_renamed_default_import_reach_the_class_it_really_names() {
     assert_eq!(
         project.usage_edges_onto_foo(),
         vec![
-            ("REFERENCES".to_string(), "ts-compiler".to_string(), true),
-            ("REFERENCES".to_string(), "ts-compiler".to_string(), true),
-            ("SUPERTYPE_OF".to_string(), "ts-compiler".to_string(), true),
+            ("REFERENCES".to_string(), "semantic".to_string(), true),
+            ("REFERENCES".to_string(), "semantic".to_string(), true),
+            ("SUPERTYPE_OF".to_string(), "semantic".to_string(), true),
         ],
-        "an edge no name matching could have made must record the checker as its source"
+        "an edge no name matching could have made must record the checker as its source tier"
     );
 
     // And the graph is coherent from the other direction too: one definition

@@ -45,7 +45,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{manifest, registry, semantic};
+use crate::daemon::{manifest, plugin, registry, semantic};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -124,7 +124,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // value, so this command's own attempt is what decides whether the
     // rebuilt index is left calling its semantic pass complete.
     if semantic_outcome.is_ok() {
-        schema::record_semantic_pass(&conn.lock().unwrap())
+        schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE)
             .context("failed to record that the semantic pass completed")?;
     }
 

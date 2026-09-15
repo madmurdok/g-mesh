@@ -95,7 +95,7 @@ use anyhow::{Context, Result};
 use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{manifest, registry, semantic};
+use crate::daemon::{manifest, plugin, registry, semantic};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::{connection, schema};
 
@@ -209,7 +209,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
                 ),
             }
             if semantic_outcome.is_ok() {
-                schema::record_semantic_pass(&conn.lock().unwrap())
+                schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE)
                     .context("failed to record that the semantic pass completed")?;
             }
         }
@@ -249,7 +249,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             ),
         }
         if semantic_outcome.is_ok() {
-            schema::record_semantic_pass(&conn.lock().unwrap())
+            schema::record_semantic_pass(&conn.lock().unwrap(), plugin::BUNDLED_LANGUAGE)
                 .context("failed to record that the semantic pass completed")?;
         }
         Some(summary)

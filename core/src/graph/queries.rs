@@ -26,7 +26,21 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         end_line: row.get("endLine")?,
         end_col: row.get("endCol")?,
         signature: row.get("signature")?,
+        // `exported` is read straight off the database's own `GENERATED
+        // ALWAYS` column (`storage::schema`'s DDL) - it is guaranteed to
+        // already agree with `visibility` below, since nothing can write it
+        // any other way. See `NodeRecord.exported`'s own doc comment.
         exported: row.get("exported")?,
+        visibility: row.get("visibility")?,
+        visibility_container: row.get("visibilityContainer")?,
+        container: row.get("container")?,
+        // Deliberately not joined, same reasoning as `declarations` just
+        // below: a read via this function is never handed back to
+        // `apply_diff` expecting an existing `placeholder_targets` row to be
+        // preserved (see `NodeRecord.target`'s own doc comment for why that
+        // would be actively wrong - `apply_diff` reads a `None` here as
+        // "delete this node's target").
+        target: None,
         doc_comment: row.get("docComment")?,
         language: row.get("language")?,
         native_kind: row.get("nativeKind")?,
@@ -47,6 +61,7 @@ fn map_edge_row(row: &Row) -> rusqlite::Result<EdgeRecord> {
         to_id: row.get("toId")?,
         kind: row.get("kind")?,
         source: row.get("source")?,
+        engine: row.get("engine")?,
         resolved: row.get("resolved")?,
         to_declaration: row.get("toDeclaration")?,
     })

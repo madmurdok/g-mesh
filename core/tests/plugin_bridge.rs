@@ -180,9 +180,9 @@ fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() 
 /// read back out of the real index.
 ///
 /// The structural pass cannot answer this one - all a name-matching walk sees
-/// is two equally good candidates - so an edge that is `ts-compiler` and
-/// resolved here can only have come from the checker, over the wire, through
-/// `apply_semantic_pass`.
+/// is two equally good candidates - so an edge whose `source` is `semantic`
+/// (engine `ts-compiler`) and resolved here can only have come from the
+/// checker, over the wire, through `apply_semantic_pass`.
 #[test]
 fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
     let project = Project::new();
@@ -233,9 +233,8 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
         .unwrap();
         thread::sleep(Duration::from_millis(250));
 
-        if count(
-            "SELECT COUNT(*) FROM edges WHERE kind = 'CALLS' AND source = 'ts-compiler' AND resolved = 1",
-        ) > 0
+        if count("SELECT COUNT(*) FROM edges WHERE kind = 'CALLS' AND source = 'semantic' AND resolved = 1")
+            > 0
         {
             break;
         }
@@ -257,7 +256,7 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
     let target: String = conn
         .query_row(
             "SELECT n.filePath FROM edges e JOIN nodes n ON n.id = e.toId \
-             WHERE e.kind = 'CALLS' AND e.source = 'ts-compiler'",
+             WHERE e.kind = 'CALLS' AND e.source = 'semantic'",
             [],
             |row| row.get(0),
         )

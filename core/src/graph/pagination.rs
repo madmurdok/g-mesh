@@ -549,7 +549,7 @@ pub fn paginate_edges(
         format!("n.filePath IN ({})", placeholders.join(", "))
     };
     let sql = format!(
-        "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.resolved AS resolved, \
+        "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.engine AS engine, e.resolved AS resolved, \
          e.toDeclaration AS toDeclaration, \
          CASE WHEN n.filePath = ?1 THEN 0 ELSE 1 END AS locality \
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
@@ -595,6 +595,7 @@ pub fn paginate_edges(
                     to_id: row.get("toId")?,
                     kind: row.get("kind")?,
                     source: row.get("source")?,
+                    engine: row.get("engine")?,
                     resolved: row.get("resolved")?,
                     to_declaration: row.get("toDeclaration")?,
                 },
@@ -780,7 +781,7 @@ mod tests {
 
     fn make_edge(conn: &Connection, id: &str, from: &str, to: &str, resolved: bool) {
         conn.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'tree-sitter', ?4)",
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'syntactic', 'tree-sitter', ?4)",
             params![id, from, to, resolved],
         )
         .unwrap();
@@ -1013,7 +1014,7 @@ mod tests {
 
     fn make_defines_edge(conn: &Connection, id: &str, file_id: &str, symbol_id: &str) {
         conn.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, 'DEFINES', 'tree-sitter', false)",
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES (?1, ?2, ?3, 'DEFINES', 'syntactic', 'tree-sitter', false)",
             params![id, file_id, symbol_id],
         )
         .unwrap();
