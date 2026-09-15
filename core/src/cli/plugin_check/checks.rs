@@ -186,7 +186,7 @@ fn verdict(findings: Vec<String>) -> Outcome {
 }
 
 fn result(id: &'static str, outcome: Outcome) -> CheckResult {
-    CheckResult { id, outcome, warnings: Vec::new() }
+    CheckResult { id: id.into(), outcome, warnings: Vec::new() }
 }
 
 const BULK_INCOMPLETE: &str = "not reached: bulk run 1 did not complete (see `session`)";

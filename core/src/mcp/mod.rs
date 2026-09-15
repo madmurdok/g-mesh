@@ -58,11 +58,17 @@ use crate::ipc::AsyncStream;
 use crate::protocol::types::Position;
 
 mod anchor;
-mod find_callers_callees;
-mod find_definition;
-mod find_implementations;
-mod find_references;
-mod get_dependencies;
+// `pub(crate)` on these five - not `mod` - so `cli::plugin_check::expectations`
+// (GM-277) can call the exact handler functions these modules' own tool
+// methods below call, rather than re-implementing the queries. Every other
+// submodule here stays private to this one: nothing outside `mcp` needs
+// `get_file_outline`/`instructions`/`search_code`/`source`/`tool_result`, and
+// widening them would just be surface nothing uses.
+pub(crate) mod find_callers_callees;
+pub(crate) mod find_definition;
+pub(crate) mod find_implementations;
+pub(crate) mod find_references;
+pub(crate) mod get_dependencies;
 mod get_file_outline;
 mod instructions;
 mod search_code;

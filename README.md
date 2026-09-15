@@ -574,7 +574,7 @@ design, including what v2 adds, is `docs/architecture/multi-language-plugins.md`
 ### Checking a plugin: `g-mesh plugins check`
 
 ```bash
-g-mesh plugins check <plugin-dir> --fixture <project-dir>
+g-mesh plugins check <plugin-dir> --fixture <project-dir> [--expect <expect.toml>]
 ```
 
 Runs the plugin against a small project in its language the way the daemon
@@ -597,7 +597,9 @@ first declaration, so it grows or moves and everything after it moves); a
 whole-project `semanticPass` if declared; and a final `fileChanged` through
 the manifest's own `semantic_pass` gate. A fixture needs at least one file
 with a newline in it; a few files with a cross-file import, a re-export and
-a call exercise every check. The ones this repo uses are under
+a call exercise every check. The bundled TS plugin's own fixture (and its
+`--expect` file, next section) is `plugins/typescript/conformance/`; a hand-
+built fixture exercising individual defects lives under
 `core/tests/fixtures/plugin_check/`.
 
 | Check | What a plugin must do |
@@ -642,6 +644,57 @@ command.
 `engine`, a placeholder target packed into `qualifiedName`) still pass `shape`
 with a `WARN` line, because core still accepts them — until the protocol v2
 migration (GM-275) makes them a failure.
+
+### Post-linking assertions: `--expect <expect.toml>`
+
+```toml
+[[callers]]
+symbol = "Server.Close"
+file = "server.go"            # optional: disambiguates an ambiguous symbol
+expect = ["cmd/main.go:run", "server_test.go:TestClose"]
+
+[[references]]
+symbol = "Greetable"
+expect = ["shapes.go:Greeter"]
+
+[[implementations]]
+symbol = "Greetable"
+expect = ["shapes.go:Greeter"]
+
+[[imports]]
+file = "cmd/main.go"
+expect = ["container:github.com/x/app/server"]
+
+[[definition]]
+symbol = "format"
+expect = ["overload.go:format"]
+```
+
+Once the fixture is fully linked (bulk, every session step, and the
+whole-project `semanticPass` — so a namespace-import or receiver-call
+resolution that only the semantic tier produces is already in the index),
+each entry is answered by literally calling the same handler function the
+matching MCP tool uses (`find_callers`/`find_references`/
+`find_implementations`/`get_dependencies`/`find_definition`) — never a
+reimplemented query — and compared as a *set* against `expect`. A row
+becomes `"filePath:qualifiedName"` (a usage with no qualifiedName — outside
+any tracked symbol — becomes `"filePath:"`); an `[[imports]]` row with no
+file of its own (a container, or an import nothing in the project resolves)
+becomes `"container:<key>"`. `symbol` is resolved the tool's own way; an
+ambiguous name fails the expectation with the real candidate list rather
+than guessing, unless `file` narrows it to exactly one. A page that reports
+`hasMore`/`truncated` even at the maximum page size fails rather than being
+silently compared as complete. An expectation this fixture's author simply
+got wrong fails with both sides of the diff, named — `expected: {...}`,
+`actual: {...}`, then which entries are missing and which are extra. An
+unknown key in the file (a typo) is a hard parse error, not a silently
+ignored one. See `core/src/cli/plugin_check/expectations.rs`'s own module
+doc for the full contract, including exactly when each edit the session
+makes is safe to have already happened.
+
+CI runs `g-mesh plugins check` with `--expect` for every `plugins/*/`
+directory that has a `conformance/{project,expect.toml}` pair — see
+`.github/workflows/ci.yml`'s `test` job.
 
 ## Run tests
 

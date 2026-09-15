@@ -148,7 +148,7 @@ fn list_references(
     Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor))
 }
 
-pub(super) fn handle(
+pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,

@@ -412,7 +412,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// struct's shared fields - which is what makes the single-hop response
 /// byte-identical to what it was before this file gained a `transitive`
 /// concept, by construction rather than by parallel maintenance.
-pub(super) fn dispatch(
+pub(crate) fn dispatch(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
     params: FindImplementationsParams,

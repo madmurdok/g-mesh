@@ -617,7 +617,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// it off its own `PluginRegistry` once per call, since discovery never
 /// changes while a daemon runs (see `daemon::manifest::discover`'s own
 /// contract) - there is nothing this function would gain by asking twice.
-pub(super) fn handle(
+pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
     entry_points: &[String],
     params: GetDependenciesParams,

@@ -495,7 +495,7 @@ fn by_name(
     }
 }
 
-pub(super) fn handle(
+pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
     project_root: &Path,
     embedding: &EmbeddingPipeline,

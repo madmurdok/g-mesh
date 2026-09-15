@@ -38,17 +38,21 @@
 //! warnings do not fail a run.
 
 mod checks;
+mod expectations;
 pub mod report;
 pub(crate) mod session;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use rusqlite::Connection;
 
-use crate::daemon::manifest::read_manifest;
+use crate::daemon::manifest::{read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
+use crate::embedding::EmbeddingPipeline;
 use crate::protocol::ndjson::BulkItem;
 pub use report::{CheckResult, Outcome, Report, Section};
 pub use session::{MARKER_DIR_ENV, SEMANTIC_ENGINE_MARKER};
@@ -62,11 +66,18 @@ pub struct PluginCheckArgs {
     /// a scratch directory first; never modified.
     #[arg(long)]
     pub fixture: PathBuf,
+    /// Post-linking assertions against the linked index - `[[callers]]`,
+    /// `[[references]]`, `[[implementations]]`, `[[imports]]`,
+    /// `[[definition]]`. Answered by the same handler code the MCP tools
+    /// use; see `expectations`' module doc for the format and when they run.
+    /// Omit for the contract checks alone.
+    #[arg(long)]
+    pub expect: Option<PathBuf>,
 }
 
 /// Runs `g-mesh plugins check`.
 pub fn run(args: &PluginCheckArgs) -> Result<()> {
-    let report = check(&args.plugin_dir, &args.fixture)?;
+    let report = check(&args.plugin_dir, &args.fixture, args.expect.as_deref())?;
     print!("{}", report.render());
     if report.failed() {
         let failed = report.failed_ids();
@@ -83,8 +94,11 @@ pub fn run(args: &PluginCheckArgs) -> Result<()> {
 /// The library entry point behind [`run`]: everything but printing and the
 /// exit status. `Err` only for a run that could not be set up at all; a
 /// plugin that fails to spawn or hangs is a failing `session` check inside
-/// an `Ok` report.
-pub fn check(plugin_dir: &Path, fixture: &Path) -> Result<Report> {
+/// an `Ok` report. `expect` is GM-277's `--expect <expect.toml>` - `None`
+/// means no `"expectations"` section at all, not an empty one (report.rs's
+/// own module doc: "a flag that parses and does nothing would read as
+/// 'expectations passed'").
+pub fn check(plugin_dir: &Path, fixture: &Path, expect: Option<&Path>) -> Result<Report> {
     // Canonicalized before `read_manifest`, which requires the directory's
     // own name to equal the manifest's language - `.` has no name to compare.
     let plugin_dir = fs::canonicalize(plugin_dir)
@@ -239,11 +253,83 @@ pub fn check(plugin_dir: &Path, fixture: &Path) -> Result<Report> {
         marker_exists_at_end: scratch.semantic_engine_marker().exists(),
     });
 
-    Ok(Report {
-        language: manifest.language.clone(),
-        plugin_dir,
-        fixture,
-        notes,
-        sections: vec![Section { title: "checks", results }],
-    })
+    let mut sections = vec![Section { title: "checks", results }];
+    if let Some(expect_path) = expect {
+        sections.push(expectations_section(
+            expect_path,
+            &manifest,
+            &conn,
+            &scratch,
+            bulk1.complete(),
+            session.as_ref(),
+        ));
+    }
+
+    Ok(Report { language: manifest.language.clone(), plugin_dir, fixture, notes, sections })
+}
+
+/// Builds the `"expectations"` section for `--expect <expect_path>` -
+/// `expectations`' module doc has the full reasoning (decisions 1-5); this
+/// is just the plumbing: gate on session readiness (decision 1), parse
+/// (decision 5), then hand off to `expectations::evaluate`.
+///
+/// One `CheckResult` id, `expectations.file`, always leads the section - a
+/// `Skip` when the session never reached the state expectations need, a
+/// `Fail` when the file could not be read or parsed, or a `Pass` followed by
+/// one result per expectation the file declared.
+fn expectations_section(
+    expect_path: &Path,
+    manifest: &PluginManifest,
+    conn: &Arc<Mutex<Connection>>,
+    scratch: &session::Scratch,
+    bulk1_complete: bool,
+    session: Option<&session::Session>,
+) -> Section {
+    const FILE_CHECK: &str = "expectations.file";
+
+    let session_ready = bulk1_complete && session.is_some_and(|s| s.failure.is_none());
+    if !session_ready {
+        return Section {
+            title: "expectations",
+            results: vec![CheckResult {
+                id: FILE_CHECK.into(),
+                outcome: Outcome::Skip(
+                    "not reached: bulk run 1 did not complete, or the control-plane session failed (see \
+                     `checks`) - expectations need the fully linked index a completed session leaves behind \
+                     (expectations' module doc, decision 1)"
+                        .to_string(),
+                ),
+                warnings: Vec::new(),
+            }],
+        };
+    }
+
+    let expect_file = match expectations::parse(expect_path) {
+        Ok(expect_file) => expect_file,
+        Err(err) => {
+            return Section {
+                title: "expectations",
+                results: vec![CheckResult {
+                    id: FILE_CHECK.into(),
+                    outcome: Outcome::Fail(vec![format!("{err:#}")]),
+                    warnings: Vec::new(),
+                }],
+            };
+        }
+    };
+
+    let embedding = EmbeddingPipeline::disabled();
+    let entry_points = manifest.workspace.entry_points.clone();
+    let project_root = scratch.workspace();
+    let ctx = expectations::EvalContext {
+        conn,
+        embedding: &embedding,
+        project_root: &project_root,
+        entry_points: &entry_points,
+    };
+
+    let mut results =
+        vec![CheckResult { id: FILE_CHECK.into(), outcome: Outcome::Pass, warnings: Vec::new() }];
+    results.extend(expectations::evaluate(&ctx, &expect_file));
+    Section { title: "expectations", results }
 }

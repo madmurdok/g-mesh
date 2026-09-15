@@ -242,6 +242,40 @@ jobs:
         # this tool over `cargo test`, and the local one that got it wrong.
         run: cargo nextest run --manifest-path core/Cargo.toml
 
+      # GM-277's conformance kit, per bundled plugin that has one -
+      # `plugins/*/conformance/{project,expect.toml}` - on the same four
+      # runners the rest of this job already covers, so a plugin (or a core
+      # change to the linker/queries `--expect` reads) that regresses on one
+      # OS and not another is caught here instead of only in a bug report.
+      #
+      # `cargo run`, not a resolved `target/debug/g-mesh(.exe)` path: the
+      # `cargo nextest run` step above already built the `g-mesh` binary
+      # (every test that uses `CARGO_BIN_EXE_g-mesh` forces cargo to build
+      # it first), and `cargo run` re-uses that same debug-profile artifact
+      # after a fast freshness check rather than rebuilding it - which is
+      # simpler and more portable across the four runners than hand-rolling
+      # the `.exe` suffix and target layout ourselves for one extra step.
+      - name: g-mesh plugins check (--expect, every plugin with a conformance fixture)
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for dir in plugins/*/; do
+            plugin="${dir%/}"
+            fixture="$plugin/conformance/project"
+            expect="$plugin/conformance/expect.toml"
+            if [ -d "$fixture" ] && [ -f "$expect" ]; then
+              found=1
+              echo "=== g-mesh plugins check $plugin ==="
+              cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
+                plugins check "$plugin" --fixture "$fixture" --expect "$expect"
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no plugins/*/conformance fixture found - this step has nothing to check" >&2
+            exit 1
+          fi
+
       # `always()`, not `failure()`: a job killed by `timeout-minutes` is
       # reported as *cancelled*, and `failure()` does not fire for it - so the
       # one run where the log mattered most produced none. Windows hung for the

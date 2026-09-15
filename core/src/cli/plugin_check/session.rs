@@ -374,11 +374,22 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
 /// refused. A real declaration edit through the TS
 /// plugin, the shape every user edit has, was never sent. The
 /// declaration-edit step (`id-stability.declaration-edit-applies`) now is.
-pub(crate) fn open_index() -> Result<Mutex<Connection>> {
+///
+/// `Arc<Mutex<Connection>>`, not a bare `Mutex<Connection>`: GM-277's
+/// expectations call the MCP tools' own handler functions
+/// (`mcp::find_callers_callees::handle_callers` and its four siblings), and
+/// every one of them is declared over `&Arc<Mutex<Connection>>` - the exact
+/// type `mcp::mod`'s `#[tool]` methods hold `self.conn` as. Every existing
+/// caller in this module keeps taking a plain `&Mutex<Connection>`
+/// unchanged: `&Arc<Mutex<Connection>>` coerces to `&Mutex<Connection>` at
+/// each of those call sites for free (`Arc`'s `Deref`), so this is the only
+/// line that needed to change for both kinds of caller to share one
+/// connection.
+pub(crate) fn open_index() -> Result<Arc<Mutex<Connection>>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    Ok(Mutex::new(conn))
+    Ok(Arc::new(Mutex::new(conn)))
 }
 
 /// Commits one bulk stream through the daemon's own batching and links it
