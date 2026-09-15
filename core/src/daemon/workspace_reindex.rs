@@ -49,17 +49,17 @@
 //!    incremental recount has to for an ordinary diff.
 //!  - **`declarations`/`vectors`/`placeholder_targets`**: every child row
 //!    keyed by a deleted node id. `storage::write::apply_diff`'s own
-//!    `delete_node_ids` loop explicitly deletes `declarations` and
-//!    `placeholder_targets` this same way (both tables carry `ON DELETE
-//!    CASCADE`, but `foreign_keys` is off on the daemon's real connection -
-//!    see that function's own comment), and this module follows the same
-//!    convention for `vectors`, which `apply_diff` itself does not delete
-//!    explicitly - a pre-existing gap in ordinary per-file deletes, out of
-//!    this task's scope to fix there, but one a language-wide delete has to
-//!    close for itself: leaving a deleted node's embedding behind would hand
-//!    it to whatever content-derived id a rebuilt node happens to collide
-//!    with, the exact hazard `apply_diff`'s own comment on `declarations`/
-//!    `placeholder_targets` warns about.
+//!    `delete_node_ids` loop explicitly deletes `declarations`,
+//!    `placeholder_targets` and `vectors` this same way (all three tables
+//!    carry `ON DELETE CASCADE`, but `storage::connection::open` switches
+//!    `foreign_keys` off on the daemon's real connection - see that
+//!    function's own doc). When this module was written `apply_diff` did not
+//!    yet delete `vectors`, a gap this delete closed for itself; GM-294 closed
+//!    it there too, once GM-292 showed the connection had in fact been
+//!    enforcing foreign keys all along, so the cascade had been hiding it.
+//!    Leaving a deleted node's embedding behind would hand it to whatever
+//!    content-derived id a rebuilt node happens to collide with, the exact
+//!    hazard `apply_diff`'s own comment warns about.
 //!  - **`indexed_files`**: deliberately **not** touched. That table is a
 //!    disk-truth baseline (`watcher::staleness`: "what's recorded... and, on
 //!    a mismatch, reindexes") - it says whether a file's *bytes on disk*
@@ -254,9 +254,10 @@ use crate::storage::schema;
 /// gives its own diffs.
 ///
 /// Order matters only under a connection that enforces foreign keys (the
-/// daemon's real connection does not, `storage::connection::open` - but this
-/// module's own tests run with them on, deliberately, the same reason
-/// `storage::write`'s tests do): edges before nodes (`edges.fromId`/`toId`
+/// daemon's real connection does not - `storage::connection::open` switches
+/// them off - but most of this module's own tests run with them on,
+/// deliberately, the same reason `storage::write`'s tests do): edges before
+/// nodes (`edges.fromId`/`toId`
 /// reference `nodes(id)` with no `ON DELETE CASCADE`), and every node-keyed
 /// child table (`vectors`, `declarations`, `placeholder_targets`,
 /// `containers`) before `nodes` itself.
@@ -517,6 +518,75 @@ mod tests {
             1,
             "beta's language_state row must be untouched"
         );
+    }
+
+    /// The other pragma state, and the one production runs in (GM-294): with
+    /// foreign keys off nothing cascades from the `nodes` delete, so every
+    /// node-keyed child row of the language has to be deleted by hand or it
+    /// outlives its node. The test above cannot see that - its enforced
+    /// foreign keys cascade on the language's behalf. Every child table is
+    /// seeded for both languages, so a delete scoped wrongly (all rows, or
+    /// none) fails as clearly as a missing one.
+    #[test]
+    fn delete_language_rows_leaves_no_orphaned_child_rows_without_foreign_keys() {
+        use crate::storage::write::PlaceholderTargetRecord;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        let placeholder = |id: &str, language: &str| {
+            let mut node = NodeRecord::new(id, "Module", id, id, format!("{id}.src"), language);
+            node.native_kind = Some("pending_symbol".to_string());
+            node.target = Some(PlaceholderTargetRecord {
+                scope_kind: "file".to_string(),
+                scope: "elsewhere.src".to_string(),
+                key_kind: "name".to_string(),
+                key: "thing".to_string(),
+                from_container: None,
+            });
+            node
+        };
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    node("a1", "alpha", "a.alpha", Some("pkg")),
+                    placeholder("a-use", "alpha"),
+                    node("b1", "beta", "b.beta", Some("mod")),
+                    placeholder("b-use", "beta"),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for id in ["a1", "b1"] {
+            conn.execute(
+                "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
+                 VALUES (?1, 0, 0, 0, 0, 1, 0)",
+                params![id],
+            )
+            .unwrap();
+            crate::storage::vectors::insert(&conn, id, &[1.0, 0.0], "test-model").unwrap();
+        }
+
+        delete_language_rows(&mut conn, "alpha").unwrap();
+
+        for table in ["declarations", "vectors", "placeholder_targets", "containers"] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE nodeId NOT IN (SELECT id FROM nodes)")
+                ),
+                0,
+                "{table}: an alpha row outlived its node"
+            );
+            assert_eq!(
+                count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
+                1,
+                "{table}: beta's own row must be untouched"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

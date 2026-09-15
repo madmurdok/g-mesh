@@ -130,9 +130,13 @@
 //!
 //! # Deleting an empty container, with `foreign_keys` off
 //!
-//! The daemon's connection does not enforce foreign keys
-//! (`storage::connection::open`), so `containers.nodeId`'s `ON DELETE CASCADE`
-//! never fires in production. Every row is deleted explicitly instead: the
+//! The daemon's connection does not enforce foreign keys -
+//! `storage::connection::open` switches them off explicitly, because the
+//! bundled SQLite defaults them *on* (GM-292, fixed by GM-293/GM-294; until
+//! then this paragraph described the intended state, not the real one) - so
+//! `containers.nodeId`'s `ON DELETE CASCADE` never fires in production. This
+//! module's tests run both pragma states for exactly that reason. Every row
+//! is deleted explicitly instead: the
 //! container's outgoing edges, its incoming edges (the `File -IMPORTS->
 //! container` edges GM-267 will add), its `containers` row, any child rows keyed
 //! by its id, and the node. The incoming edges' owners are not told: an
@@ -308,10 +312,13 @@ pub(crate) fn detach(conn: &Connection, diff: &Diff) -> Result<Option<Pending>> 
         // Deleted ids first, then upserted ones, each once. An id both deleted
         // and upserted ends up upserted (`apply_diff` deletes before it
         // upserts), which `final_membership` already says - but its edge is
-        // still dropped here, because its row really is deleted in between,
-        // and on a connection enforcing foreign keys that delete is refused
-        // while an edge still points at it. [`attach`] puts the edge back, and
-        // the recount never sees the gap.
+        // still dropped here, because its row really is deleted in between:
+        // on a connection enforcing foreign keys (this module's tests, half
+        // of the time) that delete is refused while an edge still points at
+        // it, and on one that does not (the daemon's - see the module doc) the
+        // same code path is what removes the edge of a member deleted for
+        // good, which nothing else would. [`attach`] puts the edge back for an
+        // id that is re-upserted, and the recount never sees the gap.
         let deleted: HashSet<&str> = diff.delete_node_ids.iter().map(String::as_str).collect();
         let mut seen: HashSet<&str> = HashSet::new();
         let named = diff
