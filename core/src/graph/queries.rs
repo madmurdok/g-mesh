@@ -180,6 +180,22 @@ pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result
 /// which must cover `.ts`/`.tsx`/`.d.ts`) or a fixed file name (Rust's
 /// `mod.rs`, which must not smear onto neighbouring names).
 ///
+/// # Every entry is escaped before it ever reaches a `LIKE`
+///
+/// `entry_points` is manifest content, not a literal this module wrote, so it
+/// cannot be trusted to contain no LIKE metacharacters - `%` and `_` are both
+/// wildcards to SQLite's `LIKE` (`_` matches exactly one arbitrary character),
+/// and a manifest is free to declare an entry point that legitimately
+/// contains one: Python's own `__init__.py` convention is the motivating
+/// case. Left unescaped, `__init__.py` would rank `pkg/abinitcd.py` as if it
+/// were the declared entry point - each of its two `_` wildcards consuming
+/// one arbitrary character - which is exactly the "language #N+1 pays for
+/// core surgery" trap this task exists to close, just moved from a missing
+/// parameter to a missed escape. [`escape_like`] backslash-escapes `\`, `%`
+/// and `_` in every entry before it is bound, and every `LIKE` clause below
+/// carries the matching `ESCAPE '\'`; the equality clause does not, because
+/// `=` has no wildcards to escape in the first place.
+///
 /// # Cost: not an index range scan today, and this does not make it one
 ///
 /// It would be convenient to say this stays "an indexed prefix lookup", but
@@ -214,19 +230,42 @@ fn entry_point_rank_expr(entry_points: &[String]) -> (String, Vec<String>) {
     let mut clauses: Vec<&'static str> = Vec::with_capacity(entry_points.len());
     let mut params = Vec::with_capacity(entry_points.len() * 2);
     for entry in entry_points {
+        let escaped = escape_like(entry);
         if entry.contains('.') {
             // Exact name: the file's own path either ends in "/<entry>" or,
-            // for a root-level file, equals <entry> outright.
-            clauses.push("(filePath = ? OR filePath LIKE '%/' || ?)");
+            // for a root-level file, equals <entry> outright. The first
+            // branch is a plain `=`, so the raw (unescaped) entry is bound
+            // there - only the `LIKE` branch needs the escaped form.
+            clauses.push("(filePath = ? OR filePath LIKE '%/' || ? ESCAPE '\\')");
+            params.push(entry.clone());
+            params.push(escaped);
         } else {
             // Bare stem: the file's own name starts with "<entry>." at the
             // root, or "/<entry>." under some directory - any extension.
-            clauses.push("(filePath LIKE ? || '.%' OR filePath LIKE '%/' || ? || '.%')");
+            clauses
+                .push("(filePath LIKE ? || '.%' ESCAPE '\\' OR filePath LIKE '%/' || ? || '.%' ESCAPE '\\')");
+            params.push(escaped.clone());
+            params.push(escaped);
         }
-        params.push(entry.clone());
-        params.push(entry.clone());
     }
     (format!("({})", clauses.join(" OR ")), params)
+}
+
+/// Escapes `\`, `%` and `_` in `entry` so it can be interposed into a `LIKE`
+/// pattern as a literal string rather than a pattern of its own - paired with
+/// `ESCAPE '\'` on every clause that binds the result. See
+/// [`entry_point_rank_expr`]'s own doc comment for why an unescaped entry is
+/// a real bug and not a theoretical one (`__init__.py`), not just a stylistic
+/// nicety.
+fn escape_like(entry: &str) -> String {
+    let mut escaped = String::with_capacity(entry.len());
+    for ch in entry.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// Indexed files sitting under `prefix`, entry points first.
@@ -631,6 +670,51 @@ mod tests {
             )
             .unwrap();
         assert!(!matches, "pkg/mod.rs.bak must not count as the mod.rs entry point");
+    }
+
+    /// Code-review fix: `_` and `%` are `LIKE` wildcards, and `entry_points`
+    /// is manifest content this module does not control - a future Python
+    /// manifest declaring `__init__.py` (two literal underscores) must not
+    /// have those underscores reinterpreted as "any one character". Proves
+    /// both halves: the real entry point still ranks first, and a file that
+    /// only matches because `_` was treated as a wildcard -
+    /// `pkg/abinitcd.py`'s file name is `abinitcd.py`, 11 characters, one per
+    /// literal/wildcard position in `__init__.py` (`_` `_` `i` `n` `i` `t` `_`
+    /// `_` `.` `p` `y`) - does not count as the entry point at all.
+    #[test]
+    fn an_entry_point_containing_like_wildcard_characters_is_matched_literally() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/other.py")).unwrap();
+        upsert_node(&mut conn, file("pkg/__init__.py")).unwrap();
+
+        let found = find_files_under(&conn, "pkg", &entry_points(&["__init__.py"]), 5).unwrap();
+        assert_eq!(
+            found.first().map(|n| n.file_path.as_str()),
+            Some("pkg/__init__.py"),
+            "the real entry point must still rank first: {:?}",
+            paths(&found)
+        );
+
+        // A separate file, present only so the second check below has a real
+        // row to query - unescaped, this is exactly the path the old bug
+        // would have misidentified as the __init__.py entry point.
+        upsert_node(&mut conn, file("pkg/abinitcd.py")).unwrap();
+
+        let (rank_expr, rank_params) = entry_point_rank_expr(&entry_points(&["__init__.py"]));
+        let mut bound: Vec<rusqlite::types::Value> = rank_params.into_iter().map(Into::into).collect();
+        bound.push("pkg/abinitcd.py".to_string().into());
+        let matches: bool = conn
+            .query_row(
+                &format!("SELECT {rank_expr} FROM nodes WHERE filePath = ?"),
+                rusqlite::params_from_iter(bound),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !matches,
+            "pkg/abinitcd.py must not count as the __init__.py entry point - each `_` is a literal \
+             underscore, not a single-character wildcard"
+        );
     }
 
     /// No manifest available at all (this task's documented fallback) must
