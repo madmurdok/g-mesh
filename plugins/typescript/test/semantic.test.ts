@@ -6,6 +6,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  PLUGIN_CHECK_MARKER_DIR_ENV,
+  SEMANTIC_ENGINE_MARKER,
   SemanticProject,
   resolveTsserverPath,
   tsserverCandidates,
@@ -111,6 +113,31 @@ test("the tsserver child is not started until a semantic question is actually as
   } finally {
     project.stop();
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the conformance kit's semantic-engine marker is written when the child starts, not before", async () => {
+  const root = await makeProject({
+    "src/a.ts": "export function alpha(): number {\n  return 1;\n}\n\nexport const used = alpha();\n",
+  });
+  const markers = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-markers-"));
+  const marker = path.join(markers, SEMANTIC_ENGINE_MARKER);
+  const previous = process.env[PLUGIN_CHECK_MARKER_DIR_ENV];
+  process.env[PLUGIN_CHECK_MARKER_DIR_ENV] = markers;
+  const project = new SemanticProject(root);
+  try {
+    assert.equal(existsSync(marker), false, "constructing a project must not mark the engine as started");
+
+    const file = path.join(root, "src", "a.ts");
+    const source = await fs.readFile(file, "utf8");
+    await project.definition(file, positionOf(source, "alpha();", 1));
+    assert.equal(existsSync(marker), true, "the first query starts the child, and must say so");
+  } finally {
+    project.stop();
+    if (previous === undefined) delete process.env[PLUGIN_CHECK_MARKER_DIR_ENV];
+    else process.env[PLUGIN_CHECK_MARKER_DIR_ENV] = previous;
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(markers, { recursive: true, force: true });
   }
 });
 

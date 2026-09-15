@@ -18,7 +18,7 @@ use crate::protocol::types::{ControlEnvelope, WireNode};
 /// so it never reaches this check). Every one of these requires a `target`
 /// once `WireNode::deserialize` has normalized legacy input - see the
 /// `placeholder nativeKind requires a target` shape check below.
-const PLACEHOLDER_NATIVE_KINDS: [&str; 3] =
+pub(crate) const PLACEHOLDER_NATIVE_KINDS: [&str; 3] =
     [PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,34 +69,41 @@ pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
 }
 
 fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
-    let Some(native_kind) = node.native_kind.as_deref() else {
-        return Vec::new();
-    };
-    let mut violations = Vec::new();
+    placeholder_target_violation(node)
+        .into_iter()
+        .chain(plugin_emitted_container_violation(node))
+        .map(|message| Violation { context: context.to_string(), message })
+        .collect()
+}
 
-    if PLACEHOLDER_NATIVE_KINDS.contains(&native_kind) && node.target.is_none() {
-        violations.push(Violation {
-            context: context.to_string(),
-            message: format!(
-                "placeholder node {:?} (nativeKind {native_kind:?}) has no `target`, and none could be derived \
-                 from the legacy `<file>#<name>` qualifiedName convention (qualifiedName: {:?})",
-                node.id, node.qualified_name
-            ),
-        });
-    }
+/// The `placeholder nativeKind requires a target` rule on its own, as a
+/// message rather than a [`Violation`]. Split out of `node_shape_violations`
+/// (GM-276) because `cli::plugin_check` reports this rule under its `shape`
+/// check and [`plugin_emitted_container_violation`] under its separate
+/// `ownership.no-container` check: a conformance kit whose every check must
+/// be provable by a fake plugin failing *only* that check cannot have one
+/// helper answer for two of them.
+pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
+    let native_kind = node.native_kind.as_deref()?;
+    (PLACEHOLDER_NATIVE_KINDS.contains(&native_kind) && node.target.is_none()).then(|| {
+        format!(
+            "placeholder node {:?} (nativeKind {native_kind:?}) has no `target`, and none could be derived \
+             from the legacy `<file>#<name>` qualifiedName convention (qualifiedName: {:?})",
+            node.id, node.qualified_name
+        )
+    })
+}
 
-    if native_kind == CONTAINER_NATIVE_KIND {
-        violations.push(Violation {
-            context: context.to_string(),
-            message: format!(
-                "node {:?} has nativeKind \"container\" - container nodes are never plugin-emitted, \
-                 core alone materializes them",
-                node.id
-            ),
-        });
-    }
-
-    violations
+/// The "core alone materializes container nodes" rule on its own - see
+/// [`placeholder_target_violation`] for why the two are separate functions.
+pub(crate) fn plugin_emitted_container_violation(node: &WireNode) -> Option<String> {
+    (node.native_kind.as_deref() == Some(CONTAINER_NATIVE_KIND)).then(|| {
+        format!(
+            "node {:?} has nativeKind \"container\" - container nodes are never plugin-emitted, \
+             core alone materializes them",
+            node.id
+        )
+    })
 }
 
 /// Validates a plugin's control-plane output: every frame must be valid

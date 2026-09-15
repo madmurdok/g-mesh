@@ -50,7 +50,7 @@ use crate::watcher::apply::{to_edge_record, to_node_record};
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
 /// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
-const BULK_INDEX_FLAG: &str = "--bulk-index";
+pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 
 /// Nodes plus edges accumulated before a batch is committed. One `Diff` for
 /// the whole project would mean holding a large repo's entire graph in memory
@@ -292,7 +292,7 @@ fn hold_the_walk_open_for_tests() {
 /// `linked_symbols`, which [`run`] computes once, project-wide, after every
 /// language's ingest loop like this one has run, not per language (see
 /// [`run`]'s doc comment for why).
-fn ingest<R: BufRead>(
+pub(crate) fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,

@@ -1,0 +1,4 @@
+fn alpha
+fn beta
+call alpha
+use b.fk gamma

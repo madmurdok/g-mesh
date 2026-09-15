@@ -501,6 +501,13 @@ has the full contract, including how re-exports apply to a container scope.
 g-mesh plugin check <plugin-dir> --fixture <project-dir> [--expect <expect.toml>]
 ```
 
+Built in GM-276 as `g-mesh plugins check` (next to `plugins list`; `plugin`
+stays accepted as an alias), without `--expect`, which GM-277 adds. The checks
+as built, with the evidence each reads and why `semanticPass` diffs are
+exempt from the per-file stream rules, are documented in
+`core/src/cli/plugin_check/checks.rs` and the README's "Writing a language
+plugin" section.
+
 The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-index`,
 `fileChanged`, `semanticPass`) against an in-memory index and the real
 `apply_diff` + linker. It asserts:
