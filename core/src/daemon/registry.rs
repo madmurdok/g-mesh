@@ -623,6 +623,28 @@ impl PluginRegistry {
         points
     }
 
+    /// Every discovered manifest's `[plugin.capabilities]`
+    /// (`daemon::manifest::Capabilities`), keyed by language - what
+    /// `mcp::instructions` (GM-262) reads to decide, per language present in
+    /// the index, whether its receiver-call gap
+    /// (`Capabilities::receiver_calls`/`receiver_calls_structural`) is still
+    /// open. `Capabilities` is `Copy` (see its own derive), so this clones
+    /// nothing heavier than the language-id keys - the same cheap shape as
+    /// [`entry_points`](Self::entry_points) above, read fresh per call rather
+    /// than cached for the same reason `mcp::get_dependencies` reads
+    /// `entry_points()` fresh: `discovered` never changes while this daemon
+    /// runs, so there is nothing a cache would save.
+    ///
+    /// "Every discovered manifest", not "only languages this project's index
+    /// actually has files for" - the same distinction
+    /// [`entry_points`](Self::entry_points)'s own doc comment draws, for the
+    /// same reason: this registry has no per-project presence to consult, and
+    /// the caller (`mcp::instructions::build`) already filters by what the
+    /// index reports present before this map is ever indexed into.
+    pub fn receiver_call_capabilities(&self) -> HashMap<String, manifest::Capabilities> {
+        self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
+    }
+
     /// Every discovered language whose manifest declares
     /// `capabilities.semantic_pass = true`, sorted - what
     /// `daemon::semantic::run_with_registry` iterates over to ask each
