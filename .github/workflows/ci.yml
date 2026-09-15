@@ -143,6 +143,17 @@ jobs:
         working-directory: plugins/typescript
         run: npm ci
 
+      # The plugin's own suite (protocol.ts/extract.ts/bulkIndex.ts/
+      # incremental.ts/semanticPass.ts unit and e2e tests) was not run in CI
+      # before GM-275 - only `npm ci` was, so build.rs had something to
+      # compile. Nothing here reruns it, so a wire-shape regression in the
+      # plugin surfaced only through the Rust integration tests that happen
+      # to exercise the same path, if any did. Runs before the slower Rust
+      # steps, since it needs only what `npm ci` above just installed.
+      - name: JS/TS plugin tests (npm test)
+        working-directory: plugins/typescript
+        run: npm test
+
       # Pinned and fetched directly, like ShellCheck and for the same reason:
       # a gate that changes underneath you is a gate people stop reading.
       # Fetched rather than taken from a third-party action, so the only
