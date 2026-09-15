@@ -242,7 +242,25 @@ ignore = ["node_modules"]    # optional; directory names skipped when
                               # indexer_version() (see Interfaces below) -
                               # added to, not replacing, the built-in
                               # baseline ignore list below
+
+[plugin.capabilities]        # optional; what the plugin's semantic tier can
+                              # promise - semantic_pass, receiver_calls,
+                              # receiver_calls_structural. Missing entirely or
+                              # per-field defaults conservatively ("says
+                              # nothing" => "can do the least").
+
+[plugin.workspace]           # optional; which files outside its own claimed
+                              # extensions this plugin cares about -
+                              # watch_files (triggers a per-language reindex),
+                              # exclude_dirs, entry_points. Missing entirely
+                              # defaults to all three empty.
 ```
+
+`[plugin.capabilities]` and `[plugin.workspace]` shipped with the per-language
+scheduler and workspace routing added on top of this design (task GM-269);
+see [`multi-language-plugins.md`](./multi-language-plugins.md)'s "`plugin.toml`
+additions" section for the full field list, defaults, and the rationale behind
+each one — not repeated here.
 
 **Built-in baseline ignore, applied to every plugin regardless of
 manifest**: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
@@ -294,6 +312,8 @@ pub struct PluginManifest {
     pub extensions: Vec<String>,    // lowercase, leading dot
     pub fingerprint_ignore: Vec<String>,
     pub manifest_dir: PathBuf,      // for error messages and fingerprinting
+    pub capabilities: Capabilities, // [plugin.capabilities] - see multi-language-plugins.md
+    pub workspace: WorkspaceConfig, // [plugin.workspace] - see multi-language-plugins.md
 }
 
 /// Reads and validates one `plugin.toml`. Hard error on: malformed TOML,
