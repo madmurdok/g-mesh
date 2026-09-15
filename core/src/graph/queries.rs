@@ -138,28 +138,176 @@ pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by file name")
 }
 
+/// Builds the boolean `ORDER BY` expression (and the `?` parameter values it
+/// binds, in the order they appear in it) that ranks a `filePath` matching
+/// any of `entry_points` ahead of one that does not - the shared core behind
+/// [`find_files_under`]'s and [`find_files_ending_in_dir`]'s ordering.
+///
+/// # Where `entry_points` comes from, and why this function does not know
+///
+/// `entry_points` is the caller's job to assemble, concretely the union of
+/// every discovered plugin's `[plugin.workspace] entry_points`
+/// (`daemon::manifest::WorkspaceConfig`,
+/// `daemon::registry::PluginRegistry::entry_points`), passed in rather than
+/// looked up here so this module, which is a thin SQL layer under
+/// `storage`/`graph`, never has to depend on `daemon::manifest` to answer a
+/// query. A caller with no manifest available at all (this module's own
+/// tests below; a hypothetical CLI path that never starts a daemon) passes an
+/// empty slice, which this function turns into an always-false expression:
+/// nothing ranks first, and both callers fall back to their older,
+/// entry-point-blind `LENGTH(filePath)` ordering. The one place this must
+/// stay identical to the pre-task behaviour is the bundled setup: the
+/// bundled TS plugin's own manifest already declares `entry_points =
+/// ["index"]` (`plugins/typescript/plugin.toml`), so a real daemon feeds this
+/// function exactly the one-element list that reproduces the old hardcoded
+/// `index.*` ordering, byte for byte.
+///
+/// # Matching semantics: one rule, two shapes
+///
+/// Each entry is tested one of two ways, chosen by whether it contains a `.`:
+///
+/// - **No dot** (`"index"`): matches the file's *stem*, any extension -
+///   `index.ts`, `index.tsx`, `index.d.ts` all qualify. This is the exact
+///   `%/index.%` shape the code being replaced hardcoded.
+/// - **Has a dot** (`"mod.rs"`, `"main.rs"`, `"lib.rs"` - Rust's own
+///   convention, once a Rust plugin declares it): matches the *exact* file
+///   name, with no trailing wildcard after it - an exact entry must not also
+///   match `mod.rs.bak` or `mod.rs2`, which a `LIKE 'mod.rs%'` pattern would.
+///
+/// One rule rather than two independently configurable modes, because a
+/// manifest author choosing an entry point only has one real degree of
+/// freedom: whether their convention is extension-agnostic (TS's `index`,
+/// which must cover `.ts`/`.tsx`/`.d.ts`) or a fixed file name (Rust's
+/// `mod.rs`, which must not smear onto neighbouring names).
+///
+/// # Every entry is escaped before it ever reaches a `LIKE`
+///
+/// `entry_points` is manifest content, not a literal this module wrote, so it
+/// cannot be trusted to contain no LIKE metacharacters - `%` and `_` are both
+/// wildcards to SQLite's `LIKE` (`_` matches exactly one arbitrary character),
+/// and a manifest is free to declare an entry point that legitimately
+/// contains one: Python's own `__init__.py` convention is the motivating
+/// case. Left unescaped, `__init__.py` would rank `pkg/abinitcd.py` as if it
+/// were the declared entry point - each of its two `_` wildcards consuming
+/// one arbitrary character - which is exactly the "language #N+1 pays for
+/// core surgery" trap this task exists to close, just moved from a missing
+/// parameter to a missed escape. [`escape_like`] backslash-escapes `\`, `%`
+/// and `_` in every entry before it is bound, and every `LIKE` clause below
+/// carries the matching `ESCAPE '\'`; the equality clause does not, because
+/// `=` has no wildcards to escape in the first place.
+///
+/// # Cost: not an index range scan today, and this does not make it one
+///
+/// It would be convenient to say this stays "an indexed prefix lookup", but
+/// `EXPLAIN QUERY PLAN` on the query both callers run
+/// (`WHERE kind = 'File' AND filePath LIKE ?1 || '/%' ORDER BY ...`) says
+/// otherwise: it is a full `SCAN nodes`, index or no index, and always has
+/// been - `idx_nodes_filePath` (`storage::schema`) never fires here, because
+/// SQLite's LIKE-to-range-scan optimization only applies to a *case-sensitive*
+/// LIKE (`PRAGMA case_sensitive_like = ON`, or `GLOB`), and this project sets
+/// neither; measured directly against a populated `nodes` table with
+/// `ANALYZE` run, `filePath LIKE 'pkg1/%'` alone still plans as `SCAN nodes`,
+/// while the equivalent `filePath GLOB 'pkg1/*'` plans as
+/// `SEARCH nodes USING INDEX idx_nodes_filePath`. Both `find_files_under` and
+/// `find_files_ending_in_dir` are miss-path-only (see their own doc comments)
+/// and already paid for a full scan before this task. What this function
+/// must not do - and does not - is turn one full scan into several, or into
+/// one whose per-row cost grows with the project: it stays one query, and the
+/// only new per-row cost is evaluating up to `entry_points.len()` extra
+/// `LIKE` tests (in practice 1-3, one convention per language actually
+/// discovered) instead of the previous single hardcoded one - a constant
+/// factor, not a new scan.
+fn entry_point_rank_expr(entry_points: &[String]) -> (String, Vec<String>) {
+    if entry_points.is_empty() {
+        // Not a bare `"0"`: SQLite's `ORDER BY` treats a literal integer as a
+        // 1-based reference to a column of the result set ("ORDER BY 1" means
+        // "by the first selected column"), so a bare `0` is a "column out of
+        // range" error, not a constant `false` - `(1 = 0)`, an expression
+        // rather than an integer literal, is what actually means "always
+        // false" here.
+        return ("(1 = 0)".to_string(), Vec::new());
+    }
+    let mut clauses: Vec<&'static str> = Vec::with_capacity(entry_points.len());
+    let mut params = Vec::with_capacity(entry_points.len() * 2);
+    for entry in entry_points {
+        let escaped = escape_like(entry);
+        if entry.contains('.') {
+            // Exact name: the file's own path either ends in "/<entry>" or,
+            // for a root-level file, equals <entry> outright. The first
+            // branch is a plain `=`, so the raw (unescaped) entry is bound
+            // there - only the `LIKE` branch needs the escaped form.
+            clauses.push("(filePath = ? OR filePath LIKE '%/' || ? ESCAPE '\\')");
+            params.push(entry.clone());
+            params.push(escaped);
+        } else {
+            // Bare stem: the file's own name starts with "<entry>." at the
+            // root, or "/<entry>." under some directory - any extension.
+            clauses
+                .push("(filePath LIKE ? || '.%' ESCAPE '\\' OR filePath LIKE '%/' || ? || '.%' ESCAPE '\\')");
+            params.push(escaped.clone());
+            params.push(escaped);
+        }
+    }
+    (format!("({})", clauses.join(" OR ")), params)
+}
+
+/// Escapes `\`, `%` and `_` in `entry` so it can be interposed into a `LIKE`
+/// pattern as a literal string rather than a pattern of its own - paired with
+/// `ESCAPE '\'` on every clause that binds the result. See
+/// [`entry_point_rank_expr`]'s own doc comment for why an unescaped entry is
+/// a real bug and not a theoretical one (`__init__.py`), not just a stylistic
+/// nicety.
+fn escape_like(entry: &str) -> String {
+    let mut escaped = String::with_capacity(entry.len());
+    for ch in entry.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Indexed files sitting under `prefix`, entry points first.
 ///
 /// For the caller who asked about a package or a directory rather than a
 /// file: `packages/math` is not a node, but `packages/math/src/index.ts` is,
-/// and it is what they meant. Ordering puts an `index.*` first because that is
-/// what a package specifier resolves to, then shortest path, so the head of
-/// the list is the entry point rather than whichever file sorted first.
+/// and it is what they meant. Ordering puts a declared entry point first -
+/// see [`entry_point_rank_expr`] for the matching rule, where `entry_points`
+/// comes from, and this query's actual cost - then shortest path, so the head
+/// of the list is the entry point rather than whichever file sorted first.
 ///
 /// Miss path only, like `find_in_file_named` above - a `LIKE` anchored on a
-/// prefix can use no index here and does not need to.
-pub fn find_files_under(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+/// prefix can use no index here and does not need to (see
+/// [`entry_point_rank_expr`]'s cost section for the measurement behind that).
+pub fn find_files_under(
+    conn: &Connection,
+    prefix: &str,
+    entry_points: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRecord>> {
     let trimmed = prefix.trim_end_matches('/');
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let (rank_expr, rank_params) = entry_point_rank_expr(entry_points);
+    let sql = format!(
         "SELECT * FROM nodes \
-         WHERE kind = 'File' AND filePath LIKE ?1 || '/%' \
-         ORDER BY (filePath LIKE '%/index.%') DESC, LENGTH(filePath) ASC \
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![trimmed, limit as i64], map_node_row)?;
+         WHERE kind = 'File' AND filePath LIKE ? || '/%' \
+         ORDER BY {rank_expr} DESC, LENGTH(filePath) ASC \
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // A `Vec<rusqlite::types::Value>` bound via `params_from_iter`, rather
+    // than `params![...]`/a `Vec<&dyn ToSql>`, because the parameter count
+    // varies with `entry_points.len()` - `Value` is rusqlite's own "any bound
+    // type, decided at runtime" wrapper, exactly what a variable-length
+    // parameter list needs.
+    let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(2 + rank_params.len());
+    bound.push(trimmed.to_string().into());
+    bound.extend(rank_params.into_iter().map(Into::into));
+    bound.push((limit as i64).into());
+    let rows = stmt.query_map(rusqlite::params_from_iter(bound), map_node_row)?;
     rows.collect::<rusqlite::Result<_>>().context("failed to look up files under a prefix")
 }
 
@@ -168,17 +316,31 @@ pub fn find_files_under(conn: &Connection, prefix: &str, limit: usize) -> Result
 /// The second half of the package-name case: `@excalidraw/math` is not a path,
 /// but a directory called `math` exists and holds the files. Matches a path
 /// segment, not a substring - `/math/` - so `mathutils` does not qualify.
-pub fn find_files_ending_in_dir(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<NodeRecord>> {
+/// Entry-point ordering, `entry_points`'s meaning and this query's cost are
+/// exactly [`find_files_under`]'s - see [`entry_point_rank_expr`].
+pub fn find_files_ending_in_dir(
+    conn: &Connection,
+    dir: &str,
+    entry_points: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRecord>> {
     if dir.is_empty() || dir.contains('/') {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let (rank_expr, rank_params) = entry_point_rank_expr(entry_points);
+    let sql = format!(
         "SELECT * FROM nodes \
-         WHERE kind = 'File' AND (filePath LIKE '%/' || ?1 || '/%' OR filePath LIKE ?1 || '/%') \
-         ORDER BY (filePath LIKE '%/index.%') DESC, LENGTH(filePath) ASC \
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![dir, limit as i64], map_node_row)?;
+         WHERE kind = 'File' AND (filePath LIKE '%/' || ? || '/%' OR filePath LIKE ? || '/%') \
+         ORDER BY {rank_expr} DESC, LENGTH(filePath) ASC \
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(3 + rank_params.len());
+    bound.push(dir.to_string().into());
+    bound.push(dir.to_string().into());
+    bound.extend(rank_params.into_iter().map(Into::into));
+    bound.push((limit as i64).into());
+    let rows = stmt.query_map(rusqlite::params_from_iter(bound), map_node_row)?;
     rows.collect::<rusqlite::Result<_>>().context("failed to look up files by directory name")
 }
 
@@ -422,5 +584,169 @@ mod tests {
         upsert_node(&mut conn, node_with_span("fn1", "Function", "a/lib.rs", (5, 0), (10, 1))).unwrap();
 
         assert!(find_by_position(&conn, "a/lib.rs", 50, 0).unwrap().is_none());
+    }
+
+    fn file(path: &str) -> NodeRecord {
+        NodeRecord::new(path, "File", path, path, path, "rust")
+    }
+
+    fn entry_points(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `NodeRecord` carries no `Debug` impl, so a failing assertion below
+    /// prints candidates by path instead - all a debugging message here
+    /// needs.
+    fn paths(nodes: &[NodeRecord]) -> Vec<&str> {
+        nodes.iter().map(|n| n.file_path.as_str()).collect()
+    }
+
+    /// TS behaviour, preserved byte for byte: a bare, dot-free entry
+    /// (`"index"`, exactly what the bundled TS plugin's manifest declares)
+    /// still matches the file's stem under any extension, and still outranks
+    /// a shorter path - the same property the old hardcoded `%/index.%`
+    /// check gave `find_files_under`.
+    #[test]
+    fn a_bare_entry_point_matches_the_stem_under_any_extension_and_ranks_first() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/a.ts")).unwrap();
+        upsert_node(&mut conn, file("pkg/index.tsx")).unwrap();
+
+        let found = find_files_under(&conn, "pkg", &entry_points(&["index"]), 5).unwrap();
+
+        assert_eq!(
+            found.first().map(|n| n.file_path.as_str()),
+            Some("pkg/index.tsx"),
+            "a stem match must lead even though pkg/a.ts is the shorter path: {:?}",
+            paths(&found)
+        );
+    }
+
+    /// GM-273's acceptance case: a fake manifest declaring `entry_points =
+    /// ["mod.rs"]` (Rust's own convention, not yet backed by a real plugin -
+    /// see `daemon::manifest::WorkspaceConfig::entry_points`'s doc comment)
+    /// must rank `mod.rs` first in a directory lookup, exactly the way
+    /// `"index"` already does for TypeScript. `pkg/a.rs` is deliberately the
+    /// *shorter* path, so this only passes if the entry-point rank - not
+    /// `LENGTH(filePath)` - decided the order.
+    #[test]
+    fn a_declared_rust_entry_point_ranks_first_over_a_shorter_path() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/a.rs")).unwrap();
+        upsert_node(&mut conn, file("pkg/mod.rs")).unwrap();
+
+        let found = find_files_under(&conn, "pkg", &entry_points(&["mod.rs"]), 5).unwrap();
+
+        assert_eq!(
+            found.first().map(|n| n.file_path.as_str()),
+            Some("pkg/mod.rs"),
+            "pkg/mod.rs is 2 bytes longer than pkg/a.rs, so only the declared \
+             entry point can be why it leads: {:?}",
+            paths(&found)
+        );
+    }
+
+    /// The exact-name form's whole reason to exist: unlike the stem form, it
+    /// must not smear onto a file that merely starts with the same bytes.
+    /// `pkg/mod.rs.bak` sorts after `pkg/mod.rs` here regardless (it is
+    /// longer), so this asserts the stronger property directly - the rank
+    /// expression itself, not just the final order.
+    #[test]
+    fn an_exact_entry_point_does_not_match_a_file_that_only_shares_its_prefix() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/mod.rs.bak")).unwrap();
+
+        let (rank_expr, rank_params) = entry_point_rank_expr(&entry_points(&["mod.rs"]));
+        // `rank_expr`'s own `?` placeholders come first in the SQL text, so
+        // its params are bound first too - unnumbered `?` throughout, so the
+        // two lists stay in the same left-to-right order the query text has.
+        let mut bound: Vec<rusqlite::types::Value> = rank_params.into_iter().map(Into::into).collect();
+        bound.push("pkg/mod.rs.bak".to_string().into());
+        let matches: bool = conn
+            .query_row(
+                &format!("SELECT {rank_expr} FROM nodes WHERE filePath = ?"),
+                rusqlite::params_from_iter(bound),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!matches, "pkg/mod.rs.bak must not count as the mod.rs entry point");
+    }
+
+    /// Code-review fix: `_` and `%` are `LIKE` wildcards, and `entry_points`
+    /// is manifest content this module does not control - a future Python
+    /// manifest declaring `__init__.py` (two literal underscores) must not
+    /// have those underscores reinterpreted as "any one character". Proves
+    /// both halves: the real entry point still ranks first, and a file that
+    /// only matches because `_` was treated as a wildcard -
+    /// `pkg/abinitcd.py`'s file name is `abinitcd.py`, 11 characters, one per
+    /// literal/wildcard position in `__init__.py` (`_` `_` `i` `n` `i` `t` `_`
+    /// `_` `.` `p` `y`) - does not count as the entry point at all.
+    #[test]
+    fn an_entry_point_containing_like_wildcard_characters_is_matched_literally() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/other.py")).unwrap();
+        upsert_node(&mut conn, file("pkg/__init__.py")).unwrap();
+
+        let found = find_files_under(&conn, "pkg", &entry_points(&["__init__.py"]), 5).unwrap();
+        assert_eq!(
+            found.first().map(|n| n.file_path.as_str()),
+            Some("pkg/__init__.py"),
+            "the real entry point must still rank first: {:?}",
+            paths(&found)
+        );
+
+        // A separate file, present only so the second check below has a real
+        // row to query - unescaped, this is exactly the path the old bug
+        // would have misidentified as the __init__.py entry point.
+        upsert_node(&mut conn, file("pkg/abinitcd.py")).unwrap();
+
+        let (rank_expr, rank_params) = entry_point_rank_expr(&entry_points(&["__init__.py"]));
+        let mut bound: Vec<rusqlite::types::Value> = rank_params.into_iter().map(Into::into).collect();
+        bound.push("pkg/abinitcd.py".to_string().into());
+        let matches: bool = conn
+            .query_row(
+                &format!("SELECT {rank_expr} FROM nodes WHERE filePath = ?"),
+                rusqlite::params_from_iter(bound),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !matches,
+            "pkg/abinitcd.py must not count as the __init__.py entry point - each `_` is a literal \
+             underscore, not a single-character wildcard"
+        );
+    }
+
+    /// No manifest available at all (this task's documented fallback) must
+    /// not error, and must degrade to the pre-task ordering: shortest path
+    /// wins, with no entry point ranked ahead of it.
+    #[test]
+    fn an_empty_entry_point_list_falls_back_to_shortest_path_only() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("pkg/index.ts")).unwrap();
+        upsert_node(&mut conn, file("pkg/a.ts")).unwrap();
+
+        let found = find_files_under(&conn, "pkg", &[], 5).unwrap();
+
+        assert_eq!(
+            found.first().map(|n| n.file_path.as_str()),
+            Some("pkg/a.ts"),
+            "with no entry points declared, the shortest path must win: {:?}",
+            paths(&found)
+        );
+    }
+
+    /// `find_files_ending_in_dir` shares `entry_point_rank_expr` with
+    /// `find_files_under` - one pass over this same Rust-entry-point case is
+    /// enough to prove the wiring, not a full re-run of every case above.
+    #[test]
+    fn find_files_ending_in_dir_also_ranks_a_declared_entry_point_first() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("workspace/pkg/a.rs")).unwrap();
+        upsert_node(&mut conn, file("workspace/pkg/mod.rs")).unwrap();
+
+        let found = find_files_ending_in_dir(&conn, "pkg", &entry_points(&["mod.rs"]), 5).unwrap();
+
+        assert_eq!(found.first().map(|n| n.file_path.as_str()), Some("workspace/pkg/mod.rs"));
     }
 }

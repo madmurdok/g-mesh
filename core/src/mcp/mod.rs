@@ -480,7 +480,16 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
-        get_dependencies::handle(&self.conn, params.0)
+        // The union of every discovered plugin's declared entry points (GM-273)
+        // - see `PluginRegistry::entry_points` and
+        // `graph::queries::entry_point_rank_expr` for how a miss-path
+        // directory lookup uses it. Read fresh per call rather than cached on
+        // `self`: it is a cheap map walk over data that never changes while
+        // this daemon runs (`daemon::manifest::discover`'s own contract), so
+        // there is nothing a cache would save beyond what the borrow checker
+        // already makes free.
+        let entry_points = self.registry.entry_points();
+        get_dependencies::handle(&self.conn, &entry_points, params.0)
     }
 
     #[tool(

@@ -311,7 +311,12 @@ fn from_root_reporting(
     success(&walk)
 }
 
-fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_file(
+    conn: &Connection,
+    entry_points: &[String],
+    file_path: &str,
+    shape: &WalkShape,
+) -> Result<CallToolResult, ErrorData> {
     let anchor =
         queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
@@ -320,7 +325,7 @@ fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<Ca
     }
     // Not a file. Before refusing, see whether what was named has exactly one
     // entry point behind it - `@excalidraw/math` almost always does.
-    if let Some(entry) = entry_point_for(conn, file_path)? {
+    if let Some(entry) = entry_point_for(conn, entry_points, file_path)? {
         let resolved = ResolvedFrom {
             requested: file_path.to_string(),
             file_path: entry.file_path,
@@ -328,7 +333,7 @@ fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<Ca
         };
         return from_root_reporting(conn, entry.id, shape, Some(resolved));
     }
-    error(no_file_message(conn, file_path)?)
+    error(no_file_message(conn, entry_points, file_path)?)
 }
 
 /// How many candidates [`entry_point_for`] asks for. Two would do - the rule
@@ -354,12 +359,20 @@ const ENTRY_POINT_CANDIDATES: usize = 5;
 ///
 /// THE RULE, AND WHY IT IS THIS STRICT
 ///
-/// Both underlying queries order `index.*` first, so "the first candidate is
-/// an entry point and the second is not" is a complete test for *exactly one*
-/// even under their row limit. Anything less unanimous - no entry point, or
-/// two - returns `None` and falls through to the refusal, which lists the
-/// candidates. Guessing between two entry points would be a worse failure than
-/// refusing, because the walk would succeed and answer about the wrong file.
+/// Both underlying queries rank a file matching one of `entry_points` first
+/// (`graph::queries::entry_point_rank_expr` - GM-273 generalized what used to
+/// be a hardcoded `index.*` check into this parameter, one declared per
+/// discovered language rather than one convention baked into the query), so
+/// "the first candidate is an entry point and the second is not" is a
+/// complete test for *exactly one* even under their row limit. Anything less
+/// unanimous - no entry point, or two (a Rust directory can legitimately hold
+/// both `mod.rs` and `lib.rs`) - returns `None` and falls through to the
+/// refusal, which lists the candidates. Guessing between two entry points
+/// would be a worse failure than refusing, because the walk would succeed and
+/// answer about the wrong file - this function does not get to break that tie
+/// by, say, preferring whichever entry point sorted first in `entry_points`;
+/// nothing about declaration order is a meaningful preference between two
+/// files that both plausibly are the package's entry point.
 ///
 /// Two forms are tried, in the same order and for the same reasons
 /// [`no_file_message`] tries them: the path as a directory prefix
@@ -368,19 +381,23 @@ const ENTRY_POINT_CANDIDATES: usize = 5;
 /// directory sharing a package's name does not prove the package lives there -
 /// which is why every substitution is reported back on the response rather
 /// than performed silently.
-fn entry_point_for(conn: &Connection, requested: &str) -> Result<Option<EntryPoint>, ErrorData> {
-    let under = queries::find_files_under(conn, requested, ENTRY_POINT_CANDIDATES)
+fn entry_point_for(
+    conn: &Connection,
+    entry_points: &[String],
+    requested: &str,
+) -> Result<Option<EntryPoint>, ErrorData> {
+    let under = queries::find_files_under(conn, requested, entry_points, ENTRY_POINT_CANDIDATES)
         .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
-    if let Some(entry) = sole_entry_point(under) {
+    if let Some(entry) = sole_entry_point(under, entry_points) {
         return Ok(Some(entry));
     }
 
     let Some(segment) = requested.rsplit('/').next().filter(|s| !s.is_empty() && *s != requested) else {
         return Ok(None);
     };
-    let by_segment = queries::find_files_ending_in_dir(conn, segment, ENTRY_POINT_CANDIDATES)
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, entry_points, ENTRY_POINT_CANDIDATES)
         .map_err(|e| internal_error("failed to look up files by directory name", e))?;
-    Ok(sole_entry_point(by_segment))
+    Ok(sole_entry_point(by_segment, entry_points))
 }
 
 /// The two fields an anchor substitution needs off the chosen node: the id to
@@ -392,28 +409,42 @@ struct EntryPoint {
     file_path: String,
 }
 
-/// The first element of an `index.*`-first candidate list, but only when it is
-/// an entry point and nothing after it is - see [`entry_point_for`] for why
+/// The first element of an entry-point-first candidate list, but only when it
+/// is an entry point and nothing after it is - see [`entry_point_for`] for why
 /// the uniqueness half is what makes this safe to act on.
 ///
 /// Takes the vector by value so the chosen node's strings can be moved out
 /// rather than copied.
-fn sole_entry_point(candidates: Vec<NodeRecord>) -> Option<EntryPoint> {
+fn sole_entry_point(candidates: Vec<NodeRecord>, entry_points: &[String]) -> Option<EntryPoint> {
     let first = candidates.first()?;
-    if !is_entry_point(&first.file_path) {
+    if !is_entry_point(&first.file_path, entry_points) {
         return None;
     }
-    if candidates.get(1).is_some_and(|n| is_entry_point(&n.file_path)) {
+    if candidates.get(1).is_some_and(|n| is_entry_point(&n.file_path, entry_points)) {
         return None;
     }
     let chosen = candidates.into_iter().next()?;
     Some(EntryPoint { id: chosen.id, file_path: chosen.file_path })
 }
 
-/// Matches the same `%/index.%` shape both candidate queries sort by, so the
-/// rule this module acts on and the ordering it relies on cannot drift apart.
-fn is_entry_point(file_path: &str) -> bool {
-    file_path.rsplit('/').next().is_some_and(|name| name.starts_with("index."))
+/// Whether `file_path`'s own file name matches one of `entry_points` - the
+/// same two-shape rule `graph::queries::entry_point_rank_expr` sorts by
+/// (see its doc comment), kept in exact sync so this Rust-side uniqueness
+/// check can never disagree with which row the SQL already put first:
+///
+/// - an entry with no `.` (`"index"`) matches the file's stem under any
+///   extension;
+/// - an entry with a `.` (`"mod.rs"`) matches the file name exactly, with
+///   nothing after it.
+fn is_entry_point(file_path: &str, entry_points: &[String]) -> bool {
+    let Some(name) = file_path.rsplit('/').next() else { return false };
+    entry_points.iter().any(|entry| {
+        if entry.contains('.') {
+            name == entry.as_str()
+        } else {
+            name.starts_with(&format!("{entry}."))
+        }
+    })
 }
 
 /// The not-found answer, with what the index can add to it.
@@ -437,11 +468,11 @@ fn is_entry_point(file_path: &str) -> bool {
 /// resolved (`react` survives, `@excalidraw/math` became an edge to a file and
 /// its placeholder is gone). So there is nothing to look the package name up
 /// in, which is why this matches paths rather than pretending otherwise.
-fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorData> {
+fn no_file_message(conn: &Connection, entry_points: &[String], file_path: &str) -> Result<String, ErrorData> {
     const MAX_FILES: usize = 5;
     let terse = format!("g-mesh: no file '{file_path}' found in the index");
 
-    let under = queries::find_files_under(conn, file_path, MAX_FILES)
+    let under = queries::find_files_under(conn, file_path, entry_points, MAX_FILES)
         .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
     if !under.is_empty() {
         return Ok(format!(
@@ -456,7 +487,7 @@ fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorDa
     let Some(segment) = file_path.rsplit('/').next().filter(|s| !s.is_empty() && *s != file_path) else {
         return Ok(terse);
     };
-    let by_segment = queries::find_files_ending_in_dir(conn, segment, MAX_FILES)
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, entry_points, MAX_FILES)
         .map_err(|e| internal_error("failed to look up files by directory name", e))?;
     if by_segment.is_empty() {
         return Ok(terse);
@@ -487,7 +518,12 @@ fn paths_of(nodes: &[NodeRecord]) -> String {
 /// and a second call to get the answer the first one had the input for. A
 /// path that this index carries is an answerable question however the caller
 /// labelled it, and refusing it on a technicality buys nothing.
-fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_module(
+    conn: &Connection,
+    entry_points: &[String],
+    module_id: &str,
+    shape: &WalkShape,
+) -> Result<CallToolResult, ErrorData> {
     let anchor =
         queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
 
@@ -497,7 +533,7 @@ fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<
             .map_err(|e| internal_error("failed to look up file", e))?
         {
             Some(node) => from_root(conn, node.id, shape),
-            None => error(no_file_message(conn, module_id)?),
+            None => error(no_file_message(conn, entry_points, module_id)?),
         },
     }
 }
@@ -526,8 +562,16 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
     success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked))
 }
 
+/// `entry_points` is the union of every discovered plugin's
+/// `[plugin.workspace] entry_points` - see `daemon::registry::PluginRegistry::entry_points`
+/// and `graph::queries::entry_point_rank_expr` for where it comes from and
+/// how it is used. The caller (`mcp::GMeshMcpServer::get_dependencies`) reads
+/// it off its own `PluginRegistry` once per call, since discovery never
+/// changes while a daemon runs (see `daemon::manifest::discover`'s own
+/// contract) - there is nothing this function would gain by asking twice.
 pub(super) fn handle(
     conn: &Arc<Mutex<Connection>>,
+    entry_points: &[String],
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -543,8 +587,8 @@ pub(super) fn handle(
         (Some(_), _, _) => {
             error("g-mesh: `resume_token` already carries the walk it continues - call it without `file_path`/`module_id`")
         }
-        (None, Some(file_path), None) => from_file(&conn, &file_path, &shape),
-        (None, None, Some(module_id)) => from_module(&conn, &module_id, &shape),
+        (None, Some(file_path), None) => from_file(&conn, entry_points, &file_path, &shape),
+        (None, None, Some(module_id)) => from_module(&conn, entry_points, &module_id, &shape),
         (None, Some(_), Some(_)) => error("g-mesh: give either `file_path` or `module_id`, not both"),
         (None, None, None) => error("g-mesh: give either `file_path` or `module_id` to start from"),
     }
@@ -556,6 +600,46 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
+
+    /// What a real daemon feeds `handle`/`from_file`/`from_module`/
+    /// `no_file_message` in the bundled, TS-only setup: the bundled plugin's
+    /// own manifest declares `entry_points = ["index"]`
+    /// (`plugins/typescript/plugin.toml`), so this is the one list that
+    /// reproduces the pre-GM-273 hardcoded `index.*` behaviour exactly.
+    fn ts_entry_points() -> Vec<String> {
+        vec!["index".to_string()]
+    }
+
+    /// Shadows [`super::handle`] for every test below that does not care
+    /// about entry points at all, or wants the bundled-TS-setup default -
+    /// see [`ts_entry_points`]. A test exercising a different declared set
+    /// (a fake Rust manifest, an empty one) calls `super::handle` directly
+    /// instead of this wrapper.
+    fn handle(
+        conn: &Arc<Mutex<Connection>>,
+        params: GetDependenciesParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        super::handle(conn, &ts_entry_points(), params)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::from_file`].
+    fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+        super::from_file(conn, &ts_entry_points(), file_path, shape)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::from_module`].
+    fn from_module(
+        conn: &Connection,
+        module_id: &str,
+        shape: &WalkShape,
+    ) -> Result<CallToolResult, ErrorData> {
+        super::from_module(conn, &ts_entry_points(), module_id, shape)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::no_file_message`].
+    fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorData> {
+        super::no_file_message(conn, &ts_entry_points(), file_path)
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1208,6 +1292,67 @@ mod tests {
 
         assert_eq!(body["results"][0]["filePath"], "app/viewport.ts");
         assert_eq!(body["resolvedFrom"]["filePath"], "packages/math/index.ts");
+    }
+
+    /// GM-273's acceptance case at the tool level: a fake manifest declaring
+    /// `entry_points = ["mod.rs"]` - Rust's own convention, not TypeScript's
+    /// `"index"` - must resolve a directory lookup to `mod.rs` the same way
+    /// `a_directory_with_one_entry_point_is_answered_too` resolves one to
+    /// `index.ts`. Calls `super::from_file` directly (not the `ts_entry_points`
+    /// shadow above) precisely because this is the one test that must NOT get
+    /// the bundled-TS default.
+    #[test]
+    fn a_directory_with_one_declared_rust_entry_point_is_answered_too() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("crates/math/mod.rs")).unwrap();
+        upsert_node(&mut conn, file("crates/math/point.rs")).unwrap();
+        // Shorter than "crates/math/mod.rs" - if entry-point rank did not
+        // decide the order, `LENGTH(filePath)` would put this one first
+        // instead, and the substitution below would not happen at all.
+        upsert_node(&mut conn, file("crates/math/x.rs")).unwrap();
+        upsert_node(&mut conn, file("app/main.rs")).unwrap();
+        imports(&mut conn, "app/main.rs", "crates/math/mod.rs");
+
+        let body = json_body(
+            &super::from_file(
+                &conn,
+                &["mod.rs".to_string()],
+                "crates/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(body["results"][0]["filePath"], "app/main.rs");
+        assert_eq!(
+            body["resolvedFrom"]["filePath"], "crates/math/mod.rs",
+            "mod.rs must be the file the walk actually started from: {body}"
+        );
+    }
+
+    /// A directory declaring both of a Rust crate root's two conventional
+    /// entry points (`mod.rs` and `lib.rs`) is exactly the "more than one
+    /// entry point" case `entry_point_for`'s doc comment calls out by name -
+    /// still refused, not guessed at, the same rule
+    /// `two_entry_points_still_refuse_and_list_the_candidates` proves for TS.
+    #[test]
+    fn two_declared_rust_entry_points_in_one_directory_still_refuse() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("crates/math/mod.rs")).unwrap();
+        upsert_node(&mut conn, file("crates/math/lib.rs")).unwrap();
+
+        let message = error_text(
+            &super::from_file(
+                &conn,
+                &["mod.rs".to_string(), "lib.rs".to_string()],
+                "crates/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert!(message.contains("crates/math/mod.rs"), "the candidates are still named: {message}");
+        assert!(message.contains("crates/math/lib.rs"), "both of them: {message}");
     }
 
     /// Two entry points is the case where answering would be worse than
