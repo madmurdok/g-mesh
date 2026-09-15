@@ -33,35 +33,37 @@ fn ndjson_fixture_with_invalid_edge_kind_is_rejected() {
 }
 
 /// The protocol v2 golden fixture (GM-263): visibility/container/target
-/// fields, and `source`+`engine` on the edges, in the shape a future
-/// container-aware plugin (Go, Rust, ...) will actually send - alongside
-/// `valid.ndjson`'s v1 shape above, which must keep passing unchanged.
+/// fields, and `source`+`engine` on the edges, in the shape a
+/// container-aware plugin (Go, Rust, ...) will send once one exists -
+/// `valid.ndjson` above is the ordinary TS/JS shape (no container, file-scoped
+/// targets); both are v2 as of GM-275.
 #[test]
 fn well_formed_v2_ndjson_fixture_is_conformant() {
     let report = check_bulk_output(&fixture("valid_v2.ndjson"));
     assert!(report.is_conformant(), "{:?}", report.violations);
 }
 
-/// Real, unmodified `--bulk-index` output from the compiled JS/TS plugin
-/// (protocol v1 - GM-275 has not migrated it yet), captured against a
-/// three-file fixture exercising every placeholder kind the legacy mapping
-/// has to derive a `target` for: `pending_symbol`, both reexport shapes
-/// (whole-module and renamed), and `resolved_module`. Conformant end to end
-/// is the point - this is exactly the wire bytes a real plugin process sends
-/// today, unedited.
+/// Real `--bulk-index` output from the JS/TS plugin as it shipped *before*
+/// GM-275 (protocol v1 - `exported`, no `visibility`; a placeholder's
+/// address packed into `qualifiedName` instead of a `target` field; a bare
+/// `source` with no `engine`). GM-275 retired the normalization that used to
+/// accept this - every plugin core spawns speaks v2 now, so this fixture
+/// exercises the same rejection a live v1 plugin's handshake would hit,
+/// one level down the pipeline (parsing its bulk output, rather than its
+/// handshake payload - see `protocol::handshake`'s own tests for that one).
 #[test]
-fn real_legacy_v1_plugin_output_fixture_is_conformant() {
+fn real_legacy_v1_plugin_output_fixture_is_rejected() {
     let report = check_bulk_output(&fixture("legacy_v1_real_plugin_output.ndjson"));
-    assert!(report.is_conformant(), "{:?}", report.violations);
+    assert!(!report.is_conformant());
 }
 
-/// A `pending_symbol` whose `qualifiedName` does not fit the `<file>#<name>`
-/// convention at all - nothing here for core to derive a `target` from, and
-/// the shape check is what has to say so, rather than a WireNode failing to
-/// deserialize at all further up the pipeline.
+/// A `pending_symbol` whose wire line carries no `target` at all - a v2
+/// sender's own mistake, not a legacy shape - and the shape check is what
+/// has to say so, rather than a `WireNode` failing to deserialize at all
+/// further up the pipeline.
 #[test]
-fn underivable_legacy_placeholder_fixture_is_rejected() {
-    let report = check_bulk_output(&fixture("invalid_underivable_placeholder.ndjson"));
+fn placeholder_with_no_target_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("invalid_placeholder_no_target.ndjson"));
     assert!(!report.is_conformant());
     assert!(
         report.violations.iter().any(|v| v.message.contains("pending_symbol")),
@@ -168,9 +170,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     .unwrap();
 
     // e1 is the one the fixture answers for: syntactic/tree-sitter/false ->
-    // semantic/ts-compiler/true (the fixture is real legacy-v1 plugin output,
-    // so `engine` is derived from its `source` string the same way
-    // `protocol::types::normalize_source`'s legacy branch derives it).
+    // semantic/ts-compiler/true.
     assert_eq!(
         edge(&conn, "e1"),
         ("semantic".to_string(), "ts-compiler".to_string(), true),

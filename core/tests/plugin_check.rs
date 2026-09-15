@@ -622,7 +622,8 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
         let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
-    // LEGACY-V1: remove in GM-275 - the TS plugin still speaks v1, which the
-    // kit accepts with a warning until that migration makes it a failure.
-    assert!(run.stdout.contains("WARN  shape"), "{}", run.stdout);
+    // GM-275: the TS plugin speaks wire v2 now, so there is nothing left for
+    // `shape` to warn about (that WARN existed only while the plugin still
+    // sent the v1 shape core's normalizing deserializer accepted).
+    assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
 }

@@ -448,7 +448,7 @@ if (process.argv[2] === "--bulk-index") {{
     qualifiedName: "{language}-n1",
     filePath: "src/{language}-a.src",
     range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    exported: true,
+    visibility: "public",
     language: "{language}",
   }});
   line({{
@@ -458,7 +458,7 @@ if (process.argv[2] === "--bulk-index") {{
     qualifiedName: "{language}-n2",
     filePath: "src/{language}-b.src",
     range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    exported: true,
+    visibility: "public",
     language: "{language}",
   }});
   line({{
@@ -466,7 +466,8 @@ if (process.argv[2] === "--bulk-index") {{
     fromId: "{language}-n1",
     toId: "{language}-n2",
     kind: "CALLS",
-    source: "tree-sitter",
+    source: "syntactic",
+    engine: "tree-sitter",
     resolved: true,
   }});
   process.exit(0);
