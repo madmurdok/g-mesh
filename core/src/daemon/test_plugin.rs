@@ -82,6 +82,14 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 /// request that carried an id - see this module's "Counting round trips" doc.
 const REQUEST_LOG: &str = "requests.log";
 
+/// Marks that a [`install_stalling`] plugin directory's *very first* framed
+/// request has already been (deliberately) left unanswered - see that
+/// function's doc comment. Written by the process that hits it, and read by
+/// every process spawned against this plugin directory afterward - including
+/// a crash-recovery relaunch, which is a fresh Node process with no memory of
+/// its predecessor's in-memory state, but the same directory on disk.
+const STALL_MARKER: &str = "stalled-once.marker";
+
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
 ///
@@ -89,7 +97,7 @@ const REQUEST_LOG: &str = "requests.log";
 /// `daemon::manifest::discover(&[root])` picks it up with no test-only path
 /// through discovery.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false)
+    install_inner(root, language, extensions, false, false)
 }
 
 /// [`install`], but the plugin does not answer its handshake until
@@ -117,7 +125,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
 pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, true)
+    install_inner(root, language, extensions, true, false)
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
@@ -128,10 +136,47 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
         .expect("failed to open the fake plugin's handshake gate");
 }
 
-fn install_inner(root: &Path, language: &str, extensions: &[&str], gated: bool) -> PathBuf {
+/// [`install`], but the plugin completes its handshake normally and then
+/// never answers the *first* framed request it ever sees for this plugin
+/// directory - it still parses that request and logs it to `requests.log`
+/// ([`requests`]), so a test can confirm the request really was received, but
+/// it deliberately never writes the response frame back. Every request after
+/// that first one - including the first one a crash-recovery relaunch's fresh
+/// process sees - is answered normally, exactly like [`install`].
+///
+/// This is task GM-271's fixture: a language whose plugin is up, has shaken
+/// hands, and then hangs on exactly one request - the "semantic engine hangs
+/// or is slow" failure mode `docs/architecture/multi-language-plugins.md`'s
+/// Failure Modes section describes, and exactly the shape nothing but a
+/// per-request timeout can recover from (a debounce, a retry, a bigger read
+/// buffer - none of them help when the peer is simply never going to write
+/// anything for *that* request). "Exactly one request, ever" rather than
+/// "every request forever" is deliberate: it is what lets a test observe the
+/// *whole* recovery cycle - timeout, relaunch, and a subsequent replay that
+/// actually succeeds - rather than an unbounded retry loop that never
+/// converges. The "already stalled once" fact is persisted to
+/// [`STALL_MARKER`] in this plugin's own directory, not held in the process's
+/// memory, specifically so it survives exactly the event this fixture exists
+/// to provoke: a crash-recovery relaunch, which is a brand new Node process
+/// with no memory of what its predecessor already did.
+///
+/// The stalled process itself stays alive and keeps its stdin open (unlike a
+/// crashed plugin, whose pipes are already closed) - so a test using this
+/// fixture is specifically exercising the *timeout* path, not the
+/// pre-existing "process exited" crash-recovery path
+/// `plugin_crash_recovery.rs` already covers. It still exits cleanly if core
+/// closes its stdin (the same `end`-handler exit every fixture here has), and
+/// it dies immediately if killed - which is exactly what
+/// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
+/// it runs past its budget.
+pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, true)
+}
+
+fn install_inner(root: &Path, language: &str, extensions: &[&str], gated: bool, stalling: bool) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language, gated))
+    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling))
         .expect("failed to write the fake plugin's entry point");
     fs::write(dir.join("plugin.toml"), manifest(language, extensions))
         .expect("failed to write the fake plugin's manifest");
@@ -209,7 +254,12 @@ extensions = [{extensions}]
 /// `protocol::jsonrpc` to be a peer, and would rather hang than guess if core
 /// ever sent something it does not understand, since a test that hangs is
 /// easier to diagnose than one that silently agrees with a bug.
-fn entry_point(language: &str, gated: bool) -> String {
+///
+/// `stalling` (see [`install_stalling`]) still logs every request it parses,
+/// but skips the `writeFrame` that would answer the one request this plugin
+/// directory has never yet stalled on ([`STALL_MARKER`]) - every other
+/// request, including every one after that, is answered normally.
+fn entry_point(language: &str, gated: bool, stalling: bool) -> String {
     format!(
         r#"// Generated by core/src/daemon/test_plugin.rs - not a real plugin.
 const fs = require("fs");
@@ -303,7 +353,19 @@ process.stdin.on("data", (chunk) => {{
     if (request.id !== undefined && request.id !== null) {{
       const filePath = (request.params && request.params.filePath) || "";
       fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
-      writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
+      // See test_plugin.rs's `install_stalling`/`STALL_MARKER` doc comments:
+      // this plugin directory stalls on its first-ever framed request, and
+      // answers normally forever after - including from a fresh process a
+      // crash-recovery relaunch spawns, which is why the "already stalled
+      // once" fact has to live in a file rather than a variable.
+      const markerPath = path.join(__dirname, "{STALL_MARKER}");
+      const shouldStall = {stalling} && !fs.existsSync(markerPath);
+      if (shouldStall) {{
+        fs.writeFileSync(markerPath, String(process.pid) + "\n");
+        // Deliberately never answer this one request.
+      }} else {{
+        writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
+      }}
     }}
   }}
 }});

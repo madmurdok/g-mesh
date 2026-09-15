@@ -1,4 +1,5 @@
 use std::io::{BufReader, Cursor};
+use std::time::Duration;
 
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::protocol::conformance::{check_bulk_output, check_control_plane_output};
@@ -112,6 +113,8 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         // Matches the id both fixtures carry; a mismatch is refused outright.
         RequestId::Number(7),
         &EmbeddingPipeline::disabled(),
+        Duration::from_secs(5),
+        &mut || panic!("on_timeout fired reading a fixture that is already fully buffered"),
     )
     .unwrap();
 
