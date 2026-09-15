@@ -62,10 +62,11 @@ pub struct NodeRecord {
     /// since SQLite refuses an `INSERT`/`UPDATE` that names a generated
     /// column at all. It stays a field here, rather than becoming a method
     /// computed from `visibility`, so every existing reader keeps compiling
-    /// unchanged, most importantly `graph::symbol_links::link_diff`, which
-    /// filters `diff.upsert_nodes` by `.exported` *before* anything is read
-    /// back from storage, so there is no database row yet to derive it from
-    /// at that point. Every *constructor* of a `NodeRecord`
+    /// unchanged. (`graph::symbol_links::link_diff` used to be the one that
+    /// mattered, filtering `diff.upsert_nodes` by `.exported` before anything
+    /// was read back; since GM-266 it reads `visibility` itself, because a
+    /// `container`-visible node can answer a placeholder too.) Every
+    /// *constructor* of a `NodeRecord`
     /// ([`NodeRecord::new`], `watcher::apply::to_node_record`, and this
     /// module's/`graph::symbol_links`'s own test helpers) is required to set
     /// this from `visibility` at construction time; that

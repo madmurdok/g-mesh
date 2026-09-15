@@ -476,7 +476,12 @@ edge of kind `K`:
    - Otherwise: leave the edge alone.
 5. **Visibility.**
    - `public`: always visible.
-   - `file`: visible iff `fromFile = node.filePath`.
+   - `file`: visible iff `fromFile = node.filePath` **and the node is looked up in
+     a container scope**. In a file scope a `file`-visible node is never a
+     candidate (GM-266): a file sees its own unpublished declarations only
+     lexically, as direct same-file edges, and the narrowing keeps TS exactly
+     equivalent to its old `exported = 1` rule for a placeholder addressed at its
+     own file.
    - `container(c)`: visible iff `fromContainer` is `c` or has `c` on its parent
      chain (from `containers.parentKey`).
    - A `qualifiedName` key is checked too, so a semantic tier's mistake cannot link
@@ -484,7 +489,11 @@ edge of kind `K`:
 
 `link_diff` gains one trigger: a node upserted into a container can answer
 placeholders waiting on that container, the counterpart of today's
-"new export in a file".
+"new export in a file". Building it showed a second one is needed for
+`link_all` and `link_diff` to agree: a container that comes into existence
+extends the parent chain of every container below it, so the placeholders in
+those containers' files are revisited too. `graph::symbol_links`' module doc
+has the full contract, including how re-exports apply to a container scope.
 
 ### Conformance kit
 
