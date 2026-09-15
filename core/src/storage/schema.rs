@@ -516,6 +516,34 @@ fn present_languages(conn: &Connection) -> Result<Vec<String>> {
     rows.collect::<rusqlite::Result<_>>().context("failed to read the present language set")
 }
 
+/// [`present_languages`], each paired with whether that language's
+/// `language_state.semanticPassAt` is set - what `mcp::instructions` reads
+/// (GM-262) to decide, per present language, whether a `receiver_calls`
+/// capability that depends on a completed semantic pass
+/// (`daemon::manifest::Capabilities::receiver_calls`, gated on
+/// `receiver_calls_structural` being unresolved) still names an open gap.
+///
+/// `pub` rather than folded into a private helper: this is read from
+/// `mcp::mod::GMeshMcpServer::get_info`, a synchronous trait method with a
+/// plain `&Connection` (via the session's `Mutex` guard) and no roll-up to
+/// compute - it wants the raw per-language pairs, not `present_languages`'
+/// column-agnostic boolean roll-up shape.
+pub fn present_languages_with_semantic_state(conn: &Connection) -> Result<Vec<(String, bool)>> {
+    let mut result = Vec::new();
+    for language in present_languages(conn)? {
+        let passed: Option<Option<String>> = conn
+            .query_row(
+                "SELECT semanticPassAt FROM language_state WHERE language = ?1",
+                params![language],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("failed to read language_state.semanticPassAt for {language}"))?;
+        result.push((language, matches!(passed, Some(Some(_)))));
+    }
+    Ok(result)
+}
+
 /// Whether every language [`present_languages`] names has a non-NULL
 /// `language_state.<column>` - the shared roll-up condition behind both
 /// [`record_bulk_index`] and [`record_semantic_pass`]. `column` is always one
