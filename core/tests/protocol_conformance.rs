@@ -32,6 +32,53 @@ fn ndjson_fixture_with_invalid_edge_kind_is_rejected() {
     );
 }
 
+/// The protocol v2 golden fixture (GM-263): visibility/container/target
+/// fields, and `source`+`engine` on the edges, in the shape a future
+/// container-aware plugin (Go, Rust, ...) will actually send - alongside
+/// `valid.ndjson`'s v1 shape above, which must keep passing unchanged.
+#[test]
+fn well_formed_v2_ndjson_fixture_is_conformant() {
+    let report = check_bulk_output(&fixture("valid_v2.ndjson"));
+    assert!(report.is_conformant(), "{:?}", report.violations);
+}
+
+/// Real, unmodified `--bulk-index` output from the compiled JS/TS plugin
+/// (protocol v1 - GM-275 has not migrated it yet), captured against a
+/// three-file fixture exercising every placeholder kind the legacy mapping
+/// has to derive a `target` for: `pending_symbol`, both reexport shapes
+/// (whole-module and renamed), and `resolved_module`. Conformant end to end
+/// is the point - this is exactly the wire bytes a real plugin process sends
+/// today, unedited.
+#[test]
+fn real_legacy_v1_plugin_output_fixture_is_conformant() {
+    let report = check_bulk_output(&fixture("legacy_v1_real_plugin_output.ndjson"));
+    assert!(report.is_conformant(), "{:?}", report.violations);
+}
+
+/// A `pending_symbol` whose `qualifiedName` does not fit the `<file>#<name>`
+/// convention at all - nothing here for core to derive a `target` from, and
+/// the shape check is what has to say so, rather than a WireNode failing to
+/// deserialize at all further up the pipeline.
+#[test]
+fn underivable_legacy_placeholder_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("invalid_underivable_placeholder.ndjson"));
+    assert!(!report.is_conformant());
+    assert!(
+        report.violations.iter().any(|v| v.message.contains("pending_symbol")),
+        "{:?}",
+        report.violations
+    );
+}
+
+/// Core, not a plugin, materializes container nodes - one on the wire is
+/// always a conformance violation (Data Model > Logical containers).
+#[test]
+fn container_node_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("invalid_container_node.ndjson"));
+    assert!(!report.is_conformant());
+    assert!(report.violations.iter().any(|v| v.message.contains("container")), "{:?}", report.violations);
+}
+
 #[test]
 fn well_formed_control_plane_fixture_is_conformant() {
     let report = check_control_plane_output(&fixture("valid_control.rpc"));
