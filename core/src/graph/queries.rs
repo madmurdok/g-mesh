@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 
@@ -13,6 +14,16 @@ use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 // pass-through instead of at the definition it asked for. `IS NOT` rather
 // than `<>` or `NOT IN`, so an ordinary node's NULL `nativeKind` still
 // passes.
+//
+// The name, qualifiedName and position lookups exclude core's container
+// nodes (`graph::containers::CONTAINER_NATIVE_KIND`) as well, for a
+// different reason with the same effect: a container is a real node, but it
+// has no source - `filePath` is `''` and its range is zero - so an answer
+// built on one (a source snippet, a staleness check on its file, an anchor
+// echo telling the caller where it lives) points at nothing. Its name is also
+// its whole key (`github.com/x/app/server`), which no caller asking "where is
+// `server` defined" writes. `find_in_file_named` and the file lookups below
+// need no such filter: they already refuse `Module` or require `File`.
 
 pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
     Ok(NodeRecord {
@@ -34,6 +45,11 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         visibility: row.get("visibility")?,
         visibility_container: row.get("visibilityContainer")?,
         container: row.get("container")?,
+        // Not a `nodes` column - it lives on the container's own
+        // `containers.parentKey` - so there is nothing to read it from here.
+        // See `NodeRecord.container_parent` for why a record read this way
+        // must not be written straight back.
+        container_parent: None,
         // Deliberately not joined, same reasoning as `declarations` just
         // below: a read via this function is never handed back to
         // `apply_diff` expecting an existing `placeholder_targets` row to be
@@ -99,19 +115,21 @@ pub fn delete_node(conn: &mut Connection, id: &str) -> Result<()> {
 pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> Result<Vec<NodeRecord>> {
     let mut stmt = match file_path {
         Some(_) => conn.prepare(
-            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND filePath = ?4",
+            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4 AND filePath = ?5",
         )?,
         None => conn.prepare(
-            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3",
+            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4",
         )?,
     };
     let rows = match file_path {
-        Some(fp) => {
-            stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, fp], map_node_row)?
-        }
-        None => {
-            stmt.query_map(params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND], map_node_row)?
-        }
+        Some(fp) => stmt.query_map(
+            params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND, fp],
+            map_node_row,
+        )?,
+        None => stmt.query_map(
+            params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND],
+            map_node_row,
+        )?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
@@ -366,19 +384,25 @@ pub fn find_by_qualified_name(
 ) -> Result<Vec<NodeRecord>> {
     let mut stmt = match file_path {
         Some(_) => conn.prepare(
-            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND filePath = ?4",
+            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4 AND filePath = ?5",
         )?,
         None => conn.prepare(
-            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3",
+            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4",
         )?,
     };
     let rows = match file_path {
         Some(fp) => stmt.query_map(
-            params![qualified_name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, fp],
+            params![
+                qualified_name,
+                PENDING_SYMBOL_NATIVE_KIND,
+                REEXPORT_NATIVE_KIND,
+                CONTAINER_NATIVE_KIND,
+                fp
+            ],
             map_node_row,
         )?,
         None => stmt.query_map(
-            params![qualified_name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND],
+            params![qualified_name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND],
             map_node_row,
         )?,
     };
@@ -416,11 +440,19 @@ pub fn find_by_position(
          WHERE filePath = ?1 \
            AND nativeKind IS NOT ?4 \
            AND nativeKind IS NOT ?5 \
+           AND nativeKind IS NOT ?6 \
            AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
            AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
          ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
          LIMIT 1",
-        params![file_path, line, col, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND],
+        params![
+            file_path,
+            line,
+            col,
+            PENDING_SYMBOL_NATIVE_KIND,
+            REEXPORT_NATIVE_KIND,
+            CONTAINER_NATIVE_KIND
+        ],
         map_node_row,
     )
     .optional()
@@ -590,6 +622,30 @@ mod tests {
 
         let found = find_by_position(&conn, "a/lib.rs", 7, 2).unwrap().unwrap();
         assert_eq!(found.id, "fn1", "the nested function must win over the enclosing file");
+    }
+
+    /// A container node (`graph::containers`) is a real row with no source:
+    /// no name, qualifiedName or position lookup may answer with it, even
+    /// when its key is exactly the string asked for. Materialized the way the
+    /// daemon does it, through `apply_diff`, rather than inserted by hand.
+    #[test]
+    fn container_nodes_are_not_answers_to_name_qualified_name_or_position_lookups() {
+        let mut conn = setup();
+        let mut member = NodeRecord::new("fn1", "Function", "run", "app::run", "app/run.rs", "rust");
+        member.container = Some("app".to_string());
+        upsert_node(&mut conn, member).unwrap();
+        let container = crate::graph::containers::container_id("rust", "app");
+        assert!(
+            get_node(&conn, &container).unwrap().is_some(),
+            "the container must exist for this to test anything"
+        );
+
+        assert!(find_by_name(&conn, "app", None).unwrap().is_empty());
+        assert!(find_by_name(&conn, "app", Some("")).unwrap().is_empty());
+        assert!(find_by_qualified_name(&conn, "app", None).unwrap().is_empty());
+        assert!(find_by_qualified_name(&conn, "app", Some("")).unwrap().is_empty());
+        assert!(find_by_position(&conn, "", 0, 0).unwrap().is_none());
+        assert_eq!(find_by_name(&conn, "run", None).unwrap().len(), 1, "its member is still found");
     }
 
     #[test]

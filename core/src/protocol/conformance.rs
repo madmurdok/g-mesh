@@ -1,5 +1,10 @@
 use std::io::{BufReader, Cursor};
 
+// `CONTAINER_NATIVE_KIND`: core, not a plugin, materializes container nodes
+// (`graph::containers`) - a container has members in many files, so no single
+// file's diff can own it - so a plugin ever emitting one is always a
+// conformance violation, never a legitimate message.
+use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
@@ -15,14 +20,6 @@ use crate::protocol::types::{ControlEnvelope, WireNode};
 /// `placeholder nativeKind requires a target` shape check below.
 const PLACEHOLDER_NATIVE_KINDS: [&str; 3] =
     [PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND];
-
-/// `nativeKind` of a logical-container node (Data Model > Logical
-/// containers). Core, not a plugin, materializes these - a container has
-/// members in many files, so no single file's diff can own it - so a plugin
-/// ever emitting one is always a conformance violation, never a legitimate
-/// message. Not yet a `pub const` anywhere in `graph`, because core does not
-/// build container nodes itself yet; kept local until it does.
-const CONTAINER_NATIVE_KIND: &str = "container";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Violation {

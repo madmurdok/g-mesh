@@ -141,10 +141,10 @@ const DDL: &str = r#"
 -- is a member of (Data Model > Logical containers - a Go import path, a Rust
 -- module path, ...), while `visibilityContainer` is who may *see* it, and the
 -- two disagree exactly for `pub(crate)`/`pub(super)` (visible from an
--- ancestor container, declared in a descendant one). Nothing in this task
--- populates it beyond the flat column and `idx_nodes_container` below -
--- container *nodes* (the `containers` table's own rows, membership counts,
--- GC) are GM-265's to materialize, per the design doc's Rollout table.
+-- ancestor container, declared in a descendant one). The column is the
+-- source of membership: `graph::containers` reads it inside `apply_diff` to
+-- materialize container nodes, `containers` rows and `DEFINES` edges, and to
+-- GC a container whose last member goes.
 CREATE TABLE IF NOT EXISTS nodes (
     id                   TEXT PRIMARY KEY,
     kind                 TEXT NOT NULL,
@@ -249,21 +249,19 @@ CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
 -- One row per logical container actually present in the index - a Go
 -- package, a Rust module, ... (design doc: Data Model > Logical containers).
 -- `nodeId` is the container's own node (an ordinary `Module` row with
--- `nativeKind = 'container'`, `filePath = ''` - see the design doc for the
--- id scheme), not a member; a member points *at* its container through
--- `nodes.container` above, a plain key string, not a foreign key onto this
--- table - the two are deliberately not joined by an FK, because nothing in
--- this task ever writes a row here (see the comment below).
+-- `nativeKind = 'container'`, `filePath = ''` - see
+-- `graph::containers::container_id` for the id scheme), not a member; a
+-- member points *at* its container through `nodes.container` above, a plain
+-- key string, not a foreign key onto this table - a member is written before
+-- its container exists, by a plugin diff that never names the container.
 --
--- **Not populated by GM-264.** Materializing a node for a key the first time
--- a member is upserted, maintaining `memberCount`, and GCing an empty
--- container are all core-owned behaviour the design doc assigns to
--- `graph::containers`, which does not exist yet (Rollout: GM-265). The table
--- is created now, with `idx_nodes_container` above, purely so the schema
--- bump that forces every project to reindex happens exactly once for this
--- whole area of the design rather than once per table that eventually lands
--- in it - the same reasoning `storage::vectors`' own DDL comment gives for
--- why `vectors` shipped in schema "6" ahead of the code that filled it.
+-- Written only by `graph::containers`, inside `apply_diff`'s transaction
+-- (GM-265): a row appears with a container's first member, `memberCount` is
+-- recounted from the container's `DEFINES` edges whenever a diff touches it,
+-- `parentKey` comes from the members' `containerParent`, and the row goes -
+-- explicitly, since the daemon runs with foreign keys off and the `ON DELETE
+-- CASCADE` below never fires there - when the count reaches zero. That
+-- module's doc has the reasoning for each of those choices.
 CREATE TABLE IF NOT EXISTS containers (
     nodeId      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
     language    TEXT NOT NULL,
