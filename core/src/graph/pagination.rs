@@ -255,6 +255,23 @@ const MAX_FILE_TALLY: usize = 200;
 /// path lengths.
 pub const FILE_TALLY_RESERVE: usize = 8_000;
 
+/// Ceiling on how many files the excluded-references tally on
+/// `find_callers`/`find_callees` names.
+///
+/// A quarter of [`MAX_FILE_TALLY`], because this tally is a *footnote to*
+/// another answer rather than the answer: it rides on a response that may
+/// already carry a full-sized `files` tally plus rows, and the set it
+/// summarises is by construction the leftovers of a `CALLS` walk rather than a
+/// symbol's whole fan-out. The widest such set the benchmark corpus produces
+/// is excalidraw's `pointFrom` at 26 files, so 50 leaves headroom of the same
+/// order [`MAX_FILE_TALLY`] leaves over its own worst case.
+pub const MAX_EXCLUDED_FILE_TALLY: usize = 50;
+
+/// Byte budget held back for the excluded-references tally, on the same rule
+/// and at the same ~40-bytes-an-entry sizing as [`FILE_TALLY_RESERVE`], scaled
+/// to [`MAX_EXCLUDED_FILE_TALLY`].
+pub const EXCLUDED_TALLY_RESERVE: usize = 2_000;
+
 /// Every distinct file that holds one of the edges [`paginate_edges`] would
 /// match for the same anchor/direction/kind/scope, with a per-file count -
 /// computed over the *whole* edge set, not one page of it.
@@ -276,6 +293,25 @@ pub fn tally_edge_files(
     direction: Direction,
     edge_kinds: &[&str],
     file_paths: &[&str],
+) -> Result<Vec<FileTally>> {
+    tally_edge_files_limited(conn, anchor_node_id, direction, edge_kinds, file_paths, MAX_FILE_TALLY)
+}
+
+/// [`tally_edge_files`] with the entry cap named by the caller instead of
+/// fixed at [`MAX_FILE_TALLY`].
+///
+/// Exists for the excluded-references tally on `find_callers`/`find_callees`,
+/// which rides alongside a response that may already carry a full-sized
+/// `files` tally and so cannot be allowed the same 200 entries. A caller that
+/// wants the ordinary cap should call [`tally_edge_files`] and not restate the
+/// constant.
+pub fn tally_edge_files_limited(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+    limit: usize,
 ) -> Result<Vec<FileTally>> {
     let (other_endpoint, this_endpoint) = match direction {
         Direction::Outgoing => ("toId", "fromId"),
@@ -309,7 +345,7 @@ pub fn tally_edge_files(
          LIMIT ?2"
     );
 
-    let cap = MAX_FILE_TALLY as i64;
+    let cap = limit as i64;
     let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor_node_id, &cap];
     sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
     sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
@@ -322,6 +358,60 @@ pub fn tally_edge_files(
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to tally edge files")?;
     Ok(tally)
+}
+
+/// Counts edges of `edge_kinds` incident on `anchor_node_id` in `direction`,
+/// under the same scope filter [`tally_edge_files`] applies.
+///
+/// Unlike that function this is a plain count with **no cap**. It exists to
+/// answer "how many usages did the walk you were just served leave out", and a
+/// capped answer to that question would understate the very gap it is there to
+/// disclose - the opposite of the file tally, where a bounded summary is the
+/// point and `MAX_FILE_TALLY` is what keeps it from growing without bound.
+pub fn count_edges(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> Result<usize> {
+    let (other_endpoint, this_endpoint) = match direction {
+        Direction::Outgoing => ("toId", "fromId"),
+        Direction::Incoming => ("fromId", "toId"),
+    };
+
+    // `?1` is the anchor id; the kind filter's placeholders continue after it
+    // and the scope filter's after those. Same widening rule as
+    // `tally_edge_files`, minus its `?2` row cap - there is no LIMIT here.
+    let kind_filter = if edge_kinds.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+        format!("e.kind IN ({})", placeholders.join(", "))
+    };
+    let scope_filter = if file_paths.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        let base = 2 + edge_kinds.len();
+        let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
+        format!("n.filePath IN ({})", placeholders.join(", "))
+    };
+    let sql = format!(
+        "SELECT COUNT(*) \
+         FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
+         WHERE e.{this_endpoint} = ?1 \
+           AND {kind_filter} \
+           AND {scope_filter}"
+    );
+
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor_node_id];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let count: i64 =
+        stmt.query_row(sql_params.as_slice(), |row| row.get(0)).context("failed to count edges")?;
+    Ok(count as usize)
 }
 
 /// Whether a `files` tally is worth sending alongside `results`.
@@ -352,6 +442,36 @@ pub fn bound_page_reserving_tally<T: Serialize>(
     next_cursor: Option<String>,
 ) -> Page<T> {
     bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - FILE_TALLY_RESERVE)
+}
+
+/// [`bound_page_reserving_tally`] for a response that may carry *two* tallies:
+/// the `files` one and the excluded-references one. Both reserves come off the
+/// same [`MAX_RESPONSE_BYTES`] ceiling, so the total a caller page can reach is
+/// unchanged from before the second tally existed - what shrinks is the share
+/// left for rows, which are the part that grows without bound and therefore the
+/// right part to cut.
+pub fn bound_page_reserving_two_tallies<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+) -> Page<T> {
+    bound_page_within(
+        rows,
+        has_more,
+        next_cursor,
+        MAX_RESPONSE_BYTES - FILE_TALLY_RESERVE - EXCLUDED_TALLY_RESERVE,
+    )
+}
+
+/// [`bound_page`] leaving room for an excluded-references tally alone - the
+/// callee side, which has no `files` tally of its own (see `CallerPage::files`
+/// for why that asymmetry is deliberate).
+pub fn bound_page_reserving_excluded_tally<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+) -> Page<T> {
+    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - EXCLUDED_TALLY_RESERVE)
 }
 
 /// An edge alongside the `locality` [`paginate_edges`] already computed for

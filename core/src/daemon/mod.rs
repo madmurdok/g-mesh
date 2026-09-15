@@ -30,7 +30,7 @@ use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
 use crate::ipc;
 use crate::mcp;
-use crate::storage::connection::{self, project_dir};
+use crate::storage::connection::{self, ensure_project_dir, project_dir};
 use crate::storage::schema;
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
@@ -318,9 +318,11 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// bind - the ordering, the pid file, the stale-endpoint clearing - is the
 /// same on both.
 pub fn run(root: &Path) -> Result<()> {
-    let dir = project_dir(root)?;
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create project directory {}", dir.display()))?;
+    // `ensure_project_dir`, not a bare `create_dir_all`: a state directory
+    // born without its `project.root` file is invisible to `clean orphaned`
+    // forever, since `project_hash` is one-way and there is nothing to
+    // recover the root from afterwards. See that function's doc comment.
+    let dir = ensure_project_dir(root)?;
 
     // Singleton guard, taken before anything else touches the project's
     // files: whoever holds it owns the socket. A second daemon for the same
