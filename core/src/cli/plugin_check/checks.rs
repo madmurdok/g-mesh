@@ -18,10 +18,11 @@
 //!   `RoundTripTimeouts`. Everything else depends on it; a check whose input a
 //!   failed session never produced is skipped, not passed.
 //! - **`shape`** - every bulk line and every response parses as the protocol
-//!   v2 shape *after* core's own normalization (`WireNode`/`WireEdge`
-//!   deserialize), and a placeholder `nativeKind` carries a `target`. Legacy
-//!   v1 fields are a warning on this check, not a failure - see
-//!   [`legacy_v1_warning`].
+//!   v2 shape (`WireNode`/`WireEdge` deserialize), and a placeholder
+//!   `nativeKind` carries a `target`. A v1-shaped line (GM-263's `exported`,
+//!   a bare `source` with no `engine`) fails to deserialize at all as of
+//!   GM-275 - `protocol::ndjson`'s parse error is what this check reports for
+//!   it, the same as any other malformed line.
 //! - **`stream-order`** - in the structural stream (bulk, `fileChanged`
 //!   diffs), an edge's `fromId` and `toId` are nodes of the edge's own file,
 //!   emitted before the edge. This is "edges never leave their file": a bulk
@@ -297,88 +298,7 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
         }
     }
 
-    let mut check = result("shape", verdict(findings));
-    check.warnings.extend(legacy_v1_warning(run));
-    check
-}
-
-/// LEGACY-V1: remove in GM-275, together with its call site in [`shape`].
-///
-/// `WireNode`/`WireEdge` still accept the v1 wire shape and normalize it
-/// (`protocol::types`' own `LEGACY-V1` sites), so a v1 plugin passes `shape`
-/// exactly as core would load it - which is what lets the TS plugin pass this
-/// kit before GM-275 migrates it. But a conformance kit that silently accepts
-/// the old shape would give GM-275 nothing to flip, so the use is counted
-/// from the *raw* JSON (which the normalizing deserializer erases) and
-/// reported as a warning. GM-275 turns this into a `shape` failure by moving
-/// these counts into findings, then deletes the normalization.
-fn legacy_v1_warning(run: &RunData) -> Option<String> {
-    let mut exported = 0usize;
-    let mut source_without_engine = 0usize;
-    let mut derived_targets = 0usize;
-
-    let mut inspect_node = |raw: &serde_json::Value| {
-        let has = |key: &str| raw.get(key).is_some_and(|v| !v.is_null());
-        if has("exported") && !has("visibility") {
-            exported += 1;
-        }
-        let native_kind = raw.get("nativeKind").and_then(|v| v.as_str());
-        if native_kind.is_some_and(|kind| PLACEHOLDER_NATIVE_KINDS.contains(&kind)) && !has("target") {
-            derived_targets += 1;
-        }
-    };
-    let mut edges = Vec::new();
-
-    if run.bulk[0].complete() {
-        for line in &run.bulk[0].lines {
-            let Some(raw) = &line.raw else { continue };
-            match &line.item {
-                Ok(BulkItem::Node(_)) => inspect_node(raw),
-                Ok(BulkItem::Edge(_)) => edges.push(raw.clone()),
-                Err(_) => {}
-            }
-        }
-    }
-    if let Some(session) = run.session {
-        for response in session.exchanges.iter().filter_map(|e| e.response.as_ref()) {
-            let result = response.raw.get("result");
-            for node in
-                result.and_then(|r| r.get("upsertNodes")).and_then(|v| v.as_array()).into_iter().flatten()
-            {
-                inspect_node(node);
-            }
-            for edge in
-                result.and_then(|r| r.get("upsertEdges")).and_then(|v| v.as_array()).into_iter().flatten()
-            {
-                edges.push(edge.clone());
-            }
-        }
-    }
-    for edge in &edges {
-        if edge.get("source").is_some() && edge.get("engine").is_none_or(|v| v.is_null()) {
-            source_without_engine += 1;
-        }
-    }
-
-    let uses: Vec<String> = [
-        (exported, "`exported` without `visibility` on {} node(s)"),
-        (source_without_engine, "`source` without `engine` on {} edge(s)"),
-        (
-            derived_targets,
-            "a placeholder `target` derived from the `<file>#<name>` qualifiedName convention on {} node(s)",
-        ),
-    ]
-    .into_iter()
-    .filter(|(count, _)| *count > 0)
-    .map(|(count, text)| text.replace("{}", &count.to_string()))
-    .collect();
-    if uses.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "legacy protocol v1 wire fields, accepted as core normalizes them until GM-275 makes v2 mandatory: {}",
-        uses.join(", ")
-    ))
+    result("shape", verdict(findings))
 }
 
 // --- bulk-stream rules ------------------------------------------------------
@@ -954,10 +874,7 @@ mod tests {
                 step: "semanticPass #1".to_string(),
                 method: Method::SemanticPass,
                 file_paths: Vec::new(),
-                response: Some(Response {
-                    raw: serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}),
-                    diff: Ok(FileChangeDiff::default()),
-                }),
+                response: Some(Response { diff: Ok(FileChangeDiff::default()) }),
             }],
             ..Session::default()
         };
@@ -993,8 +910,12 @@ mod tests {
         assert_eq!(lazy(data(true)), Outcome::Pass);
     }
 
+    /// GM-275: a v1-shaped line (`exported`, a bare `source` with no
+    /// `engine`) used to pass `shape` with a warning (core normalized it);
+    /// now that every plugin speaks v2, it fails to parse at all and `shape`
+    /// reports that failure like any other malformed line.
     #[test]
-    fn legacy_v1_fields_warn_without_failing_shape() {
+    fn v1_shaped_lines_fail_shape_instead_of_warning() {
         let lines = vec![
             "{\"id\":\"a\",\"kind\":\"File\",\"name\":\"a\",\"qualifiedName\":\"a.fk\",\"filePath\":\"a.fk\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"exported\":false,\"language\":\"fake\"}".to_string(),
             "{\"id\":\"p\",\"kind\":\"Module\",\"name\":\"x\",\"qualifiedName\":\"b.fk#x\",\"filePath\":\"a.fk\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"exported\":false,\"language\":\"fake\",\"nativeKind\":\"pending_symbol\"}".to_string(),
@@ -1002,13 +923,8 @@ mod tests {
         ];
         let results = evaluate_bulk(lines);
         let shape = results.iter().find(|r| r.id == "shape").unwrap();
-        assert_eq!(shape.outcome, Outcome::Pass);
-        assert_eq!(shape.warnings.len(), 1);
-        assert!(
-            shape.warnings[0].contains("on 2 node(s), `source` without `engine` on 1 edge(s)"),
-            "{:?}",
-            shape.warnings
-        );
-        assert!(shape.warnings[0].contains("on 1 node(s)"), "{:?}", shape.warnings);
+        let Outcome::Fail(findings) = &shape.outcome else { panic!("shape must fail: {shape:?}") };
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert!(shape.warnings.is_empty(), "{:?}", shape.warnings);
     }
 }
