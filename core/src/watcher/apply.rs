@@ -298,12 +298,10 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
         visibility,
         visibility_container,
         container: node.container,
-        // `container_parent` has nowhere to go yet: container *nodes* (the
-        // `containers` table's own rows, the only place a parent relationship
-        // is recorded) are not materialized until GM-265 - see
-        // `storage::schema`'s DDL comment on `containers`. Dropped here, the
-        // same way this field was already dropped before GM-264 added
-        // anywhere for `container` itself to land.
+        // Carried through to `apply_diff`, where `graph::containers` stores it
+        // on the container's `containers.parentKey` - it describes the
+        // container, not this member, so it has no `nodes` column of its own.
+        container_parent: node.container_parent,
         target: node.target.as_ref().map(to_placeholder_target_record),
         doc_comment: node.doc_comment,
         language: node.language,

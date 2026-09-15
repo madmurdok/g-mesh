@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::graph::containers;
+
 /// One declaration of a symbol that has several - a row of the `declarations`
 /// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
 /// (plugins/typescript/src/extract.ts) field for field, which is also the wire
@@ -82,6 +84,15 @@ pub struct NodeRecord {
     /// Logical container this declaration is a member of (Data Model >
     /// Logical containers). `None` for a language with no containers.
     pub container: Option<String>,
+    /// `container`'s own parent key, as the plugin sent it with this member.
+    /// Not a `nodes` column: it describes the container, so it lands on that
+    /// container's `containers.parentKey` (`graph::containers`, which also
+    /// documents what happens when two members disagree). **Write-side
+    /// only**, like `target` and `declarations` below - a record read back
+    /// through `graph::queries::map_node_row` carries `None` here, and handing
+    /// it straight back to [`apply_diff`] would record its container as a
+    /// root, since `None` is a value ("no parent"), not "unknown".
+    pub container_parent: Option<String>,
     /// What this node is waiting to be linked onto, for a placeholder node -
     /// `None` for an ordinary declaration. Write-side only, the same "absent
     /// says nothing about what is stored" convention `declarations` documents
@@ -138,6 +149,7 @@ impl NodeRecord {
             visibility: "file".to_string(),
             visibility_container: None,
             container: None,
+            container_parent: None,
             target: None,
             doc_comment: None,
             language: language.into(),
@@ -250,12 +262,23 @@ impl Diff {
 /// deletes, node upserts, edge upserts, in that order so edge FKs are
 /// always valid mid-transaction. Any failure rolls back the whole diff -
 /// nothing partial is ever committed.
+///
+/// Logical-container membership (`graph::containers`) is maintained inside
+/// the same transaction, in two halves around those writes: `detach` before
+/// anything is deleted (a member leaving its container loses its `DEFINES`
+/// edge while the node is still there to be pointed at), `attach` after
+/// everything is written (container nodes, rows and edges for the members the
+/// diff leaves behind, then a recount that deletes any container left empty).
+/// No diff owns container rows, so no caller has to do anything for them -
+/// see that module's doc for why this is inside the transaction rather than a
+/// pass after it, like linking is.
 pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     if diff.is_empty() {
         return Ok(());
     }
 
     let tx = conn.transaction().context("failed to start transaction")?;
+    let membership = containers::detach(&tx, diff).context("failed to detach container members")?;
 
     for id in &diff.delete_edge_ids {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
@@ -425,6 +448,9 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             ],
         )
         .context("failed to upsert edge")?;
+    }
+    if let Some(membership) = membership {
+        containers::attach(&tx, membership).context("failed to attach container members")?;
     }
 
     tx.commit().context("failed to commit diff transaction")?;
