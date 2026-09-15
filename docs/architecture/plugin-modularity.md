@@ -121,7 +121,7 @@ manifest, instead of a hardcoded `node` + baked-in path).
 ```mermaid
 graph TD
     Agent["AI Agent (MCP client)"] -->|stdio| Shim["g-mesh mcp-shim"]
-    Shim -->|AF_UNIX| Core["Daemon core (Rust)"]
+    Shim -->|AF_UNIX / named pipe| Core["Daemon core (Rust)"]
 
     subgraph Core Responsibilities
         Watcher["File watcher"]

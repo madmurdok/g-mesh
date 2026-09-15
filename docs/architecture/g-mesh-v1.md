@@ -98,7 +98,8 @@ since a plain HTTP client has no "spawn on demand" behavior the way stdio
 MCP clients do. **Chosen: stdio + shim process** — the MCP client spawns
 `g-mesh mcp-shim` the way it spawns any stdio MCP server (its normal
 behavior, nothing special required); the shim detects/bootstraps a detached
-per-project daemon and proxies over an `AF_UNIX` socket.
+per-project daemon and proxies over a per-project IPC endpoint (an `AF_UNIX`
+socket on Unix, a named pipe on Windows — see [Shim ↔ daemon](#shim--daemon)).
 
 **Core implementation language — Rust vs. faster-iteration alternative
 (e.g. TypeScript).**
@@ -130,12 +131,12 @@ storage (batched SQLite transactions) layers.
 ```mermaid
 graph TD
     Agent["AI Agent<br/>(MCP client)"] -->|stdio, spawned per session| Shim["g-mesh mcp-shim<br/>(stateless proxy)"]
-    Shim -->|AF_UNIX socket<br/>bootstraps if absent| Core["Daemon core (Rust)<br/>per project"]
+    Shim -->|AF_UNIX socket / named pipe<br/>bootstraps if absent| Core["Daemon core (Rust)<br/>per project"]
 
     subgraph Core Responsibilities
         Watcher["File watcher<br/>(notify crate)"]
         ToolLogic["MCP tool logic<br/>(find_*, search_code, ...)"]
-        SockListener["Unix socket listener"]
+        SockListener["IPC listener<br/>(Unix socket / named pipe)"]
     end
     Core --- Watcher
     Core --- ToolLogic
@@ -149,7 +150,7 @@ graph TD
 ```
 
 - **Shim**: spawned fresh per MCP session by the client; no state of its own.
-  Hashes project `cwd`, checks for a live daemon socket, bootstraps a
+  Hashes project `cwd`, checks for a live daemon endpoint, bootstraps a
   detached daemon if none is found (file lock guards concurrent first-start
   races), then pure-proxies JSON-RPC frames between stdio and the socket.
 - **Daemon core**: one per project, identified by a hash of the project
