@@ -80,9 +80,9 @@ pub enum SourceTier {
 /// (`Public` => `true`, everything else => `false`), so `get_file_outline`'s
 /// output does not change; only the wire shape and the in-core type move to
 /// this richer enum, which is what lets a container-scoped visibility (Go
-/// unexported, Rust private, Java package-private, ...) eventually answer
-/// differently from a file-private one once `graph::symbol_links`'s linker
-/// grows the container-aware visibility check the design doc describes.
+/// unexported, Rust private, Java package-private, ...) answers
+/// differently from a file-private one in `graph::symbol_links`'s
+/// container-aware visibility check (GM-266; its module doc has the rules).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Visibility {
@@ -94,10 +94,9 @@ pub enum Visibility {
 /// Which kind of thing a [`PlaceholderTarget`] is anchored to: a single file
 /// (TS's own convention, and every language before containers exist), or a
 /// logical container - a Go package, Rust module, C# namespace, ... (Data
-/// Model > Logical containers). Nothing in core produces `Container` yet -
-/// `graph::imports`/`graph::symbol_links` only ever look a candidate up by
-/// file - it exists on the wire now so a future container-aware linker pass
-/// does not need another protocol change to receive one.
+/// Model > Logical containers). `graph::symbol_links` looks a `Container`
+/// target up among that container's members (GM-266); `graph::imports` still
+/// only ever resolves a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TargetScope {
@@ -297,8 +296,10 @@ impl<'de> Deserialize<'de> for WireNode {
 
         // LEGACY-V1: remove in GM-275 - a v1 sender never had `target` to
         // send at all; a placeholder's address was, and still is, packed
-        // into `qualifiedName` by the convention `graph::symbol_links` and
-        // `graph::imports` already parse on the read side. Re-derive the
+        // into `qualifiedName` by the convention `graph::imports` still reads
+        // on its side (`graph::symbol_links` reads only the target since
+        // GM-266, so this derivation is all that links a v1 plugin's
+        // symbols). Re-derive the
         // same v2 `target` here so every `WireNode` this type ever hands to
         // the rest of core is already the v2 shape - no call site downstream
         // has to know the legacy convention exists.
@@ -338,11 +339,13 @@ impl<'de> Deserialize<'de> for WireNode {
 /// `target: None` to say so with a clear message rather than have
 /// deserialization fail with a generic "malformed NDJSON line".
 ///
-/// Splits on the qualifiedName's own *last* `#`, the same invariant
-/// `graph::symbol_links::Placeholder::parse` relies on ("a symbol name never
-/// contains a #, whatever a file path might") - but computed directly from
-/// the string, not by stripping a `#{name}` suffix built from the row's own
-/// `name` field the way `Placeholder::parse` does. The two agree for
+/// Splits on the qualifiedName's own *last* `#`, the same invariant the
+/// pre-GM-266 `graph::symbol_links::Placeholder::parse` relied on ("a symbol
+/// name never contains a #, whatever a file path might") - but computed
+/// directly from the string, not by stripping a `#{name}` suffix built from
+/// the row's own `name` field the way `Placeholder::parse` did. Since GM-266
+/// this is the *only* place that split happens: the linker reads the target
+/// this returns and nothing else. The two approaches agree for
 /// `pending_symbol`: `importedSymbol` in extract.ts always sets a pending
 /// symbol's `name` to the *target's* own export name, never a local alias,
 /// so it is always exactly the qualifiedName's own suffix. They disagree for
