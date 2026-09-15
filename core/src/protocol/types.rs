@@ -95,8 +95,8 @@ pub enum Visibility {
 /// (TS's own convention, and every language before containers exist), or a
 /// logical container - a Go package, Rust module, C# namespace, ... (Data
 /// Model > Logical containers). `graph::symbol_links` looks a `Container`
-/// target up among that container's members (GM-266); `graph::imports` still
-/// only ever resolves a file.
+/// target up among that container's members (GM-266), and `graph::imports`
+/// links a `Container` import onto the container node itself (GM-267).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TargetScope {
@@ -296,10 +296,10 @@ impl<'de> Deserialize<'de> for WireNode {
 
         // LEGACY-V1: remove in GM-275 - a v1 sender never had `target` to
         // send at all; a placeholder's address was, and still is, packed
-        // into `qualifiedName` by the convention `graph::imports` still reads
-        // on its side (`graph::symbol_links` reads only the target since
-        // GM-266, so this derivation is all that links a v1 plugin's
-        // symbols). Re-derive the
+        // into `qualifiedName` - and neither linker reads that convention any
+        // more (`graph::imports` since GM-267, `graph::symbol_links` since
+        // GM-266 read only the target), so this derivation is all that links
+        // a v1 plugin's imports and symbols. Re-derive the
         // same v2 `target` here so every `WireNode` this type ever hands to
         // the rest of core is already the v2 shape - no call site downstream
         // has to know the legacy convention exists.
