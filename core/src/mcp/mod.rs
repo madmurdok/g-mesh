@@ -652,7 +652,9 @@ pub struct GetFileOutlineParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetDependenciesParams {
-    /// Project-relative path of the file to start from.
+    /// Project-relative path of the file to start from. Also accepts the
+    /// exact key of a logical container (a Go import path, a Rust module
+    /// path, ...) to anchor on the package as a whole.
     pub file_path: Option<String>,
     /// Opaque node id from a previous result - not a module name or a path.
     /// For either of those use `file_path`; this accepts one anyway rather

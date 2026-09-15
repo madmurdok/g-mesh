@@ -279,12 +279,13 @@ CREATE TABLE IF NOT EXISTS containers (
 -- packed into a placeholder's own `qualifiedName` as a `<file>#<name>`
 -- string (design doc: Data Model > Structured placeholder targets;
 -- `graph::symbol_links`' and `graph::imports`' module docs describe the old
--- convention this replaces on the wire, though **this task changes storage
--- only** - the linker itself still parses `qualifiedName` exactly as before,
--- per this task's own scope). `nodeId` is 1:0-or-1 with `nodes` - a
--- placeholder has exactly one target, an ordinary declaration has none - the
--- same shape `storage::vectors` already uses for "this node has at most one
--- of these".
+-- convention this replaces on the wire). GM-264 only wrote this table -
+-- every linker still parsed `qualifiedName` as before. GM-267 is the first
+-- reader, for `resolved_module`'s own `graph::imports`; `graph::symbol_links`
+-- (`pending_symbol`/`reexport`) moves onto it separately, in GM-266, on its
+-- own schedule. `nodeId` is 1:0-or-1 with `nodes` - a placeholder has exactly
+-- one target, an ordinary declaration has none - the same shape
+-- `storage::vectors` already uses for "this node has at most one of these".
 --
 -- `scopeKind`/`scope` and `keyKind`/`key` are two independent two-valued
 -- facts, not one four-valued column, because the linker contract (design
@@ -316,6 +317,11 @@ CREATE TABLE IF NOT EXISTS placeholder_targets (
 -- kind, this scope, this key)" - see `graph::symbol_links`'s "new export in a
 -- file" trigger today, and the design doc's Interfaces > Linker contract
 -- step 1 ("Candidates") for the container-scoped counterpart GM-266 adds.
+-- `graph::imports` (GM-267) is a narrower reader of the same shape: it never
+-- reads `key`, only `(scopeKind, scope)` - its own "new file"/"new container
+-- member" triggers - so it uses this index's leading columns, the same way a
+-- lookup on `(scopeKind, scope)` alone already benefits from an index whose
+-- third column it does not filter on.
 CREATE INDEX IF NOT EXISTS idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
 
 -- Per-language index state - the roll-up `meta.bulkIndexedAt`/
