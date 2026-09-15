@@ -65,6 +65,12 @@ pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
 /// the hint and exited.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a relaunch gives the process it replaced to exit on its closed
+/// stdin before killing it. Only a live process ever waits this out - one
+/// that crashed is already gone - and nothing is blocked meanwhile, since the
+/// replacement is serving before the wait starts.
+const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
+
 /// How much of the digest [`fingerprint`] keeps. 64 bits is far more than
 /// enough to tell two builds of one plugin apart, and short enough that a
 /// human reading a build stamp file can compare two of them at a glance.
@@ -443,6 +449,33 @@ impl PluginState {
 
         Ok(Self { child, io: PluginIo { reader, writer: stdin } })
     }
+
+    /// Ends this process and reaps it: closes its pipes (the plugin's own cue
+    /// to exit), waits up to `grace` for it to go, then kills it. Shared by
+    /// [`PluginProcess::shutdown`] and a relaunch that replaces a process
+    /// which is still alive (see [`PluginProcess::apply_file_change`]) - both
+    /// have to leave neither a running tsserver nor a zombie behind. On a
+    /// process that has already exited it returns straight away.
+    fn end(self, grace: Duration) -> Result<()> {
+        // Destructured rather than dropped field by field: dropping `io`
+        // closes both pipes, and closing the write half of the plugin's stdin
+        // is precisely the "please exit" signal.
+        let PluginState { mut child, io } = self;
+        drop(io);
+
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait().context("failed to check whether the plugin had exited")? {
+                Some(_) => return Ok(()),
+                None if Instant::now() >= deadline => break,
+                None => std::thread::sleep(EXIT_POLL_INTERVAL),
+            }
+        }
+
+        child.kill().context("failed to signal a plugin that ignored its closed stdin")?;
+        child.wait().context("failed to reap the plugin process")?;
+        Ok(())
+    }
 }
 
 /// A live handle on the spawned JS/TS plugin process. `Mutex`-wrapped so it
@@ -522,28 +555,12 @@ impl PluginProcess {
     /// core exits, and `is_process_alive` (which `cli::status` and the tests
     /// ask) cannot tell a zombie from a running process.
     pub fn shutdown(self, grace: Duration) -> Result<()> {
-        // Destructured rather than dropped field by field: dropping `io`
-        // closes both pipes, and closing the write half of the plugin's stdin
-        // is precisely the "please exit" signal. `state`'s Mutex is unwrapped
-        // via `into_inner` - `self` is owned here, so there is no contention
-        // left to guard against, only the poisoning case `.unwrap()` already
-        // treats as fatal everywhere else in this module.
+        // `state`'s Mutex is unwrapped via `into_inner` - `self` is owned
+        // here, so there is no contention left to guard against, only the
+        // poisoning case `.unwrap()` already treats as fatal everywhere else
+        // in this module. See `PluginState::end` for the ending itself.
         let Self { state, .. } = self;
-        let PluginState { mut child, io } = state.into_inner().unwrap();
-        drop(io);
-
-        let deadline = Instant::now() + grace;
-        loop {
-            match child.try_wait().context("failed to check whether the plugin had exited")? {
-                Some(_) => return Ok(()),
-                None if Instant::now() >= deadline => break,
-                None => std::thread::sleep(EXIT_POLL_INTERVAL),
-            }
-        }
-
-        child.kill().context("failed to signal a plugin that ignored its closed stdin")?;
-        child.wait().context("failed to reap the plugin process")?;
-        Ok(())
+        state.into_inner().unwrap().end(grace)
     }
 
     /// Sends a `FileChanged` request for `file_path` to the plugin and
@@ -561,13 +578,26 @@ impl PluginProcess {
     /// Any other failure - the plugin is alive, but its diff could not be
     /// committed (a storage error, a link pass that failed) - is returned as
     /// it is, and the file is dropped from the pending queue. It is *not*
-    /// replayed, and that is the whole of GM-293's fix here: the plugin
-    /// updates its cached copy of a file when it answers, not when core
-    /// commits, so asking the same live process again gets an empty diff back
-    /// and the failure turns into an `Ok(())` that nothing ever logs. That is
-    /// exactly how a foreign-key refusal on every second edit went unseen
-    /// (GM-292). Callers already report what this returns - see
-    /// `daemon::lifecycle::PluginSupervisor::file_changed`.
+    /// replayed: the plugin updates its cached copy of a file when it
+    /// answers, not when core commits, so asking the same live process again
+    /// gets an empty diff back and the failure turns into an `Ok(())` that
+    /// nothing ever logs. That is exactly how a foreign-key refusal on every
+    /// second edit went unseen (GM-292). Callers already report what this
+    /// returns - see `daemon::lifecycle::PluginSupervisor::file_changed`.
+    ///
+    /// Returning the error is not enough on its own, though, because that
+    /// cache is still ahead of the index: the file's *next* reparse - a later
+    /// watcher event, or `ensure_fresh` on the next query - would get the
+    /// same empty diff, and `ensure_fresh` would then record the new content
+    /// hash over a graph that never took the edit. So a non-crash failure
+    /// also relaunches the plugin deliberately (GM-293). A fresh process has
+    /// no cache, so its first reparse of the file is a full extraction, and
+    /// the index converges as soon as whatever refused the write stops doing
+    /// so. The price is a warm tsserver thrown away, which is acceptable
+    /// only because this path should now be rare: the one failure known to
+    /// hit it routinely, enforced foreign keys, is gone
+    /// (`storage::connection::open`). If it ever becomes common, that is a
+    /// bug to fix at its cause, not a relaunch to make cheaper.
     pub fn apply_file_change(
         &self,
         conn: &Mutex<Connection>,
@@ -592,17 +622,32 @@ impl PluginProcess {
             // whatever is current).
             let relaunched_elsewhere = self.pid() != sent_to;
             if !exited && !relaunched_elsewhere {
-                // Not a crash, so nothing a relaunch or a replay can fix -
-                // see this method's doc. Dropped from the queue rather than
-                // left in it: a later crash's replay would otherwise stop at
-                // this entry first and fail every recovery behind it.
+                // Not a crash, so nothing a replay can fix - see this
+                // method's doc. Dropped from the queue rather than left in
+                // it: a later crash's replay would otherwise stop at this
+                // entry first and fail every recovery behind it.
                 self.remove_pending(&file_path);
-                return Err(first_err)
-                    .with_context(|| format!("failed to apply the plugin's diff for {file_path}"));
+                let err = first_err.context(format!("failed to apply the plugin's diff for {file_path}"));
+                // Relaunched to discard a cache that is now ahead of the
+                // index, not replayed - the error below is still what the
+                // caller gets, whether or not the relaunch works.
+                if let Err(relaunch_err) = self.relaunch(&format!(
+                    "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
+                     that file is ahead of the index - a fresh process re-extracts it in full"
+                )) {
+                    eprintln!(
+                        "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
+                         ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
+                        self.manifest.language
+                    );
+                }
+                return Err(err);
             }
             if exited {
-                self.relaunch(&first_err)
-                    .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
+                self.relaunch(&format!(
+                    "the process exited unexpectedly ({first_err:#}) - replaying pending file changes"
+                ))
+                .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
             }
             return self.replay_pending(conn, embedding).with_context(|| {
                 format!(
@@ -761,8 +806,9 @@ impl PluginProcess {
         }
     }
 
-    /// Replaces the dead process with a freshly spawned one, handshake and
-    /// all. `cause` is logged, not propagated - a relaunch that itself fails
+    /// Replaces the current process - a crashed one, or a live one whose
+    /// cache has to be discarded - with a freshly spawned one, handshake and
+    /// all. `why` is logged, not propagated - a relaunch that itself fails
     /// to spawn is the caller's problem (via the `Result` this returns), but
     /// one that succeeds should read as "recovered from X", not silently
     /// swallow what X was.
@@ -774,16 +820,27 @@ impl PluginProcess {
     /// harmless while there was only ever one plugin but would have let two
     /// languages' relaunches overwrite each other's pid file once there was
     /// more than one.
-    fn relaunch(&self, cause: &anyhow::Error) -> Result<()> {
-        eprintln!(
-            "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - \
-             relaunching and replaying pending file changes",
-            self.manifest.language
-        );
+    ///
+    /// `why` is the whole reason, worded by the caller: a crash and a
+    /// deliberate relaunch over a failed apply are different events and must
+    /// not read the same in the log. The process being replaced is ended and
+    /// reaped after the swap - a no-op for one that already crashed, and what
+    /// keeps a relaunched *live* plugin from leaving its tsserver running or
+    /// its pid a zombie.
+    fn relaunch(&self, why: &str) -> Result<()> {
+        eprintln!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
-        *self.state.lock().unwrap() = fresh;
+        let replaced = std::mem::replace(&mut *self.state.lock().unwrap(), fresh);
         super::write_pid_file(&self.pid_file, pid);
+        // Outside the state lock: the fresh process is already serving, and
+        // waiting out the old one's grace period must not hold up a request.
+        if let Err(err) = replaced.end(RELAUNCH_GRACE) {
+            eprintln!(
+                "g-mesh daemon: the replaced {} plugin process did not shut down cleanly: {err:#}",
+                self.manifest.language
+            );
+        }
         Ok(())
     }
 }
@@ -1034,6 +1091,11 @@ mod tests {
     /// enforces foreign keys (as the daemon's connection silently did before
     /// this fix), then an edit through a warm plugin cache that deletes and
     /// re-adds a symbol whose unchanged `DEFINES` edge is not re-sent.
+    ///
+    /// The second half is what the relaunch is for: once the index accepts
+    /// writes again, the very next reparse of that file - with no further
+    /// edit on disk - must carry the edit in, rather than the empty diff a
+    /// plugin still caching the refused text would answer with.
     #[test]
     fn a_storage_failure_behind_a_live_plugin_is_returned_rather_than_replayed() {
         let project = tempfile::tempdir().unwrap();
@@ -1061,8 +1123,31 @@ mod tests {
         };
 
         assert!(err.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {err}");
-        assert_eq!(plugin.pid(), pid, "a live plugin must not be relaunched over a storage failure");
         assert!(plugin.pending.lock().unwrap().is_empty(), "nothing is left queued for a later replay");
+
+        // Whatever refused the write stops refusing it.
+        conn.lock().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
+        plugin
+            .apply_file_change(&conn, "lib.ts", &embedding)
+            .expect("the same file's next reparse must apply once the index accepts writes");
+
+        let greet_end: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT endLine FROM nodes WHERE filePath = 'lib.ts' AND name = 'greet'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            greet_end, 3,
+            "the refused edit must reach the index on the next reparse - a plugin still caching it \
+             would answer with an empty diff and leave `greet` ending on line 2"
+        );
+        assert_ne!(plugin.pid(), pid, "the plugin holding the refused text must have been relaunched");
+        assert!(
+            !crate::daemon::is_process_alive(pid),
+            "the replaced plugin must be ended and reaped, not left running or as a zombie"
+        );
     }
 
     /// The check `docs/architecture/plugin-modularity.md`'s Interfaces
