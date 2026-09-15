@@ -18,6 +18,17 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 flate2 = "1"
+# Already resolved into this tree as a transitive dependency of `ignore`
+# (which uses it internally for `.gitignore`-style overrides), so promoting
+# it to a direct dependency for `daemon::manifest`'s `[plugin.workspace]
+# watch_files` glob validation (`*.csproj`, per the multi-language-plugins
+# architecture doc's paper stress test) adds no new subtree to compile -
+# `cargo tree` already has one copy. Chosen over hand-rolling glob matching
+# or reaching for `ignore`'s own `Override` type (built for `.gitignore`
+# semantics - anchoring, negation, directory-only patterns - none of which
+# `watch_files` needs) because `globset::Glob` is exactly "one shell-style
+# pattern, compiled and validated once" with nothing else attached.
+globset = "0.4"
 ignore = "0.4"
 notify = "6"
 # ONNX Runtime bindings for the local embedding model (see src/embedding).

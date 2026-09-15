@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::manifest::{self};
+use crate::daemon::manifest::{self, Capabilities};
 
 /// `<root>/<language-dir>/plugin.toml` - matches
 /// `daemon::manifest`'s own (private) constant of the same name.
@@ -71,8 +71,17 @@ pub enum PluginOutcome {
     Loaded {
         version: String,
         status: PluginStatus,
+        /// What this plugin declares it can do - see
+        /// `daemon::manifest::Capabilities`'s own doc comment. Carried
+        /// through so `render` can show it: capabilities are read from the
+        /// manifest specifically so they are knowable without spawning
+        /// anything (see that type's doc comment), which is exactly the
+        /// constraint a listing command that never spawns a plugin process
+        /// already operates under.
+        capabilities: Capabilities,
     },
-    /// In place of a version/status pair - see this module's doc comment.
+    /// In place of a version/status/capabilities triple - see this module's
+    /// doc comment.
     Error(String),
 }
 
@@ -160,7 +169,11 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
             Ok(manifest) => {
                 infos.push(PluginInfo {
                     language: manifest.language,
-                    outcome: PluginOutcome::Loaded { version: manifest.plugin_version, status },
+                    outcome: PluginOutcome::Loaded {
+                        version: manifest.plugin_version,
+                        status,
+                        capabilities: manifest.capabilities,
+                    },
                 });
                 continue;
             }
@@ -173,14 +186,22 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
 }
 
 /// Renders the plugin list the way `plugins list` prints it: one line per
-/// plugin naming its language, then either its version and status, or - for
-/// a manifest that failed to read - an error in their place.
+/// plugin naming its language, then either its version, status and
+/// capabilities, or - for a manifest that failed to read - an error in their
+/// place.
 pub fn render(plugins: &[PluginInfo]) -> String {
     let mut out = String::new();
     for plugin in plugins {
         match &plugin.outcome {
-            PluginOutcome::Loaded { version, status } => {
-                let _ = writeln!(out, "{}  {}  {}", plugin.language, version, status.label());
+            PluginOutcome::Loaded { version, status, capabilities } => {
+                let _ = writeln!(
+                    out,
+                    "{}  {}  {}  {}",
+                    plugin.language,
+                    version,
+                    status.label(),
+                    render_capabilities(capabilities)
+                );
             }
             PluginOutcome::Error(message) => {
                 let _ = writeln!(out, "{}  error: {}", plugin.language, message);
@@ -188,6 +209,21 @@ pub fn render(plugins: &[PluginInfo]) -> String {
         }
     }
     out
+}
+
+/// One plugin's `[plugin.capabilities]`, as `render` shows them -
+/// `semantic_pass` as `yes`/`no` (there is no third state to distinguish
+/// from a boolean, unlike the two receiver-call fields) and the two
+/// receiver-call fields via [`ReceiverCallResolution`]'s own `Display`
+/// impl, so this has no second "resolved"/"unresolved" mapping to keep in
+/// sync with the one on the type itself.
+fn render_capabilities(capabilities: &Capabilities) -> String {
+    format!(
+        "semantic_pass={} receiver_calls={} receiver_calls_structural={}",
+        if capabilities.semantic_pass { "yes" } else { "no" },
+        capabilities.receiver_calls,
+        capabilities.receiver_calls_structural,
+    )
 }
 
 #[cfg(test)]
@@ -218,6 +254,18 @@ mod tests {
             .as_str()
             .expect("plugin_version must be a string")
             .to_string()
+    }
+
+    /// The bundled manifest's `[plugin.capabilities]`, read through the real
+    /// `read_manifest` parser rather than hand-extracted from the TOML -
+    /// same "track what the plugin actually declares, not a restated copy"
+    /// reasoning as [`bundled_plugin_version`], and it exercises the same
+    /// parse path every assertion below is really checking.
+    fn bundled_plugin_capabilities() -> Capabilities {
+        let (_root, dir) = fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST)]);
+        manifest::read_manifest(&dir.join("typescript"))
+            .expect("the bundled plugin's manifest must parse")
+            .capabilities
     }
 
     /// Builds a fresh tempdir root containing one `<dir_name>/plugin.toml`
@@ -252,7 +300,11 @@ mod tests {
         assert_eq!(plugins[0].language, "typescript");
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded {
+                version: bundled_plugin_version(),
+                status: PluginStatus::Bundled,
+                capabilities: bundled_plugin_capabilities()
+            }
         );
     }
 
@@ -273,7 +325,11 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(
             plugins[0].outcome,
-            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Installed }
+            PluginOutcome::Loaded {
+                version: bundled_plugin_version(),
+                status: PluginStatus::Installed,
+                capabilities: bundled_plugin_capabilities()
+            }
         );
     }
 
@@ -294,7 +350,11 @@ mod tests {
         let good = plugins.iter().find(|p| p.language == "typescript").expect("good entry missing");
         assert_eq!(
             good.outcome,
-            PluginOutcome::Loaded { version: bundled_plugin_version(), status: PluginStatus::Bundled }
+            PluginOutcome::Loaded {
+                version: bundled_plugin_version(),
+                status: PluginStatus::Bundled,
+                capabilities: bundled_plugin_capabilities()
+            }
         );
 
         let bad = plugins.iter().find(|p| p.language == "broken").expect("bad entry missing");
@@ -317,7 +377,11 @@ mod tests {
     fn render_reports_language_version_and_status_for_a_loaded_plugin() {
         let plugins = vec![PluginInfo {
             language: "typescript".to_string(),
-            outcome: PluginOutcome::Loaded { version: "2.0.0".to_string(), status: PluginStatus::Bundled },
+            outcome: PluginOutcome::Loaded {
+                version: "2.0.0".to_string(),
+                status: PluginStatus::Bundled,
+                capabilities: Capabilities::default(),
+            },
         }];
 
         let rendered = render(&plugins);
@@ -331,12 +395,44 @@ mod tests {
     fn render_reports_installed_status() {
         let plugins = vec![PluginInfo {
             language: "python".to_string(),
-            outcome: PluginOutcome::Loaded { version: "0.1.0".to_string(), status: PluginStatus::Installed },
+            outcome: PluginOutcome::Loaded {
+                version: "0.1.0".to_string(),
+                status: PluginStatus::Installed,
+                capabilities: Capabilities::default(),
+            },
         }];
 
         let rendered = render(&plugins);
 
         assert!(rendered.contains("installed"), "{rendered}");
+    }
+
+    /// The acceptance criterion for this task's `g-mesh plugins list` change:
+    /// capabilities are visible in the rendered output, not just carried on
+    /// the struct. Uses a non-default `Capabilities` value on purpose - a
+    /// render test built entirely from `Capabilities::default()` would still
+    /// pass if `render_capabilities` silently ignored its argument and
+    /// printed the defaults every time.
+    #[test]
+    fn render_shows_capabilities_for_a_loaded_plugin() {
+        let plugins = vec![PluginInfo {
+            language: "go".to_string(),
+            outcome: PluginOutcome::Loaded {
+                version: "0.1.0".to_string(),
+                status: PluginStatus::Bundled,
+                capabilities: Capabilities {
+                    semantic_pass: true,
+                    receiver_calls: manifest::ReceiverCallResolution::Resolved,
+                    receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
+                },
+            },
+        }];
+
+        let rendered = render(&plugins);
+
+        assert!(rendered.contains("semantic_pass=yes"), "{rendered}");
+        assert!(rendered.contains("receiver_calls=resolved"), "{rendered}");
+        assert!(rendered.contains("receiver_calls_structural=unresolved"), "{rendered}");
     }
 
     #[test]

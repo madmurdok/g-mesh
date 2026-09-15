@@ -48,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::daemon::manifest::PluginManifest;
+use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
 use crate::protocol::types::{RequestId, CURRENT_PROTOCOL_VERSION};
@@ -200,6 +200,13 @@ pub fn bundled_manifest() -> PluginManifest {
         extensions: Vec::new(),
         fingerprint_ignore: Vec::new(),
         manifest_dir,
+        // The bundled plugin's real capabilities/workspace live in
+        // `plugins/typescript/plugin.toml`, not here - this helper predates
+        // both fields and exists only for tests that need a bare manifest,
+        // so the conservative defaults are the right stand-in rather than
+        // duplicating the real manifest's values.
+        capabilities: Capabilities::default(),
+        workspace: WorkspaceConfig::default(),
     }
 }
 
@@ -792,6 +799,10 @@ mod tests {
             extensions: Vec::new(),
             fingerprint_ignore: ignore.iter().map(|s| s.to_string()).collect(),
             manifest_dir: dir.to_path_buf(),
+            // Irrelevant to `fingerprint` - see this function's own doc
+            // comment - so the conservative defaults are fine here too.
+            capabilities: Capabilities::default(),
+            workspace: WorkspaceConfig::default(),
         }
     }
 
