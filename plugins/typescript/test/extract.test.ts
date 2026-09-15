@@ -93,8 +93,8 @@ test("extracts the documented node kinds from a TypeScript file", () => {
 
   assert.equal(node(result, "Function", "greetAll").signature, "greetAll(names: string[]): string[]");
   assert.equal(node(result, "Type", "Greeter").docComment, "Anything that can greet.");
-  assert.equal(node(result, "Type", "Greeter").exported, true);
-  assert.equal(node(result, "Function", "formatName").exported, false);
+  assert.equal(node(result, "Type", "Greeter").visibility, "public");
+  assert.equal(node(result, "Function", "formatName").visibility, "file");
 });
 
 test("extracts SUPERTYPE_OF, CALLS and IMPORTS edges", () => {
@@ -123,7 +123,8 @@ test("an edge onto a declaration of this file is resolved; one onto a placeholde
   const byId = new Map(result.nodes.map((n) => [n.id, n]));
 
   for (const edge of result.edges) {
-    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.source, "syntactic");
+    assert.equal(edge.engine, "tree-sitter");
     const target = byId.get(edge.toId)!;
     // The only non-declaration target here is the unresolvable `./i18n`
     // module: everything else is declared in this very file, so nothing about
@@ -179,11 +180,11 @@ export function run(): void {
 
   const namespaceNode = node(result, "Module", "Config");
   assert.equal(namespaceNode.nativeKind, "namespace");
-  assert.equal(namespaceNode.exported, true);
+  assert.equal(namespaceNode.visibility, "public");
 
-  assert.equal(node(result, "Variable", "Config.retries").exported, true);
+  assert.equal(node(result, "Variable", "Config.retries").visibility, "public");
   assert.equal(node(result, "Variable", "attempts").nativeKind, "let");
-  assert.equal(node(result, "Variable", "secret").exported, false);
+  assert.equal(node(result, "Variable", "secret").visibility, "file");
   assert.deepEqual(
     result.nodes.filter((n) => n.name === "cached"),
     [],
@@ -208,7 +209,7 @@ export * from "./other";
 `,
   );
 
-  assert.equal(node(result, "Function", "boot").exported, true);
+  assert.equal(node(result, "Function", "boot").visibility, "public");
   assert.ok(hasEdge(result, "EXPORTS", "src/reexport.ts", "boot"));
   assert.ok(hasEdge(result, "IMPORTS", "src/reexport.ts", "./other"));
 });
@@ -295,7 +296,7 @@ test("an overloaded function reports the first call signature, not the implement
   assert.equal(parse.endLine, 5);
   // The doc comment sits on the first overload, not on the implementation.
   assert.equal(parse.docComment, "Turns text into whatever it names.");
-  assert.equal(parse.exported, true);
+  assert.equal(parse.visibility, "public");
   assert.equal(parse.nativeKind, "function");
   assert.equal(parse.id, nodeIdFor("src/parse.ts", "Function", "parse", "function"));
 });
@@ -512,12 +513,18 @@ export default function App() {
 `,
   );
 
-  assert.equal(node(result, "File", "src/App.jsx").language, "javascript");
+  // The wire `language` is always this plugin's own identity ("typescript",
+  // GM-275) regardless of extension - see extract.ts's `WIRE_LANGUAGE` doc
+  // comment for why: core keys per-language state on it, and a `.js` file
+  // reported as "javascript" would have no manifest of its own to match
+  // against. The JavaScript *grammar* still parsed this file, which the rest
+  // of this test (JSX handled, `require()` resolved) is what actually proves.
+  assert.equal(node(result, "File", "src/App.jsx").language, "typescript");
   assert.equal(result.hasSyntaxErrors, false);
   assert.ok(hasEdge(result, "IMPORTS", "src/App.jsx", "./renderer"));
   // A JSX element name is a usage of the component, not a binding.
   assert.ok(hasEdge(result, "REFERENCES", "App", "Label"));
-  assert.equal(node(result, "Function", "App").exported, true);
+  assert.equal(node(result, "Function", "App").visibility, "public");
 });
 
 test("rejects files this plugin does not own", () => {
@@ -597,7 +604,8 @@ test("specifier resolution never claims an IMPORTS edge is resolved - that is co
   const imports = result.edges.filter((e) => e.kind === "IMPORTS");
   assert.ok(imports.length > 0);
   for (const edge of imports) {
-    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.source, "syntactic");
+    assert.equal(edge.engine, "tree-sitter");
     assert.equal(edge.resolved, false, "the target node is still a placeholder until core links it");
   }
 });
@@ -815,7 +823,8 @@ export const boot = () => import(\`./plugins/\${NAME}.js\`);
   assert.equal(placeholder.name, "./plugins/alpha.js", "the computed specifier is what it names");
   const imports = result.edges.filter((e) => e.kind === "IMPORTS");
   assert.equal(imports.length, 1);
-  assert.equal(imports[0].source, "tree-sitter");
+  assert.equal(imports[0].source, "syntactic");
+  assert.equal(imports[0].engine, "tree-sitter");
   assert.equal(imports[0].resolved, false, "the target node is still a placeholder until core links it");
 });
 
@@ -1199,7 +1208,7 @@ export type { Bounds } from "./bounds";
   const placeholder = node(result, "Module", "src/factory.ts#newElement");
   assert.equal(placeholder.kind, "Module");
   assert.equal(placeholder.filePath, "src/index.ts", "the placeholder lives where the statement is");
-  assert.equal(placeholder.exported, false, "a placeholder is not a symbol this file exports");
+  assert.equal(placeholder.visibility, "file", "a placeholder is not a symbol this file exports");
   // `export ... from` is still an import, and still resolves as one.
   assert.ok(hasEdge(result, "IMPORTS", "src/index.ts", "src/factory.ts"));
 });
@@ -1239,7 +1248,7 @@ test("a local `export { name }` still marks the declaration, not a re-export", (
     BARREL_RESOLVER,
   );
 
-  assert.equal(node(result, "Function", "boot").exported, true);
+  assert.equal(node(result, "Function", "boot").visibility, "public");
   assert.deepEqual(reexports(result), [], "nothing is forwarded anywhere - the symbol is right here");
 });
 
@@ -1628,7 +1637,8 @@ export type Held = Box<Widget>;
   // Nothing here needs a checker: these are ordinary structural edges onto
   // declarations of this very file.
   for (const edge of result.edges) {
-    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.source, "syntactic");
+    assert.equal(edge.engine, "tree-sitter");
     assert.equal(edge.resolved, true);
   }
 });

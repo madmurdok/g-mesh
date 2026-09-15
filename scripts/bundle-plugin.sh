@@ -348,7 +348,7 @@ EOF
 
 [plugin]
 language = "typescript"
-protocol_version = 1
+protocol_version = 2
 plugin_version = "$plugin_version"
 
 [plugin.spawn]

@@ -197,7 +197,7 @@ impl Drop for PluginBuild {
 const MANIFEST: &str = r#"
 [plugin]
 language = "typescript"
-protocol_version = 1
+protocol_version = 2
 plugin_version = "2.0.0"
 
 [plugin.spawn]

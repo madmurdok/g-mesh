@@ -1192,13 +1192,10 @@ tighter default.
   compatibility (a protocol is code, not data; there's nothing to
   "reindex" when it doesn't match). `protocol::types` defines wire v2 (the
   `Visibility`/`PlaceholderTarget` and `SourceTier`+`engine` shapes above,
-  plus `ControlMessage::WorkspaceChanged`) and core already accepts it, but
-  `CURRENT_PROTOCOL_VERSION` itself stays `1` and core still accepts the v1
-  wire shape from a plugin that has not migrated — the JS/TS plugin, as
-  shipped, is exactly that plugin. Every v1-only code path is marked
-  `LEGACY-V1` and is removed together with the version bump to `2` in a
-  later task, at which point a v1 sender is a hard handshake failure like
-  any other version mismatch. See
+  plus `ControlMessage::WorkspaceChanged`), and `CURRENT_PROTOCOL_VERSION`
+  is `2` — every plugin core spawns, the bundled JS/TS plugin included
+  (GM-275), speaks it. A v1 sender is a hard handshake failure like any
+  other version mismatch. See
   [`multi-language-plugins.md`](./multi-language-plugins.md)'s "Wire v2"
   section for the full type definitions.
 - **Conformance**: a shared fixture/golden-file suite validates any plugin

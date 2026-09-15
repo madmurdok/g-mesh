@@ -1,1 +1,0 @@
-{"id":"n1","kind":"Module","name":"foo","qualifiedName":"not-the-convention","filePath":"a.ts","range":{"start":{"line":0,"col":0},"end":{"line":0,"col":1}},"exported":false,"language":"typescript","nativeKind":"pending_symbol"}

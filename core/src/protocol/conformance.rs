@@ -14,10 +14,12 @@ use crate::protocol::types::{ControlEnvelope, WireNode};
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
 /// `PLACEHOLDER_NATIVE_KINDS` in plugins/typescript/src/extract.ts, minus
-/// `external_module` - core never materializes a node for that one at all,
-/// so it never reaches this check). Every one of these requires a `target`
-/// once `WireNode::deserialize` has normalized legacy input - see the
-/// `placeholder nativeKind requires a target` shape check below.
+/// `external_module` - it names a bare specifier that never links to
+/// anything in this project, so core never materializes a node for one and
+/// it never reaches this check; see this task's own report for why
+/// `external_module` is exempt rather than required to carry a `target`).
+/// Every one of these requires a `target` - see the `placeholder nativeKind
+/// requires a target` shape check below.
 pub(crate) const PLACEHOLDER_NATIVE_KINDS: [&str; 3] =
     [PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND];
 
@@ -40,18 +42,15 @@ impl ConformanceReport {
 
 /// Validates a plugin's bulk-transfer output: every non-blank line must be a
 /// well-formed `WireNode`/`WireEdge`, plus the shape rules parsing alone
-/// cannot express. serde already rejects unknown `kind`/`source` values as
-/// part of ordinary deserialization, so there's no separate edge-kind
-/// allow-list to maintain here - an invalid kind simply fails to parse as
-/// either type. What *does* parse still has two rules of its own, both
-/// checked on the normalized (v2) node `WireNode::deserialize` already
-/// produced - so legacy v1 input whose placeholder address derives cleanly
-/// passes exactly like an equivalent v2 message would:
+/// cannot express. serde already rejects unknown `kind`/`source` values (and,
+/// as of GM-275, a v1-shaped line with no `visibility`/`engine`) as part of
+/// ordinary deserialization, so there's no separate edge-kind allow-list to
+/// maintain here - an invalid kind simply fails to parse as either type.
+/// What *does* parse still has two rules of its own:
 ///
 ///  - a placeholder `nativeKind` (`pending_symbol`, `reexport`,
-///    `resolved_module`) requires a `target` - present on the wire, or
-///    derived from the legacy `<file>#<name>` convention; an underivable one
-///    is reported here rather than surfacing as an opaque parse failure.
+///    `resolved_module`) requires a `target` on the wire - a missing one is
+///    reported here rather than surfacing as an opaque parse failure.
 ///  - `nativeKind: "container"` is never plugin-emitted - core alone
 ///    materializes container nodes (Data Model > Logical containers).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
@@ -87,8 +86,7 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
     let native_kind = node.native_kind.as_deref()?;
     (PLACEHOLDER_NATIVE_KINDS.contains(&native_kind) && node.target.is_none()).then(|| {
         format!(
-            "placeholder node {:?} (nativeKind {native_kind:?}) has no `target`, and none could be derived \
-             from the legacy `<file>#<name>` qualifiedName convention (qualifiedName: {:?})",
+            "placeholder node {:?} (nativeKind {native_kind:?}) has no `target` (qualifiedName: {:?})",
             node.id, node.qualified_name
         )
     })
@@ -138,39 +136,39 @@ mod tests {
 
     #[test]
     fn well_formed_bulk_output_is_conformant() {
-        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Function\",\"name\":\"foo\",\"qualifiedName\":\"m::foo\",\"filePath\":\"a.rs\",\"range\":{\"start\":{\"line\":1,\"col\":0},\"end\":{\"line\":2,\"col\":0}},\"exported\":false,\"language\":\"rust\"}\n";
+        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Function\",\"name\":\"foo\",\"qualifiedName\":\"m::foo\",\"filePath\":\"a.rs\",\"range\":{\"start\":{\"line\":1,\"col\":0},\"end\":{\"line\":2,\"col\":0}},\"visibility\":\"file\",\"language\":\"rust\"}\n";
         let report = check_bulk_output(ndjson);
         assert!(report.is_conformant(), "{:?}", report.violations);
     }
 
     #[test]
     fn invalid_edge_kind_is_a_violation() {
-        let ndjson = b"{\"id\":\"e1\",\"fromId\":\"n1\",\"toId\":\"n2\",\"kind\":\"NOT_A_REAL_KIND\",\"source\":\"tree-sitter\",\"resolved\":false}\n";
+        let ndjson = b"{\"id\":\"e1\",\"fromId\":\"n1\",\"toId\":\"n2\",\"kind\":\"NOT_A_REAL_KIND\",\"source\":\"syntactic\",\"engine\":\"tree-sitter\",\"resolved\":false}\n";
         let report = check_bulk_output(ndjson);
         assert!(!report.is_conformant());
         assert_eq!(report.violations[0].context, "NDJSON line 1");
     }
 
-    /// A legacy (v1) placeholder whose address derives cleanly must pass -
-    /// the shape check runs against the normalized v2 form, not the wire
-    /// bytes, so this is exactly as conformant as sending an explicit
-    /// `target` would be.
+    /// GM-275: a v1-shaped line (`exported`, no `visibility`) no longer
+    /// parses at all, so it surfaces as an ordinary NDJSON parse failure
+    /// rather than a `placeholder_target_violation` - see this file's git
+    /// history for the pre-GM-275 legacy-derivation tests this replaces.
     #[test]
-    fn legacy_placeholder_with_a_derivable_address_is_conformant() {
+    fn a_v1_shaped_placeholder_line_is_a_violation() {
         let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"foo\",\"qualifiedName\":\"target.ts#foo\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"exported\":false,\"language\":\"typescript\",\"nativeKind\":\"pending_symbol\"}\n";
         let report = check_bulk_output(ndjson);
-        assert!(report.is_conformant(), "{:?}", report.violations);
+        assert!(!report.is_conformant());
+        assert_eq!(report.violations[0].context, "NDJSON line 1");
     }
 
-    /// The negative case `legacy_placeholder_with_a_derivable_address_is_conformant`
-    /// checks the positive side of: a `pending_symbol` whose `qualifiedName`
-    /// does not fit the `<file>#<name>` convention (no `#` at all) derives no
-    /// target, and the shape check must say so with a message naming both
-    /// the `nativeKind` and the offending `qualifiedName` - not fail silently
-    /// or surface as an opaque parse error.
+    /// A placeholder whose `nativeKind` requires a `target` but whose wire
+    /// line omits one entirely - a v2 sender's own mistake, not a legacy
+    /// shape - must be reported with a message naming both the `nativeKind`
+    /// and the `qualifiedName`, not fail silently or as an opaque parse
+    /// error.
     #[test]
-    fn placeholder_with_no_derivable_legacy_target_is_a_violation() {
-        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"foo\",\"qualifiedName\":\"not-the-convention\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"exported\":false,\"language\":\"typescript\",\"nativeKind\":\"pending_symbol\"}\n";
+    fn placeholder_with_no_target_is_a_violation() {
+        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"foo\",\"qualifiedName\":\"not-the-convention\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"typescript\",\"nativeKind\":\"pending_symbol\"}\n";
         let report = check_bulk_output(ndjson);
         assert!(!report.is_conformant());
         assert_eq!(report.violations[0].context, "NDJSON line 1");
@@ -178,9 +176,7 @@ mod tests {
         assert!(report.violations[0].message.contains("not-the-convention"), "{:?}", report.violations);
     }
 
-    /// A v2 node whose `target` is present on the wire needs no derivation
-    /// at all and must still pass - the positive v2 counterpart to the two
-    /// legacy tests above.
+    /// A v2 node whose `target` is present on the wire is conformant.
     #[test]
     fn v2_placeholder_with_an_explicit_target_is_conformant() {
         let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"foo\",\"qualifiedName\":\"target.ts#foo\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"typescript\",\"nativeKind\":\"pending_symbol\",\"target\":{\"scope\":{\"file\":\"target.ts\"},\"key\":{\"name\":\"foo\"}}}\n";
@@ -193,7 +189,7 @@ mod tests {
     /// conformance violation, never a legitimate message.
     #[test]
     fn a_plugin_emitted_container_node_is_a_violation() {
-        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"pkg\",\"qualifiedName\":\"pkg\",\"filePath\":\"\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":0}},\"exported\":false,\"language\":\"go\",\"nativeKind\":\"container\"}\n";
+        let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"pkg\",\"qualifiedName\":\"pkg\",\"filePath\":\"\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":0}},\"visibility\":\"file\",\"language\":\"go\",\"nativeKind\":\"container\"}\n";
         let report = check_bulk_output(ndjson);
         assert!(!report.is_conformant());
         assert!(report.violations[0].message.contains("container"), "{:?}", report.violations);

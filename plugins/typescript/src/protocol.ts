@@ -4,7 +4,7 @@
 // attributes and its test module for the ground truth.
 
 // Bumped in lockstep with core's CURRENT_PROTOCOL_VERSION.
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const JSONRPC_VERSION = "2.0";
 
 export interface Handshake {

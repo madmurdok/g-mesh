@@ -23,7 +23,7 @@ const EDGE_KINDS: ReadonlySet<EdgeKind> = new Set([
   "REFERENCES",
   "EXPORTS",
 ]);
-const EDGE_SOURCES: ReadonlySet<EdgeSource> = new Set(["tree-sitter", "ts-compiler"]);
+const EDGE_SOURCES: ReadonlySet<EdgeSource> = new Set(["syntactic", "semantic"]);
 
 /** Builds a small real project directory under a fresh tempdir; `files` maps
  * project-relative paths to their contents (mirrors how other tests in this
@@ -78,7 +78,13 @@ function assertConformsToWireShape(parsed: unknown): void {
     assert.equal(typeof range.start.col, "number");
     assert.equal(typeof range.end.line, "number");
     assert.equal(typeof range.end.col, "number");
-    assert.equal(typeof obj.exported, "boolean");
+    // Protocol v2: `visibility`, not the legacy `exported: boolean` - this
+    // plugin never emits the `{ container }` variant (TS/JS has no
+    // containers), so the wire value is always one of these two strings.
+    assert.ok(
+      obj.visibility === "public" || obj.visibility === "file",
+      `unexpected visibility ${JSON.stringify(obj.visibility)}`,
+    );
     assert.equal(typeof obj.language, "string");
     assert.equal(typeof obj.hasSyntaxErrors, "boolean");
     assert.ok(
@@ -93,6 +99,17 @@ function assertConformsToWireShape(parsed: unknown): void {
       obj.nativeKind === null || typeof obj.nativeKind === "string",
       "nativeKind must be string or null",
     );
+    // A placeholder nativeKind must carry a structured `target` (protocol
+    // v2) - `external_module` is the one placeholder-shaped kind exempt,
+    // since it names a bare specifier that never links to anything in this
+    // project (see extract.ts's `PLACEHOLDER_NATIVE_KINDS` doc comment).
+    if (
+      obj.nativeKind === "pending_symbol" ||
+      obj.nativeKind === "reexport" ||
+      obj.nativeKind === "resolved_module"
+    ) {
+      assert.equal(typeof obj.target, "object", `${String(obj.nativeKind)} must carry a target`);
+    }
     // Flat extract.ts fields must not leak onto the wire.
     assert.equal(obj.startLine, undefined);
     assert.equal(obj.startCol, undefined);
@@ -105,6 +122,7 @@ function assertConformsToWireShape(parsed: unknown): void {
     assert.equal(typeof obj.toId, "string");
     assert.ok(EDGE_KINDS.has(obj.kind as EdgeKind), `unexpected EdgeKind ${String(obj.kind)}`);
     assert.ok(EDGE_SOURCES.has(obj.source as EdgeSource), `unexpected EdgeSource ${String(obj.source)}`);
+    assert.equal(typeof obj.engine, "string");
     assert.equal(typeof obj.resolved, "boolean");
   }
 }
@@ -151,7 +169,7 @@ test("toWireNode nests flat range fields", () => {
     startCol: 2,
     endLine: 3,
     endCol: 4,
-    exported: false,
+    visibility: "file",
     language: "typescript",
     hasSyntaxErrors: false,
   });
@@ -175,7 +193,7 @@ function extractedNode(declarations?: SymbolDeclaration[]): ExtractedNode {
     endLine: 5,
     endCol: 1,
     signature: "parse(input: string): string[]",
-    exported: true,
+    visibility: "public",
     language: "typescript",
     nativeKind: "function",
     hasSyntaxErrors: false,
@@ -230,7 +248,7 @@ test("toWireNode leaves an ordinary node's wire line exactly as it was", () => {
     "filePath",
     "range",
     "signature",
-    "exported",
+    "visibility",
     "docComment",
     "language",
     "nativeKind",

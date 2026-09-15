@@ -218,9 +218,6 @@ pub(crate) fn count_claimed_files(manifest: &PluginManifest, dir: &Path) -> usiz
 /// author sees running `--bulk-index` by hand).
 pub(crate) struct BulkLine {
     pub line_no: usize,
-    /// The line as plain JSON, for the legacy-v1 field inspection
-    /// `WireNode`'s normalizing deserializer deliberately erases.
-    pub raw: Option<serde_json::Value>,
     pub item: Result<BulkItem, String>,
 }
 
@@ -347,17 +344,9 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
             }
             let line_no = index + 1;
             let Ok(text) = std::str::from_utf8(line) else {
-                return Some(BulkLine {
-                    line_no,
-                    raw: None,
-                    item: Err("line is not valid UTF-8".to_string()),
-                });
+                return Some(BulkLine { line_no, item: Err("line is not valid UTF-8".to_string()) });
             };
-            Some(BulkLine {
-                line_no,
-                raw: serde_json::from_str(text).ok(),
-                item: BulkItem::parse(text).map_err(|err| format!("{err:#}")),
-            })
+            Some(BulkLine { line_no, item: BulkItem::parse(text).map_err(|err| format!("{err:#}")) })
         })
         .collect()
 }
@@ -504,7 +493,6 @@ impl Method {
 }
 
 pub(crate) struct Response {
-    pub raw: serde_json::Value,
     pub diff: Result<FileChangeDiff, String>,
 }
 
@@ -828,7 +816,6 @@ impl Driver<'_> {
             };
             let id = serde_json::to_value(id).unwrap_or_default();
             let response = frames.iter().find(|frame| frame.get("id") == Some(&id)).map(|raw| Response {
-                raw: raw.clone(),
                 diff: serde_json::from_value::<FileChangeResponse>(raw.clone())
                     .map(|response| response.result)
                     .map_err(|err| err.to_string()),

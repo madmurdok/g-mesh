@@ -218,6 +218,7 @@ import { walkProjectFiles } from "./bulkIndex";
 import {
   edgeIdFor,
   extractFile,
+  fileTarget,
   isPlaceholder,
   isSupportedFile,
   nodeIdFor,
@@ -240,9 +241,12 @@ import { createProjectResolver } from "./resolve";
 import { semanticProjectFor, type DefinitionLocation, type SemanticProject } from "./semantic";
 import { canonicalizeProjectRoot } from "./symlinks";
 
-/** `source` of every edge this pass writes - the whole point of it. The
+/** `source` tier of every edge this pass writes - the whole point of it. The
  * counterpart to extract.ts's `EDGE_SOURCE`, which is the other value. */
-const SEMANTIC_EDGE_SOURCE: EdgeSource = "ts-compiler";
+const SEMANTIC_EDGE_SOURCE: EdgeSource = "semantic";
+/** `engine` label alongside [`SEMANTIC_EDGE_SOURCE`] - the counterpart to
+ * extract.ts's `ENGINE`. */
+const SEMANTIC_ENGINE = "ts-compiler";
 
 /**
  * How many questions in a row may fail to reach the checker at all before the
@@ -610,10 +614,11 @@ async function askNamespaceUses(
       startCol: use.bindingCol,
       endLine: use.bindingLine,
       endCol: use.bindingCol + use.namespaceName.length,
-      exported: false,
+      visibility: "file",
       language: entry.language,
       nativeKind: PENDING_SYMBOL_NATIVE_KIND,
       hasSyntaxErrors: false,
+      target: fileTarget(answer.declPath, answer.declName),
     };
 
     out.placeholderEdge(entry.filePath, placeholder, {
@@ -622,6 +627,7 @@ async function askNamespaceUses(
       toId: placeholder.id,
       kind: use.edgeKind,
       source: SEMANTIC_EDGE_SOURCE,
+      engine: SEMANTIC_ENGINE,
       // Pointing at a placeholder *is* what unresolved means here, whichever
       // pass built it: only core can confirm the target file exports the
       // name, and it says so by repointing this edge (`graph::symbol_links`).
@@ -666,7 +672,10 @@ async function askUpgrade(
     const required = LINKABLE_EDGE_KINDS.get(edge.kind);
     if (required !== undefined && required !== null && target.kind !== required) continue;
     if (target.id === edge.fromId) continue; // a self-edge carries no information
-    out.upgradedEdge({ ...edge, toId: target.id, source: SEMANTIC_EDGE_SOURCE, resolved: true }, target);
+    out.upgradedEdge(
+      { ...edge, toId: target.id, source: SEMANTIC_EDGE_SOURCE, engine: SEMANTIC_ENGINE, resolved: true },
+      target,
+    );
   }
 }
 
@@ -910,7 +919,9 @@ class ProjectIndex {
   async declaresExport(file: string, name: string): Promise<boolean> {
     const result = await this.extractionOf(file);
     if (result === null) return false;
-    return result.nodes.some((node) => node.exported && node.name === name && !isPlaceholder(node));
+    return result.nodes.some(
+      (node) => node.visibility === "public" && node.name === name && !isPlaceholder(node),
+    );
   }
 
   /**
@@ -934,7 +945,7 @@ class ProjectIndex {
     if (result === null) return false;
     return result.nodes.some(
       (node) =>
-        node.exported &&
+        node.visibility === "public" &&
         node.name === name &&
         node.kind === "Function" &&
         node.declarations !== undefined &&
@@ -1127,6 +1138,7 @@ class PassOutput {
         toId: target.id,
         kind: "CALLS",
         source: SEMANTIC_EDGE_SOURCE,
+        engine: SEMANTIC_ENGINE,
         // Unlike the placeholder half, this one has the declaration in hand -
         // there is nothing left for core to look up.
         resolved: true,
