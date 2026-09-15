@@ -56,6 +56,7 @@ use crate::config::ProjectConfig;
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::protocol::jsonrpc::is_timeout;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
@@ -340,8 +341,32 @@ impl PluginSupervisor {
         // while is the plugin being *used*, and an idle check that fired in
         // the middle of one would be measuring from the wrong end of it.
         self.touch();
+        // Kept before the call, which consumes `file_path` - only needed on
+        // the timeout branch below, but cloning a file path is cheap next to
+        // everything else a round trip costs.
+        let retry_path = file_path.clone();
         if let Err(err) = process.apply_file_change(conn, file_path, &self.embedding) {
-            eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+            if is_timeout(&err) {
+                // `PluginProcess::apply_file_change`'s own doc comment: a
+                // timed-out request is deliberately not replayed inline (the
+                // plugin may have still been mid-write on it, and the process
+                // behind it has already been killed and relaunched by the
+                // time this error reaches us). Queue it exactly like a file
+                // that changed while the plugin was asleep, so the next
+                // request that touches this language - `replay_pending`,
+                // reached the same way a wake-from-sleep is - sends it again
+                // against the fresh process instead of it being silently
+                // dropped.
+                eprintln!(
+                    "g-mesh daemon: {} plugin timed out applying a file change ({err:#}) - \
+                     the plugin was relaunched and {retry_path} is queued for replay",
+                    self.manifest.language
+                );
+                inner.dirty.push(retry_path);
+                self.pending.store(true, Ordering::SeqCst);
+            } else {
+                eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+            }
         }
     }
 
@@ -417,11 +442,20 @@ impl PluginSupervisor {
     /// In practice this is unreachable at the one call site there is (the
     /// plugin cannot have idled out during its own project's first walk),
     /// which is precisely why it must not be an error.
-    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<bool> {
+    ///
+    /// `file_count` is forwarded to `PluginProcess::semantic_pass` unchanged.
+    /// See that method and `daemon::plugin::RoundTripTimeouts`'s doc comment
+    /// for why the whole-project timeout has to scale with it.
+    pub fn semantic_pass(
+        &self,
+        conn: &Mutex<Connection>,
+        file_paths: Vec<String>,
+        file_count: usize,
+    ) -> Result<bool> {
         let inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return Ok(false) };
         self.touch();
-        process.semantic_pass(conn, file_paths, &self.embedding)?;
+        process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
         Ok(true)
     }
 
@@ -743,6 +777,134 @@ mod tests {
             vec![first_pid, woken_pid],
             "the wake must have spawned this manifest's plugin, not some other one"
         );
+    }
+
+    /// GM-271's acceptance test. Today, before this task's fix, a request the
+    /// plugin never answers blocks `watcher::apply::round_trip`'s read
+    /// forever - `file_changed` below would simply never return, and this
+    /// test would hang rather than fail. With the fix: the request times out
+    /// (a short, test-only `FILE_CHANGED_TIMEOUT_ENV` override - see
+    /// `daemon::plugin::RoundTripTimeouts` - so this test does not wait the
+    /// production 30s budget), the plugin is killed and relaunched through
+    /// the same crash-recovery path an out-of-band kill already used
+    /// (`plugin_crash_recovery.rs`), the file stays dirty rather than being
+    /// silently dropped, a later replay actually delivers it (the fixture
+    /// stalls on its first request only - see
+    /// `test_plugin::install_stalling`'s doc comment), and a second
+    /// language's supervisor - a wholly separate `PluginSupervisor` with its
+    /// own process, exactly as `daemon::registry::PluginRegistry` creates one
+    /// per language - keeps serving normally throughout, because streams are
+    /// per language.
+    #[test]
+    fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_without_blocking_another_language(
+    ) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV, "150");
+
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+
+        let stalling_dir = test_plugin::install_stalling(plugins.path(), "go", &[".go-src"]);
+        let stalling_manifest = read_manifest(&stalling_dir).expect("the fixture manifest must parse");
+        let responsive_dir = test_plugin::install(plugins.path(), "python", &[".python-src"]);
+        let responsive_manifest = read_manifest(&responsive_dir).expect("the fixture manifest must parse");
+
+        let stalling = PluginSupervisor::start(
+            project.path(),
+            stalling_manifest,
+            plugins.path().join("plugin-go.pid"),
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the stalling fixture plugin must still shake hands and start normally");
+        let responsive = PluginSupervisor::start(
+            project.path(),
+            responsive_manifest,
+            plugins.path().join("plugin-python.pid"),
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the responsive fixture plugin must start");
+
+        // The override only has to be visible while `PluginProcess::spawn`
+        // resolves it, above - both supervisors have already captured their
+        // own `RoundTripTimeouts` by value, so removing it now cannot affect
+        // either, and leaving it set any longer than necessary would risk
+        // another test (racing on `ENV_LOCK` right after this one) seeing it.
+        std::env::remove_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV);
+
+        let conn = test_plugin::empty_index();
+        let first_pid = stalling.pid().expect("a freshly started plugin is awake");
+
+        // The discriminating assertion: this call must return once its
+        // timeout elapses, not hang forever waiting for an answer that is
+        // never coming. 10s is a generous multiple of the 150ms override -
+        // this is a hang guard, not a timing assertion (see this repo's
+        // house rule on timing measurements).
+        let start = Instant::now();
+        stalling.file_changed(&conn, "app.go-src".to_string());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "file_changed must return once its timeout elapses, not block on a plugin that never \
+             answers - took {elapsed:?}"
+        );
+
+        // The stalled request was genuinely received (not skipped, dropped,
+        // or refused) before it was left unanswered.
+        assert_eq!(
+            test_plugin::file_changed_requests(&stalling_dir),
+            vec!["app.go-src".to_string()],
+            "the timed-out plugin must have actually seen the request before timing out on it"
+        );
+
+        // The plugin was killed and relaunched: a fresh, different, live pid.
+        let relaunched_pid = stalling.pid().expect("a fresh process must be running after the timeout");
+        assert_ne!(relaunched_pid, first_pid, "the timed-out plugin process must have been relaunched");
+        assert!(
+            crate::daemon::is_process_alive(relaunched_pid),
+            "the relaunched process must actually be running"
+        );
+        assert_eq!(
+            test_plugin::spawns(&stalling_dir),
+            vec![first_pid, relaunched_pid],
+            "exactly one relaunch, of this supervisor's own manifest"
+        );
+
+        // The request is dropped rather than replayed inline - the file
+        // stays dirty for a later replay instead.
+        assert!(stalling.has_pending(), "the timed-out file must stay queued as dirty, not be dropped");
+
+        // Meanwhile, a second language's supervisor - a wholly independent
+        // stream - was never touched by any of the above, and keeps serving
+        // normally.
+        responsive.file_changed(&conn, "app.python-src".to_string());
+        assert_eq!(
+            test_plugin::file_changed_requests(&responsive_dir),
+            vec!["app.python-src".to_string()],
+            "a second language must keep flowing while the first is stuck"
+        );
+        assert_eq!(
+            test_plugin::spawns(&responsive_dir).len(),
+            1,
+            "the second language's plugin was never touched by the first one's timeout"
+        );
+
+        // The dirty file is actually replayed - against the relaunched
+        // process, which (per `install_stalling`'s one-stall-ever contract)
+        // now answers normally, so this succeeds rather than timing out
+        // again.
+        let replayed = stalling.replay_pending(&conn).expect("the queued replay must succeed this time");
+        assert_eq!(replayed, 1, "exactly the one file that was left dirty");
+        assert!(!stalling.has_pending(), "nothing should be left queued after a successful replay");
+        assert_eq!(
+            test_plugin::file_changed_requests(&stalling_dir),
+            vec!["app.go-src".to_string(), "app.go-src".to_string()],
+            "the relaunched process must have seen the same file a second time, and answered it"
+        );
+
+        stalling.sleep_now("test cleanup");
+        responsive.sleep_now("test cleanup");
     }
 
     #[test]

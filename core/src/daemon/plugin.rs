@@ -51,6 +51,7 @@ use sha2::{Digest, Sha256};
 use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
+use crate::protocol::jsonrpc::is_timeout;
 use crate::protocol::types::{RequestId, CURRENT_PROTOCOL_VERSION};
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
@@ -64,6 +65,210 @@ pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
 /// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
 /// the hint and exited.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Per-method budgets for one control-plane round trip - see
+/// `docs/architecture/multi-language-plugins.md`'s "Semantic engine hangs or
+/// is slow" failure mode, and `watcher::apply::round_trip`/
+/// `protocol::jsonrpc::read_message_with_timeout` for the mechanism that
+/// enforces them. Three separate fields, not one shared timeout, because each
+/// covers a different amount of plugin work - and, as of this task's review
+/// round, two very different evidence bars: [`file_changed`](Self::file_changed)
+/// and [`semantic_pass_file`](Self::semantic_pass_file) below are reasoned
+/// from first principles, not measured; [`semantic_pass_project`]
+/// (Self::semantic_pass_project) is measured, because a flat guess there was
+/// tried first and turned out wrong (see its own section).
+///
+/// - **`file_changed`**: one file's structural (tree-sitter) reparse plus its
+///   incremental diff - no type-checking, no cross-file work. **Not
+///   measured** - no per-file timing exists anywhere in this repo's indexes
+///   or bench output. The reasoning: even a large single file is
+///   milliseconds of parsing, so [`DEFAULT_FILE_CHANGED_TIMEOUT`] (30s)
+///   leaves roughly two orders of magnitude of slack for OS scheduling noise
+///   and a loaded CI box before calling the plugin wedged rather than merely
+///   slow. Treat this as a guess with a wide margin, not a validated budget.
+/// - **`semantic_pass_file`**: the per-file semantic upgrade that rides on
+///   the very same reparse (`watcher::apply::apply_file_change`'s own doc
+///   comment). **Not measured either** - same gap: the bench indexes this
+///   task's `semantic_pass_project` numbers came from only record the
+///   *whole-project* pass's timestamps (`meta.bulkIndexedAt` /
+///   `meta.semanticPassAt`), never a per-file one. The reasoning: real
+///   compiler work against an already-warm tsserver, scoped to the handful of
+///   unresolved sites one file could plausibly have introduced, matching the
+///   per-request budget `docs/architecture/multi-language-plugins.md`'s
+///   `LspBridge` section already calls for ("Budgets: per-request
+///   timeout..."). [`DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT`] (120s) is longer
+///   than the structural budget because it is real type-checking, not
+///   parsing, but still bounded to one file's worth of it - again, a guess
+///   with margin, not a validated number.
+/// - **`semantic_pass_project`**: the whole-project pass
+///   (`daemon::semantic::run_with_registry`/`run_once`), which type-checks
+///   across every file in the project at once, cold. This one *is* measured,
+///   and the first version of this comment was wrong to say no measurement
+///   existed - it undersold what `meta.bulkIndexedAt` -> `meta.semanticPassAt`
+///   deltas across a project's own index already record. Source: those
+///   deltas, read across every g-mesh-bench index under `~/.g-mesh/projects`
+///   as of 2026-09-15:
+///
+///   | corpus | n | min | p50 | p90 | max |
+///   |---|---|---|---|---|---|
+///   | excalidraw (658 `File` nodes) | 47 | 56s | 90s | ~163-174s (method-dependent) | **1475s (24.6min)**, under heavy contention from parallel bench runs sharing the machine; other tail samples 778s, 261s, 254s |
+///   | task-tracker-mcp (49 `File` nodes) | 93 | 0s | 1s | 2s | 9s |
+///
+///   The one number that matters most: a real, healthy pass on a
+///   medium-sized repo (excalidraw, 658 files) *already exceeded 20 minutes
+///   once*, even before scaling to a larger corpus. A flat 20-minute timeout
+///   would have killed that exact pass, relaunched the plugin, and had the
+///   next attempt likely die the same way - a project that never finishes
+///   its semantic layer. [`DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT`] therefore
+///   is not the timeout used directly; it is the **floor** a per-project
+///   scaled budget is clamped to, via [`RoundTripTimeouts::
+///   semantic_pass_project_timeout`]: `max(floor, file_count *
+///   `[`SEMANTIC_PASS_PER_FILE_BUDGET`]`)`.
+///     - **Floor: 20 minutes**, kept exactly at its pre-review value - it is
+///       what small/empty projects (few or zero `File` nodes) still get, and
+///       nothing in the measurement above argues for changing it.
+///     - **Per-file budget: 10 seconds.** excalidraw's worst observed rate
+///       under contention is 1475s / 658 files ~= 2.24s/file; 10s/file is
+///       ~4.5x that. Its p50 rate is 90s / 658 files ~= 0.137s/file; 10s/file
+///       is ~73x that. Both margins are deliberately generous: this budget
+///       has to cover a repo this daemon has never actually measured, not
+///       just replay the corpora above.
+///
+///   Task-tracker-mcp's own numbers (max 9s, 49 files) are there to show the
+///   floor is not accidentally starving a small project - 49 * 10s = 490s is
+///   already far below the 20-minute floor, so the floor is what it gets, and
+///   9s of real work disappears into that floor with room to spare.
+///
+///   File-count scaling is computed over the *whole* index today
+///   (`daemon::semantic::indexed_file_count`), not per language, because
+///   there is no per-language `File`-node accounting yet - `language_state`
+///   (mentioned in this task's own notes) is a later task. GM-270 (the
+///   per-language semantic scheduler) is the natural place to narrow this to
+///   "this language's own files" once that distinction exists; until then, a
+///   multi-language project's timeout is sized off every language's files
+///   combined, which only ever makes the budget *more* generous than a
+///   single language would need.
+///
+/// Constants, not configuration (see the task this type was added for): a
+/// project's `config.toml` has no `[plugin.timeouts]` section, and none of
+/// these numbers are meant to be a per-project tuning knob. The only thing
+/// that overrides them is the matching `*_TIMEOUT_ENV` variable
+/// [`RoundTripTimeouts::from_env`] reads - the same "a test can drive the
+/// real timer instead of faking the subsystem around it" escape hatch
+/// `daemon::lifecycle::PLUGIN_IDLE_ENV` already documents, and for the same
+/// reason: nobody wants a unit test to actually wait 20 minutes (or longer,
+/// once file-count scaling is in play) to prove a timeout fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTripTimeouts {
+    pub file_changed: Duration,
+    pub semantic_pass_file: Duration,
+    /// The **floor** a real whole-project semanticPass timeout is clamped
+    /// to, not the timeout itself. See
+    /// [`RoundTripTimeouts::semantic_pass_project_timeout`] for the actual
+    /// per-project value, and this type's own doc comment for the
+    /// measurement behind both the floor and the per-file budget it is
+    /// combined with.
+    pub semantic_pass_project: Duration,
+}
+
+/// See [`RoundTripTimeouts`]'s doc comment for the evidence behind this
+/// number.
+pub const DEFAULT_FILE_CHANGED_TIMEOUT: Duration = Duration::from_secs(30);
+/// See [`RoundTripTimeouts`]'s doc comment for the evidence behind this
+/// number.
+pub const DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// See [`RoundTripTimeouts`]'s doc comment for the evidence behind this
+/// number. The floor for [`RoundTripTimeouts::semantic_pass_project_timeout`],
+/// not a timeout used as-is - see that method.
+pub const DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How much whole-project semanticPass budget one indexed `File` node buys -
+/// see [`RoundTripTimeouts`]'s doc comment ("Per-file budget: 10 seconds")
+/// for the measurement this is derived from.
+pub const SEMANTIC_PASS_PER_FILE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Test-only override for [`RoundTripTimeouts::file_changed`] - real installs
+/// never set it. See [`RoundTripTimeouts`]'s doc comment.
+pub const FILE_CHANGED_TIMEOUT_ENV: &str = "G_MESH_FILE_CHANGED_TIMEOUT_MS";
+/// Test-only override for [`RoundTripTimeouts::semantic_pass_file`].
+pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_FILE_TIMEOUT_MS";
+/// Test-only override for [`RoundTripTimeouts::semantic_pass_project`] - the
+/// floor, not the scaled timeout (there is no override for the per-file
+/// budget; tests that need a short whole-project timeout pass a small
+/// `file_count` too, since the floor is what dominates at small counts).
+pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_PROJECT_TIMEOUT_MS";
+
+impl Default for RoundTripTimeouts {
+    fn default() -> Self {
+        Self {
+            file_changed: DEFAULT_FILE_CHANGED_TIMEOUT,
+            semantic_pass_file: DEFAULT_SEMANTIC_PASS_FILE_TIMEOUT,
+            semantic_pass_project: DEFAULT_SEMANTIC_PASS_PROJECT_TIMEOUT,
+        }
+    }
+}
+
+impl RoundTripTimeouts {
+    /// The production defaults, unless a test-only env override names
+    /// something else - see this type's own doc comment.
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            file_changed: parse_round_trip_timeout(
+                std::env::var(FILE_CHANGED_TIMEOUT_ENV).ok().as_deref(),
+                default.file_changed,
+                FILE_CHANGED_TIMEOUT_ENV,
+            ),
+            semantic_pass_file: parse_round_trip_timeout(
+                std::env::var(SEMANTIC_PASS_FILE_TIMEOUT_ENV).ok().as_deref(),
+                default.semantic_pass_file,
+                SEMANTIC_PASS_FILE_TIMEOUT_ENV,
+            ),
+            semantic_pass_project: parse_round_trip_timeout(
+                std::env::var(SEMANTIC_PASS_PROJECT_TIMEOUT_ENV).ok().as_deref(),
+                default.semantic_pass_project,
+                SEMANTIC_PASS_PROJECT_TIMEOUT_ENV,
+            ),
+        }
+    }
+
+    /// The timeout to actually give a whole-project semanticPass over a
+    /// project with `file_count` indexed `File` nodes: `self
+    /// .semantic_pass_project` as a floor, and `file_count *
+    /// `[`SEMANTIC_PASS_PER_FILE_BUDGET`]` as a per-project budget, whichever
+    /// is larger - see [`RoundTripTimeouts`]'s doc comment for the
+    /// measurement behind both numbers.
+    ///
+    /// `file_count` is clamped to `u32::MAX` before multiplying (a project
+    /// with that many files is not one this daemon has ever seen, and
+    /// overflowing the multiplication into a wildly wrong, possibly tiny,
+    /// timeout would be a worse failure than merely capping the input).
+    pub fn semantic_pass_project_timeout(&self, file_count: usize) -> Duration {
+        let file_count = u32::try_from(file_count).unwrap_or(u32::MAX);
+        let scaled = SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(file_count);
+        self.semantic_pass_project.max(scaled)
+    }
+}
+
+/// `default` for an absent or unparseable override, and - unlike
+/// `daemon::lifecycle::parse_timeout`'s idle timers - also for an explicit
+/// `0`: an idle timer can mean "never" at zero, but a round-trip timeout of
+/// zero would fail every request, which is not a meaningful "off" state for
+/// this type to offer.
+fn parse_round_trip_timeout(raw: Option<&str>, default: Duration, name: &str) -> Duration {
+    let Some(raw) = raw else { return default };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => default,
+        Ok(millis) => Duration::from_millis(millis),
+        Err(_) => {
+            eprintln!(
+                "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
+                 using the default {default:?}"
+            );
+            default
+        }
+    }
+}
 
 /// How much of the digest [`fingerprint`] keeps. 64 bits is far more than
 /// enough to tell two builds of one plugin apart, and short enough that a
@@ -482,6 +687,11 @@ pub struct PluginProcess {
     /// that dies mid round-trip leaves it here instead, which is exactly the
     /// "pending dirty-file queue" a crash relaunch replays before returning.
     pending: Mutex<Vec<String>>,
+    /// Resolved once at construction (from [`RoundTripTimeouts::from_env`])
+    /// and reused across every relaunch - a timeout budget is a property of
+    /// this `PluginProcess`, not of whichever child process happens to be
+    /// running behind it right now.
+    timeouts: RoundTripTimeouts,
 }
 
 impl PluginProcess {
@@ -500,6 +710,7 @@ impl PluginProcess {
             state: Mutex::new(state),
             next_id: AtomicI64::new(1),
             pending: Mutex::new(Vec::new()),
+            timeouts: RoundTripTimeouts::from_env(),
         })
     }
 
@@ -564,6 +775,28 @@ impl PluginProcess {
     /// including `file_path` itself - against it before returning, rather
     /// than surfacing the crash to the caller. See this module's doc comment
     /// for why that distinction (crash vs. a deliberate stop) matters.
+    ///
+    /// A round trip that instead *times out* (`self.timeouts` - see
+    /// [`RoundTripTimeouts`]) is deliberately **not** treated the same way as
+    /// an ordinary crash, even though `send_one`'s own `on_timeout` already
+    /// killed the process by the time control gets back here, which makes
+    /// `process_has_exited()` true either way. The difference is what is
+    /// safe to do next: an ordinary crash means the dead process never got a
+    /// chance to act on anything still pending, so blindly replaying it
+    /// against the fresh one is lossless. A timeout carries no such
+    /// guarantee - the plugin may have been mid-write on the very request
+    /// that just timed out - so resending it blind here risks a duplicate
+    /// side effect, and could turn one wedged plugin into a loop of
+    /// full-timeout waits if the replacement is no more responsive than the
+    /// original (imagine a plugin that is slow, not dead: every relaunch
+    /// would just time out again). So on a timeout this still relaunches
+    /// (`self.relaunch`, the same "existing crash-recovery path" an ordinary
+    /// crash uses), but leaves `file_path` sitting in the pending queue and
+    /// returns the timeout error rather than calling `replay_pending` -
+    /// `daemon::lifecycle::PluginSupervisor::file_changed` is what notices
+    /// that error is a timeout and requeues the file onto its own dirty
+    /// queue, to be replayed by whatever next touches this language, exactly
+    /// like a file that arrived while the plugin was asleep.
     pub fn apply_file_change(
         &self,
         conn: &Mutex<Connection>,
@@ -580,11 +813,25 @@ impl PluginProcess {
             // is a non-blocking (if briefly polled) check for exactly that.
             // Another thread may already have won the relaunch race by the
             // time we check, which is fine: `replay_pending` always sends
-            // against whatever is current, so it recovers either way.
+            // against whatever is current, so it recovers either way. A
+            // timeout has already forced this to be true (`on_timeout` killed
+            // the process before this line runs), but the check is still
+            // correct and still cheap to make unconditionally.
             if self.process_has_exited() {
                 self.relaunch(&first_err)
                     .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
             }
+
+            if is_timeout(&first_err) {
+                // See this function's own doc comment: a timeout is not safe
+                // to replay inline. `file_path` (and anything else already
+                // queued) stays in `self.pending` for whenever the next
+                // ordinary call retries it - which is exactly what happens,
+                // since a fresh `apply_file_change` for the same path just
+                // re-enqueues (a no-op, already there) and sends it again.
+                return Err(first_err);
+            }
+
             return self.replay_pending(conn, embedding).with_context(|| {
                 format!(
                     "JS/TS plugin process exited unexpectedly and could not be recovered while applying a change to {file_path}"
@@ -651,6 +898,15 @@ impl PluginProcess {
     /// layer logs and treats as best-effort (see `mcp::GMeshMcpServer::
     /// ensure_file_fresh`) rather than something worth relaunching a process
     /// over on a mere freshness check.
+    ///
+    /// A *timeout* still gets the process relaunched, though (best-effort -
+    /// a relaunch failure is logged, not propagated over the timeout error
+    /// itself): unlike an ordinary crash, this call already knows for certain
+    /// the process is dead (its own `on_timeout` just killed it), so leaving
+    /// it dead until some unrelated request happens to notice would strand
+    /// every other query-time freshness check behind it for no reason. This
+    /// query itself is not retried, matching [`Self::apply_file_change`]'s
+    /// own reasoning for why a timed-out request must not be resent blind.
     pub fn ensure_fresh(
         &self,
         conn: &Mutex<Connection>,
@@ -665,10 +921,26 @@ impl PluginProcess {
         }
 
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let mut state = self.state.lock().unwrap();
-        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
-        let mut conn = conn.lock().unwrap();
-        staleness::ensure_fresh(reader, writer, &mut conn, &self.project_root, file_path, id, embedding)
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
+            let mut conn = conn.lock().unwrap();
+            let mut on_timeout = self.kill_on_timeout(child);
+            staleness::ensure_fresh(
+                reader,
+                writer,
+                &mut conn,
+                &self.project_root,
+                file_path,
+                id,
+                embedding,
+                self.timeouts.file_changed,
+                self.timeouts.semantic_pass_file,
+                &mut on_timeout,
+            )
+        };
+        self.relaunch_after_timeout_if_needed(&result);
+        result
     }
 
     /// Asks the plugin's semantic layer to upgrade what the structural pass
@@ -684,17 +956,77 @@ impl PluginProcess {
     /// ordinary `Err` rather than a relaunch: there is nothing pending to
     /// replay (a semantic pass owns no file the index is missing), and the
     /// caller treats a missing upgrade as best-effort.
+    ///
+    /// A *timeout* is the one case that still relaunches - see
+    /// [`Self::ensure_fresh`]'s doc comment for the identical reasoning: this
+    /// call already knows the process is dead (`on_timeout` just killed it),
+    /// so leaving it dead would strand every future request against this
+    /// language, not just this one pass. `daemon::semantic`'s callers already
+    /// treat any `Err` from this function as "the pass did not complete,
+    /// `semanticPassAt` stays unset, try again later" - a relaunch changes
+    /// nothing about that contract, it just means "later" has a live process
+    /// to try against instead of a dead one.
+    ///
+    /// `file_count` is the number of indexed `File` nodes the caller already
+    /// knows about (`daemon::semantic::indexed_file_count`), used to scale
+    /// this one request's timeout via [`RoundTripTimeouts::
+    /// semantic_pass_project_timeout`] - see that method and
+    /// [`RoundTripTimeouts`]'s own doc comment for why a flat timeout here is
+    /// wrong for anything past a small project.
     pub fn semantic_pass(
         &self,
         conn: &Mutex<Connection>,
         file_paths: Vec<String>,
+        file_count: usize,
         embedding: &EmbeddingPipeline,
     ) -> Result<()> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let mut state = self.state.lock().unwrap();
-        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
-        let mut conn = conn.lock().unwrap();
-        apply_semantic_pass(reader, writer, &mut conn, file_paths, id, embedding)
+        let timeout = self.timeouts.semantic_pass_project_timeout(file_count);
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
+            let mut conn = conn.lock().unwrap();
+            let mut on_timeout = self.kill_on_timeout(child);
+            apply_semantic_pass(
+                reader,
+                writer,
+                &mut conn,
+                file_paths,
+                id,
+                embedding,
+                timeout,
+                &mut on_timeout,
+            )
+        };
+        self.relaunch_after_timeout_if_needed(&result);
+        result
+    }
+
+    /// Shared tail of [`Self::ensure_fresh`]/[`Self::semantic_pass`]: neither
+    /// goes through [`Self::apply_file_change`]'s pending-queue replay, but
+    /// both still owe the plugin a relaunch once they know for certain it is
+    /// dead - which a timeout (unlike an ordinary crash) tells them for
+    /// certain, since their own `on_timeout` is what killed it. Called after
+    /// `self.state`'s lock has already been released (both callers scope
+    /// their round trip in a block for exactly this), because [`Self::relaunch`]
+    /// takes that same lock itself.
+    ///
+    /// Best-effort: a relaunch failure is logged and swallowed here rather
+    /// than replacing the caller's own error, because the caller's error (the
+    /// timeout) is the one its own contract already knows how to report;
+    /// losing that in favor of a secondary "and then the relaunch also
+    /// failed" would tell the caller less, not more.
+    fn relaunch_after_timeout_if_needed<T>(&self, result: &Result<T>) {
+        let Err(err) = result else { return };
+        if !is_timeout(err) {
+            return;
+        }
+        if let Err(relaunch_err) = self.relaunch(err) {
+            eprintln!(
+                "g-mesh daemon: failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
+                self.manifest.language
+            );
+        }
     }
 
     fn send_one(
@@ -710,12 +1042,48 @@ impl PluginProcess {
         // any of these ids either, so there is nothing to collide with.
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let mut state = self.state.lock().unwrap();
-        // Split into disjoint field borrows up front - borrowing the
-        // reader/writer directly as two separate `&mut` arguments doesn't
-        // typecheck through the `MutexGuard`'s `DerefMut`.
-        let PluginState { io: PluginIo { reader, writer }, .. } = &mut *state;
+        // Split into disjoint field borrows up front - borrowing `child` and
+        // the reader/writer as three separate `&mut` borrows doesn't
+        // typecheck through the `MutexGuard`'s `DerefMut` otherwise, and
+        // `on_timeout` below needs `child` independently of the read.
+        let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
         let mut conn = conn.lock().unwrap();
-        apply_file_change_diff(reader, writer, &mut conn, file_path, id, embedding)
+        let mut on_timeout = self.kill_on_timeout(child);
+        apply_file_change_diff(
+            reader,
+            writer,
+            &mut conn,
+            file_path,
+            id,
+            embedding,
+            self.timeouts.file_changed,
+            self.timeouts.semantic_pass_file,
+            &mut on_timeout,
+        )
+    }
+
+    /// The `on_timeout` this process gives every round trip: kill the child
+    /// behind `child` - see `protocol::jsonrpc::read_message_with_timeout`'s
+    /// doc comment for why killing it is what actually unblocks the read
+    /// that timed out (closing its stdout), and this module's own doc
+    /// comment for why an unexpected exit - which this deliberately causes -
+    /// is already a case [`Self::apply_file_change`]/[`Self::semantic_pass`]/
+    /// [`Self::ensure_fresh`] know how to recover from.
+    ///
+    /// Takes `child` as a parameter rather than reading `self.state` itself
+    /// because every caller already holds `self.state`'s lock for the
+    /// round trip this guards - calling back into `self.state.lock()` from
+    /// inside the closure would deadlock on the very same, non-reentrant
+    /// `Mutex`.
+    fn kill_on_timeout<'a>(&'a self, child: &'a mut Child) -> impl FnMut() + 'a {
+        move || {
+            eprintln!(
+                "g-mesh daemon: the {} plugin did not answer a control-plane request in time - \
+                 killing it so a fresh process can take over",
+                self.manifest.language
+            );
+            let _ = child.kill();
+        }
     }
 
     /// Whether the process backing the *current* state has exited.
@@ -757,8 +1125,7 @@ impl PluginProcess {
     /// more than one.
     fn relaunch(&self, cause: &anyhow::Error) -> Result<()> {
         eprintln!(
-            "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - \
-             relaunching and replaying pending file changes",
+            "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - relaunching",
             self.manifest.language
         );
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
@@ -772,6 +1139,47 @@ impl PluginProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GM-271 review round: the floor must win for a project too small for
+    /// the per-file budget to matter - see `RoundTripTimeouts`'s doc comment
+    /// ("Task-tracker-mcp's own numbers... show the floor is not
+    /// accidentally starving a small project"). 49 files (task-tracker-mcp's
+    /// own `File`-node count) * 10s/file = 490s, well under the 20-minute
+    /// (1200s) floor.
+    #[test]
+    fn semantic_pass_project_timeout_uses_the_floor_for_a_small_project() {
+        let timeouts = RoundTripTimeouts::default();
+        assert_eq!(timeouts.semantic_pass_project_timeout(49), timeouts.semantic_pass_project);
+        assert_eq!(timeouts.semantic_pass_project_timeout(0), timeouts.semantic_pass_project);
+    }
+
+    /// The other half: a project large enough that the per-file budget
+    /// exceeds the floor must get the scaled value, not the flat one that
+    /// this task's review measured as too short for excalidraw's own 658
+    /// `File` nodes (a real pass there took as long as 1475s = 24.6min,
+    /// past the 20-minute floor).
+    #[test]
+    fn semantic_pass_project_timeout_scales_past_the_floor_for_a_large_project() {
+        let timeouts = RoundTripTimeouts::default();
+        let file_count = 658;
+        let expected = SEMANTIC_PASS_PER_FILE_BUDGET * file_count;
+        assert!(
+            expected > timeouts.semantic_pass_project,
+            "the fixture must actually exercise the scaled branch, not the floor"
+        );
+        assert_eq!(timeouts.semantic_pass_project_timeout(file_count as usize), expected);
+    }
+
+    /// A pathological file count must not overflow the multiplication into a
+    /// wildly wrong (and, worse, possibly small) `Duration` - it clamps to
+    /// `u32::MAX` files instead, which still comfortably exceeds the floor.
+    #[test]
+    fn semantic_pass_project_timeout_does_not_overflow_on_an_absurd_file_count() {
+        let timeouts = RoundTripTimeouts::default();
+        let huge = timeouts.semantic_pass_project_timeout(usize::MAX);
+        assert!(huge > timeouts.semantic_pass_project);
+        assert_eq!(huge, SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(u32::MAX));
+    }
 
     /// Writes `files` (relative-path, contents pairs) under `dir`, creating
     /// whatever subdirectories they need - the fixture every digest test in

@@ -1,4 +1,6 @@
 use std::io::{BufRead, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -50,6 +52,106 @@ pub fn read_message<T: DeserializeOwned, R: BufRead>(reader: &mut R) -> Result<O
     Ok(Some(message))
 }
 
+/// Marks a [`read_message_with_timeout`] failure specifically caused by its
+/// deadline elapsing (or, treated the same way, its reader thread ending
+/// without answering at all - see that function's doc comment on why the two
+/// are folded together) - as opposed to a framing error, a malformed body, or
+/// a clean EOF discovered *before* the deadline, all of which stay ordinary
+/// `anyhow::Error`s with no marker.
+///
+/// The distinction matters one layer up: `daemon::plugin::PluginProcess
+/// ::apply_file_change` already knows how to recover from an ordinary crash
+/// (relaunch, then blindly replay whatever was pending - safe, because a dead
+/// process never got a chance to act on the request at all). A timeout is not
+/// that safe to treat the same way: the plugin may still be mid-write on the
+/// very request that just timed out, so resending it blind into a freshly
+/// spawned process risks a duplicate side effect for whatever that request
+/// was doing. That function downcasts for this marker (via [`is_timeout`], to
+/// survive any `.context()` layered on top by the callers in between) to
+/// choose the safer path: relaunch, but leave the request for the caller's
+/// own dirty-queue replay instead of resending it here.
+#[derive(Debug)]
+pub struct RoundTripTimedOut {
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for RoundTripTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no response within {:?}", self.timeout)
+    }
+}
+
+impl std::error::Error for RoundTripTimedOut {}
+
+/// Whether `err` is, anywhere in its `.context()` chain, a
+/// [`RoundTripTimedOut`] - see that type's doc comment for why callers need
+/// to tell a timeout apart from every other round-trip failure.
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.downcast_ref::<RoundTripTimedOut>().is_some())
+}
+
+/// [`read_message`], but gives up after `timeout` if the plugin has not
+/// answered.
+///
+/// # Why a reader thread rather than a read with a deadline
+///
+/// A blocking `read`/`read_exact` on a pipe - a spawned plugin's `stdout`, or
+/// the `std::io::pipe()` peers this module's own tests use - has no deadline
+/// of its own: the underlying syscall blocks until bytes arrive or the pipe
+/// closes, however wedged the process on the other end is. Neither `Read` nor
+/// `BufRead` exposes a way to attach one, and there is no portable
+/// alternative that works across a real child process's pipe and a test's
+/// bare `std::io::pipe()` alike.
+///
+/// So the read is moved onto its own thread, and this function waits on *that*
+/// with [`mpsc::Receiver::recv_timeout`], which does have a deadline. On a
+/// timeout, `on_timeout` is called - for a real plugin,
+/// `daemon::plugin::PluginProcess` kills the child process there, which
+/// closes its stdout and is what actually unblocks the read (with an error or
+/// an EOF); this module deliberately knows nothing about child processes, to
+/// stay usable against the plain pipes its own tests fake a peer with (see
+/// this module's own tests and `watcher::apply`'s).
+///
+/// [`std::thread::scope`] is what makes borrowing `reader` here possible
+/// without demanding `'static` ownership of it, and - just as importantly -
+/// is what keeps this function from ever leaking that thread: `scope` does
+/// not return until every thread spawned inside it has finished, so even
+/// after `on_timeout` has already been called and this function is about to
+/// report failure, the actual `read_message` call below is still running
+/// somewhere, and this function's caller does not get its result back until
+/// that thread has actually ended - which, once `on_timeout` has closed the
+/// pipe, is a matter of the OS delivering EOF or an error, not an open-ended
+/// wait. Net effect: this call returns in `timeout` plus however long that
+/// cleanup takes, never returns while the thread is still running, and never
+/// abandons it running in the background.
+pub fn read_message_with_timeout<T, R>(
+    reader: &mut R,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<Option<T>>
+where
+    T: DeserializeOwned + Send,
+    R: BufRead + Send,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // The receiver may already have given up by the time this sends
+            // (the timeout branch below) - nothing is left to tell, and that
+            // is not this thread's problem to report.
+            let _ = tx.send(read_message::<T, _>(reader));
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => {
+                on_timeout();
+                Err(anyhow::Error::new(RoundTripTimedOut { timeout }))
+            }
+        }
+    })
+}
+
 fn read_content_length<R: BufRead>(reader: &mut R) -> Result<Option<usize>> {
     let mut content_length = None;
     let mut started = false;
@@ -95,6 +197,8 @@ mod tests {
     use super::*;
     use crate::protocol::types::{ControlEnvelope, ControlMessage, RequestId, JSONRPC_VERSION};
     use std::io::{BufReader, Cursor, Read};
+    use std::sync::Mutex;
+    use std::time::Instant;
 
     fn request() -> ControlEnvelope {
         ControlEnvelope {
@@ -252,5 +356,68 @@ mod tests {
 
         let mut reader = BufReader::new(Cursor::new(buf));
         assert!(read_message::<ControlEnvelope, _>(&mut reader).is_err());
+    }
+
+    /// The mechanism this whole module exists to add: a peer that never
+    /// writes anything must not block the caller past `timeout`, and the
+    /// deadline must actually be enforced, not just documented - this is the
+    /// discriminating half of the acceptance test in
+    /// `daemon::lifecycle`/`daemon::plugin`, cut down to the primitive itself
+    /// so it runs in milliseconds instead of spawning a real plugin process.
+    ///
+    /// `on_timeout` here drops the writer end of the pipe - the pipe-level
+    /// equivalent of `PluginProcess` killing the child - which is what lets
+    /// the abandoned reader thread actually finish (EOF) instead of staying
+    /// blocked forever; `join` on the spawning thread (inside
+    /// `read_message_with_timeout`'s own `thread::scope`) proves it did.
+    #[test]
+    fn a_peer_that_never_answers_times_out_instead_of_blocking_forever() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut reader = BufReader::new(reader);
+        let writer = Mutex::new(Some(writer));
+
+        let start = Instant::now();
+        let result = read_message_with_timeout::<ControlEnvelope, _>(
+            &mut reader,
+            Duration::from_millis(50),
+            &mut || {
+                // Dropping the writer closes the pipe, which is what
+                // unblocks the reader thread's blocked `read`.
+                writer.lock().unwrap().take();
+            },
+        );
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("a peer that never answers must be reported as a failure");
+        assert!(is_timeout(&err), "the failure must be recognizable as a timeout: {err:#}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not block far past its 50ms timeout - took {elapsed:?}"
+        );
+    }
+
+    /// The other half of the same claim: a peer that answers before the
+    /// deadline is unaffected by this function existing at all - `on_timeout`
+    /// must never fire on the ordinary path.
+    #[test]
+    fn a_peer_that_answers_in_time_is_unaffected() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let mut reader = BufReader::new(reader);
+        let sent = request();
+        write_message(&mut writer, &sent).unwrap();
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let received: ControlEnvelope =
+            read_message_with_timeout(&mut reader, Duration::from_secs(5), &mut || {
+                fired.store(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sent, received);
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "on_timeout must not fire on a timely answer"
+        );
     }
 }

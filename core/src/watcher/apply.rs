@@ -18,13 +18,14 @@
 //! `jsonrpc.rs`'s own pipe-based tests do.
 
 use std::io::{BufRead, Write};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
-use crate::protocol::jsonrpc::{read_message, write_message};
+use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, RequestId, WireEdge, WireNode,
     JSONRPC_VERSION,
@@ -58,13 +59,26 @@ use crate::storage::write::{apply_diff, DeclarationRecord, Diff, EdgeRecord, Nod
 /// `request_id` is supplied by the caller rather than generated internally
 /// so this function stays pure and easy to test; the id for the second
 /// round trip is derived from it by [`semantic_pass_id`].
-pub fn apply_file_change<R: BufRead, W: Write>(
+///
+/// `file_changed_timeout`/`semantic_pass_timeout` bound each of this
+/// function's two round trips independently - see
+/// `daemon::plugin::RoundTripTimeouts`'s doc comment for why they differ and
+/// how their values are chosen. `on_timeout` is called at most once, from
+/// whichever round trip actually times out (the two never overlap: a timed-
+/// out `FileChanged` returns early via `?` before the semantic pass is ever
+/// sent) - see [`round_trip`] for what it is for and why this function does
+/// not know how to implement it itself.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     conn: &mut Connection,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    semantic_pass_timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let file_path = file_path.into();
     round_trip(
@@ -74,6 +88,8 @@ pub fn apply_file_change<R: BufRead, W: Write>(
         ControlMessage::FileChanged { file_path: file_path.clone() },
         request_id.clone(),
         embedding,
+        file_changed_timeout,
+        on_timeout,
     )?;
 
     if let Err(err) = apply_semantic_pass(
@@ -83,6 +99,8 @@ pub fn apply_file_change<R: BufRead, W: Write>(
         vec![file_path.clone()],
         semantic_pass_id(&request_id),
         embedding,
+        semantic_pass_timeout,
+        on_timeout,
     ) {
         eprintln!(
             "g-mesh: the semantic pass over {file_path} failed after its reparse ({err:#}) - \
@@ -105,15 +123,27 @@ pub fn apply_file_change<R: BufRead, W: Write>(
 /// gave them, so `apply_diff`'s `ON CONFLICT(id) DO UPDATE` upgrades each
 /// one in place - `source` `tree-sitter` -> `ts-compiler`, `resolved`
 /// `false` -> `true` - and touches nothing it was not sent.
-pub fn apply_semantic_pass<R: BufRead, W: Write>(
+#[allow(clippy::too_many_arguments)]
+pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     conn: &mut Connection,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
-    round_trip(reader, writer, conn, ControlMessage::SemanticPass { file_paths }, request_id, embedding)
+    round_trip(
+        reader,
+        writer,
+        conn,
+        ControlMessage::SemanticPass { file_paths },
+        request_id,
+        embedding,
+        timeout,
+        on_timeout,
+    )
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -147,20 +177,41 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
 /// differ only in the message they send. Everything after the response is
 /// identical, which is the whole reason a semantic upgrade needed no
 /// storage or schema work of its own.
-fn round_trip<R: BufRead, W: Write>(
+///
+/// The write above is not timed: this module's whole concern is the read
+/// having no timeout (see this module's own doc comment and
+/// `docs/architecture/multi-language-plugins.md`'s "Semantic engine hangs or
+/// is slow" failure mode), and a write blocking would need the plugin's own
+/// stdin pipe buffer to be full *and* the plugin to have stopped reading it -
+/// a materially different, and much rarer, failure than a plugin that reads a
+/// request and simply never answers it.
+///
+/// `timeout` bounds only the read; `on_timeout` is this function's entire
+/// interface to whatever makes that read actually give up - see
+/// `protocol::jsonrpc::read_message_with_timeout`'s doc comment for the
+/// mechanism and why it lives there instead of here. This module stays
+/// transport-agnostic on purpose (see its own doc comment): it has no idea
+/// whether `reader`/`writer` are a spawned plugin's pipes or a test's bare
+/// `std::io::pipe()`, so it cannot itself know what "make the peer stop being
+/// silent" means - only the caller that owns the transport does (for a real
+/// plugin, `daemon::plugin::PluginProcess` kills the child).
+#[allow(clippy::too_many_arguments)]
+fn round_trip<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     conn: &mut Connection,
     message: ControlMessage,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let method = method_name(&message);
     let request =
         ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: Some(request_id.clone()), message };
     write_message(writer, &request).with_context(|| format!("failed to write {method} request to plugin"))?;
 
-    let response: FileChangeResponse = read_message(reader)
+    let response: FileChangeResponse = read_message_with_timeout(reader, timeout, on_timeout)
         .with_context(|| format!("failed to read plugin's {method} response"))?
         .with_context(|| format!("plugin closed its output before responding to {method}"))?;
 
@@ -301,9 +352,26 @@ fn edge_source_wire_value(source: &crate::protocol::types::EdgeSource) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::jsonrpc::read_message;
     use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range, WireEdge, WireNode};
     use crate::storage::schema;
     use std::io::BufReader;
+
+    /// A timeout no test below is meant to hit - every stub plugin in this
+    /// module answers immediately, so this only has to be longer than a
+    /// slow CI box's scheduling noise. The dedicated timeout tests near the
+    /// bottom of this module use their own short, explicit durations.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// `on_timeout` for every call below that is not itself testing the
+    /// timeout mechanism - asserting it is never invoked would be redundant
+    /// with `TEST_TIMEOUT` never elapsing, but a stub plugin that hung would
+    /// otherwise turn into a 5-second wait per test instead of a fast panic.
+    fn on_timeout_must_not_fire() {
+        panic!(
+            "on_timeout fired in a test whose stub plugin always answers - the stub or the timeout is broken"
+        );
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -518,6 +586,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -576,6 +647,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -615,6 +689,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         );
         plugin.join().unwrap();
 
@@ -652,6 +729,9 @@ mod tests {
             "src/unchanged.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -731,6 +811,8 @@ mod tests {
             vec!["src/lib.rs".to_string()],
             RequestId::Number(9),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -789,6 +871,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -836,6 +921,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         );
         plugin.join().unwrap();
 
@@ -861,6 +949,8 @@ mod tests {
             Vec::new(),
             RequestId::Number(1),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();

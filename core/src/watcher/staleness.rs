@@ -60,7 +60,7 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -109,7 +109,14 @@ impl StalenessOutcome {
 /// used elsewhere for `filePath` columns and `FileChanged` requests;
 /// `project_root` + `file_path` are joined with `Path::join` to locate the
 /// real file on disk.
-pub fn ensure_fresh<R: BufRead, W: Write>(
+///
+/// `file_changed_timeout`/`semantic_pass_timeout`/`on_timeout` are forwarded
+/// to `apply_file_change` unchanged - this synchronous reindex is a reparse
+/// settling exactly like any other (see that function's own doc comment on
+/// why the semantic pass rides along), so it is bound by the very same
+/// per-method budgets, not a query-time timeout of its own.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     conn: &mut Connection,
@@ -117,6 +124,9 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
     file_path: &str,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    semantic_pass_timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
 ) -> Result<StalenessOutcome> {
     match decide(conn, project_root, file_path)? {
         Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
@@ -130,8 +140,18 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
         Decision::NeedsReindex { mtime, hash, had_prior_record } => {
             // Genuinely stale (or never indexed) - synchronously reindex
             // before recording the new baseline.
-            apply_file_change(reader, writer, conn, file_path, request_id, embedding)
-                .context("failed to synchronously reindex stale file")?;
+            apply_file_change(
+                reader,
+                writer,
+                conn,
+                file_path,
+                request_id,
+                embedding,
+                file_changed_timeout,
+                semantic_pass_timeout,
+                on_timeout,
+            )
+            .context("failed to synchronously reindex stale file")?;
             upsert_indexed_file(conn, file_path, mtime, &hash)?;
             Ok(if had_prior_record {
                 StalenessOutcome::ReindexedViaHashMismatch
@@ -275,6 +295,17 @@ mod tests {
     use std::io::BufReader;
     use std::sync::mpsc;
 
+    /// See `watcher::apply`'s own test module for why this exists and what it
+    /// is deliberately not testing - every stub plugin below answers
+    /// immediately, so nothing here should ever wait this long.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn on_timeout_must_not_fire() {
+        panic!(
+            "on_timeout fired in a test whose stub plugin always answers - the stub or the timeout is broken"
+        );
+    }
+
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -398,6 +429,9 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -444,6 +478,9 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -482,6 +519,9 @@ mod tests {
             "lib.rs",
             request_id2,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin2.join().unwrap();
@@ -524,6 +564,9 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -558,6 +601,9 @@ mod tests {
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
 
@@ -605,6 +651,9 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -643,6 +692,9 @@ mod tests {
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
 
