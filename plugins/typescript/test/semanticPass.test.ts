@@ -99,7 +99,8 @@ export function run(): number {
     assert.equal(placeholder.filePath, "src/app.ts");
 
     assert.equal(edge.kind, "CALLS");
-    assert.equal(edge.source, "ts-compiler", "the checker answered this, not a name match");
+    assert.equal(edge.source, "semantic", "the checker answered this, not a name match");
+    assert.equal(edge.engine, "ts-compiler");
     // Pointing at a placeholder is what unresolved means, whichever pass built
     // it: core repoints it and marks it resolved (`graph::symbol_links`).
     assert.equal(edge.resolved, false);
@@ -134,7 +135,8 @@ export function run(): number {
 
     const { edge } = edgeOnto(result, pendingSymbolQualifiedName("src/impl.ts", "realName"));
     assert.equal(edge.kind, "CALLS");
-    assert.equal(edge.source, "ts-compiler");
+    assert.equal(edge.source, "semantic");
+    assert.equal(edge.engine, "ts-compiler");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -155,7 +157,8 @@ export const answer = ns.setting;
 
     const { edge } = edgeOnto(result, pendingSymbolQualifiedName("src/mod.ts", "setting"));
     assert.equal(edge.kind, "REFERENCES");
-    assert.equal(edge.source, "ts-compiler");
+    assert.equal(edge.source, "semantic");
+    assert.equal(edge.engine, "ts-compiler");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -185,7 +188,7 @@ function ambiguousBarrel(order: readonly string[]): Record<string, string> {
 async function declarationId(root: string, file: string, name: string): Promise<string> {
   const source = await fs.readFile(path.join(root, file), "utf8");
   const result = extractFile(file, source, { resolveSpecifier: createProjectResolver(root) });
-  const node = result.nodes.find((candidate) => candidate.exported && candidate.name === name);
+  const node = result.nodes.find((candidate) => candidate.visibility === "public" && candidate.name === name);
   assert.ok(node, `${file} must export a ${name}`);
   return node.id;
 }
@@ -200,7 +203,8 @@ function structuralCallEdge(root: string): ExtractedEdge {
   const call = result.edges.find((edge) => edge.kind === "CALLS");
   assert.ok(call, "the structural pass must produce a CALLS edge for caller.ts");
   assert.equal(call.resolved, false, "and must leave it unresolved - it cannot see index.ts");
-  assert.equal(call.source, "tree-sitter");
+  assert.equal(call.source, "syntactic");
+  assert.equal(call.engine, "tree-sitter");
   return call;
 }
 
@@ -220,7 +224,8 @@ test("two `export *` branches offering one name resolve to the branch TypeScript
     assert.equal(edge.id, structural.id);
     assert.equal(edge.fromId, structural.fromId);
     assert.equal(edge.kind, "CALLS");
-    assert.equal(edge.source, "ts-compiler");
+    assert.equal(edge.source, "semantic");
+    assert.equal(edge.engine, "ts-compiler");
     assert.equal(edge.resolved, true);
     // `export * from "./a"` comes first, so `a.ts`'s declaration is the one a
     // consumer actually sees (`tsc` calls the second branch a TS2308
@@ -309,7 +314,8 @@ test("a default export imported under another name is upgraded onto the class it
     assert.equal(diff.upsertEdges.length, 2, "one usage in each importing file");
     for (const edge of diff.upsertEdges) {
       assert.equal(edge.kind, "REFERENCES");
-      assert.equal(edge.source, "ts-compiler");
+      assert.equal(edge.source, "semantic");
+      assert.equal(edge.engine, "ts-compiler");
       assert.equal(edge.resolved, true);
       assert.equal(
         edge.toId,
@@ -347,7 +353,8 @@ test("an indirect default, re-exported through a barrel, is followed to the decl
     const diff = await runSemanticPass(root, ["src/caller.ts"], { project });
 
     assert.equal(diff.upsertEdges.length, 1);
-    assert.equal(diff.upsertEdges[0].source, "ts-compiler");
+    assert.equal(diff.upsertEdges[0].source, "semantic");
+    assert.equal(diff.upsertEdges[0].engine, "ts-compiler");
     assert.equal(diff.upsertEdges[0].resolved, true);
     assert.equal(diff.upsertEdges[0].toId, await declarationId(root, "src/widget.ts", "Widget"));
   } finally {
@@ -418,7 +425,8 @@ export function run(): string {
     const upgraded = diff.upsertEdges.filter((edge) => edge.resolved);
     assert.equal(upgraded.length, 1);
     assert.equal(upgraded[0].toId, await declarationId(root, "a.ts", "mutate"));
-    assert.equal(upgraded[0].source, "ts-compiler");
+    assert.equal(upgraded[0].source, "semantic");
+    assert.equal(upgraded[0].engine, "ts-compiler");
 
     // Question 1: `ns.mutate()`, an edge nothing emitted before, addressed at
     // `b.ts` and left for core's placeholder walk to link.
@@ -426,7 +434,8 @@ export function run(): string {
     assert.equal(placeholder.nativeKind, PENDING_SYMBOL_NATIVE_KIND);
     assert.equal(placeholder.filePath, "caller.ts");
     assert.equal(edge.resolved, false);
-    assert.equal(edge.source, "ts-compiler");
+    assert.equal(edge.source, "semantic");
+    assert.equal(edge.engine, "ts-compiler");
     // Only the invented edge is this pass's to retract later.
     assert.deepEqual(diff.deleteEdgeIds, []);
   } finally {
@@ -584,7 +593,8 @@ function bindingsOnto(result: SemanticPassResult, targetId: string): Map<number,
   const bound = new Map<number, ExtractedEdge>();
   for (const edge of result.upsertEdges) {
     if (edge.kind !== "CALLS" || edge.toId !== targetId) continue;
-    assert.equal(edge.source, "ts-compiler", "a bound edge is the checker's answer");
+    assert.equal(edge.source, "semantic", "a bound edge is the checker's answer");
+    assert.equal(edge.engine, "ts-compiler");
     assert.equal(edge.resolved, true, "and needs nothing further from core");
     assert.ok(edge.toDeclaration !== undefined, "and names a declaration");
     assert.equal(bound.has(edge.toDeclaration), false, "one edge per ordinal, never two");
@@ -604,7 +614,8 @@ async function structuralCalls(root: string, file: string): Promise<Map<string, 
     if (edge.kind !== "CALLS") continue;
     const from = byId.get(edge.fromId);
     assert.ok(from, "a CALLS edge must come from a node of this file");
-    assert.equal(edge.source, "tree-sitter");
+    assert.equal(edge.source, "syntactic");
+    assert.equal(edge.engine, "tree-sitter");
     assert.equal(
       edge.toDeclaration,
       undefined,
@@ -864,7 +875,8 @@ export function viaNamespace(): number {
 
     const edges = result.upsertEdges.filter((edge) => edge.toId === placeholders[0].id);
     assert.equal(edges.length, 1, "only the namespace use is this pass's to write");
-    assert.equal(edges[0].source, "ts-compiler");
+    assert.equal(edges[0].source, "semantic");
+    assert.equal(edges[0].engine, "ts-compiler");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
