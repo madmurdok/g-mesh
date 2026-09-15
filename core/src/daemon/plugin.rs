@@ -68,6 +68,13 @@ pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
 /// the hint and exited.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a relaunch gives the process it replaced to exit on its closed
+/// stdin before killing it. Only a live process ever waits this out - one
+/// that crashed, or that a timeout already killed, is gone or going - and
+/// nothing is blocked meanwhile, since the replacement is serving before the
+/// wait starts.
+const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
+
 /// Per-method budgets for one control-plane round trip - see
 /// `docs/architecture/multi-language-plugins.md`'s "Semantic engine hangs or
 /// is slow" failure mode, and `watcher::apply::round_trip`/
@@ -661,6 +668,40 @@ impl PluginState {
 
         Ok(Self { child, io: PluginIo { reader, writer: stdin } })
     }
+
+    /// Ends this process and reaps it: closes its pipes (the plugin's own cue
+    /// to exit), waits up to `grace` for it to go, then kills it. Shared by
+    /// [`PluginProcess::shutdown`] and [`PluginProcess::relaunch`] - both have
+    /// to leave neither a running tsserver nor a zombie behind. On a process
+    /// that has already exited it returns straight away.
+    ///
+    /// The relaunch half is new with GM-294. A relaunch used to replace a
+    /// process that was always already dead (a crash, or a timeout's own
+    /// kill), and simply dropped its `Child` - which never waits, so even
+    /// that left a zombie until the daemon exited. Since a failed apply now
+    /// relaunches a *live* plugin on purpose (see
+    /// [`PluginProcess::apply_file_change`]), dropping would leave a whole
+    /// running plugin and its tsserver behind.
+    fn end(self, grace: Duration) -> Result<()> {
+        // Destructured rather than dropped field by field: dropping `io`
+        // closes both pipes, and closing the write half of the plugin's stdin
+        // is precisely the "please exit" signal.
+        let PluginState { mut child, io } = self;
+        drop(io);
+
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait().context("failed to check whether the plugin had exited")? {
+                Some(_) => return Ok(()),
+                None if Instant::now() >= deadline => break,
+                None => std::thread::sleep(EXIT_POLL_INTERVAL),
+            }
+        }
+
+        child.kill().context("failed to signal a plugin that ignored its closed stdin")?;
+        child.wait().context("failed to reap the plugin process")?;
+        Ok(())
+    }
 }
 
 /// A live handle on the spawned JS/TS plugin process. `Mutex`-wrapped so it
@@ -746,28 +787,12 @@ impl PluginProcess {
     /// core exits, and `is_process_alive` (which `cli::status` and the tests
     /// ask) cannot tell a zombie from a running process.
     pub fn shutdown(self, grace: Duration) -> Result<()> {
-        // Destructured rather than dropped field by field: dropping `io`
-        // closes both pipes, and closing the write half of the plugin's stdin
-        // is precisely the "please exit" signal. `state`'s Mutex is unwrapped
-        // via `into_inner` - `self` is owned here, so there is no contention
-        // left to guard against, only the poisoning case `.unwrap()` already
-        // treats as fatal everywhere else in this module.
+        // `state`'s Mutex is unwrapped via `into_inner` - `self` is owned
+        // here, so there is no contention left to guard against, only the
+        // poisoning case `.unwrap()` already treats as fatal everywhere else
+        // in this module. See `PluginState::end` for the ending itself.
         let Self { state, .. } = self;
-        let PluginState { mut child, io } = state.into_inner().unwrap();
-        drop(io);
-
-        let deadline = Instant::now() + grace;
-        loop {
-            match child.try_wait().context("failed to check whether the plugin had exited")? {
-                Some(_) => return Ok(()),
-                None if Instant::now() >= deadline => break,
-                None => std::thread::sleep(EXIT_POLL_INTERVAL),
-            }
-        }
-
-        child.kill().context("failed to signal a plugin that ignored its closed stdin")?;
-        child.wait().context("failed to reap the plugin process")?;
-        Ok(())
+        state.into_inner().unwrap().end(grace)
     }
 
     /// Sends a `FileChanged` request for `file_path` to the plugin and
@@ -803,6 +828,43 @@ impl PluginProcess {
     /// that error is a timeout and requeues the file onto its own dirty
     /// queue, to be replayed by whatever next touches this language, exactly
     /// like a file that arrived while the plugin was asleep.
+    ///
+    /// Any other failure - the plugin is alive and answered, but its diff
+    /// could not be committed (a storage error, a link pass that failed, an
+    /// answer that does not parse) - is neither a crash nor a timeout, and is
+    /// returned as it is, with the file dropped from the pending queue. It is
+    /// *not* replayed: the plugin updates its cached copy of a file when it
+    /// answers, not when core commits, so asking the same live process again
+    /// gets an empty diff back and the failure turns into an `Ok(())` that
+    /// nothing ever logs. That is exactly how a foreign-key refusal on every
+    /// second edit went unseen (GM-292) - this method replayed after *any*
+    /// send error, and `process_has_exited` merely decided whether to
+    /// relaunch first. The caller reports what this returns - see
+    /// `daemon::lifecycle::PluginSupervisor::file_changed`'s non-timeout
+    /// branch.
+    ///
+    /// Returning the error is not enough on its own, because that cache is
+    /// still ahead of the index: the file's *next* reparse - a later watcher
+    /// event, or `ensure_fresh` on the next query - would get the same empty
+    /// diff, and `ensure_fresh` would then record the new content hash over a
+    /// graph that never took the edit. So a non-crash failure also relaunches
+    /// the plugin deliberately (GM-293 on 2.12.1, GM-294 here). A fresh
+    /// process has no cache, so its first reparse of the file is a full
+    /// extraction, and the index converges as soon as whatever refused the
+    /// write stops doing so. The price is a warm tsserver thrown away, which
+    /// is acceptable only because this path should now be rare: the one
+    /// failure known to hit it routinely, enforced foreign keys, is gone
+    /// (`storage::connection::open`). If it ever becomes common, that is a
+    /// bug to fix at its cause, not a relaunch to make cheaper. The relaunch
+    /// is best-effort - a spawn failure is logged, and the apply error is
+    /// still what the caller gets.
+    ///
+    /// "The plugin is alive" means both that the current process has not
+    /// exited *and* that it is the process this request was sent to. If
+    /// another caller relaunched in between, the process this request died
+    /// on is gone and the current one never saw the file - that is the crash
+    /// path's replay, not this one.
+    ///
     /// `semantic_suspended` (task GM-274) is ANDed with this plugin's own
     /// `manifest.capabilities.semantic_pass` at every round trip this makes
     /// (directly, and via [`Self::replay_pending`] on the crash-recovery
@@ -825,21 +887,17 @@ impl PluginProcess {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
 
-        if let Err(first_err) = self.send_one(conn, &file_path, embedding, semantic_suspended) {
-            // The plugin's pipes only fail like this when the process behind
-            // them is gone. Confirm that before replacing a merely-slow
-            // process's live handle out from under it - `process_has_exited`
-            // is a non-blocking (if briefly polled) check for exactly that.
-            // Another thread may already have won the relaunch race by the
-            // time we check, which is fine: `replay_pending` always sends
-            // against whatever is current, so it recovers either way. A
-            // timeout has already forced this to be true (`on_timeout` killed
-            // the process before this line runs), but the check is still
-            // correct and still cheap to make unconditionally.
-            if self.process_has_exited() {
-                self.relaunch(&first_err)
-                    .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
-            }
+        let (sent_to, sent) = self.send_one(conn, &file_path, embedding, semantic_suspended);
+        if let Err(first_err) = sent {
+            // A crash shows up here as a failed write or read on the plugin's
+            // pipes. Confirm the process is really gone before replacing a
+            // merely-slow process's live handle out from under it -
+            // `process_has_exited` is a non-blocking (if briefly polled)
+            // check for exactly that. A timeout has already forced this to be
+            // true (`on_timeout` killed the process before this line runs),
+            // but the check is still correct and still cheap to make
+            // unconditionally.
+            let exited = self.process_has_exited();
 
             if is_timeout(&first_err) {
                 // See this function's own doc comment: a timeout is not safe
@@ -848,7 +906,49 @@ impl PluginProcess {
                 // ordinary call retries it - which is exactly what happens,
                 // since a fresh `apply_file_change` for the same path just
                 // re-enqueues (a no-op, already there) and sends it again.
+                // Unchanged by GM-294: checked before the non-crash branch
+                // below so a timeout can never be mistaken for one.
+                if exited {
+                    self.relaunch(&format!("the process exited unexpectedly ({first_err:#})"))
+                        .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
+                }
                 return Err(first_err);
+            }
+
+            // Another thread may already have won the relaunch race by the
+            // time we check - then the current process is alive, but it is
+            // not the one this request died on, and replaying against it is
+            // still the recovery (`replay_pending` always sends against
+            // whatever is current).
+            let relaunched_elsewhere = self.pid() != sent_to;
+            if !exited && !relaunched_elsewhere {
+                // Not a crash, so nothing a replay can fix - see this
+                // method's doc. Dropped from the queue rather than left in
+                // it: a later crash's replay would otherwise stop at this
+                // entry first and fail every recovery behind it.
+                self.remove_pending(&file_path);
+                let err = first_err.context(format!("failed to apply the plugin's diff for {file_path}"));
+                // Relaunched to discard a cache that is now ahead of the
+                // index, not replayed - the error below is still what the
+                // caller gets, whether or not the relaunch works.
+                if let Err(relaunch_err) = self.relaunch(&format!(
+                    "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
+                     that file is ahead of the index - a fresh process re-extracts it in full"
+                )) {
+                    eprintln!(
+                        "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
+                         ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
+                        self.manifest.language
+                    );
+                }
+                return Err(err);
+            }
+
+            if exited {
+                self.relaunch(&format!(
+                    "the process exited unexpectedly ({first_err:#}) - replaying pending file changes"
+                ))
+                .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
             }
 
             return self.replay_pending(conn, embedding, semantic_suspended).with_context(|| {
@@ -899,7 +999,7 @@ impl PluginProcess {
         loop {
             let next = { self.pending.lock().unwrap().first().cloned() };
             let Some(file_path) = next else { return Ok(()) };
-            self.send_one(conn, &file_path, embedding, semantic_suspended)?;
+            self.send_one(conn, &file_path, embedding, semantic_suspended).1?;
             self.remove_pending(&file_path);
         }
     }
@@ -932,6 +1032,24 @@ impl PluginProcess {
     /// query itself is not retried, matching [`Self::apply_file_change`]'s
     /// own reasoning for why a timed-out request must not be resent blind.
     ///
+    /// The other exception is a reindex that a *live* plugin answered and the
+    /// index refused (GM-293, ported by GM-294), for the same reason
+    /// [`Self::apply_file_change`] relaunches on it - and here it matters
+    /// more. The plugin has already cached the refused text, so the next
+    /// query's retry would get an empty diff back, succeed, and record the
+    /// new content hash as this file's baseline over a graph that never took
+    /// the edit: stale data marked fresh, surviving a restart. The baseline
+    /// is not written for the failed attempt (`watcher::staleness::
+    /// ensure_fresh` records it only after a successful reindex); the
+    /// relaunch is what makes the retry a full extraction instead of that
+    /// empty diff. The error is still returned, for the MCP layer to log.
+    /// Only a [`staleness::ReindexFailed`] that is not a timeout, from the
+    /// very process that was asked and is still running, qualifies - a file
+    /// that could not be read, or a baseline that could not be written,
+    /// leaves the plugin's cache no further ahead than the index; a timeout
+    /// already took the relaunch above; and a crashed plugin keeps the
+    /// no-relaunch behaviour this doc starts with.
+    ///
     /// `semantic_suspended` gates the semantic half exactly like
     /// [`Self::apply_file_change`]'s own parameter of the same name - see
     /// that method's doc comment.
@@ -950,12 +1068,13 @@ impl PluginProcess {
         }
 
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let result = {
+        let (result, asked) = {
             let mut state = self.state.lock().unwrap();
+            let asked = state.child.id();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
             let mut conn = conn.lock().unwrap();
             let mut on_timeout = self.kill_on_timeout(child);
-            staleness::ensure_fresh(
+            let result = staleness::ensure_fresh(
                 reader,
                 writer,
                 &mut conn,
@@ -967,9 +1086,28 @@ impl PluginProcess {
                 self.timeouts.semantic_pass_file,
                 self.manifest.capabilities.semantic_pass && !semantic_suspended,
                 &mut on_timeout,
-            )
+            );
+            (result, asked)
         };
         self.relaunch_after_timeout_if_needed(&result);
+
+        let Err(err) = &result else { return result };
+        let refused_by_the_index = err.downcast_ref::<staleness::ReindexFailed>().is_some()
+            && !is_timeout(err)
+            && self.pid() == asked
+            && !self.process_has_exited();
+        if refused_by_the_index {
+            if let Err(relaunch_err) = self.relaunch(&format!(
+                "its query-time reindex of {file_path} could not be applied ({err:#}), so its cached \
+                 copy of that file is ahead of the index - a fresh process re-extracts it in full"
+            )) {
+                eprintln!(
+                    "g-mesh daemon: could not relaunch the {} plugin after a failed query-time \
+                     reindex ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
+                    self.manifest.language
+                );
+            }
+        }
         result
     }
 
@@ -1096,7 +1234,7 @@ impl PluginProcess {
         if !is_timeout(err) {
             return;
         }
-        if let Err(relaunch_err) = self.relaunch(err) {
+        if let Err(relaunch_err) = self.relaunch(&format!("the process exited unexpectedly ({err:#})")) {
             eprintln!(
                 "g-mesh daemon: failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
                 self.manifest.language
@@ -1104,13 +1242,23 @@ impl PluginProcess {
         }
     }
 
+    /// One `fileChanged` round trip against whichever process is current,
+    /// returning that process's pid alongside the result. The pid is read
+    /// under the same `state` lock the round trip holds, so it names the
+    /// process that actually got the request - which is what
+    /// [`Self::apply_file_change`] compares against to tell "this plugin
+    /// refused, and is still here" from "another caller relaunched it in
+    /// between". Read before taking the lock instead, a relaunch landing in
+    /// that gap would make a live plugin's storage refusal look like a crash
+    /// someone else had already recovered from, and replay it into exactly
+    /// the empty diff GM-292 hid behind.
     fn send_one(
         &self,
         conn: &Mutex<Connection>,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
-    ) -> Result<()> {
+    ) -> (u32, Result<()>) {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
         // response answering the wrong request, not a globally unique one.
@@ -1118,6 +1266,7 @@ impl PluginProcess {
         // any of these ids either, so there is nothing to collide with.
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let mut state = self.state.lock().unwrap();
+        let sent_to = state.child.id();
         // Split into disjoint field borrows up front - borrowing `child` and
         // the reader/writer as three separate `&mut` borrows doesn't
         // typecheck through the `MutexGuard`'s `DerefMut` otherwise, and
@@ -1125,7 +1274,7 @@ impl PluginProcess {
         let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
         let mut conn = conn.lock().unwrap();
         let mut on_timeout = self.kill_on_timeout(child);
-        apply_file_change_diff(
+        let result = apply_file_change_diff(
             reader,
             writer,
             &mut conn,
@@ -1136,7 +1285,8 @@ impl PluginProcess {
             self.timeouts.semantic_pass_file,
             self.manifest.capabilities.semantic_pass && !semantic_suspended,
             &mut on_timeout,
-        )
+        );
+        (sent_to, result)
     }
 
     /// The `on_timeout` this process gives every round trip: kill the child
@@ -1187,11 +1337,16 @@ impl PluginProcess {
         }
     }
 
-    /// Replaces the dead process with a freshly spawned one, handshake and
-    /// all. `cause` is logged, not propagated - a relaunch that itself fails
-    /// to spawn is the caller's problem (via the `Result` this returns), but
-    /// one that succeeds should read as "recovered from X", not silently
-    /// swallow what X was.
+    /// Replaces the current process - a crashed one, one a timeout killed, or
+    /// a live one whose cache has to be discarded - with a freshly spawned
+    /// one, handshake and all. `why` is logged, not propagated - a relaunch
+    /// that itself fails to spawn is the caller's problem (via the `Result`
+    /// this returns), but one that succeeds should read as "recovered from
+    /// X", not silently swallow what X was.
+    ///
+    /// `why` is the whole reason, worded by the caller: a crash and a
+    /// deliberate relaunch over a failed apply (GM-294) are different events
+    /// and must not read the same in the log.
     ///
     /// `self.pid_file` - this process's own, not a hardcoded shared path - is
     /// rewritten too - left alone, it would keep naming a process that no
@@ -1200,15 +1355,25 @@ impl PluginProcess {
     /// harmless while there was only ever one plugin but would have let two
     /// languages' relaunches overwrite each other's pid file once there was
     /// more than one.
-    fn relaunch(&self, cause: &anyhow::Error) -> Result<()> {
-        eprintln!(
-            "g-mesh daemon: {} plugin process exited unexpectedly ({cause:#}) - relaunching",
-            self.manifest.language
-        );
+    ///
+    /// The process being replaced is ended and reaped after the swap
+    /// ([`PluginState::end`]) - near-instant for one that already crashed or
+    /// was killed, and what keeps a relaunched *live* plugin from leaving its
+    /// tsserver running or its pid a zombie.
+    fn relaunch(&self, why: &str) -> Result<()> {
+        eprintln!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
-        *self.state.lock().unwrap() = fresh;
+        let replaced = std::mem::replace(&mut *self.state.lock().unwrap(), fresh);
         super::write_pid_file(&self.pid_file, pid);
+        // Outside the state lock: the fresh process is already serving, and
+        // waiting out the old one's grace period must not hold up a request.
+        if let Err(err) = replaced.end(RELAUNCH_GRACE) {
+            eprintln!(
+                "g-mesh daemon: the replaced {} plugin process did not shut down cleanly: {err:#}",
+                self.manifest.language
+            );
+        }
         Ok(())
     }
 }
@@ -1514,5 +1679,165 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("python"), "{message}");
         assert!(message.contains("typescript"), "{message}");
+    }
+
+    const GREET: &str = "export function greet(): string {\n  return \"hi\";\n}\n";
+    /// [`GREET`] with one more line in its body: `greet`'s range changes, so
+    /// a warm TS plugin reports it as a delete plus an upsert of the same id,
+    /// without re-sending the file's unchanged `DEFINES` edge into it.
+    const GREET_GROWN: &str = "export function greet(): string {\n  const a = 1;\n  return \"hi\";\n}\n";
+
+    /// An in-memory index that *enforces* foreign keys - the state the
+    /// daemon's connection was silently in before GM-293/GM-294, and the
+    /// most direct way to make a live plugin's perfectly ordinary diff be
+    /// refused by storage.
+    fn index_enforcing_foreign_keys() -> Mutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::storage::schema::apply(&conn).unwrap();
+        Mutex::new(conn)
+    }
+
+    fn greet_end_line(conn: &Mutex<Connection>) -> i64 {
+        conn.lock()
+            .unwrap()
+            .query_row("SELECT endLine FROM nodes WHERE filePath = 'lib.ts' AND name = 'greet'", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// GM-293, ported by GM-294. A diff the *storage* refuses, from a plugin
+    /// that is alive and well, is neither a crash nor a timeout - and
+    /// treating it as a crash was what hid GM-292 for as long as it lasted:
+    /// the "replay" asked that same live plugin again, its cache already held
+    /// the new text, so it answered with an empty diff and the failure came
+    /// back as `Ok(())`.
+    ///
+    /// The refusal is produced the way production produced it: an index that
+    /// enforces foreign keys, then an edit through a warm plugin cache that
+    /// deletes and re-adds a symbol whose unchanged `DEFINES` edge is not
+    /// re-sent. The second half is what the deliberate relaunch is for: once
+    /// the index accepts writes again, the very next reparse of that file -
+    /// with no further edit on disk - must carry the edit in, rather than the
+    /// empty diff a plugin still caching the refused text would answer with.
+    ///
+    /// `semantic_suspended = true` throughout: the refusal is in the
+    /// structural diff, and starting tsserver for a semantic pass would only
+    /// make this slower.
+    #[test]
+    fn a_storage_failure_behind_a_live_plugin_is_returned_and_the_relaunch_lets_the_next_apply_land() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.ts");
+        fs::write(&file, GREET).unwrap();
+        let conn = index_enforcing_foreign_keys();
+
+        let plugin =
+            PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
+                .expect("failed to spawn the JS/TS plugin");
+        let embedding = EmbeddingPipeline::disabled();
+        plugin
+            .apply_file_change(&conn, "lib.ts", &embedding, true)
+            .expect("a cold cache sends only upserts, which nothing can refuse");
+        let pid = plugin.pid();
+
+        fs::write(&file, GREET_GROWN).unwrap();
+        let err = match plugin.apply_file_change(&conn, "lib.ts", &embedding, true) {
+            Ok(()) => panic!("a diff the index refused must not be reported as applied"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {message}");
+        assert!(!is_timeout(&err), "and must not be mistaken for a timeout the supervisor would requeue");
+        assert!(plugin.pending.lock().unwrap().is_empty(), "nothing is left queued for a later replay");
+        assert_eq!(greet_end_line(&conn), 2, "nothing of the refused diff was committed");
+
+        // Whatever refused the write stops refusing it.
+        conn.lock().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
+        plugin
+            .apply_file_change(&conn, "lib.ts", &embedding, true)
+            .expect("the same file's next reparse must apply once the index accepts writes");
+
+        assert_eq!(
+            greet_end_line(&conn),
+            3,
+            "the refused edit must reach the index on the next reparse - a plugin still caching it \
+             would answer with an empty diff and leave `greet` ending on line 2"
+        );
+        assert_ne!(plugin.pid(), pid, "the plugin holding the refused text must have been relaunched");
+        assert!(
+            !crate::daemon::is_process_alive(pid),
+            "the replaced plugin must be ended and reaped, not left running or as a zombie"
+        );
+    }
+
+    /// The query-time twin of the test above, where getting it wrong is
+    /// worse: a retry that gets an empty diff also *records the baseline*,
+    /// marking the stale graph fresh. So besides the edit reaching the index
+    /// once writes are accepted again, the baseline must name what is on
+    /// disk - and must not have moved for the refused attempt.
+    #[test]
+    fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_edit() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.ts");
+        fs::write(&file, GREET).unwrap();
+        let conn = index_enforcing_foreign_keys();
+        let baseline = |conn: &Mutex<Connection>| -> (i64, String) {
+            conn.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = 'lib.ts'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let on_disk = |path: &Path| -> (i64, String) {
+            let mtime = staleness::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
+            let hash = Sha256::digest(fs::read(path).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
+            (mtime, hash)
+        };
+
+        let plugin =
+            PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
+                .expect("failed to spawn the JS/TS plugin");
+        let embedding = EmbeddingPipeline::disabled();
+        assert_eq!(
+            plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap(),
+            StalenessOutcome::ReindexedNoPriorRecord,
+            "a never-indexed file is a cold-cache reparse, which nothing can refuse"
+        );
+        let before = baseline(&conn);
+        let pid = plugin.pid();
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&file, GREET_GROWN).unwrap();
+        let err = match plugin.ensure_fresh(&conn, "lib.ts", &embedding, true) {
+            Ok(outcome) => panic!("a reindex the index refused must not be reported as {outcome:?}"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {err}");
+        assert_eq!(baseline(&conn), before, "a refused reindex must not advance the baseline");
+
+        // Whatever refused the write stops refusing it.
+        conn.lock().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap(),
+            StalenessOutcome::ReindexedViaHashMismatch,
+            "the file is still stale, so the next query must reindex it"
+        );
+
+        assert_eq!(
+            greet_end_line(&conn),
+            3,
+            "the refused edit must reach the index on the retry - a plugin still caching it would \
+             answer with an empty diff, leave `greet` ending on line 2, and have the baseline recorded anyway"
+        );
+        assert_eq!(baseline(&conn), on_disk(&file), "the baseline must now describe the file on disk");
+        assert_ne!(plugin.pid(), pid, "the plugin holding the refused text must have been relaunched");
+        assert!(
+            !crate::daemon::is_process_alive(pid),
+            "the replaced plugin must be ended and reaped, not left running or as a zombie"
+        );
     }
 }

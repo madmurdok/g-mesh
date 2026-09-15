@@ -44,7 +44,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Every check id the kit reports, in report order - asserted in full on
 /// every run, so a check silently dropping out of the report fails a test
 /// rather than passing every "only X fails" assertion vacuously.
-const ALL_CHECKS: [&str; 14] = [
+const ALL_CHECKS: [&str; 15] = [
     "session",
     "shape",
     "stream-order",
@@ -53,6 +53,7 @@ const ALL_CHECKS: [&str; 14] = [
     "id-stability.whitespace-edit",
     "id-stability.deletes-known",
     "id-stability.incremental-matches-bulk",
+    "id-stability.declaration-edit-applies",
     "ownership.defines-exports-from-file",
     "ownership.language",
     "ownership.no-container",
@@ -232,13 +233,21 @@ function fileChanged(filePath) {
     ["nodes", diff.upsertNodes, diff.deleteNodeIds],
     ["edges", diff.upsertEdges, diff.deleteEdgeIds],
   ]) {
-    // Gone ids are deleted; new or changed ones are upserted in place (by id),
-    // never deleted and re-upserted - a delete of a node whose unchanged edges
-    // survive the diff is refused by the index's foreign keys.
+    // Gone ids are deleted; new or changed ones are upserted in place (by id).
+    // (The TS plugin deletes and re-upserts a changed node instead; both are
+    // conformant. This comment used to say the delete was refused by the
+    // index's foreign keys - it was, because the kit's index enforced them by
+    // accident, GM-292. It no longer does.)
     const before = new Map(previous[key].map((item) => [item.id, JSON.stringify(item)]));
     const after = new Map(next[key].map((item) => [item.id, JSON.stringify(item)]));
     for (const item of previous[key]) if (!after.has(item.id)) remove.push(item.id);
-    for (const item of next[key]) if (before.get(item.id) !== after.get(item.id)) upsert.push(item);
+    // The `stale-ranges` defect only sends ids it has never sent before, so a
+    // declaration that is still there but has moved or grown is never
+    // re-sent - every id check still passes, and the index keeps the old range.
+    const changed = DEFECT === "stale-ranges"
+      ? (item) => !before.has(item.id)
+      : (item) => before.get(item.id) !== after.get(item.id);
+    for (const item of next[key]) if (changed(item)) upsert.push(item);
   }
   const empty = diff.upsertNodes.length + diff.deleteNodeIds.length + diff.upsertEdges.length + diff.deleteEdgeIds.length === 0;
   if (!empty && DEFECT === "deletes-unknown") diff.deleteNodeIds.push("never-emitted-node");
@@ -419,6 +428,20 @@ fn the_conformant_fake_passes_every_check() {
     // The emptied-file step really deleted something, so `deletes-known`
     // passed on evidence rather than on an empty list.
     assert!(run.stdout.contains("(a.fk emptied) -> fileChanged: +1 / -3 node(s)"), "{}", run.stdout);
+    // Likewise the declaration edit really moved something - `alpha` is the
+    // first declaration, on line 1, so the break goes before it and every
+    // node of a.fk moves - so `declaration-edit-applies` compared real ranges.
+    assert!(
+        run.stdout
+            .contains("declaration edit: a line break before line 1 of a.fk, the last line of \"alpha\""),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("the last line of \"alpha\") -> fileChanged: +4 / -0 node(s)"),
+        "{}",
+        run.stdout
+    );
 
     for (path, contents) in before {
         assert_eq!(
@@ -514,6 +537,22 @@ fn incremental_ids_that_differ_from_bulk_ids_fail_incremental_matches_bulk() {
     assert!(
         run.stdout
             .contains("node \"a.fk#func:alpha\" of \"a.fk\" is in the index after fileChanged restored"),
+        "{}",
+        run.stdout
+    );
+}
+
+/// GM-294. A plugin whose diff never re-sends a declaration that moved keeps
+/// every id right - `whitespace-edit`, `deletes-known` and
+/// `incremental-matches-bulk` all pass - while the index goes on answering
+/// with the old ranges: the user-visible half of GM-292, produced by the
+/// plugin instead of by core. Only the declaration edit, judged against a
+/// bulk walk of the edited file, sees it.
+#[test]
+fn a_diff_that_never_resends_a_moved_declaration_fails_declaration_edit_applies() {
+    let run = assert_only_failure("stale-ranges", true, "id-stability.declaration-edit-applies", &[]);
+    assert!(
+        run.stdout.contains("node \"a.fk#fn:alpha\" is at 0:0-0:8 in the index, but a fresh bulk walk of the edited file puts it at 1:0-1:8"),
         "{}",
         run.stdout
     );

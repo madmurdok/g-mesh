@@ -401,7 +401,7 @@ async fn a_plugin_rebuilt_under_a_running_daemon_costs_the_project_a_re_walk() {
         "the index has to record the plugin build that filled it, or the next start repeats this"
     );
     assert!(
-        generation_after.starts_with("1+"),
+        generation_after.starts_with(&format!("{}+", g_mesh::storage::schema::CURRENT_INDEXER_VERSION)),
         "core's own pipeline generation is still half of it: {generation_after}"
     );
 }

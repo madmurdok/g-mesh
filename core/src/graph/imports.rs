@@ -288,8 +288,12 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
 }
 
 /// The linking itself, in one transaction: repoint, then drop what that
-/// orphaned. Order matters - a placeholder still referenced by an edge is a
-/// foreign-key parent, so it can only be deleted after the edges have moved.
+/// orphaned. Order matters - a placeholder is only dropped once no edge
+/// touches it, so the edges have to move first. (On a connection enforcing
+/// foreign keys, deleting it earlier would be refused; on the daemon's, which
+/// does not, it would leave those edges dangling - which is why this counts
+/// them rather than relying on a refusal. Its dependent rows are deleted by
+/// hand for the same reason; see the comment on `drop_placeholder_dependents`.)
 ///
 /// Idempotent, which is what makes it safe to run after every write: a
 /// placeholder that was already linked has no edges left to repoint and no
@@ -322,6 +326,29 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         let mut incident = tx
             .prepare("SELECT COUNT(*) FROM edges WHERE fromId = ?1 OR toId = ?1")
             .context("failed to prepare the incident-edge count")?;
+        // The placeholder's dependents go first, explicitly: the daemon's
+        // connection does not enforce foreign keys (`storage::connection::
+        // open` switches them off), so the DDL's ON DELETE CASCADE never runs
+        // there, and rows left keyed by this id would be inherited by the
+        // next node to take it - the same reason `storage::write::apply_diff`
+        // deletes them for every node a diff removes. `placeholder_targets` is
+        // the one that is really there: every resolved placeholder this pass
+        // links carries a target row (it is how it was found - see the module
+        // doc's "Reading the address"). Declarations and embeddings a
+        // `Module` placeholder has none of today; deleted anyway, so this
+        // does not depend on that staying true.
+        //
+        // Until GM-294 only the node was deleted here, and the target row went
+        // with it only because the connection silently enforced foreign keys
+        // (GM-292) - the cascade this module's comments assumed never ran.
+        let mut drop_placeholder_dependents = [
+            "DELETE FROM placeholder_targets WHERE nodeId = ?1",
+            "DELETE FROM declarations WHERE nodeId = ?1",
+            "DELETE FROM vectors WHERE nodeId = ?1",
+        ]
+        .into_iter()
+        .map(|sql| tx.prepare(sql).context("failed to prepare a placeholder's dependent-row delete"))
+        .collect::<Result<Vec<_>>>()?;
         let mut drop_placeholder = tx
             .prepare("DELETE FROM nodes WHERE id = ?1")
             .context("failed to prepare the placeholder delete")?;
@@ -357,6 +384,11 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
                 .query_row(params![placeholder.id], |row| row.get(0))
                 .context("failed to count a placeholder's remaining edges")?;
             if remaining == 0 {
+                for statement in &mut drop_placeholder_dependents {
+                    statement
+                        .execute(params![placeholder.id])
+                        .context("failed to drop a linked-away placeholder's dependent rows")?;
+                }
                 summary.dropped_placeholders += drop_placeholder
                     .execute(params![placeholder.id])
                     .context("failed to drop a linked-away placeholder")?;
@@ -776,6 +808,60 @@ mod tests {
                 == 1,
             "a placeholder something still points at must not be deleted out from under it"
         );
+    }
+
+    /// GM-293, ported by GM-294: dropping a linked-away placeholder is a bare
+    /// `DELETE FROM nodes`, and on the daemon's connection (foreign keys off -
+    /// see `storage::connection::open`) nothing cascades from it. Whatever
+    /// hangs off the placeholder by `nodeId` has to be deleted with it
+    /// explicitly, or it is inherited by the next node to take that id.
+    ///
+    /// On 3.0.0 that is not hypothetical: every resolved placeholder carries a
+    /// `placeholder_targets` row (it is what this module links by), so a drop
+    /// without the explicit delete leaves one behind on every linked import,
+    /// for both address scopes. Declarations and an embedding are seeded by
+    /// hand on top - a `Module` placeholder has neither today - because the
+    /// delete must not depend on that staying true.
+    #[test]
+    fn dropping_a_placeholder_leaves_no_orphaned_rows_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    file_node("a.ts"),
+                    file_node("b.ts"),
+                    container_member("m", "go", "github.com/x/pkg"),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        seed_resolved_import(&mut conn, "a.ts", "b.ts");
+        seed_container_import(&mut conn, "main.go", "go", "github.com/x/pkg");
+        let file_placeholder = "mod:a.ts:b.ts";
+        let container_placeholder = "mod:main.go:github.com/x/pkg";
+        assert_eq!(count(&conn, "placeholder_targets"), 2, "both placeholders carry their address");
+        for id in [file_placeholder, container_placeholder] {
+            conn.execute(
+                "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
+                 VALUES (?1, 0, 0, 0, 0, 1, 0)",
+                params![id],
+            )
+            .unwrap();
+            crate::storage::vectors::insert(&conn, id, &[1.0, 0.0], "test-model").unwrap();
+        }
+
+        let summary = link_all(&mut conn).unwrap();
+
+        assert_eq!(summary, LinkSummary { linked_edges: 2, dropped_placeholders: 2 });
+        assert!(!node_exists(&conn, file_placeholder) && !node_exists(&conn, container_placeholder));
+        assert_eq!(count(&conn, "placeholder_targets"), 0, "a dropped placeholder's target must go with it");
+        assert_eq!(count(&conn, "declarations"), 0, "a dropped placeholder's declarations must go with it");
+        assert_eq!(count(&conn, "vectors"), 0, "a dropped placeholder's embedding must go with it");
     }
 
     #[test]

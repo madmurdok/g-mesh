@@ -111,7 +111,32 @@ pub const CURRENT_SCHEMA_VERSION: &str = "8";
 /// changes are different events, and tying the two would both miss changes
 /// (a release that fixes nothing about extraction) and force pointless
 /// reindexes (a release that only touches the CLI).
-pub const CURRENT_INDEXER_VERSION: &str = "1";
+///
+/// # History
+///
+/// Bumped to "2" by GM-293 on 2.12.1, and not because the pipeline extracts
+/// anything differently from a clean start. Until then the daemon's
+/// connection enforced foreign keys without anyone knowing (see
+/// `storage::connection::open`), so from the second edit of a file in a
+/// plugin process's lifetime on, the diff was refused and the failure
+/// swallowed - and the query-time staleness check then recorded the new
+/// content hash over the graph that never took the edit. An index that lived
+/// through that is wrong in ways nothing will ever notice on its own: its
+/// `indexed_files` baselines claim the stale files are fresh, so no future
+/// query re-reads them, and a restart trusts it as current. The only repair
+/// is the one this constant already buys - a mismatch in [`ensure_current`]
+/// drops every table and the next daemon start re-walks the project.
+///
+/// GM-294 carried the same fix, and the same "2", into 3.0.0. Here the bump
+/// is nearly free rather than necessary: [`CURRENT_SCHEMA_VERSION`] "8"
+/// already wipes every index a 2.x binary built, whatever its indexer
+/// generation. What it still catches is an index built by a *pre-release*
+/// 3.0.0 binary - schema "8", indexer "1", the same bug - which the schema
+/// check alone would trust as current. Leaving it at "1" would also give two
+/// different pipeline generations (2.12.0's buggy writer and 3.0.0's fixed
+/// one) the same number in this constant's history, which is exactly the
+/// ambiguity it exists to rule out.
+pub const CURRENT_INDEXER_VERSION: &str = "2";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md).
@@ -261,8 +286,10 @@ CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
 -- (GM-265): a row appears with a container's first member, `memberCount` is
 -- recounted from the container's `DEFINES` edges whenever a diff touches it,
 -- `parentKey` comes from the members' `containerParent`, and the row goes -
--- explicitly, since the daemon runs with foreign keys off and the `ON DELETE
--- CASCADE` below never fires there - when the count reaches zero. That
+-- explicitly, since the daemon runs with foreign keys off
+-- (`storage::connection::open` switches them off; the bundled SQLite would
+-- enforce them otherwise, GM-292) and the `ON DELETE CASCADE` below never
+-- fires there - when the count reaches zero. That
 -- module's doc has the reasoning for each of those choices.
 CREATE TABLE IF NOT EXISTS containers (
     nodeId      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
@@ -392,11 +419,16 @@ CREATE TABLE IF NOT EXISTS indexed_files (
 -- One row per node that has been embedded. The relation is 1:0-or-1 (see the
 -- architecture doc's Data Model erDiagram: `NODES ||--o| VECTORS`), so
 -- nodeId is the primary key rather than an ordinary indexed FK column - a
--- re-embed overwrites the row instead of accumulating one. ON DELETE CASCADE
--- so a node going away (a file edit, a deletion) drops its stale embedding
--- with it instead of leaving an orphan a later similarity search could still
--- surface - the same reasoning `declarations` and `edges` already follow for
--- their own FKs into `nodes`.
+-- re-embed overwrites the row instead of accumulating one. A node going away
+-- (a file edit, a deletion) must drop its stale embedding with it instead of
+-- leaving an orphan a later similarity search could still surface. ON DELETE
+-- CASCADE states that intent, but it only runs on a connection that enforces
+-- foreign keys, and the daemon's does not (`storage::connection::open`
+-- switches them off, GM-293/GM-294 for why) - so every production delete from
+-- `nodes` removes the vector itself (`storage::write::apply_diff`,
+-- `graph::imports`' placeholder drop, `graph::containers`,
+-- `daemon::workspace_reindex`), exactly as it does for `declarations` and
+-- `placeholder_targets`.
 --
 -- embedding is sqlite-vec's compact vector format: each dimension as a
 -- 4-byte little-endian float32, back to back, no header - see

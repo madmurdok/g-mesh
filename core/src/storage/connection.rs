@@ -57,6 +57,47 @@ pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
 /// the sqlite-vec extension available on the returned connection (see
 /// `storage::vectors` for what that unlocks and why registering it here is
 /// enough for every connection, not just this one).
+///
+/// # Foreign keys are switched off here, explicitly
+///
+/// The schema declares `edges`, `declarations`, `vectors`,
+/// `placeholder_targets` and `containers` as foreign keys onto `nodes`, and
+/// every writer is built on those declarations *not* being enforced.
+/// Cross-file edges are lazy by design: when a symbol another file points at
+/// is deleted or renamed, the importer's edge is left dangling until that
+/// importer is itself reindexed (see `graph::imports::link_diff`). And the TS
+/// plugin reports any change to a symbol as a delete plus an upsert of the
+/// same id, without re-sending the unchanged edges into it - so under
+/// enforcement the delete is refused and the whole diff rolls back.
+///
+/// This used to be left to the default, on the belief that the default is
+/// off. It is off in the `sqlite3` shell and in a stock SQLite build, which is
+/// presumably where the belief came from - but `rusqlite`'s `bundled` feature
+/// compiles SQLite with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1` (libsqlite3-sys's
+/// build script), so the connection this function returned *enforced* them.
+/// Every edit after the first in a plugin process's lifetime was refused, and
+/// the refusal was swallowed (GM-292; fixed on 2.12.1 by GM-293 and carried
+/// into 3.0.0 by GM-294). Setting it here rather than trusting either default
+/// is what keeps that from depending on how the dependency happens to be
+/// built.
+///
+/// Because nothing cascades, a delete from `nodes` owes its dependents an
+/// explicit delete of their own - `storage::write::apply_diff`,
+/// `graph::containers`' empty-container delete, `graph::imports`' placeholder
+/// drop and `daemon::workspace_reindex::delete_language_rows` all do this.
+/// `ON DELETE CASCADE` in the DDL is still honoured where a connection turns
+/// enforcement on (many unit tests do, to catch an edge pointed at a node that
+/// was never written, or a delete made in the wrong order); it is not what
+/// production relies on.
+///
+/// Every connection that *writes* a project's index comes through here: the
+/// daemon (`daemon::run`), `g-mesh init` and `g-mesh reindex`. The two that
+/// open an existing file without `CREATE` - `cli::status::index_status` and
+/// `gc::last_used::read_from_project_dir` - deliberately leave the pragma
+/// alone: they only read, and foreign-key enforcement only ever affects
+/// writes. The one other index core builds, `g-mesh plugins check`'s
+/// in-memory one (`cli::plugin_check::session::open_index`), switches it off
+/// itself, because it exists to commit diffs exactly as the daemon would.
 pub fn open(root: &Path) -> Result<Connection> {
     vectors::register_extension();
 
@@ -66,6 +107,7 @@ pub fn open(root: &Path) -> Result<Connection> {
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;
+    conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     Ok(conn)
 }
 
@@ -91,6 +133,21 @@ mod tests {
 
         let expected_db = project_dir(tmp.path()).unwrap().join("index.db");
         assert!(expected_db.exists());
+    }
+
+    /// GM-293, carried into 3.0.0 by GM-294. The bundled SQLite this crate
+    /// links is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so leaving the
+    /// pragma alone means enforcement is *on* - the opposite of what the
+    /// write path is built for. Asked of the connection itself rather than of
+    /// the build, so the test keeps meaning something if the dependency or
+    /// its defines change.
+    #[test]
+    fn opens_database_with_foreign_keys_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let enforced: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
+        assert_eq!(enforced, 0, "the daemon's index connection must not enforce foreign keys");
     }
 
     /// Opening an index is the moment a state directory learns which project

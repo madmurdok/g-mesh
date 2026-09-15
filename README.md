@@ -578,7 +578,8 @@ g-mesh plugins check <plugin-dir> --fixture <project-dir>
 ```
 
 Runs the plugin against a small project in its language the way the daemon
-does — two bulk walks, then one control-plane session — through core's real
+does — two bulk walks, then one control-plane session, then a third bulk
+walk of the tree the session's declaration edit left — through core's real
 index writes and linker, and prints one line per check: `PASS`, `FAIL` (with
 the offending ids, NDJSON lines or session steps), or `SKIP` with a reason.
 The exit status is non-zero if any check failed. The fixture is copied to a
@@ -590,7 +591,9 @@ doc spells it, is accepted too.)
 The session, in order: `fileChanged` on the file with the most nodes,
 unmodified; again after a whitespace-only edit (one space inserted before
 that file's last newline — an edit after which no range can legitimately
-move); again after emptying the file; again after restoring it; a
+move); again after emptying the file; again after restoring it; again after
+a declaration edit (a line break inserted before the last line of the file's
+first declaration, so it grows or moves and everything after it moves); a
 whole-project `semanticPass` if declared; and a final `fileChanged` through
 the manifest's own `semantic_pass` gate. A fixture needs at least one file
 with a newline in it; a few files with a cross-file import, a re-export and
@@ -599,7 +602,7 @@ a call exercise every check. The ones this repo uses are under
 
 | Check | What a plugin must do |
 |---|---|
-| `session` | spawn, handshake with the manifest's protocol version and language, exit 0 from both bulk walks, and answer every request within its timeout |
+| `session` | spawn, handshake with the manifest's protocol version and language, exit 0 from every bulk walk, answer every request within its timeout, and send diffs core can commit |
 | `shape` | emit lines and diffs that parse as protocol v2 after core's normalization; a placeholder `nativeKind` carries a `target` |
 | `stream-order` | in the bulk stream and `fileChanged` diffs, emit an edge only after both its endpoints, and only between nodes of its own file |
 | `same-file-rule` | mark a same-file edge onto a declaration `resolved: true`, and an edge onto a placeholder `resolved: false` |
@@ -607,6 +610,7 @@ a call exercise every check. The ones this repo uses are under
 | `id-stability.whitespace-edit` | answer the whitespace-only edit with an empty diff |
 | `id-stability.deletes-known` | only name ids it emitted earlier in `deleteNodeIds` |
 | `id-stability.incremental-matches-bulk` | derive the same node ids on the `fileChanged` path as on the bulk path |
+| `id-stability.declaration-edit-applies` | answer the declaration edit with a diff that leaves every node it delivered where a fresh bulk walk of the edited file puts it |
 | `ownership.defines-exports-from-file` | start every `DEFINES`/`EXPORTS` edge at the file's `File` node |
 | `ownership.language` | give every node the manifest's `language` |
 | `ownership.no-container` | never emit `nativeKind: "container"` — core owns containers |
