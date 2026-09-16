@@ -1,0 +1,95 @@
+# Post-linking assertions for the Rust plugin - `g-mesh plugins check
+# plugins/rust --fixture plugins/rust/tests/fixtures/workspace --expect
+# plugins/rust/conformance/expect.toml`, which `tests/conformance.rs` runs
+# from `cargo test`.
+#
+# DELIBERATELY MINIMAL. This file asserts GM-286's own acceptance criteria
+# and nothing else: a `pub(crate)` item linkable from a sibling module and
+# not from another crate, a `pub use` re-export chain, a type-qualified call
+# across crates, `impl Trait for T` found by find_implementations, and the
+# containers a file's `use` items import. GM-287 owns the full expectations
+# file for this plugin - the one that covers the rest of the graph. This one
+# is the floor.
+#
+# Every entry is answered by the same handler code the MCP tools use
+# (`core/src/cli/plugin_check/expectations.rs`), and each `expect` is a SET of
+# `"filePath:qualifiedName"` strings - order never matters, and an entry
+# missing from the set is as much of a failure as an extra one. That is what
+# makes the two `[[callers]]` entries below a *visibility* test rather than a
+# reachability one.
+
+# --- impl Trait for T, found by find_implementations --------------------------
+
+[[implementations]]
+symbol = "shapes::Shape"
+# Both impls are same-file `SUPERTYPE_OF` edges from the type to the trait.
+# `prelude.rs` re-exports `Shape`, which is a placeholder and must not appear
+# here as a third implementor.
+expect = ["crates/alpha/src/shapes.rs:shapes::Square", "crates/alpha/src/shapes.rs:shapes::Circle"]
+
+# --- pub(crate): linkable from a sibling module, and not from another crate ---
+
+[[callers]]
+symbol = "internals::crate_only"
+# `alpha::internals::crate_only` is `pub(crate)`, i.e. `container(alpha)`.
+#
+# IN: `shapes` is a *sibling* of `internals`, not an ancestor - it reaches the
+# item because `alpha` is on its parent chain. `internals::published` reaches
+# it from the same module. `nested::deep::deep_work` reaches it from two
+# modules down, and that one is only linkable because every `mod` item is
+# emitted as a member of the module that declares it: `alpha::nested`
+# declares nothing else, so without `mod deep;` it would have no `containers`
+# row, `parent_chain` would stop there, and `alpha` would never appear on the
+# chain (see `src/extractor/decls.rs`, and that file's own doc).
+#
+# OUT, and this is the assertion: `crates/beta/src/main.rs:forbidden` calls it
+# too, through a `use` that real `rustc` would reject. The plugin emits that
+# placeholder like any other; core's visibility check is what must refuse it,
+# because `alpha` is not on `beta_crate`'s parent chain. Its absence from this
+# set is the check.
+expect = [
+    "crates/alpha/src/shapes.rs:shapes::<Circle as Shape>::area",
+    "crates/alpha/src/internals.rs:internals::published",
+    "crates/alpha/src/nested/deep.rs:nested::deep::deep_work",
+]
+
+# --- a pub use re-export chain -------------------------------------------------
+
+[[callers]]
+symbol = "internals::published"
+# `main` calls `exported_helper()`, imported from `alpha::prelude`, which
+# declares nothing: the only path from the call to this declaration is core's
+# re-export walk over `pub use crate::internals::published as exported_helper`
+# - including the rename, which is why the placeholder's key is `published`
+# and its node's name is `exported_helper`.
+expect = ["crates/beta/src/main.rs:main"]
+
+# --- a type-qualified call across crates ---------------------------------------
+
+[[callers]]
+symbol = "shapes::Square::new"
+# `Square::new(3)` in the other crate is addressed by `qualifiedName`, not by
+# name: `alpha::shapes` holds several declarations named `new` would have to
+# choose between if it were a name key.
+expect = ["crates/beta/src/main.rs:main"]
+
+# --- imports (get_dependencies, one hop, Outgoing) ------------------------------
+
+[[imports]]
+file = "crates/alpha/src/nested/mod.rs"
+# Every `use` is an import, not only the glob - which is all the design doc's
+# sketch listed, and which would make `get_dependencies` answer "nothing" for
+# almost every Rust file. This file has one of each: `use crate::internals::*`
+# (a glob) and `pub use deep::work` (a named re-export), and both link onto
+# the container they read from. `container:` is how a row with no `filePath`
+# renders, and a container node's `qualifiedName` is its key.
+#
+# It is anchored on *this* file rather than on `crates/beta/src/main.rs`,
+# whose `use` items are more interesting, because the kit's session empties
+# and restores the file with the most nodes - `crates/alpha/src/shapes.rs` -
+# and core GCs a container whose last member goes, taking every `IMPORTS`
+# edge pointing at it along (`graph::containers`: "importers' placeholders
+# come back on their next reindex", which within one session never happens).
+# An expectation over beta's imports would be asserting that deliberate core
+# behaviour, not this plugin's.
+expect = ["container:alpha::internals", "container:alpha::nested::deep"]

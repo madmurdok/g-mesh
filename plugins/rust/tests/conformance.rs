@@ -2,35 +2,30 @@
 //! plugins check`, the same way `plugins/sdk`'s own toy plugin proves the
 //! SDK and `plugins/typescript` proves itself in core's CI.
 //!
-//! # Why two checks legitimately skip
+//! # Why exactly one check skips
 //!
-//! This crate is presently a **project-model-only** plugin (GM-285):
-//! `extract` emits a file's own `File` node and nothing else - see
-//! `src/extractor.rs`'s module doc for why, and GM-286 for the tree-sitter
-//! extractor that replaces it. Two checks in the kit's fifteen depend on a
-//! *declaration* existing to have something to say:
+//! `capabilities.semantic-engine-lazy` only applies when
+//! `[plugin.capabilities] semantic_pass = true`. This plugin's manifest says
+//! `false` - the rust-analyzer tier is GM-290, R4 in the design doc's
+//! rollout - so its counterpart, `capabilities.semantic-pass-undeclared`, is
+//! the one that runs instead. Everything else is asserted `Pass` by name,
+//! one by one, so that a check which silently starts *skipping* (rather than
+//! genuinely not applying) fails this test instead of passing it by
+//! omission.
 //!
-//! - `id-stability.declaration-edit-applies` needs a non-`File`,
-//!   non-placeholder node to edit and re-diff. A File-only plugin never
-//!   emits one, so the kit reports "not reached", not a pass it did not earn.
-//! - `capabilities.semantic-engine-lazy` only applies when
-//!   `[plugin.capabilities] semantic_pass = true`; this plugin's manifest
-//!   says `false` (no semantic tier yet), so its counterpart,
-//!   `capabilities.semantic-pass-undeclared`, is the one that runs instead.
-//!
-//! Every other check - `shape`, `stream-order`, `same-file-rule`, every
-//! `ownership.*` rule, and the three `id-stability.*` checks a File node
-//! alone can satisfy (`bulk-repeat`, `whitespace-edit`,
-//! `incremental-matches-bulk`, `deletes-known`) - is asserted `Pass`
-//! explicitly, one by one, so a check silently starting to skip (rather than
-//! genuinely not applying) fails this test instead of passing it by omission.
+//! Until GM-286 that list had a second entry:
+//! `id-stability.declaration-edit-applies` needs a non-`File`,
+//! non-placeholder node to edit and re-diff, and the project-model-only
+//! plugin emitted none. It is a real `PASS` now, which is the narrow,
+//! concrete sense in which this task made the plugin's diff path testable at
+//! all.
 
 use g_mesh_plugin_sdk::testing::{PluginCheck, Verdict};
 
 /// Every check `g-mesh plugins check` reports, in no particular order -
 /// asserted as a set so a check dropping out of the report (this crate's
 /// own regression, not a plugin defect) fails loudly rather than shrinking
-/// the "everything but these two passed" loop below silently.
+/// the loop below silently.
 const ALL_CHECKS: [&str; 15] = [
     "session",
     "shape",
@@ -49,8 +44,9 @@ const ALL_CHECKS: [&str; 15] = [
     "capabilities.semantic-engine-lazy",
 ];
 
-/// The checks a File-only plugin can, and must, pass outright.
-const MUST_PASS: [&str; 13] = [
+/// Everything but `capabilities.semantic-engine-lazy` - see this file's own
+/// module doc.
+const MUST_PASS: [&str; 14] = [
     "session",
     "shape",
     "stream-order",
@@ -59,6 +55,7 @@ const MUST_PASS: [&str; 13] = [
     "id-stability.whitespace-edit",
     "id-stability.deletes-known",
     "id-stability.incremental-matches-bulk",
+    "id-stability.declaration-edit-applies",
     "ownership.defines-exports-from-file",
     "ownership.language",
     "ownership.no-container",
@@ -80,7 +77,7 @@ fn check() -> PluginCheck {
 }
 
 #[test]
-fn the_file_only_stub_passes_every_check_that_applies_to_it() {
+fn the_plugin_passes_every_check_that_applies_to_it() {
     let outcome = check().run().expect("the conformance kit could not be run");
     outcome.assert_conformant();
 
@@ -94,14 +91,39 @@ fn the_file_only_stub_passes_every_check_that_applies_to_it() {
         assert_eq!(outcome.verdict(id), Some(Verdict::Pass), "{id} did not pass:\n{}", outcome.stdout);
     }
 
-    // The two checks a File-only plugin genuinely cannot exercise - see this
-    // file's own module doc.
-    let mut skipped = outcome.skipped();
-    skipped.sort_unstable();
     assert_eq!(
-        skipped,
-        vec!["capabilities.semantic-engine-lazy", "id-stability.declaration-edit-applies"],
-        "exactly these two must skip, and nothing else:\n{}",
+        outcome.skipped(),
+        vec!["capabilities.semantic-engine-lazy"],
+        "exactly this one must skip, and nothing else:\n{}",
         outcome.stdout
     );
+}
+
+/// The acceptance criteria, as assertions against the linked index: see
+/// `conformance/expect.toml`, which says what each one proves and why it is
+/// deliberately a short list.
+#[test]
+fn the_linked_index_answers_the_acceptance_criteria() {
+    let outcome = check()
+        .expect(concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml"))
+        .run()
+        .expect("the conformance kit could not be run");
+    outcome.assert_conformant();
+
+    // `assert_conformant` fails on a FAIL and says nothing about a SKIP, and
+    // the whole expectations section is skipped when the session did not
+    // reach a state worth judging. So each entry is asserted to have been
+    // *judged*: `expectations.file` (the file parsed at all) plus the five
+    // acceptance criteria, each reported under its own
+    // `expectations.<kind>[<index>]` id.
+    let judged: Vec<(&str, Verdict)> = outcome
+        .outcomes
+        .iter()
+        .filter(|(id, _)| id.starts_with("expectations."))
+        .map(|(id, verdict)| (id.as_str(), *verdict))
+        .collect();
+    assert_eq!(judged.len(), 6, "every expectation must be reported:\n{}", outcome.stdout);
+    for (id, verdict) in judged {
+        assert_eq!(verdict, Verdict::Pass, "{id} was not judged and passed:\n{}", outcome.stdout);
+    }
 }
