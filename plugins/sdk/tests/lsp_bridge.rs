@@ -256,6 +256,41 @@ fn a_definition_becomes_a_semantic_edge() {
     assert_eq!(target.from_container.as_deref(), Some("pkg"), "who is asking, for the visibility check");
 }
 
+/// The other half of decision 3: a server that negotiates a *different* unit
+/// is answered in that unit.
+///
+/// The same fixture, the same site, and a server that says `utf-32` - so the
+/// columns it matches on and answers with are the wire's own, and both
+/// conversions become the identity. A bridge that ignored the negotiated
+/// encoding would send UTF-16 columns to a UTF-32 server and get nothing,
+/// which is the same silent nothing as getting the conversion backwards.
+#[test]
+fn the_encoding_the_server_negotiates_is_the_one_it_is_answered_in() {
+    let scratch = Scratch::new("utf32");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-32",
+        "answers": [{
+            "uri": scratch.uri("src/b.toy"),
+            "line": 1,
+            // Characters, not UTF-16 code units - this is the one difference
+            // from every other test in this file.
+            "character": SITE_CHAR_COL,
+            "definition": {
+                "uri": scratch.uri("src/a.toy"),
+                "line": 0,
+                "character": DECL_CHAR_COL,
+            },
+        }],
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+}
+
 /// The rule the design doc states outright: "an empty answer before readiness
 /// is never recorded as 'no target'".
 ///
