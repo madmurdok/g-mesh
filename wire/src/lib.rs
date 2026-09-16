@@ -411,6 +411,36 @@ pub struct FileChangeResponse {
     pub jsonrpc: String,
     pub id: RequestId,
     pub result: FileChangeDiff,
+    /// **`semanticPass` only:** the pass answered with what it managed and
+    /// did *not* cover everything it was asked about - a per-request or
+    /// per-pass budget ran out, the engine's server died, or it never became
+    /// ready (GM-289).
+    ///
+    /// Core applies the diff either way and, for a whole-project pass, leaves
+    /// `language_state.semanticPassAt` unset so the next daemon start asks
+    /// again (`daemon::semantic`, `watcher::apply::apply_semantic_pass`). That
+    /// is the whole reason this is a field beside `result` rather than a
+    /// JSON-RPC `error`: an error answer carries no diff, so reporting "the
+    /// last hundred sites are missing" would throw away the nine thousand this
+    /// pass did resolve, and the retry would have to redo all of them from
+    /// nothing.
+    ///
+    /// Absent means `false`, so a plugin that predates this field - the
+    /// bundled Go and JS/TS plugins, and any third-party one - keeps
+    /// answering exactly as it did: a pass that answers at all is a pass that
+    /// finished. That is also why this is not an enum: the only thing core
+    /// branches on is "was this pass complete", and the reason it was not is
+    /// the plugin's own to log, in words, where there is room for it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incomplete: bool,
+}
+
+/// `skip_serializing_if` for a `bool` that is absent-means-false on the wire.
+/// A free function because `bool` has no inherent method with the right
+/// signature, and spelling it `std::ops::Not::not` would read as cleverness
+/// rather than as "do not send the default".
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -821,14 +851,31 @@ mod tests {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: RequestId::Number(42),
             result: FileChangeDiff::default(),
+            incomplete: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"result\""));
         assert!(!json.contains("\"method\""), "a response has no method field, unlike ControlEnvelope");
+        assert!(!json.contains("\"incomplete\""), "a complete pass says nothing: {json}");
 
         let round_tripped: FileChangeResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(response, round_tripped);
+    }
+
+    /// The field a semantic tier reports a partial pass with, and the
+    /// backwards compatibility that lets every plugin written before it keep
+    /// answering unchanged - see [`FileChangeResponse::incomplete`].
+    #[test]
+    fn a_response_without_the_incomplete_field_reads_as_a_complete_pass() {
+        let without = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let parsed: FileChangeResponse = serde_json::from_str(without).unwrap();
+        assert!(!parsed.incomplete);
+
+        let with = r#"{"jsonrpc":"2.0","id":7,"result":{},"incomplete":true}"#;
+        let parsed: FileChangeResponse = serde_json::from_str(with).unwrap();
+        assert!(parsed.incomplete);
+        assert!(serde_json::to_string(&parsed).unwrap().contains("\"incomplete\":true"));
     }
 
     #[test]
