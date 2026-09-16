@@ -764,6 +764,54 @@ directory one check writes.
 - **Distribution:** a cargo binary in the same workspace as core, built by the
   existing native release matrix.
 
+#### Implementation notes (GM-286)
+
+Built as `plugins/rust/src/extractor/`, on tree-sitter-rust. The seven
+decisions this task had to settle are each argued in full in the module
+named beside them; `plugins/rust/README.md` is the reader-facing summary,
+including the gap list. Recorded here are the three places the sketch above
+turned out to be *wrong* rather than merely incomplete, so that a later
+language does not copy them.
+
+1. **`qualifiedName` carries the module path, and a trait impl's method
+   carries the trait** (`extractor::keys`). The sketch's `f` / `T` / `T::m`
+   is not injective, and a node's id is
+   `(filePath, kind, qualifiedName, nativeKind)`. Two inline modules of one
+   file can each declare `helper`; a type can implement `Display` and
+   `Debug` and have two `fmt`s. Both collapse to one id under the sketch, and
+   the second declaration silently replaces the first. So a declaration is
+   named by its path from the crate root minus the crate name
+   (`parse::Lexer::next`), and a trait impl's member by Rust's own
+   disambiguation syntax (`<Point as Display>::fmt`). `nativeKind` stays
+   `trait_impl_method` as the sketch says - it was never the part carrying
+   the information. The cost is one documented gap: a fully-qualified
+   `Point::fmt()` path call addresses the inherent method, not the trait's.
+2. **Every `use` is an `IMPORTS` edge, not only the glob.** The sketch lists
+   a container import for `use a::b::*` alone. `get_dependencies` is
+   answered from `IMPORTS` edges, so that would make it report "no
+   dependencies" for essentially every Rust file. A `use` names a module;
+   the plugin emits the container import *and*, for a named leaf, the
+   `pending_symbol` placeholder - the same pair the TS plugin emits for a
+   specifier plus each imported name.
+3. **A path call needs two different key kinds.** `a::b::f()` uses a `name`
+   key, so core's re-export walk can follow a `pub use` chain; `T::f()` uses
+   a `qualifiedName` key, because a module holding `impl Reader { fn new }`
+   and `impl Writer { fn new }` - which is most modules - offers two
+   declarations *named* `new` and core rightly refuses both. Which of the
+   two a path is, is decided by Rust's naming convention, and only ever
+   chooses between two *addresses*: either guess fails to a missing edge,
+   never to a wrong one.
+
+Two facts about core that this plugin now depends on, both already
+documented there and both worth naming because they are what the fixture
+exercises: `graph::containers::parent_chain` stops at a memberless
+ancestor, which is why every `mod` item is emitted as a member of the module
+that *declares* it; and a container whose last member goes is GCed together
+with the `IMPORTS` edges pointing at it, which is why a module consisting
+only of `pub use` has no container node at all (its re-exports still resolve
+- the walk reads a node's own `container` column, not the `containers`
+table).
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated
