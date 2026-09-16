@@ -1,0 +1,68 @@
+# Bundled Go plugin manifest. See docs/architecture/multi-language-plugins.md
+# ("Interfaces > plugin.toml additions") for the schema this file follows,
+# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/
+# validation rules it must satisfy. `language` below must equal this
+# manifest's own containing directory name ("go"), the same rule every
+# other bundled plugin's manifest follows (see plugins/typescript/plugin.toml's
+# own comment on why).
+
+[plugin]
+language = "go"
+protocol_version = 2
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+# A prebuilt binary, not `go run ./...`. `go run` recompiles the whole
+# module on every single spawn - and the daemon spawns this plugin
+# repeatedly (once per bulk index, and again as a long-lived control-plane
+# process), with a fresh one-shot process for *every* --bulk-index call
+# (daemon::bulk_index::walk_one_language) - so `go run` would mean paying a
+# full compiler invocation on the hot path of a reindex, not just at
+# startup. A prebuilt binary costs one build per checkout/commit instead,
+# at the price of a build step existing at all - core/build.rs pays that
+# price the same best-effort way it already does for the TS plugin's
+# `npm run build` (see that file), so `cargo build`/`cargo test`/
+# `g-mesh plugins check`/`g-mesh plugins list` all keep working from a
+# fresh checkout with nothing extra to run by hand, as long as a Go
+# toolchain is on PATH - and degrade to a clear "failed to spawn" error,
+# not a build failure, when one is not (the same best-effort contract
+# build.rs already documents for npm). GM-283 (distribution) is what ships
+# this binary inside a release archive instead of building it from a
+# checkout.
+command = "./g-mesh-plugin-go"
+
+[plugin.languages]
+extensions = [".go"]
+
+[plugin.capabilities]
+# No real semantic engine exists yet - go/types lands in GM-281. core may
+# still send semanticPass (this stays true rather than false): a plugin
+# that will grow a real semantic tier should not lock in "core never asks"
+# before that tier exists, and this plugin already answers every
+# semanticPass honestly (an empty diff - see control.go's
+# handleSemanticPass). See this doc's "Implementation notes (GM-279)" below
+# for the semantic-engine-marker decision this capability implies.
+semantic_pass = true
+# This scaffold emits no edges at all yet (File nodes only - GM-280 adds
+# symbols and edges), so receiver calls are unresolved at both tiers -
+# an honest "nothing yet", not an overclaim either GM-280 or GM-281 would
+# have to walk back later.
+receiver_calls = "unresolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+# A go.mod/go.work edit moves the whole project's package/import-path
+# layout, so core reindexes this language from scratch when either changes -
+# the same "workspace boundary file" role Cargo.toml/*.csproj play for
+# their languages (docs/architecture/multi-language-plugins.md's
+# "plugin.toml additions" section).
+watch_files = ["go.mod", "go.work"]
+# vendor/ holds copied dependency source the project does not own;
+# testdata/ is Go's own convention for fixtures `go build`/`go vet`/`go
+# test` skip - neither should ever become part of this project's own
+# graph. `.git` is excluded unconditionally at the core level already, and
+# again by this plugin's own walk (walk.go) regardless of what this list
+# says, for a plugin run standalone (`--bulk-index`) with no core in front
+# of it to apply this list on its behalf.
+exclude_dirs = ["vendor", "testdata"]
+entry_points = []
