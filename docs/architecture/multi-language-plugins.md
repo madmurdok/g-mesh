@@ -602,6 +602,98 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
   - Budgets: per-request timeout, a max number of sites per pass, and
     readiness-waiting (see Failure Modes).
 
+#### Implementation notes (GM-284)
+
+Built as `plugins/sdk` (`g-mesh-plugin-sdk`). Seven decisions the sketch above
+left open, recorded here so a later language does not have to re-derive them;
+each one's full reasoning is in the module doc named beside it.
+
+1. **Workspace layout, and where the wire types live.** The repository root
+   became a cargo *workspace* (`Cargo.toml`, virtual) over `core/`, `wire/` and
+   `plugins/sdk`, so `cargo test` at the root covers all three. The build
+   directory moved with it, from `core/target/` to `target/`, which is why
+   `.gitignore`, `scripts/build-targets.sh` and the nextest profile
+   (`core/.config/` -> `.config/`, since nextest resolves it against the
+   workspace root) changed in the same commit.
+
+   **The SDK does not depend on the `g-mesh` crate.** Sharing the wire types
+   is non-negotiable - two hand-kept copies is exactly the arrangement that
+   makes a protocol version number necessary - but depending on core would
+   make every plugin link a statically linked ONNX Runtime, a bundled SQLite
+   and tokio. So `protocol::types` moved out into a third crate,
+   `g-mesh-wire`, whose entire dependency list is `serde` (plus `schemars`
+   behind a default-off feature core turns on for its MCP schemas). Core
+   re-exports it as `protocol::types`, unchanged at every call site. The
+   extraction was one file move plus a one-line re-export - "cheap", as the
+   task's condition for doing it at all.
+
+2. **The id scheme is specified in bytes, in `ids`' module doc**, and pinned
+   by `plugins/sdk/tests/id_scheme.rs` against ids the TS plugin's own
+   `nodeIdFor`/`edgeIdFor` produced. Both ids are `sha256` of NUL-joined
+   fields, hex, first 32 characters: `"node" NUL path NUL kind NUL
+   qualifiedName NUL nativeKind` (nativeKind empty when absent) and
+   `"edge" NUL fromId NUL kind NUL toId [NUL toDeclaration]` (the ordinal
+   field, *and its separator*, absent when there is none). **`plugins/go` must
+   match this**; the separator is a NUL rather than a space, which is easy to
+   miss from reading `extract.ts`, where it is invisible in the template
+   literal.
+
+3. **The incremental diff is id-keyed and content-refined**, the same
+   algorithm as `incremental.ts`: a node present on both sides whose fields
+   differ is reported as a delete *and* an upsert of the same id, and ranges
+   count as fields. `apply_diff` performs every delete before every upsert in
+   one transaction, so that lands - the GM-292 failure was foreign-key
+   enforcement being on when core believed it was off, not the diff shape.
+   `diff`'s module doc says so explicitly and says not to work around it.
+
+4. **`FileGraph` carries `open_sites: Vec<OpenSite>`**, never serialized.
+   An `OpenSite` is `{from_id, position, name, kind, edge_kind,
+   from_container}` - a position and a name rather than a syntax node, because
+   the two engine shapes it has to fit look at a file from opposite ends: an
+   LSP bridge asks *at a position* and gets a location, while a
+   `go/types`-style engine re-analyses the file and correlates by position.
+   Neither can be handed a tree-sitter node.
+
+5. **The semantic engine is lazy by construction.** `run` takes a
+   `SemanticEngineFactory` (`FnOnce`), not a built `Box<dyn SemanticEngine>`:
+   with the sketch's signature the engine is already running by the time `run`
+   sees it. The SDK writes
+   `$G_MESH_PLUGIN_CHECK_MARKER_DIR/semantic-engine-started` immediately
+   *before* calling the factory (an engine that spawned a server and then
+   failed has still started one), so every SDK plugin passes
+   `capabilities.semantic-engine-lazy` instrumented rather than skipped.
+   A whole-project `semanticPass` first fills `SdkIndex` by walking and
+   extracting - the control-plane process never runs the bulk walk, so
+   otherwise it would answer about only the files someone happened to edit.
+
+6. **Errors.** A panic in the extractor is caught per file
+   (`catch_unwind`): the walk skips that file, and a `fileChanged` answers an
+   empty diff and *keeps* its previous baseline. Taking the process down would
+   cost the project every other file. A syntax error is not an error at all -
+   `extract` has no way to report one, deliberately; it returns the partial
+   graph with `hasSyntaxErrors` set.
+
+7. **The test helper** is `testing::PluginCheck`. The plugin binary is passed
+   in as `env!("CARGO_BIN_EXE_<name>")` - exact, and it makes cargo build the
+   binary before the test runs. Core's binary is found by `G_MESH_BIN`, else
+   by looking beside the test binary in the shared workspace target directory;
+   not found is an error naming what to run, never a skip. The helper writes a
+   `plugin.toml` into a scratch directory (a cargo-built plugin has none) and
+   points the plugin at it with `G_MESH_PLUGIN_MANIFEST`, so the run exercises
+   the manifest path rather than the in-code fallback.
+
+Two deliberate differences from the TS plugin, both in `walk`'s module doc:
+symlinks are **not** followed (JS needs them for workspace packages linked
+into `node_modules`; no language this SDK is for has that convention, and the
+guard TS needs against cycles and escapes is real machinery), and the walk
+reads neither the user's global gitignore nor `.gitignore` above the project
+root, so an index does not depend on the machine it was built on.
+
+The toy plugin the SDK's own conformance test drives (`plugins/sdk/toy/`) is a
+line-oriented language with five line shapes. It is built by `cargo build` and
+shipped by nothing: no `plugin.toml` of its own exists outside the scratch
+directory one check writes.
+
 ### Go plugin (`plugins/go`)
 
 - **Structure:** `go/parser` with `parser.ParseComments | parser.AllErrors`.

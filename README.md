@@ -568,8 +568,39 @@ as `<command> <args> --bulk-index <project-root>`, whose stdout is one NDJSON
 node/edge per line, and as a long-lived `<command> <args> <project-root>`
 speaking framed JSON-RPC on stdin/stdout — a handshake, then a diff in answer
 to each `fileChanged`, and to each `semanticPass` when the manifest declares
-`semantic_pass = true`. The wire types are `core/src/protocol/types.rs`; the
-design, including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+`semantic_pass = true`. The wire types are the `g-mesh-wire` crate
+(`wire/src/lib.rs`, re-exported by core as `protocol::types`); the design,
+including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+
+### In Rust: the plugin SDK
+
+Everything in the paragraph above except the language itself is already
+written, in `plugins/sdk` (`g-mesh-plugin-sdk`). A plugin built on it
+implements one trait — "given one file's text, what nodes and edges are in
+it" — and the crate owns the handshake, the control loop, `--bulk-index`
+streaming, the `.gitignore`-aware walk, the per-file cache and incremental
+diff, the id scheme, placeholder builders, and starting a semantic engine
+lazily (including writing the marker below, so the lazy check is a `PASS`
+rather than a `SKIP`). It does **not** depend on core: the only thing the two
+share is the wire crate.
+
+```rust
+impl Extractor for MyExtractor {
+    const LANGUAGE: &'static str = "mylang";
+    type Project = ();
+    fn load_project(&self, _root: &Path) -> anyhow::Result<()> { Ok(()) }
+    fn extract(&self, _project: &(), path: &RelPath, source: &str) -> FileGraph { … }
+}
+
+fn main() -> ! {
+    run(MyExtractor, PluginSpec::new("mylang", env!("CARGO_PKG_VERSION"), &[".ml"]), None)
+}
+```
+
+`testing::PluginCheck` runs `g-mesh plugins check` below from the plugin
+crate's own `#[test]`, so every check runs on every `cargo test`. The crate's
+module docs carry the contracts an extractor has to keep; `plugins/sdk/toy/`
+is a complete, deliberately tiny plugin built on it.
 
 ### Checking a plugin: `g-mesh plugins check`
 
