@@ -156,13 +156,19 @@
 //! case) a concrete, realistic shape: a `src/`-layout project with one file
 //! sitting beside `src/` rather than inside it.
 //!
-//! **Several independent roots.** `pyproject.toml` hints and the `src/`
-//! heuristic are not mutually exclusive - a project can declare more than
-//! one `[tool.poetry] packages` entry with different `from`s, or combine a
-//! `package-dir` hint with an unrelated `src/` directory the heuristic also
-//! finds. Every distinct directory named by either source becomes its own
-//! root, modeled as [`ProjectContext::roots`] returning more than one
-//! [`Root`] - the same "more than one, each independent" shape
+//! **Several independent roots.** One project can have more than one root,
+//! but only from *one* of the three sources - they are tried in order and
+//! the first that names anything wins outright, which is point 1's "not
+//! second-guessed by what this plugin happens to find on disk" applied to
+//! the whole list rather than to a single hint. So a project declaring two
+//! `[tool.poetry] packages` entries with different `from`s gets both of
+//! them as roots, while a project declaring one hint *and* holding an
+//! unrelated `src/` directory gets the hint alone - that `src/`'s files
+//! become orphans (Decision 5), the missing-answer side of the trade, not a
+//! phantom root the project never claimed. Where there is more than one,
+//! each is modeled as its own [`Root`] and
+//! [`ProjectContext::roots`] returns them all - the same "more than one,
+//! each independent" shape
 //! `plugins/rust/src/project::Crate` uses for several crates in one
 //! workspace, chosen over trying to nest or merge them because nothing about
 //! Python's import system requires two `sys.path` entries to relate to each
@@ -773,6 +779,27 @@ mod tests {
         assert_eq!(
             context.container_for(&RelPath::new("vendor-src/b/mod.py")),
             module("b.mod", Some("b"), "mod")
+        );
+    }
+
+    /// The other half of "the first source that names anything wins
+    /// outright": a project that declares its own root keeps that root even
+    /// when a `src/` directory holding Python sits right beside it. Pinned
+    /// because the doc used to promise the opposite (the two sources adding
+    /// up), and because the failure it prevents is silent - `src/side.py`
+    /// keyed as a top-level module `side` would be a root the project never
+    /// claimed, where an orphan is merely an answer withheld.
+    #[test]
+    fn a_declared_root_is_not_joined_by_a_stray_src_directory() {
+        let tree = Tree::new("hint-beats-src");
+        tree.write("pyproject.toml", "[tool.poetry]\npackages = [{ include = \"pkg\", from = \"lib\" }]\n");
+        tree.write("lib/pkg/mod.py", "");
+        tree.write("src/side.py", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("lib") }]);
+        assert_eq!(
+            context.container_for(&RelPath::new("src/side.py")),
+            ContainerInfo::Orphan { key: "orphan:src/side.py".to_string() }
         );
     }
 
