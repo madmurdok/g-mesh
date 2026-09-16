@@ -1004,6 +1004,50 @@ has run once - which is what keeps this doc's "Structural tiers may not
 semantic tier's alone, and without it the plugin logs one line and answers
 every `semanticPass` with an empty diff.
 
+#### Implementation notes (GM-282)
+
+GM-282 owns the full `plugins/go/conformance/expect.toml` GM-280/GM-281 left
+deliberately minimal, wires it into the CI plugin-check job GM-277 added, and
+adds a second CI job that runs it with `go` off `PATH`. Two decisions:
+
+1. **The fixture needed no new files.** Every ACCEPTANCE category (bare and
+   package-qualified calls, receiver/embedded/interface-dispatched calls,
+   implicit implementations, container imports, references, definition) had
+   a real site already in the nine-file fixture GM-280/GM-281 built for a
+   narrower purpose - `[[references]]` reuses `Server`'s own type (used at
+   several sites, never called, which is what makes it provable only by this
+   handler and not `[[callers]]`), and `[[definition]]` reuses
+   `Server.Addr`'s and `Placeholder`'s declarations. One deliberate
+   non-choice: `helper` (declared twice, unexported, in two containers) was
+   *not* used for a "file disambiguates an ambiguous name" `[[definition]]`
+   entry, because it cannot pass one. Go's `qualifiedName` carries no
+   container (unlike TypeScript's, which can differ between two same-named
+   declarations) - see this doc's Data Model, "Logical containers" - so
+   `find_definition`'s `file`-narrowed retry, which re-resolves by
+   `qualifiedName` alone (`expectations.rs`'s decision 3, since
+   `find_definition` has no `symbol_id`), lands on the same ambiguity a
+   second time for *any* two Go declarations that share a bare name. This
+   isn't a fixture gap to work around; it is verified and documented in
+   `expect.toml`'s own comment, matching this repo's own rule that a
+   constant belongs in the record once it is computed, not guessed at again
+   by the next reader.
+2. **A reduced expectation set is read out of the one file, not copied into
+   a second one.** `expect.toml` entries take an optional `tier =
+   "semantic"` (default `"structural"`); `g-mesh plugins check --expect
+   ... --skip-semantic-expectations` answers every tagged entry with `Skip`
+   in place, at the same id, instead of running it - so CI's "no toolchain"
+   job and its ordinary counterpart read the exact same file, and a new
+   entry is only ever exempted from the reduced run by a fixture author
+   deliberately tagging it, never by an id list this doc or a script would
+   have to keep in sync by hand. Full reasoning: `expectations.rs`'s module
+   doc, decision 6. The CI job that exercises this (`.github/workflows/
+   ci.yml`'s `go-plugin-without-toolchain`) still needs the toolchain to
+   *build* `plugins/go/g-mesh-plugin-go` (`core/build.rs`'s own `go build`),
+   so it installs Go, builds, and only then computes and switches to a `PATH`
+   with Go's own directory filtered out for the one check step - verified by
+   refusing to run that step at all if `go` still resolves afterward, rather
+   than assumed to have worked.
+
 ### Rust plugin (`plugins/rust`, on the SDK)
 
 - **Structure:** tree-sitter-rust.

@@ -773,6 +773,22 @@ fn the_go_plugin_passes_on_its_own_fixture() {
 /// so this does not assert the fixed `ALL_CHECKS` set the way `run_check`
 /// does - only that the command ran and captured output to inspect.
 fn run_check_with_expect(plugin_dir: &Path, fixture: &Path, expect: &Path) -> Run {
+    run_check_with_expect_env(plugin_dir, fixture, expect, &[], &[])
+}
+
+/// [`run_check_with_expect`], generalized with extra CLI args (GM-282's
+/// `--skip-semantic-expectations`) and an environment override (GM-282's
+/// `PATH` stripped of `go` - [`path_without_go`]). `env` is *added* to the
+/// spawned process's environment (`Command::env`, not `env_clear`), so
+/// everything not named here is inherited as usual; passing `PATH` replaces
+/// the inherited one rather than merging with it, which is the point.
+fn run_check_with_expect_env(
+    plugin_dir: &Path,
+    fixture: &Path,
+    expect: &Path,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+) -> Run {
     let output = Command::new(BIN)
         .args(["plugins", "check"])
         .arg(plugin_dir)
@@ -780,6 +796,8 @@ fn run_check_with_expect(plugin_dir: &Path, fixture: &Path, expect: &Path) -> Ru
         .arg(fixture)
         .arg("--expect")
         .arg(expect)
+        .args(extra_args)
+        .envs(env.iter().copied())
         .output()
         .expect("failed to run g-mesh plugins check --expect");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -797,6 +815,33 @@ fn run_check_with_expect(plugin_dir: &Path, fixture: &Path, expect: &Path) -> Ru
         }
     }
     Run { success: output.status.success(), stdout, outcomes }
+}
+
+/// The current process's `PATH` with every directory holding a `go`/`go.exe`
+/// binary removed - lifted from `plugins/go/semantic_test.go`'s own way of
+/// simulating "no toolchain installed" (`exec.LookPath` consults `PATH`
+/// only, so filtering by directory contents is exact, not an approximation)
+/// to the process this test spawns rather than the plugin's own unit tests.
+/// Filters by directory rather than deleting one known entry, since which
+/// directory holds `go` is a property of the machine running the test, not
+/// something this file can assume.
+fn path_without_go() -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let go_name = if cfg!(windows) { "go.exe" } else { "go" };
+    let kept: Vec<String> = std::env::split_paths(&path)
+        .filter(|dir| !dir.join(go_name).is_file())
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+    std::env::join_paths(kept).expect("filtered PATH must still join").to_string_lossy().into_owned()
+}
+
+/// Whether `go` resolves anywhere on `path` - [`path_without_go`]'s own
+/// sanity check, so a pass downstream is not mistaken for a real
+/// discrimination when it was actually still finding a toolchain some other
+/// way.
+fn path_has_go(path: &str) -> bool {
+    let go_name = if cfg!(windows) { "go.exe" } else { "go" };
+    std::env::split_paths(path).any(|dir| dir.join(go_name).is_file())
 }
 
 /// Writes a small `.fk` fixture project (the toy language `install_fake`'s
@@ -848,13 +893,13 @@ fn the_typescript_plugin_satisfies_its_own_expectations_file() {
 
 /// The Go plugin's own expectations, through the real linker and the real
 /// MCP handlers - GM-280's end-to-end proof that a container-scoped
-/// placeholder is an address core actually resolves, and GM-281's that a
+/// placeholder is an address core actually resolves, GM-281's that a
 /// `go/types` pass answers the three receiver shapes and finds implementers
-/// nothing in the syntax declares.
-///
-/// Deliberately a smaller set than the TS plugin's (GM-282 owns the full Go
-/// expectations file), so this asserts the three kinds that file does carry
-/// rather than every kind the kit supports.
+/// nothing in the syntax declares, and GM-282's that the remaining two kinds
+/// (`[[references]]`, `[[definition]]`) resolve too - the full set, every
+/// kind the kit supports, the same acceptance criterion
+/// `the_typescript_plugin_satisfies_its_own_expectations_file` checks for
+/// that plugin's own file.
 #[test]
 fn the_go_plugin_satisfies_its_own_expectations_file() {
     let run = run_check_with_expect(&go_plugin_dir(), &go_conformance_project(), &go_conformance_expect());
@@ -866,7 +911,7 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
         .filter(|id| id.starts_with("expectations.") && *id != "expectations.file")
         .collect();
     assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.references")), "{}", run.stdout);
     // GM-281: implicit interface satisfaction is in the file now, and it is
     // the one kind no structural tier could ever have produced.
     assert!(
@@ -874,8 +919,91 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
         "{}",
         run.stdout
     );
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.definition")), "{}", run.stdout);
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
+    }
+}
+
+/// GM-282's discrimination test for `--skip-semantic-expectations`, the Go
+/// counterpart to `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`
+/// above - except this drives the real toolchain dependency (`go` missing
+/// from `PATH`) rather than a manifest edit, the same way `plugins/go/
+/// semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
+/// measured it at the unit level first, and the same way CI's "no toolchain"
+/// job runs it for real.
+///
+/// Every `tier = "semantic"` entry in the fixture's own `expect.toml` (three
+/// `[[callers]]`, one `[[implementations]]`) must report `Skip`, in place,
+/// under the exact id it would otherwise carry - never silently absent from
+/// the report, and never re-numbered around the gap. Every other entry -
+/// bare and package-qualified calls, references, imports, definition - is
+/// untouched and still passes, which is what proves the reduction is exactly
+/// the tagged four and nothing else.
+#[test]
+fn the_go_plugin_without_a_toolchain_skips_only_the_semantic_tier_expectations() {
+    let path = path_without_go();
+    // Sanity first (this repo's own rule: a comparison must be shown capable
+    // of telling the arms apart before it is relied on) - `go` really is
+    // gone from this PATH, so a pass below is not an accident of the
+    // toolchain still being reachable some other way (GOROOT, a cached
+    // `go/packages` driver, ...).
+    assert!(
+        !path_has_go(&path),
+        "the filtered PATH still resolves `go` - this test would not be discriminating anything: {path}"
+    );
+
+    let run = run_check_with_expect_env(
+        &go_plugin_dir(),
+        &go_conformance_project(),
+        &go_conformance_expect(),
+        &["--skip-semantic-expectations"],
+        &[("PATH", &path)],
+    );
+    assert!(run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+
+    for id in [
+        "expectations.callers[4]",
+        "expectations.callers[5]",
+        "expectations.callers[6]",
+        "expectations.implementations[0]",
+    ] {
+        assert_eq!(run.outcome(id), "SKIP", "{id}:\n{}", run.stdout);
+    }
+    for id in [
+        "expectations.callers[0]",
+        "expectations.callers[1]",
+        "expectations.callers[2]",
+        "expectations.callers[3]",
+        "expectations.references[0]",
+        "expectations.imports[0]",
+        "expectations.definition[0]",
+        "expectations.definition[1]",
+    ] {
+        assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
+    }
+
+    // The same run, minus the flag: the four semantic entries now FAIL
+    // outright (the plugin really answered nothing, not "skipped by us") -
+    // the fact `--skip-semantic-expectations` exists to turn into a clean
+    // `Skip` instead.
+    let run_without_flag = run_check_with_expect_env(
+        &go_plugin_dir(),
+        &go_conformance_project(),
+        &go_conformance_expect(),
+        &[],
+        &[("PATH", &path)],
+    );
+    assert!(!run_without_flag.success, "{}", run_without_flag.stdout);
+    for id in [
+        "expectations.callers[4]",
+        "expectations.callers[5]",
+        "expectations.callers[6]",
+        "expectations.implementations[0]",
+    ] {
+        assert_eq!(run_without_flag.outcome(id), "FAIL", "{id}:\n{}", run_without_flag.stdout);
     }
 }
 

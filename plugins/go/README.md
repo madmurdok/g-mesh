@@ -28,6 +28,23 @@ g-mesh plugins check plugins/go \
   --expect  plugins/go/conformance/expect.toml
 ```
 
+A second CI job runs the same fixture and the same `expect.toml` with `go`
+removed from `PATH` and `--skip-semantic-expectations` added:
+
+```bash
+g-mesh plugins check plugins/go \
+  --fixture plugins/go/conformance/project \
+  --expect  plugins/go/conformance/expect.toml \
+  --skip-semantic-expectations
+```
+
+That flag answers every entry `expect.toml` tags `tier = "semantic"` with
+`Skip` instead of running it - the four that need the `go/types` pass (three
+`[[callers]]`, one `[[implementations]]`) - while the rest of the same file
+still runs and still has to pass. One file, not two: see `expectations.rs`'s
+module doc, decision 6, for why a reduced set is read out of the full file
+rather than kept as a second one that could drift out of sync by hand.
+
 ## The semantic pass
 
 Core sends `semanticPass` twice over: once per language after the cold-start

@@ -336,6 +336,98 @@ jobs:
             echo "no daemon log at $log - nothing ever wrote one, which is itself the answer"
           fi
 
+  # GM-282's other half of "the Go toolchain is available on all CI
+  # runners" (the `test` job above, all four platforms): one job proves the
+  # opposite - a `go` binary off `PATH` - and asserts the *reduced*
+  # expectation set `plugins/go/conformance/expect.toml`'s `tier =
+  # "semantic"` entries carve out (`expectations.rs`'s own module doc,
+  # decision 6). One OS is enough: this is a property of the plugin's own
+  # `exec.LookPath("go")` fallback, not of the runner - `plugins/go/
+  # semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
+  # already proved that at the unit level, and this job is its CI-facing,
+  # end-to-end counterpart.
+  go-plugin-without-toolchain:
+    name: Go plugin conformance (no toolchain on PATH)
+    runs-on: ubuntu-22.04
+    env:
+      RUST_VERSION: "1.97.1"
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustc -vV
+
+      # Needed only to BUILD plugins/go/g-mesh-plugin-go (core/build.rs's own
+      # `go build`, downgraded to a `cargo:warning` rather than a failure
+      # without a toolchain - see that file). The staged binary itself needs
+      # no toolchain to run; only its semantic tier does, by shelling out to
+      # `go list`/`go env` through golang.org/x/tools/go/packages, which is
+      # exactly what this job strips PATH of below, after the build. Without
+      # this step the binary is never produced at all, and the check step
+      # would fail on "failed to spawn" - a real failure, but not the one
+      # this job exists to prove.
+      #
+      # `cache: true`, matching the `test` job's own note: GM-281 gave
+      # plugins/go/go.mod its first real dependency (golang.org/x/tools),
+      # keyed off plugins/go/go.sum.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache: true
+          cache-dependency-path: plugins/go/go.sum
+
+      # Builds `g-mesh` and, as a side effect of core/build.rs, the Go
+      # plugin binary - with `go` still on PATH, unlike the check step below.
+      - name: Build g-mesh and the Go plugin
+        run: cargo build --manifest-path core/Cargo.toml --bin g-mesh
+
+      # Filters `go`'s own directory out of PATH rather than deleting a
+      # hardcoded one, since which directory `actions/setup-go` prepended is
+      # this step's own business, not something to hardcode and have drift.
+      # Verified rather than assumed (this repo's own rule): the step fails
+      # outright if `go` still resolves after filtering, so a change to how
+      # setup-go installs the toolchain would break this job loudly instead
+      # of quietly running the "no toolchain" job with a toolchain present.
+      - name: Compute PATH without the Go toolchain
+        id: no_go_path
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_dir="$(dirname "$(command -v go)")"
+          filtered="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$go_dir" | paste -sd: -)"
+          if PATH="$filtered" command -v go >/dev/null 2>&1; then
+            echo "go is still resolvable on PATH after filtering out $go_dir - refusing to claim this job \
+                  tests anything" >&2
+            exit 1
+          fi
+          echo "path=$filtered" >> "$GITHUB_OUTPUT"
+
+      # `--skip-semantic-expectations`: the four `tier = "semantic"` entries
+      # (three `[[callers]]`, one `[[implementations]]`) report `Skip`
+      # instead of running, and the rest of the same file - bare and
+      # package-qualified calls, references, imports, definition - must
+      # still pass. `PATH` is overridden for this one step only, so every
+      # earlier step (and cargo/git themselves here) keep the toolchain they
+      # needed to get this far.
+      - name: g-mesh plugins check plugins/go (--skip-semantic-expectations, no Go on PATH)
+        shell: bash
+        env:
+          PATH: ${{ steps.no_go_path.outputs.path }}
+        run: |
+          set -euo pipefail
+          if command -v go >/dev/null 2>&1; then
+            echo "go must not be resolvable in this step - PATH override did not take" >&2
+            exit 1
+          fi
+          cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
+            plugins check plugins/go --fixture plugins/go/conformance/project \
+            --expect plugins/go/conformance/expect.toml --skip-semantic-expectations
+
   lint:
     name: cargo clippy
     runs-on: ubuntu-22.04
