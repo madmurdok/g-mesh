@@ -166,7 +166,7 @@ jobs:
       # Pinned to the minor version plugins/go/go.mod requires, for the same
       # reason Node is pinned: a gate that changes underneath you is a gate
       # people stop reading.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
           cache: false
