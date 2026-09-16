@@ -20,8 +20,9 @@
 #
 # GM-288: since the repository became a cargo workspace (GM-284), `core/
 # Cargo.toml` is not the only manifest with a hand-pinned `version` -
-# `wire/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml`
-# each carry their own. Nothing forces them to agree with core's, and a crate
+# `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
+# since GM-298, `plugins/python/Cargo.toml` each carry their own. Nothing
+# forces them to agree with core's, and a crate
 # whose version silently drifts is the same class of failure #197 already
 # named, just in a manifest this script did not use to look at. Rather than
 # switching every member to `version.workspace = true` (root-Cargo.toml
@@ -107,6 +108,7 @@ OTHER_WORKSPACE_MANIFESTS=(
 	"wire/Cargo.toml"
 	"plugins/sdk/Cargo.toml"
 	"plugins/rust/Cargo.toml"
+	"plugins/python/Cargo.toml"
 )
 
 # The `version` of a manifest's `[package]` section. Same restriction as
@@ -238,10 +240,10 @@ main() {
 	[ "$crate_version" = "$version" ] ||
 		die "core/Cargo.toml says $crate_version, not $version - the release branch's first commit should have bumped it; fix core/Cargo.toml (or pass the version that's actually there) before tagging"
 
-	# GM-288: core/Cargo.toml agreeing with the tag is not enough on its own
-	# now that three more workspace members carry their own hand-pinned
-	# version - see this script's header comment for why this is a second
-	# check here rather than workspace-level inheritance.
+	# GM-288 (GM-298 added a fourth): core/Cargo.toml agreeing with the tag is
+	# not enough on its own now that four more workspace members carry their
+	# own hand-pinned version - see this script's header comment for why this
+	# is a second check here rather than workspace-level inheritance.
 	check_workspace_versions "$crate_version"
 
 	if [ "$skip_tests" -eq 1 ]; then
@@ -253,10 +255,11 @@ main() {
 		# GM-288: `--workspace` from the repo root, not `cd core && cargo
 		# test` - since GM-284 made the repository a cargo workspace, the
 		# latter tests core alone and would gate a release on green tests
-		# while shipping wire/, plugins/sdk and plugins/rust untested. Every
-		# one of those now ships inside every release archive (the Rust
-		# plugin, since GM-288), so a release gate that does not run their
-		# tests is not actually gating on them.
+		# while shipping wire/, plugins/sdk, plugins/rust and plugins/python
+		# untested. Every one of those now ships inside every release archive
+		# (the Rust plugin since GM-288, the Python plugin since GM-298), so a
+		# release gate that does not run their tests is not actually gating on
+		# them.
 		(cd "$REPO_ROOT" && cargo test --workspace) ||
 			die "cargo test --workspace failed - fix the failure before cutting a release"
 		test_end="$(date +%s)"

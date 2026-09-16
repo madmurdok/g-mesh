@@ -50,20 +50,30 @@
 #                                    discovers it through (built by
 #                                    scripts/bundle-rust-plugin.sh; see that
 #                                    script's own header for GM-288)
+#   plugins/python/                  the Python plugin: a cargo binary built
+#                                    in the same workspace as core, for the
+#                                    same target, and the plugin.toml core
+#                                    discovers it through (built by
+#                                    scripts/bundle-python-plugin.sh; see that
+#                                    script's own header for GM-298). No
+#                                    Python interpreter is required for the
+#                                    structural tier this ships today - a
+#                                    future semantic tier over pyright would
+#                                    need one installed separately.
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
 # The JS/TS plugin is not optional dressing: core cannot index a TypeScript
 # project without one, so an archive missing it is not a release artifact.
-# The Go and Rust plugins ship for the same reason, one language later each.
-# The Go plugin is the one that does cross-compile from any host
+# The Go, Rust and Python plugins ship for the same reason, one language
+# later each. The Go plugin is the one that does cross-compile from any host
 # (GOOS/GOARCH, CGO_ENABLED=0 - see scripts/bundle-go-plugin.sh); the other
-# two are built on their target's own runner. Every part of
+# three are built on their target's own runner. Every part of
 # an archive has to be for the *same* platform, which is why each target is
 # built on its own runner (see .github/workflows/release.yml) - the JS/TS
 # plugin embeds the build machine's own Node runtime and cannot be
-# cross-built, and the Rust plugin is built the same way core itself is
-# (`rustup target add` + `cargo build --target`, on that target's own
-# runner) rather than through a second, plugin-specific cross-build path -
+# cross-built, and the Rust and Python plugins are built the same way core
+# itself is (`rustup target add` + `cargo build --target`, on that target's
+# own runner) rather than through a second, plugin-specific cross-build path -
 # see scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
@@ -236,6 +246,8 @@ build_one() {
 		bash "$REPO_ROOT/scripts/bundle-go-plugin.sh" "$target" "$stage_dir/plugins"
 		log "bundling the Rust plugin for $target"
 		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-rust-plugin.sh" "$target" "$stage_dir/plugins"
+		log "bundling the Python plugin for $target"
+		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-python-plugin.sh" "$target" "$stage_dir/plugins"
 	fi
 
 	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
@@ -265,9 +277,10 @@ build_one() {
 		# The check task 64 could not make: that the *staged* binary finds the
 		# *staged* plugins, through the same discovery an unpacked archive uses
 		# (`plugins/` beside the executable). This is the one that fails if the
-		# path resolution regresses back to a compile-time path. Both bundled
+		# path resolution regresses back to a compile-time path. All bundled
 		# plugins are required, not just one - GM-288 added the Rust check
-		# alongside the JS/TS one that was already here.
+		# alongside the JS/TS one that was already here, and GM-298 adds the
+		# Python one the same way.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
 			log "smoke test: the staged binary discovers the staged plugins"
 			local plugins_output
@@ -278,6 +291,8 @@ build_one() {
 				die "the staged binary does not discover the go plugin staged beside it"
 			echo "$plugins_output" | grep -q "rust" ||
 				die "the staged binary does not discover the rust plugin staged beside it"
+			echo "$plugins_output" | grep -q "python" ||
+				die "the staged binary does not discover the python plugin staged beside it"
 		fi
 	else
 		log "smoke test skipped: $target is not the host ($host)"
