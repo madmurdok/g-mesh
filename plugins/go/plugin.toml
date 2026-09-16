@@ -26,9 +26,14 @@ plugin_version = "0.1.0"
 # fresh checkout with nothing extra to run by hand, as long as a Go
 # toolchain is on PATH - and degrade to a clear "failed to spawn" error,
 # not a build failure, when one is not (the same best-effort contract
-# build.rs already documents for npm). GM-283 (distribution) is what ships
-# this binary inside a release archive instead of building it from a
-# checkout.
+# build.rs already documents for npm). This exact command line - no `.exe`
+# on any platform - is a dev-checkout contract, not a release one: GM-283
+# (distribution) does not reuse this file for a release archive. It
+# generates a separate, installed manifest per target
+# (scripts/bundle-go-plugin.sh) whose command names that target's actual
+# binary (`g-mesh-plugin-go.exe` on Windows), the same way
+# plugins/typescript/plugin.toml's checked-in dev manifest is never the one
+# an archive ships either (see scripts/bundle-plugin.sh).
 command = "./g-mesh-plugin-go"
 
 [plugin.languages]

@@ -40,16 +40,24 @@
 #                                    executable, its native addons, and the
 #                                    plugin.toml core discovers it through
 #                                    (built by scripts/bundle-plugin.sh)
+#   plugins/go/                      the Go plugin as one static,
+#                                    CGO-free binary cross-compiled for this
+#                                    target, and the plugin.toml core
+#                                    discovers it through (built by
+#                                    scripts/bundle-go-plugin.sh)
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
-# The plugin is not optional dressing: core cannot index anything without one,
-# so an archive without it is not a release artifact. Both halves have to be
-# for the *same* platform, which is why each target is built on its own runner
-# (see .github/workflows/release.yml) - a single-executable plugin embeds the
-# build machine's own Node runtime and cannot be cross-built.
+# Neither plugin is optional dressing: core cannot index a language without
+# one, so an archive missing either is not a complete release artifact. The
+# two plugins are bundled differently for the same reason they are bundled at
+# all - the JS/TS plugin's single-executable build embeds the build machine's
+# own Node runtime and so has to be built on a runner *for* its target (see
+# .github/workflows/release.yml), while the Go plugin has no such runtime to
+# embed and cross-compiles for any of the four targets from any one of them
+# (`GOOS`/`GOARCH`, `CGO_ENABLED=0` - see scripts/bundle-go-plugin.sh).
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
-# without a plugin: exercising the Rust cross-build path (macOS x86_64 ->
+# without either plugin: exercising the Rust cross-build path (macOS x86_64 ->
 # aarch64 does work) when the resulting archive is known not to be shippable.
 # It warns loudly, because that is exactly the state task 64 shipped in and
 # task 65 was opened to fix.
@@ -205,10 +213,13 @@ build_one() {
 	# is where `daemon::manifest::bundled_roots` looks in an installed layout,
 	# which is what makes the unpacked archive work from any directory.
 	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
-		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugin. The resulting archive CANNOT index anything and must not be published." >&2
+		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugins. The resulting archive CANNOT index anything and must not be published." >&2
 	else
 		log "bundling the JS/TS plugin for $target"
 		bash "$REPO_ROOT/scripts/bundle-plugin.sh" "$target" "$stage_dir/plugins"
+
+		log "bundling the Go plugin for $target"
+		bash "$REPO_ROOT/scripts/bundle-go-plugin.sh" "$target" "$stage_dir/plugins"
 	fi
 
 	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
@@ -236,13 +247,17 @@ build_one() {
 		esac
 
 		# The check task 64 could not make: that the *staged* binary finds the
-		# *staged* plugin, through the same discovery an unpacked archive uses
+		# *staged* plugins, through the same discovery an unpacked archive uses
 		# (`plugins/` beside the executable). This is the one that fails if the
 		# path resolution regresses back to a compile-time path.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
-			log "smoke test: the staged binary discovers the staged plugin"
-			"$stage_dir/$bin_name" plugins list | grep -q "typescript" ||
-				die "the staged binary does not discover the plugin staged beside it"
+			log "smoke test: the staged binary discovers the staged plugins"
+			local plugins_output
+			plugins_output="$("$stage_dir/$bin_name" plugins list)"
+			echo "$plugins_output" | grep -q "typescript" ||
+				die "the staged binary does not discover the typescript plugin staged beside it"
+			echo "$plugins_output" | grep -q "go" ||
+				die "the staged binary does not discover the go plugin staged beside it"
 		fi
 	else
 		log "smoke test skipped: $target is not the host ($host)"

@@ -18,13 +18,15 @@
 # ---------------------------------------------------------------------------
 # WHAT THESE ARTIFACTS ARE
 #
-# Since task #65 each archive carries both halves of a working install: the
-# core binary, and the JS/TS plugin compiled to a self-contained executable
-# (Node's SEA - it embeds the runtime, so the machine needs no Node.js) in
-# `plugins/typescript/`, which is where `daemon::manifest::bundled_roots` looks
-# beside the executable. `scripts/install.sh` (#66) fetches exactly these
-# assets, by the URLs the section below fixes, and verifies the `.sha256`
-# beside each archive before it unpacks anything.
+# Since task #65 each archive carries a working install: the core binary and
+# the JS/TS plugin compiled to a self-contained executable (Node's SEA - it
+# embeds the runtime, so the machine needs no Node.js) in `plugins/typescript/`.
+# Since GM-283 it also carries the Go plugin, one static `CGO_ENABLED=0`
+# binary cross-compiled for the target in `plugins/go/`. Both live where
+# `daemon::manifest::bundled_roots` looks beside the executable.
+# `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
+# section below fixes, and verifies the `.sha256` beside each archive before
+# it unpacks anything.
 #
 # ---------------------------------------------------------------------------
 # HOW TO CUT A RELEASE
@@ -66,9 +68,12 @@
 # and only the `<version>` and `<target>` parts vary - which is why the names
 # are generated, not typed.
 #
-# This is also why every job needs Node: the plugin is built here, and the
+# This is also why every job needs Node: the TS plugin is built here, and the
 # runtime it embeds is the one `setup-node` installs on that runner. Pinning
-# that version pins what ships.
+# that version pins what ships. Every job also needs Go, for the second
+# bundled plugin (`plugins/go`, GM-283) - `setup-go` only, no per-target
+# runner requirement, since that plugin cross-compiles instead of embedding a
+# runtime (see scripts/bundle-go-plugin.sh).
 # ---------------------------------------------------------------------------
 #
 # WHY A MATRIX ON NATIVE RUNNERS, NOT TRUE CROSS-COMPILATION
@@ -135,6 +140,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/build-targets.sh"
       - "scripts/bundle-plugin.sh"
+      - "scripts/bundle-go-plugin.sh"
       - "scripts/prepare-release-assets.sh"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
@@ -230,6 +236,19 @@ jobs:
         with:
           node-version: "22.x"
 
+      # The Go plugin (plugins/go, GM-283) needs no native runner - it
+      # cross-compiles a static, CGO-free binary for any target from any
+      # host (`GOOS`/`GOARCH`, `CGO_ENABLED=0`; see
+      # scripts/bundle-go-plugin.sh) - but `go build` itself still has to
+      # exist on PATH. `go-version-file` reads plugins/go/go.mod so the
+      # toolchain version installed here can never drift from the one the
+      # module declares. `cache: false` because that module has zero
+      # dependencies (no go.sum to key a cache on).
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: plugins/go/go.mod
+          cache: false
+
       # All naming/staging/archiving lives in the script so that what CI
       # produces is exactly what a developer can reproduce locally. Invoked via
       # `bash` rather than as an executable because the checkout on Windows
@@ -253,6 +272,7 @@ jobs:
             echo "target=${{ matrix.target }}"
             echo "runner=${{ matrix.runner }}"
             echo "node=$(node --version)"
+            echo "go=$(go version)"
             echo "rustc=$(rustc --version)"
           } > "dist/meta/${{ matrix.target }}.txt"
           cat "dist/meta/${{ matrix.target }}.txt"
@@ -366,8 +386,8 @@ jobs:
           {
             echo "## Downloads"
             echo
-            echo "| target | archive | Node runtime inside | built with |"
-            echo "| --- | --- | --- | --- |"
+            echo "| target | archive | Node runtime inside | Go compiler used | built with |"
+            echo "| --- | --- | --- | --- | --- |"
             for target in $(bash scripts/build-targets.sh --list); do
               # First line is the archive, second is its .sha256. Piping to
               # `head -1` would risk a SIGPIPE failure under `pipefail`.
@@ -375,20 +395,23 @@ jobs:
               archive="${names%%$'\n'*}"
 
               node="unknown"
+              go="unknown"
               rustc="unknown"
               meta="dist/meta/$target.txt"
               if [ -f "$meta" ]; then
                 node="$(awk -F= '$1 == "node" { print $2 }' "$meta")"
+                go="$(awk -F= '$1 == "go" { print $2 }' "$meta")"
                 rustc="$(awk -F= '$1 == "rustc" { print $2 }' "$meta")"
               fi
 
-              echo "| \`$target\` | \`$archive\` | $node | $rustc |"
+              echo "| \`$target\` | \`$archive\` | $node | $go | $rustc |"
             done
 
             echo
-            echo "Every archive unpacks to a directory holding the \`g-mesh\` binary and the"
-            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`. The"
-            echo "machine running it needs no Node.js and no toolchain; \`g-mesh model fetch\`"
+            echo "Every archive unpacks to a directory holding the \`g-mesh\` binary, the"
+            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, and"
+            echo "the Go plugin as a static binary in \`plugins/go/\`. The machine running it"
+            echo "needs no Node.js, no Go and no other toolchain; \`g-mesh model fetch\`"
             echo "downloads the embedding model \`search_code\` needs."
             echo
             echo "### Verifying a download"

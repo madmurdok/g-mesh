@@ -633,8 +633,16 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
   - Per-file pass: re-check the file's package, reusing the loaded dependency
     packages. Dependents' edges into a changed package are refreshed when they are
     next checked, the same staleness TS accepts today.
-- **Distribution:** a static binary per target via `GOOS`/`GOARCH` cross-compile.
-  No native runner and no embedded runtime.
+- **Distribution:** a static binary per target via `GOOS`/`GOARCH` cross-compile,
+  `CGO_ENABLED=0`. No native runner and no embedded runtime - `.github/workflows
+  /release.yml` still builds each target on its own runner (the JS/TS plugin and
+  the Rust binary both need to), but unlike those two, the Go binary could be
+  built for all four targets from any single one of those runners; it stays in
+  the same per-target loop only because that is where `scripts/build-targets.sh`
+  already runs (`scripts/bundle-go-plugin.sh`, called there alongside
+  `scripts/bundle-plugin.sh`). See "Implementation notes (GM-279)" point 6
+  below for the per-target manifest this generates to close the Windows
+  binary-naming gap the dev-checkout build leaves open.
 
 #### Implementation notes (GM-279)
 
@@ -715,9 +723,25 @@ GM-281 do not have to re-derive them:
    test`/`g-mesh plugins check`/`g-mesh plugins list` all work from a fresh
    checkout with nothing extra to run by hand. `plugin.toml`'s `command =
    "./g-mesh-plugin-go"` has no `.exe` suffix, so this only produces a
-   spawnable binary on macOS/Linux today; Windows naming is left to GM-283
-   (distribution), which already owns per-target binary naming for the
-   release matrix.
+   spawnable binary on macOS/Linux today; Windows naming was left to GM-283
+   (distribution), which owns per-target binary naming for the release
+   matrix - resolved there (see "Distribution" above and
+   `scripts/bundle-go-plugin.sh`'s own header comment) by generating a
+   separate, per-target manifest for the archive rather than by editing this
+   checked-in one: the archive's `plugin.toml` is derived from this file with
+   only its `command` line rewritten to the binary actually staged beside it
+   (`g-mesh-plugin-go.exe` for the Windows target), so the dev-checkout
+   contract above is unchanged and the two manifests cannot drift apart on
+   every other field. Verified before relying on it: `go build -o
+   g-mesh-plugin-go .` with `GOOS=windows` does **not** append `.exe` on its
+   own when `-o` names the output explicitly (only when `-o` is omitted), so
+   the rewrite is required, not cosmetic - and separately, Rust's own
+   `std::process::Command` resolver on Windows (`resolve_exe` in
+   `library/std/src/sys/process/windows.rs`) would likely have tolerated the
+   unmodified name too (it tries `<path>.exe` first, then falls back to the
+   literal path, which Windows can execute directly via its full path
+   regardless of extension), but a release archive should not depend on that
+   fallback when naming the file correctly costs one generated manifest.
 
 ### Rust plugin (`plugins/rust`, on the SDK)
 
