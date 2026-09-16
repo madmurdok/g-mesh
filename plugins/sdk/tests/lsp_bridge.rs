@@ -209,6 +209,13 @@ fn semantic_edges(answer: &SemanticAnswer) -> Vec<&WireEdge> {
     answer.diff.upsert_edges.iter().filter(|edge| edge.source == SourceTier::Semantic).collect()
 }
 
+/// How many times the scripted server was asked `method`, from the log it
+/// was told to keep. A question counted rather than assumed is the only way
+/// to assert that a follow-up was *not* sent.
+fn asked(log: &Path, method: &str) -> usize {
+    std::fs::read_to_string(log).unwrap_or_default().lines().filter(|line| line.trim() == method).count()
+}
+
 fn placeholder<'a>(answer: &'a SemanticAnswer, edge: &WireEdge) -> &'a WireNode {
     answer
         .diff
@@ -371,6 +378,80 @@ fn a_server_that_reports_no_progress_is_ready_once_it_has_settled() {
     assert!(started.elapsed() < Duration::from_secs(10), "it settled rather than waiting out readiness");
 }
 
+/// A server whose startup is a *sequence* of progress tokens is not ready in
+/// the gaps between them - GM-290's correction to GM-289's rule 1.
+///
+/// The scripted server runs two phases with a 150ms gap and answers `null` to
+/// everything until the second one ends. Under the rule this replaces - "once
+/// a progress has begun, ready when all of them have ended" - the bridge asks
+/// in that gap, is told nothing, and records nothing while reporting the pass
+/// complete. The 300ms quiet period cannot be satisfied by a 150ms gap, so
+/// the question waits for the real end and gets the real answer.
+///
+/// This is the fixture shape a real rust-analyzer produces: `Fetching` ends,
+/// `Building CrateGraph` begins 0.28s later, and the whole startup is not
+/// over for another eight seconds.
+#[test]
+fn a_gap_between_two_progress_phases_is_not_readiness() {
+    let scratch = Scratch::new("phases");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "phases": [
+            { "token": "fetching", "beginAfterMs": 0, "holdMs": 50 },
+            { "token": "indexing", "beginAfterMs": 50, "holdMs": 50 },
+        ]},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    // Forty times the scripted gap. The margin is not fussiness: the gap is a
+    // `sleep` on a machine that may be loaded, and a settle merely twice as
+    // long lets a stretched 50ms sleep satisfy it - which is the bug this
+    // test exists to catch, passing itself off as the fix. Measured: at load
+    // average 500 this failed with a 150ms gap against a 300ms settle.
+    budgets.settle = Duration::from_millis(2_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&answer).len(),
+        1,
+        "the gap between two phases is not the end of indexing: {:#?}",
+        answer.diff
+    );
+    assert!(answer.complete);
+}
+
+/// The quiet period is a per-server cost, not a per-pass one.
+///
+/// A server that reports no progress at all becomes ready purely by the
+/// clock, so the first pass pays the whole settle; the second must pay none
+/// of it, or every per-file pass after an edit would spend it again.
+#[test]
+fn the_settle_is_paid_once_per_server_rather_than_once_per_pass() {
+    let scratch = Scratch::new("settle-once");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(900);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let first = std::time::Instant::now();
+    assert_eq!(semantic_edges(&pass(&mut bridge, &index)).len(), 1);
+    let first = first.elapsed();
+    let second = std::time::Instant::now();
+    assert_eq!(semantic_edges(&pass(&mut bridge, &index)).len(), 1);
+    let second = second.elapsed();
+
+    assert!(first >= Duration::from_millis(800), "the first pass waits out the settle: {first:?}");
+    assert!(second < Duration::from_millis(400), "the second pass does not: {second:?}");
+}
+
 /// Readiness is not only a startup condition. The server begins a second
 /// progress just before answering the first question, answers `null` while it
 /// runs, and ends it 300ms later. The empty answer must be re-asked rather
@@ -434,9 +515,11 @@ fn an_implementation_becomes_a_supertype_edge_from_the_implementor() {
     );
     index.insert(r, "type Robot\n".to_string(), builder.finish());
 
+    let log = scratch.path().join("asked.log");
     let mut config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
+        "log": log.to_string_lossy(),
         "answers": [{
             // The request lands on the *name*, not on the `trait` keyword the
             // node's range starts at.
@@ -460,6 +543,100 @@ fn an_implementation_becomes_a_supertype_edge_from_the_implementor() {
     let target = node.target.as_ref().expect("a pending symbol always carries its address");
     assert_eq!(target.key, TargetKey::QualifiedName("Greeter".to_string()));
     assert!(answer.complete);
+
+    // The other half of GM-290's second hop: a location that already names a
+    // declaration costs no extra question at all.
+    assert_eq!(
+        asked(&log, "textDocument/definition"),
+        0,
+        "an implementation answer that resolved needs no follow-up"
+    );
+}
+
+/// The second hop (GM-290): an implementation answer that lands on no
+/// declaration is resolved with one `textDocument/definition` at that very
+/// position.
+///
+/// This is rust-analyzer's real shape, in miniature. `r.toy`'s second line is
+/// the implementing construct - an `impl` header, which no plugin emits a
+/// node for - and the server answers `implementation` with a position inside
+/// it. Without the follow-up, [`SdkIndex::node_at`] finds only the file, a
+/// file is never an answer's target, and the whole sweep produces nothing;
+/// with it, the declaration on line 0 is found and the edge starts there.
+#[test]
+fn an_implementation_answer_on_no_declaration_is_resolved_with_one_more_question() {
+    let scratch = Scratch::new("implementation-site");
+    const R_TOY: &str = "type Robot\nimpl Greeter for Robot\n";
+    scratch.write("src/t.toy", "trait Greeter\n");
+    scratch.write("src/r.toy", R_TOY);
+
+    let mut index = SdkIndex::new();
+    let t = RelPath::new("src/t.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &t);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Type, "Greeter", "Greeter", range(0, 0, 0, 13))
+            .native_kind("trait")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(t, "trait Greeter\n".to_string(), builder.finish());
+
+    let r = RelPath::new("src/r.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &r);
+    builder.file_node(range(0, 0, 2, 0));
+    // The declaration covers line 0 only. Line 1 - the `impl` header the
+    // server points at - is deliberately inside no node but the file's.
+    let robot = builder.add_node(
+        NodeSpec::new(NodeKind::Type, "Robot", "Robot", range(0, 0, 0, 10))
+            .native_kind("struct")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(r, R_TOY.to_string(), builder.finish());
+
+    let log = scratch.path().join("asked.log");
+    let mut config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "log": log.to_string_lossy(),
+        "answers": [
+            {
+                "uri": scratch.uri("src/t.toy"),
+                "line": 0,
+                "character": 6,
+                // `Robot` in `impl Greeter for Robot`, not the declaration.
+                "implementation": [{ "uri": scratch.real_uri("src/r.toy"), "line": 1, "character": 17 }],
+            },
+            {
+                // The follow-up, answered the way a server answers "what is
+                // this name": with the declaration itself.
+                "uri": scratch.uri("src/r.toy"),
+                "line": 1,
+                "character": 17,
+                "definition": { "uri": scratch.real_uri("src/r.toy"), "line": 0, "character": 5 },
+            },
+        ],
+    }));
+    config.implementation_kinds = vec!["trait".to_string()];
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "the second hop found the declaration: {:#?}", answer.diff);
+    assert_eq!(edges[0].kind, EdgeKind::SupertypeOf);
+    assert_eq!(edges[0].from_id, robot, "the edge starts at the declaration, not at the impl");
+
+    let node = placeholder(&answer, edges[0]);
+    assert_eq!(node.file_path, "src/r.toy");
+    assert_eq!(
+        node.target.as_ref().map(|target| &target.key),
+        Some(&TargetKey::QualifiedName("Greeter".to_string()))
+    );
+    assert!(answer.complete);
+
+    assert_eq!(asked(&log, "textDocument/implementation"), 1, "one sweep question");
+    assert_eq!(asked(&log, "textDocument/definition"), 1, "and exactly one follow-up, never a third");
 }
 
 /// A question the server simply never answers costs its own budget and

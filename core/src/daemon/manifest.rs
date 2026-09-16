@@ -70,6 +70,32 @@ use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 
+/// Where a spawned plugin is told to find the manifest core read about it.
+///
+/// Must match `g_mesh_plugin_sdk::MANIFEST_PATH_ENV`. Spelled out here rather
+/// than imported because core deliberately does not depend on the plugin SDK;
+/// a divergence shows up as an SDK plugin falling back to its in-code spec,
+/// which is exactly the failure this variable exists to prevent.
+///
+/// # Why core sets it at all
+///
+/// An SDK plugin re-reads its own `plugin.toml` - for the walk's
+/// `exclude_dirs`, and since GM-289 for `[plugin.semantic]`, the language
+/// server behind its semantic tier. Left to itself it looks for the manifest
+/// *beside its own executable*, which is true of an installed layout and
+/// false of a cargo checkout, where the binary is in `target/debug/` and the
+/// manifest is in `plugins/<language>/`.
+///
+/// That mismatch is silent and one-sided: core reads the manifest, sees
+/// `capabilities.semantic_pass = true`, and sends a `semanticPass`; the
+/// plugin finds no manifest, has no `[plugin.semantic]`, and degrades to
+/// structural for the life of the process. Two readers of one file disagreed
+/// about where the file was. Telling the plugin the path core actually used
+/// removes the question - it is the same thing
+/// `g_mesh_plugin_sdk::testing::PluginCheck` already does for the manifest it
+/// writes, and for the same stated reason.
+pub const MANIFEST_PATH_ENV: &str = "G_MESH_PLUGIN_MANIFEST";
+
 /// Overrides [`default_roots`]'s entire return value with a single directory.
 /// Generalizes `daemon::plugin::PLUGIN_PATH_ENV` (the JS/TS-only, test-only
 /// entry-point override that predates this module): a test drops whatever
@@ -275,12 +301,22 @@ pub struct PluginManifest {
     /// Kept on the resolved struct for error messages and fingerprinting
     /// (walking every file under it), not just as a read-time detail.
     pub manifest_dir: PathBuf,
+    // `path()` below is the file this was read from - see `MANIFEST_PATH_ENV`.
     /// Parsed `[plugin.capabilities]`, or [`Capabilities::default`] if the
     /// table is absent - see this module's doc comment.
     pub capabilities: Capabilities,
     /// Parsed `[plugin.workspace]`, or [`WorkspaceConfig::default`] if the
     /// table is absent - see this module's doc comment.
     pub workspace: WorkspaceConfig,
+}
+
+impl PluginManifest {
+    /// The file this manifest was read from - what every spawn site hands the
+    /// plugin as [`MANIFEST_PATH_ENV`], so the plugin reads the same file core
+    /// did rather than looking for one beside its own binary.
+    pub fn path(&self) -> PathBuf {
+        self.manifest_dir.join(MANIFEST_FILE_NAME)
+    }
 }
 
 /// Reads and validates `<dir>/plugin.toml`.

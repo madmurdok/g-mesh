@@ -25,3 +25,22 @@ fn main() {
 fn forbidden() -> u8 {
     crate_only()
 }
+
+/// GM-290's cross-crate implementation case: a type of *this* crate
+/// implementing a trait of the other one.
+///
+/// `Loud` is not imported by item here - it arrives through
+/// `use alpha::prelude::*` at the top of this file - so the structural tier
+/// emits nothing for the `impl` below: not an edge, and not even an open
+/// site (see `crates/alpha/src/prelude.rs`'s own comment for the resolution
+/// path). `find_implementations` on `shapes::Loud` therefore answers
+/// `{Circle}` structurally and `{Circle, Megaphone}` after a semantic pass,
+/// which is what makes `conformance/expect.toml`'s entry for it a real
+/// measurement of the rust-analyzer tier rather than of the parser.
+pub struct Megaphone;
+
+impl Loud for Megaphone {
+    fn speak(&self) -> &'static str {
+        "BETA"
+    }
+}

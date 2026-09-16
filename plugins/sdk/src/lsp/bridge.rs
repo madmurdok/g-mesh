@@ -138,16 +138,52 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   the implementing declaration to a placeholder addressing the anchor.
 ///   That is the direction `find_implementations` walks.
 ///
-/// **An `Implementation` open site is deliberately not asked.** The one that
-/// exists today (`plugins/rust`'s `impl Trait for T` where `T` is declared in
-/// another file) records the position of `T`, the *subtype*, while the edge it
-/// wants runs from `T` to the trait. `definition` at that position answers
-/// "where is T", which is the wrong end, and `implementation` there answers
-/// "what implements T", which is a different question. Neither turns into the
-/// missing edge, so the bridge counts these sites and says so rather than
-/// inventing an answer; the same fact is reachable from the other end, by
-/// asking `implementation` on the trait's own node. See this task's notes in
-/// `docs/architecture/multi-language-plugins.md` for what would close it.
+/// # An implementation answer names a *site*, and a site is not a declaration
+///
+/// GM-289 assumed the location an `implementation` answer carries is the
+/// implementing declaration, so that [`SdkIndex::node_at`] turns it straight
+/// into the edge's `from`. That holds for a language whose implementations
+/// are declarations - Go's `implementation` on an interface points at the
+/// concrete type - and it is false for every language that implements
+/// through a construct of its own. rust-analyzer answers `implementation` on
+/// a trait with one `LocationLink` per `impl` block, whose
+/// `targetSelectionRange` is the implementing type's name *inside the impl
+/// header*: for `impl Shape for Square` it is the `Square` on the `impl`
+/// line, not the `struct Square` six lines earlier. No plugin emits a node
+/// for an `impl` block - it declares nothing of its own - so `node_at` finds
+/// only the enclosing `File`, which is never an answer's target, and the
+/// sweep produced nothing at all.
+///
+/// So an implementation location that does not land on a declaration this
+/// index knows gets **one more question**: `textDocument/definition` at that
+/// very position, which is the server's own way of being asked "what is
+/// this name". Measured on rust-analyzer: `implementation` on `Loud` returns
+/// `shapes.rs:81:14` and `beta/src/main.rs:30:14`, both `impl` headers, and
+/// `definition` at those two answers `shapes.rs:33:11` (`struct Circle`) and
+/// `beta/src/main.rs:28:11` (`struct Megaphone`) - the declarations the edges
+/// have to start at, one of them in another crate of the workspace.
+///
+/// The second hop is asked **only when the first answer did not resolve**, so
+/// a server that already points at a declaration pays nothing, and it is
+/// asked only for a location in a file this index holds - a definition
+/// outside the project cannot become an edge whatever it says. It never
+/// spawns a third: an `Implementor` answer is read as a declaration or
+/// dropped.
+///
+/// **An `Implementation` open site is still deliberately not asked**, and the
+/// sweep above is why it does not need to be. The site that exists today
+/// (`plugins/rust`'s `impl Trait for T` where `T` is declared in another
+/// file) records the position of `T`, the *subtype*, while the edge it wants
+/// runs from `T` to the trait - and the site carries no position for the
+/// trait at all, so `definition` there answers "where is T", the wrong end,
+/// and `implementation` there answers "what implements T", a different
+/// question. Neither reconstructs the missing edge. Asking the trait instead
+/// reconstructs all of it, including the shapes no open site is recorded for
+/// at all: `impl Trait for T` where the *trait* came through a glob import
+/// gets no edge and no site from `plugins/rust`, and the sweep finds it
+/// anyway. The bridge therefore counts these sites and says so rather than
+/// inventing an answer. See `docs/architecture/multi-language-plugins.md`'s
+/// "Implementation notes (GM-290)" for the argument in full.
 ///
 /// # Readiness (decision 4)
 ///
@@ -158,23 +194,42 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// end (`$/progress` for indexing) before asking, within the pass timeout. An
 /// empty answer before readiness is never recorded as 'no target'" - and
 /// `$/progress` is optional and server-specific, so "waits for progress end"
-/// needs a definition for the servers that send none:
+/// needs a definition both for the servers that send none and for the ones
+/// that send *several*.
 ///
-/// 1. If a work-done progress has **begun**, the server is ready when all of
-///    them have ended.
-/// 2. If none has begun within [`Budgets::settle`] of `initialized`, the
-///    server is one that does not report progress, and is ready. A server
-///    that answers immediately is not penalised beyond those two seconds,
-///    paid once per server rather than once per pass.
-/// 3. If neither happens within [`Budgets::readiness`] (or the pass budget,
-///    whichever comes first), the pass is **incomplete** and asks nothing. It
-///    does not record "no target" for a single site, which is the whole point.
+/// **The rule is one quiet period, not one token** (GM-290): the server is
+/// ready when it has had nothing in flight for [`Budgets::settle`]
+/// continuously. If that has not happened within [`Budgets::readiness`] (or
+/// the pass budget, whichever comes first), the pass is **incomplete** and
+/// asks nothing - it does not record "no target" for a single site, which is
+/// the whole point.
+///
+/// That single rule subsumes the two GM-289 wrote, and it replaces the first
+/// of them because measurement showed it wrong. GM-289's rule 1 was "once a
+/// progress has begun, the server is ready when all of them have ended", and
+/// a real rust-analyzer reports its startup as a *sequence* of tokens with
+/// gaps between them - `Fetching`, then `Building CrateGraph`, then `Roots
+/// Scanned`, then `Building compile-time-deps`, `Loading proc-macros` and
+/// `cachePriming`, each one begun after the previous ended. Traced against
+/// the Rust plugin's own conformance fixture: the active set first emptied
+/// 5.83s in, in a 0.28s gap, and the last token ended at 14.21s. A bridge
+/// that believed the first gap asked every one of its questions ten seconds
+/// early and was answered `null` to all of them - measured, not feared, in
+/// the first run of that trace. A quiet period cannot be fooled by a gap
+/// shorter than itself, and it still answers the no-progress case the way
+/// GM-289's rule 2 did: a server that says nothing is quiet from birth, so it
+/// is ready exactly [`Budgets::settle`] after the client starts.
+///
+/// The settle is paid **once per server**, not once per pass. After a server
+/// has been quiet for a full settle it has shown which shape it is, and a
+/// later pass waits only for whatever is in flight now - otherwise the
+/// per-file pass that follows every edit would spend two of its ninety
+/// seconds proving a point that was already settled.
 ///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
-/// arrives while a progress is in flight is therefore re-asked once, after
-/// waiting for that progress to end, and only the second empty answer is
-/// believed.
+/// arrives before the server is quiet again is therefore re-asked once, after
+/// the quiet period returns, and only the second empty answer is believed.
 ///
 /// # Retraction (decision 5)
 ///
@@ -385,19 +440,15 @@ impl LspBridge {
 
     /// Waits until the server is ready to be believed - see this type's doc
     /// on readiness.
+    ///
+    /// [`LspClient::settle`] is what turns the quiet period from a per-pass
+    /// cost into a per-server one.
     fn wait_ready(client: &mut LspClient, budgets: &Budgets, deadline: Instant, language: &str) -> bool {
         let started = Instant::now();
         let until = deadline.min(started + budgets.readiness);
-        let settle = started + budgets.settle;
         loop {
             client.drain();
-            if client.progress_begun() {
-                if !client.busy() {
-                    return true;
-                }
-            } else if Instant::now() >= settle {
-                // A server that reports no progress at all is ready as soon as
-                // it has had a moment to say otherwise - see rule 2.
+            if client.settle(budgets.settle) {
                 return true;
             }
             let now = Instant::now();
@@ -457,12 +508,21 @@ enum Ask {
     Definition(OpenSite),
     /// A declaration other declarations may implement: who implements it.
     Implementation { anchor: String },
+    /// The second hop of an implementation answer: what declaration is at the
+    /// site the server pointed at - see [`LspBridge`]'s doc on why a site is
+    /// not a declaration.
+    ///
+    /// `for_file` is the *anchor's* file, not this question's, because that is
+    /// where the whole sweep's answers are remembered for retraction: a later
+    /// pass over the trait re-derives its implementors, and a pass over some
+    /// implementor's file has no idea the sweep ever happened.
+    Implementor { anchor: String, for_file: RelPath },
 }
 
 impl Question {
     fn method(&self) -> &'static str {
         match self.ask {
-            Ask::Definition(_) => "textDocument/definition",
+            Ask::Definition(_) | Ask::Implementor { .. } => "textDocument/definition",
             Ask::Implementation { .. } => "textDocument/implementation",
         }
     }
@@ -766,6 +826,31 @@ fn locations(result: &Value) -> Vec<ServerLocation> {
     out
 }
 
+/// The file a location is in, when this index holds it at all.
+///
+/// Separate from [`node_at`] because the two "no" answers are different
+/// questions: a location in a file nothing indexed can never become an edge,
+/// while a location in a file this index *does* hold, at a position no
+/// declaration covers, is exactly the case the second hop was added for.
+fn file_at(index: &SdkIndex, roots: [&Path; 2], location: &ServerLocation) -> Option<RelPath> {
+    let absolute = path_from_uri(&location.uri)?;
+    let relative = roots.iter().find_map(|root| absolute.strip_prefix(root).ok())?;
+    let path = RelPath::new(relative.to_string_lossy().replace('\\', "/"));
+    index.entry(&path).is_some().then_some(path)
+}
+
+/// A server location's position in the wire's own column units.
+fn wire_position(
+    index: &SdkIndex,
+    path: &RelPath,
+    encoding: PositionEncoding,
+    location: &ServerLocation,
+) -> Position {
+    let source = index.source(path).unwrap_or_default();
+    let column = encoding.to_wire_column(line_text(source, location.line), location.column);
+    Position { line: location.line, col: column }
+}
+
 /// The node a location points at, together with the file it is in.
 fn node_at<'i>(
     index: &'i SdkIndex,
@@ -773,12 +858,9 @@ fn node_at<'i>(
     encoding: PositionEncoding,
     location: &ServerLocation,
 ) -> Option<(RelPath, &'i WireNode)> {
-    let absolute = path_from_uri(&location.uri)?;
-    let relative = roots.iter().find_map(|root| absolute.strip_prefix(root).ok())?;
-    let path = RelPath::new(relative.to_string_lossy().replace('\\', "/"));
-    let entry = index.entry(&path)?;
-    let column = encoding.to_wire_column(line_text(&entry.source, location.line), location.column);
-    let node = index.node_at(&path, Position { line: location.line, col: column })?;
+    let path = file_at(index, roots, location)?;
+    let at = wire_position(index, &path, encoding, location);
+    let node = index.node_at(&path, at)?;
     is_addressable(node).then_some((path, node))
 }
 
@@ -815,7 +897,13 @@ fn run_pass(
     let mut complete = true;
 
     loop {
-        if !deferred.is_empty() && !client.busy() {
+        // A deferred question goes back on the queue only once the server has
+        // been quiet for a whole settle, not the instant its progress set
+        // empties - the same rule, and for the same measured reason, as
+        // readiness itself (see `LspBridge`'s doc). A re-ask sent into the gap
+        // between two of rust-analyzer's startup phases is answered `null`
+        // again, and that second empty answer is the one this bridge believes.
+        if !deferred.is_empty() && client.quiet_for(budgets.settle) {
             queue.append(&mut deferred);
         }
         // Fill the pipeline.
@@ -893,11 +981,16 @@ fn run_pass(
                 // answer: re-ask it once, after the indexing ends.
                 let empty = locations(&result).is_empty();
                 let key = (question.file.clone(), question.position.line, question.position.col);
-                if empty && client.busy() && re_asked.insert(key) {
+                if empty && !client.quiet_for(budgets.settle) && re_asked.insert(key) {
                     deferred.push(question);
                     continue;
                 }
-                record_answer(&mut answers, index, roots, client.encoding(), &question, &result);
+                let again = record_answer(&mut answers, index, roots, client.encoding(), &question, &result);
+                // The second hop of an implementation answer. Pushed onto the
+                // front of the queue rather than the back so that a sweep's
+                // follow-ups are asked while the questions that produced them
+                // are still the server's warm working set.
+                queue.extend(again);
             }
             Poll::Failed { id, message } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
@@ -953,7 +1046,14 @@ fn run_pass(
     (answers, covered, complete)
 }
 
-/// Turns one server answer into whatever it is evidence for.
+/// Turns one server answer into whatever it is evidence for, and into
+/// whatever it still has to be asked.
+///
+/// The returned questions are the second hop of an implementation answer and
+/// nothing else - see [`LspBridge`]'s doc. They are always empty for every
+/// other kind, which is what makes the recursion one hop deep by
+/// construction rather than by a counter.
+#[must_use]
 fn record_answer(
     answers: &mut Answers,
     index: &SdkIndex,
@@ -961,7 +1061,7 @@ fn record_answer(
     encoding: PositionEncoding,
     question: &Question,
     result: &Value,
-) {
+) -> Vec<Question> {
     let found = locations(result);
     match &question.ask {
         Ask::Definition(site) => {
@@ -974,12 +1074,12 @@ fn record_answer(
             for location in &found {
                 let Some((path, node)) = node_at(index, roots, encoding, location) else { continue };
                 match &target {
-                    Some((_, chosen)) if chosen.id != node.id => return,
+                    Some((_, chosen)) if chosen.id != node.id => return Vec::new(),
                     Some(_) => {}
                     None => target = Some((path, node)),
                 }
             }
-            let Some((_, node)) = target else { return };
+            let Some((_, node)) = target else { return Vec::new() };
             let edge = answers.record(
                 &question.file,
                 &question.file,
@@ -997,33 +1097,74 @@ fn record_answer(
                     answers.retract.insert(replaced.clone());
                 }
             }
+            Vec::new()
         }
         Ask::Implementation { anchor } => {
-            let Some((_, anchor_node)) = index.node(anchor) else { return };
-            let anchor_node = anchor_node.clone();
+            let mut again = Vec::new();
             for location in &found {
-                let Some((path, node)) = node_at(index, roots, encoding, location) else { continue };
-                if node.id == anchor_node.id {
-                    // A server that lists the trait's own declaration among
-                    // its implementations, which some do.
+                if record_implementor(answers, index, roots, encoding, anchor, &question.file, location) {
                     continue;
                 }
-                let (from_id, at, container) = (node.id.clone(), node.range.start, node.container.clone());
-                answers.record(
-                    &question.file,
-                    &path,
-                    &from_id,
-                    // The direction `find_implementations` walks: subtype ->
-                    // supertype. The question was "who implements this", so
-                    // the edge starts at each answer and points at the anchor.
-                    EdgeKind::SupertypeOf,
-                    &anchor_node.name,
-                    at,
-                    address_of(&anchor_node, container),
-                );
+                // The location is in a file this index holds, at a position no
+                // declaration of it covers: an `impl` header, or whatever else
+                // the language spells an implementation with. Ask the server
+                // what is written there - see [`LspBridge`]'s doc.
+                let Some(path) = file_at(index, roots, location) else { continue };
+                again.push(Question {
+                    position: wire_position(index, &path, encoding, location),
+                    file: path,
+                    ask: Ask::Implementor { anchor: anchor.clone(), for_file: question.file.clone() },
+                });
             }
+            again
+        }
+        Ask::Implementor { anchor, for_file } => {
+            for location in &found {
+                record_implementor(answers, index, roots, encoding, anchor, for_file, location);
+            }
+            Vec::new()
         }
     }
+}
+
+/// Records one implementor of `anchor`, if `location` is a declaration this
+/// index holds. `false` means it is not one - which is a question for the
+/// caller, not an error.
+///
+/// `for_file` is the file whose question produced this, and it is the
+/// anchor's, never the implementor's: see [`Ask::Implementor`].
+fn record_implementor(
+    answers: &mut Answers,
+    index: &SdkIndex,
+    roots: [&Path; 2],
+    encoding: PositionEncoding,
+    anchor: &str,
+    for_file: &RelPath,
+    location: &ServerLocation,
+) -> bool {
+    let Some((_, anchor_node)) = index.node(anchor) else { return false };
+    let anchor_node = anchor_node.clone();
+    let Some((path, node)) = node_at(index, roots, encoding, location) else { return false };
+    if node.id == anchor_node.id {
+        // A server that lists the trait's own declaration among its
+        // implementations, which some do - and, for the second hop, the
+        // `Trait` half of `impl Trait for T` if a server ever points there.
+        return true;
+    }
+    let (from_id, at, container) = (node.id.clone(), node.range.start, node.container.clone());
+    answers.record(
+        for_file,
+        &path,
+        &from_id,
+        // The direction `find_implementations` walks: subtype -> supertype.
+        // The question was "who implements this", so the edge starts at each
+        // answer and points at the anchor.
+        EdgeKind::SupertypeOf,
+        &anchor_node.name,
+        at,
+        address_of(&anchor_node, container),
+    );
+    true
 }
 
 impl SemanticEngine for LspBridge {
