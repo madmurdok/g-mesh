@@ -237,10 +237,16 @@ jobs:
           # daemon activity the step below exists to show. Turn it back on for
           # a specific question, not as a standing setting.
         # `fail-fast = false` and the per-test timeout live in
-        # core/.config/nextest.toml rather than here, so they hold however the
+        # .config/nextest.toml rather than here, so they hold however the
         # suite is invoked. That file also carries the measurement that chose
         # this tool over `cargo test`, and the local one that got it wrong.
-        run: cargo nextest run --manifest-path core/Cargo.toml
+        #
+        # No `--manifest-path` since GM-284: the repository root is the cargo
+        # workspace root now, so this runs core's suite *and* the wire types'
+        # round-trip tests *and* the plugin SDK's - including the SDK's toy
+        # plugin going through the real `g-mesh plugins check`, which is the
+        # only place the SDK's own conformance is proved.
+        run: cargo nextest run --workspace
 
       # GM-277's conformance kit, per bundled plugin that has one -
       # `plugins/*/conformance/{project,expect.toml}` - on the same four
@@ -335,7 +341,8 @@ jobs:
       # file. A formatter written down but not checked drifts straight back,
       # which is the state this repository was in until GM-241.
       - name: cargo fmt --check
-        run: cargo fmt --manifest-path core/Cargo.toml --check
+        # `--all`: every workspace member, not core alone (GM-284).
+        run: cargo fmt --all --check
 
       # `-D warnings`, because a lint that reports and passes is a lint nobody
       # reads. The tree was brought to zero findings before this was turned on
@@ -343,4 +350,4 @@ jobs:
       # annotations, a seven-field tuple type, and one assertion that was
       # constant-true and therefore checking nothing).
       - name: cargo clippy
-        run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

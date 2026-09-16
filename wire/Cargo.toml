@@ -1,0 +1,28 @@
+[package]
+name = "g-mesh-wire"
+version = "3.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The g-mesh core <-> language-plugin wire protocol types (protocol v2)"
+
+[lib]
+name = "g_mesh_wire"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+# Only for the `JsonSchema` derive on `Position`, which core needs so its MCP
+# tool schemas can describe a position with the very type the wire and the
+# storage layer already use. Optional, and off by default, so that a plugin
+# built on `plugins/sdk` - which publishes no schemas - does not compile a
+# schema generator to send NDJSON. Core enables it explicitly.
+schemars = { version = "1", optional = true }
+
+[dev-dependencies]
+# The round-trip tests in this crate assert against real wire bytes.
+serde_json = "1"
+
+[features]
+default = []
+json-schema = ["dep:schemars"]

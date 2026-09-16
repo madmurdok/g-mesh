@@ -188,7 +188,11 @@ build_one() {
 		profile_dir="debug"
 	fi
 
-	local built="$REPO_ROOT/core/target/$target/$profile_dir/$bin_name"
+	# `$REPO_ROOT/target`, not `$REPO_ROOT/core/target`: GM-284 made the
+	# repository root the cargo workspace root (see the root Cargo.toml), and
+	# cargo puts the build directory there, whichever member's manifest the
+	# build was invoked through.
+	local built="$REPO_ROOT/target/$target/$profile_dir/$bin_name"
 	[ -f "$built" ] || die "expected binary not found: $built"
 
 	stage_dir="$DIST_DIR/$(artifact_stem_for "$target" "$version")"
