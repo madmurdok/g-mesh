@@ -1,0 +1,38 @@
+# The repository's cargo workspace.
+#
+# WHY THIS FILE EXISTS (GM-284)
+#
+# Until the Rust plugin SDK there was exactly one Rust crate here, `core/`,
+# and it was its own implicit workspace root - no manifest above it. That was
+# right while it was the only one. `plugins/sdk` makes three (`wire/`,
+# `core/`, `plugins/sdk`), two of which are meant to be built and tested
+# together with the third, so the workspace has to sit where it can see all
+# of them: the repository root.
+#
+# WHAT THIS CHANGES, AND WHAT IT DELIBERATELY DOES NOT
+#
+# - `cargo test` at the repository root now covers every crate. That is the
+#   point: the SDK's own tests, and the wire types' round-trip tests, run in
+#   the same command that has always run core's.
+# - `cargo test --manifest-path core/Cargo.toml` (what CI used to run) still
+#   builds and tests core alone. A workspace does not widen a package-scoped
+#   command; it only makes the unscoped one mean "all of them".
+# - The build output directory moves from `core/target/` to `target/`, because
+#   cargo puts it at the workspace root. Three places named the old path and
+#   were updated with this file: `.gitignore`, `scripts/build-targets.sh`, and
+#   the nextest profile, which nextest resolves against the workspace root and
+#   which therefore moved from `core/.config/` to `.config/`.
+# - **`plugins/sdk` does not depend on `g-mesh`.** A workspace shares a lock
+#   file and a target directory, not a dependency graph - core keeps its ONNX
+#   Runtime, SQLite and tokio subtree entirely to itself, and a plugin binary
+#   built on the SDK links none of it. The wire types the two genuinely have
+#   to agree on live in `wire/`, which is why that crate exists at all; see
+#   its own module doc.
+#
+# A *virtual* manifest (no `[package]` of its own) rather than making one of
+# the three crates the root: none of them contains the others, and a root
+# package would make `cargo build` with no `-p` mean "build that one", which
+# is exactly the ambiguity this layout is meant to remove.
+[workspace]
+resolver = "2"
+members = ["core", "plugins/sdk", "wire"]

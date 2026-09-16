@@ -1,0 +1,7 @@
+# the entry point
+fn main
+call helper
+use b.toy shared
+?compute
+fn helper
+call main

@@ -1,3 +1,8 @@
+# Cargo's build output. At the repository root since GM-284 made this a
+# workspace (see the root Cargo.toml); `/core/target` is kept so a checkout
+# that still has the pre-workspace directory lying around does not start
+# offering it as untracked.
+/target
 /core/target
 # Release archives produced by scripts/build-targets.sh.
 /dist/

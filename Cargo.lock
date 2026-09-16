@@ -708,6 +708,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "g-mesh-wire",
  "globset",
  "ignore",
  "libc",
@@ -728,6 +729,28 @@ dependencies = [
  "toml",
  "ureq",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "g-mesh-plugin-sdk"
+version = "3.2.0"
+dependencies = [
+ "anyhow",
+ "g-mesh-wire",
+ "ignore",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
+name = "g-mesh-wire"
+version = "3.2.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
