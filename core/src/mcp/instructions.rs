@@ -7,12 +7,12 @@
 //! Before multi-language support, the instructions stated as a fixed fact
 //! that a receiver call (`x.foo()`) produces no edge - true for every
 //! language g-mesh indexed at the time (TypeScript, never). It stopped being
-//! a fact once a second language could resolve that gap: Go resolves it from
-//! its structural tier alone (`go/types`, no external process to wait for);
-//! Rust resolves it only once its semantic pass has run
-//! (`language_state.semanticPassAt`, because `rust-analyzer` is a child
-//! process the structural tier cannot wait on); TypeScript never resolves it
-//! at all (see `daemon::manifest::Capabilities`'s own doc comment for what
+//! a fact once a second language could resolve that gap: Go and Rust both
+//! resolve it in their *semantic* tier, once that language's whole-project
+//! pass has completed (`language_state.semanticPassAt`) and not before - Go's
+//! go/parser tier records an open site and emits nothing (GM-281), and Rust's
+//! tree-sitter tier does the same; TypeScript never resolves it at all (see
+//! `daemon::manifest::Capabilities`'s own doc comment for what
 //! `receiver_calls`/`receiver_calls_structural` encode per language). A
 //! constant sentence can be true for at most one of those, so [`build`]
 //! renders it from what is actually discovered and indexed.
@@ -141,12 +141,14 @@ pub struct PresentLanguage {
 ///
 /// Mirrors `daemon::manifest::Capabilities::receiver_calls`'s own doc
 /// comment exactly: `receiver_calls_structural = Resolved` settles it on its
-/// own (Go: `go/types` runs in-process, no external readiness to wait on -
-/// see the architecture doc's Go plugin section), regardless of
-/// `semantic_pass_done`. Otherwise the gap is open unless a semantic tier
-/// both *can* resolve it (`receiver_calls = Resolved`) and *has*
-/// (`semantic_pass_done`) - Rust's shape: `rust-analyzer` is a real gap until
-/// its pass actually completes.
+/// own - a plugin whose *structural* tier already emits the edge has no gap
+/// to wait out - regardless of `semantic_pass_done`. Otherwise the gap is
+/// open unless a semantic tier both *can* resolve it (`receiver_calls =
+/// Resolved`) and *has* (`semantic_pass_done`). That second shape is what
+/// both Go and Rust actually ship: Go's `go/types` pass runs in-process and
+/// is quick, Rust's waits on a `rust-analyzer` child, but until either one
+/// has completed once, the edges simply are not in the index yet and saying
+/// otherwise would promise a caller rows it cannot find.
 fn has_open_receiver_gap(present: &PresentLanguage) -> bool {
     if present.capabilities.receiver_calls_structural == ReceiverCallResolution::Resolved {
         return false;
@@ -456,15 +458,24 @@ results instead of paging.";
         }]
     }
 
-    fn go_resolved() -> PresentLanguage {
+    /// The bundled Go plugin's own `[plugin.capabilities]`, read off
+    /// `plugins/go/plugin.toml` rather than transcribed - so the flip GM-281
+    /// made there (`receiver_calls = "resolved"`, structural still
+    /// `"unresolved"`) is what these tests actually render from, and a later
+    /// edit to that manifest changes what they assert instead of quietly
+    /// disagreeing with it.
+    fn bundled_go_capabilities() -> Capabilities {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/go");
+        crate::daemon::manifest::read_manifest(&dir)
+            .expect("the bundled Go plugin's manifest must be readable")
+            .capabilities
+    }
+
+    fn go_present(semantic_pass_done: bool) -> PresentLanguage {
         PresentLanguage {
             language: "go".to_string(),
-            capabilities: Capabilities {
-                semantic_pass: true,
-                receiver_calls: ReceiverCallResolution::Resolved,
-                receiver_calls_structural: ReceiverCallResolution::Resolved,
-            },
-            semantic_pass_done: true,
+            capabilities: bundled_go_capabilities(),
+            semantic_pass_done,
         }
     }
 
@@ -531,17 +542,40 @@ results instead of paging.";
         assert_eq!(build(&[]), ORIGINAL_INSTRUCTIONS, "no index yet must read the same as it always has");
     }
 
+    /// What a Go-only index reads once Go's whole-project `semanticPass` has
+    /// landed - GM-281's own "check what the generated instructions then say"
+    /// criterion, asserted against the shipped manifest rather than a
+    /// hand-written capability literal.
+    ///
+    /// The receiver-call gap drops out of the text entirely: the `go/types`
+    /// pass resolved every `x.M()` in the index, so the only thing left to
+    /// warn about is the still-building one, renumbered out of its `(2)`.
     #[test]
-    fn go_only_resolved_omits_the_receiver_gap_entirely() {
-        let rendered = build(&[go_resolved()]);
+    fn go_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+        let rendered = build(&[go_present(true)]);
         assert!(
             rendered.contains("One real gap"),
-            "go/types resolves receiver calls with no external process to wait on"
+            "go/types resolves every receiver call once its whole-project pass has completed"
         );
         assert!(!rendered.contains("Two real gaps"));
         assert!(!rendered.contains("variable receiver"));
         assert!(rendered.contains("still building"), "the second gap must survive renumbering");
-        println!("go-only bytes: {}", rendered.len());
+        println!("go-only (pass done) bytes: {}", rendered.len());
+    }
+
+    /// And before that pass - the cold-start window, and the *permanent*
+    /// state of a machine with no Go toolchain, where the plugin answers
+    /// every `semanticPass` with an empty diff and `semanticPassAt` is never
+    /// set. The gap is real then, so it stays listed: `receiver_calls =
+    /// "resolved"` is a statement about what the semantic tier *can* do, and
+    /// `receiver_calls_structural = "unresolved"` is what stops that from
+    /// being read as a promise about the index as it stands.
+    #[test]
+    fn go_only_before_its_semantic_pass_still_lists_the_receiver_gap() {
+        let rendered = build(&[go_present(false)]);
+        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+        assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
     }
 
     #[test]

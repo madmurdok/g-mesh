@@ -19,14 +19,18 @@ import (
 const (
 	protocolVersion = 2
 	jsonrpcVersion  = "2.0"
-	// Mirrors plugin.toml's `plugin_version` - kept in sync by hand today.
-	// daemon::manifest has a test enforcing this for the bundled TS
-	// plugin's package.json/plugin.toml pair; no equivalent exists here
-	// yet because nothing on the core side compares this value against
-	// the manifest's copy (unlike protocol_version, which
-	// `handshake::verify` does check) - see this task's own report for
-	// the gap.
-	pluginVersion = "0.1.0"
+	// Mirrors plugin.toml's `plugin_version`. Nothing on the core side
+	// compares the two (unlike protocol_version, which `handshake::verify`
+	// does check), so manifest_test.go's
+	// TestPluginVersionMatchesTheManifest is what keeps them from drifting -
+	// the Go-side equivalent of the test daemon::manifest has for the TS
+	// plugin's package.json/plugin.toml pair.
+	//
+	// 0.2.0 is GM-281: the plugin grew a second tier (go/types through
+	// golang.org/x/tools/go/packages) and its manifest's declared
+	// capabilities changed with it, which is exactly what a plugin version
+	// exists to say.
+	pluginVersion = "0.2.0"
 	languageName  = "go"
 )
 

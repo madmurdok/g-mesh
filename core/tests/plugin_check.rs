@@ -48,7 +48,12 @@
 //! conformance run in core's own CI, which is what the design doc asks for
 //! ("The same fixtures run in core's CI for every bundled plugin"), and they
 //! are GM-280's end-to-end evidence that the container-scoped placeholders
-//! that plugin emits are addresses core's linker actually resolves.
+//! that plugin emits are addresses core's linker actually resolves - plus,
+//! since GM-281, that its `go/types` pass resolves receiver calls through a
+//! variable, an embedded field and an interface value, and finds implicit
+//! interface implementations. Both therefore need a Go toolchain on `PATH`,
+//! the same way the TS pair needs Node: without one `core/build.rs` cannot
+//! build the plugin at all.
 //!
 //! # `--expect` (GM-277)
 //!
@@ -69,6 +74,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use g_mesh::daemon::manifest::ReceiverCallResolution;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -735,19 +742,20 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
 /// second package reached through an import, an external `_test` package and
 /// a `go.work` naming two modules.
 ///
-/// The two capability checks are both `SKIP`, for different reasons and both
-/// correctly: the manifest declares `semantic_pass = true`, so
-/// `semantic-pass-undeclared` does not apply, and the plugin has no semantic
-/// engine to start yet (go/types is GM-281), so it writes no
-/// semantic-engine marker and `semantic-engine-lazy` has no evidence either
-/// way. When GM-281 lands that second one becomes a `PASS` and this test
-/// should say so.
+/// `capabilities.semantic-pass-undeclared` is a `SKIP` and the only one:
+/// the manifest declares `semantic_pass = true`, so that check does not
+/// apply. `capabilities.semantic-engine-lazy` is a `PASS` as of GM-281 -
+/// the plugin now has a real engine (`go/types` through
+/// golang.org/x/tools/go/packages) and writes the kit's marker at the moment
+/// it first calls `packages.Load`, which happens only on a `semanticPass`.
+/// Before GM-281 it was a second `SKIP ... not instrumented`, which was the
+/// honest report for a plugin with no engine to start.
 #[test]
 fn the_go_plugin_passes_on_its_own_fixture() {
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id.starts_with("capabilities.") { "SKIP" } else { "PASS" };
+        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
@@ -840,13 +848,13 @@ fn the_typescript_plugin_satisfies_its_own_expectations_file() {
 
 /// The Go plugin's own expectations, through the real linker and the real
 /// MCP handlers - GM-280's end-to-end proof that a container-scoped
-/// placeholder is an address core actually resolves.
+/// placeholder is an address core actually resolves, and GM-281's that a
+/// `go/types` pass answers the three receiver shapes and finds implementers
+/// nothing in the syntax declares.
 ///
 /// Deliberately a smaller set than the TS plugin's (GM-282 owns the full Go
-/// expectations file), so this asserts the two kinds that file does carry
-/// rather than every kind the kit supports. `[[implementations]]` in
-/// particular is absent on purpose: Go's interfaces are structural, so
-/// `SUPERTYPE_OF` edges are go/types' answer and arrive with GM-281.
+/// expectations file), so this asserts the three kinds that file does carry
+/// rather than every kind the kit supports.
 #[test]
 fn the_go_plugin_satisfies_its_own_expectations_file() {
     let run = run_check_with_expect(&go_plugin_dir(), &go_conformance_project(), &go_conformance_expect());
@@ -859,9 +867,45 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
         .collect();
     assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
     assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
+    // GM-281: implicit interface satisfaction is in the file now, and it is
+    // the one kind no structural tier could ever have produced.
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.implementations")),
+        "{}",
+        run.stdout
+    );
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
+}
+
+/// The bundled Go manifest declares the semantic tier GM-281 built, and
+/// core's own generated instructions change accordingly.
+///
+/// This is the cheap hook GM-281 asked for: the flip to `receiver_calls =
+/// "resolved"` is only meaningful through what `mcp::instructions` renders
+/// from it, and `instructions::build` is private to `mcp`, so the
+/// manifest-side half is asserted here and the rendering half in
+/// `core/src/mcp/instructions.rs`'s own unit tests
+/// (`go_only_after_its_semantic_pass_omits_the_receiver_gap_entirely` and
+/// `go_only_before_its_semantic_pass_still_lists_the_receiver_gap`), which
+/// read this same file rather than a transcription of it.
+#[test]
+fn the_go_manifest_declares_a_semantic_tier_that_resolves_receiver_calls() {
+    let manifest = g_mesh::daemon::manifest::read_manifest(&go_plugin_dir())
+        .expect("the bundled Go plugin's manifest must be readable");
+    assert_eq!(manifest.language, "go");
+    assert!(manifest.capabilities.semantic_pass, "core must keep sending semanticPass to the Go plugin");
+    assert_eq!(
+        manifest.capabilities.receiver_calls,
+        ReceiverCallResolution::Resolved,
+        "go/types resolves x.M() once the whole-project pass has run"
+    );
+    assert_eq!(
+        manifest.capabilities.receiver_calls_structural,
+        ReceiverCallResolution::Unresolved,
+        "go/parser alone still emits nothing for a receiver call - it records an open site"
+    );
 }
 
 /// A deliberately wrong `[[callers]]` entry - one expected caller that does

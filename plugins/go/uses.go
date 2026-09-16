@@ -675,7 +675,7 @@ func (e *extractor) useIdent(ident *ast.Ident, sc *scope, ctx useContext, isCall
 	// before the universe block, because a package may legally declare a
 	// name that shadows a builtin.
 	if id, ok := e.fileDecls[name]; ok {
-		e.emitUse(ctx, isCall, id, e.nodeKind[id] == nodeKindFunction)
+		e.emitUse(ctx, isCall, id, e.nodeKind[id] == nodeKindFunction, ident)
 		return
 	}
 
@@ -686,13 +686,17 @@ func (e *extractor) useIdent(ident *ast.Ident, sc *scope, ctx useContext, isCall
 
 	// A dot import makes every remaining bare name ambiguous between this
 	// package and the dot-imported one, and nothing structural can tell them
-	// apart - see collectImports.
+	// apart - see collectImports. The site is still recorded: `types.Info
+	// .Uses` knows exactly which package the name came from, so what this
+	// tier can only refuse the semantic one answers (open_sites.go's
+	// openSiteBareName).
 	if e.hasDotImport {
+		e.recordBareNameSite(ident, ctx, isCall)
 		return
 	}
 
 	// 4. A sibling file of this package, as far as this tier can tell.
-	e.emitUse(ctx, isCall, e.placeholderFor(e.container, name, ident), true)
+	e.emitUse(ctx, isCall, e.placeholderFor(e.container, name, ident), true, ident)
 }
 
 // useSelector splits `a.b` into the one case this tier can answer exactly
@@ -709,7 +713,7 @@ func (e *extractor) useSelector(sel *ast.SelectorExpr, sc *scope, ctx useContext
 	// cross-package edge a structural tier can honestly emit.
 	if base, ok := unparen(sel.X).(*ast.Ident); ok && !sc.bound(base.Name) {
 		if importPath, isImport := e.imports[base.Name]; isImport {
-			e.emitUse(ctx, isCall, e.placeholderFor(importPath, sel.Sel.Name, sel.Sel), true)
+			e.emitUse(ctx, isCall, e.placeholderFor(importPath, sel.Sel.Name, sel.Sel), true, sel.Sel)
 			return
 		}
 	}
@@ -738,9 +742,18 @@ func (e *extractor) useSelector(sel *ast.SelectorExpr, sc *scope, ctx useContext
 // For a placeholder the target's kind is unknown here, and "can be a
 // function" is the right claim to make: core applies the kind filter to the
 // candidates it finds, and refuses rather than mislands.
-func (e *extractor) emitUse(ctx useContext, isCall bool, toID string, targetMayBeFunction bool) {
+//
+// A CALLS edge onto a placeholder is *also* recorded as a
+// [placeholderCall], because "can be a function" is a guess this tier cannot
+// check and `go/types` can - see that type's own doc comment. `at` is the
+// identifier the call names, which is the position the semantic pass asks
+// `types.Info` about.
+func (e *extractor) emitUse(ctx useContext, isCall bool, toID string, targetMayBeFunction bool, at *ast.Ident) {
 	if isCall && targetMayBeFunction && ctx.callerID != "" {
 		e.addEdge(ctx.callerID, edgeKindCalls, toID)
+		if e.placeholder[toID] {
+			e.recordPlaceholderCall(at, ctx, edgeIDFor(ctx.callerID, edgeKindCalls, toID, nil))
+		}
 		return
 	}
 	e.addEdge(ctx.symbolID, edgeKindReferences, toID)
