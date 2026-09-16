@@ -324,12 +324,24 @@ impl LspBridge {
     /// in different coordinate systems - the failure being ruled out here is a
     /// definition mapped onto whatever declaration has since drifted into that
     /// line.
+    ///
+    /// Only files this pass will actually *ask about*, which on a whole-project
+    /// pass is materially fewer than the files in scope. An open document is
+    /// text the server holds in memory on the plugin's behalf, and the plugin
+    /// is what `[plugin] memoryLimitMb` charges for it; a file nothing is asked
+    /// about gains nothing by being open, because the server reads the ones it
+    /// merely has to *resolve into* off disk itself.
+    ///
+    /// Nothing is ever closed again. A `didClose` after each pass would free
+    /// that text and make the next pass re-send every byte of it, and the
+    /// per-file passes that follow every edit are exactly where that would be
+    /// paid over and over.
     fn sync_documents(
         client: &mut LspClient,
         opened: &mut BTreeMap<RelPath, OpenDocument>,
         root: &Path,
         index: &SdkIndex,
-        scope: &[RelPath],
+        scope: &BTreeSet<RelPath>,
         language_id: &str,
     ) {
         for path in scope {
@@ -1058,6 +1070,8 @@ impl SemanticEngine for LspBridge {
         let root = self.root.clone();
         let real_root = self.real_root.clone();
         let mut opened = std::mem::take(&mut self.opened);
+        let asked_about: BTreeSet<RelPath> =
+            plan.asking.iter().map(|question| question.file.clone()).collect();
         let outcome = {
             // The client is borrowed for the whole pass, so everything else
             // this needs was cloned or moved out of `self` above.
@@ -1065,7 +1079,7 @@ impl SemanticEngine for LspBridge {
                 None => None,
                 Some(client) => {
                     client.drain();
-                    Self::sync_documents(client, &mut opened, &root, index, &scope, &language);
+                    Self::sync_documents(client, &mut opened, &root, index, &asked_about, &language);
                     if Self::wait_ready(client, &budgets, deadline, &language) {
                         Some(run_pass(
                             client,
