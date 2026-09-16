@@ -505,6 +505,19 @@ results instead of paging.";
             .capabilities
     }
 
+    /// The bundled Python plugin's own `[plugin.capabilities]`, read off
+    /// `plugins/python/plugin.toml` rather than transcribed - the same
+    /// `bundled_rust_capabilities`/`bundled_go_capabilities` pattern, so a
+    /// later edit to that manifest (a pyright semantic tier landing, say)
+    /// changes what [`python_only_lists_the_receiver_gap_with_no_semantic_tier_yet`]
+    /// asserts instead of quietly disagreeing with it.
+    fn bundled_python_capabilities() -> Capabilities {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/python");
+        crate::daemon::manifest::read_manifest(&dir)
+            .expect("the bundled Python plugin's manifest must be readable")
+            .capabilities
+    }
+
     fn typescript_present() -> PresentLanguage {
         PresentLanguage {
             language: "typescript".to_string(),
@@ -572,6 +585,33 @@ results instead of paging.";
             let rendered = build(&[PresentLanguage {
                 language: "rust".to_string(),
                 capabilities: bundled_rust_capabilities(),
+                semantic_pass_done,
+            }]);
+            assert_eq!(
+                rendered, ORIGINAL_INSTRUCTIONS,
+                "a single gapped language reads as it always has, semantic_pass_done = {semantic_pass_done}"
+            );
+            assert!(rendered.contains("produces no edge by design"));
+        }
+    }
+
+    /// GM-297's own acceptance criterion 2: a Python-only index still lists
+    /// the receiver-call gap for python, checked against the shipped
+    /// manifest rather than a hand-written capability literal
+    /// (`bundled_python_capabilities`'s own doc). `plugins/python/
+    /// plugin.toml` declares both `receiver_calls` and
+    /// `receiver_calls_structural` as `"unresolved"` - the plugin has no
+    /// semantic tier at all (a pyright tier is future work the design doc
+    /// names but does not schedule), so `semantic_pass_done` cannot close
+    /// the gap either way - the same shape
+    /// [`rust_only_lists_the_receiver_gap_with_no_semantic_tier_yet`] proves
+    /// for Rust, run here against Python's own manifest.
+    #[test]
+    fn python_only_lists_the_receiver_gap_with_no_semantic_tier_yet() {
+        for semantic_pass_done in [false, true] {
+            let rendered = build(&[PresentLanguage {
+                language: "python".to_string(),
+                capabilities: bundled_python_capabilities(),
                 semantic_pass_done,
             }]);
             assert_eq!(
