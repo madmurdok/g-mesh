@@ -114,8 +114,10 @@ pub fn default_roots() -> Vec<PathBuf> {
 ///
 /// 1. An **installed** layout: `plugins/` beside the core executable, which is
 ///    what a release archive unpacks to (`scripts/build-targets.sh`). In a
-///    checkout this points inside `core/target/<profile>/`, where nothing
-///    creates a `plugins/` directory, so it contributes nothing.
+///    checkout this points inside `target/<profile>/` (the workspace root's
+///    build directory, `core/target/` before GM-284 made the repository a
+///    cargo workspace), where nothing creates a `plugins/` directory, so it
+///    contributes nothing.
 /// 2. A **checkout** layout: `CARGO_MANIFEST_DIR/../plugins/`, baked in at
 ///    compile time, since `core/` and `plugins/` are sibling directories here.
 ///    An installed binary's compile-time path is a directory on the build

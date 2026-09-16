@@ -9,14 +9,23 @@ an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 
 ## Layout
 
-- `core/` — Rust workspace: the `g-mesh` binary (`mcp-shim` + the per-project
-  `daemon`), SQLite storage, graph queries, file watcher, and the MCP tool
-  surface.
+The repository is one cargo workspace (`Cargo.toml` at the root), so
+`cargo build` and `cargo test` from here cover every Rust crate and the build
+output lands in `target/`.
+
+- `core/` — the `g-mesh` binary (`mcp-shim` + the per-project `daemon`),
+  SQLite storage, graph queries, file watcher, and the MCP tool surface.
+- `wire/` — the core ⇆ plugin wire protocol types, and nothing else. Its own
+  crate so core and a Rust plugin share one declaration without a plugin
+  linking core; core re-exports it as `protocol::types`.
 - `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
   bulk indexing, incremental reparse. Spawned by the daemon as a child
   process, one instance per project.
+- `plugins/sdk/` — everything a Rust language plugin needs that is not its
+  language: protocol loop, walk, incremental diff, ids. See "Writing a
+  language plugin".
 
-The daemon and shim are one binary (`core/target/{debug,release}/g-mesh`);
+The daemon and shim are one binary (`target/{debug,release}/g-mesh`);
 the plugin is a separate Node entry point the daemon launches with `node`.
 
 ## Install
@@ -87,12 +96,11 @@ build-from-source path below is the only one that works.
 
 ```bash
 # 1. Core (Rust binary: g-mesh, with the mcp-shim/daemon subcommands)
-cd core
-cargo build --release
-# -> core/target/release/g-mesh
+cargo build --release -p g-mesh
+# -> target/release/g-mesh
 
 # 2. JS/TS plugin
-cd ../plugins/typescript
+cd plugins/typescript
 npm install
 npm run build
 # -> plugins/typescript/dist/src/index.js
@@ -108,7 +116,7 @@ the semantic one, needs a model directory that **you fetch explicitly** —
 nothing in g-mesh ever downloads anything on its own, by design (that is
 enforced by a test: the HTTP client is reachable from this one command and
 from nowhere else in the codebase). Using the binary built in step 1
-(`core/target/release/g-mesh`, until it is on your `PATH`):
+(`target/release/g-mesh`, until it is on your `PATH`):
 
 ```bash
 g-mesh model fetch
@@ -415,7 +423,7 @@ what actually closes it.
 project you open Claude Code in — no per-project setup:
 
 ```bash
-claude mcp add g-mesh -s user -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
+claude mcp add g-mesh -s user -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 ```
 
 **Fallback (any other stdio MCP client): register per project.** Run from
@@ -424,7 +432,7 @@ therefore the shim's, absent `CLAUDE_PROJECT_DIR` — is the project root:
 
 ```bash
 cd /path/to/target-project
-claude mcp add g-mesh -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
+claude mcp add g-mesh -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 ```
 
 ## First run: the initial index
@@ -730,8 +738,9 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 ## Run tests
 
 ```bash
-cd core && cargo test
-cd ../plugins/typescript && npm run build && npm test
+cargo test                       # every crate: core, wire, plugins/sdk
+cargo test -p g-mesh             # core alone
+cd plugins/typescript && npm run build && npm test
 ```
 
 The integration tests spawn real shims, real daemons and a real plugin against
