@@ -26,6 +26,20 @@ path = "src/lib.rs"
 name = "g-mesh-plugin-toy"
 path = "toy/main.rs"
 
+# The scripted language server `tests/lsp_bridge.rs` spawns through the real
+# `lsp::LspBridge`. A `[[bin]]` for the same reason the toy plugin is one -
+# cargo exports `CARGO_BIN_EXE_g-mesh-fake-lsp` to this package's integration
+# tests and builds it before they run - and in a top-level directory rather
+# than under `tests/` because cargo auto-discovers `tests/*/main.rs` as an
+# integration test target of its own.
+#
+# It is not shipped: nothing installs it, no manifest names it, and its only
+# caller is a `#[test]`. See its own module doc for why the fixture is a
+# process rather than a mock.
+[[bin]]
+name = "g-mesh-fake-lsp"
+path = "fake-lsp/main.rs"
+
 [dependencies]
 anyhow = "1"
 # The wire types themselves, shared verbatim with core so the two cannot

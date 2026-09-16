@@ -1,0 +1,519 @@
+//! The client half of the Language Server Protocol: as much of it as
+//! answering an open site needs, and not one method more.
+//!
+//! # Decision 2: no LSP crate
+//!
+//! The obvious move is `lsp-types` (or `lsp-server`, or `tower-lsp`), and it
+//! was weighed and refused. What this bridge sends is six requests and four
+//! notifications - `initialize`, `initialized`, `textDocument/didOpen`,
+//! `didChange`, `definition`, `implementation`, `$/cancelRequest`,
+//! `shutdown`, `exit`, plus the two server-initiated messages it has to
+//! answer - and what it reads out of the replies is a URI and two integers.
+//!
+//! Against that:
+//!
+//! - **`lsp-types` is the whole protocol as Rust types.** It models every
+//!   request, every capability struct and every optional field of a
+//!   specification that gains more of them every release, to save this file
+//!   the `json!` literals below. It also pins the protocol *version* into the
+//!   types, so keeping up with a server that speaks a newer one becomes a
+//!   dependency bump rather than an extra key in an object this crate already
+//!   passes through.
+//! - **`lsp-server`/`tower-lsp` bring a transport and a runtime** - crossbeam
+//!   channels, or tokio. This crate's whole dependency list is `anyhow`,
+//!   `serde`, `serde_json`, `sha2`, `toml` and `ignore`, and the design's
+//!   reason for that is stated in the doc: a plugin must not link what core
+//!   links.
+//! - **Every later language inherits this cost.** The SDK is what languages
+//!   #3 through #7 are built on (the design doc's "Paper stress test"), so a
+//!   dependency here is paid seven times and removed never.
+//!
+//! The counter-argument - "hand-rolled protocol code is where bugs live" - is
+//! real, and is why the framing is [`crate::framing`] (one implementation,
+//! already exercised against core) and why the fake server in
+//! `plugins/sdk/fake-lsp` drives every path in this file, including the ones
+//! a real server only reaches when something goes wrong.
+//!
+//! # The server is a child, deliberately
+//!
+//! It is spawned as an ordinary child of the plugin process: no `setsid`, no
+//! double fork, no re-parenting. That is what makes
+//! `[plugin] memoryLimitMb` work at all - core samples a plugin's whole
+//! *process tree* (`core::daemon::memory::process_tree_rss_mb`, which walks
+//! parent → child links from the plugin's pid) and the design says explicitly
+//! that "tsserver, rust-analyzer and a language server behind the LSP bridge
+//! all count against their plugin". A detached server would be invisible to
+//! that sampler while holding the gigabytes the limit exists to catch.
+//!
+//! The other half of that promise is [`LspClient::shutdown`], called from
+//! `Drop`: core ends a plugin by closing its stdin, so a server left running
+//! when the plugin exits is an orphan holding a workspace open with nothing
+//! reading its pipes.
+
+use std::collections::BTreeMap;
+use std::io::BufReader;
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+
+use super::config::SemanticConfig;
+use super::position::{file_uri, PositionEncoding};
+use crate::framing::{read_frame, write_message};
+
+/// How many lines of a server's stderr are forwarded before the rest is
+/// counted instead of printed.
+///
+/// Draining it is not optional - a server whose stderr pipe fills up blocks
+/// on its next log line, which looks exactly like a hang - but forwarding all
+/// of it is not either: a language server at its default log level can
+/// produce megabytes per pass, and the daemon's log is a shared resource.
+const STDERR_LINE_BUDGET: usize = 200;
+
+/// What [`LspClient::poll`] saw.
+#[derive(Debug)]
+pub(crate) enum Poll {
+    /// A response to a request this client sent. `result` is whatever the
+    /// server answered, `Value::Null` included - which for `definition` is
+    /// the ordinary "nothing here" answer and not an error.
+    Answered { id: i64, result: Value },
+    /// The server answered a request with a JSON-RPC error.
+    Failed { id: i64, message: String },
+    /// Something moved that is not an answer: a progress notification, a
+    /// server request this client replied to, a log message. The caller
+    /// re-reads whatever state it is waiting on.
+    Noise,
+    /// Nothing arrived before the timeout.
+    Idle,
+    /// The server's stdout is closed: it exited, or crashed.
+    Closed,
+}
+
+/// One running language server, and everything this process knows about it.
+pub(crate) struct LspClient {
+    language: String,
+    child: Child,
+    stdin: ChildStdin,
+    incoming: Receiver<Value>,
+    next_id: i64,
+    /// How the server counts columns, from the negotiation in `initialize`.
+    encoding: PositionEncoding,
+    /// Work-done progress tokens the server has begun and not ended. While
+    /// this is non-empty the server is doing something it told us about -
+    /// which is the difference between "there is no definition there" and
+    /// "ask again when it has finished loading".
+    active_progress: BTreeMap<String, ()>,
+    /// Whether any progress has ever begun. A server that reports none is not
+    /// penalised for it - see [`super::bridge`]'s readiness rules.
+    progress_begun: bool,
+    /// Set once the server's stdout has closed, so a caller that polls again
+    /// after a crash is told the same thing rather than blocking.
+    closed: bool,
+}
+
+impl LspClient {
+    /// Spawns the server, runs `initialize`/`initialized`, and returns a
+    /// client that is connected but not necessarily *ready* - readiness is
+    /// the bridge's question, and this one is "is there a server at all".
+    ///
+    /// An `Err` here is the design doc's "semantic engine missing" failure
+    /// mode: no binary on `PATH`, or a binary that is not a language server.
+    pub(crate) fn start(
+        language: &str,
+        config: &SemanticConfig,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let mut command = Command::new(&config.command);
+        command
+            .args(&config.args)
+            .envs(&config.env)
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start the language server {}", config.command.display()))?;
+
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // One thread per pipe, both detached. They end when the server's
+        // stdout/stderr close, which is the only event either of them cares
+        // about, and neither holds anything the main thread needs to join on.
+        let (sender, incoming) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let Ok(message) = serde_json::from_slice::<Value>(&body) else { continue };
+                if sender.send(message).is_err() {
+                    return;
+                }
+            }
+        });
+        let label = language.to_string();
+        let server = config.engine.clone();
+        std::thread::spawn(move || drain_stderr(&label, &server, stderr));
+
+        let mut client = Self {
+            language: language.to_string(),
+            child,
+            stdin,
+            incoming,
+            next_id: 1,
+            encoding: PositionEncoding::Utf16,
+            active_progress: BTreeMap::new(),
+            progress_begun: false,
+            closed: false,
+        };
+        client.initialize(config, root, deadline)?;
+        Ok(client)
+    }
+
+    /// The `initialize` handshake, and the two things this bridge reads out of
+    /// its answer: how the server counts columns, and nothing else.
+    ///
+    /// The capabilities sent are the smallest set that is honest. Claiming
+    /// capabilities a client does not have is how a server ends up sending
+    /// requests nobody answers, and every unanswered server request is a
+    /// server that may never finish loading.
+    fn initialize(&mut self, config: &SemanticConfig, root: &Path, deadline: Instant) -> Result<()> {
+        let mut params = json!({
+            // Not this process's pid by accident: it is what tells a server to
+            // exit if we die without saying `exit`, which is the one safety net
+            // against an orphaned server holding a workspace open.
+            "processId": std::process::id(),
+            "rootUri": file_uri(root),
+            "workspaceFolders": [{ "uri": file_uri(root), "name": root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "root".to_string()) }],
+            "capabilities": {
+                "general": { "positionEncodings": PositionEncoding::OFFERED },
+                "window": { "workDoneProgress": true },
+                "workspace": { "configuration": true, "workspaceFolders": true },
+                "textDocument": {
+                    "synchronization": { "dynamicRegistration": false },
+                    "definition": { "dynamicRegistration": false, "linkSupport": true },
+                    "implementation": { "dynamicRegistration": false, "linkSupport": true },
+                },
+            },
+        });
+        if let Some(options) = &config.initialization_options {
+            params["initializationOptions"] = options.clone();
+        }
+
+        let id = self.request("initialize", params)?;
+        let result = self.await_response(id, deadline).context("the server did not initialize")?;
+        self.encoding = PositionEncoding::from_capability(
+            result.get("capabilities").and_then(|caps| caps.get("positionEncoding")).and_then(Value::as_str),
+        );
+        self.notify("initialized", json!({}))?;
+        Ok(())
+    }
+
+    /// How this server counts columns.
+    pub(crate) fn encoding(&self) -> PositionEncoding {
+        self.encoding
+    }
+
+    /// Whether the server has told us it is busy - a work-done progress that
+    /// began and has not ended.
+    pub(crate) fn busy(&self) -> bool {
+        !self.active_progress.is_empty()
+    }
+
+    /// Whether the server has ever reported progress at all.
+    pub(crate) fn progress_begun(&self) -> bool {
+        self.progress_begun
+    }
+
+    /// Whether this server is gone.
+    ///
+    /// Two independent signs, because either can be the first to show: its
+    /// stdout closing (which the reader thread notices, and which is how a
+    /// crash mid-conversation presents), and the process having exited (which
+    /// is what a send failure leaves behind, where nothing may ever be read
+    /// again to notice the closed pipe).
+    pub(crate) fn gone(&mut self) -> bool {
+        self.closed || matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Sends a request and returns the id its answer will carry.
+    pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<i64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .with_context(|| format!("failed to send {method} to the language server"))?;
+        Ok(id)
+    }
+
+    /// Sends a notification - no answer, no id.
+    pub(crate) fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .with_context(|| format!("failed to send {method} to the language server"))
+    }
+
+    /// Tells the server to stop working on a request whose answer is no
+    /// longer wanted.
+    ///
+    /// Best-effort in the strongest sense: it is a notification, the server
+    /// may ignore it, and an answer may already be in flight. What it buys is
+    /// a server that stops *computing* an answer this side has given up
+    /// waiting for - which matters exactly when a pass is already over
+    /// budget, and costs nothing when it does not.
+    pub(crate) fn cancel(&mut self, id: i64) {
+        let _ = self.notify("$/cancelRequest", json!({ "id": id }));
+    }
+
+    fn send(&mut self, message: &Value) -> Result<()> {
+        write_message(&mut self.stdin, message)?;
+        Ok(())
+    }
+
+    /// Waits up to `timeout` for the next thing the server says, handling
+    /// everything that is not an answer to one of our requests.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> Poll {
+        if self.closed {
+            return Poll::Closed;
+        }
+        let message = match self.incoming.recv_timeout(timeout) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => return Poll::Idle,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                return Poll::Closed;
+            }
+        };
+        self.handle(message)
+    }
+
+    /// [`LspClient::poll`] without waiting - drains what has already arrived.
+    fn poll_now(&mut self) -> Poll {
+        if self.closed {
+            return Poll::Closed;
+        }
+        match self.incoming.try_recv() {
+            Ok(message) => self.handle(message),
+            Err(TryRecvError::Empty) => Poll::Idle,
+            Err(TryRecvError::Disconnected) => {
+                self.closed = true;
+                Poll::Closed
+            }
+        }
+    }
+
+    /// One message from the server: an answer to pass up, or something this
+    /// client deals with itself.
+    fn handle(&mut self, message: Value) -> Poll {
+        let method = message.get("method").and_then(Value::as_str);
+        let id = message.get("id");
+
+        match (method, id) {
+            // A request from the server. Every one of these must be answered,
+            // including the ones this client has nothing to say about: a
+            // server waiting on a reply that never comes is a server that
+            // never finishes indexing, and "the plugin hung" is how that
+            // presents.
+            (Some(method), Some(id)) => {
+                let id = id.clone();
+                let result = server_request_reply(method, message.get("params"));
+                let _ = self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                Poll::Noise
+            }
+            // A notification.
+            (Some(method), None) => {
+                if method == "$/progress" {
+                    self.track_progress(message.get("params"));
+                }
+                Poll::Noise
+            }
+            // A response to one of ours.
+            (None, Some(id)) => {
+                let Some(id) = id.as_i64() else { return Poll::Noise };
+                if let Some(error) = message.get("error") {
+                    let text = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the server reported an error with no message");
+                    return Poll::Failed { id, message: text.to_string() };
+                }
+                Poll::Answered { id, result: message.get("result").cloned().unwrap_or(Value::Null) }
+            }
+            (None, None) => Poll::Noise,
+        }
+    }
+
+    /// Follows a `$/progress` notification's `begin`/`end` for work-done
+    /// tokens.
+    ///
+    /// Only `begin` and `end` are tracked, never `report`: a percentage is
+    /// information for a human, and what this needs is the one bit "is the
+    /// server still working". An `end` for a token that never began still
+    /// clears it - servers do send those, and a token stuck "active" forever
+    /// would make this client believe a ready server is busy for the rest of
+    /// its life.
+    fn track_progress(&mut self, params: Option<&Value>) {
+        let Some(params) = params else { return };
+        let Some(token) = params.get("token") else { return };
+        let token = match token {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        match params.get("value").and_then(|value| value.get("kind")).and_then(Value::as_str) {
+            Some("begin") => {
+                self.progress_begun = true;
+                self.active_progress.insert(token, ());
+            }
+            Some("end") => {
+                self.progress_begun = true;
+                self.active_progress.remove(&token);
+            }
+            _ => {}
+        }
+    }
+
+    /// Waits for one specific answer, dealing with everything else that
+    /// arrives meanwhile. Used only for `initialize`, which is the one request
+    /// this client has nothing else to do during.
+    fn await_response(&mut self, wanted: i64, deadline: Instant) -> Result<Value> {
+        loop {
+            let Some(remaining) =
+                deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())
+            else {
+                bail!("the server did not answer request {wanted} within the budget for this pass");
+            };
+            match self.poll(remaining.min(Duration::from_millis(100))) {
+                Poll::Answered { id, result } if id == wanted => return Ok(result),
+                Poll::Failed { id, message } if id == wanted => {
+                    bail!("the server answered request {wanted} with an error: {message}")
+                }
+                Poll::Closed => bail!("the language server exited before answering request {wanted}"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Ends the server: `shutdown`, `exit`, and a kill for one that ignores
+    /// both.
+    ///
+    /// Every step is best-effort and none of them can fail this process. A
+    /// server that has already crashed is the normal case for the first two,
+    /// and the kill is what makes the *last* case - a server that answered
+    /// `shutdown` and then kept running - bounded rather than permanent.
+    pub(crate) fn shutdown(&mut self, grace: Duration) {
+        let id = self.request("shutdown", Value::Null).ok();
+        if let Some(id) = id {
+            let _ = self.await_response(id, Instant::now() + grace);
+        }
+        let _ = self.notify("exit", Value::Null);
+
+        let until = Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => break,
+            }
+        }
+        if self.child.kill().is_ok() {
+            let _ = self.child.wait();
+            eprintln!("[{}] the language server did not exit when asked - killed it", self.language);
+        }
+    }
+
+    /// Drains whatever the server has said since the last poll, without
+    /// waiting. Called before a pass starts so that progress notifications
+    /// sent while the plugin was idle are accounted for rather than read as
+    /// "the server is busy" on the next question.
+    pub(crate) fn drain(&mut self) {
+        while matches!(self.poll_now(), Poll::Noise | Poll::Answered { .. } | Poll::Failed { .. }) {}
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        self.shutdown(Duration::from_millis(500));
+    }
+}
+
+/// What to answer a server-initiated request with.
+///
+/// `workspace/configuration` is the one that cannot be answered with a bare
+/// `null`: it asks for *n* settings and the specification says the answer is
+/// an array of *n* values, so a scalar makes a server that trusts its own
+/// protocol index into nothing. `null` per item means "no configuration for
+/// that section", which is true here - this client carries no user settings -
+/// and is what every server handles.
+///
+/// Everything else gets `null`, which covers
+/// `window/workDoneProgress/create` (an acknowledgement),
+/// `client/registerCapability` (this client registers nothing dynamically,
+/// and saying so is better than not answering) and whatever a future server
+/// invents. None of these is language-specific: they are base-protocol
+/// methods.
+///
+/// A free function because it reads nothing about the client, which is also
+/// what lets its own test call the real thing rather than a copy of it.
+fn server_request_reply(method: &str, params: Option<&Value>) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let items = params
+                .and_then(|params| params.get("items"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            Value::Array(vec![Value::Null; items])
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Forwards the server's stderr, prefixed, up to a budget - see
+/// [`STDERR_LINE_BUDGET`].
+fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr) {
+    use std::io::BufRead;
+    let mut lines = 0usize;
+    let mut suppressed = 0usize;
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        lines += 1;
+        if lines <= STDERR_LINE_BUDGET {
+            eprintln!("[{language}] {server}: {line}");
+            if lines == STDERR_LINE_BUDGET {
+                eprintln!(
+                    "[{language}] {server}: further output is counted rather than printed - \
+                     {STDERR_LINE_BUDGET} lines is this log's share of it"
+                );
+            }
+        } else {
+            suppressed += 1;
+        }
+    }
+    if suppressed > 0 {
+        eprintln!("[{language}] {server}: {suppressed} further line(s) of server output were suppressed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reply shapes a server-initiated request gets, which are the
+    /// difference between a server that finishes loading and one that waits
+    /// forever - see [`server_request_reply`]. The end-to-end version, with a
+    /// real spawned server, is in `tests/lsp_bridge.rs`.
+    #[test]
+    fn a_configuration_request_is_answered_one_value_per_item() {
+        let items = json!({ "items": [{}, {}, {}] });
+        assert_eq!(server_request_reply("workspace/configuration", Some(&items)), json!([null, null, null]));
+        assert_eq!(server_request_reply("workspace/configuration", None), json!([]));
+
+        let token = json!({ "token": "t" });
+        assert_eq!(server_request_reply("window/workDoneProgress/create", Some(&token)), Value::Null);
+        assert_eq!(server_request_reply("client/registerCapability", None), Value::Null);
+    }
+}
