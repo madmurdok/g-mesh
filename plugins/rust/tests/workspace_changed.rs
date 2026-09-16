@@ -10,18 +10,21 @@
 //! does, and that kit never sends `workspaceChanged` (its own report, run
 //! by hand against this crate's fixture, has no such line).
 //!
-//! # What this can and cannot observe
+//! # What this observes
 //!
-//! This crate's `extract` is presently a File-only stub (GM-285's own scope
-//! boundary - see `src/extractor.rs`'s module doc) that never reads its
-//! `ProjectContext` argument, so no wire *content* differs before and after
-//! a `Cargo.toml` edit yet: there is nothing for GM-286's declarations to
-//! attribute to a container until GM-286 exists to emit them. What this test
-//! proves instead is the wiring itself - the SDK's own control loop
-//! (`run::Session::handle`'s `"workspaceChanged"` arm, calling
-//! `RustExtractor::load_project` a second time) accepts the notification,
-//! reports the reload on its own stderr, and keeps answering `fileChanged`
-//! correctly afterwards rather than wedging or crashing.
+//! Until GM-286 this could only prove the *wiring* - that the notification
+//! was accepted and the plugin kept answering - because `extract` was a
+//! File-only stub that never read its `ProjectContext`. Now the reload has a
+//! visible consequence on the wire, and that is what is asserted: a `Cargo.toml`
+//! edit that drops `crates/beta` from the workspace changes the container
+//! every declaration in `crates/beta/src/main.rs` belongs to, from the crate
+//! `beta_crate` to the synthetic `orphan:` key a file no crate's module tree
+//! reaches gets (`project`'s Decision 5).
+//!
+//! That is a stronger claim than "it did not crash": a plugin that
+//! acknowledged the notification and kept its stale model would answer the
+//! second `fileChanged` exactly as it answered the first, and pass the old
+//! version of this test.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -141,10 +144,29 @@ impl Drop for Scratch {
     }
 }
 
+/// The containers every declaration of `file` is attributed to, in the
+/// plugin's answer to one `fileChanged`. The `File` node itself carries none
+/// by design (it is not a container member), so it drops out here.
+fn containers_of(response: &serde_json::Value, file: &str) -> Vec<String> {
+    let upserts = response["result"]["upsertNodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no upsertNodes in the response to {file}: {response}"));
+    let mut containers: Vec<String> =
+        upserts.iter().filter_map(|node| node["container"].as_str().map(str::to_string)).collect();
+    containers.sort();
+    containers.dedup();
+    containers
+}
+
 #[test]
-fn workspace_changed_is_acknowledged_and_the_plugin_keeps_answering() {
+fn workspace_changed_reloads_the_project_model_the_next_answer_is_built_from() {
     let scratch = Scratch::create("basic");
     let mut client = Client::spawn(&scratch.0);
+
+    // Before: `crates/beta` is a workspace member, so its `main.rs` is the
+    // root of the crate `beta-crate` (normalized to `beta_crate`).
+    let before = client.request("fileChanged", serde_json::json!({ "filePath": "crates/beta/src/main.rs" }));
+    assert_eq!(containers_of(&before, "crates/beta/src/main.rs"), vec!["beta_crate".to_string()], "{before}");
 
     // The same edit `project::tests::reloading_after_a_cargo_toml_edit_picks_up_the_new_membership`
     // makes directly against `ProjectContext::load` - here made against the
@@ -152,18 +174,20 @@ fn workspace_changed_is_acknowledged_and_the_plugin_keeps_answering() {
     std::fs::write(scratch.0.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/alpha\"]\n").unwrap();
     client.notify("workspaceChanged", serde_json::json!({ "filePath": "Cargo.toml" }));
 
-    // The plugin must still be alive and answering correctly: this is the
-    // first time this process has seen `crates/alpha/src/lib.rs`, so its
-    // `File` node comes back as an addition either way - what this proves is
-    // that `workspaceChanged` did not wedge or crash the control loop.
-    let response =
-        client.request("fileChanged", serde_json::json!({ "filePath": "crates/alpha/src/lib.rs" }));
-    let upserts = response["result"]["upsertNodes"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no upsertNodes in the response: {response}"));
-    assert_eq!(upserts.len(), 1, "{response}");
-    assert_eq!(upserts[0]["kind"], "File", "{response}");
-    assert_eq!(upserts[0]["qualifiedName"], "crates/alpha/src/lib.rs", "{response}");
+    // After: no crate reaches that file any more, so it is an orphan - the
+    // observable consequence of the reload, and one a plugin that merely
+    // acknowledged the notification could not produce.
+    let after = client.request("fileChanged", serde_json::json!({ "filePath": "crates/beta/src/main.rs" }));
+    assert_eq!(
+        containers_of(&after, "crates/beta/src/main.rs"),
+        vec!["orphan:crates/beta/src/main.rs".to_string()],
+        "{after}"
+    );
+
+    // ...and the control loop is still answering about other files, rather
+    // than having wedged on the notification.
+    let alpha = client.request("fileChanged", serde_json::json!({ "filePath": "crates/alpha/src/lib.rs" }));
+    assert!(containers_of(&alpha, "crates/alpha/src/lib.rs").contains(&"alpha".to_string()), "{alpha}");
 
     client.shutdown();
 }
