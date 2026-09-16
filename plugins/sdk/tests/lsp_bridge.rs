@@ -857,3 +857,71 @@ fn the_bridge_carries_no_language_of_its_own() {
         "the answer does not depend on the name: {produced:?}"
     );
 }
+
+/// The second settings channel (GM-299): a server that *asks* for its
+/// settings gets the ones the config carries, positionally, and `null` for a
+/// section nobody configured.
+///
+/// This is the one direction the rest of this file cannot exercise - the
+/// server making a request of the client - and it is the only channel pyright
+/// reads at all (`lsp::config`'s module doc has that measurement). The
+/// assertion is on what the *server received*, written back out to a file,
+/// rather than on what the client believed it sent: a reply that never leaves
+/// the client is indistinguishable from a correct one at this end.
+#[test]
+fn a_server_that_asks_for_its_settings_is_answered_from_the_config() {
+    let scratch = Scratch::new("settings");
+    let (index, _caller) = fixture(&scratch);
+    let received = scratch.path().join("configuration.json");
+    let mut config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "askConfiguration": ["toy", "nobody-configured-this"],
+        "configurationOut": received.to_string_lossy(),
+    }));
+    config.settings.insert("toy".to_string(), json!({ "analysis": { "mode": "basic" } }));
+
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "the settings exchange must not disturb the pass itself");
+    assert_eq!(semantic_edges(&answer).len(), 1, "and the pass still answers: {:#?}", answer.diff);
+
+    // Dropping the bridge runs `shutdown`/`exit` and waits for the child, and
+    // that is what makes this read deterministic rather than a race: one pipe
+    // preserves order, so a reply the client sent during the pass is a frame
+    // the server necessarily read before the `exit` it has now acted on.
+    drop(bridge);
+    let text = std::fs::read_to_string(&received).expect("the server wrote down what it was answered");
+    let sent: Value = serde_json::from_str(&text).expect("and it is the JSON the client sent");
+    assert_eq!(
+        sent,
+        json!([{ "analysis": { "mode": "basic" } }, null]),
+        "one value per item, in the order asked, with an unconfigured section null: {text}"
+    );
+}
+
+/// The discrimination for the test above: the same server asking the same
+/// question of a bridge whose config carries no settings is answered `null` -
+/// so the test above is measuring the settings and not the request.
+#[test]
+fn a_server_that_asks_with_nothing_configured_is_answered_null() {
+    let scratch = Scratch::new("settings-none");
+    let (index, _caller) = fixture(&scratch);
+    let received = scratch.path().join("configuration.json");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "askConfiguration": ["toy", "nobody-configured-this"],
+        "configurationOut": received.to_string_lossy(),
+    }));
+    assert!(config.settings.is_empty(), "the arm's whole difference");
+
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    assert!(pass(&mut bridge, &index).complete);
+
+    drop(bridge);
+    let text = std::fs::read_to_string(&received).expect("the server wrote down what it was answered");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!([null, null]), "{text}");
+}

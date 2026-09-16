@@ -10,9 +10,13 @@
 //!
 //! See `project`'s module doc for the package model (container keys, roots,
 //! namespace packages, `.pyi` stubs - the eight decisions GM-295 and GM-296
-//! settled between them) and `extractor`'s for the structural tier itself:
-//! what a `qualifiedName` is, why every declaration is `public`, what each
-//! import shape emits, and what stays a documented gap.
+//! settled between them), `extractor`'s for the structural tier itself (what a
+//! `qualifiedName` is, why every declaration is `public`, what each import
+//! shape emits, and what stays a documented gap), and `semantic`'s for the
+//! pyright tier over the SDK's `LspBridge` - including the three places it
+//! looks for a server and the two things pyright does differently from
+//! rust-analyzer.
 
 pub mod extractor;
 pub mod project;
+pub mod semantic;

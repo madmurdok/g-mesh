@@ -284,6 +284,17 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// into, beyond [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`] - virtual
 /// environments and their caches, never source in any Python project.
 ///
+/// `node_modules` joined the list in GM-299 and is the one entry that is not
+/// a Python artefact. A Python project may perfectly well have one - a web
+/// application with a JavaScript front end - and it is never that project's
+/// own Python source. What forced the question is that `crate::semantic`'s
+/// second resolution branch *invites* one: a user told to run `npm install
+/// pyright` in their project gets a `node_modules` holding pyright's bundled
+/// typeshed, which is **5,205 `.pyi` files** (measured, 1.1.414). Without
+/// this entry every one of them would be indexed as a declaration of the
+/// project. The same reasoning as `site-packages`, arriving through a
+/// different package manager.
+///
 /// Duplicated as a plain constant here, and again in `plugin.toml`'s
 /// `[plugin.workspace] exclude_dirs`, rather than shared as code: this
 /// module's own walk (root detection, run once per [`ProjectContext::load`])
@@ -292,8 +303,8 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// `manifest` module doc names this exact drift as accepted precedent
 /// (`ignorePolicy.ts`'s `HARD_EXCLUDED_DIRS` vs. `plugin.toml`, "the same
 /// list written twice, with a comment explaining how they relate").
-pub(crate) const EXCLUDE_DIRS: [&str; 6] =
-    [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages"];
+pub(crate) const EXCLUDE_DIRS: [&str; 7] =
+    [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"];
 
 const PY_EXTENSION: &str = ".py";
 const PYI_EXTENSION: &str = ".pyi";

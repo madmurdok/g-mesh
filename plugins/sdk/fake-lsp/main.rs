@@ -178,7 +178,24 @@ struct Script {
     /// count what was asked.
     #[serde(default)]
     log: Option<String>,
+    /// Sections to ask the *client* for with `workspace/configuration`, right
+    /// after `initialized` - which is when pyright asks, and the only channel
+    /// it takes settings through at all (GM-299). A server asking its client
+    /// something is the one direction the rest of this script cannot
+    /// exercise.
+    #[serde(default)]
+    ask_configuration: Vec<String>,
+    /// Where to write the client's answer to that request, verbatim, so a
+    /// test can assert what the client actually sent rather than what it
+    /// meant to.
+    #[serde(default)]
+    configuration_out: Option<String>,
 }
+
+/// The id this server uses for its own `workspace/configuration` request.
+/// Far away from the client's own ids, which start at 1, so a frame carrying
+/// it cannot be mistaken for anything else.
+const CONFIGURATION_REQUEST_ID: i64 = 9001;
 
 fn main() {
     let script = read_script();
@@ -210,7 +227,25 @@ fn main() {
                 }
                 respond(&mut stdout, id, json!({ "capabilities": capabilities }));
             }
-            "initialized" => start_progress(&script, Arc::clone(&indexing)),
+            "initialized" => {
+                start_progress(&script, Arc::clone(&indexing));
+                if !script.ask_configuration.is_empty() {
+                    let items: Vec<Value> = script
+                        .ask_configuration
+                        .iter()
+                        .map(|section| json!({ "scopeUri": "file:///p", "section": section }))
+                        .collect();
+                    write_frame(
+                        &mut stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": CONFIGURATION_REQUEST_ID,
+                            "method": "workspace/configuration",
+                            "params": { "items": items },
+                        }),
+                    );
+                }
+            }
             "shutdown" => respond(&mut stdout, id, Value::Null),
             "exit" => return,
             "textDocument/definition" | "textDocument/implementation" => {
@@ -257,12 +292,22 @@ fn main() {
                     std::process::exit(101);
                 }
             }
+            // The client's answer to *our* `workspace/configuration`: a frame
+            // with an id and no method. It must be recognised before the
+            // catch-all below, which would otherwise "answer" a response and
+            // leave the client correlating a reply to nothing.
+            "" if id.as_ref().and_then(Value::as_i64) == Some(CONFIGURATION_REQUEST_ID) => {
+                if let Some(path) = &script.configuration_out {
+                    let answer = message.get("result").cloned().unwrap_or(Value::Null);
+                    let _ = std::fs::write(path, serde_json::to_string(&answer).unwrap_or_default());
+                }
+            }
             // Everything else - `didOpen`, `didChange`, `$/cancelRequest` - is
             // accepted and ignored. A request this fixture does not know still
             // gets an answer, because a client left waiting on one would hang
             // for a reason that has nothing to do with the test.
             _ => {
-                if id.is_some() {
+                if id.is_some() && !method.is_empty() {
                     respond(&mut stdout, id, Value::Null);
                 }
             }

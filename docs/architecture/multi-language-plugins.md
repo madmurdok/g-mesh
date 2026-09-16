@@ -1778,9 +1778,12 @@ longer to build than Rust's, and the tracker has nothing more precise than
 that to offer either way.
 
 What this covers, and what it does not: the structural tier only. GM-299
-(Python's semantic tier, a pyright bridge) is deferred and unbuilt, and this
-document's own Open Questions already name Python's dynamic dispatch as a
-gap that persists "even with pyright." A semantic tier is exactly where Rust
+(Python's semantic tier, a pyright bridge) was deferred and unbuilt when this
+was written - it has since landed, and "Implementation notes (GM-299)" below
+answers the question this paragraph leaves open: no core change, one generic
+SDK field. This document's own Open Questions already name Python's dynamic
+dispatch as a gap that persists "even with pyright." A semantic tier is
+exactly where Rust
 needed its one real core fix (GM-290 - core did not tell a spawned plugin
 which manifest it had read), for a *different* language's semantic engine.
 This result says nothing about whether Python's semantic tier will need
@@ -1791,6 +1794,212 @@ than exercise it, this section would report the opposite finding - the
 generalization would have been narrower than R1 claimed, and the C#/C++/
 Java/Kotlin plans in the stress test above should have been revisited before
 being built. Neither happened.
+
+#### Implementation notes (GM-299): the pyright engine
+
+Built as `plugins/python/src/semantic.rs` plus one addition inside the SDK's
+generic bridge. GM-290 was the first time `LspBridge` met a real language
+server; this was the first time it met a *second* one, and the value of that
+is that it separates "what the bridge assumed" from "what rust-analyzer
+happens to do". Four of the five findings below are the second kind, and none
+of them is about Python.
+
+**What it cost core and the SDK.** GM-300's own note ends by saying it is
+silent on whether Python's semantic tier would need core work. The answer is
+**no core capability change** and **one SDK addition**.
+
+Core's diff is `core/src/mcp/instructions.rs`, +54/-27, and every changed line
+sits inside `#[cfg(test)] mod tests` (that module starts at line 415; the three
+hunks start at 514, 626 and 643) - the same shape and the same file GM-300
+reports for GM-297. What changed there is what *had* to: GM-297 wrote
+`python_only_lists_the_receiver_gap_with_no_semantic_tier_yet` to read
+`plugins/python/plugin.toml` rather than transcribe it, precisely so that a
+pyright tier landing would break it, and it did. It is now the pair
+`python_only_before_…`/`python_only_after_…`, exactly the transition GM-290
+made for Rust. The *generator* is untouched: Python flipping to
+`receiver_calls = "resolved"` exercises a branch written for Go in GM-281 and
+used by Rust since GM-290.
+
+The SDK addition is `SemanticConfig::settings` (finding 2 below), and it is
+generic protocol surface rather than a Python accommodation:
+`workspace/configuration` is a base-protocol method and the next server that
+takes its settings that way needs nothing further. So the "zero" of GM-300
+becomes "zero core capability, one generic SDK field, one test that was built
+to fail this way" once a second engine exists - a weaker claim than R1's and
+still a strong one.
+
+**1. `pyright-langserver` has no `--version`, so GM-290's probe does not
+transfer.** GM-290's rule - a candidate is accepted for *answering*
+`--version`, not for existing - is right and is kept. Its implementation is
+not portable:
+
+```text
+$ node_modules/.bin/pyright-langserver --version
+Error: Connection input stream is not set. Use arguments of createConnection
+or set command line parameters: '--node-ipc', '--stdio' or '--socket={number}'
+$ echo $?
+1
+```
+
+The npm package ships two `"bin"` entries, `pyright` (a CLI) and
+`pyright-langserver` (a server), and only the CLI answers. So each candidate is
+probed through its **CLI twin** - same directory, same npx invocation, one name
+changed. The general lesson for language #5: the thing you can ask for a
+version may not be the thing you are about to run, and "probe it" has to mean
+"probe the same installation", not "probe the same file".
+
+Two consequences fell straight out of that. `args = ["--stdio"]` is
+**mandatory** in the manifest, where rust-analyzer needed no args at all - a
+manifest that omits it configures a server that exits before reading a byte.
+And the probe is now **bounded** (`PROBE_BUDGET`, 60s, the child killed rather
+than waited on), which `plugins/rust`'s unbounded `Command::output()` is not:
+rust-analyzer's `--version` is ~20ms of local work, while the measured costs
+here are 0.89s for a `node_modules` probe and 4.94s for an `npx` one that has
+to populate npm's cache - and an unreachable registry does not fail fast.
+
+**2. `initializationOptions` is not the settings channel, for pyright it is not
+a channel at all.** GM-289 modelled a server's settings as
+`initializationOptions`, and the task that scheduled this work repeats that
+("initialization options: basic type checking; the project's own venv"). LSP
+has a second channel - the server *asks*, with `workspace/configuration` - and
+GM-289's client answered that with a fixed array of `null`s, which is exactly
+right for rust-analyzer and exactly wrong here. One variable changed, same
+fixture, same value:
+
+```text
+initializationOptions {"python":{"analysis":{"typeCheckingMode":"off"}}}
+  -> 4 diagnostics, severity 1     (identical to the no-settings run)
+workspace/configuration reply {"analysis":{"typeCheckingMode":"off"}}
+  -> 1 diagnostic,  severity 2
+```
+
+and, for the venv, `python.pythonPath` through the same channel makes pyright
+log `Setting pythonPath for service "…"`, while a deliberately bogus path turns
+`Assuming Python version 3.9.6.final.0` into `Unable to get Python version from
+interpreter` - a discriminating pair in both directions.
+
+So `SemanticConfig::settings` is a map of LSP *section* to JSON, read from
+`[plugin.semantic.settings]`, answered positionally by
+`client::server_request_reply`. It sits *beside* `initialization_options`
+rather than replacing it: the two are different mechanisms and servers differ
+in which they read. A plugin may also add to it at run time, which is how
+`python.pythonPath` gets in at all - it names a path inside the project being
+indexed, and a manifest ships beside the plugin binary.
+
+**3. `textDocument/implementation` is optional, and the obvious manifest value
+would have been catastrophic rather than merely useless.** `plugins/rust` sets
+`implementation_kinds = ["trait"]`; the obvious Python reading is `["class"]`.
+pyright advertises no `implementationProvider` and answers the request with
+`{"code":-32601,"message":"Unhandled method textDocument/implementation"}`. The
+bridge reads a JSON-RPC error as a *refused question* - correctly, since a
+server that errors has not said "nothing there" - which marks the file
+uncovered and the pass **incomplete**. One wrong word in the manifest would
+therefore have meant: every class asked, every answer an error, every pass
+incomplete, `semanticPassAt` never set, and the receiver gap listed forever -
+on a tier that otherwise works. `implementation_kinds = []` is the shipped
+value and the manifest says why at length.
+
+The cost is honest and stated in the plugin README: `find_implementations` for
+Python is exactly as structural as it was in 3.4.0, and a subclass whose base
+arrived through a star import (`conformance/project/pkg/dynamic.py`) is
+invisible to it. The general lesson: `implementation_kinds` is the one manifest
+key whose wrong value fails *closed on the whole pass* rather than on itself,
+so a language's plugin has to check the server's `initialize` result rather
+than assume the request exists.
+
+**4. The bridge's question set is narrower than "what the engine could
+answer", and that is where this task's own description was wrong.** The task
+says the tier "sees re-exports pyright resolves that the structural tier could
+not". pyright *does* resolve them - asked directly at `class Megaphone(Speaker)`
+where `Speaker` arrived through `from pkg.base import *`, it answers
+`pkg/base.py:11:6` - and the tier still does not see it, because the bridge
+asks one question per **open site** and `plugins/python`'s extractor records an
+open site only for a receiver call. A bare name that resolves to nothing is
+deliberately not one (it would make the open-site set mostly builtins). So the
+limit here is not the engine's reach but the structural tier's question list,
+and closing it would be a change to `OpenSiteKind`, not to a manifest. Worth
+knowing before language #5 writes the same sentence into its own task.
+
+**5. A `.pyi` stub next to its module makes every `definition` answer
+ambiguous, and GM-295's Decision 6 silently saves the tier.** pyright answers
+`greeter.render()` with **two** locations - `pkg/mod.pyi` and `pkg/mod.py` -
+because a stub shadows its module for a type checker. The bridge refuses an
+answer whose locations disagree (that is the linker's job, not a guess of
+its own), so two *addressable* nodes would have produced no edge. It works only
+because GM-295 decided a `.pyi` contributes its `File` node and nothing else:
+`node_at` finds the `File`, `is_addressable` rejects it, and one target
+survives. That decision was taken to keep `from pkg import mod` unambiguous and
+had nothing to do with a semantic tier; had stubs been indexed as declarations,
+this tier would have emitted *zero* edges for every stubbed module, and the
+symptom would have been an empty caller list rather than an error.
+
+**Readiness, measured, and deliberately not changed.** pyright's `$/progress`
+is one token with an empty title, created through
+`window/workDoneProgress/create`, and its whole life is ~0.18s - nothing like
+rust-analyzer's seven sequential tokens over 14.21s. It arrives ~0.63s *after*
+`didOpen`, so the 2s settle covers the gap with a 3.2x margin, and readiness
+lands at ~3.06s of which 2.0s is the settle itself.
+
+The measurement that matters is the counterfactual: asking pyright the same
+nine questions with the settle set to **zero** - the first at 0.28s, before the
+progress token had even begun - returns **byte-identical answers**, the first
+request taking 773ms and the rest 2-9ms. pyright analyses on demand; its
+progress token is a background diagnostics pass, not an indexing gate. So for
+Python the readiness rule is pure latency: about 2.0s of a 3.3-3.5s
+whole-project pass, ~60%, is the bridge waiting for a server that was ready
+before it was asked.
+
+`Budgets::settle` is per-bridge and `LspBridge::with_budgets` would let this
+plugin shorten it. **It is deliberately left at the default.** The measurement
+is of one server version, on one twelve-file fixture, with nothing installed in
+the environment; "a server made to look ready before it can answer" is the exact
+bug GM-290 found twice, and the failure mode of getting it wrong is a pass that
+reports itself complete having resolved nothing. Two seconds of a cold start is
+a cheap insurance premium, and a per-engine settle is a decision for whoever
+measures it on a real corpus rather than for whoever noticed it first.
+
+**Cold load, memory and the gap, on the twelve-file conformance fixture.**
+Three `g-mesh init` runs against an isolated `G_MESH_HOME` with only the Python
+plugin discovered (`G_MESH_PLUGIN_ROOTS_OVERRIDE`), the project carrying its
+own `node_modules` so resolution branch 2 is what answered, reading core's own
+two timestamps back out of the index rather than timing from outside:
+
+| | rep A | rep B | rep C |
+|---|---:|---:|---:|
+| load average at start (1m) | 6.00 | 5.97 | 5.53 |
+| `g-mesh init`, `real` / `user` / `sys` | 11.23 / 22.02 / 1.44 | 10.29 / 21.37 / 1.31 | 10.44 / 21.47 / 1.39 |
+| plugin's own report for the pass | 3.59s | 3.43s | 3.39s |
+| `bulkIndexedAt` → `semanticPassAt` | 4s | 4s | 3s |
+| peak process-tree RSS | 130.8 MiB | 130.7 MiB | 132.1 MiB |
+| …of which node/pyright | 125.1 | 125.1 | 126.4 |
+
+`user` at roughly twice `real` says the whole `init` is doing parallel work
+rather than waiting on something, which is what makes these timings a
+measurement of the code rather than of the machine. The gap column is
+second-resolution, which is all `language_state` stores.
+
+Peak RSS is the whole tree, which is what `[plugin] memoryLimitMb` samples, and
+it splits 5.6-5.7 MiB of plugin to 125-126 MiB of node: **pyright costs about a
+quarter of what rust-analyzer does** (535-555 MiB in GM-290), so the ~600 MiB
+floor that note records for Rust is not the floor here - a limit around 200 MiB
+would leave Python room on a fixture this size. The sampler walks the tree
+about twice a second, so the peak is a lower bound rather than an exact
+maximum.
+
+A second set of three reps taken earlier, at load averages 3.41, 18.47 and
+18.81, gives 3.31-3.47s for the pass and 128.6-131.6 MiB peak - indistinguishable
+from the quiet set. That is itself the finding: the pass is 2.0s of fixed
+settle plus ~1.4s of work, and neither is CPU-bound enough for a six-fold
+change in this machine's load to show. The per-file pass that follows an edit is
+33-36ms, because `LspClient::settle` latches: a server that has proved its
+shape once is never made to prove it again.
+
+None of this extrapolates. Twelve files with no third-party dependencies is the
+best case; pyright's cold load on a real project is dominated by resolving
+imports against a venv's `site-packages` and by the typeshed it bundles, which
+this fixture does not exercise at all. "Many minutes on a large repository"
+remains the expectation for every engine on this bridge, and measuring it on a
+Python bench corpus is bench work this task did not do.
 
 ### MCP instructions
 
@@ -2127,6 +2336,12 @@ What it leaves for later, deliberately:
 - the C++ preprocessor and include paths, which belong to clangd and
   `compile_commands.json`, and not to core;
 - Python's dynamic dispatch, which stays a documented gap even with pyright.
+  Built and measured in GM-299: pyright answers a receiver whose type it can
+  infer (a local from its initializer, a parameter from its annotation, a call
+  result) and answers `null` for an unannotated parameter, which is the most
+  ordinary shape in un-hinted Python. `plugins/python/README.md` states the
+  whole boundary; the fixture asserts the `null` case by the *absence* of a
+  caller row.
 
 ## Rollout
 

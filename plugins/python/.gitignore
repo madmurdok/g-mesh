@@ -1,0 +1,15 @@
+# pyright, installed with `npm install pyright` run in this directory - the
+# language server this plugin's semantic tier (GM-299) drives, and a test
+# dependency of this crate the same way rust-analyzer is one of
+# plugins/rust's. Never committed: it is 34 MB of someone else's package,
+# pinned by nothing here, and `plugins/typescript/.gitignore` sets the same
+# precedent for its own dependencies.
+#
+# It lives here rather than inside `conformance/project/` on purpose. The
+# conformance kit runs a plugin against a scratch *copy* of the fixture and
+# `copy_tree` skips symlinks, so an npm `.bin` directory would not survive the
+# copy - and a pyright install inside the fixture would also put 5,205
+# bundled typeshed stubs where the walk can see them.
+node_modules/
+package.json
+package-lock.json
