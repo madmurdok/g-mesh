@@ -1643,9 +1643,9 @@ mod tests {
 
     /// The dev checkout keeps the behavior it has always had: nothing about
     /// bundling a release may change how `cargo test` and a working tree spawn
-    /// the plugin. (Test binaries live in `core/target/<profile>/deps/`, where
-    /// no `plugins/` directory exists, so resolution falls through to the
-    /// compile-time path.)
+    /// the plugin. (Test binaries live in the workspace's
+    /// `target/<profile>/deps/`, where no `plugins/` directory exists, so
+    /// resolution falls through to the compile-time path.)
     #[test]
     fn a_checkout_still_resolves_to_the_compiled_javascript_entry_point() {
         let manifest = bundled_manifest();

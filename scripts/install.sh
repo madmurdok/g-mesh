@@ -24,14 +24,17 @@
 #   plugins/typescript/          the JS/TS plugin (its own embedded Node
 #                                runtime) and the plugin.toml core discovers
 #                                it through
+#   plugins/rust/                the Rust plugin (a plain cargo binary,
+#                                needing no runtime of its own) and its own
+#                                plugin.toml (GM-288)
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
-# Core cannot index anything without a plugin, and it finds one by looking for
-# `plugins/` *next to the executable that is running*
-# (`daemon::manifest::installed_bundled_root`, which is
-# `std::env::current_exe()` + `/plugins`). So the two halves have to land in
-# one directory, and that directory - not a copy of the binary - is what goes
-# on `PATH`.
+# Core cannot index a TypeScript project without the JS/TS plugin, and it
+# finds both plugins by looking for `plugins/` *next to the executable that is
+# running* (`daemon::manifest::installed_bundled_root`, which is
+# `std::env::current_exe()` + `/plugins`). So every part of the install has to
+# land in one directory, and that directory - not a copy of the binary - is
+# what goes on `PATH`.
 #
 # That also rules out the usual `ln -s <install>/g-mesh /usr/local/bin/g-mesh`
 # convenience: `current_exe()` resolves symlinks on Linux (`/proc/self/exe`)
@@ -454,7 +457,7 @@ this binary."
 	[ -d "$_stage" ] || die "unexpected archive layout: $_asset does not contain a $_stem/ directory"
 	[ -f "$_stage/g-mesh" ] || die "unexpected archive layout: no g-mesh binary inside $_asset"
 	[ -f "$_stage/plugins/typescript/plugin.toml" ] ||
-		die "unexpected archive layout: $_asset carries no plugins/typescript/plugin.toml. Core cannot index anything without the plugin, so this archive is not installable."
+		die "unexpected archive layout: $_asset carries no plugins/typescript/plugin.toml. Core cannot index a TypeScript project without it, so this archive is not installable."
 	chmod +x "$_stage/g-mesh" 2>/dev/null || true
 
 	# Run it before installing it. `--version` proves the binary executes on

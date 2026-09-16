@@ -1,6 +1,9 @@
-# How the test suite is run (GM-253). `core/` is its own cargo workspace root -
-# there is no manifest above it - which is why this lives here rather than at
-# the repository root; nextest resolves this path against the workspace.
+# How the test suite is run (GM-253). nextest resolves this path against the
+# cargo *workspace* root, which is why it lives here: GM-284 added a root
+# manifest (see `Cargo.toml`) so `core/`, `wire/` and `plugins/sdk` are one
+# workspace, and this file moved up from `core/.config/` with it. Left in
+# `core/` it would have been silently ignored - no fail-fast, no per-test
+# timeout - which is exactly the blind spot the settings below exist to close.
 #
 # Adopted on the runners' evidence, against run 32588238433's `cargo test`
 # step, after a local comparison said the opposite and was wrong. That one

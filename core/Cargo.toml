@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -29,6 +29,13 @@ flate2 = "1"
 # `watch_files` needs) because `globset::Glob` is exactly "one shell-style
 # pattern, compiled and validated once" with nothing else attached.
 globset = "0.4"
+# The wire protocol types, shared verbatim with `plugins/sdk` so core and
+# every SDK-built plugin cannot disagree about the format - see that crate's
+# own module doc for why they were moved out of `protocol::types` rather than
+# either re-declared in the SDK or pulled in by making every plugin depend on
+# this crate. `json-schema` is the `schemars` derive on `Position`, which only
+# core needs (its MCP tool schemas); the SDK leaves it off.
+g-mesh-wire = { path = "../wire", features = ["json-schema"] }
 ignore = "0.4"
 notify = "6"
 # `[plugin] memoryLimitMb` (task GM-274, `daemon::memory`) needs each

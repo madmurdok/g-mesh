@@ -40,27 +40,37 @@
 #                                    executable, its native addons, and the
 #                                    plugin.toml core discovers it through
 #                                    (built by scripts/bundle-plugin.sh)
-#   plugins/go/                      the Go plugin as one static,
-#                                    CGO-free binary cross-compiled for this
+#   plugins/go/                     the Go plugin as one static, CGO-free
+#                                    binary cross-compiled for this target,
+#                                    with the plugin.toml core discovers it
+#                                    through (scripts/bundle-go-plugin.sh)
+#   plugins/rust/                    the Rust plugin: a cargo binary built in
+#                                    the same workspace as core, for the same
 #                                    target, and the plugin.toml core
 #                                    discovers it through (built by
-#                                    scripts/bundle-go-plugin.sh)
+#                                    scripts/bundle-rust-plugin.sh; see that
+#                                    script's own header for GM-288)
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
-# Neither plugin is optional dressing: core cannot index a language without
-# one, so an archive missing either is not a complete release artifact. The
-# two plugins are bundled differently for the same reason they are bundled at
-# all - the JS/TS plugin's single-executable build embeds the build machine's
-# own Node runtime and so has to be built on a runner *for* its target (see
-# .github/workflows/release.yml), while the Go plugin has no such runtime to
-# embed and cross-compiles for any of the four targets from any one of them
-# (`GOOS`/`GOARCH`, `CGO_ENABLED=0` - see scripts/bundle-go-plugin.sh).
+# The JS/TS plugin is not optional dressing: core cannot index a TypeScript
+# project without one, so an archive missing it is not a release artifact.
+# The Go and Rust plugins ship for the same reason, one language later each.
+# The Go plugin is the one that does cross-compile from any host
+# (GOOS/GOARCH, CGO_ENABLED=0 - see scripts/bundle-go-plugin.sh); the other
+# two are built on their target's own runner. Every part of
+# an archive has to be for the *same* platform, which is why each target is
+# built on its own runner (see .github/workflows/release.yml) - the JS/TS
+# plugin embeds the build machine's own Node runtime and cannot be
+# cross-built, and the Rust plugin is built the same way core itself is
+# (`rustup target add` + `cargo build --target`, on that target's own
+# runner) rather than through a second, plugin-specific cross-build path -
+# see scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
-# without either plugin: exercising the Rust cross-build path (macOS x86_64 ->
-# aarch64 does work) when the resulting archive is known not to be shippable.
-# It warns loudly, because that is exactly the state task 64 shipped in and
-# task 65 was opened to fix.
+# without either plugin: exercising the Rust *core* cross-build path (macOS
+# x86_64 -> aarch64 does work) when the resulting archive is known not to be
+# shippable. It warns loudly, because that is exactly the state task 64
+# shipped in and task 65 was opened to fix.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -196,7 +206,11 @@ build_one() {
 		profile_dir="debug"
 	fi
 
-	local built="$REPO_ROOT/core/target/$target/$profile_dir/$bin_name"
+	# `$REPO_ROOT/target`, not `$REPO_ROOT/core/target`: GM-284 made the
+	# repository root the cargo workspace root (see the root Cargo.toml), and
+	# cargo puts the build directory there, whichever member's manifest the
+	# build was invoked through.
+	local built="$REPO_ROOT/target/$target/$profile_dir/$bin_name"
 	[ -f "$built" ] || die "expected binary not found: $built"
 
 	stage_dir="$DIST_DIR/$(artifact_stem_for "$target" "$version")"
@@ -220,6 +234,8 @@ build_one() {
 
 		log "bundling the Go plugin for $target"
 		bash "$REPO_ROOT/scripts/bundle-go-plugin.sh" "$target" "$stage_dir/plugins"
+		log "bundling the Rust plugin for $target"
+		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-rust-plugin.sh" "$target" "$stage_dir/plugins"
 	fi
 
 	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
@@ -249,7 +265,9 @@ build_one() {
 		# The check task 64 could not make: that the *staged* binary finds the
 		# *staged* plugins, through the same discovery an unpacked archive uses
 		# (`plugins/` beside the executable). This is the one that fails if the
-		# path resolution regresses back to a compile-time path.
+		# path resolution regresses back to a compile-time path. Both bundled
+		# plugins are required, not just one - GM-288 added the Rust check
+		# alongside the JS/TS one that was already here.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
 			log "smoke test: the staged binary discovers the staged plugins"
 			local plugins_output
@@ -258,6 +276,8 @@ build_one() {
 				die "the staged binary does not discover the typescript plugin staged beside it"
 			echo "$plugins_output" | grep -q "go" ||
 				die "the staged binary does not discover the go plugin staged beside it"
+			echo "$plugins_output" | grep -q "rust" ||
+				die "the staged binary does not discover the rust plugin staged beside it"
 		fi
 	else
 		log "smoke test skipped: $target is not the host ($host)"

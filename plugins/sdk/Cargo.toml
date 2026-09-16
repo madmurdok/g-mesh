@@ -1,0 +1,51 @@
+[package]
+name = "g-mesh-plugin-sdk"
+version = "3.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Everything a g-mesh language plugin needs that is not its language: protocol loop, project walk, incremental diff, ids"
+
+[lib]
+name = "g_mesh_plugin_sdk"
+path = "src/lib.rs"
+
+# The toy plugin the SDK's own conformance test drives through the real
+# `g-mesh plugins check`. A `[[bin]]` rather than an `examples/` target purely
+# so cargo exports `CARGO_BIN_EXE_g-mesh-plugin-toy` to this package's
+# integration tests - the same mechanism `testing::PluginCheck` documents for
+# a real plugin crate's own tests, exercised here on itself rather than
+# described and untried.
+#
+# `toy/main.rs`, not `tests/toy/main.rs`: cargo auto-discovers `tests/*/main.rs`
+# as an integration test target, so a bin pointed there would also be compiled
+# and run as a test harness. It is not shipped: shipping a plugin means a
+# `plugin.toml` in a discovery root (`daemon::manifest::default_roots`), and
+# nothing installs one for this - the test writes a manifest into a scratch
+# directory for the length of one check.
+[[bin]]
+name = "g-mesh-plugin-toy"
+path = "toy/main.rs"
+
+[dependencies]
+anyhow = "1"
+# The wire types themselves, shared verbatim with core so the two cannot
+# drift - see `g-mesh-wire`'s own module doc for why this is a crate. The
+# `json-schema` feature is deliberately left off: a plugin publishes no
+# schemas, so it compiles no schema generator.
+g-mesh-wire = { path = "../../wire" }
+# The project walk. `.gitignore` semantics (layered, with negation) are the
+# thing every plugin's walk has to get right and none of them should be
+# writing twice; this is the crate ripgrep's own walker is, and core already
+# depends on it, so it is one copy in the workspace rather than a new subtree.
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Node and edge ids are sha256 prefixes, and the scheme is a cross-plugin
+# contract (see `ids`' module doc): the TS plugin computes it with node's
+# `crypto`, the Go plugin with `crypto/sha256`, this crate with `sha2`. Core
+# already depends on it too.
+sha2 = "0.10"
+# `plugin.toml`, read back by the plugin itself for the walk's `exclude_dirs`
+# and the extensions it claims - see `manifest`' module doc for why the
+# plugin re-reads the file core also reads rather than being told.
+toml = "0.8"

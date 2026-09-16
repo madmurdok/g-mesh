@@ -22,8 +22,13 @@
 # the JS/TS plugin compiled to a self-contained executable (Node's SEA - it
 # embeds the runtime, so the machine needs no Node.js) in `plugins/typescript/`.
 # Since GM-283 it also carries the Go plugin, one static `CGO_ENABLED=0`
-# binary cross-compiled for the target in `plugins/go/`. Both live where
-# `daemon::manifest::bundled_roots` looks beside the executable.
+# binary cross-compiled for the target in `plugins/go/`, and since GM-288 the
+# Rust plugin, a plain cargo binary built in the same workspace as core for
+# the same target, in `plugins/rust/` - see `scripts/bundle-rust-plugin.sh`
+# for why that needs no extra toolchain setup here (unlike the JS/TS plugin,
+# it is built by the Rust toolchain this file already installs for core).
+# Every plugin directory lives where `daemon::manifest::bundled_roots` looks
+# beside the executable.
 # `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
 # section below fixes, and verifies the `.sha256` beside each archive before
 # it unpacks anything.
@@ -34,7 +39,11 @@
 # 1. Make sure `core/Cargo.toml`'s version is the version you are releasing.
 #    It, not the tag, is what the artifacts are named after; the tag is checked
 #    against it in the first step of every build job so a mismatch costs a
-#    minute instead of four 90-minute builds.
+#    minute instead of four 90-minute builds. Since GM-288, `wire/Cargo.toml`,
+#    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
+#    version too - `scripts/cut-release.sh` refuses if any of them disagree
+#    (see that script's own header), which is the easiest way to check this
+#    by hand as well.
 # 2. Tag the commit and push the tag:  `git tag v2.7.0 && git push origin v2.7.0`
 #    The repository has no tags at all today, so this is a deliberate, manual,
 #    human act - nothing in this pipeline creates one.
@@ -141,6 +150,7 @@ on:
       - "scripts/build-targets.sh"
       - "scripts/bundle-plugin.sh"
       - "scripts/bundle-go-plugin.sh"
+      - "scripts/bundle-rust-plugin.sh"
       - "scripts/prepare-release-assets.sh"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
@@ -410,9 +420,10 @@ jobs:
             echo
             echo "Every archive unpacks to a directory holding the \`g-mesh\` binary, the"
             echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, and"
-            echo "the Go plugin as a static binary in \`plugins/go/\`. The machine running it"
-            echo "needs no Node.js, no Go and no other toolchain; \`g-mesh model fetch\`"
-            echo "downloads the embedding model \`search_code\` needs."
+            echo "the Go plugin as a static binary in \`plugins/go/\` and the Rust plugin in"
+            echo "\`plugins/rust/\`. The machine running it needs no Node.js, no Go and no"
+            echo "other toolchain; \`g-mesh model fetch\` downloads the embedding model"
+            echo "\`search_code\` needs."
             echo
             echo "### Verifying a download"
             echo

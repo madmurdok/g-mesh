@@ -1,0 +1,214 @@
+# Post-linking expectations for the Rust plugin - `g-mesh plugins check
+# plugins/rust --fixture plugins/rust/conformance/project --expect
+# plugins/rust/conformance/expect.toml`, which `tests/conformance.rs` runs
+# from `cargo test`.
+#
+# GM-287's full file - every category `g-mesh plugins check --expect` can
+# assert (`core/src/cli/plugin_check/expectations.rs`'s module doc has the
+# format/anchoring/paging contract), each exercised at least once against
+# `conformance/project`, the fixture GM-285/GM-286 built and this task moved
+# here from `tests/fixtures/workspace` so CI and `cargo test` share one copy
+# (`plugins/typescript/conformance/`'s own layout, GM-277's precedent):
+#
+#   - callers, free fn (`shapes::describe`, called across crates through a
+#     plain `use` import - not a path call, not a pub-use rename chain);
+#   - callers, path (`nested::deep::work`, a module-qualified path call
+#     within one crate - the `name`-keyed row of `bodies.rs`'s own table);
+#   - callers, `Self::` and cross-crate path together (`shapes::Square::new`
+#     - see that entry's own comment);
+#   - callers, cross-crate through a `pub use` chain (`internals::published`);
+#   - callers, `pub(crate)` visibility (`internals::crate_only` - GM-286's
+#     own acceptance case, kept here rather than duplicated);
+#   - callers, the receiver-call gap made airtight (`shapes::Square::perimeter`
+#     - see that entry's own comment for what "airtight" means here);
+#   - references (`shapes::Shape`, which `[[callers]]` cannot reach at all -
+#     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
+#   - implementations (`shapes::Shape`, `impl Trait for T` found by
+#     `find_implementations` - GM-286's own acceptance case);
+#   - imports (`nested/mod.rs`, a glob and a container-scoped named re-export
+#     - GM-286's own acceptance case);
+#   - definition, twice (`internals::crate_only` with a redundant-but-armless
+#     `file`, `shapes::Square::perimeter` without one).
+#
+# Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
+# matters, and an entry missing from the set is as much of a failure as an
+# extra one.
+
+# --- callers: pub(crate), linkable from a sibling module and not from another
+#     crate (GM-286's own acceptance case) --------------------------------------
+
+[[callers]]
+symbol = "internals::crate_only"
+# `alpha::internals::crate_only` is `pub(crate)`, i.e. `container(alpha)`.
+#
+# IN: `shapes` is a *sibling* of `internals`, not an ancestor - it reaches the
+# item because `alpha` is on its parent chain. `internals::published` reaches
+# it from the same module. `nested::deep::deep_work` reaches it from two
+# modules down, and that one is only linkable because every `mod` item is
+# emitted as a member of the module that declares it: `alpha::nested`
+# declares nothing else, so without `mod deep;` it would have no `containers`
+# row, `parent_chain` would stop there, and `alpha` would never appear on the
+# chain (see `src/extractor/decls.rs`, and that file's own doc).
+#
+# OUT, and this is the assertion: `crates/beta/src/main.rs:forbidden` calls it
+# too, through a `use` that real `rustc` would reject. The plugin emits that
+# placeholder like any other; core's visibility check is what must refuse it,
+# because `alpha` is not on `beta_crate`'s parent chain. Its absence from this
+# set is the check.
+expect = [
+    "crates/alpha/src/shapes.rs:shapes::<Circle as Shape>::area",
+    "crates/alpha/src/internals.rs:internals::published",
+    "crates/alpha/src/nested/deep.rs:nested::deep::deep_work",
+]
+
+# --- callers: a pub use re-export chain, cross-crate --------------------------
+
+[[callers]]
+symbol = "internals::published"
+# `main` calls `exported_helper()`, imported from `alpha::prelude`, which
+# declares nothing: the only path from the call to this declaration is core's
+# re-export walk over `pub use crate::internals::published as exported_helper`
+# - including the rename, which is why the placeholder's key is `published`
+# and its node's name is `exported_helper`.
+expect = ["crates/beta/src/main.rs:main"]
+
+# --- callers: a type-qualified path call across crates, and a `Self::` call
+#     against the same declaration from inside its own impl -------------------
+
+[[callers]]
+symbol = "shapes::Square::new"
+# `Square::new(3)` in the other crate is addressed by `qualifiedName`, not by
+# name: `alpha::shapes` holds several declarations named `new` would have to
+# choose between if it were a name key. `unit`'s `Self::new(1)`, in this same
+# file, resolves through the same `qualifiedName` lookup `bodies.rs`'s table
+# gives `Self::f()` - `self_member` finds the impl's own type first - so one
+# entry proves both the cross-crate path form and the in-impl `Self::` form
+# reach the one declaration.
+expect = ["crates/beta/src/main.rs:main", "crates/alpha/src/shapes.rs:shapes::Square::unit"]
+
+# --- callers: a free function, called across crates through a plain `use` -----
+
+[[callers]]
+symbol = "shapes::describe"
+# `main` imports `describe` by name (`use alpha::shapes::{describe, Square};`)
+# and calls it bare - a free function, not a method and not a re-export
+# rename, so this is the plain "name key in an imported container" row of
+# `bodies.rs`'s own table, exercised cross-crate rather than same-file the
+# way `internals::published`'s callers already are.
+expect = ["crates/beta/src/main.rs:main"]
+
+# --- callers: a module-qualified path call, within one crate ------------------
+
+[[callers]]
+symbol = "nested::deep::work"
+# `run`'s `nested::deep::work()` is a multi-segment path whose qualifier
+# (`nested::deep`) is a module, not a type - the `a::b::f()` row of
+# `bodies.rs`'s table, addressed as a `name` key in the container the path
+# names rather than by `qualifiedName`. `nested/mod.rs`'s own `pub use
+# deep::work;` re-export is not a call site and must not appear here.
+expect = ["crates/alpha/src/lib.rs:run"]
+
+# --- callers: the receiver-call gap, made airtight -----------------------------
+
+[[callers]]
+symbol = "shapes::Square::perimeter"
+# `perimeter` is called three ways in this file, and only two produce an
+# edge: `Square::scale`'s `self.perimeter()` (resolved - `self.m()` inside an
+# impl is the one receiver-shaped call this tier does answer) and
+# `total_perimeter_via_path`'s `Square::perimeter(square)` (resolved - a
+# type-qualified path call). `total_perimeter`'s `square.perimeter()` is a
+# receiver call on a local variable, structurally identical to `total`'s
+# `square.area()`, and is deliberately left out of this expected set.
+#
+# That omission is what makes this an assertion rather than an oversight: if
+# a receiver call ever started producing an edge, `total_perimeter` would
+# appear in the *actual* set this check computes, the set would no longer
+# equal what is written below, and the check would fail on the unexpected
+# extra entry - not silently pass because nobody asked. Proven, not just
+# claimed: adding `"crates/alpha/src/shapes.rs:shapes::total_perimeter"` to
+# `expect` below fails today (see this task's own completion notes for the
+# recorded diff).
+expect = [
+    "crates/alpha/src/shapes.rs:shapes::Square::scale",
+    "crates/alpha/src/shapes.rs:shapes::total_perimeter_via_path",
+]
+
+# --- references: a usage [[callers]] cannot reach at all -----------------------
+
+[[references]]
+symbol = "shapes::Shape"
+file = "crates/alpha/src/shapes.rs"
+# `Shape` is never called - it is a trait, not a callee - so this is the one
+# category `[[callers]]` structurally cannot exercise for it at all.
+# `SUPERTYPE_OF` (from `impl Shape for Square`/`impl Shape for Circle`) is a
+# `find_references` edge kind `find_callers` does not share
+# (`plugins/typescript/conformance/expect.toml`'s own `Greetable` case makes
+# the same point); `describe`'s `<S: Shape>` bound is an ordinary same-file
+# `REFERENCES` edge; `gaps::measure`'s `<S: crate::prelude::Shape>` bound
+# names `Shape` through `alpha::prelude`'s re-export, a cross-file
+# `REFERENCES` edge the same re-export walk `internals::published` above
+# proves resolves through a prelude with no container node of its own
+# (README: "names imported through a prelude still resolve").
+#
+# `prelude.rs:` (a File-kind row, no `qualifiedName`, per `expectations.rs`'s
+# own doc on that shape) is the fourth: `pub use crate::shapes::{Shape,
+# Square};` is itself a reference to `Shape`, and `prelude.rs` declares
+# nothing of its own for the edge to start at - the same reason its own
+# `containers` row is missing (README's "A module that declares nothing but
+# `pub use` gets no container node"). Measured, not guessed: this row showed
+# up as an unexpected extra the first time this entry was written without it.
+expect = [
+    "crates/alpha/src/shapes.rs:shapes::Square",
+    "crates/alpha/src/shapes.rs:shapes::Circle",
+    "crates/alpha/src/shapes.rs:shapes::describe",
+    "crates/alpha/src/gaps.rs:gaps::measure",
+    "crates/alpha/src/prelude.rs:",
+]
+
+# --- implementations: impl Trait for T, found by find_implementations ---------
+# (GM-286's own acceptance case, kept here rather than duplicated)
+
+[[implementations]]
+symbol = "shapes::Shape"
+# Both impls are same-file `SUPERTYPE_OF` edges from the type to the trait.
+# `prelude.rs` re-exports `Shape`, which is a placeholder and must not appear
+# here as a third implementor.
+expect = ["crates/alpha/src/shapes.rs:shapes::Square", "crates/alpha/src/shapes.rs:shapes::Circle"]
+
+# --- imports (get_dependencies, one hop, Outgoing): glob and container --------
+# (GM-286's own acceptance case, kept here rather than duplicated)
+
+[[imports]]
+file = "crates/alpha/src/nested/mod.rs"
+# Every `use` is an import, not only the glob - which is all the design doc's
+# sketch listed, and which would make `get_dependencies` answer "nothing" for
+# almost every Rust file. This file has one of each: `use crate::internals::*`
+# (a glob) and `pub use deep::work` (a named re-export), and both link onto
+# the container they read from. `container:` is how a row with no `filePath`
+# renders, and a container node's `qualifiedName` is its key.
+#
+# It is anchored on *this* file rather than on `crates/beta/src/main.rs`,
+# whose `use` items are more interesting, because the kit's session empties
+# and restores the file with the most nodes - `crates/alpha/src/shapes.rs` -
+# and core GCs a container whose last member goes, taking every `IMPORTS`
+# edge pointing at it along (`graph::containers`: "importers' placeholders
+# come back on their next reindex", which within one session never happens).
+# An expectation over beta's imports would be asserting that deliberate core
+# behaviour, not this plugin's.
+expect = ["container:alpha::internals", "container:alpha::nested::deep"]
+
+# --- definition ------------------------------------------------------------------
+
+[[definition]]
+symbol = "internals::crate_only"
+file = "crates/alpha/src/internals.rs"
+# Already unambiguous by `qualifiedName` alone - `file` is given anyway, the
+# way `plugins/go/conformance/expect.toml`'s `Server.Addr` entry does,
+# because `find_definition` only ever consults it once resolution turns out
+# ambiguous; here it doesn't, and the entry still passes.
+expect = ["crates/alpha/src/internals.rs:internals::crate_only"]
+
+[[definition]]
+symbol = "shapes::Square::perimeter"
+# Unambiguous - no `file` needed to disambiguate.
+expect = ["crates/alpha/src/shapes.rs:shapes::Square::perimeter"]

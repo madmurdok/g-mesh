@@ -9,14 +9,23 @@ an `import * as ns` namespace import. See `REQUIREMENTS.md` and
 
 ## Layout
 
-- `core/` — Rust workspace: the `g-mesh` binary (`mcp-shim` + the per-project
-  `daemon`), SQLite storage, graph queries, file watcher, and the MCP tool
-  surface.
+The repository is one cargo workspace (`Cargo.toml` at the root), so
+`cargo build` and `cargo test` from here cover every Rust crate and the build
+output lands in `target/`.
+
+- `core/` — the `g-mesh` binary (`mcp-shim` + the per-project `daemon`),
+  SQLite storage, graph queries, file watcher, and the MCP tool surface.
+- `wire/` — the core ⇆ plugin wire protocol types, and nothing else. Its own
+  crate so core and a Rust plugin share one declaration without a plugin
+  linking core; core re-exports it as `protocol::types`.
 - `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
   bulk indexing, incremental reparse. Spawned by the daemon as a child
   process, one instance per project.
+- `plugins/sdk/` — everything a Rust language plugin needs that is not its
+  language: protocol loop, walk, incremental diff, ids. See "Writing a
+  language plugin".
 
-The daemon and shim are one binary (`core/target/{debug,release}/g-mesh`);
+The daemon and shim are one binary (`target/{debug,release}/g-mesh`);
 the plugin is a separate Node entry point the daemon launches with `node`.
 
 ## Install
@@ -87,12 +96,11 @@ build-from-source path below is the only one that works.
 
 ```bash
 # 1. Core (Rust binary: g-mesh, with the mcp-shim/daemon subcommands)
-cd core
-cargo build --release
-# -> core/target/release/g-mesh
+cargo build --release -p g-mesh
+# -> target/release/g-mesh
 
 # 2. JS/TS plugin
-cd ../plugins/typescript
+cd plugins/typescript
 npm install
 npm run build
 # -> plugins/typescript/dist/src/index.js
@@ -108,7 +116,7 @@ the semantic one, needs a model directory that **you fetch explicitly** —
 nothing in g-mesh ever downloads anything on its own, by design (that is
 enforced by a test: the HTTP client is reachable from this one command and
 from nowhere else in the codebase). Using the binary built in step 1
-(`core/target/release/g-mesh`, until it is on your `PATH`):
+(`target/release/g-mesh`, until it is on your `PATH`):
 
 ```bash
 g-mesh model fetch
@@ -212,8 +220,18 @@ g-mesh-v<version>-<triple>/
     node_modules/                         its native tree-sitter grammars
     plugin.toml                           how core discovers and spawns it
     LICENSE-nodejs                        the embedded runtime's notice
+  plugins/rust/
+    g-mesh-plugin-rust                    the Rust plugin - a plain cargo
+                                           binary, no runtime to embed
+    plugin.toml                           how core discovers and spawns it
   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 ```
+
+The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
+SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
+target with `cargo build --target <triple>`, the same way `build-targets.sh`
+already builds core, and writes an installed `plugin.toml` naming the binary
+it staged.
 
 **No Node.js required.** The plugin is compiled with [Node's single-executable
 application](https://nodejs.org/api/single-executable-applications.html)
@@ -235,13 +253,16 @@ build machine's own Node runtime and cannot be cross-built.
 
 ### Cutting a release
 
-1. Merge the release branch (with `core/Cargo.toml` already bumped to the new
-   version) into `main`.
+1. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
+   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml`,
+   which must all agree with it — already bumped to the new version) into
+   `main`.
 2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
-   version, working tree and branch state, runs `cargo test`, and creates an
-   annotated `v<version>` tag locally — it does not push by default, since
-   pushing the tag is what starts the public four-platform build and drafts a
-   Release. Pass `--push` to push it in the same step, or run the printed
+   version (every workspace member's, not only core's), working tree and
+   branch state, runs `cargo test --workspace`, and creates an annotated
+   `v<version>` tag locally — it does not push by default, since pushing the
+   tag is what starts the public four-platform build and drafts a Release.
+   Pass `--push` to push it in the same step, or run the printed
    `git push origin v<version>` yourself when ready.
 3. Once the build finishes, approve the draft on GitHub.
 
@@ -415,7 +436,7 @@ what actually closes it.
 project you open Claude Code in — no per-project setup:
 
 ```bash
-claude mcp add g-mesh -s user -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
+claude mcp add g-mesh -s user -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 ```
 
 **Fallback (any other stdio MCP client): register per project.** Run from
@@ -424,7 +445,7 @@ therefore the shim's, absent `CLAUDE_PROJECT_DIR` — is the project root:
 
 ```bash
 cd /path/to/target-project
-claude mcp add g-mesh -- /path/to/g-mesh/core/target/release/g-mesh mcp-shim
+claude mcp add g-mesh -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 ```
 
 ## First run: the initial index
@@ -568,8 +589,39 @@ as `<command> <args> --bulk-index <project-root>`, whose stdout is one NDJSON
 node/edge per line, and as a long-lived `<command> <args> <project-root>`
 speaking framed JSON-RPC on stdin/stdout — a handshake, then a diff in answer
 to each `fileChanged`, and to each `semanticPass` when the manifest declares
-`semantic_pass = true`. The wire types are `core/src/protocol/types.rs`; the
-design, including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+`semantic_pass = true`. The wire types are the `g-mesh-wire` crate
+(`wire/src/lib.rs`, re-exported by core as `protocol::types`); the design,
+including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+
+### In Rust: the plugin SDK
+
+Everything in the paragraph above except the language itself is already
+written, in `plugins/sdk` (`g-mesh-plugin-sdk`). A plugin built on it
+implements one trait — "given one file's text, what nodes and edges are in
+it" — and the crate owns the handshake, the control loop, `--bulk-index`
+streaming, the `.gitignore`-aware walk, the per-file cache and incremental
+diff, the id scheme, placeholder builders, and starting a semantic engine
+lazily (including writing the marker below, so the lazy check is a `PASS`
+rather than a `SKIP`). It does **not** depend on core: the only thing the two
+share is the wire crate.
+
+```rust
+impl Extractor for MyExtractor {
+    const LANGUAGE: &'static str = "mylang";
+    type Project = ();
+    fn load_project(&self, _root: &Path) -> anyhow::Result<()> { Ok(()) }
+    fn extract(&self, _project: &(), path: &RelPath, source: &str) -> FileGraph { … }
+}
+
+fn main() -> ! {
+    run(MyExtractor, PluginSpec::new("mylang", env!("CARGO_PKG_VERSION"), &[".ml"]), None)
+}
+```
+
+`testing::PluginCheck` runs `g-mesh plugins check` below from the plugin
+crate's own `#[test]`, so every check runs on every `cargo test`. The crate's
+module docs carry the contracts an extractor has to keep; `plugins/sdk/toy/`
+is a complete, deliberately tiny plugin built on it.
 
 ### Checking a plugin: `g-mesh plugins check`
 
@@ -699,8 +751,9 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 ## Run tests
 
 ```bash
-cd core && cargo test
-cd ../plugins/typescript && npm run build && npm test
+cargo test                       # every crate: core, wire, plugins/sdk
+cargo test -p g-mesh             # core alone
+cd plugins/typescript && npm run build && npm test
 ```
 
 The integration tests spawn real shims, real daemons and a real plugin against
