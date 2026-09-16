@@ -1,0 +1,27 @@
+[package]
+name = "g-mesh-plugin-python"
+version = "3.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "g-mesh's Python language plugin: pyproject.toml/src-layout/namespace-package project model (GM-295), tree-sitter extraction (GM-296)"
+
+[lib]
+name = "g_mesh_plugin_python"
+path = "src/lib.rs"
+
+[[bin]]
+name = "g-mesh-plugin-python"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-wire = { path = "../../wire" }
+# `pyproject.toml` parsing for the project model (`project::pyproject`) - read
+# as data, never by executing `setup.py` or any other project code (the
+# task's own constraint). Already a dependency of `g-mesh-plugin-sdk` (for its
+# own `plugin.toml`) and of `g-mesh-plugin-rust` (for `Cargo.toml`), so this
+# adds no new crate to the workspace's dependency graph, only a third user of
+# one already vetted.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
