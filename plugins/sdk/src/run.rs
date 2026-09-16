@@ -591,6 +591,49 @@ mod tests {
         }
     }
 
+    /// An extractor that panics on one file costs that file and nothing else -
+    /// the walk keeps going, and the process is still standing afterwards.
+    ///
+    /// The panic hook is silenced for the duration, because the default one
+    /// prints the panic to stderr and a *deliberately* panicking test would
+    /// otherwise look like a failing one in the output.
+    #[test]
+    fn a_panicking_extractor_costs_its_file_and_not_the_process() {
+        use crate::graph::{FileGraphBuilder, NodeSpec};
+        use g_mesh_wire::{NodeKind, Position, Range};
+
+        struct Explodes;
+
+        impl crate::Extractor for Explodes {
+            const LANGUAGE: &'static str = "boom";
+            type Project = ();
+
+            fn load_project(&self, _root: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn extract(&self, _project: &(), path: &RelPath, _source: &str) -> FileGraph {
+                assert_ne!(path.as_str(), "bad.boom", "deliberate panic for the test below");
+                let mut builder = FileGraphBuilder::new("boom", "boom-parser", path);
+                let range = Range { start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 0 } };
+                builder.file_node(range);
+                builder.add_node(NodeSpec::new(NodeKind::Function, "ok", "ok", range).public());
+                builder.finish()
+            }
+        }
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let exploded = extract_caught(&Explodes, &(), &RelPath::new("bad.boom"), "", "boom");
+        std::panic::set_hook(previous);
+        assert!(exploded.is_none(), "a panic must not be reported as a graph");
+
+        // The same extractor, still usable, on the next file.
+        let fine = extract_caught(&Explodes, &(), &RelPath::new("good.boom"), "", "boom")
+            .expect("the file after the panicking one is extracted normally");
+        assert_eq!(fine.nodes.len(), 2);
+    }
+
     #[test]
     fn a_files_nodes_are_written_before_its_edges() {
         use crate::graph::{FileGraphBuilder, NodeSpec};
