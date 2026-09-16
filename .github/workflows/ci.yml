@@ -125,6 +125,26 @@ jobs:
           rustup default "$RUST_VERSION"
           rustc -vV
 
+      # rust-analyzer is a *test* dependency of `plugins/rust`, exactly the way
+      # Node is one of `plugins/typescript` and Go is one of `plugins/go`:
+      # since GM-290 the Rust plugin's semantic tier drives a real
+      # rust-analyzer, and `plugins/rust/tests/conformance.rs` runs the
+      # conformance kit against it rather than skipping when there is none.
+      # `--profile minimal` above deliberately installs nothing beyond
+      # rustc/cargo, so this line is what makes that suite runnable at all.
+      #
+      # `rust-analyzer --version` is the check, not `which rust-analyzer`:
+      # `~/.cargo/bin/rust-analyzer` is a rustup *proxy* that exists for every
+      # component rustup knows of, installed or not, and exits 1 with "unknown
+      # binary in toolchain" when the component behind it is missing. The
+      # plugin makes exactly this check at run time, for exactly this reason
+      # (plugins/rust/src/semantic.rs).
+      - name: Install rust-analyzer
+        shell: bash
+        run: |
+          rustup component add rust-analyzer --toolchain "$RUST_VERSION"
+          rust-analyzer --version
+
       # `build.rs` runs `npm run build` for the JS/TS plugin, and the
       # integration tests drive that plugin for real - so this is a test
       # dependency here, not only a packaging one. Pinned to match release.yml
