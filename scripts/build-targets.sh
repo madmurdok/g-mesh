@@ -40,19 +40,30 @@
 #                                    executable, its native addons, and the
 #                                    plugin.toml core discovers it through
 #                                    (built by scripts/bundle-plugin.sh)
+#   plugins/rust/                    the Rust plugin: a cargo binary built in
+#                                    the same workspace as core, for the same
+#                                    target, and the plugin.toml core
+#                                    discovers it through (built by
+#                                    scripts/bundle-rust-plugin.sh; see that
+#                                    script's own header for GM-288)
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
-# The plugin is not optional dressing: core cannot index anything without one,
-# so an archive without it is not a release artifact. Both halves have to be
-# for the *same* platform, which is why each target is built on its own runner
-# (see .github/workflows/release.yml) - a single-executable plugin embeds the
-# build machine's own Node runtime and cannot be cross-built.
+# The JS/TS plugin is not optional dressing: core cannot index a TypeScript
+# project without one, so an archive missing it is not a release artifact.
+# The Rust plugin ships for the same reason, one language later. Every part of
+# an archive has to be for the *same* platform, which is why each target is
+# built on its own runner (see .github/workflows/release.yml) - the JS/TS
+# plugin embeds the build machine's own Node runtime and cannot be
+# cross-built, and the Rust plugin is built the same way core itself is
+# (`rustup target add` + `cargo build --target`, on that target's own
+# runner) rather than through a second, plugin-specific cross-build path -
+# see scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
-# without a plugin: exercising the Rust cross-build path (macOS x86_64 ->
-# aarch64 does work) when the resulting archive is known not to be shippable.
-# It warns loudly, because that is exactly the state task 64 shipped in and
-# task 65 was opened to fix.
+# without either plugin: exercising the Rust *core* cross-build path (macOS
+# x86_64 -> aarch64 does work) when the resulting archive is known not to be
+# shippable. It warns loudly, because that is exactly the state task 64
+# shipped in and task 65 was opened to fix.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -209,10 +220,13 @@ build_one() {
 	# is where `daemon::manifest::bundled_roots` looks in an installed layout,
 	# which is what makes the unpacked archive work from any directory.
 	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
-		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugin. The resulting archive CANNOT index anything and must not be published." >&2
+		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugins. The resulting archive CANNOT index anything and must not be published." >&2
 	else
 		log "bundling the JS/TS plugin for $target"
 		bash "$REPO_ROOT/scripts/bundle-plugin.sh" "$target" "$stage_dir/plugins"
+
+		log "bundling the Rust plugin for $target"
+		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-rust-plugin.sh" "$target" "$stage_dir/plugins"
 	fi
 
 	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
@@ -240,13 +254,19 @@ build_one() {
 		esac
 
 		# The check task 64 could not make: that the *staged* binary finds the
-		# *staged* plugin, through the same discovery an unpacked archive uses
+		# *staged* plugins, through the same discovery an unpacked archive uses
 		# (`plugins/` beside the executable). This is the one that fails if the
-		# path resolution regresses back to a compile-time path.
+		# path resolution regresses back to a compile-time path. Both bundled
+		# plugins are required, not just one - GM-288 added the Rust check
+		# alongside the JS/TS one that was already here.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
-			log "smoke test: the staged binary discovers the staged plugin"
-			"$stage_dir/$bin_name" plugins list | grep -q "typescript" ||
-				die "the staged binary does not discover the plugin staged beside it"
+			log "smoke test: the staged binary discovers the staged plugins"
+			local plugins_output
+			plugins_output="$("$stage_dir/$bin_name" plugins list)"
+			echo "$plugins_output" | grep -q "typescript" ||
+				die "the staged binary does not discover the typescript plugin staged beside it"
+			echo "$plugins_output" | grep -q "rust" ||
+				die "the staged binary does not discover the rust plugin staged beside it"
 		fi
 	else
 		log "smoke test skipped: $target is not the host ($host)"

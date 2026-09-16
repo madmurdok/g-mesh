@@ -762,7 +762,53 @@ directory one check writes.
   - It needs `rust-analyzer` on `PATH` or through rustup; without it, structural
     only.
 - **Distribution:** a cargo binary in the same workspace as core, built by the
-  existing native release matrix.
+  existing native release matrix. See "Implementation notes (GM-288)" below
+  for how that turned into `scripts/bundle-rust-plugin.sh`, and why it is not
+  a GM-283-style cross-compile even though this crate's own dependency list
+  would allow one.
+
+#### Implementation notes (GM-288)
+
+Four decisions this task had to settle rather than infer, recorded here so a
+later change (or the Go plugin's own distribution, when it returns to this
+branch) does not have to re-derive them:
+
+1. **The staged manifest is generated, not the checked-in one, and for the
+   same reason as both other bundled plugins**: `plugins/rust/plugin.toml`'s
+   `command` is a dev-checkout path into the workspace's own `target/`, which
+   does not exist in an installed layout. `scripts/bundle-rust-plugin.sh`
+   derives the installed manifest from it by rewriting only the
+   `[plugin.spawn] command` line - the same one-substitution pattern
+   `scripts/bundle-go-plugin.sh` uses for the Go plugin, chosen over
+   hand-duplicating every other field for the reason that script's own header
+   gives.
+2. **Windows naming needs no GM-283-style rewrite of its own, because cargo
+   already does it.** `cargo build --target x86_64-pc-windows-msvc` names its
+   output `<bin>.exe` on its own - unlike `go build -o <name>`, which never
+   appends one - so the manifest substitution above only has to pick the
+   right filename (`exe_name_for` in the bundler), not work around a build
+   step that silently produces the wrong one.
+3. **Built the way core itself is built, not cross-compiled.** This crate
+   has no C dependency of its own (unlike core's ONNX Runtime/SQLite/
+   Oniguruma), so a `GOOS`/`GOARCH`-style cross-compile from one host was
+   technically available, the same shape `scripts/bundle-go-plugin.sh` uses
+   for the Go plugin. It was rejected: the Rust plugin already sits inside
+   core's own cargo workspace, and the release matrix already runs a native
+   job per target to build core (`rustup target add` + `cargo build
+   --target`, on that target's own runner - see
+   `.github/workflows/release.yml`'s "WHY A MATRIX ON NATIVE RUNNERS"
+   section). Building this crate the same way, in the same job, is reusing
+   that mechanism rather than adding a second one for a single plugin -
+   `scripts/bundle-rust-plugin.sh` builds with exactly the same two commands
+   core's own build step uses, just scoped to `plugins/rust` instead of
+   `core`. No CI toolchain setup was added for it, unlike Go's `setup-go`:
+   the Rust toolchain the job already installs for core is all this needs.
+4. **`plugins/sdk` and `wire/` ship nothing of their own.** Both are library
+   crates with no `[[bin]]` a release would install; they are statically
+   linked into `g-mesh-plugin-rust` (and, for `wire`, into core's own binary
+   too) at build time, the same way any Rust dependency is. There is nothing
+   for `scripts/bundle-rust-plugin.sh` to stage for either beyond what
+   already exists inside the one binary it copies.
 
 ### MCP instructions
 

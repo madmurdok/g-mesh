@@ -18,13 +18,18 @@
 # ---------------------------------------------------------------------------
 # WHAT THESE ARTIFACTS ARE
 #
-# Since task #65 each archive carries both halves of a working install: the
-# core binary, and the JS/TS plugin compiled to a self-contained executable
-# (Node's SEA - it embeds the runtime, so the machine needs no Node.js) in
-# `plugins/typescript/`, which is where `daemon::manifest::bundled_roots` looks
-# beside the executable. `scripts/install.sh` (#66) fetches exactly these
-# assets, by the URLs the section below fixes, and verifies the `.sha256`
-# beside each archive before it unpacks anything.
+# Since task #65 each archive carries a working install: the core binary and
+# the JS/TS plugin compiled to a self-contained executable (Node's SEA - it
+# embeds the runtime, so the machine needs no Node.js) in `plugins/typescript/`.
+# Since GM-288 it also carries the Rust plugin, a plain cargo binary built in
+# the same workspace as core for the same target, in `plugins/rust/` - see
+# `scripts/bundle-rust-plugin.sh` for why that needs no extra toolchain setup
+# in this workflow (unlike the JS/TS plugin, it is built by the Rust
+# toolchain this file already installs for core). Both plugin directories
+# live where `daemon::manifest::bundled_roots` looks beside the executable.
+# `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
+# section below fixes, and verifies the `.sha256` beside each archive before
+# it unpacks anything.
 #
 # ---------------------------------------------------------------------------
 # HOW TO CUT A RELEASE
@@ -32,7 +37,11 @@
 # 1. Make sure `core/Cargo.toml`'s version is the version you are releasing.
 #    It, not the tag, is what the artifacts are named after; the tag is checked
 #    against it in the first step of every build job so a mismatch costs a
-#    minute instead of four 90-minute builds.
+#    minute instead of four 90-minute builds. Since GM-288, `wire/Cargo.toml`,
+#    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
+#    version too - `scripts/cut-release.sh` refuses if any of them disagree
+#    (see that script's own header), which is the easiest way to check this
+#    by hand as well.
 # 2. Tag the commit and push the tag:  `git tag v2.7.0 && git push origin v2.7.0`
 #    The repository has no tags at all today, so this is a deliberate, manual,
 #    human act - nothing in this pipeline creates one.
@@ -135,6 +144,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/build-targets.sh"
       - "scripts/bundle-plugin.sh"
+      - "scripts/bundle-rust-plugin.sh"
       - "scripts/prepare-release-assets.sh"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
@@ -386,10 +396,11 @@ jobs:
             done
 
             echo
-            echo "Every archive unpacks to a directory holding the \`g-mesh\` binary and the"
-            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`. The"
-            echo "machine running it needs no Node.js and no toolchain; \`g-mesh model fetch\`"
-            echo "downloads the embedding model \`search_code\` needs."
+            echo "Every archive unpacks to a directory holding the \`g-mesh\` binary, the"
+            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, and"
+            echo "the Rust plugin as a plain binary in \`plugins/rust/\`. The machine running it"
+            echo "needs no Node.js and no toolchain; \`g-mesh model fetch\` downloads the"
+            echo "embedding model \`search_code\` needs."
             echo
             echo "### Verifying a download"
             echo
