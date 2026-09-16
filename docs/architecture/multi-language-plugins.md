@@ -1321,6 +1321,84 @@ conformance kit already passes on it (13 passed, 2 skipped: no declarations yet
 to edit, and `semantic_pass = false`), which is the same pre-extractor state
 `plugins/rust` documented before GM-286.
 
+#### Implementation notes (GM-296)
+
+Built as `plugins/python/src/extractor/`, on tree-sitter-python. The eight
+decisions this task had to settle are each argued in full in the module named
+beside them; `plugins/python/README.md` is the reader-facing summary, including
+the gap list. Recorded here are the four places the row above, and GM-295's own
+notes, turned out to be *wrong* rather than merely incomplete, so that language
+#4 does not copy them.
+
+1. **A `qualifiedName` needs the whole lexical path, not just the enclosing
+   class.** The task's own sketch is `f`, `C`, `C.m`, `outer.inner` - which
+   leaves a method of a *nested* class unspecified, and the obvious reading
+   (`Inner.m`, named by its immediate parent) is not injective. One file may
+   hold `class Request: class Inner:` and `class Response: class Inner:`, and a
+   node's id is `(filePath, kind, qualifiedName, nativeKind)`, so both `Inner.m`
+   collapse to one node and the second silently replaces the first. The answer
+   is `Outer.Inner.m` - which is also CPython's own `__qualname__` for it. This
+   is the *same* failure `plugins/rust`'s GM-286 notes record for two inline
+   modules each declaring `helper`: it is not a Rust quirk, it is what happens
+   whenever a language can nest two namespaces of one name in one file, and
+   language #4 should assume it applies until it has checked that it does not.
+   (Where this plugin departs from `__qualname__` is the `<locals>` marker
+   CPython inserts for a function nested in a function: `nativeKind` already
+   separates `function` from `method`, so the marker would spell a fact the
+   node states twice.)
+
+2. **`self.m()` is resolvable in Python too, and not by trusting the name.**
+   The row above gives Rust `Self::f()` / `self.f()` -> the impl type's method
+   and gives Python nothing of the kind, on the reasonable-looking grounds that
+   `self` is a convention rather than a keyword and a structural tier must not
+   trust a convention. That reasoning is right about the *name* and wrong about
+   the *construct*: what the language guarantees is that the **first parameter**
+   of a method is the instance it was called on, which is a fact about the
+   parameter's position, not its spelling. So `<first parameter>.m(...)`
+   resolves to the enclosing class's own member, `@staticmethod` is excluded the
+   way Python itself excludes it, and code that names the parameter `s` or `cls`
+   resolves identically. The general lesson for language #4: before writing off
+   a receiver as unknowable, check whether the language *declares* the receiver
+   somewhere - it often does, in a place the convention is merely pointing at.
+
+3. **A structural tier needs to know which dotted names are the project's
+   own, and Python's manifest cannot tell it.** The row above says nothing about
+   external modules, and GM-295's project model had no query for it, because
+   Rust and Go both get the answer free (`Cargo.toml` names every crate,
+   `go.mod` every module path). `pyproject.toml`'s `[project] dependencies` is
+   *not* that list: it holds distribution names, which routinely differ from
+   import names (`pip install pillow` imports as `PIL`), so reading it would be
+   reading the wrong list confidently. The only honest source is the package
+   tree the walk already produced, which is why `ProjectContext::has_container`
+   (Decision 8, added by this task) exists. Language #4's check: does its
+   manifest name *import* units or *distribution* units? If the latter, it has
+   this problem.
+
+4. **`__all__` had to be read as a re-export, and nothing else.** GM-295's
+   notes settle that `__all__` is not visibility. What they leave open, and what
+   this task found, is that reading it as a re-export is not optional
+   decoration: `from pkg import Greeter` against a package whose `__init__`
+   declares nothing has **no** path to `pkg/mod.py`'s class except core's
+   re-export walk, so without the `reexport` nodes the single most common
+   Python import shape resolves to nothing. The same is true of
+   `from mod import *`, which needs the `*`-at-both-ends shape for the same
+   reason. Both are pinned end to end in `conformance/expect.toml` rather than
+   only in a unit test, because the failure is invisible in one file's graph -
+   the placeholder looks fine; it simply never links.
+
+Two facts about core that this plugin now depends on, both already documented
+there: `graph::containers::parent_chain` stops at a memberless ancestor, which
+is what the module self-announcement node (GM-295's Decision 1, emitted here)
+closes for PEP 420 namespace packages; and a `name`-keyed placeholder walks
+re-export chains while a `qualifiedName`-keyed one does not, which is why a
+module-qualified call (`helpers.assist()`) keeps a `name` key and a
+class-qualified one (`Base.describe()`) does not.
+
+The kit now reports 14 passed, 1 skipped: `id-stability.declaration-edit-applies`
+became a real `PASS` the moment real declarations existed, and
+`capabilities.semantic-engine-lazy` still legitimately skips because
+`semantic_pass = false`.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated

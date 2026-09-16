@@ -37,11 +37,12 @@ command = "../../target/debug/g-mesh-plugin-python"
 extensions = [".py", ".pyi"]
 
 [plugin.capabilities]
-# No semantic tier yet (this task is the project model; the tree-sitter
-# structural extractor is GM-296; a pyright/pyright-langserver tier over the
-# SDK's LspBridge is future work the design doc's paper stress test names but
-# does not schedule). `false` means core never sends `semanticPass` and never
-# requires an answer to one.
+# No semantic tier. The structural one (tree-sitter-python, GM-296) is built;
+# a pyright/pyright-langserver tier over the SDK's LspBridge is future work
+# the design doc's paper stress test names but does not schedule. `false`
+# means core never sends `semanticPass` and never requires an answer to one -
+# and it is also why `capabilities.semantic-engine-lazy` is the one
+# conformance check that legitimately skips (see `tests/conformance.rs`).
 semantic_pass = false
 # Receiver calls and, more generally, Python's dynamic dispatch are an open
 # site with no structural answer - the design doc's own paper stress test
