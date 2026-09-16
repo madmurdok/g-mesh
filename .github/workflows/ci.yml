@@ -154,6 +154,42 @@ jobs:
         working-directory: plugins/typescript
         run: npm test
 
+      # The Go plugin is a second bundled plugin with a real toolchain
+      # dependency, and the same "test dependency, not only a packaging one"
+      # applies to it as to Node above: `build.rs` runs `go build` to produce
+      # `plugins/go/g-mesh-plugin-go`, and both the Rust integration tests
+      # (`core/tests/plugin_check.rs`'s two `the_go_plugin_*` cases) and the
+      # conformance step below spawn that binary for real. Without a Go
+      # toolchain build.rs downgrades the failure to a warning, the run
+      # continues, and those fail much later with "failed to spawn".
+      #
+      # Pinned to the minor version plugins/go/go.mod requires, for the same
+      # reason Node is pinned: a gate that changes underneath you is a gate
+      # people stop reading.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+
+      # The Go plugin's own suite - the extractor's scope rules, container
+      # keys, edge shapes and incremental diff. Runs before the slower Rust
+      # steps, like the JS/TS one above, since it needs only the toolchain
+      # just installed. `gofmt -l` prints the files that need formatting and
+      # exits 0 either way, so the emptiness of its output is the assertion.
+      - name: Go plugin tests (go vet, gofmt, go test)
+        shell: bash
+        working-directory: plugins/go
+        run: |
+          set -euo pipefail
+          go vet ./...
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          go test ./...
+
       # Pinned and fetched directly, like ShellCheck and for the same reason:
       # a gate that changes underneath you is a gate people stop reading.
       # Fetched rather than taken from a third-party action, so the only

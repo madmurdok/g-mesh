@@ -19,18 +19,47 @@ import (
 type bulkIndexSummary struct {
 	filesProcessed int
 	nodesEmitted   int
+	edgesEmitted   int
 }
 
 // runBulkIndex walks root (walkProjectFiles - gitignore-aware, symlink-
-// guarded, honoring exclude_dirs) and writes each matched file's node(s) to
-// out as compact NDJSON, one line per node. A file this plugin can no
-// longer read (vanished between the walk and the read) is skipped, not
+// guarded, honoring exclude_dirs) and writes each matched file's graph to
+// out as compact NDJSON, one line per node or edge. A file this plugin can
+// no longer read (vanished between the walk and the read) is skipped, not
 // fatal - matching bulkIndexProject's own "a corrupt/vanished file must not
 // abort the whole bulk index" rule.
+//
+// # Line order is the contract, not a formatting choice
+//
+// All of a file's nodes are written before any of its edges, and a file's
+// nodes and edges are never interleaved with another file's. That is what
+// the kit's `stream-order` check enforces and what lets
+// `daemon::bulk_index` cut the stream at any line: an edge is a foreign key
+// onto two nodes, so it may only lean on what an earlier line already
+// delivered, and extractFile guarantees every edge of a file points at two
+// nodes of that same file.
+//
+// The workspace is loaded once for the whole walk rather than per file: it
+// is the same answer for every file in the tree, and reading every go.mod in
+// the project once per file would turn a linear walk into a quadratic one.
 func runBulkIndex(root string, out io.Writer) (bulkIndexSummary, error) {
 	var summary bulkIndexSummary
 
+	ws := loadWorkspace(root)
 	w := bufio.NewWriter(out)
+	write := func(value interface{}) error {
+		line, err := json.Marshal(value)
+		if err != nil {
+			// Unreachable outside a bug in wire.go's marshalling - every
+			// field is a plain string/int/bool or a small struct of them.
+			return nil
+		}
+		if _, err := w.Write(line); err != nil {
+			return err
+		}
+		return w.WriteByte('\n')
+	}
+
 	for _, relPath := range walkProjectFiles(root) {
 		abs := filepath.Join(root, filepath.FromSlash(relPath))
 		content, err := os.ReadFile(abs)
@@ -38,24 +67,20 @@ func runBulkIndex(root string, out io.Writer) (bulkIndexSummary, error) {
 			continue
 		}
 
-		node := computeFileNode(relPath, content)
-		line, err := json.Marshal(node)
-		if err != nil {
-			// Unreachable outside a bug in wire.go's MarshalJSON - every
-			// field here is a plain string/int/bool. Skipping rather than
-			// aborting the walk keeps this consistent with the read-error
-			// case above.
-			continue
+		graph := extractFile(ws, relPath, content)
+		for _, node := range graph.nodes {
+			if err := write(node); err != nil {
+				return summary, err
+			}
+			summary.nodesEmitted++
 		}
-		if _, err := w.Write(line); err != nil {
-			return summary, err
+		for _, edge := range graph.edges {
+			if err := write(edge); err != nil {
+				return summary, err
+			}
+			summary.edgesEmitted++
 		}
-		if err := w.WriteByte('\n'); err != nil {
-			return summary, err
-		}
-
 		summary.filesProcessed++
-		summary.nodesEmitted++
 	}
 
 	return summary, w.Flush()

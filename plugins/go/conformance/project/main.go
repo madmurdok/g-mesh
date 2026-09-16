@@ -1,14 +1,17 @@
 package app
 
 // A tiny fixture for `g-mesh plugins check plugins/go --fixture
-// plugins/go/conformance/project` (GM-279). This scaffold's extractor
-// emits File nodes only - no symbols, no edges - so this fixture exists to
-// exercise the shape/stream-order/id-stability/ownership checks over a
-// small multi-file, multi-directory tree, not to demonstrate real Go
-// cross-file linking (that needs GM-280's real declarations and edges, and
-// its own `expect.toml` - see this directory's own absence of one, and
-// GM-279's report, for why).
+// plugins/go/conformance/project`. Deliberately small: every file in it
+// exists to exercise one shape of the Go plugin's contract, and the kit
+// rewrites whichever file has the most nodes on its way through, so a bigger
+// fixture buys nothing but a slower run.
 
+// Placeholder is this package's exported entry point, and the one symbol the
+// external test package reaches through `app.Placeholder`.
 func Placeholder() string {
-	return "app"
+	// A call into a *sibling file of the same package*, which is the whole
+	// point of a container-scoped placeholder: nothing in this file declares
+	// `helper`, so the plugin addresses it at this package's container and
+	// core links it against helper.go's declaration.
+	return helper()
 }

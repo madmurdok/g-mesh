@@ -1,14 +1,17 @@
-// Command g-mesh-plugin-go is g-mesh's bundled Go language plugin (GM-279):
-// a Content-Length-framed JSON-RPC control loop plus a one-shot
-// `--bulk-index` NDJSON walk, speaking wire protocol v2
-// (core/src/protocol/types.rs). This scaffold's extractor (extract.go)
-// emits File nodes only - no symbols, no edges - so `g-mesh plugins check`
-// can exercise the shape/stream-order/id-stability/ownership contract end
-// to end before GM-280 adds real Go declarations and GM-281 adds go/types
-// semantics. See docs/architecture/multi-language-plugins.md's "Go plugin"
-// section (and its "Implementation notes (GM-279)" subsection) for the
-// design this implements and the decisions this task had to settle rather
-// than infer.
+// Command g-mesh-plugin-go is g-mesh's bundled Go language plugin: a
+// Content-Length-framed JSON-RPC control loop plus a one-shot `--bulk-index`
+// NDJSON walk (GM-279), speaking wire protocol v2
+// (core/src/protocol/types.rs), over a `go/parser` structural extractor
+// (GM-280) that produces real declarations, containers, visibility and
+// edges. The semantic tier - `go/types` through
+// golang.org/x/tools/go/packages, which is what answers the receiver calls
+// this one records as open sites - is GM-281, and until it lands every
+// `semanticPass` is answered honestly with an empty diff.
+//
+// See docs/architecture/multi-language-plugins.md's "Go plugin" section,
+// and its "Implementation notes (GM-279)" and "(GM-280)" subsections, for
+// the design this implements and the decisions each task had to settle
+// rather than infer.
 package main
 
 import (
@@ -42,7 +45,8 @@ func main() {
 			logf("bulk index failed: %v", err)
 			os.Exit(1)
 		}
-		logf("bulk index complete: %d file(s), %d node(s)", summary.filesProcessed, summary.nodesEmitted)
+		logf("bulk index complete: %d file(s), %d node(s), %d edge(s)",
+			summary.filesProcessed, summary.nodesEmitted, summary.edgesEmitted)
 		return
 	}
 

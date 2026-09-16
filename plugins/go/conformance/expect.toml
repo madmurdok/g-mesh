@@ -1,0 +1,72 @@
+# Post-linking expectations for the Go plugin, answered by the same handler
+# code the MCP tools use (core/src/cli/plugin_check/expectations.rs):
+#
+#   g-mesh plugins check plugins/go \
+#     --fixture plugins/go/conformance/project \
+#     --expect  plugins/go/conformance/expect.toml
+#
+# **Deliberately minimal.** GM-282 owns the full Go expectations file, and
+# this one is not it: every entry below exists to prove *one* end-to-end
+# claim GM-280 makes about the linker contract - that the placeholders this
+# plugin emits are addresses core can actually resolve - and nothing here
+# tries to cover the fixture. Interface implementations in particular are
+# absent on purpose: Go's interfaces are structural, so `SUPERTYPE_OF` edges
+# are go/types' answer and arrive with GM-281, and an `[[implementations]]`
+# entry now could only assert the empty set.
+#
+# Every `expect` list is an exact set, which is what makes the two `helper`
+# entries a real test rather than two ways of finding some function with that
+# name: the fixture declares `helper` twice, unexported, in two different
+# packages, and each entry asserts that *only* its own package's caller
+# reaches it. An address that was file-scoped, or scoped to the project
+# rather than to a container, would put the other package's caller in the set
+# and fail here.
+
+# A cross-file call inside one package, linked through core's container-
+# scoped lookup: main.go's `Placeholder` calls `helper`, which is declared in
+# helper.go. This is the single most important line in this file - it is the
+# shape core's linker must accept from a Go placeholder, and the reason
+# `scope = container` exists in the wire protocol at all.
+#
+# `init`'s call is the same-file, already-resolved half of the same picture:
+# it is in the set because it is a real caller, and it is attributed to `init`
+# rather than to the file because this plugin gives `init` a node of its own.
+[[callers]]
+symbol = "helper"
+file = "helper.go"
+expect = ["main.go:Placeholder", "helper.go:init"]
+
+# The same shape in the server package, against an identically named target.
+# The root package's `Placeholder` and `init` must NOT appear here, and this
+# package's `New` must not appear above: an unexported symbol is visible only
+# inside its own container, and a container-scoped placeholder never looks
+# outside the container it names.
+[[callers]]
+symbol = "helper"
+file = "server/conn.go"
+expect = ["server/server.go:New"]
+
+# A qualified cross-package call, `app.Placeholder()`, from the *external*
+# test package - a different container (`github.com/example/app_test`) from
+# the one it calls into. It links because `Placeholder` is exported; the two
+# entries above are what show that an unexported one would not have.
+[[callers]]
+symbol = "Placeholder"
+expect = ["app_test.go:TestPlaceholder"]
+
+# The same cross-file link again, in the *second module* of the fixture's
+# go.work. Both files' container key comes from tools/go.mod, so this passes
+# only if they agree on it.
+[[callers]]
+symbol = "local"
+expect = ["tools/gen.go:Generate"]
+
+# An import of a package of this project resolves onto that package's
+# container node; an import of anything else stays an unresolved placeholder.
+# Both render the same way here (`container:<key>`) - see expectations.rs's
+# decision 2 for why the row shape cannot tell them apart - so what this
+# entry pins down is that a Go file's imports are addressed as containers at
+# all, and that both of cmd/main.go's are present.
+[[imports]]
+file = "cmd/main.go"
+expect = ["container:fmt", "container:github.com/example/app/server"]

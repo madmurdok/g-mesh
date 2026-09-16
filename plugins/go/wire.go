@@ -56,10 +56,8 @@ type visibility struct {
 
 func fileVisibility() visibility { return visibility{kind: "file"} }
 
-//lint:ignore U1000 kept for GM-280, which needs it for real declarations
 func publicVisibility() visibility { return visibility{kind: "public"} }
 
-//lint:ignore U1000 kept for GM-280, which needs it for real declarations
 func containerVisibility(container string) visibility {
 	return visibility{kind: "container", container: container}
 }
@@ -110,26 +108,69 @@ func (v *visibility) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// wireNode mirrors core's WireNode for exactly what this scaffold ever
-// emits: File nodes with no container, no declarations and no placeholder
-// target. The optional Rust fields this struct has no use for yet
-// (signature, docComment, nativeKind, declarations, container,
-// containerParent, target) are omitted from the struct entirely rather
-// than modeled as always-nil pointers: Rust's
-// `skip_serializing_if = "Option::is_none"` makes an absent key exactly
-// equivalent to an explicit `None` there, and this scaffold never has
-// anything to put in any of them. GM-280 adds them back once there is a
-// real symbol to carry them.
+// targetScope mirrors core's TargetScope: an externally tagged enum, so
+// exactly one of the two keys is ever present - `{"file": "a.go"}` or
+// `{"container": "github.com/x/app"}`. Modelled as a struct with two
+// `omitempty` fields rather than a tagged union type because Go's
+// encoding/json has no sum types and this shape round-trips both ways with
+// no custom marshaller at all. Neither value is ever legitimately the empty
+// string (a container key is "." at worst - see workspace.importPath), so
+// `omitempty` cannot drop a key that was meant to be there.
+type targetScope struct {
+	File      string `json:"file,omitempty"`
+	Container string `json:"container,omitempty"`
+}
+
+// targetKey mirrors core's TargetKey, the same way: `{"name": "Run"}` from a
+// structural tier, `{"qualifiedName": "Server.Close"}` from a semantic one.
+// This plugin only ever sends `name` keys - a structural pass has no way to
+// know *which* `Close` a name means, which is exactly what GM-281's
+// go/types pass is for.
+type targetKey struct {
+	Name          string `json:"name,omitempty"`
+	QualifiedName string `json:"qualifiedName,omitempty"`
+}
+
+// placeholderTarget mirrors core's PlaceholderTarget - the address a
+// placeholder node is waiting to be linked onto (core/src/graph/
+// symbol_links.rs's "The address is a row, not a string"). Required by the
+// shape check exactly when a node's nativeKind is one of core's placeholder
+// kinds.
+type placeholderTarget struct {
+	Scope targetScope `json:"scope"`
+	Key   targetKey   `json:"key"`
+	// The requester's own container, which is what core's visibility check
+	// compares against a `container(...)`-visible candidate. Always set by
+	// this plugin: every Go file belongs to a package.
+	FromContainer string `json:"fromContainer,omitempty"`
+}
+
+// wireNode mirrors core's WireNode, field for field and in the same order
+// (core/src/protocol/types.rs), minus `declarations` - Go has no overload
+// sets or merged declarations, so no Go symbol is ever written as more than
+// one declaration, and the field is omitted from this struct rather than
+// modelled as an always-nil pointer.
+//
+// Every optional field is `omitempty`, matching Rust's
+// `skip_serializing_if = "Option::is_none"`: an absent key is exactly a
+// `None` there. None of these fields has a meaningful empty-string value, so
+// omitting an empty one never loses information.
 type wireNode struct {
-	ID              string     `json:"id"`
-	Kind            string     `json:"kind"`
-	Name            string     `json:"name"`
-	QualifiedName   string     `json:"qualifiedName"`
-	FilePath        string     `json:"filePath"`
-	Range           wireRange  `json:"range"`
-	Visibility      visibility `json:"visibility"`
-	Language        string     `json:"language"`
-	HasSyntaxErrors bool       `json:"hasSyntaxErrors"`
+	ID              string             `json:"id"`
+	Kind            string             `json:"kind"`
+	Name            string             `json:"name"`
+	QualifiedName   string             `json:"qualifiedName"`
+	FilePath        string             `json:"filePath"`
+	Range           wireRange          `json:"range"`
+	Signature       string             `json:"signature,omitempty"`
+	Visibility      visibility         `json:"visibility"`
+	DocComment      string             `json:"docComment,omitempty"`
+	Language        string             `json:"language"`
+	NativeKind      string             `json:"nativeKind,omitempty"`
+	HasSyntaxErrors bool               `json:"hasSyntaxErrors"`
+	Container       string             `json:"container,omitempty"`
+	ContainerParent string             `json:"containerParent,omitempty"`
+	Target          *placeholderTarget `json:"target,omitempty"`
 }
 
 // wireEdge mirrors core's WireEdge. Unused by this scaffold's extractor (no
