@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-rust"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-sdk"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "g-mesh-wire",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-wire"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "schemars",
  "serde",

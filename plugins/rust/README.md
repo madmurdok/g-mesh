@@ -1,11 +1,12 @@
 # g-mesh's Rust plugin
 
-A structural Rust plugin built on `plugins/sdk`: a `Cargo.toml`/module-tree
-project model (GM-285) and a tree-sitter-rust extractor (GM-286). The design
-is `docs/architecture/multi-language-plugins.md` ("Rust plugin"); the
-reasoning behind each decision is in the module docs named below, and this
-file is the summary plus the one thing a *user* of the index has to know:
-what it does not see.
+A Rust plugin built on `plugins/sdk`: a `Cargo.toml`/module-tree project
+model (GM-285), a tree-sitter-rust extractor (GM-286), and a rust-analyzer
+semantic tier behind the SDK's LSP bridge (GM-290). The design is
+`docs/architecture/multi-language-plugins.md` ("Rust plugin"); the reasoning
+behind each decision is in the module docs named below, and this file is the
+summary plus the one thing a *user* of the index has to know: what it does
+not see.
 
 ```
 src/project/     the workspace model - crates, module tree, container keys
@@ -16,7 +17,29 @@ src/extractor/   one file's bytes -> nodes, edges, open sites
   decls.rs       pass 1 - declarations and `use`
   bodies.rs      pass 2 - calls, references, implementations, open sites
   emit.rs        the graph, de-duplicated, in the wire's own units
+src/semantic.rs  finding rust-analyzer, and handing it to the SDK's bridge
 ```
+
+## The two tiers
+
+The structural tier always runs and never fails. The semantic tier runs when
+core asks for it and rust-analyzer is there.
+
+```bash
+rustup component add rust-analyzer    # what the semantic tier needs
+```
+
+Without it the plugin logs one line, answers empty semantic diffs, and serves
+the structural graph unchanged - and because those diffs are reported
+*incomplete*, `language_state.semanticPassAt` stays unset and the MCP
+instructions keep listing Rust's receiver-call gap. Installing the component
+and restarting the daemon is enough to get the pass.
+
+A `rust-analyzer` on `PATH` is not proof of one: `~/.cargo/bin/rust-analyzer`
+is a rustup proxy that exists for every component rustup knows, installed or
+not, and exits 1 when the one behind it is missing. `src/semantic.rs` tries
+the `PATH` name and then `rustup which`, and probes each with `--version`
+before believing it.
 
 ## What it indexes
 
@@ -52,11 +75,13 @@ to each trait it implements and from a trait to each of its supertraits.
 
 ## What it does not see
 
-These are structural gaps, not bugs. Each is a question only name resolution
-can answer, and each is answered by the rust-analyzer tier (GM-290) once that
-lands. Until then nothing in the index claims otherwise: a missing edge is
-missing, never guessed. `conformance/project/crates/alpha/src/gaps.rs`
-has all three written beside code that has them.
+These are what the *structural* tier does not see. Each is a question only
+name resolution can answer, and the rust-analyzer tier answers 1 and 3 by
+asking a compiler; 2 it does not, and nothing will. Until a semantic pass has
+landed, and on any machine without rust-analyzer, nothing in the index claims
+otherwise: a missing edge is missing, never guessed.
+`conformance/project/crates/alpha/src/gaps.rs` has all three written beside
+code that has them.
 
 1. **Macro-generated items.** Nothing inside a `macro_rules!` body is parsed,
    and nothing inside a macro invocation's token tree is either - the grammar
@@ -74,11 +99,19 @@ has all three written beside code that has them.
 
 Two smaller ones, for completeness:
 
-- **Receiver calls (`x.m()`) produce no edge.** This is the design's own
-  documented gap for Rust, declared in `plugin.toml`
-  (`receiver_calls = "unresolved"`) so the MCP instructions say so, and it is
-  what open sites exist for. `self.m()` inside an `impl` *is* resolved, to
-  the impl type's own method.
+- **Receiver calls (`x.m()`) produce no *structural* edge.** They are what
+  open sites exist for, and the semantic tier answers them: `plugin.toml`
+  declares `receiver_calls_structural = "unresolved"` with
+  `receiver_calls = "resolved"`, which is what makes the MCP instructions
+  list the gap until a semantic pass has landed for this language and stop
+  afterwards. `self.m()` inside an `impl` *is* resolved structurally, to the
+  impl type's own method.
+- **An `impl Trait for T` whose trait arrives through a glob import** gets no
+  structural edge and not even an open site - a bare type name that is
+  neither declared nor imported by item resolves to nothing, deliberately, so
+  that `Vec` and `String` do not become questions. The semantic tier finds it
+  from the other end, by asking rust-analyzer which types implement the
+  trait; `conformance/project/crates/beta/src/main.rs` is that case.
 - **A path call through a `pub use` chain** (`a::b::f()` where `a::b`
   re-exports `f`) does not resolve: a type-qualified path is addressed by
   `qualifiedName`, and core walks re-export chains for `name` keys only. A
@@ -120,10 +153,37 @@ The `--expect` file (GM-287) covers every category `g-mesh plugins check
 --expect` can assert at least once: callers (a free function, a
 module-qualified path call, a type-qualified path call paired with the
 equivalent `Self::` call from inside its own impl, a `pub use` re-export
-chain, `pub(crate)` visibility, and the receiver-call gap itself made
-airtight - the same declaration called both a resolving and a non-resolving
-way, so the non-resolving call site's absence from the expected set is a
-real assertion rather than an omission nobody would notice), references,
-`impl Trait for T` via `find_implementations`, imports (a glob and a
-container-scoped named re-export), and definition. GM-286's original five
-acceptance-criteria entries are folded in rather than duplicated.
+chain, `pub(crate)` visibility), references, `impl Trait for T` via
+`find_implementations`, imports (a glob and a container-scoped named
+re-export), and definition. GM-286's original five acceptance-criteria
+entries are folded in rather than duplicated.
+
+Five of its entries are tagged `tier = "semantic"` (GM-290) and are run three
+ways by `tests/conformance.rs`, which is what makes any of the runs mean
+something:
+
+- with the manifest this plugin ships, where all fifteen entries pass;
+- with 3.2.0's own manifest (`semantic_pass = false`) and
+  `--skip-semantic-expectations`, where those five report `Skip` and every
+  structural entry keeps passing - this plugin binary answering the release
+  before it;
+- and once more without the skip flag, where those five must **fail**. That
+  third run is the discrimination: it is how the semantic entries are known
+  to be measuring the rust-analyzer tier rather than being answered by
+  something else.
+
+A fourth run covers the degradation itself - the shipped manifest with the
+server command pointing at nothing - and asserts the log, not the
+expectations: with `semantic_pass = true` and no engine the whole-project pass
+is reported incomplete, which the kit reads as a session failure and after
+which it judges no expectations at all. That one failing check is the kit
+telling the truth about the environment, and the test pins it to exactly that
+one so nothing else can hide behind it.
+
+The receiver-call gap's own assertion moved with them. Through 3.2.0 it lived
+in this file as a caller set that deliberately *omitted* the non-resolving
+call site; it is now the same entry listing all three callers and requiring
+the semantic tier to produce the third. The structural half - that `x.m()`
+emits one open site and no edge - is pinned by
+`src/extractor/tests.rs::a_receiver_call_produces_no_edge_and_one_open_site`,
+which needs no toolchain at all.

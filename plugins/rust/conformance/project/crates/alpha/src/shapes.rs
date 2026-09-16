@@ -128,3 +128,17 @@ pub fn total_perimeter_via_path(square: &Square) -> u8 {
 pub fn describe<S: Shape>(shape: &S) -> &'static str {
     shape.label()
 }
+
+/// Dispatch through a **trait object**, the other half of GM-290's
+/// receiver-call acceptance criterion and the one that separates two answers
+/// a careless semantic tier would merge.
+///
+/// `total` above calls `area` through a variable whose type is `Square`, and
+/// the honest answer there is `<Square as Shape>::area` - the impl's own
+/// method. Here the receiver is `&dyn Shape`, and which `area` runs is a
+/// run-time question, so the honest answer is `Shape::area`, the trait's
+/// declaration. `conformance/expect.toml` asserts both as exact sets, which
+/// means a pass that gave either call the other's answer fails twice over.
+pub fn total_dyn(shape: &dyn Shape) -> u8 {
+    shape.area()
+}

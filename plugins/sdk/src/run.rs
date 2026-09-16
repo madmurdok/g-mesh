@@ -49,13 +49,14 @@
 //! `hasSyntaxErrors` records it (see [`FileGraph::mark_syntax_errors`]) and
 //! the graph is committed like any other.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use g_mesh_wire::{FileChangeDiff, Handshake, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
 
 use crate::diff::diff_file;
+use crate::framing::{read_frame, write_message};
 use crate::graph::FileGraph;
 use crate::index::SdkIndex;
 use crate::manifest::{PluginSpec, ResolvedSpec};
@@ -295,8 +296,9 @@ impl<E: Extractor> Session<'_, E> {
                     .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
                     .unwrap_or_default();
                 self.hydrate(&files);
-                let diff = self.engine.answer(&files, &self.index);
-                self.respond(out, id, diff)
+                let root = self.root.clone();
+                let answer = self.engine.answer(&files, &self.index, &root);
+                self.respond_to_pass(out, id, files.is_empty(), answer)
             }
             "workspaceChanged" => {
                 // A notification: core follows it with the per-language
@@ -418,6 +420,45 @@ impl<E: Extractor> Session<'_, E> {
         path.extension().is_some_and(|extension| self.spec.extensions.contains(&extension))
     }
 
+    /// Answers a `semanticPass` with its diff and, for a whole-project pass
+    /// that did not finish, the `incomplete` flag core reads to leave
+    /// `language_state.semanticPassAt` unset
+    /// (`core::watcher::apply::apply_semantic_pass`).
+    ///
+    /// # Why only a whole-project pass carries it
+    ///
+    /// `semanticPassAt` is a one-shot completion flag for the *whole-project*
+    /// pass, and nothing else reads `incomplete`. On a per-file pass - the one
+    /// that follows every settled reparse - the only effect the flag could
+    /// have is core logging a line per keystroke-save, which is precisely the
+    /// noise the design's "log once" rule for a degraded engine exists to
+    /// prevent (`docs/architecture/multi-language-plugins.md`, "Semantic
+    /// engine missing"). A permanently missing language server would otherwise
+    /// print one failure line into the daemon log for every file anyone
+    /// touches, all of them saying the same thing the first one said.
+    ///
+    /// The engine still answers honestly in both cases - [`SemanticAnswer`]'s
+    /// `complete` is about the pass, not about the wire - and this is the one
+    /// place that decides the flag is worth sending.
+    fn respond_to_pass<W: Write>(
+        &self,
+        out: &mut W,
+        id: Option<serde_json::Value>,
+        whole_project: bool,
+        answer: crate::semantic::SemanticAnswer,
+    ) -> anyhow::Result<()> {
+        let Some(id) = id else { return Ok(()) };
+        if whole_project && !answer.complete {
+            eprintln!(
+                "[{}] the whole-project semantic pass did not finish - reporting it incomplete so the \
+                 index does not record a semantic pass it did not get",
+                self.spec.language
+            );
+        }
+        write_message(out, &pass_response(id, whole_project, answer))?;
+        Ok(())
+    }
+
     /// Answers a request with a diff. A notification (no id) gets nothing -
     /// but the work above still ran, so the cache stays current.
     fn respond<W: Write>(
@@ -442,6 +483,26 @@ impl<E: Extractor> Session<'_, E> {
         )?;
         Ok(())
     }
+}
+
+/// The frame a `semanticPass` is answered with - see
+/// [`Session::respond_to_pass`] for why only a whole-project pass carries the
+/// flag.
+///
+/// A free function so its shape can be asserted directly: what core reads is
+/// this JSON, and the difference between a pass that is recorded as done and
+/// one that is retried is one key in it.
+fn pass_response(
+    id: serde_json::Value,
+    whole_project: bool,
+    answer: crate::semantic::SemanticAnswer,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "id": id,
+        "result": answer.diff,
+        "incomplete": whole_project && !answer.complete,
+    })
 }
 
 // --- shared helpers ---------------------------------------------------------
@@ -498,97 +559,54 @@ fn extract_caught<E: Extractor>(
 // --- framing ----------------------------------------------------------------
 //
 // LSP-style `Content-Length` framing, the same wire core's
-// `protocol::jsonrpc` writes and reads. Re-implemented rather than shared
-// because sharing it would mean depending on core - see `g-mesh-wire`'s
-// module doc for why that trade goes the other way. It is a header, a blank
-// line and a body; what has to match is the format, not the code.
-
-/// A misbehaving core must not be able to make a plugin allocate an arbitrary
-/// buffer by announcing a huge body. Same limit core applies in the other
-/// direction: control messages are small, and bulk data does not travel here.
-const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-
-fn write_message<T: serde::Serialize + ?Sized, W: Write>(out: &mut W, message: &T) -> io::Result<()> {
-    let body = serde_json::to_vec(message).map_err(io::Error::other)?;
-    out.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())?;
-    out.write_all(&body)?;
-    out.flush()
-}
-
-/// Reads one frame, or `None` at a clean EOF on a frame boundary.
-fn read_frame<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
-    let mut length: Option<usize> = None;
-    let mut started = false;
-    loop {
-        let mut line = Vec::new();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            anyhow::ensure!(!started, "unexpected end of input inside a frame header");
-            return Ok(None);
-        }
-        started = true;
-        let line = std::str::from_utf8(&line)?.trim_end_matches('\n').trim_end_matches('\r');
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                length = Some(value.trim().parse()?);
-            }
-        }
-    }
-
-    let length = length.ok_or_else(|| anyhow::anyhow!("frame header is missing Content-Length"))?;
-    anyhow::ensure!(length <= MAX_BODY_BYTES, "frame body of {length} bytes exceeds the limit");
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body)?;
-    Ok(Some(body))
-}
+// `protocol::jsonrpc` writes and reads, and the same wire a semantic tier
+// speaks to a language server ([`crate::lsp`]). It lives in `framing` because
+// this process speaks it in both directions - see that module's doc.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::semantic::SemanticAnswer;
 
+    /// The one key that decides whether core records this language as having
+    /// had its semantic pass - and the reason a per-file pass never carries it.
     #[test]
-    fn a_written_frame_is_the_lsp_wire_format_core_reads() {
-        let mut buffer = Vec::new();
-        write_message(&mut buffer, &serde_json::json!({ "ok": true })).unwrap();
-        assert_eq!(buffer, b"Content-Length: 11\r\n\r\n{\"ok\":true}");
+    fn only_a_whole_project_pass_reports_that_it_did_not_finish() {
+        let id = serde_json::json!(7);
+        let incomplete = SemanticAnswer::incomplete(FileChangeDiff::default());
+        let complete = SemanticAnswer::complete(FileChangeDiff::default());
+
+        let response = pass_response(id.clone(), true, incomplete.clone());
+        assert_eq!(response["incomplete"], serde_json::json!(true));
+        assert!(response.get("result").is_some(), "an incomplete pass still carries its diff");
+
+        assert_eq!(pass_response(id.clone(), true, complete.clone())["incomplete"], serde_json::json!(false));
+        assert_eq!(
+            pass_response(id.clone(), false, incomplete)["incomplete"],
+            serde_json::json!(false),
+            "a per-file pass has no completion flag to protect"
+        );
+        assert_eq!(pass_response(id, false, complete)["incomplete"], serde_json::json!(false));
     }
 
+    /// The diff an incomplete pass did manage travels with it - core commits
+    /// it and declines to record the pass, which is the whole point of the
+    /// field being beside `result` rather than replacing it.
     #[test]
-    fn frames_round_trip_in_order_and_end_at_a_clean_eof() {
-        let mut buffer = Vec::new();
-        write_message(&mut buffer, &serde_json::json!({ "a": 1 })).unwrap();
-        write_message(&mut buffer, &serde_json::json!({ "b": 2 })).unwrap();
+    fn an_incomplete_pass_still_carries_what_it_resolved() {
+        use crate::graph::{FileGraphBuilder, NodeSpec};
+        use g_mesh_wire::{NodeKind, Position, Range};
 
-        let mut reader = BufReader::new(Cursor::new(buffer));
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), br#"{"a":1}"#);
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), br#"{"b":2}"#);
-        assert!(read_frame(&mut reader).unwrap().is_none(), "EOF on a frame boundary is not an error");
-    }
+        let path = RelPath::new("a.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+        let range = Range { start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 1 } };
+        builder.add_node(NodeSpec::new(NodeKind::Function, "a", "a", range));
+        let graph = builder.finish();
 
-    #[test]
-    fn headers_other_than_content_length_are_ignored() {
-        let raw = b"Content-Type: application/vscode-jsonrpc\r\nContent-Length: 2\r\n\r\n{}".to_vec();
-        let mut reader = BufReader::new(Cursor::new(raw));
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), b"{}");
-    }
-
-    #[test]
-    fn malformed_framing_is_an_error_rather_than_a_guess() {
-        let cases: &[&[u8]] = &[
-            b"\r\n{}",                                // no Content-Length
-            b"Content-Length: nope\r\n\r\n{}",        // unparsable length
-            b"Content-Length: 64\r\n\r\n{}",          // body shorter than announced
-            b"Content-Length: 99999999999\r\n\r\n{}", // over the size limit
-            b"Content-Length: 2\r\n",                 // EOF inside the header block
-        ];
-        for case in cases {
-            let mut reader = BufReader::new(Cursor::new(case.to_vec()));
-            assert!(read_frame(&mut reader).is_err(), "expected a framing error for {case:?}");
-        }
+        let diff = FileChangeDiff { upsert_nodes: graph.nodes, ..Default::default() };
+        let response = pass_response(serde_json::json!(1), true, SemanticAnswer::incomplete(diff));
+        assert_eq!(response["incomplete"], serde_json::json!(true));
+        assert_eq!(response["result"]["upsertNodes"].as_array().map(Vec::len), Some(1));
     }
 
     /// An extractor that panics on one file costs that file and nothing else -

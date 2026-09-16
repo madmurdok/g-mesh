@@ -11,7 +11,12 @@ fn main() -> ! {
     run(
         RustExtractor,
         PluginSpec::new("rust", env!("CARGO_PKG_VERSION"), &[".rs"]).exclude_dirs(&["target"]),
-        // No semantic tier yet - see `plugin.toml`'s `capabilities.semantic_pass = false`.
-        None,
+        // The rust-analyzer tier (GM-290). A *factory*, not an engine: the SDK
+        // calls this on the first `semanticPass` and never before, which is
+        // what `capabilities.semantic-engine-lazy` checks and what keeps a
+        // structural-only wake-up from loading a compiler. Nothing here runs
+        // until then - not the `PATH` lookup, not the `--version` probe, and
+        // certainly not rust-analyzer.
+        Some(Box::new(g_mesh_plugin_rust::semantic::engine)),
     )
 }

@@ -633,6 +633,13 @@ impl PluginState {
         let mut child = Command::new(&manifest.command)
             .args(&manifest.args)
             .arg(project_root)
+            // The manifest core read, so the plugin reads the same one - see
+            // `manifest::MANIFEST_PATH_ENV`. Without it an SDK plugin looks
+            // beside its own binary, which is right in an installed layout and
+            // wrong in a checkout, where core would send a `semanticPass` to a
+            // plugin that never found the `[plugin.semantic]` section
+            // declaring the server to answer it with.
+            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Plugin logs are diagnostic-only today - nothing consumes them

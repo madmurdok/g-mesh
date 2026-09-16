@@ -248,6 +248,11 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         .args(&manifest.args)
         .arg(BULK_INDEX_FLAG)
         .arg(scratch.workspace())
+        // The manifest being checked, so an SDK plugin reads the same file the
+        // kit is judging it against rather than one beside its own binary -
+        // see `daemon::manifest::MANIFEST_PATH_ENV`. Checking a plugin against
+        // a manifest it cannot see is checking something else.
+        .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -791,6 +796,8 @@ pub(crate) fn run_session(
     command
         .args(&manifest.args)
         .arg(scratch.workspace())
+        // As in `run_bulk` above - see `daemon::manifest::MANIFEST_PATH_ENV`.
+        .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

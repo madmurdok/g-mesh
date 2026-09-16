@@ -19,8 +19,18 @@
 #   - callers, cross-crate through a `pub use` chain (`internals::published`);
 #   - callers, `pub(crate)` visibility (`internals::crate_only` - GM-286's
 #     own acceptance case, kept here rather than duplicated);
-#   - callers, the receiver-call gap made airtight (`shapes::Square::perimeter`
-#     - see that entry's own comment for what "airtight" means here);
+#   - callers, the receiver-call gap now closed (`shapes::Square::perimeter`,
+#     semantic - see that entry for how GM-290 turned an assertion of
+#     absence into one of presence);
+#   - callers, a receiver call through a variable and through a trait object
+#     (semantic): `shapes::<Square as Shape>::area` and `shapes::Shape::area`,
+#     one pair of exact sets that a pass resolving either to the other's
+#     answer fails twice;
+#   - callers, a default trait method through a generic (semantic):
+#     `shapes::Shape::label`;
+#   - implementations in another crate of the workspace (semantic):
+#     `shapes::Loud`, which `crates/beta` implements through a glob import
+#     the structural tier cannot follow;
 #   - references (`shapes::Shape`, which `[[callers]]` cannot reach at all -
 #     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
 #   - implementations (`shapes::Shape`, `impl Trait for T` found by
@@ -33,6 +43,43 @@
 # Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
 # matters, and an entry missing from the set is as much of a failure as an
 # extra one.
+#
+# **`tier = "semantic"`** marks the five entries that need a real
+# rust-analyzer behind the SDK's `LspBridge` (GM-290) - decision 6 of
+# `core/src/cli/plugin_check/expectations.rs`'s own module doc, the same way
+# `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
+# runs this file three ways, and the three together are the whole point:
+#
+#   1. with the manifest this plugin ships, where all fifteen entries run and
+#      pass;
+#   2. with 3.2.0's own manifest (`semantic_pass = false`, no
+#      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
+#      five report `Skip` and the other ten - every structural entry here,
+#      unchanged since 3.2.0 - keep passing;
+#   3. with 3.2.0's manifest and *without* the skip flag, where those five
+#      must FAIL.
+#
+# Arm 2 is what "without rust-analyzer, the structural results are the 3.2.0
+# results" means as something a machine checks. Arm 3 is the discrimination,
+# and it is not decoration: measured, it fails exactly five entries, each for
+# the reason it was written -
+#
+#   callers[5]  missing shapes::total_perimeter            (receiver call on a variable)
+#   callers[6]  empty, wanted shapes::total                (variable receiver -> the impl's method)
+#   callers[7]  empty, wanted total_dyn and gaps::measure  (trait object / generic -> the trait's)
+#   callers[8]  empty, wanted shapes::describe             (a default trait method)
+#   implementations[1]  missing beta's Megaphone           (an impl in another crate)
+#
+# - which is how this file is known to be measuring the rust-analyzer tier
+# rather than describing it.
+#
+# 3.2.0's manifest rather than "the shipped one with a broken command" for
+# arm 2 and 3, and the reason is the kit's own rule: a plugin that declares
+# `semantic_pass = true` and cannot start an engine reports its whole-project
+# pass incomplete, `watcher::apply` turns that into a session failure, and the
+# kit then skips the entire expectations section. The degradation itself is
+# asserted by `tests/conformance.rs`'s own missing-toolchain test, which reads
+# the log rather than the expectations.
 
 # --- callers: pub(crate), linkable from a sibling module and not from another
 #     crate (GM-286's own acceptance case) --------------------------------------
@@ -108,30 +155,75 @@ symbol = "nested::deep::work"
 # deep::work;` re-export is not a call site and must not appear here.
 expect = ["crates/alpha/src/lib.rs:run"]
 
-# --- callers: the receiver-call gap, made airtight -----------------------------
+# --- callers: the receiver-call gap, now closed (GM-290) -----------------------
 
 [[callers]]
 symbol = "shapes::Square::perimeter"
-# `perimeter` is called three ways in this file, and only two produce an
-# edge: `Square::scale`'s `self.perimeter()` (resolved - `self.m()` inside an
-# impl is the one receiver-shaped call this tier does answer) and
-# `total_perimeter_via_path`'s `Square::perimeter(square)` (resolved - a
-# type-qualified path call). `total_perimeter`'s `square.perimeter()` is a
-# receiver call on a local variable, structurally identical to `total`'s
-# `square.area()`, and is deliberately left out of this expected set.
+tier = "semantic"
+# This entry used to be the receiver-call gap's airtight *proof of absence*:
+# `perimeter` is called three ways in this file, `Square::scale`'s
+# `self.perimeter()` and `total_perimeter_via_path`'s
+# `Square::perimeter(square)` both resolve structurally, and
+# `total_perimeter`'s `square.perimeter()` did not - so the set below listed
+# two callers and the third's absence was the assertion.
 #
-# That omission is what makes this an assertion rather than an oversight: if
-# a receiver call ever started producing an edge, `total_perimeter` would
-# appear in the *actual* set this check computes, the set would no longer
-# equal what is written below, and the check would fail on the unexpected
-# extra entry - not silently pass because nobody asked. Proven, not just
-# claimed: adding `"crates/alpha/src/shapes.rs:shapes::total_perimeter"` to
-# `expect` below fails today (see this task's own completion notes for the
-# recorded diff).
+# GM-290 turns it over. With rust-analyzer behind the bridge the third call
+# resolves too, so the honest expected set is all three, and the entry
+# becomes a proof of *presence* - the same discrimination pointing the other
+# way. It is `tier = "semantic"` because that is exactly what it now
+# measures: run this file with `--skip-semantic-expectations` against a
+# plugin whose server is missing and this entry reports `Skip`; run it with a
+# server and `total_perimeter` has to be there, or the pass resolved nothing
+# and nobody noticed.
+#
+# The structural half did not go away, it moved somewhere that needs no
+# toolchain to check: `src/extractor/tests.rs`'s
+# `a_receiver_call_produces_no_edge_and_one_open_site` asserts, on the parser
+# alone, that `x.m()` still emits one open site and no edge.
 expect = [
     "crates/alpha/src/shapes.rs:shapes::Square::scale",
     "crates/alpha/src/shapes.rs:shapes::total_perimeter_via_path",
+    "crates/alpha/src/shapes.rs:shapes::total_perimeter",
 ]
+
+# --- callers: a receiver call through a variable, and through a trait object ---
+#
+# GM-290's acceptance criterion, split into the two entries that make it a
+# measurement rather than a formality. Both call sites are spelled `_.area()`
+# and neither produces a structural edge; what separates them is the
+# receiver's type, which is precisely what only a semantic tier knows.
+
+[[callers]]
+symbol = "shapes::<Square as Shape>::area"
+tier = "semantic"
+# Through a *variable* of a concrete type: `total`'s `square.area()`, where
+# `square: &Square`. The honest answer is the impl's own method, not the
+# trait's declaration - and this set is exact, so a pass that answered
+# `Shape::area` here fails on the missing entry while the entry below fails
+# on the extra one.
+expect = ["crates/alpha/src/shapes.rs:shapes::total"]
+
+[[callers]]
+symbol = "shapes::Shape::area"
+tier = "semantic"
+# Through a *trait object* (`total_dyn`'s `&dyn Shape`) and through a
+# *generic* (`gaps::measure`'s `<S: crate::prelude::Shape>`). In both, which
+# `area` runs is a run-time question, so the honest answer is the trait's own
+# declaration - and `shapes::total` must NOT appear here, which is what makes
+# this entry and the one above a pair rather than two spellings of one claim.
+expect = [
+    "crates/alpha/src/shapes.rs:shapes::total_dyn",
+    "crates/alpha/src/gaps.rs:gaps::measure",
+]
+
+[[callers]]
+symbol = "shapes::Shape::label"
+tier = "semantic"
+# A *default* trait method, reached through a generic: `describe`'s
+# `shape.label()`. No type implements it, so there is nothing else this could
+# resolve to - which makes it the cheapest possible check that the pass reads
+# a trait's own body and not only its implementors.
+expect = ["crates/alpha/src/shapes.rs:shapes::describe"]
 
 # --- references: a usage [[callers]] cannot reach at all -----------------------
 
@@ -157,10 +249,17 @@ file = "crates/alpha/src/shapes.rs"
 # `containers` row is missing (README's "A module that declares nothing but
 # `pub use` gets no container node"). Measured, not guessed: this row showed
 # up as an unexpected extra the first time this entry was written without it.
+#
+# `shapes::total_dyn` joined this set in GM-290: its `&dyn Shape` parameter
+# is an ordinary same-file type reference, structural like `describe`'s
+# bound, and it is here in both arms for that reason - the *call* inside its
+# body is the semantic half and is asserted separately, under
+# `shapes::Shape::area`.
 expect = [
     "crates/alpha/src/shapes.rs:shapes::Square",
     "crates/alpha/src/shapes.rs:shapes::Circle",
     "crates/alpha/src/shapes.rs:shapes::describe",
+    "crates/alpha/src/shapes.rs:shapes::total_dyn",
     "crates/alpha/src/gaps.rs:gaps::measure",
     "crates/alpha/src/prelude.rs:",
 ]
@@ -173,7 +272,31 @@ symbol = "shapes::Shape"
 # Both impls are same-file `SUPERTYPE_OF` edges from the type to the trait.
 # `prelude.rs` re-exports `Shape`, which is a placeholder and must not appear
 # here as a third implementor.
+#
+# Deliberately still structural after GM-290, and it is an assertion about
+# the semantic tier too: the implementation sweep asks rust-analyzer about
+# *every* trait, so it re-derives these same two impls and emits its own
+# `SUPERTYPE_OF` edges for them. This set staying exactly two is what says
+# those answers landed on the declarations the structural tier had already
+# found, rather than on the `impl` blocks, on the prelude's re-export, or on
+# nothing at all.
 expect = ["crates/alpha/src/shapes.rs:shapes::Square", "crates/alpha/src/shapes.rs:shapes::Circle"]
+
+# --- implementations: an impl in another crate of the workspace (GM-290) ------
+
+[[implementations]]
+symbol = "shapes::Loud"
+tier = "semantic"
+# The other acceptance criterion, and the one nothing structural can reach.
+# `crates/beta/src/main.rs` implements `alpha`'s `Loud` for its own
+# `Megaphone`, naming the trait through `use alpha::prelude::*` - a glob. The
+# extractor resolves a bare *type* name that is neither declared nor imported
+# by item to `Bound::Nothing`: no edge, and not even an open site (see
+# `crates/alpha/src/prelude.rs`'s comment). So `Megaphone` is here only if
+# `textDocument/implementation` on the trait found it, and `Circle` is here
+# either way - which is what makes this one entry both the cross-crate claim
+# and a guard against a sweep that drops the answers it used to get right.
+expect = ["crates/alpha/src/shapes.rs:shapes::Circle", "crates/beta/src/main.rs:Megaphone"]
 
 # --- imports (get_dependencies, one hop, Outgoing): glob and container --------
 # (GM-286's own acceptance case, kept here rather than duplicated)

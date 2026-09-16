@@ -3,5 +3,14 @@
 # membership resolution - see `crates/alpha/src/lib.rs` for the module-tree
 # shapes (a `#[path]` module, a nested `mod.rs`, an inline module and an
 # orphan file) this fixture is really here to prove.
+#
+# `Cargo.lock` beside this file is checked in, and GM-290 is why: the semantic
+# tier runs a real rust-analyzer over this fixture, rust-analyzer runs `cargo
+# metadata`, and `cargo metadata` writes a lockfile. A generated file nobody
+# committed turns every conformance run into a dirty working tree.
 [workspace]
 members = ["crates/alpha", "crates/beta"]
+# Stated rather than defaulted, so that `cargo metadata` - which the semantic
+# tier runs on every cold load - does not print a resolver warning into the
+# daemon's log on every start.
+resolver = "2"
