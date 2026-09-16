@@ -44,6 +44,10 @@ type pluginState struct {
 	projectRoot string
 	workspace   *workspace
 	files       map[string]cachedFile
+	// semantic is this process's go/types tier (semantic.go). Constructing
+	// it loads nothing - the engine is inert until the first semanticPass,
+	// which is the laziness `capabilities.semantic-engine-lazy` checks.
+	semantic *semanticEngine
 }
 
 func newPluginState(projectRoot string) *pluginState {
@@ -51,6 +55,7 @@ func newPluginState(projectRoot string) *pluginState {
 		projectRoot: projectRoot,
 		workspace:   loadWorkspace(projectRoot),
 		files:       map[string]cachedFile{},
+		semantic:    newSemanticEngine(projectRoot),
 	}
 }
 
@@ -177,32 +182,23 @@ func nodesEqual(a, b wireNode) bool {
 	return a == b
 }
 
-// handleSemanticPass answers every semanticPass request - per-file or
-// whole-project alike, core's own filePaths convention (an empty list
-// means "everything") - with an empty diff. There is no semantic engine
-// yet to ask (go/types lands in GM-281): the structural pass produces this
-// plugin's whole honest answer today, and the questions it deliberately
-// refused - the open sites this process is already collecting per file
-// (openSitesFor, open_sites.go) - have nobody to put them to yet. Answering
-// with an empty diff rather than a guess is what keeps the receiver gap
-// declared in plugin.toml true.
+// handleSemanticPass answers a semanticPass request - per-file or
+// whole-project alike, core's own filePaths convention (an empty list means
+// "everything") - by asking the go/types engine (semantic.go).
 //
-// Deliberately does *not* write the conformance kit's semantic-engine
-// marker (session.go's MARKER_DIR_ENV contract, mirrored from
-// core/src/cli/plugin_check/session.rs) - see this repo's
-// docs/architecture/multi-language-plugins.md, Go plugin section,
-// "Implementation notes (GM-279)", for why: there being no engine to
-// start is not the same claim as "the engine started lazily", and writing
-// a marker with nothing behind it would make the
-// capabilities.semantic-engine-lazy check either vacuously pass (useless)
-// or fail on a technicality unrelated to laziness. Reporting
-// "not instrumented" (the kit's own behavior for a plugin that never
-// writes the marker) is the honest answer today, and GM-281 is expected to
-// add the marker write at the moment it actually spawns/loads a real
-// engine.
+// This is the *only* path into that engine. Nothing in bulk indexing,
+// `fileChanged` or `workspaceChanged` touches it, which is what makes the
+// conformance kit's `capabilities.semantic-engine-lazy` check pass rather
+// than merely go uninstrumented: the engine's own first `packages.Load`
+// writes the kit's marker, and that call can only be reached from here.
+//
+// With no Go toolchain on PATH, or a `packages.Load` that fails outright,
+// the engine logs once and returns an empty diff, exactly as this function
+// did before there was an engine at all - the structural graph stays, Go's
+// `language_state.semanticPassAt` is never set, and the receiver-call gap
+// stays listed in the MCP instructions.
 func (s *pluginState) handleSemanticPass(filePaths []string) fileChangeDiff {
-	_ = filePaths // nothing to resolve yet - see the doc comment above
-	return emptyDiff()
+	return s.semantic.run(s.workspace, filePaths)
 }
 
 // handleEnvelope dispatches one parsed control message and, for a request

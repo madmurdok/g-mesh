@@ -166,10 +166,18 @@ jobs:
       # Pinned to the minor version plugins/go/go.mod requires, for the same
       # reason Node is pinned: a gate that changes underneath you is a gate
       # people stop reading.
+      #
+      # `cache: true` since GM-281: the plugin now requires
+      # golang.org/x/tools for its go/types tier, so without the module cache
+      # every run re-downloads it (and every `go build` re-compiles it). It
+      # was `false` while `plugins/go/go.mod` had zero requirements and there
+      # was genuinely nothing to cache. The cache is keyed off
+      # `plugins/go/go.sum`, which only exists for the same reason.
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
-          cache: false
+          cache: true
+          cache-dependency-path: plugins/go/go.sum
 
       # The Go plugin's own suite - the extractor's scope rules, container
       # keys, edge shapes and incremental diff. Runs before the slower Rust

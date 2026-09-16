@@ -6,13 +6,22 @@
 #     --expect  plugins/go/conformance/expect.toml
 #
 # **Deliberately minimal.** GM-282 owns the full Go expectations file, and
-# this one is not it: every entry below exists to prove *one* end-to-end
-# claim GM-280 makes about the linker contract - that the placeholders this
-# plugin emits are addresses core can actually resolve - and nothing here
-# tries to cover the fixture. Interface implementations in particular are
-# absent on purpose: Go's interfaces are structural, so `SUPERTYPE_OF` edges
-# are go/types' answer and arrive with GM-281, and an `[[implementations]]`
-# entry now could only assert the empty set.
+# this one is not it. Every entry below exists to prove *one* end-to-end
+# claim, and nothing here tries to cover the fixture:
+#
+#   - GM-280's claim about the linker contract - that the container-scoped,
+#     `name`-keyed placeholders the structural tier emits are addresses core
+#     can actually resolve (the first five entries);
+#   - GM-281's claim about the semantic tier - that a `go/types` pass
+#     resolves each of the three receiver shapes (through a variable,
+#     through an embedded field, through an interface value) and that
+#     `types.Implements` finds implementers nothing in the syntax declares
+#     (the last four).
+#
+# The second group is what makes this file a discrimination test for the
+# semantic tier as a whole: run the same fixture with a `go` binary off
+# PATH, or with the Selections lookup disabled, and exactly those four fail
+# while the five structural ones still pass.
 #
 # Every `expect` list is an exact set, which is what makes the two `helper`
 # entries a real test rather than two ways of finding some function with that
@@ -70,3 +79,48 @@ expect = ["tools/gen.go:Generate"]
 [[imports]]
 file = "cmd/main.go"
 expect = ["container:fmt", "container:github.com/example/app/server"]
+
+# --- GM-281: the semantic tier ------------------------------------------
+#
+# Each of the four below is unanswerable without type information, and each
+# is an exact set, so a pass that resolved the *wrong* declaration fails
+# here just as loudly as one that resolved nothing.
+
+# Receiver call through a variable (`s := server.New(); s.Addr()`) and
+# through an *embedded field* (`l.Addr()` on a Logged that embeds *Server),
+# in one set. Neither call site names `Server` at all: the first knows only
+# that `s` came out of `New()`, and the second calls a method Logged never
+# declares. `types.Info.Selections` answers both with the same declaration,
+# which is why they are one expectation rather than two.
+[[callers]]
+symbol = "Server.Addr"
+expect = ["cmd/main.go:main", "server/logged.go:UseLogged"]
+
+# A method call through a struct field, resolved to the sibling file that
+# declares it. The structural tier emits nothing here either: `c.server` is
+# a selection through a value, and so is the `.Close()` on it.
+[[callers]]
+symbol = "Server.Close"
+expect = ["server/conn.go:Conn.Close"]
+
+# Receiver call through an *interface value*. The honest answer is the
+# interface method's own declaration - which concrete `Close` runs is a
+# run-time question - so `Closer.Close` is what carries the caller, and
+# `[[implementations]]` below is what gets a reader from there to the
+# concrete types.
+[[callers]]
+symbol = "Closer.Close"
+expect = ["server/conn.go:CloseAll"]
+
+# Implicit implementation: the thing Go's structural interfaces make
+# invisible to any amount of parsing. Three implementers, none of which
+# mentions Closer anywhere - Server (pointer receiver), Conn (pointer
+# receiver), and Logged, which declares no Close at all: it embeds *Server,
+# and the method-set promotion is what satisfies the interface.
+[[implementations]]
+symbol = "Closer"
+expect = [
+  "server/server.go:Server",
+  "server/conn.go:Conn",
+  "server/logged.go:Logged",
+]

@@ -9,7 +9,10 @@
 [plugin]
 language = "go"
 protocol_version = 2
-plugin_version = "0.1.0"
+# 0.2.0 is GM-281, which added the go/types semantic tier. Kept equal to
+# wire.go's `pluginVersion` by plugins/go/manifest_test.go - nothing on the
+# core side compares the two, so the plugin's own suite is what does.
+plugin_version = "0.2.0"
 
 [plugin.spawn]
 # A prebuilt binary, not `go run ./...`. `go run` recompiles the whole
@@ -40,23 +43,32 @@ command = "./g-mesh-plugin-go"
 extensions = [".go"]
 
 [plugin.capabilities]
-# No real semantic engine exists yet - go/types lands in GM-281. core may
-# still send semanticPass (this stays true rather than false): a plugin
-# that will grow a real semantic tier should not lock in "core never asks"
-# before that tier exists, and this plugin already answers every
-# semanticPass honestly (an empty diff - see control.go's
-# handleSemanticPass). See the design doc's "Implementation notes (GM-279)"
-# for the semantic-engine-marker decision this capability implies.
+# core sends semanticPass (per file after a reparse, whole project after a
+# walk) and this plugin answers it with go/types through
+# golang.org/x/tools/go/packages - plugins/go/semantic.go. The engine is
+# started lazily, on the first such request and never during a bulk index or
+# a fileChanged, which is what `capabilities.semantic-engine-lazy` checks
+# through the marker that pass writes.
 semantic_pass = true
-# `x.M()` needs to know the receiver's type, which only go/types can answer,
-# so GM-280's structural tier emits no edge for one at all - it records an
-# open site instead (plugins/go/open_sites.go) and leaves the gap declared
-# here, where the MCP instructions read it. Both stay "unresolved" until
-# GM-281 lands the pass that answers those sites, at which point
-# `receiver_calls` becomes "resolved" and `receiver_calls_structural` stays
-# as it is: the structural tier will still not answer them, the semantic one
-# will.
-receiver_calls = "unresolved"
+# `x.M()` needs to know the receiver's type, which only go/types can answer.
+# The two values therefore differ, and the difference is the whole point:
+#
+#   - `receiver_calls = "resolved"` - once Go's whole-project semanticPass
+#     has completed (`language_state.semanticPassAt`), receiver calls are
+#     resolved, so core's generated MCP instructions stop listing the
+#     receiver-call gap for this language (core/src/mcp/instructions.rs's
+#     has_open_receiver_gap);
+#   - `receiver_calls_structural = "unresolved"` - the go/parser tier alone
+#     still emits nothing for one (it records an open site instead:
+#     plugins/go/open_sites.go), so between the bulk walk and the first
+#     completed pass the gap is real and stays listed. Claiming otherwise
+#     here would make the instructions promise, for those minutes, edges
+#     that are not in the index yet.
+#
+# Without a Go toolchain on PATH the pass answers with an empty diff and
+# `semanticPassAt` is never set, so the gap simply stays listed forever -
+# the degradation is honest by construction rather than by a second flag.
+receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
 
 [plugin.workspace]

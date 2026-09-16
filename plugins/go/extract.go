@@ -149,10 +149,21 @@ type fileGraph struct {
 	nodes []wireNode
 	edges []wireEdge
 	// Use sites this tier could not resolve - receiver calls and field
-	// accesses through a value (`x.M()`). Kept in this process's memory and
-	// handed to the semantic pass; never sent to core, which has no concept
-	// of one. The design doc's `FileGraph.open_sites`, and GM-281's input.
+	// accesses through a value (`x.M()`), and bare names a dot import made
+	// ambiguous. Kept in this process's memory and handed to the semantic
+	// pass; never sent to core, which has no concept of one. The design
+	// doc's `FileGraph.open_sites`, and semantic.go's input.
 	openSites []openSite
+	// CALLS edges this tier emitted onto a placeholder, which the semantic
+	// pass retracts where the name turns out to be a type rather than a
+	// function - see placeholderCall's own doc comment. Never sent to core
+	// either.
+	placeholderCalls []placeholderCall
+	// container is the file's package as a container key, which every
+	// declaration node of the file also carries. Recorded here so the
+	// semantic pass can state `fromContainer` on the placeholders it emits
+	// without re-deriving the package clause.
+	container string
 }
 
 // extractFile parses one Go file and returns its graph.
@@ -199,7 +210,13 @@ func extractFile(ws *workspace, relPath string, content []byte) fileGraph {
 	e.declareAll(astFile)
 	e.useAll(astFile)
 
-	return fileGraph{nodes: e.nodes, edges: e.edges, openSites: e.openSites}
+	return fileGraph{
+		nodes:            e.nodes,
+		edges:            e.edges,
+		openSites:        e.openSites,
+		placeholderCalls: e.placeholderCalls,
+		container:        e.container,
+	}
 }
 
 // extractor is one file's extraction state. Not reused across files: every
@@ -238,7 +255,8 @@ type extractor struct {
 	// see collectImports.
 	hasDotImport bool
 
-	openSites []openSite
+	openSites        []openSite
+	placeholderCalls []placeholderCall
 	// initOrdinal counts `func init()` declarations within this file, so
 	// several of them get distinct node ids - see declareFunc.
 	initOrdinal int
