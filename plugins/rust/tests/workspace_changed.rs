@@ -31,7 +31,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/workspace");
+const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project");
 
 /// A minimal client for the SDK's control-plane wire - just enough framing
 /// to send one notification and one request and read the answers, not a

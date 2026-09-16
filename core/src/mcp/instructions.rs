@@ -480,6 +480,20 @@ results instead of paging.";
         }
     }
 
+    /// The bundled Rust plugin's own `[plugin.capabilities]`, read off
+    /// `plugins/rust/plugin.toml` rather than transcribed - so a later edit
+    /// to that manifest changes what [`rust_only_lists_the_receiver_gap_with_no_semantic_tier_yet`]
+    /// asserts instead of quietly disagreeing with it. Unlike
+    /// [`rust_pre_semantic`] above (a *hypothetical* future manifest, used to
+    /// exercise the multi-language naming branch before GM-290 exists), this
+    /// reads the manifest as GM-286 actually shipped it.
+    fn bundled_rust_capabilities() -> Capabilities {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/rust");
+        crate::daemon::manifest::read_manifest(&dir)
+            .expect("the bundled Rust plugin's manifest must be readable")
+            .capabilities
+    }
+
     fn typescript_present() -> PresentLanguage {
         PresentLanguage {
             language: "typescript".to_string(),
@@ -529,6 +543,32 @@ results instead of paging.";
     #[test]
     fn empty_present_falls_back_to_the_original_string() {
         assert_eq!(build(&[]), ORIGINAL_INSTRUCTIONS, "no index yet must read the same as it always has");
+    }
+
+    /// GM-287's own acceptance criterion: a Rust-only index still lists the
+    /// receiver-call gap, checked against the shipped manifest rather than a
+    /// hand-written capability literal (`bundled_rust_capabilities`'s own
+    /// doc). `plugins/rust/plugin.toml` declares both `receiver_calls` and
+    /// `receiver_calls_structural` as `"unresolved"` - there is no semantic
+    /// tier at all yet (GM-290, R4 of the design doc's rollout), so
+    /// `semantic_pass_done` cannot close the gap either way, unlike Go's
+    /// `go_present`/`bundled_go_capabilities` pair on the sibling release
+    /// branch this module's own git history shows once GM-281/GM-282 land
+    /// here.
+    #[test]
+    fn rust_only_lists_the_receiver_gap_with_no_semantic_tier_yet() {
+        for semantic_pass_done in [false, true] {
+            let rendered = build(&[PresentLanguage {
+                language: "rust".to_string(),
+                capabilities: bundled_rust_capabilities(),
+                semantic_pass_done,
+            }]);
+            assert_eq!(
+                rendered, ORIGINAL_INSTRUCTIONS,
+                "a single gapped language reads as it always has, semantic_pass_done = {semantic_pass_done}"
+            );
+            assert!(rendered.contains("produces no edge by design"));
+        }
     }
 
     #[test]
