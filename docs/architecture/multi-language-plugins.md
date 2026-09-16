@@ -416,7 +416,11 @@ entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: 
 # Absent means the plugin has no language server behind its semantic tier.
 [plugin.semantic]
 command = "rust-analyzer"       # a bare name is a PATH lookup; a relative path
-                                # resolves against this manifest's directory
+                                # resolves against this manifest's directory.
+                                # A plugin may probe a candidate before using
+                                # it - plugins/rust does, because a PATH hit
+                                # can be a rustup proxy for a component that
+                                # is not installed (GM-290)
 args = []
 engine = "rust-analyzer"        # the `engine` label on every edge it emits;
                                 # defaults to the command's file stem
@@ -1300,7 +1304,8 @@ adds a second CI job that runs it with `go` off `PATH`. Two decisions:
   - It answers open sites and `implementation` for traits, and sees macro
     expansions.
   - It needs `rust-analyzer` on `PATH` or through rustup; without it, structural
-    only.
+    only. See "Implementation notes (GM-290)" for why "on `PATH`" is not the
+    same as "works", and what the plugin does about it.
 - **Distribution:** a cargo binary in the same workspace as core, built by the
   existing native release matrix. See "Implementation notes (GM-288)" below
   for how that turned into `scripts/bundle-rust-plugin.sh`, and why it is not
@@ -1397,6 +1402,163 @@ with the `IMPORTS` edges pointing at it, which is why a module consisting
 only of `pub use` has no container node at all (its re-exports still resolve
 - the walk reads a node's own `container` column, not the `containers`
 table).
+
+#### Implementation notes (GM-290): the rust-analyzer engine
+
+R4, built as `plugins/rust/src/semantic.rs` plus two corrections inside the
+SDK's generic bridge. The bridge was written against the specification and a
+scripted fixture; this was the first time it was pointed at a real language
+server, and two of its rules turned out to be wrong rather than incomplete.
+Both were found by tracing rust-analyzer against this plugin's own
+conformance fixture, and both are recorded here because neither is about
+Rust.
+
+**1. "The server is ready when every progress it began has ended" is false
+for any server whose startup is a sequence.** GM-289's readiness rule (rule 1
+of `plugins/sdk/src/lsp/bridge.rs`) watched the set of in-flight work-done
+tokens and called the server ready the moment it emptied. rust-analyzer
+1.97.1 reports its startup as seven *consecutive* tokens - `Fetching`,
+`Building CrateGraph`, `Roots Scanned`, `Building compile-time-deps`,
+`Loading proc-macros`, `cachePriming`, and a `flycheck` - each begun after
+the previous ended. Traced on the fixture: the set first emptied 5.83s in,
+in a 0.28s gap, and the last token did not end until 14.21s. The first
+version of that trace obeyed GM-289's rule exactly, declared readiness at
+3.38s, and got `null` from all nine questions it then asked - including
+`textDocument/implementation` on a trait with two impls in the same file.
+Nothing was recorded as "no target" (an empty answer records no edge), but
+the pass would have been reported *complete*, which is worse: core would
+have set `semanticPassAt`, dropped Rust's receiver gap from the generated
+instructions, and stood behind an index with no semantic layer in it at all.
+
+The fix replaces both of GM-289's readiness rules with one: the server is
+ready when nothing has been in flight for `Budgets::settle` *continuously*.
+A server that reports no progress is quiet from birth and is ready after
+exactly that period, which is what rule 2 said; a server that reports a
+sequence cannot be fooled by a gap shorter than the settle. The period is
+paid once per server rather than once per pass (`LspClient::settle` latches),
+so the per-file pass after an edit does not spend two of its ninety seconds
+proving a point that was settled at start-up. The same quiet test now gates
+the re-ask of an empty answer, for the same reason.
+
+**2. An implementation answer names a site, and a site is not a
+declaration.** GM-289 mapped each `textDocument/implementation` location
+straight through `SdkIndex::node_at` to the node an edge should start at.
+That holds for Go, whose `implementation` on an interface points at the
+concrete type's declaration. rust-analyzer points at the implementing type's
+name *inside the `impl` header*: for `impl Shape for Square` it answers
+`shapes.rs:67:15`, the `Square` on the `impl` line, not the `struct Square`
+declared 38 lines earlier. No plugin emits a node for an `impl` block - it
+declares nothing of its own - so `node_at` found only the enclosing `File`,
+which is never an answer's target, and the whole sweep produced **zero**
+edges.
+
+So a location that does not land on a declaration this index knows now gets
+one more question: `textDocument/definition` at that same position, which is
+the server's own way of being asked "what is this name". Measured:
+`implementation` on `Loud` answers `shapes.rs:81:14` and
+`beta/src/main.rs:30:14`, and `definition` at those two answers
+`shapes.rs:33:11` (`struct Circle`) and `beta/src/main.rs:28:11` (`struct
+Megaphone`) - the declarations the edges have to start at, one of them in
+another crate. The follow-up is asked only when the first answer did not
+resolve (gopls pays nothing), only for a file this index holds, and never
+recursively.
+
+**3. The `Implementation` open site stays unanswered, and the sweep is why
+that is now a decision rather than a gap.** GM-286 records `impl Trait for T`
+where `T` is declared in another file as an open site at `T`'s position, and
+GM-289 observed that this is unanswerable: the wanted edge runs `T → Trait`,
+`definition` there answers "where is `T`" - the wrong end - and the site
+carries no position for the trait at all. Both suggested fixes were weighed
+and neither was taken:
+
+- *Extend the site to carry the trait's position.* It is a wire-visible
+  change to `OpenSite` that every plugin inherits, to describe one of the two
+  shapes this construct has - and it does not cover the other one at all.
+  `impl Loud for Megaphone` in `crates/beta`, where the trait arrives through
+  `use alpha::prelude::*`, produces no open site of any kind: the extractor
+  resolves a bare *type* name that is neither declared nor imported by item
+  to `Bound::Nothing`, deliberately, so that `Vec` and `String` do not swamp
+  the bridge. A richer site would leave that case exactly where it was.
+- *Rely on the trait-node sweep.* Taken. Asking `implementation` on the
+  trait reconstructs both shapes from the other end, including the one no
+  site exists for, and it needs nothing new on the wire - only correction 2
+  above, which every language on the bridge wanted anyway. The sweep's edges
+  are remembered against the *trait's* file for retraction, because a pass
+  over some implementor's file has no idea the sweep ever happened.
+
+The cost is that `implementation_kinds` must be non-empty for a language to
+get implementation answers at all, and that a trait outside the project is
+never swept - which is correct, since its implementors' edges would point at
+a declaration the index does not hold.
+
+**4. A `rust-analyzer` on `PATH` is not evidence of a rust-analyzer.**
+`~/.cargo/bin/rust-analyzer` is a rustup *proxy*: a symlink to `rustup` that
+exists for every binary rustup knows how to forward, installed or not. On the
+machine this was built on, `which rust-analyzer` answered
+`/Users/…/.cargo/bin/rust-analyzer` while `rust-analyzer --version` exited 1
+with "Unknown binary 'rust-analyzer' in official toolchain" and `rustup which
+rust-analyzer` failed too. Handed to the bridge, that is a server which
+starts and immediately dies - not `ErrorKind::NotFound`, so the bridge's
+permanent degradation never fires and the plugin re-spawns the proxy once per
+pass until `MAX_SERVER_STARTS` stops it four starts later.
+
+So `plugins/rust/src/semantic.rs` resolves *and probes*: the manifest's
+command (a bare name, so the OS does the `PATH` lookup), then `rustup which`,
+each accepted only if `--version` exits 0. One spawn per plugin process, and
+the version it prints goes in the log line. Nothing usable is a factory
+error, which the SDK reports exactly once and turns into an empty,
+*incomplete* diff for the rest of the process's life - "log once and an empty
+diff", with `semanticPassAt` left unset so the receiver gap stays listed
+until the toolchain is actually there.
+
+**5. Exactly one `initializationOption`, and the one that was nearly two is
+the more interesting.** `checkOnSave = false` is uncontroversial: it runs
+`cargo check` for diagnostics this bridge never reads, and it *builds*, which
+wrote a `target/` directory and a `Cargo.lock` into the fixture the first
+time this tier was pointed at one.
+
+`cachePriming.enable = false` was set too, measured as a win, and then taken
+back out - which is worth recording because the first measurement was of the
+wrong thing. Time-to-quiet with priming off is shorter, and on the fixture
+the whole pass is faster: ~7s against ~9.5-13s, four samples each at load
+average 4. But priming is the work that decides whether the *first query* is
+milliseconds or minutes, and turning it off does not remove that work; it
+moves it out of start-up, where `Budgets::readiness` allows ten minutes, and
+into the first `textDocument/definition`, where `Budgets::request` allows ten
+seconds and whose own doc says it assumes "a server that has finished
+indexing". At load average 693 that is exactly what happened: eight questions
+blew the per-request budget and the pass came back incomplete. It is
+correction 1's bug entering through a second door - a server made to look
+ready before it can answer - so the setting is gone and the three-second
+difference is paid.
+
+`procMacro` and `cargo.buildScripts` are deliberately left on for a different
+reason: they are slower and hungrier than either of the above, and unlike
+either they change which edges *exist*.
+
+**The open question above - how long the receiver gap stays listed after
+structural readiness - is answered for a small workspace and still open for a
+large one.** `meta.bulkIndexedAt` is recorded before the pass runs, by
+design, so the gap's duration is exactly the semantic pass's own wall clock.
+Measured with a real `g-mesh init` over this plugin's fixture, three runs at
+load average 3.9-4.7, reading core's own two timestamps out of the index
+rather than timing from outside: `bulkIndexedAt` to `semanticPassAt` is
+**9-10s** (the columns are second-resolution), against the plugin's own
+report of 9.47-9.54s for the pass and 16.8-17.1s for the whole `init`. Peak
+RSS of the plugin's process tree over the same work is **535-555 MiB**,
+essentially all of it rust-analyzer - which is what `[plugin] memoryLimitMb`
+would be sampling, and a useful floor to know: a limit below about 600 MiB
+would suspend this language on any project at all.
+
+Almost all of those ten seconds are rust-analyzer reaching quiet; the
+questions themselves are milliseconds (a warm `definition` measured 6ms, and
+the per-file pass that follows an edit 3.4-77.9ms). The number does not
+extrapolate - a two-crate workspace with no dependencies is the best case,
+and cold-load time is dominated by `cargo metadata` and sysroot discovery
+over the *dependency* graph. "Many minutes on a large workspace, with the
+structural index serving meanwhile" stands as the expectation, and measuring
+it on the Rust bench corpus is still R4 bench work rather than something this
+task settled.
 
 ### MCP instructions
 
@@ -1684,11 +1846,20 @@ moving target under development).
 - **Memory ceiling:** decided. `[plugin] memoryLimitMb`, off by default (see
   Interfaces). Still open: whether the sampling interval (the idle-check timer) is
   fine-grained enough to catch a fast rust-analyzer load spike before the OS does.
-  Measure in R4.
-- **rust-analyzer cold-load time vs `semanticPassAt`.** On a large workspace the
-  receiver gap may stay in the instructions for many minutes after the structural
-  index is ready. That is acceptable under the honest-partial-availability rule, but
-  it should be measured on the Rust corpus in R4.
+  R4 measured the *floor* rather than the spike: the Rust plugin's whole process
+  tree peaks at 535-555 MiB on a two-crate fixture, essentially all of it
+  rust-analyzer, so a limit below about 600 MiB suspends this language on any
+  project at all. Whether the sampler catches a spike on a large workspace is
+  still bench work.
+- **rust-analyzer cold-load time vs `semanticPassAt`.** Measured for a small
+  workspace in R4 and still open for a large one. Because `meta.bulkIndexedAt` is
+  recorded before the pass, the gap's duration *is* the pass's wall clock: 9-10s on
+  the Rust plugin's own two-crate fixture, almost all of it rust-analyzer reaching
+  quiet rather than answering. That does not extrapolate - cold-load time is
+  dominated by `cargo metadata` and sysroot discovery over the dependency graph,
+  which the fixture does not have - so "many minutes on a large workspace" stands
+  as the expectation, and measuring it on the Rust bench corpus is still R4 bench
+  work. See "Implementation notes (GM-290)".
 - **go.work and multi-module repos.** Container keys are import paths, so they
   compose. go/packages loading across modules needs checking on a real multi-module
   corpus, and no candidate above is one.
