@@ -878,6 +878,132 @@ the full Go expectations file, and the entries there now exist only to prove
 GM-280's own end-to-end claim (that a container-scoped placeholder is an
 address core resolves) with a comparison that was shown capable of failing.
 
+#### Implementation notes (GM-281)
+
+GM-281 added the `go/types` tier (`plugins/go/semantic.go`): every open site
+resolved to an exact declaration, `types.Implements` over the project's own
+interfaces, the lazy-engine marker, and the `receiver_calls = "resolved"`
+flip in `plugin.toml`. Eight decisions this task had to settle rather than
+infer:
+
+1. **One `packages.Load` per module root, not one per project.** `./...`
+   from the project root lists the packages of *one* module; a nested
+   `go.mod` is outside it, so `go list ./nested/...` from the root fails
+   there, and a `go.work` only rescues that when the workspace happens to
+   name the module. So the whole-project pass runs `./...` once per module
+   root found by `workspace.go`, with the loader's working directory set to
+   that module - the one form that behaves identically with and without a
+   workspace file, and exactly one invocation for the ordinary
+   single-module repository. A per-file pass instead asks for
+   `file=<abs path>`, `go list`'s own spelling of "the package containing
+   this file", which is what "re-check that file's package" means
+   operationally.
+2. **`NeedDeps` deliberately absent.** The load mode is `packages.LoadSyntax`'s
+   (`NeedName|NeedFiles|NeedCompiledGoFiles|NeedImports|NeedTypes|NeedSyntax|
+   NeedTypesInfo`). With `NeedDeps`, every transitive dependency - the whole
+   standard library included - is type-checked *from source* to build syntax
+   trees this pass never reads: the only thing it ever asks about a
+   dependency's symbol is its package path and name, and export data carries
+   both. Without it, dependencies arrive as compiled export data through the
+   go build cache, which is also the only "reusing loaded dependencies" that
+   is actually available - `go/packages` has no incremental API, so there is
+   no in-process package graph to reuse. Measured on `junegunn/fzf`
+   (89 `.go` files, 6 packages): 17.9s and 304MB peak RSS with a cold build
+   cache, 2.3-2.7s and 91-95MB warm; on `spf13/cobra` (36 files, 2 packages)
+   8.7s/136MB cold and 1.5s/45MB warm.
+3. **`Tests: true`.** Without it `go/packages` skips every `_test.go` file,
+   which would leave the receiver calls in a repository's test suite
+   permanently open while the structural tier indexed them - the silent-gap
+   failure this project treats as worst. The cost is that a package is
+   loaded in up to four variants; the pass deduplicates by node and edge id,
+   and named types by their `*types.TypeName`, so a declaration reached
+   through two variants collapses to one answer.
+4. **Every answer is a `qualifiedName`-keyed placeholder, never a computed
+   node id.** This process knows the declaring *file*, so it could compute
+   the target's node id and emit a direct, `resolved: true` edge. It does
+   not know that core has that file *indexed* (gitignored, under an excluded
+   directory, not yet walked), and an edge onto an id nothing declares is a
+   dangling row no query can see past, whereas a placeholder degrades to
+   "unresolved". The address is `{ container: <import path>, qualifiedName:
+   "Server.Close" }`, and it still gets core's visibility check, so a
+   mistake here cannot link a private symbol from outside its package.
+   Targets outside the project are dropped for the same reason: their
+   packages are not indexed, so the address could only ever go unresolved.
+5. **What each of GM-280's six leftovers became.** Receiver calls, method
+   promotion through embedding and interface dispatch are all one mechanism:
+   `types.Info.Selections[expr].Obj()` is the *declared* method - on the
+   embedded type for a promoted one, on the interface for a call through an
+   interface value - which is precisely the declaration a caller list should
+   point at. A **call through an interface value is attributed to `I.M`**,
+   not to every implementer: which concrete method runs is a run-time
+   question, and `find_implementations` is the hop that answers it, which is
+   why `SUPERTYPE_OF` matters as much as the caller edge. A **mis-guessed
+   import binding name** lands in the same place from the other side: the
+   structural tier saw `that.F()` as a selection, `Selections` has no entry
+   for a qualified identifier, and the fallback to `types.Info.Uses`
+   resolves it exactly. **Dot-imported bare names** needed one extractor
+   change - a file carrying a dot import now records each suppressed bare
+   name as an open site of its own (`openSiteBareName`) instead of silently
+   dropping it - resolved through `Uses` as well. **`pkg.T(x)` conversions**
+   needed the opposite: the structural tier *did* answer them, with a
+   `CALLS` edge core's kind filter will never land on a `Type`, so every
+   `CALLS` edge onto a placeholder is now recorded as a `placeholderCall`
+   and the pass retracts by id exactly the ones whose name turns out not to
+   be a function, re-stating them as the `REFERENCES` edge a conversion
+   actually is. That last one is not hypothetical: 22 such edges on fzf, 6
+   on cobra.
+6. **`types.Implements` over pairs, with a method-name pre-check.** The
+   pairing is quadratic in principle (every project named type against every
+   project interface). A per-type method-name set, compared against the
+   interface's method names before `types.Implements` is called at all,
+   rejects almost every pair before a method set has to be built - which is
+   why it does not show up in the measurement above. Both the value and the
+   pointer method set are tried, because `func (s *Server) Close()` makes
+   `*Server` satisfy the interface while `Server` does not, and the node
+   this index has is `Server`. Four kinds of pair are skipped on purpose and
+   documented in `plugins/go/README.md`: the empty interface (satisfied by
+   everything, useful to nobody), constraint interfaces with a type set (not
+   something a type "implements" in the sense `find_implementations`
+   answers), type aliases (an edge from one would restate what the
+   underlying declaration already says), and generic named types (`Stack[T]`
+   is one node here but a family of types there, so there is no single
+   honest answer to attach).
+7. **The marker is written immediately before the first `packages.Load`,
+   and nothing else in the process imports `golang.org/x/tools`.** GM-279
+   left `capabilities.semantic-engine-lazy` at `SKIP ... not instrumented`
+   because there was no engine to start; it is a `PASS` now. Writing it at
+   the top of `handleSemanticPass` would have been a claim about the request
+   rather than about the engine, and writing it at process start would have
+   made the check pass for a plugin that loads eagerly. The one call site is
+   reachable only from `semanticPass`, so "the engine started" and "a
+   semanticPass arrived" cannot come apart by construction rather than by
+   discipline.
+8. **Retraction is per file and edges only.** A re-pass of a file deletes
+   the semantic edge ids this process emitted for it last time and did not
+   produce again - a renamed method, a type that stopped satisfying an
+   interface - so a long-lived daemon does not accumulate edges out of
+   declarations that have moved. Placeholder *nodes* are never deleted: one
+   with no edges left on it is inert, while `deleteNodeIds` is held to
+   "every id was emitted before" by the conformance kit and is not worth the
+   bookkeeping for rows nothing reads. The state lives in the process, so a
+   restart forgets it, the same honest limitation the structural per-file
+   cache already has.
+
+The cost of the dependency, since GM-279's zero-requirement property is
+gone: `golang.org/x/tools v0.50.0` plus the two modules it brings with it,
+`golang.org/x/mod` and `golang.org/x/sync` - 8 `go.sum` lines, 13MB
+extracted in the module cache (12MB of it `x/tools`), the plugin binary
+5,778,352 -> 8,822,032 bytes (+3.0MB, +53%), and a from-scratch `go build`
+after `go clean -cache` 15.4s -> 21.8s real / 32.0s -> 44.7s user (measured
+back to back on one heavily loaded machine, so the ratio is the number to
+read, not the seconds). Nothing is vendored. The **structural** tier still
+has no dependency of its own, and `GOPROXY=off go build` succeeds and its
+`--bulk-index` walk produces byte-identical output once `go mod download`
+has run once - which is what keeps this doc's "Structural tiers may not
+[depend on a toolchain]" constraint true: the toolchain requirement is the
+semantic tier's alone, and without it the plugin logs one line and answers
+every `semanticPass` with an empty diff.
+
 ### Rust plugin (`plugins/rust`, on the SDK)
 
 - **Structure:** tree-sitter-rust.
@@ -921,8 +1047,15 @@ from the languages present in the index and their `receiver_calls` state:
 
 - **No present language lists the gap:** the sentence is omitted.
 - **Some languages list it:** "(1) a method call through a variable receiver
-  (`x.foo()`) produces no edge **in TypeScript and Rust** …". Rust is listed until
-  its semantic pass has completed (`language_state.semanticPassAt`).
+  (`x.foo()`) produces no edge **in go, rust and typescript** …". Go and Rust are
+  each listed until *their own* semantic pass has completed
+  (`language_state.semanticPassAt`) - GM-281 shipped Go's with
+  `receiver_calls = "resolved"` and `receiver_calls_structural = "unresolved"`,
+  so a Go-only project reads the original two-gap sentence between the cold-start
+  walk and the first completed pass (one present language is never named), and
+  the "One real gap" wording - clause (1) gone entirely - afterwards. A project
+  with no Go toolchain never reaches that second state, which is exactly right:
+  the edges are not in its index.
 
 The builder asserts the byte budget in a unit test over the worst case: every
 bundled language listed. The wording is deliberately not fixed here. GM-262 carries
