@@ -84,13 +84,17 @@ It is found in three places, in order, and each is *probed* before it is used:
 `pyright --version` - the CLI twin from the same npm package - because
 `pyright-langserver --version` has no such flag and exits 1.
 
-The `npx` branch is last because it is the only one that can **reach the
-network**: on a machine with no pyright anywhere it fetches the package into
-npm's `_npx` cache, which cost 4.94s measured here and costs more on a slow
-link. It is bounded rather than trusted (60s, then the child is killed), and
-the log line always names which of the three branches answered, so a pass that
-was slower than expected says why. Install pyright locally or globally if you
-would rather it never happened.
+The `npx` branch is last, and there are two reasons rather than one. It is the
+only one that can **reach the network**: on a machine with no pyright anywhere
+it fetches the package into npm's `_npx` cache, which cost 4.94s measured here
+and costs more on a slow link. It is bounded rather than trusted (60s, then the
+child is killed). And it is measurably more expensive even once cached: on the
+conformance fixture the whole-project pass goes from ~3.4s to 4.13s, and peak
+process-tree RSS from 131 MiB to **204 MiB**, because `npm` stays resident
+beside the server it launched - 74 MiB of launcher, charged to this plugin by
+`[plugin] memoryLimitMb` like everything else in its tree. Install pyright in
+the project or globally and the branch is never reached; the log line always
+names which of the three answered.
 
 **No pyright at all is not an error**: the plugin logs one line, answers every
 pass with an empty *incomplete* diff, and the structural index is untouched.

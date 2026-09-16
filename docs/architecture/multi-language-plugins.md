@@ -1994,6 +1994,17 @@ change in this machine's load to show. The per-file pass that follows an edit is
 33-36ms, because `LspClient::settle` latches: a server that has proved its
 shape once is never made to prove it again.
 
+**The `npx` branch costs 74 MiB that nothing gets to use.** Same fixture, same
+three-rep harness, with the project's `node_modules` removed and nothing on
+`PATH`, so branch 3 is what answered (the log line says so, which is what it is
+for): the pass takes 4.13s instead of ~3.4s, the gap is 6s instead of 3-4s, and
+peak tree RSS is **204.1 MiB instead of 130.8** - `npm` itself stays resident
+beside the server it launched, at 73.7 MiB, for the whole life of the pass. It
+is a *parent* of the node process, so `process_tree_rss_mb` charges the plugin
+for it and `[plugin] memoryLimitMb` would too. That is a 56% memory surcharge
+for a launcher that has finished launching, and it is the strongest argument
+for the ordering: `npx` works, and it should be the branch nobody reaches.
+
 None of this extrapolates. Twelve files with no third-party dependencies is the
 best case; pyright's cold load on a real project is dominated by resolving
 imports against a venv's `site-packages` and by the typeshed it bundles, which
