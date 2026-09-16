@@ -1270,6 +1270,57 @@ only of `pub use` has no container node at all (its re-exports still resolve
 - the walk reads a node's own `container` column, not the `containers`
 table).
 
+### Python plugin (`plugins/python`, on the SDK)
+
+Language #3, and the first one built entirely from the paper stress test's own
+row rather than from a design section written in advance - which is the point of
+the row existing. Same shape as `plugins/rust`: a Rust crate on `plugins/sdk`,
+a `ProjectContext` computed once per `load_project`, an extractor that asks it
+one question per file.
+
+#### Implementation notes (GM-295)
+
+`plugins/python/src/project/` is the project model - roots, container keys, and
+nothing else; its module doc argues all seven decisions in full. Four are worth
+lifting out because a later language will meet them again:
+
+1. **No source is parsed to build the package tree.** Rust needs a scanner
+   because `mod foo;` is a *statement*; Python's module structure is a pure
+   function of the path on disk, so the SDK's `walk_project` output is the whole
+   input. Language #4 should check which of the two it is before writing a
+   scanner: Java and Kotlin are Python-shaped, C# and C++ are not.
+2. **A module is a container *and* a member of its parent.** `from pkg.sub.mod
+   import f` needs `pkg.sub.mod` to be a container; `from pkg.sub import mod`
+   needs `mod` to be a *member* of `pkg.sub`. Python has no `mod child;`
+   statement to hang the second on, so `ContainerInfo::Module` carries both the
+   own key and the `parent`/`name` pair, and GM-296 must emit the extra
+   self-announcement node. This is also what keeps `parent_chain` gap-free
+   across a PEP 420 namespace package: the namespace directory gets a member the
+   moment anything directly inside it announces itself, with no
+   namespace-specific machinery at all. The one residual gap - an *intermediate*
+   namespace package with no direct content of its own - is accepted, not
+   hidden: it is the missing-edge side of the rule, and manufacturing a
+   canonical announcer would couple a file to a container its own text says
+   nothing about.
+3. **Roots are three sources tried in order, first one wins outright**:
+   `pyproject.toml` hints (`[tool.poetry] packages[].from`, `[tool.setuptools]
+   package-dir[""]`), then a `src/` that actually holds Python, then the project
+   root as a fallback. A project that declares its layout is never
+   second-guessed by what is on disk, so a stray `src/` beside a declared root
+   contributes orphans rather than a phantom root - pinned by
+   `a_declared_root_is_not_joined_by_a_stray_src_directory`, because the doc
+   first promised the opposite and the failure is silent.
+4. **`.pyi` stubs are indexed but never announce themselves.** A stub computes
+   the *same* key its sibling module would, which is what `DECLARATION_OF` will
+   need later; letting it also emit the Decision-2 membership node would put two
+   files' declarations under one container and make `from pkg import mod`
+   ambiguous - a wrong answer where skipping is merely a missing one.
+
+`plugins/python/src/extractor/` is a File-only stub until GM-296. The
+conformance kit already passes on it (13 passed, 2 skipped: no declarations yet
+to edit, and `semantic_pass = false`), which is the same pre-extractor state
+`plugins/rust` documented before GM-286.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated

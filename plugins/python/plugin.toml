@@ -1,0 +1,74 @@
+# Bundled Python plugin manifest. See docs/architecture/multi-language-plugins.md
+# ("Interfaces > `plugin.toml` additions") for the schema this file follows,
+# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# rules it must satisfy. `language` must equal this directory's own name
+# ("python"), the same rule every other bundled plugin's manifest follows.
+#
+# `command` is a dev-time path into the workspace's own `target/` (relative
+# to this manifest's directory, `plugins/python/`), not a packaged layout -
+# the same dev-checkout contract `plugins/rust/plugin.toml` documents for
+# itself, and for the same reason: this plugin is an ordinary member of the
+# repository's cargo workspace, built by `cargo build` like `core` itself,
+# so it needs no `core/build.rs` step the way the Node and Go plugins do.
+# `g-mesh plugins check plugins/python --fixture <dir>` run from the
+# repository root, after `cargo build -p g-mesh-plugin-python`, is what this
+# path is for today. A release archive does not reuse this file - see
+# `scripts/bundle-rust-plugin.sh`'s own header for why, and expect a
+# `scripts/bundle-python-plugin.sh` to do the same one-line `command`
+# rewrite when this plugin is distributed.
+
+[plugin]
+language = "python"
+protocol_version = 2
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "../../target/debug/g-mesh-plugin-python"
+
+[plugin.languages]
+# `.pyi` stubs are claimed too, so an edit to one reaches this plugin and
+# reindexes - see `project`'s module doc ("Decision 6: `.pyi` stubs") for
+# what the project model does with a stub once it is walked: it is indexed
+# (so the plugin never silently drops a file it claims) but never folded into
+# its sibling module's container, because 3.0.0 deliberately did not build
+# `DECLARATION_OF` and a stub's declarations merged into the same container
+# as its `.py` twin would be an unresolvable, silently wrong ambiguity rather
+# than an honestly missing edge.
+extensions = [".py", ".pyi"]
+
+[plugin.capabilities]
+# No semantic tier yet (this task is the project model; the tree-sitter
+# structural extractor is GM-296; a pyright/pyright-langserver tier over the
+# SDK's LspBridge is future work the design doc's paper stress test names but
+# does not schedule). `false` means core never sends `semanticPass` and never
+# requires an answer to one.
+semantic_pass = false
+# Receiver calls and, more generally, Python's dynamic dispatch are an open
+# site with no structural answer - the design doc's own paper stress test
+# lists this as a documented gap even with a semantic tier ("Python's dynamic
+# dispatch, which stays a documented gap even with pyright"). Both fields
+# stay "unresolved" until a semantic release exists to flip either one.
+receiver_calls = "unresolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+# Any of these moving can move where this project's roots are (`pyproject.toml`
+# packaging hints) or, for `setup.cfg`/`setup.py`, describe packaging this
+# plugin does not parse but still cannot rule out having moved something -
+# see `project`'s module doc ("Decision 4: roots") for why only
+# `pyproject.toml`'s own content is actually read. Any of the three still
+# triggers the same per-language reindex `workspaceChanged` drives, because a
+# plugin that goes stale on an unread file is worse than one that reindexes
+# on a no-op edit.
+watch_files = ["pyproject.toml", "setup.cfg", "setup.py"]
+# A miss-path lookup's container-entry-point name: `__init__` is a package's
+# own file, matched as a bare stem under either extension this plugin claims
+# (`__init__.py`, `__init__.pyi`) - `graph::queries::entry_point_rank_expr`'s
+# own "a bare entry point matches the stem under any extension" rule, the
+# same one `typescript`'s `"index"` relies on.
+entry_points = ["__init__"]
+# Never real source, and excluded from the walk the same way `node_modules`/
+# `target` are for the other two SDK plugins - see `project`'s module doc for
+# why these exact six names and why this list is duplicated (not shared as
+# code) between this file and `project::EXCLUDE_DIRS`.
+exclude_dirs = [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages"]
