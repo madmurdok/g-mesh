@@ -410,12 +410,28 @@ watch_files = ["go.mod", "go.work"]
 exclude_dirs = ["vendor", "testdata"]
 # File or directory names a miss-path lookup treats as a container's entry point.
 entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: ["index"]
+
+# GM-289, read by the SDK's LSP bridge and by nothing in core - see
+# "Implementation notes (GM-289)" for why core deliberately does not parse it.
+# Absent means the plugin has no language server behind its semantic tier.
+[plugin.semantic]
+command = "rust-analyzer"       # a bare name is a PATH lookup; a relative path
+                                # resolves against this manifest's directory
+args = []
+engine = "rust-analyzer"        # the `engine` label on every edge it emits;
+                                # defaults to the command's file stem
+implementation_kinds = ["trait"]  # nativeKinds asked textDocument/implementation
+[plugin.semantic.env]           # added to the inherited environment, never an
+                                # allowlist - a server has to find its toolchain
+RA_LOG = "error"
+[plugin.semantic.initialization_options]   # passed to `initialize` verbatim
+cachePriming = { enable = false }
 ```
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest
 is already the startup-time source of truth. Validation follows `read_manifest`'s
-hard-failure rule.
+hard-failure rule - which is exactly why `[plugin.semantic]` is not part of it.
 
 ### Wire v2 (`protocol::types`, `CURRENT_PROTOCOL_VERSION = 2`)
 
@@ -589,7 +605,8 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
   - id hashing;
   - placeholder builders;
   - a `#[test]` helper that runs `g-mesh plugin check` against a fixture.
-- **`LspBridge: SemanticEngine`:**
+- **`LspBridge: SemanticEngine`** (built in GM-289; see "Implementation notes
+  (GM-289)" below for the seven decisions this sketch left open)**:**
   - spawns the configured server (command from the manifest's
     `[plugin.semantic] command`);
   - runs `initialize`, `didOpen`/`didChange` from the SDK's file cache;
@@ -693,6 +710,117 @@ The toy plugin the SDK's own conformance test drives (`plugins/sdk/toy/`) is a
 line-oriented language with five line shapes. It is built by `cargo build` and
 shipped by nothing: no `plugin.toml` of its own exists outside the scratch
 directory one check writes.
+
+#### Implementation notes (GM-289): the LSP bridge
+
+Built as `plugins/sdk/src/lsp/` (`lsp::LspBridge`), with every decision argued
+in the module it belongs to. Recorded here are the seven the sketch above left
+open, plus the two places it turned out to be *incomplete* rather than merely
+unspecified.
+
+1. **`[plugin.semantic]` lives in `plugin.toml` and core never reads it**
+   (`lsp::config`). The section carries `command`, `args`, `env`, `engine` (the
+   edge label), `implementation_kinds` and a free-form
+   `initialization_options` table. Core's `daemon::manifest` is **unchanged**:
+   it would do nothing with any of these (it never spawns the server, and the
+   memory limit already counts it by sampling the plugin's process *tree*), and
+   a field core parses is a field core hard-fails on - so a typo in a server
+   command would have stopped the plugin being discovered at all, taking its
+   structural tier down to protect a string only the plugin reads. The SDK
+   already re-reads its own manifest for the walk, and reads three more keys
+   out of the same file through the same search order. The env table *adds*
+   variables rather than allowlisting them: a language server is a program that
+   finds a toolchain (`PATH`, `CARGO_HOME`, `GOMODCACHE`, `JAVA_HOME`, …), and
+   an allowlist written by someone who is not that language's maintainer fails
+   silently - the server starts, finds nothing, and answers nothing.
+2. **No LSP crate** (`lsp::client`). The bridge sends six requests and four
+   notifications and reads a URI and two integers out of the replies.
+   `lsp-types` is the whole specification as Rust types (and pins a protocol
+   version); `lsp-server`/`tower-lsp` bring crossbeam or tokio. The SDK is what
+   languages #3-#7 inherit, so a dependency here is paid seven times and
+   removed never. The framing is shared with the control plane
+   (`plugins/sdk/src/framing.rs`), which is one implementation of the byte
+   format rather than two.
+3. **Columns are converted, in both directions** (`lsp::position`). The wire
+   counts Unicode scalar values; LSP counts UTF-16 code units unless the
+   negotiation says otherwise. The bridge offers `utf-32, utf-16, utf-8` in
+   `initialize` and honours what the server picks, converting against the text
+   the SDK's index holds - the same bytes the server was sent in `didOpen`,
+   which is the only reason a conversion computed on this side is true on the
+   other. Both directions are load-bearing and both are tested with a
+   non-ASCII fixture line: dropping either one makes
+   `tests/lsp_bridge.rs`'s definition test emit nothing at all.
+4. **Readiness has a definition for servers that report none.** All begun
+   `$/progress` ended → ready; no progress begun within a two-second settle →
+   ready (a server that answers immediately is not penalised beyond that,
+   once per server rather than once per pass); neither within the readiness
+   budget → the pass asks nothing and reports itself incomplete, so no site is
+   ever recorded as "no target" on the strength of a cold server's silence.
+   Readiness is not only a startup condition: an empty answer that arrives
+   while a progress is in flight is deferred until that progress ends and asked
+   once more, rather than believed or re-asked in a spin.
+5. **Retraction has two rules and one deliberate refusal.** The bridge
+   withdraws its own earlier answers for a file it has finished again and not
+   re-produced, and it withdraws a syntactic edge an answer contradicts - but
+   only when the extractor said which edge that is. That is the new
+   `OpenSite::replaces` field: `from_id` plus `edge_kind` does *not* name an
+   edge (one function calling two same-named methods through different
+   receivers produces two sites with an identical pair), so retracting on that
+   basis would delete correct edges to repair ones that were never wrong. Only
+   the extractor knows which edge it wrote for which site. `plugins/rust` sets
+   it to `None` everywhere, correctly: its open sites are sites it emitted no
+   edge for. The shape that needs it is Go's `placeholderCall`.
+6. **Budgets** (`lsp::Budgets`): a 10s per-request timeout, 20,000 sites per
+   pass, 8 questions in flight, and a whole-pass budget of
+   `max(15 min, 8s × files)` (90s for a per-file pass). Each is inside the
+   limit core kills the plugin at - `max(20 min, 10s × files)` and a flat 120s
+   (`daemon::plugin::RoundTripTimeouts`) - because a bridge that runs to
+   *core's* limit is killed rather than reporting anything, and loses the
+   answers it had already built. A unit test asserts the containment at
+   several project sizes so the two cannot drift apart silently.
+7. **An incomplete pass is a diff plus a flag, not an error.**
+   `FileChangeResponse` gains `incomplete` (absent means `false`, so every
+   plugin written before this keeps answering unchanged), and
+   `watcher::apply::apply_semantic_pass` commits the diff and *then* fails the
+   whole-project pass, which is exactly what leaves
+   `language_state.semanticPassAt` unset for a retry on the next daemon start.
+   A JSON-RPC error was the alternative and is worse: it carries no diff, so
+   reporting that the last hundred sites are missing would throw away the nine
+   thousand the pass did resolve. The SDK's own half is
+   `SemanticAnswer { diff, complete }` (`semantic.rs`) - and the flag is only
+   put on the wire for a *whole-project* pass, because a per-file one has no
+   completion record to protect and the only thing the flag could do there is
+   print a line per keystroke-save, which is the noise the design's "log once"
+   rule exists to prevent.
+
+Two things the sketch above did not say, found while building it:
+
+- **An `Implementation` open site cannot be answered by this bridge, and that
+  is a gap in the *site*, not in the engine.** `plugins/rust` records one for
+  `impl Trait for T` where `T` is declared in another file, at the position of
+  `T` - the subtype - while the edge it wants runs from `T` to the trait.
+  `definition` there answers "where is T" (the wrong end) and `implementation`
+  answers "what implements T" (a different question). The same fact is
+  reachable from the other end, by asking `implementation` on the trait's own
+  node, which is what `implementation_kinds` drives. Closing it properly needs
+  the site to carry the trait as well as the type; until then the bridge counts
+  these sites, logs them and answers nothing, which is honest rather than
+  incomplete-forever.
+- **A request has to land on an identifier.** A node's range starts at the
+  whole declaration (`pub trait Foo` starts at `pub`), and a server asked there
+  resolves a keyword. The bridge aims at the first occurrence of the node's own
+  name inside its range - a heuristic, but a language-agnostic one, with the
+  range's start as the fallback.
+
+The fixture is a real process: `plugins/sdk/fake-lsp/` is a language server
+whose whole behaviour is a JSON script the test writes (readiness mode,
+per-position answers, delays, a crash after *n* requests, silence from the
+*n*th). A mocked client would have tested the easy half and skipped the
+transport, and "the plugin survives its server dying" cannot be faked at all -
+it is a statement about a process. Fourteen integration tests drive it,
+including the readiness gate (which fails, as it must, when the gate is
+removed), both column conversions, the implementation mapping, a request
+timeout, and a crash mid-pass after which the bridge starts a fresh server.
 
 ### Go plugin (`plugins/go`)
 

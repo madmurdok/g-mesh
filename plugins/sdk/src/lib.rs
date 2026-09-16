@@ -17,6 +17,8 @@
 //! - the open-site store ([`SdkIndex`]) a semantic tier reads;
 //! - starting the semantic engine lazily, on the first `semanticPass` and
 //!   never before, with the conformance kit's marker written when it does;
+//! - a language-agnostic LSP bridge ([`lsp::LspBridge`]) for the languages
+//!   whose semantic tier is a language server;
 //! - `workspaceChanged` handling: the project model is rebuilt, nothing else.
 //!
 //! # The shape of a plugin
@@ -71,9 +73,11 @@
 #![deny(missing_docs)]
 
 mod diff;
+mod framing;
 mod graph;
 pub mod ids;
 mod index;
+pub mod lsp;
 mod manifest;
 mod path;
 mod run;
@@ -88,7 +92,7 @@ pub use manifest::{PluginSpec, ResolvedSpec, MANIFEST_PATH_ENV};
 pub use path::RelPath;
 pub use run::run;
 pub use semantic::{
-    write_semantic_engine_marker, SemanticEngine, SemanticEngineFactory, MARKER_DIR_ENV,
+    write_semantic_engine_marker, SemanticAnswer, SemanticEngine, SemanticEngineFactory, MARKER_DIR_ENV,
     SEMANTIC_ENGINE_MARKER,
 };
 pub use walk::{walk_project, BASELINE_EXCLUDED_DIRS};

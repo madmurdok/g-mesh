@@ -46,7 +46,7 @@
 //! would otherwise say `SKIP`, and a regression in some later language's
 //! plugin is a failing check rather than a check that never ran.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use g_mesh_wire::FileChangeDiff;
@@ -67,13 +67,59 @@ pub const MARKER_DIR_ENV: &str = "G_MESH_PLUGIN_CHECK_MARKER_DIR";
 /// `cli::plugin_check::session::SEMANTIC_ENGINE_MARKER`.
 pub const SEMANTIC_ENGINE_MARKER: &str = "semantic-engine-started";
 
+/// One semantic pass's answer: the diff, and whether the pass actually
+/// covered what it was asked about.
+///
+/// # Why completeness is a separate field and not an `Err`
+///
+/// The two are different facts and core does different things with them. A
+/// diff is committed; completeness decides whether
+/// `language_state.semanticPassAt` is recorded
+/// (`core::daemon::semantic`), which is what the MCP instructions read to
+/// decide whether to keep listing that language's receiver-call gap. A pass
+/// that answered nine thousand sites and ran out of budget before the last
+/// hundred has *both* things to say, and an `Err` can only say the second:
+/// core drops the diff of a failing pass entirely, so nine thousand real
+/// upgrades would be thrown away to report that a hundred are missing.
+///
+/// So an incomplete pass still carries its diff, and core applies it and
+/// leaves `semanticPassAt` unset - the next daemon start asks again (the
+/// pass is only ever retried per daemon start, and only while still owed),
+/// re-sends the same content-derived ids, and upserts them in place.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SemanticAnswer {
+    /// What to upsert and retract - see [`SemanticEngine::answer`].
+    pub diff: FileChangeDiff,
+    /// `true` when every question this pass was asked was actually put to the
+    /// engine and answered (or answered "nothing there", which is an answer).
+    /// `false` when a budget ran out, a server died, or the engine never
+    /// became ready - anything that leaves a question unasked.
+    ///
+    /// Default is `false`, deliberately: a value that has not been thought
+    /// about must not claim completeness. [`SemanticAnswer::complete`] is how
+    /// an engine that always finishes says so.
+    pub complete: bool,
+}
+
+impl SemanticAnswer {
+    /// A pass that covered everything it was asked about.
+    pub fn complete(diff: FileChangeDiff) -> Self {
+        Self { diff, complete: true }
+    }
+
+    /// A pass that did not - the diff is whatever it did manage.
+    pub fn incomplete(diff: FileChangeDiff) -> Self {
+        Self { diff, complete: false }
+    }
+}
+
 /// A plugin's semantic tier: whatever can answer what the structural pass
 /// could only leave open.
 ///
-/// Implemented by an LSP bridge (GM-289), by an in-process type checker, or
-/// by anything else that can turn an [`OpenSite`](crate::OpenSite) into a
-/// target. The SDK owns when it is asked and what happens to the answer; the
-/// engine owns only the answering.
+/// Implemented by an LSP bridge ([`crate::lsp::LspBridge`], GM-289), by an
+/// in-process type checker, or by anything else that can turn an
+/// [`OpenSite`](crate::OpenSite) into a target. The SDK owns when it is asked
+/// and what happens to the answer; the engine owns only the answering.
 pub trait SemanticEngine: Send {
     /// Answers for `files` - **empty means the whole project**, which is the
     /// wire's own convention for the pass that follows the cold-start walk
@@ -88,19 +134,28 @@ pub trait SemanticEngine: Send {
     /// invariant for the structural stream specifically - so an answer may
     /// carry the target node along with the edge.
     ///
-    /// An `Err` is reported and turned into an empty diff, not propagated:
-    /// core drops a failing semantic pass by design, since it is an upgrade
-    /// over a graph that is already committed and serviceable. Answering with
-    /// an empty diff reaches the same outcome without making core parse a
-    /// failure first, and is what a plugin whose engine is simply not
-    /// installed does (no `go` binary, no `rust-analyzer`) - the receiver gap
-    /// stays in the MCP instructions for that language, which is honest.
-    fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<FileChangeDiff>;
+    /// An `Err` is reported and turned into an empty *incomplete* answer, not
+    /// propagated: core drops a failing semantic pass by design, since it is
+    /// an upgrade over a graph that is already committed and serviceable.
+    /// Answering here reaches the same outcome without making core parse a
+    /// failure first. Prefer returning [`SemanticAnswer::incomplete`] with
+    /// whatever was resolved before the trouble over an `Err` that discards
+    /// it; an `Err` is for "this pass produced nothing usable".
+    fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer>;
 }
 
 /// Builds the semantic engine, called at most once and only on the first
 /// `semanticPass` - see this module's doc for why this is a factory.
-pub type SemanticEngineFactory = Box<dyn FnOnce() -> Result<Box<dyn SemanticEngine>> + Send>;
+///
+/// The argument is the project root, absolute, exactly as
+/// [`Extractor::load_project`](crate::Extractor::load_project) is given it.
+/// An engine that drives a language server needs it for `initialize`'s
+/// `rootUri`, and it is the SDK that knows it: core passes the root in argv
+/// and [`run`](crate::run) is what parses argv, so a factory built in a
+/// plugin's `main` would otherwise have to re-derive it by repeating that
+/// parsing rule - the kind of duplication that stays right until the day core
+/// adds an argument.
+pub type SemanticEngineFactory = Box<dyn FnOnce(&Path) -> Result<Box<dyn SemanticEngine>> + Send>;
 
 /// Holds the factory until it is needed, then the engine.
 pub(crate) struct LazyEngine {
@@ -122,23 +177,37 @@ impl LazyEngine {
     }
 
     /// Answers a `semanticPass`, starting the engine if this is the first
-    /// one. Never fails: see [`SemanticEngine::answer`] on why an empty diff
-    /// is the right shape for every failure here.
-    pub(crate) fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> FileChangeDiff {
+    /// one. Never fails: see [`SemanticEngine::answer`] on why an answer is
+    /// the right shape for every failure here.
+    ///
+    /// # What each failure says about completeness
+    ///
+    /// - **No factory at all** - a plugin with no semantic tier, whose
+    ///   manifest should have said `semantic_pass = false` and which core
+    ///   should therefore never have asked. Reported *complete*: there is no
+    ///   engine that could ever make this pass cover more, so leaving the
+    ///   language permanently owed a pass would be a retry loop with no
+    ///   possible end.
+    /// - **The factory failed** - the "semantic engine missing" failure mode
+    ///   (no `rust-analyzer`, no `go` on `PATH`). Reported *incomplete*, which
+    ///   is what keeps `semanticPassAt` unset and the receiver gap listed for
+    ///   that language, exactly as the design doc's failure-mode table
+    ///   specifies. Installing the toolchain and restarting the daemon is then
+    ///   enough to get the pass - a completed-but-empty pass would have
+    ///   recorded "done" and never asked again.
+    /// - **The engine returned `Err`** - it produced nothing usable. Empty
+    ///   diff, incomplete.
+    pub(crate) fn answer(&mut self, files: &[RelPath], index: &SdkIndex, root: &Path) -> SemanticAnswer {
         if self.engine.is_none() && !self.failed {
             let Some(factory) = self.factory.take() else {
-                // No semantic tier at all. The manifest should say
-                // `semantic_pass = false`, in which case core never sends this
-                // - but answering an empty diff costs nothing and is what a
-                // plugin whose manifest overclaims should do.
-                return FileChangeDiff::default();
+                return SemanticAnswer::complete(FileChangeDiff::default());
             };
             // Before the factory runs, not after: the marker records the
             // *attempt* to start. A factory that spawns a server and then
             // fails its handshake has still started a process, and a marker
             // written only on success would hide exactly that.
             write_semantic_engine_marker(&self.language);
-            match factory() {
+            match factory(root) {
                 Ok(engine) => self.engine = Some(engine),
                 Err(err) => {
                     self.failed = true;
@@ -151,15 +220,17 @@ impl LazyEngine {
             }
         }
 
-        let Some(engine) = self.engine.as_mut() else { return FileChangeDiff::default() };
+        let Some(engine) = self.engine.as_mut() else {
+            return SemanticAnswer::incomplete(FileChangeDiff::default());
+        };
         match engine.answer(files, index) {
-            Ok(diff) => diff,
+            Ok(answer) => answer,
             Err(err) => {
                 eprintln!(
-                    "[{}] the semantic pass failed ({err:#}) - answering with an empty diff",
+                    "[{}] the semantic pass failed ({err:#}) - answering with an empty, incomplete diff",
                     self.language
                 );
-                FileChangeDiff::default()
+                SemanticAnswer::incomplete(FileChangeDiff::default())
             }
         }
     }
@@ -219,10 +290,14 @@ mod tests {
     }
 
     impl SemanticEngine for Counting {
-        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<FileChangeDiff> {
+        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<SemanticAnswer> {
             self.answers.fetch_add(1, Ordering::SeqCst);
-            Ok(FileChangeDiff::default())
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
         }
+    }
+
+    fn root() -> &'static Path {
+        Path::new("/nowhere")
     }
 
     /// The whole point of the type: constructing the engine is deferred until
@@ -234,7 +309,7 @@ mod tests {
         let (started, answered) = (Arc::clone(&starts), Arc::clone(&answers));
         let mut lazy = LazyEngine::new(
             "toy",
-            Some(Box::new(move || {
+            Some(Box::new(move |_root| {
                 started.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(Counting { answers: answered }) as Box<dyn SemanticEngine>)
             })),
@@ -243,42 +318,66 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 0, "constructing LazyEngine must start nothing");
         assert!(!lazy.started());
 
-        lazy.answer(&[], &SdkIndex::new());
+        lazy.answer(&[], &SdkIndex::new(), root());
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(answers.load(Ordering::SeqCst), 1);
         assert!(lazy.started());
 
         // And exactly once, however many passes follow.
-        lazy.answer(&[], &SdkIndex::new());
-        lazy.answer(&[RelPath::new("a.toy")], &SdkIndex::new());
+        lazy.answer(&[], &SdkIndex::new(), root());
+        lazy.answer(&[RelPath::new("a.toy")], &SdkIndex::new(), root());
         assert_eq!(starts.load(Ordering::SeqCst), 1, "the engine must be started once, not per pass");
         assert_eq!(answers.load(Ordering::SeqCst), 3);
     }
 
+    /// The factory is handed the project root, so an engine that needs one
+    /// does not have to re-derive it from argv.
+    #[test]
+    fn the_factory_is_given_the_project_root() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        let mut lazy = LazyEngine::new(
+            "toy",
+            Some(Box::new(move |root: &Path| {
+                *recorded.lock().unwrap() = Some(root.to_path_buf());
+                Ok(Box::new(Counting { answers: Arc::new(AtomicUsize::new(0)) }) as Box<dyn SemanticEngine>)
+            })),
+        );
+        lazy.answer(&[], &SdkIndex::new(), Path::new("/projects/thing"));
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(Path::new("/projects/thing")));
+    }
+
+    /// A plugin with no semantic tier at all is *complete*: nothing it could
+    /// be asked again would ever answer more - see [`LazyEngine::answer`].
     #[test]
     fn a_plugin_with_no_engine_answers_empty_and_never_claims_to_have_started_one() {
         let mut lazy = LazyEngine::new("toy", None);
-        let diff = lazy.answer(&[], &SdkIndex::new());
-        assert_eq!(diff, FileChangeDiff::default());
+        let answer = lazy.answer(&[], &SdkIndex::new(), root());
+        assert_eq!(answer.diff, FileChangeDiff::default());
+        assert!(answer.complete, "a plugin that will never have an engine must not stay owed a pass");
         assert!(!lazy.started());
     }
 
     /// An engine that cannot start is reported once and then stays out of the
-    /// way - it must not be retried on every later pass.
+    /// way - it must not be retried on every later pass. The pass is reported
+    /// *incomplete* every time, which is what keeps `semanticPassAt` unset
+    /// and the language's receiver gap listed until the toolchain is there.
     #[test]
     fn a_failed_start_degrades_to_structural_rather_than_retrying_forever() {
         let starts = Arc::new(AtomicUsize::new(0));
         let attempted = Arc::clone(&starts);
         let mut lazy = LazyEngine::new(
             "toy",
-            Some(Box::new(move || {
+            Some(Box::new(move |_root| {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                anyhow::bail!("no rust-analyzer on PATH")
+                anyhow::bail!("no language server on PATH")
             })),
         );
 
         for _ in 0..3 {
-            assert_eq!(lazy.answer(&[], &SdkIndex::new()), FileChangeDiff::default());
+            let answer = lazy.answer(&[], &SdkIndex::new(), root());
+            assert_eq!(answer.diff, FileChangeDiff::default());
+            assert!(!answer.complete, "an engine that never started has not completed a pass");
         }
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(lazy.started(), "a failed start still counts as started - it must not be retried");
@@ -287,15 +386,17 @@ mod tests {
     struct Failing;
 
     impl SemanticEngine for Failing {
-        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<FileChangeDiff> {
+        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<SemanticAnswer> {
             anyhow::bail!("the server timed out")
         }
     }
 
     #[test]
-    fn a_failing_pass_answers_an_empty_diff_rather_than_an_error() {
+    fn a_failing_pass_answers_an_empty_incomplete_diff_rather_than_an_error() {
         let mut lazy =
-            LazyEngine::new("toy", Some(Box::new(|| Ok(Box::new(Failing) as Box<dyn SemanticEngine>))));
-        assert_eq!(lazy.answer(&[], &SdkIndex::new()), FileChangeDiff::default());
+            LazyEngine::new("toy", Some(Box::new(|_root| Ok(Box::new(Failing) as Box<dyn SemanticEngine>))));
+        let answer = lazy.answer(&[], &SdkIndex::new(), root());
+        assert_eq!(answer.diff, FileChangeDiff::default());
+        assert!(!answer.complete);
     }
 }

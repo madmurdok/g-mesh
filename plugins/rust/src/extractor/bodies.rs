@@ -726,6 +726,12 @@ impl Bodies<'_, '_> {
             kind,
             edge_kind,
             from_container: Some(module.key.clone()),
+            // Nothing this tier emitted is being replaced: every open site
+            // here is a site it wrote *no* edge for (see the module doc,
+            // Decision 7), so a semantic answer has nothing to contradict.
+            // The field exists for the other shape - a structural edge
+            // written on a guess - which this extractor does not produce.
+            replaces: None,
         });
     }
 
