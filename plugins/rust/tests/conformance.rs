@@ -67,7 +67,7 @@ fn check() -> PluginCheck {
     PluginCheck::new(
         "rust",
         env!("CARGO_BIN_EXE_g-mesh-plugin-rust"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/workspace"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
     .extensions(&[".rs"])
     .exclude_dirs(&["target"])
@@ -100,8 +100,8 @@ fn the_plugin_passes_every_check_that_applies_to_it() {
 }
 
 /// The acceptance criteria, as assertions against the linked index: see
-/// `conformance/expect.toml`, which says what each one proves and why it is
-/// deliberately a short list.
+/// `conformance/expect.toml`, which says what each one proves - GM-287's
+/// full file, not GM-286's original five-entry floor.
 #[test]
 fn the_linked_index_answers_the_acceptance_criteria() {
     let outcome = check()
@@ -113,16 +113,16 @@ fn the_linked_index_answers_the_acceptance_criteria() {
     // `assert_conformant` fails on a FAIL and says nothing about a SKIP, and
     // the whole expectations section is skipped when the session did not
     // reach a state worth judging. So each entry is asserted to have been
-    // *judged*: `expectations.file` (the file parsed at all) plus the five
-    // acceptance criteria, each reported under its own
-    // `expectations.<kind>[<index>]` id.
+    // *judged*: `expectations.file` (the file parsed at all) plus the eleven
+    // entries `conformance/expect.toml` now carries, each reported under its
+    // own `expectations.<kind>[<index>]` id.
     let judged: Vec<(&str, Verdict)> = outcome
         .outcomes
         .iter()
         .filter(|(id, _)| id.starts_with("expectations."))
         .map(|(id, verdict)| (id.as_str(), *verdict))
         .collect();
-    assert_eq!(judged.len(), 6, "every expectation must be reported:\n{}", outcome.stdout);
+    assert_eq!(judged.len(), 12, "every expectation must be reported:\n{}", outcome.stdout);
     for (id, verdict) in judged {
         assert_eq!(verdict, Verdict::Pass, "{id} was not judged and passed:\n{}", outcome.stdout);
     }

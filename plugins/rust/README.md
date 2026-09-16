@@ -55,7 +55,7 @@ to each trait it implements and from a trait to each of its supertraits.
 These are structural gaps, not bugs. Each is a question only name resolution
 can answer, and each is answered by the rust-analyzer tier (GM-290) once that
 lands. Until then nothing in the index claims otherwise: a missing edge is
-missing, never guessed. `tests/fixtures/workspace/crates/alpha/src/gaps.rs`
+missing, never guessed. `conformance/project/crates/alpha/src/gaps.rs`
 has all three written beside code that has them.
 
 1. **Macro-generated items.** Nothing inside a `macro_rules!` body is parsed,
@@ -103,16 +103,27 @@ Two smaller ones, for completeness:
 cargo test -p g-mesh-plugin-rust      # unit tests, plus the conformance kit
 cargo build -p g-mesh --bin g-mesh    # the kit needs core's binary
 g-mesh plugins check plugins/rust \
-  --fixture plugins/rust/tests/fixtures/workspace \
+  --fixture plugins/rust/conformance/project \
   --expect  plugins/rust/conformance/expect.toml
 ```
 
 `tests/conformance.rs` runs exactly that from `cargo test`, and asserts each
 check's verdict by name so that a check which starts *skipping* fails the
-suite instead of quietly shrinking it.
+suite instead of quietly shrinking it. `conformance/project` is the same
+fixture `tests/workspace_changed.rs` copies to a scratch dir and mutates -
+GM-287 moved it here from `tests/fixtures/workspace` so CI's `plugins/*/
+conformance` loop and `cargo test` share one copy rather than a second,
+divergence-prone one (`plugins/typescript/conformance/`'s own layout,
+GM-277's precedent).
 
-The `--expect` file is deliberately **minimal**: five assertions covering the
-acceptance criteria of GM-286 (a `pub(crate)` item linkable from a sibling
-module and not from another crate, a `pub use` re-export chain, and
-`impl Trait for T` found by `find_implementations`). GM-287 owns the full
-expectations file for this plugin; this one is the floor, not the ceiling.
+The `--expect` file (GM-287) covers every category `g-mesh plugins check
+--expect` can assert at least once: callers (a free function, a
+module-qualified path call, a type-qualified path call paired with the
+equivalent `Self::` call from inside its own impl, a `pub use` re-export
+chain, `pub(crate)` visibility, and the receiver-call gap itself made
+airtight - the same declaration called both a resolving and a non-resolving
+way, so the non-resolving call site's absence from the expected set is a
+real assertion rather than an omission nobody would notice), references,
+`impl Trait for T` via `find_implementations`, imports (a glob and a
+container-scoped named re-export), and definition. GM-286's original five
+acceptance-criteria entries are folded in rather than duplicated.
