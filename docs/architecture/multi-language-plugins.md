@@ -633,8 +633,420 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
   - Per-file pass: re-check the file's package, reusing the loaded dependency
     packages. Dependents' edges into a changed package are refreshed when they are
     next checked, the same staleness TS accepts today.
-- **Distribution:** a static binary per target via `GOOS`/`GOARCH` cross-compile.
-  No native runner and no embedded runtime.
+- **Distribution:** a static binary per target via `GOOS`/`GOARCH` cross-compile,
+  `CGO_ENABLED=0`. No native runner and no embedded runtime - `.github/workflows
+  /release.yml` still builds each target on its own runner (the JS/TS plugin and
+  the Rust binary both need to), but unlike those two, the Go binary could be
+  built for all four targets from any single one of those runners; it stays in
+  the same per-target loop only because that is where `scripts/build-targets.sh`
+  already runs (`scripts/bundle-go-plugin.sh`, called there alongside
+  `scripts/bundle-plugin.sh`). See "Implementation notes (GM-279)" point 6
+  below for the per-target manifest this generates to close the Windows
+  binary-naming gap the dev-checkout build leaves open.
+
+#### Implementation notes (GM-279)
+
+The first Go plugin release is a scaffold: the wire v2 control loop, the
+`--bulk-index` NDJSON stream, the project walk and the id scheme, all proven
+against `g-mesh plugin check` end to end - but the extractor emits `File`
+nodes only, no symbols and no edges. `go/parser` structure (real declarations,
+containers, `DEFINES`/`EXPORTS`) is GM-280; `go/types` semantics (the pass
+this scaffold already answers, honestly, with nothing) is GM-281. Six
+decisions this task had to settle rather than infer, recorded here so GM-280/
+GM-281 do not have to re-derive them:
+
+1. **`semantic_pass = true` from the first release, with no marker written.**
+   The manifest declares the capability now (not once GM-281 lands): a plugin
+   that will grow a real semantic tier should not lock in "core never asks"
+   before that tier exists, and this plugin already answers every
+   `semanticPass` honestly - an empty diff, because there is nothing yet to
+   resolve. The conformance kit's semantic-engine marker
+   (`G_MESH_PLUGIN_CHECK_MARKER_DIR`/`semantic-engine-started`, `session.rs`'s
+   own contract) is deliberately **not** written by this scaffold: there being
+   no engine to start is not the same claim as "the engine started lazily",
+   and writing the marker with nothing behind it would make
+   `capabilities.semantic-engine-lazy` either vacuously pass or fail on a
+   technicality unrelated to laziness. The kit reports this correctly today -
+   `SKIP ... not instrumented` - which is the honest answer until GM-281
+   spawns/loads `go/packages` and writes the marker at that moment, the same
+   way the TS plugin's `semantic.ts` does for `tsserver`.
+2. **Id scheme reproduced field-for-field from `extract.ts`, checked against
+   real TS output.** `nodeIdFor`/`edgeIdFor` in `plugins/go/ids.go` hash the
+   exact same space-joined strings `plugins/typescript/src/extract.ts`'s
+   `nodeIdFor`/`edgeIdFor` do (sha256, hex, first 32 characters). `ids_test.go`
+   asserts against values computed by actually running that TS code
+   (`node -e '...'` with the functions copied in verbatim, Node v20.6.1 - the
+   transcript is in this task's own completion report), not recalled from
+   memory or re-derived independently in Go.
+3. **The walk's `.gitignore` support is hand-rolled, not a dependency.**
+   `plugins/go/ignore.go` translates each pattern to a regexp by hand -
+   literal segments, `*`/`?` within a segment, `**` across segments, a
+   directory-only trailing `/`, an anchoring leading or embedded `/`,
+   negation, later-line-and-later-layer-wins - the same subset
+   `ignorePolicy.ts`'s own `ignore` dependency is exercised for by this
+   repo's fixtures, and the same tier of coverage small Go gitignore
+   libraries offer. Chosen over a dependency so `plugins/go/go.mod` stays at
+   zero requirements for a scaffold whose only job is proving the wire
+   contract; `ignore.go`'s own doc comment has the full trade-off, including
+   the heavier alternative (go-git's `gitignore` sub-package) considered and
+   rejected. Symlink handling (`plugins/go/symlinks.go`) matches
+   `symlinks.ts`'s guard exactly: followed, not skipped, under a guard that
+   refuses a cycle, a second path onto an already-claimed real location, and
+   an escape outside the project root - proven by `walk_test.go`'s own cycle/
+   dangling-link/claimed-twice cases.
+4. **File nodes only, `visibility: "file"` - not `"public"`.** GM-279's own
+   task text said `visibility public` for the File node; this repo's one
+   concrete example of a Go plugin's node
+   (`core/tests/fixtures/valid_v2.ndjson`) uses `"file"`, matching the TS
+   plugin's own convention (`extract.ts`'s `addNode`: a node is file-visible
+   unless something marks it exported, and nothing ever marks the File node
+   itself exported - only what it *defines* can be public). The golden
+   fixture was treated as authoritative over the task's own prose.
+5. **Unknown methods and `workspaceChanged` never crash, mirroring
+   `index.ts`'s own gaps.** A method this plugin does not recognize is
+   logged and dropped, never answered - even when it carried an id - matching
+   `plugins/typescript/src/protocol.ts`'s `parseControlEnvelope` refusing
+   anything outside its four known methods the same way. `workspaceChanged`
+   *is* recognized (the TS plugin predates it and has no workspace files to
+   watch at all), but this scaffold caches nothing at the workspace level -
+   no module/crate map exists yet to invalidate - so it is a no-op beyond a
+   log line. GM-280/GM-281 are expected to give it real work once there is a
+   cached package map to drop.
+6. **Distribution for a dev checkout: a prebuilt binary via `core/build.rs`,
+   not `go run ./...`.** `go run` recompiles the whole module on every single
+   spawn - and the daemon spawns this plugin repeatedly, including one
+   one-shot process per `--bulk-index` call - so it would mean a full compiler
+   invocation on the hot path of a reindex. `core/build.rs` now builds
+   `plugins/go` into `plugins/go/g-mesh-plugin-go` the same best-effort way it
+   already builds the TS plugin's `dist/` (a `cargo:warning`, not a build
+   failure, when no Go toolchain is on `PATH`), so `cargo build`/`cargo
+   test`/`g-mesh plugins check`/`g-mesh plugins list` all work from a fresh
+   checkout with nothing extra to run by hand. `plugin.toml`'s `command =
+   "./g-mesh-plugin-go"` has no `.exe` suffix, so this only produces a
+   spawnable binary on macOS/Linux today; Windows naming was left to GM-283
+   (distribution), which owns per-target binary naming for the release
+   matrix - resolved there (see "Distribution" above and
+   `scripts/bundle-go-plugin.sh`'s own header comment) by generating a
+   separate, per-target manifest for the archive rather than by editing this
+   checked-in one: the archive's `plugin.toml` is derived from this file with
+   only its `command` line rewritten to the binary actually staged beside it
+   (`g-mesh-plugin-go.exe` for the Windows target), so the dev-checkout
+   contract above is unchanged and the two manifests cannot drift apart on
+   every other field. Verified before relying on it: `go build -o
+   g-mesh-plugin-go .` with `GOOS=windows` does **not** append `.exe` on its
+   own when `-o` names the output explicitly (only when `-o` is omitted), so
+   the rewrite is required, not cosmetic - and separately, Rust's own
+   `std::process::Command` resolver on Windows (`resolve_exe` in
+   `library/std/src/sys/process/windows.rs`) would likely have tolerated the
+   unmodified name too (it tries `<path>.exe` first, then falls back to the
+   literal path, which Windows can execute directly via its full path
+   regardless of extension), but a release archive should not depend on that
+   fallback when naming the file correctly costs one generated manifest.
+
+#### Implementation notes (GM-280)
+
+GM-280 replaced the scaffold's File-node-only extractor with the real
+`go/parser` structural tier: declarations, containers, visibility,
+`DEFINES`/`EXPORTS`, the three placeholder shapes, open sites and an
+id-keyed incremental diff. `go/types` semantics stay GM-281's; the semantic
+pass still answers every request with an empty diff. Eight decisions this
+task had to settle rather than infer, recorded here so GM-281/GM-282 do not
+have to re-derive them:
+
+1. **Local scope is tracked by the walk itself, never read off the AST.**
+   `go/ast`'s `Object`/`Scope` fields look like they answer "is this name
+   local", and they are both deprecated *and* wrong for this: the parser
+   resolves names with no type information, and under `AllErrors` whatever
+   it managed is partial in a way nothing flags. So `plugins/go/scope.go`
+   builds the chain from the declarations the walk actually sees, which
+   behaves identically on a complete and on a partial AST. A name the chain
+   binds is dropped without ever asking what it is bound to - parameters,
+   named results, receivers, type parameters, `:=`, local `var`/`const`/
+   `type`, closure parameters, `if`/`for`/`switch`/`select` init bindings,
+   type-switch bindings and range variables. Statements are walked in
+   source order and a name is bound at the point it is declared, so
+   `helper := helper()` still reads the package-level `helper` on the
+   right. Labels are not tracked at all but *skipped* (a `LabeledStmt`'s
+   label and a `BranchStmt`'s label are never visited), which is exact
+   rather than approximate: a label lives in its own namespace and can
+   never denote a package symbol. Ambiguity resolves the same way
+   everywhere in this tier - toward the missing edge. The two places it
+   bites are a composite-literal key that is a bare identifier (a struct
+   field name and a map key are the same syntax, so it is skipped; a key
+   that is not a bare identifier is unambiguous and is walked) and a
+   selection through a value, which becomes an open site.
+2. **Dot, blank and aliased imports, each decided.** An **alias** binds the
+   alias and changes nothing else. A **blank** import binds nothing and
+   still gets its placeholder and `IMPORTS` edge - the dependency is the
+   only thing such an import states, and `get_dependencies` would be wrong
+   to omit it. A **dot** import binds every exported name of another
+   package into this file invisibly, and the set of those names is exactly
+   what a structural tier cannot see; so a file containing one emits **no
+   own-container placeholders at all**, keeping only what stays exact
+   (direct same-file hits, which are lexical, and qualified `pkg.F()` uses
+   through other imports, which name their container). Guessing the other
+   way would produce a wrong edge every time the name really came from the
+   dot import and the own package happened to declare one too. The name an
+   unaliased import binds is guessed from the path's last segment, with
+   major-version suffixes handled (`.../v2`, `gopkg.in/yaml.v2`); a wrong
+   guess degrades to an open site, never to a wrong edge.
+3. **Method sets are not modelled, only declarations.** `func (s *Server)
+   Close()` and `func (s Server) Close()` both become `Server.Close` with
+   `nativeKind = "method"` and the receiver kind in the printed signature;
+   Go forbids declaring both, so the normalization can never merge two
+   distinct declarations. A generic receiver normalizes the same way
+   (`*Stack[T]` → `Stack`). An interface method is `I.M`,
+   `nativeKind = "interface_method"` - a *declaration*, never an
+   implementation claim. **Struct embedding promotes methods, and nothing
+   structural says so**: an embedded field is walked as an ordinary type
+   reference and no promoted method is invented. Interface satisfaction is
+   the same case: Go's interfaces are structural, so no `SUPERTYPE_OF`
+   edge exists at this tier at all, including for the `var _ I = (*T)(nil)`
+   idiom, which does state it syntactically but is one spelling among
+   several. Both belong to GM-281's `types.Implements` / method-set pass.
+4. **`containerParent` is always absent, and core is fine with it.** Go
+   packages are flat (this doc's own Logical containers table). A container
+   with no parent yields an empty `parent_chain`, which makes Go's
+   `container(pkg)` visibility exactly "the same package and nothing else"
+   - exactly Go's own rule for an unexported name. GM-265's gap rule
+   (an ancestor with no members truncates the chain) cannot bite here,
+   because Go has no way to produce an intermediate container at all. This
+   was verified rather than assumed: the fixture declares `helper`,
+   unexported, in two different packages, and `plugins/go/conformance/
+   expect.toml` asserts each one's caller set is exactly its own package's.
+5. **`package main`, two packages in one directory, and generated files.**
+   `main` is *not* special: it gets the ordinary directory-derived import
+   path (`github.com/example/app/cmd`), which is what `go list` calls it
+   too, so two `main` packages in one repository get two containers instead
+   of colliding on the name. An external test package (`package x_test`) is
+   Go's one legal two-packages-in-one-directory case and gets
+   `<import path>_test`, keyed off the *package clause* rather than the file
+   name (Go reserves that suffix for external test packages); an *internal*
+   test file is an ordinary member of the package it tests, which is what
+   lets it reach unexported symbols. Two packages in one directory that are
+   not a test pair is illegal Go but reachable on disk, and both land in the
+   same container key - the same answer `go list` gives before it reports
+   the error, with a bounded consequence (a name declared in both becomes
+   ambiguous and core refuses to link it). **Generated files are indexed
+   like any other**: they are real, compiled, callable code, and dropping
+   them would make `find_callers` silently incomplete for everything they
+   call. Whether one is *interesting* is a query's question, and a
+   repository that considers generated output not-source already says so in
+   `.gitignore`, which the walk honours.
+6. **`init` is kept, and disambiguated in `nativeKind`.** A package may have
+   any number of `func init()`, and so may one file, so they collide on
+   qualifiedName and therefore on node id. Skipping them was rejected: an
+   `init` body is ordinary code making ordinary calls, and with no node to
+   hang them on every one of those calls would lose its caller. So the first
+   `init` of a file is `nativeKind = "init"`, the second `"init#1"`, and so
+   on in source order - `nativeKind` participates in the node id, so the ids
+   are distinct and stable as long as the order of a file's inits is (adding
+   one at the end changes nothing about the ones before it). Two inits in
+   one file share a qualifiedName and are therefore ambiguous to any name
+   lookup, which is correct: nothing in Go can name an `init` to call it.
+7. **Build constraints are indexed, every alternative.** `//go:build` and
+   `_windows.go` change nothing structurally - a node id carries the file
+   path, so `sys_windows.go`'s and `sys_linux.go`'s `Platform` are two
+   distinct nodes that never collapse. GM-281's `go/packages` pass only ever
+   type-checks the host `GOOS`/`GOARCH`, so files excluded by the host's
+   constraints keep this structural graph and receive no semantic upgrade -
+   this doc's "Go build constraints" failure mode, documented rather than
+   hidden.
+8. **The workspace model is parsed by hand, and `workspaceChanged` now has
+   real work.** `plugins/go/workspace.go` reads every `go.mod` in the tree
+   plus `go.work`'s `use` directives, and takes the union: a `go.work` is not
+   required for a multi-module repository (nested `go.mod` files alone make
+   one), and a workspace may name a directory the walk would skip. A
+   directory belongs to the *innermost* module containing it, so a nested
+   module owns its own subtree. `golang.org/x/mod/modfile` was rejected to
+   keep `plugins/go/go.mod` at zero requirements (GM-279's decision 3, same
+   trade-off), and `go list -m` was rejected because it would make the
+   *structural* tier depend on a toolchain, which this doc's Constraints
+   forbid. With no `go.mod` anywhere the container key falls back to the
+   project-relative directory, which still links same-package uses across
+   one directory's files and can never match an import specifier - the right
+   failure, since a directory with no module is not importable in Go either.
+   `workspaceChanged` reloads that model and drops the whole per-file cache,
+   because a cached graph carries the old container keys inside its nodes.
+
+Two things GM-280 deliberately left to its successors. The **open sites**
+(`x.M()` receiver calls and value field accesses) are collected per file in
+plugin memory with the position, the selected name and the enclosing
+symbol/caller ids, and never sent to core - GM-281 consumes them.
+`plugins/go/conformance/expect.toml` is **minimal on purpose**: GM-282 owns
+the full Go expectations file, and the entries there now exist only to prove
+GM-280's own end-to-end claim (that a container-scoped placeholder is an
+address core resolves) with a comparison that was shown capable of failing.
+
+#### Implementation notes (GM-281)
+
+GM-281 added the `go/types` tier (`plugins/go/semantic.go`): every open site
+resolved to an exact declaration, `types.Implements` over the project's own
+interfaces, the lazy-engine marker, and the `receiver_calls = "resolved"`
+flip in `plugin.toml`. Eight decisions this task had to settle rather than
+infer:
+
+1. **One `packages.Load` per module root, not one per project.** `./...`
+   from the project root lists the packages of *one* module; a nested
+   `go.mod` is outside it, so `go list ./nested/...` from the root fails
+   there, and a `go.work` only rescues that when the workspace happens to
+   name the module. So the whole-project pass runs `./...` once per module
+   root found by `workspace.go`, with the loader's working directory set to
+   that module - the one form that behaves identically with and without a
+   workspace file, and exactly one invocation for the ordinary
+   single-module repository. A per-file pass instead asks for
+   `file=<abs path>`, `go list`'s own spelling of "the package containing
+   this file", which is what "re-check that file's package" means
+   operationally.
+2. **`NeedDeps` deliberately absent.** The load mode is `packages.LoadSyntax`'s
+   (`NeedName|NeedFiles|NeedCompiledGoFiles|NeedImports|NeedTypes|NeedSyntax|
+   NeedTypesInfo`). With `NeedDeps`, every transitive dependency - the whole
+   standard library included - is type-checked *from source* to build syntax
+   trees this pass never reads: the only thing it ever asks about a
+   dependency's symbol is its package path and name, and export data carries
+   both. Without it, dependencies arrive as compiled export data through the
+   go build cache, which is also the only "reusing loaded dependencies" that
+   is actually available - `go/packages` has no incremental API, so there is
+   no in-process package graph to reuse. Measured on `junegunn/fzf`
+   (89 `.go` files, 6 packages): 17.9s and 304MB peak RSS with a cold build
+   cache, 2.3-2.7s and 91-95MB warm; on `spf13/cobra` (36 files, 2 packages)
+   8.7s/136MB cold and 1.5s/45MB warm.
+3. **`Tests: true`.** Without it `go/packages` skips every `_test.go` file,
+   which would leave the receiver calls in a repository's test suite
+   permanently open while the structural tier indexed them - the silent-gap
+   failure this project treats as worst. The cost is that a package is
+   loaded in up to four variants; the pass deduplicates by node and edge id,
+   and named types by their `*types.TypeName`, so a declaration reached
+   through two variants collapses to one answer.
+4. **Every answer is a `qualifiedName`-keyed placeholder, never a computed
+   node id.** This process knows the declaring *file*, so it could compute
+   the target's node id and emit a direct, `resolved: true` edge. It does
+   not know that core has that file *indexed* (gitignored, under an excluded
+   directory, not yet walked), and an edge onto an id nothing declares is a
+   dangling row no query can see past, whereas a placeholder degrades to
+   "unresolved". The address is `{ container: <import path>, qualifiedName:
+   "Server.Close" }`, and it still gets core's visibility check, so a
+   mistake here cannot link a private symbol from outside its package.
+   Targets outside the project are dropped for the same reason: their
+   packages are not indexed, so the address could only ever go unresolved.
+5. **What each of GM-280's six leftovers became.** Receiver calls, method
+   promotion through embedding and interface dispatch are all one mechanism:
+   `types.Info.Selections[expr].Obj()` is the *declared* method - on the
+   embedded type for a promoted one, on the interface for a call through an
+   interface value - which is precisely the declaration a caller list should
+   point at. A **call through an interface value is attributed to `I.M`**,
+   not to every implementer: which concrete method runs is a run-time
+   question, and `find_implementations` is the hop that answers it, which is
+   why `SUPERTYPE_OF` matters as much as the caller edge. A **mis-guessed
+   import binding name** lands in the same place from the other side: the
+   structural tier saw `that.F()` as a selection, `Selections` has no entry
+   for a qualified identifier, and the fallback to `types.Info.Uses`
+   resolves it exactly. **Dot-imported bare names** needed one extractor
+   change - a file carrying a dot import now records each suppressed bare
+   name as an open site of its own (`openSiteBareName`) instead of silently
+   dropping it - resolved through `Uses` as well. **`pkg.T(x)` conversions**
+   needed the opposite: the structural tier *did* answer them, with a
+   `CALLS` edge core's kind filter will never land on a `Type`, so every
+   `CALLS` edge onto a placeholder is now recorded as a `placeholderCall`
+   and the pass retracts by id exactly the ones whose name turns out not to
+   be a function, re-stating them as the `REFERENCES` edge a conversion
+   actually is. That last one is not hypothetical: 22 such edges on fzf, 6
+   on cobra.
+6. **`types.Implements` over pairs, with a method-name pre-check.** The
+   pairing is quadratic in principle (every project named type against every
+   project interface). A per-type method-name set, compared against the
+   interface's method names before `types.Implements` is called at all,
+   rejects almost every pair before a method set has to be built - which is
+   why it does not show up in the measurement above. Both the value and the
+   pointer method set are tried, because `func (s *Server) Close()` makes
+   `*Server` satisfy the interface while `Server` does not, and the node
+   this index has is `Server`. Four kinds of pair are skipped on purpose and
+   documented in `plugins/go/README.md`: the empty interface (satisfied by
+   everything, useful to nobody), constraint interfaces with a type set (not
+   something a type "implements" in the sense `find_implementations`
+   answers), type aliases (an edge from one would restate what the
+   underlying declaration already says), and generic named types (`Stack[T]`
+   is one node here but a family of types there, so there is no single
+   honest answer to attach).
+7. **The marker is written immediately before the first `packages.Load`,
+   and nothing else in the process imports `golang.org/x/tools`.** GM-279
+   left `capabilities.semantic-engine-lazy` at `SKIP ... not instrumented`
+   because there was no engine to start; it is a `PASS` now. Writing it at
+   the top of `handleSemanticPass` would have been a claim about the request
+   rather than about the engine, and writing it at process start would have
+   made the check pass for a plugin that loads eagerly. The one call site is
+   reachable only from `semanticPass`, so "the engine started" and "a
+   semanticPass arrived" cannot come apart by construction rather than by
+   discipline.
+8. **Retraction is per file and edges only.** A re-pass of a file deletes
+   the semantic edge ids this process emitted for it last time and did not
+   produce again - a renamed method, a type that stopped satisfying an
+   interface - so a long-lived daemon does not accumulate edges out of
+   declarations that have moved. Placeholder *nodes* are never deleted: one
+   with no edges left on it is inert, while `deleteNodeIds` is held to
+   "every id was emitted before" by the conformance kit and is not worth the
+   bookkeeping for rows nothing reads. The state lives in the process, so a
+   restart forgets it, the same honest limitation the structural per-file
+   cache already has.
+
+The cost of the dependency, since GM-279's zero-requirement property is
+gone: `golang.org/x/tools v0.50.0` plus the two modules it brings with it,
+`golang.org/x/mod` and `golang.org/x/sync` - 8 `go.sum` lines, 13MB
+extracted in the module cache (12MB of it `x/tools`), the plugin binary
+5,778,352 -> 8,822,032 bytes (+3.0MB, +53%), and a from-scratch `go build`
+after `go clean -cache` 15.4s -> 21.8s real / 32.0s -> 44.7s user (measured
+back to back on one heavily loaded machine, so the ratio is the number to
+read, not the seconds). Nothing is vendored. The **structural** tier still
+has no dependency of its own, and `GOPROXY=off go build` succeeds and its
+`--bulk-index` walk produces byte-identical output once `go mod download`
+has run once - which is what keeps this doc's "Structural tiers may not
+[depend on a toolchain]" constraint true: the toolchain requirement is the
+semantic tier's alone, and without it the plugin logs one line and answers
+every `semanticPass` with an empty diff.
+
+#### Implementation notes (GM-282)
+
+GM-282 owns the full `plugins/go/conformance/expect.toml` GM-280/GM-281 left
+deliberately minimal, wires it into the CI plugin-check job GM-277 added, and
+adds a second CI job that runs it with `go` off `PATH`. Two decisions:
+
+1. **The fixture needed no new files.** Every ACCEPTANCE category (bare and
+   package-qualified calls, receiver/embedded/interface-dispatched calls,
+   implicit implementations, container imports, references, definition) had
+   a real site already in the nine-file fixture GM-280/GM-281 built for a
+   narrower purpose - `[[references]]` reuses `Server`'s own type (used at
+   several sites, never called, which is what makes it provable only by this
+   handler and not `[[callers]]`), and `[[definition]]` reuses
+   `Server.Addr`'s and `Placeholder`'s declarations. One deliberate
+   non-choice: `helper` (declared twice, unexported, in two containers) was
+   *not* used for a "file disambiguates an ambiguous name" `[[definition]]`
+   entry, because it cannot pass one. Go's `qualifiedName` carries no
+   container (unlike TypeScript's, which can differ between two same-named
+   declarations) - see this doc's Data Model, "Logical containers" - so
+   `find_definition`'s `file`-narrowed retry, which re-resolves by
+   `qualifiedName` alone (`expectations.rs`'s decision 3, since
+   `find_definition` has no `symbol_id`), lands on the same ambiguity a
+   second time for *any* two Go declarations that share a bare name. This
+   isn't a fixture gap to work around; it is verified and documented in
+   `expect.toml`'s own comment, matching this repo's own rule that a
+   constant belongs in the record once it is computed, not guessed at again
+   by the next reader.
+2. **A reduced expectation set is read out of the one file, not copied into
+   a second one.** `expect.toml` entries take an optional `tier =
+   "semantic"` (default `"structural"`); `g-mesh plugins check --expect
+   ... --skip-semantic-expectations` answers every tagged entry with `Skip`
+   in place, at the same id, instead of running it - so CI's "no toolchain"
+   job and its ordinary counterpart read the exact same file, and a new
+   entry is only ever exempted from the reduced run by a fixture author
+   deliberately tagging it, never by an id list this doc or a script would
+   have to keep in sync by hand. Full reasoning: `expectations.rs`'s module
+   doc, decision 6. The CI job that exercises this (`.github/workflows/
+   ci.yml`'s `go-plugin-without-toolchain`) still needs the toolchain to
+   *build* `plugins/go/g-mesh-plugin-go` (`core/build.rs`'s own `go build`),
+   so it installs Go, builds, and only then computes and switches to a `PATH`
+   with Go's own directory filtered out for the one check step - verified by
+   refusing to run that step at all if `go` still resolves afterward, rather
+   than assumed to have worked.
 
 ### Rust plugin (`plugins/rust`, on the SDK)
 
@@ -679,8 +1091,15 @@ from the languages present in the index and their `receiver_calls` state:
 
 - **No present language lists the gap:** the sentence is omitted.
 - **Some languages list it:** "(1) a method call through a variable receiver
-  (`x.foo()`) produces no edge **in TypeScript and Rust** …". Rust is listed until
-  its semantic pass has completed (`language_state.semanticPassAt`).
+  (`x.foo()`) produces no edge **in go, rust and typescript** …". Go and Rust are
+  each listed until *their own* semantic pass has completed
+  (`language_state.semanticPassAt`) - GM-281 shipped Go's with
+  `receiver_calls = "resolved"` and `receiver_calls_structural = "unresolved"`,
+  so a Go-only project reads the original two-gap sentence between the cold-start
+  walk and the first completed pass (one present language is never named), and
+  the "One real gap" wording - clause (1) gone entirely - afterwards. A project
+  with no Go toolchain never reaches that second state, which is exactly right:
+  the edges are not in its index.
 
 The builder asserts the byte budget in a unit test over the worst case: every
 bundled language listed. The wording is deliberately not fixed here. GM-262 carries

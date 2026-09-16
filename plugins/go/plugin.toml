@@ -1,0 +1,89 @@
+# Bundled Go plugin manifest. See docs/architecture/multi-language-plugins.md
+# ("Interfaces > plugin.toml additions") for the schema this file follows,
+# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/
+# validation rules it must satisfy. `language` below must equal this
+# manifest's own containing directory name ("go"), the same rule every
+# other bundled plugin's manifest follows (see plugins/typescript/plugin.toml's
+# own comment on why).
+
+[plugin]
+language = "go"
+protocol_version = 2
+# 0.2.0 is GM-281, which added the go/types semantic tier. Kept equal to
+# wire.go's `pluginVersion` by plugins/go/manifest_test.go - nothing on the
+# core side compares the two, so the plugin's own suite is what does.
+plugin_version = "0.2.0"
+
+[plugin.spawn]
+# A prebuilt binary, not `go run ./...`. `go run` recompiles the whole
+# module on every single spawn - and the daemon spawns this plugin
+# repeatedly (once per bulk index, and again as a long-lived control-plane
+# process), with a fresh one-shot process for *every* --bulk-index call
+# (daemon::bulk_index::walk_one_language) - so `go run` would mean paying a
+# full compiler invocation on the hot path of a reindex, not just at
+# startup. A prebuilt binary costs one build per checkout/commit instead,
+# at the price of a build step existing at all - core/build.rs pays that
+# price the same best-effort way it already does for the TS plugin's
+# `npm run build` (see that file), so `cargo build`/`cargo test`/
+# `g-mesh plugins check`/`g-mesh plugins list` all keep working from a
+# fresh checkout with nothing extra to run by hand, as long as a Go
+# toolchain is on PATH - and degrade to a clear "failed to spawn" error,
+# not a build failure, when one is not (the same best-effort contract
+# build.rs already documents for npm). This exact command line - no `.exe`
+# on any platform - is a dev-checkout contract, not a release one: GM-283
+# (distribution) does not reuse this file for a release archive. It
+# generates a separate, installed manifest per target
+# (scripts/bundle-go-plugin.sh) whose command names that target's actual
+# binary (`g-mesh-plugin-go.exe` on Windows), the same way
+# plugins/typescript/plugin.toml's checked-in dev manifest is never the one
+# an archive ships either (see scripts/bundle-plugin.sh).
+command = "./g-mesh-plugin-go"
+
+[plugin.languages]
+extensions = [".go"]
+
+[plugin.capabilities]
+# core sends semanticPass (per file after a reparse, whole project after a
+# walk) and this plugin answers it with go/types through
+# golang.org/x/tools/go/packages - plugins/go/semantic.go. The engine is
+# started lazily, on the first such request and never during a bulk index or
+# a fileChanged, which is what `capabilities.semantic-engine-lazy` checks
+# through the marker that pass writes.
+semantic_pass = true
+# `x.M()` needs to know the receiver's type, which only go/types can answer.
+# The two values therefore differ, and the difference is the whole point:
+#
+#   - `receiver_calls = "resolved"` - once Go's whole-project semanticPass
+#     has completed (`language_state.semanticPassAt`), receiver calls are
+#     resolved, so core's generated MCP instructions stop listing the
+#     receiver-call gap for this language (core/src/mcp/instructions.rs's
+#     has_open_receiver_gap);
+#   - `receiver_calls_structural = "unresolved"` - the go/parser tier alone
+#     still emits nothing for one (it records an open site instead:
+#     plugins/go/open_sites.go), so between the bulk walk and the first
+#     completed pass the gap is real and stays listed. Claiming otherwise
+#     here would make the instructions promise, for those minutes, edges
+#     that are not in the index yet.
+#
+# Without a Go toolchain on PATH the pass answers with an empty diff and
+# `semanticPassAt` is never set, so the gap simply stays listed forever -
+# the degradation is honest by construction rather than by a second flag.
+receiver_calls = "resolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+# A go.mod/go.work edit moves the whole project's package/import-path
+# layout, so core reindexes this language from scratch when either changes -
+# the same "workspace boundary file" role Cargo.toml/*.csproj play for
+# their languages (docs/architecture/multi-language-plugins.md's
+# "plugin.toml additions" section).
+watch_files = ["go.mod", "go.work"]
+# vendor/ holds copied dependency source the project does not own;
+# testdata/ is Go's own convention for fixtures `go build`/`go vet`/`go
+# test` skip - neither should ever become part of this project's own
+# graph. `.git` is excluded unconditionally at the core level already, and
+# again by this plugin's own walk (walk.go) regardless of what this list
+# says, for a plugin run standalone (`--bulk-index`) with no core in front
+# of it to apply this list on its behalf.
+exclude_dirs = ["vendor", "testdata"]
+entry_points = []
