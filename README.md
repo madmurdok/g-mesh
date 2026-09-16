@@ -220,8 +220,18 @@ g-mesh-v<version>-<triple>/
     node_modules/                         its native tree-sitter grammars
     plugin.toml                           how core discovers and spawns it
     LICENSE-nodejs                        the embedded runtime's notice
+  plugins/rust/
+    g-mesh-plugin-rust                    the Rust plugin - a plain cargo
+                                           binary, no runtime to embed
+    plugin.toml                           how core discovers and spawns it
   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 ```
+
+The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
+SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
+target with `cargo build --target <triple>`, the same way `build-targets.sh`
+already builds core, and writes an installed `plugin.toml` naming the binary
+it staged.
 
 **No Node.js required.** The plugin is compiled with [Node's single-executable
 application](https://nodejs.org/api/single-executable-applications.html)
@@ -243,13 +253,16 @@ build machine's own Node runtime and cannot be cross-built.
 
 ### Cutting a release
 
-1. Merge the release branch (with `core/Cargo.toml` already bumped to the new
-   version) into `main`.
+1. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
+   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml`,
+   which must all agree with it — already bumped to the new version) into
+   `main`.
 2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
-   version, working tree and branch state, runs `cargo test`, and creates an
-   annotated `v<version>` tag locally — it does not push by default, since
-   pushing the tag is what starts the public four-platform build and drafts a
-   Release. Pass `--push` to push it in the same step, or run the printed
+   version (every workspace member's, not only core's), working tree and
+   branch state, runs `cargo test --workspace`, and creates an annotated
+   `v<version>` tag locally — it does not push by default, since pushing the
+   tag is what starts the public four-platform build and drafts a Release.
+   Pass `--push` to push it in the same step, or run the printed
    `git push origin v<version>` yourself when ready.
 3. Once the build finishes, approve the draft on GitHub.
 

@@ -5,13 +5,18 @@
 # ("rust"), the same rule plugins/typescript's manifest documents.
 #
 # `command` is a dev-time path into the workspace's own `target/` (relative to
-# this manifest's directory, `plugins/rust/`), not a packaged layout - this
-# task (GM-285) builds the project model only, and where a released binary
-# actually lives is the release-matrix task's decision (the design doc's
-# Rust plugin section: "a cargo binary in the same workspace as core, built
-# by the existing native release matrix"). `g-mesh plugins check plugins/rust
-# --fixture <dir>` run from the repository root, after `cargo build -p
-# g-mesh-plugin-rust`, is what this path is for today.
+# this manifest's directory, `plugins/rust/`), not a packaged layout - this is
+# a dev-checkout contract, not a release one, the same distinction
+# plugins/go/plugin.toml documents for itself. `g-mesh plugins check
+# plugins/rust --fixture <dir>` run from the repository root, after `cargo
+# build -p g-mesh-plugin-rust`, is what this path is for today.
+#
+# GM-288 (distribution) does not reuse this file for a release archive: it
+# generates a separate, installed manifest per target
+# (scripts/bundle-rust-plugin.sh) whose command names that target's actual
+# staged binary (`./g-mesh-plugin-rust` or `./g-mesh-plugin-rust.exe`), the
+# same way plugins/typescript/plugin.toml's checked-in dev manifest is never
+# the one an archive ships either (see scripts/bundle-plugin.sh).
 
 [plugin]
 language = "rust"

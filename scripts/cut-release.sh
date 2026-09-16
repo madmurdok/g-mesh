@@ -7,7 +7,7 @@
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
 #   scripts/cut-release.sh <version> --push       # ...and push the tag
-#   scripts/cut-release.sh <version> --skip-tests # skip the `cargo test` run
+#   scripts/cut-release.sh <version> --skip-tests # skip the `cargo test --workspace` run
 #
 # This script does NOT bump the version - that already happened as the
 # release branch's first commit. What it does instead is VERIFY that
@@ -17,6 +17,27 @@
 # is the whole point: it is the guard against the tag and the crate disagreeing
 # - the failure #197 recorded, where the crate sat at 2.0.0 through five
 # releases because nothing caught it.
+#
+# GM-288: since the repository became a cargo workspace (GM-284), `core/
+# Cargo.toml` is not the only manifest with a hand-pinned `version` -
+# `wire/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml`
+# each carry their own. Nothing forces them to agree with core's, and a crate
+# whose version silently drifts is the same class of failure #197 already
+# named, just in a manifest this script did not use to look at. Rather than
+# switching every member to `version.workspace = true` (root-Cargo.toml
+# inheritance, which would remove the possibility of drift entirely but also
+# ripple through every comment and script that currently reads `core/
+# Cargo.toml`'s own `[package] version` as the release's version of record -
+# `build-targets.sh`, `prepare-release-assets.sh`, `release.yml`, this file,
+# and README.md's own release checklist), this script instead grows the same
+# check it already runs to cover every workspace member: `core/Cargo.toml`
+# stays the one manifest whose version *names* the release, and every other
+# member's version is checked to equal it, in `check_workspace_versions`
+# below, before a single test runs. A member added to the workspace later
+# that forgets this gets caught here, not after a release ships with it
+# silently stale - which is the whole reason this got written down instead of
+# only fixed: this decision is what the next language plugin's manifest
+# should follow too.
 #
 # It tags `main`, and only after the release branch has already been merged
 # into it - the tag is meant to point at the code someone gets by cloning, not
@@ -29,7 +50,7 @@
 # it takes the explicit --push above; without it, the tag is created locally
 # and the exact command to push it is printed instead.
 #
-# `cargo test` takes 10+ minutes on this machine. Skipping the announcement of
+# `cargo test --workspace` takes 10+ minutes on this machine. Skipping the announcement of
 # that fact makes the wait look like a hang, so this script says what it is
 # doing before it goes quiet. --skip-tests exists for re-running this script
 # after a preflight check fails post-test (e.g. to fix --push without paying
@@ -47,6 +68,7 @@
 #   - the tag already exists, locally or on the remote
 #   - a version string that is not `X.Y.Z`
 #   - `core/Cargo.toml`'s version disagreeing with the argument
+#   - any other workspace member's version disagreeing with core's (GM-288)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -68,8 +90,64 @@ usage: scripts/cut-release.sh <version> [--push] [--skip-tests]
 
   <version>      the release version, X.Y.Z, matching core/Cargo.toml
   --push         also push the tag (starts the build/publish workflow)
-  --skip-tests   skip the `cargo test` run before tagging
+  --skip-tests   skip the `cargo test --workspace` run before tagging
 EOF
+}
+
+# The other workspace members whose `[package] version` must agree with
+# core's - see the GM-288 comment above this script's header for why this
+# exists instead of workspace-level version inheritance. Kept as a flat list
+# rather than derived from the root Cargo.toml's `members` array: deriving it
+# would let a member opt out of the check by construction (any member listed
+# there is, by definition, checked), whereas the point is that every member
+# is checked, with a new one requiring a deliberate addition here - the same
+# fail-closed shape `SUPPORTED_TARGETS` in build-targets.sh already uses for
+# release targets.
+OTHER_WORKSPACE_MANIFESTS=(
+	"wire/Cargo.toml"
+	"plugins/sdk/Cargo.toml"
+	"plugins/rust/Cargo.toml"
+)
+
+# The `version` of a manifest's `[package]` section. Same restriction as
+# build-targets.sh's own `crate_version` and for the same reason: `version =`
+# also appears under `[dependencies]`.
+package_version() {
+	awk '
+		/^\[/ { in_package = ($0 == "[package]") }
+		in_package && /^version[[:space:]]*=/ {
+			gsub(/[",]/, "", $3); print $3; exit
+		}
+	' "$1"
+}
+
+# Refuses if any other workspace member's own `[package] version` disagrees
+# with `core/Cargo.toml`'s (already resolved as `version` by the caller).
+# Collects every mismatch before dying, rather than stopping at the first,
+# because a release that is about to fix one drifted crate wants to know
+# about all of them in the same run rather than finding the second one after
+# re-running this script.
+check_workspace_versions() {
+	local core_version="$1" manifest path mismatches=()
+	for manifest in "${OTHER_WORKSPACE_MANIFESTS[@]}"; do
+		path="$REPO_ROOT/$manifest"
+		[ -f "$path" ] || die "workspace member manifest not found: $manifest (update OTHER_WORKSPACE_MANIFESTS in this script if it moved or was removed)"
+		local member_version
+		member_version="$(package_version "$path")"
+		[ -n "$member_version" ] || die "could not determine version from $manifest"
+		if [ "$member_version" != "$core_version" ]; then
+			mismatches+=("$manifest says $member_version")
+		fi
+	done
+	if [ ${#mismatches[@]} -gt 0 ]; then
+		local line
+		echo "cut-release: workspace version drift - core/Cargo.toml says $core_version, but:" >&2
+		for line in "${mismatches[@]}"; do
+			echo "  - $line" >&2
+		done
+		die "fix every listed manifest's [package] version to $core_version before tagging"
+	fi
+	log "workspace versions agree: $core_version (core, ${OTHER_WORKSPACE_MANIFESTS[*]})"
 }
 
 # owner/repo parsed from the `origin` remote, for printing real URLs at the
@@ -160,14 +238,27 @@ main() {
 	[ "$crate_version" = "$version" ] ||
 		die "core/Cargo.toml says $crate_version, not $version - the release branch's first commit should have bumped it; fix core/Cargo.toml (or pass the version that's actually there) before tagging"
 
+	# GM-288: core/Cargo.toml agreeing with the tag is not enough on its own
+	# now that three more workspace members carry their own hand-pinned
+	# version - see this script's header comment for why this is a second
+	# check here rather than workspace-level inheritance.
+	check_workspace_versions "$crate_version"
+
 	if [ "$skip_tests" -eq 1 ]; then
 		log "skipping cargo test (--skip-tests)"
 	else
-		log "running cargo test - this takes 10+ minutes on this machine, not hung, just slow"
+		log "running cargo test --workspace - this takes 10+ minutes on this machine, not hung, just slow"
 		local test_start test_end
 		test_start="$(date +%s)"
-		(cd "$REPO_ROOT/core" && cargo test) ||
-			die "cargo test failed - fix the failure before cutting a release"
+		# GM-288: `--workspace` from the repo root, not `cd core && cargo
+		# test` - since GM-284 made the repository a cargo workspace, the
+		# latter tests core alone and would gate a release on green tests
+		# while shipping wire/, plugins/sdk and plugins/rust untested. Every
+		# one of those now ships inside every release archive (the Rust
+		# plugin, since GM-288), so a release gate that does not run their
+		# tests is not actually gating on them.
+		(cd "$REPO_ROOT" && cargo test --workspace) ||
+			die "cargo test --workspace failed - fix the failure before cutting a release"
 		test_end="$(date +%s)"
 		log "cargo test passed in $((test_end - test_start))s"
 	fi
