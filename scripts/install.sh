@@ -497,7 +497,7 @@ this binary."
 	echo
 	log "installed g-mesh $VERSION"
 	echo "  binary:  $INSTALL_DIR/g-mesh"
-	echo "  plugin:  $INSTALL_DIR/plugins/typescript/  (must stay beside the binary)"
+	echo "  plugins: $INSTALL_DIR/plugins/  (must stay beside the binary)"
 	echo
 
 	case ":$PATH:" in
