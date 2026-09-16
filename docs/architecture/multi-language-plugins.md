@@ -1777,17 +1777,24 @@ speed. The only defensible reading: Python's structural tier did not take
 longer to build than Rust's, and the tracker has nothing more precise than
 that to offer either way.
 
-What this covers, and what it does not: the structural tier only. GM-299
-(Python's semantic tier, a pyright bridge) was deferred and unbuilt when this
-was written - it has since landed, and "Implementation notes (GM-299)" below
-answers the question this paragraph leaves open: no core change, one generic
-SDK field. This document's own Open Questions already name Python's dynamic
-dispatch as a gap that persists "even with pyright." A semantic tier is
-exactly where Rust
-needed its one real core fix (GM-290 - core did not tell a spawned plugin
-which manifest it had read), for a *different* language's semantic engine.
-This result says nothing about whether Python's semantic tier will need
-core work; it is silent on that until GM-299 is built. Had `has_container`
+What this covers, and what it does not. The paragraph above was written of
+the structural tier alone, while GM-299 (Python's semantic tier, a pyright
+bridge) was still deferred. It has since landed, so the open question it left
+now has an answer, and the answer is worth stating in the same breath as the
+claim rather than only in the notes below: **no core change, and one generic
+SDK field.** The field is `SemanticConfig::settings`, which answers
+`workspace/configuration` - needed because pyright ignores
+`initializationOptions` entirely (GM-299 proved it with a one-variable A/B:
+the same settings object produced 4 diagnostics through one channel and 1
+through the other). So the honest scorecard for language #4 is *not* "zero
+changes outside the plugin": it is zero to core, one to the SDK, and that one
+is protocol surface any LSP server might need rather than a Python
+accommodation - which is the distinction the R1 claim actually rests on. A
+semantic tier is exactly where Rust needed its one real core fix (GM-290 -
+core did not tell a spawned plugin which manifest it had read), so Python
+getting away with an SDK field is a genuine result rather than a formality.
+This document's own Open Questions already name Python's dynamic dispatch as
+a gap that persists "even with pyright." Had `has_container`
 required a new SDK function instead of reusing `walk_project`, or had the
 GM-297 conformance work needed the instructions *generator* to change rather
 than exercise it, this section would report the opposite finding - the
