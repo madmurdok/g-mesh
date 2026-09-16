@@ -1,0 +1,8 @@
+# Built by core/build.rs (and, by hand, `go build -o g-mesh-plugin-go .`) -
+# the binary plugins/go/plugin.toml's [plugin.spawn] command names. Never
+# committed, the same convention plugins/typescript/.gitignore's `dist/`
+# follows for that plugin's own build output.
+/g-mesh-plugin-go
+# `go build ./...` (no `-o`) names its output after the directory when run
+# here by hand - never committed either.
+/go

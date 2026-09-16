@@ -636,6 +636,89 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
 - **Distribution:** a static binary per target via `GOOS`/`GOARCH` cross-compile.
   No native runner and no embedded runtime.
 
+#### Implementation notes (GM-279)
+
+The first Go plugin release is a scaffold: the wire v2 control loop, the
+`--bulk-index` NDJSON stream, the project walk and the id scheme, all proven
+against `g-mesh plugin check` end to end - but the extractor emits `File`
+nodes only, no symbols and no edges. `go/parser` structure (real declarations,
+containers, `DEFINES`/`EXPORTS`) is GM-280; `go/types` semantics (the pass
+this scaffold already answers, honestly, with nothing) is GM-281. Six
+decisions this task had to settle rather than infer, recorded here so GM-280/
+GM-281 do not have to re-derive them:
+
+1. **`semantic_pass = true` from the first release, with no marker written.**
+   The manifest declares the capability now (not once GM-281 lands): a plugin
+   that will grow a real semantic tier should not lock in "core never asks"
+   before that tier exists, and this plugin already answers every
+   `semanticPass` honestly - an empty diff, because there is nothing yet to
+   resolve. The conformance kit's semantic-engine marker
+   (`G_MESH_PLUGIN_CHECK_MARKER_DIR`/`semantic-engine-started`, `session.rs`'s
+   own contract) is deliberately **not** written by this scaffold: there being
+   no engine to start is not the same claim as "the engine started lazily",
+   and writing the marker with nothing behind it would make
+   `capabilities.semantic-engine-lazy` either vacuously pass or fail on a
+   technicality unrelated to laziness. The kit reports this correctly today -
+   `SKIP ... not instrumented` - which is the honest answer until GM-281
+   spawns/loads `go/packages` and writes the marker at that moment, the same
+   way the TS plugin's `semantic.ts` does for `tsserver`.
+2. **Id scheme reproduced field-for-field from `extract.ts`, checked against
+   real TS output.** `nodeIdFor`/`edgeIdFor` in `plugins/go/ids.go` hash the
+   exact same space-joined strings `plugins/typescript/src/extract.ts`'s
+   `nodeIdFor`/`edgeIdFor` do (sha256, hex, first 32 characters). `ids_test.go`
+   asserts against values computed by actually running that TS code
+   (`node -e '...'` with the functions copied in verbatim, Node v20.6.1 - the
+   transcript is in this task's own completion report), not recalled from
+   memory or re-derived independently in Go.
+3. **The walk's `.gitignore` support is hand-rolled, not a dependency.**
+   `plugins/go/ignore.go` translates each pattern to a regexp by hand -
+   literal segments, `*`/`?` within a segment, `**` across segments, a
+   directory-only trailing `/`, an anchoring leading or embedded `/`,
+   negation, later-line-and-later-layer-wins - the same subset
+   `ignorePolicy.ts`'s own `ignore` dependency is exercised for by this
+   repo's fixtures, and the same tier of coverage small Go gitignore
+   libraries offer. Chosen over a dependency so `plugins/go/go.mod` stays at
+   zero requirements for a scaffold whose only job is proving the wire
+   contract; `ignore.go`'s own doc comment has the full trade-off, including
+   the heavier alternative (go-git's `gitignore` sub-package) considered and
+   rejected. Symlink handling (`plugins/go/symlinks.go`) matches
+   `symlinks.ts`'s guard exactly: followed, not skipped, under a guard that
+   refuses a cycle, a second path onto an already-claimed real location, and
+   an escape outside the project root - proven by `walk_test.go`'s own cycle/
+   dangling-link/claimed-twice cases.
+4. **File nodes only, `visibility: "file"` - not `"public"`.** GM-279's own
+   task text said `visibility public` for the File node; this repo's one
+   concrete example of a Go plugin's node
+   (`core/tests/fixtures/valid_v2.ndjson`) uses `"file"`, matching the TS
+   plugin's own convention (`extract.ts`'s `addNode`: a node is file-visible
+   unless something marks it exported, and nothing ever marks the File node
+   itself exported - only what it *defines* can be public). The golden
+   fixture was treated as authoritative over the task's own prose.
+5. **Unknown methods and `workspaceChanged` never crash, mirroring
+   `index.ts`'s own gaps.** A method this plugin does not recognize is
+   logged and dropped, never answered - even when it carried an id - matching
+   `plugins/typescript/src/protocol.ts`'s `parseControlEnvelope` refusing
+   anything outside its four known methods the same way. `workspaceChanged`
+   *is* recognized (the TS plugin predates it and has no workspace files to
+   watch at all), but this scaffold caches nothing at the workspace level -
+   no module/crate map exists yet to invalidate - so it is a no-op beyond a
+   log line. GM-280/GM-281 are expected to give it real work once there is a
+   cached package map to drop.
+6. **Distribution for a dev checkout: a prebuilt binary via `core/build.rs`,
+   not `go run ./...`.** `go run` recompiles the whole module on every single
+   spawn - and the daemon spawns this plugin repeatedly, including one
+   one-shot process per `--bulk-index` call - so it would mean a full compiler
+   invocation on the hot path of a reindex. `core/build.rs` now builds
+   `plugins/go` into `plugins/go/g-mesh-plugin-go` the same best-effort way it
+   already builds the TS plugin's `dist/` (a `cargo:warning`, not a build
+   failure, when no Go toolchain is on `PATH`), so `cargo build`/`cargo
+   test`/`g-mesh plugins check`/`g-mesh plugins list` all work from a fresh
+   checkout with nothing extra to run by hand. `plugin.toml`'s `command =
+   "./g-mesh-plugin-go"` has no `.exe` suffix, so this only produces a
+   spawnable binary on macOS/Linux today; Windows naming is left to GM-283
+   (distribution), which already owns per-target binary naming for the
+   release matrix.
+
 ### Rust plugin (`plugins/rust`, on the SDK)
 
 - **Structure:** tree-sitter-rust.
