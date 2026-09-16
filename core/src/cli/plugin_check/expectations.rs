@@ -150,6 +150,33 @@
 //! the whole run's exit status through the same path every built-in check
 //! does (`report::Report::failed`) - expectations need no exit-code
 //! mechanism of their own.
+//!
+//! # Decision 6: a reduced set for a missing toolchain, from the same file
+//!
+//! Some plugins have a semantic tier that needs a real toolchain on `PATH`
+//! (`go/types` for Go, `tsserver` for TypeScript) and degrade to
+//! structural-only answers without one - a real, supported deployment shape
+//! (`plugins/go/README.md`'s "Out of scope, deliberately"), not a broken one.
+//! GM-282 needs a CI job that runs with `go` off `PATH` and still asserts
+//! *something* - "the structural entries still pass" - without either
+//! duplicating the file (a second `expect.toml` a fixture author can update
+//! and forget to mirror) or hand-picking ids to skip (a list that drifts the
+//! moment an entry is reordered or a new one inserted before it).
+//!
+//! So the same file carries the answer: [`SymbolExpectation`] and
+//! [`ImportsExpectation`] both take an optional `tier = "semantic"` (default
+//! `"structural"`, the common case, so most entries never spell it out).
+//! `--skip-semantic-expectations` (`mod.rs`'s `PluginCheckArgs`) makes
+//! [`evaluate`] answer every `tier = "semantic"` entry with `Outcome::Skip`
+//! instead of calling its handler, in the same file-order position it would
+//! otherwise occupy - so the *set* of entries this flag reduces to is
+//! whatever the fixture author already tagged, computed once by [`evaluate`]
+//! from the one file both CI invocations read, never copied by hand into a
+//! second one. `plugins/go/conformance/expect.toml`'s four `go/types`-only
+//! entries (three `[[callers]]`, one `[[implementations]]`) carry the tag;
+//! everything else - bare and package-qualified calls, references,
+//! `[[imports]]`, `[[definition]]` - answers from the structural tier alone
+//! and is untagged.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -188,6 +215,21 @@ pub(crate) struct ExpectFile {
     definition: Vec<SymbolExpectation>,
 }
 
+/// Which of a plugin's tiers an expectation needs answered before it can
+/// possibly pass - decision 6. `Structural` is the default: most
+/// expectations are answerable by the always-available tier, so most entries
+/// never spell this field out at all.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Tier {
+    #[default]
+    Structural,
+    /// Needs the plugin's semantic tier (a real toolchain on `PATH`) to have
+    /// resolved the site - `--skip-semantic-expectations` answers this entry
+    /// with `Outcome::Skip` rather than running it (decision 6).
+    Semantic,
+}
+
 /// One `[[callers]]` / `[[references]]` / `[[implementations]]` /
 /// `[[definition]]` entry - they share a shape because all four anchor on a
 /// `symbol` the same way (decision 3) and compare the same kind of set
@@ -202,6 +244,9 @@ struct SymbolExpectation {
     #[serde(default)]
     file: Option<String>,
     expect: Vec<String>,
+    /// Decision 6. Absent means `Structural`.
+    #[serde(default)]
+    tier: Tier,
 }
 
 /// One `[[imports]]` entry: `get_dependencies` from `file`, one hop
@@ -211,6 +256,12 @@ struct SymbolExpectation {
 struct ImportsExpectation {
     file: String,
     expect: Vec<String>,
+    /// Decision 6. Absent means `Structural`; no bundled fixture's
+    /// `[[imports]]` entry needs the semantic tier today, but the field
+    /// exists here too so one that does never has to duplicate the file to
+    /// say so.
+    #[serde(default)]
+    tier: Tier,
 }
 
 /// Reads and parses `path`. The one hard-error path in this module - see
@@ -239,31 +290,64 @@ pub(crate) struct EvalContext<'a> {
 
 /// Runs every expectation in `expect`, in file order, and returns one
 /// [`CheckResult`] per entry - report.rs's own module doc calls for "one per
-/// expectation the fixture's author wrote, not one per rule".
-pub(crate) fn evaluate(ctx: &EvalContext, expect: &ExpectFile) -> Vec<CheckResult> {
+/// expectation the fixture's author wrote, not one per rule". `skip_semantic`
+/// is decision 6's `--skip-semantic-expectations`: a `tier = "semantic"`
+/// entry is answered with `Outcome::Skip` in place rather than run, so the id
+/// numbering and the count of entries in the report is identical whether or
+/// not the flag is set - only the outcome of the tagged ones changes.
+pub(crate) fn evaluate(ctx: &EvalContext, expect: &ExpectFile, skip_semantic: bool) -> Vec<CheckResult> {
     let mut results = Vec::new();
     for (index, item) in expect.callers.iter().enumerate() {
-        results.push(eval_symbol_expectation(ctx, "callers", index, item, SymbolTool::Callers));
+        results.push(skip_or_eval(skip_semantic, "callers", index, item.tier, || {
+            eval_symbol_expectation(ctx, "callers", index, item, SymbolTool::Callers)
+        }));
     }
     for (index, item) in expect.references.iter().enumerate() {
-        results.push(eval_symbol_expectation(ctx, "references", index, item, SymbolTool::References));
+        results.push(skip_or_eval(skip_semantic, "references", index, item.tier, || {
+            eval_symbol_expectation(ctx, "references", index, item, SymbolTool::References)
+        }));
     }
     for (index, item) in expect.implementations.iter().enumerate() {
-        results.push(eval_symbol_expectation(
-            ctx,
-            "implementations",
-            index,
-            item,
-            SymbolTool::Implementations,
-        ));
+        results.push(skip_or_eval(skip_semantic, "implementations", index, item.tier, || {
+            eval_symbol_expectation(ctx, "implementations", index, item, SymbolTool::Implementations)
+        }));
     }
     for (index, item) in expect.imports.iter().enumerate() {
-        results.push(eval_imports_expectation(ctx, index, item));
+        results.push(skip_or_eval(skip_semantic, "imports", index, item.tier, || {
+            eval_imports_expectation(ctx, index, item)
+        }));
     }
     for (index, item) in expect.definition.iter().enumerate() {
-        results.push(eval_definition_expectation(ctx, index, item));
+        results.push(skip_or_eval(skip_semantic, "definition", index, item.tier, || {
+            eval_definition_expectation(ctx, index, item)
+        }));
     }
     results
+}
+
+/// Decision 6: when `skip_semantic` is set and `tier` is `Semantic`, returns
+/// the `Skip` this entry gets instead of running `eval` at all - same id
+/// (`expectations.{kind}[{index}]`) either way, so the report shape and the
+/// entry's position never move, only whether it was actually evaluated.
+fn skip_or_eval(
+    skip_semantic: bool,
+    kind: &str,
+    index: usize,
+    tier: Tier,
+    eval: impl FnOnce() -> CheckResult,
+) -> CheckResult {
+    if skip_semantic && tier == Tier::Semantic {
+        return CheckResult {
+            id: format!("expectations.{kind}[{index}]").into(),
+            outcome: Outcome::Skip(
+                "tier = \"semantic\" and --skip-semantic-expectations was passed - this entry needs the \
+                 plugin's semantic tier, which is assumed unavailable (decision 6)"
+                    .to_string(),
+            ),
+            warnings: Vec::new(),
+        };
+    }
+    eval()
 }
 
 // --- the three symbol_id-anchored tools -------------------------------------
@@ -812,6 +896,46 @@ mod tests {
     fn an_untruncated_dependency_walk_is_not_flagged() {
         let walk = serde_json::json!({"results": [], "truncated": false});
         assert!(walk_truncation_finding(&walk).is_none());
+    }
+
+    /// Decision 6, the parsing half: `tier` defaults to `Structural` when
+    /// absent, and a `[[callers]]` entry that does spell `tier = "semantic"`
+    /// parses to `Tier::Semantic` - the two states `skip_or_eval` branches
+    /// on.
+    #[test]
+    fn tier_defaults_to_structural_and_parses_semantic_when_given() {
+        let file: ExpectFile = toml::from_str(
+            "[[callers]]\nsymbol = \"a\"\nexpect = []\n\n\
+             [[callers]]\nsymbol = \"b\"\nexpect = []\ntier = \"semantic\"\n",
+        )
+        .unwrap();
+        assert_eq!(file.callers[0].tier, Tier::Structural);
+        assert_eq!(file.callers[1].tier, Tier::Semantic);
+    }
+
+    /// Decision 6: with `skip_semantic = true`, a `Semantic`-tier entry never
+    /// calls `eval` at all (it would panic if it did) and reports `Skip`
+    /// under the same id `eval_symbol_expectation` would have used; a
+    /// `Structural` one is unaffected.
+    #[test]
+    fn skip_or_eval_skips_only_the_semantic_tier_entries() {
+        let skipped = skip_or_eval(true, "callers", 2, Tier::Semantic, || panic!("must not run"));
+        assert_eq!(skipped.id, "expectations.callers[2]");
+        assert!(matches!(skipped.outcome, Outcome::Skip(_)), "{:?}", skipped.outcome);
+
+        let ran = skip_or_eval(true, "callers", 0, Tier::Structural, || CheckResult {
+            id: "expectations.callers[0]".into(),
+            outcome: Outcome::Pass,
+            warnings: Vec::new(),
+        });
+        assert_eq!(ran.outcome, Outcome::Pass);
+
+        let ran_without_the_flag = skip_or_eval(false, "callers", 2, Tier::Semantic, || CheckResult {
+            id: "expectations.callers[2]".into(),
+            outcome: Outcome::Pass,
+            warnings: Vec::new(),
+        });
+        assert_eq!(ran_without_the_flag.outcome, Outcome::Pass);
     }
 
     #[test]

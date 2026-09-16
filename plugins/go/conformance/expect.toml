@@ -5,23 +5,37 @@
 #     --fixture plugins/go/conformance/project \
 #     --expect  plugins/go/conformance/expect.toml
 #
-# **Deliberately minimal.** GM-282 owns the full Go expectations file, and
-# this one is not it. Every entry below exists to prove *one* end-to-end
-# claim, and nothing here tries to cover the fixture:
+# GM-282's full file - every category `g-mesh plugins check --expect` can
+# assert, each exercised once rather than exhaustively (`multi-language-
+# plugins.md`'s "Go plugin", GM-282's implementation notes has the design
+# discussion this header summarizes):
 #
-#   - GM-280's claim about the linker contract - that the container-scoped,
-#     `name`-keyed placeholders the structural tier emits are addresses core
-#     can actually resolve (the first five entries);
-#   - GM-281's claim about the semantic tier - that a `go/types` pass
-#     resolves each of the three receiver shapes (through a variable,
-#     through an embedded field, through an interface value) and that
-#     `types.Implements` finds implementers nothing in the syntax declares
-#     (the last four).
+#   - callers, bare and package-qualified (structural, GM-280's claim about
+#     the linker contract - that the container-scoped, `name`-keyed
+#     placeholders the structural tier emits are addresses core can actually
+#     resolve): the two `helper` entries and `Placeholder`;
+#   - callers, receiver/embedded/interface-dispatched (semantic, GM-281's
+#     claim that a `go/types` pass resolves each of the three receiver
+#     shapes core cannot see structurally at all): `Server.Addr` (variable
+#     and embedded field, combined - see that entry), `Server.Close`
+#     (through a struct field) and `Closer.Close` (through an interface
+#     value);
+#   - implementations, implicit (semantic): `Closer`, satisfied by three
+#     types none of which mention it in their syntax;
+#   - imports, container-scoped (structural): `cmd/main.go`'s two imports;
+#   - references (structural): `Server`, used but never called, which is
+#     what makes it a case `[[callers]]` cannot answer at all;
+#   - definition (structural): `Server.Addr`'s own declaration and
+#     `Placeholder`'s.
 #
-# The second group is what makes this file a discrimination test for the
-# semantic tier as a whole: run the same fixture with a `go` binary off
-# PATH, or with the Selections lookup disabled, and exactly those four fail
-# while the five structural ones still pass.
+# **`tier = "semantic"`** marks the four entries that need the `go/types`
+# pass - decision 6 of `expectations.rs`'s own module doc. Run this exact
+# file a second way, `--skip-semantic-expectations` with `go` off `PATH`
+# (the way CI's "no toolchain" job does, and the way `plugins/go/
+# semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
+# measured it at the unit level first): those four report `Skip` instead of
+# running, and the other eleven - every structural entry in this file - keep
+# passing, which is the whole discrimination this file exists to make.
 #
 # Every `expect` list is an exact set, which is what makes the two `helper`
 # entries a real test rather than two ways of finding some function with that
@@ -94,6 +108,7 @@ expect = ["container:fmt", "container:github.com/example/app/server"]
 # which is why they are one expectation rather than two.
 [[callers]]
 symbol = "Server.Addr"
+tier = "semantic"
 expect = ["cmd/main.go:main", "server/logged.go:UseLogged"]
 
 # A method call through a struct field, resolved to the sibling file that
@@ -101,6 +116,7 @@ expect = ["cmd/main.go:main", "server/logged.go:UseLogged"]
 # a selection through a value, and so is the `.Close()` on it.
 [[callers]]
 symbol = "Server.Close"
+tier = "semantic"
 expect = ["server/conn.go:Conn.Close"]
 
 # Receiver call through an *interface value*. The honest answer is the
@@ -110,6 +126,7 @@ expect = ["server/conn.go:Conn.Close"]
 # concrete types.
 [[callers]]
 symbol = "Closer.Close"
+tier = "semantic"
 expect = ["server/conn.go:CloseAll"]
 
 # Implicit implementation: the thing Go's structural interfaces make
@@ -119,8 +136,72 @@ expect = ["server/conn.go:CloseAll"]
 # and the method-set promotion is what satisfies the interface.
 [[implementations]]
 symbol = "Closer"
+tier = "semantic"
 expect = [
   "server/server.go:Server",
   "server/conn.go:Conn",
   "server/logged.go:Logged",
 ]
+
+# --- GM-282: the categories the file above didn't yet cover ----------------
+#
+# The nine entries above already prove callers in five of the ACCEPTANCE
+# shapes (bare same-package: the two `helper` entries; package-qualified:
+# `Placeholder`; receiver-through-a-variable and embedded: the combined
+# `Server.Addr` entry; interface-dispatched: `Closer.Close`), implicit
+# implementations and container imports. What was still unproven: a
+# `[[references]]` entry (the one USAGE_EDGE_KIND `[[callers]]` never
+# exercises - a use that is not a call at all) and `[[definition]]` (the one
+# handler none of the above touches, `find_definition`'s own resolution
+# ladder). Both draw on symbols already in the fixture rather than adding new
+# files, the same way the two `helper` entries above reuse one name across
+# two containers for a reason.
+
+# `Server`'s own type is used, never called, at several sites - which is what
+# makes this entry prove something `[[callers]]` structurally cannot:
+# `find_callers("Server")` would answer nothing, since `Server` is a type,
+# never a callee. Same-file (`New`'s return type and its `&Server{...}`
+# composite literal collapse onto one edge) and, from every method declared
+# on it, the receiver type itself (`Addr`, `Close` - a method's receiver is a
+# use of its type, same as a parameter's). Two sibling files can only *name*
+# it through a container-scoped placeholder: `Conn`'s field and `newConn`'s
+# parameter (conn.go), and `Logged`'s embedded field (logged.go).
+[[references]]
+symbol = "Server"
+file = "server/server.go"
+expect = [
+  "server/server.go:New",
+  "server/server.go:Server.Addr",
+  "server/server.go:Server.Close",
+  "server/conn.go:Conn",
+  "server/conn.go:newConn",
+  "server/logged.go:Logged",
+]
+
+# `Server.Addr`'s own declaration, found directly by its qualifiedName - no
+# semantic pass involved, unlike the `[[callers]]` entry higher up that asks
+# who calls it. `file` is given though the name is already unique (matching
+# `plugins/typescript/conformance/expect.toml`'s `format` entry), since
+# `find_definition` only ever consults it when resolution turns out
+# ambiguous (decision 3) - here it doesn't, and the entry still passes.
+#
+# `helper` was deliberately not used for this: it is declared twice
+# (helper.go and server/conn.go's `helper`), but both share the *same*
+# qualifiedName `helper` - Go's qualifiedName carries no container, unlike a
+# `filePath` - so `file` narrows `find_definition`'s *candidate* list to one
+# but its disambiguated re-call (by qualifiedName; `find_definition` has no
+# `symbol_id`, decision 3) is exactly as ambiguous as the first attempt. Not
+# a fixture gap: no `[[definition]]` entry over two same-qualifiedName Go
+# declarations can ever pass this way, which is worth knowing before
+# reaching for `helper` here again.
+[[definition]]
+symbol = "Server.Addr"
+file = "server/server.go"
+expect = ["server/server.go:Server.Addr"]
+
+# `Placeholder` is declared once in the whole fixture, so no `file` is
+# needed - the direct-answer path `is_candidate_page` has to tell apart from
+# a real candidate page (decision 3's own regression).
+[[definition]]
+symbol = "Placeholder"
+expect = ["main.go:Placeholder"]

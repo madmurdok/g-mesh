@@ -73,11 +73,19 @@ pub struct PluginCheckArgs {
     /// Omit for the contract checks alone.
     #[arg(long)]
     pub expect: Option<PathBuf>,
+    /// Answer every `--expect` entry tagged `tier = "semantic"` with `Skip`
+    /// instead of running it - the reduced set a plugin's semantic tier
+    /// being unavailable (no toolchain on `PATH`) still owes, read from the
+    /// same `--expect` file rather than a second one (`expectations`' module
+    /// doc, decision 6). Meaningless without `--expect`, and ignored then.
+    #[arg(long)]
+    pub skip_semantic_expectations: bool,
 }
 
 /// Runs `g-mesh plugins check`.
 pub fn run(args: &PluginCheckArgs) -> Result<()> {
-    let report = check(&args.plugin_dir, &args.fixture, args.expect.as_deref())?;
+    let report =
+        check(&args.plugin_dir, &args.fixture, args.expect.as_deref(), args.skip_semantic_expectations)?;
     print!("{}", report.render());
     if report.failed() {
         let failed = report.failed_ids();
@@ -97,8 +105,15 @@ pub fn run(args: &PluginCheckArgs) -> Result<()> {
 /// an `Ok` report. `expect` is GM-277's `--expect <expect.toml>` - `None`
 /// means no `"expectations"` section at all, not an empty one (report.rs's
 /// own module doc: "a flag that parses and does nothing would read as
-/// 'expectations passed'").
-pub fn check(plugin_dir: &Path, fixture: &Path, expect: Option<&Path>) -> Result<Report> {
+/// 'expectations passed'"). `skip_semantic` is GM-282's
+/// `--skip-semantic-expectations` (`expectations`' module doc, decision 6);
+/// it does nothing when `expect` is `None`.
+pub fn check(
+    plugin_dir: &Path,
+    fixture: &Path,
+    expect: Option<&Path>,
+    skip_semantic: bool,
+) -> Result<Report> {
     // Canonicalized before `read_manifest`, which requires the directory's
     // own name to equal the manifest's language - `.` has no name to compare.
     let plugin_dir = fs::canonicalize(plugin_dir)
@@ -262,6 +277,7 @@ pub fn check(plugin_dir: &Path, fixture: &Path, expect: Option<&Path>) -> Result
             &scratch,
             bulk1.complete(),
             session.as_ref(),
+            skip_semantic,
         ));
     }
 
@@ -284,6 +300,7 @@ fn expectations_section(
     scratch: &session::Scratch,
     bulk1_complete: bool,
     session: Option<&session::Session>,
+    skip_semantic: bool,
 ) -> Section {
     const FILE_CHECK: &str = "expectations.file";
 
@@ -330,6 +347,6 @@ fn expectations_section(
 
     let mut results =
         vec![CheckResult { id: FILE_CHECK.into(), outcome: Outcome::Pass, warnings: Vec::new() }];
-    results.extend(expectations::evaluate(&ctx, &expect_file));
+    results.extend(expectations::evaluate(&ctx, &expect_file, skip_semantic));
     Section { title: "expectations", results }
 }
