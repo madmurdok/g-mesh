@@ -3,7 +3,15 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking change to this wire contract. A mismatch between
 /// core and plugin is a hard load failure - never best-effort compatibility.
-pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
+///
+/// `2` as of GM-275: every plugin core spawns, bundled JS/TS included, now
+/// speaks wire v2 (`Visibility`, structured `PlaceholderTarget`, and
+/// `SourceTier` plus `engine`) - see this file's own git history for the v1
+/// shapes and the normalization that used to accept both, during the
+/// migration window GM-263 opened and this task closes. A v1 sender is now
+/// an ordinary handshake version mismatch, exactly like any other
+/// (`protocol::handshake::verify`).
+pub const CURRENT_PROTOCOL_VERSION: u32 = 2;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -47,12 +55,86 @@ pub enum EdgeKind {
 }
 
 /// Whether an edge was produced by the fast structural pass or confirmed by
-/// the plugin's semantic layer.
+/// a plugin's semantic layer - the closed set queries and code branch on.
+///
+/// Replaces wire v1's `EdgeSource` (`"tree-sitter" | "ts-compiler"`), which
+/// conflated the *tier* with the one pair of engines the JS/TS plugin
+/// happens to have. [`WireEdge::engine`] is the free-text label that used to
+/// be baked into `EdgeSource`'s two variants; splitting it out is what lets
+/// a Go or Rust plugin report its own engine (`go-parser`, `rust-analyzer`,
+/// ...) without a schema or protocol change - see the design doc's Data
+/// Model > Edge source section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EdgeSource {
-    TreeSitter,
-    TsCompiler,
+#[serde(rename_all = "camelCase")]
+pub enum SourceTier {
+    Syntactic,
+    Semantic,
+}
+
+/// Who may reach a declaration - replaces wire v1's `exported: bool` (Data
+/// Model > Visibility). `exported` stays a *derived storage column*
+/// (`Public` => `true`, everything else => `false`), so `get_file_outline`'s
+/// output does not change; only the wire shape and the in-core type move to
+/// this richer enum, which is what lets a container-scoped visibility (Go
+/// unexported, Rust private, Java package-private, ...) answers
+/// differently from a file-private one in `graph::symbol_links`'s
+/// container-aware visibility check (GM-266; its module doc has the rules).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Visibility {
+    Public,
+    File,
+    Container(String),
+}
+
+/// Which kind of thing a [`PlaceholderTarget`] is anchored to: a single file
+/// (TS's own convention, and every language before containers exist), or a
+/// logical container - a Go package, Rust module, C# namespace, ... (Data
+/// Model > Logical containers). `graph::symbol_links` looks a `Container`
+/// target up among that container's members (GM-266), and `graph::imports`
+/// links a `Container` import onto the container node itself (GM-267).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetScope {
+    File(String),
+    Container(String),
+}
+
+/// How a [`PlaceholderTarget`] names the thing it wants inside its `scope`:
+/// a bare `name` (ambiguous if several match - every structural tier's own
+/// contract, `*`/`default` included, ties to this) or an exact
+/// `qualifiedName` (a semantic tier's answer - matches one declaration with
+/// nothing left to disambiguate). See the design doc's Data Model >
+/// Structured placeholder targets and Interfaces > Linker contract sections
+/// for the full rules each key gets from the linker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetKey {
+    Name(String),
+    QualifiedName(String),
+}
+
+/// What a placeholder [`WireNode`] is waiting on - replaces the `<file>#
+/// <name>` convention that used to be packed into `qualifiedName` (see
+/// `graph::symbol_links`'s and `graph::imports`'s module docs) with a
+/// structured row, so a container scope or a semantic tier's exact-match
+/// answer no longer has to be smuggled through a string two different call
+/// sites each parse by their own convention.
+///
+/// Required (via [`WireNode::target`]) exactly when `nativeKind` is one of
+/// the placeholder kinds - `pending_symbol`, `reexport`, `resolved_module` -
+/// which `protocol::conformance`'s shape check enforces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceholderTarget {
+    pub scope: TargetScope,
+    pub key: TargetKey,
+    /// The requester's own container, carried onto the placeholder for the
+    /// container-scoped [`Visibility`] check a future linker pass runs once
+    /// it has resolved a candidate. `None` for a language with no containers
+    /// (every language today), same as [`WireNode::container`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_container: Option<String>,
 }
 
 /// One declaration of a symbol written as several - an overload signature
@@ -80,6 +162,14 @@ pub struct WireDeclaration {
 }
 
 /// Bulk-transfer wire shape for a single graph node (one NDJSON line).
+///
+/// The protocol v2 shape, both received from a plugin and (in tests) sent to
+/// one - every plugin core spawns speaks this shape as of GM-275, so there is
+/// nothing left to normalize between deserializing and handing a `WireNode`
+/// to the rest of core. (Until GM-275, this type's `Deserialize` was
+/// hand-written to also accept wire v1's `exported`/derived-`target` shape
+/// from the not-yet-migrated JS/TS plugin - see this file's git history if
+/// that normalization is ever needed again.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireNode {
@@ -91,7 +181,7 @@ pub struct WireNode {
     pub range: Range,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    pub exported: bool,
+    pub visibility: Visibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_comment: Option<String>,
     pub language: String,
@@ -110,9 +200,35 @@ pub struct WireNode {
     /// declaration" - hence `Option`, not `Vec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declarations: Option<Vec<WireDeclaration>>,
+    /// Logical container this declaration is a member of - a Go import path,
+    /// a Rust module path, ... (Data Model > Logical containers). `None` for
+    /// a language with no containers (TS/JS today, and every v1 plugin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// `container`'s own parent key, sent alongside every member rather than
+    /// looked up separately - core, not the plugin, materializes container
+    /// nodes, so this is the only place a parent relationship is ever
+    /// stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_parent: Option<String>,
+    /// What this node is waiting to be linked onto. Required iff
+    /// `native_kind` is a placeholder kind (`pending_symbol`, `reexport`,
+    /// `resolved_module`) - `protocol::conformance`'s shape check enforces
+    /// this on the normalized (i.e. this) form, so a v1 placeholder whose
+    /// legacy address is derivable still passes. `None` for an ordinary
+    /// declaration, and for a placeholder a v1 sender's legacy address could
+    /// not be derived from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PlaceholderTarget>,
 }
 
 /// Bulk-transfer wire shape for a single graph edge (one NDJSON line).
+///
+/// The protocol v2 shape both ways, like [`WireNode`] - a plain
+/// `#[derive(Deserialize)]`, since GM-275 retired the v1 `source`-alone shape
+/// this type's `Deserialize` used to also accept (see this file's git history
+/// for `WireEdgeOnWire`/`normalize_source` if that shape is ever relevant
+/// again).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireEdge {
@@ -120,7 +236,8 @@ pub struct WireEdge {
     pub from_id: String,
     pub to_id: String,
     pub kind: EdgeKind,
-    pub source: EdgeSource,
+    pub source: SourceTier,
+    pub engine: String,
     pub resolved: bool,
     /// Which of the target's declarations this edge binds, as an ordinal into
     /// its declaration list. Set only on [`EdgeKind::Calls`], only by the
@@ -146,10 +263,11 @@ pub enum RequestId {
 }
 
 /// The control-plane payload shapes: reindex request, file-changed
-/// notification, status query, semantic-pass request. Which of these is a
-/// "request" (expects a response) vs. a "notification" (fire-and-forget) is
-/// determined by whether `ControlEnvelope.id` is present, per JSON-RPC 2.0 -
-/// not by this enum itself.
+/// notification, status query, semantic-pass request, workspace-changed
+/// notification. Which of these is a "request" (expects a response) vs. a
+/// "notification" (fire-and-forget) is determined by whether
+/// `ControlEnvelope.id` is present, per JSON-RPC 2.0 - not by this enum
+/// itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "camelCase")]
 pub enum ControlMessage {
@@ -179,6 +297,17 @@ pub enum ControlMessage {
     #[serde(rename_all = "camelCase")]
     SemanticPass {
         file_paths: Vec<String>,
+    },
+    /// Tells a plugin its cached module/crate map is stale - a workspace
+    /// file changed (`plugin.toml`'s `workspace.watch_files`, e.g. `go.mod`,
+    /// `Cargo.toml`), so whatever it memoized about the project's module
+    /// layout no longer applies. A notification, not a request: core always
+    /// follows it with the per-language reindex that actually repopulates
+    /// the graph, so the plugin never has to answer with a diff of its own
+    /// (design doc's Interfaces > Wire v2 section).
+    #[serde(rename_all = "camelCase")]
+    WorkspaceChanged {
+        file_path: String,
     },
 }
 
@@ -258,18 +387,23 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: Some("fn foo()".to_string()),
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
         let round_tripped: WireNode = serde_json::from_str(&json).unwrap();
         assert_eq!(node, round_tripped);
         assert!(json.contains("\"qualifiedName\""));
+        assert!(json.contains("\"visibility\":\"public\""), "{json}");
+        assert!(!json.contains("\"exported\""), "v2 serialization never emits the legacy field: {json}");
     }
 
     #[test]
@@ -279,23 +413,104 @@ mod tests {
             from_id: "n1".to_string(),
             to_id: "n2".to_string(),
             kind: EdgeKind::SupertypeOf,
-            source: EdgeSource::TsCompiler,
+            source: SourceTier::Semantic,
+            engine: "ts-compiler".to_string(),
             resolved: true,
             to_declaration: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();
         assert!(json.contains("\"SUPERTYPE_OF\""));
-        assert!(json.contains("\"ts-compiler\""));
+        assert!(json.contains("\"source\":\"semantic\""), "{json}");
+        assert!(json.contains("\"engine\":\"ts-compiler\""), "{json}");
         let round_tripped: WireEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(edge, round_tripped);
     }
 
-    /// Exactly what `toWireNode` (plugins/typescript/src/bulkIndex.ts) emits for an
-    /// overloaded `parse` - copied from that plugin's own output rather than
-    /// hand-written, so this asserts against the real wire bytes and not
-    /// against what serde would have produced from the Rust struct.
-    const OVERLOADED_NODE_LINE: &str = r#"{"id":"5ff9a3373000bb2f00e38ba616f6cd46","kind":"Function","name":"parse","qualifiedName":"parse","filePath":"src/overloads.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"parse(input: string): string[]","exported":true,"docComment":"Parses a value.","language":"typescript","nativeKind":"function","hasSyntaxErrors":false,"declarations":[{"ordinal":0,"startLine":1,"startCol":7,"endLine":1,"endCol":47,"hasBody":false,"signature":"parse(input: string): string[]"},{"ordinal":1,"startLine":2,"startCol":7,"endLine":2,"endCol":61,"hasBody":false,"signature":"parse(input: number, radix?: number): number"},{"ordinal":2,"startLine":3,"startCol":7,"endLine":5,"endCol":1,"hasBody":true,"signature":"parse(input: string | number, radix?: number): any"}]}"#;
+    #[test]
+    fn visibility_round_trips_every_variant() {
+        for (visibility, json) in [
+            (Visibility::Public, "\"public\""),
+            (Visibility::File, "\"file\""),
+            (Visibility::Container("github.com/x/pkg".to_string()), "{\"container\":\"github.com/x/pkg\"}"),
+        ] {
+            assert_eq!(serde_json::to_string(&visibility).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Visibility>(json).unwrap(), visibility);
+        }
+    }
+
+    #[test]
+    fn target_scope_round_trips_both_variants() {
+        for (scope, json) in [
+            (TargetScope::File("src/a.ts".to_string()), r#"{"file":"src/a.ts"}"#),
+            (TargetScope::Container("github.com/x/pkg".to_string()), r#"{"container":"github.com/x/pkg"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).unwrap(), json);
+            assert_eq!(serde_json::from_str::<TargetScope>(json).unwrap(), scope);
+        }
+    }
+
+    #[test]
+    fn target_key_round_trips_both_variants() {
+        for (key, json) in [
+            (TargetKey::Name("foo".to_string()), r#"{"name":"foo"}"#),
+            (TargetKey::QualifiedName("Server.Close".to_string()), r#"{"qualifiedName":"Server.Close"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&key).unwrap(), json);
+            assert_eq!(serde_json::from_str::<TargetKey>(json).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn source_tier_round_trips_both_variants() {
+        for (tier, json) in [(SourceTier::Syntactic, "\"syntactic\""), (SourceTier::Semantic, "\"semantic\"")]
+        {
+            assert_eq!(serde_json::to_string(&tier).unwrap(), json);
+            assert_eq!(serde_json::from_str::<SourceTier>(json).unwrap(), tier);
+        }
+    }
+
+    /// A full v2-native node: container membership plus a container-scoped,
+    /// qualifiedName-keyed target - the shape only a semantic tier over a
+    /// containered language (Go, Rust, ...) will ever actually send, but
+    /// which the wire format has to carry correctly today regardless.
+    #[test]
+    fn wire_node_v2_shape_round_trips_container_and_target() {
+        let node = WireNode {
+            id: "n1".to_string(),
+            kind: NodeKind::Function,
+            name: "Close".to_string(),
+            qualified_name: "Server.Close".to_string(),
+            file_path: "server.go".to_string(),
+            range: Range { start: Position { line: 4, col: 0 }, end: Position { line: 6, col: 1 } },
+            signature: None,
+            visibility: Visibility::Container("github.com/x/app/server".to_string()),
+            doc_comment: None,
+            language: "go".to_string(),
+            native_kind: Some("pending_symbol".to_string()),
+            has_syntax_errors: false,
+            declarations: None,
+            container: Some("github.com/x/app/server".to_string()),
+            container_parent: None,
+            target: Some(PlaceholderTarget {
+                scope: TargetScope::Container("github.com/x/app/server".to_string()),
+                key: TargetKey::QualifiedName("Server.Close".to_string()),
+                from_container: Some("github.com/x/app/client".to_string()),
+            }),
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"container\":\"github.com/x/app/server\""), "{json}");
+        assert!(json.contains("\"qualifiedName\":\"Server.Close\""), "{json}");
+        let round_tripped: WireNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(node, round_tripped);
+    }
+
+    /// Exactly what `toWireNode` (plugins/typescript/src/bulkIndex.ts) emits
+    /// for an overloaded `parse` - copied from that plugin's own output
+    /// rather than hand-written, so this asserts against the real wire bytes
+    /// and not against what serde would have produced from the Rust struct.
+    const OVERLOADED_NODE_LINE: &str = r#"{"id":"5ff9a3373000bb2f00e38ba616f6cd46","kind":"Function","name":"parse","qualifiedName":"parse","filePath":"src/overloads.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"parse(input: string): string[]","visibility":"public","docComment":"Parses a value.","language":"typescript","nativeKind":"function","hasSyntaxErrors":false,"declarations":[{"ordinal":0,"startLine":1,"startCol":7,"endLine":1,"endCol":47,"hasBody":false,"signature":"parse(input: string): string[]"},{"ordinal":1,"startLine":2,"startCol":7,"endLine":2,"endCol":61,"hasBody":false,"signature":"parse(input: number, radix?: number): number"},{"ordinal":2,"startLine":3,"startCol":7,"endLine":5,"endCol":1,"hasBody":true,"signature":"parse(input: string | number, radix?: number): any"}]}"#;
 
     #[test]
     fn a_declaration_list_deserializes_from_what_the_plugin_actually_sends() {
@@ -309,6 +524,7 @@ mod tests {
         assert_eq!(declarations[0].signature.as_deref(), Some("parse(input: string): string[]"));
         assert!(!declarations[0].has_body);
         assert!(declarations[2].has_body, "the implementation is the one with a body");
+        assert_eq!(node.visibility, Visibility::Public);
 
         // Re-serializing has to produce the same list back, since this is the
         // shape core hands to storage.
@@ -329,24 +545,28 @@ mod tests {
             file_path: "src/lib.ts".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "typescript".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
         assert!(!json.contains("declarations"), "{json}");
 
-        // And a line from a plugin that never heard of the field is still a
-        // valid node, rather than a parse failure.
+        // And a minimal line that never heard of `declarations` at all is
+        // still a valid node, rather than a parse failure.
         let without: WireNode = serde_json::from_str(
-            r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"foo","filePath":"src/lib.ts","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"exported":true,"language":"typescript"}"#,
+            r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"foo","filePath":"src/lib.ts","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"visibility":"public","language":"typescript"}"#,
         )
         .unwrap();
         assert_eq!(without.declarations, None);
+        assert_eq!(without.visibility, Visibility::Public);
     }
 
     #[test]
@@ -356,7 +576,8 @@ mod tests {
             from_id: "n1".to_string(),
             to_id: "n2".to_string(),
             kind: EdgeKind::Calls,
-            source: EdgeSource::TreeSitter,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
         };
@@ -373,6 +594,54 @@ mod tests {
         let json = serde_json::to_string(&first).unwrap();
         assert!(json.contains("\"toDeclaration\":0"), "{json}");
         assert_eq!(serde_json::from_str::<WireEdge>(&json).unwrap().to_declaration, Some(0));
+    }
+
+    // --- Wire v1 is rejected, not normalized (GM-275) -----------------------
+    //
+    // Before GM-275, `WireNode`/`WireEdge` accepted both shapes below and
+    // normalized a v1 sender's `exported`/bare `source` into the v2 fields -
+    // see this file's git history for the mapping tests that exercised that
+    // (real `--bulk-index` output from the not-yet-migrated JS/TS plugin).
+    // Every plugin core spawns speaks v2 now, so a v1-shaped line is simply a
+    // parse failure like any other malformed message - the same failure mode
+    // `protocol::conformance`'s `shape` check and `cli::plugin_check` surface
+    // it through, and the same reasoning `handshake::verify` applies one
+    // level up (a protocol is code, not data - there is nothing left to
+    // reconcile once a version no longer matches).
+
+    #[test]
+    fn a_v1_shaped_node_exported_instead_of_visibility_is_rejected_with_a_clear_error() {
+        let v1_line = r#"{"id":"n1","kind":"Function","name":"run","qualifiedName":"run","filePath":"caller.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"run(): void","exported":true,"docComment":null,"language":"typescript","nativeKind":"function","hasSyntaxErrors":false}"#;
+        let err = serde_json::from_str::<WireNode>(v1_line).unwrap_err();
+        assert!(err.to_string().contains("visibility"), "{err}");
+    }
+
+    #[test]
+    fn a_v1_shaped_edge_bare_tree_sitter_source_instead_of_source_plus_engine_is_rejected_with_a_clear_error()
+    {
+        // `"tree-sitter"` was a valid v1 `source` value; it is not a
+        // `SourceTier` at all in v2 ("syntactic"/"semantic" plus a separate
+        // `engine"), so this now fails to parse `source` itself rather than
+        // being accepted and missing `engine`.
+        let v1_line =
+            r#"{"id":"e1","fromId":"n1","toId":"n2","kind":"CALLS","source":"tree-sitter","resolved":false}"#;
+        let err = serde_json::from_str::<WireEdge>(v1_line).unwrap_err();
+        assert!(err.to_string().contains("tree-sitter"), "{err}");
+        assert!(err.to_string().contains("syntactic") || err.to_string().contains("semantic"), "{err}");
+    }
+
+    #[test]
+    fn a_node_missing_visibility_is_rejected() {
+        let json = r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"foo","filePath":"a.ts","range":{"start":{"line":0,"col":0},"end":{"line":0,"col":1}},"language":"typescript"}"#;
+        let err = serde_json::from_str::<WireNode>(json).unwrap_err();
+        assert!(err.to_string().contains("visibility"), "{err}");
+    }
+
+    #[test]
+    fn an_edge_missing_source_is_rejected() {
+        let json = r#"{"id":"e1","fromId":"n1","toId":"n2","kind":"CALLS","resolved":false}"#;
+        let err = serde_json::from_str::<WireEdge>(json).unwrap_err();
+        assert!(err.to_string().contains("source"), "{err}");
     }
 
     #[test]
@@ -438,6 +707,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_changed_round_trips_as_a_notification() {
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::WorkspaceChanged { file_path: "go.mod".to_string() },
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"workspaceChanged\""), "{json}");
+        assert!(json.contains("\"filePath\":\"go.mod\""), "{json}");
+        assert!(!json.contains("\"id\""), "notifications must omit id per JSON-RPC 2.0");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
+
+    #[test]
     fn file_change_diff_round_trips_with_camel_case_keys() {
         let diff = FileChangeDiff {
             upsert_nodes: vec![WireNode {
@@ -448,12 +733,15 @@ mod tests {
                 file_path: "src/lib.rs".to_string(),
                 range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
                 signature: None,
-                exported: true,
+                visibility: Visibility::Public,
                 doc_comment: None,
                 language: "rust".to_string(),
                 native_kind: None,
                 has_syntax_errors: false,
                 declarations: None,
+                container: None,
+                container_parent: None,
+                target: None,
             }],
             delete_node_ids: vec!["n2".to_string()],
             upsert_edges: vec![WireEdge {
@@ -461,7 +749,8 @@ mod tests {
                 from_id: "n1".to_string(),
                 to_id: "n3".to_string(),
                 kind: EdgeKind::Calls,
-                source: EdgeSource::TreeSitter,
+                source: SourceTier::Syntactic,
+                engine: "tree-sitter".to_string(),
                 resolved: false,
                 to_declaration: None,
             }],
@@ -505,7 +794,7 @@ mod tests {
     #[test]
     fn handshake_payload_round_trips() {
         let example = r#"{
-            "protocolVersion": 1,
+            "protocolVersion": 2,
             "language": "typescript",
             "pluginVersion": "0.1.0"
         }"#;

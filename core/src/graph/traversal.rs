@@ -352,8 +352,8 @@ fn run_walk(
         "{cte} \
          SELECT n.*, w.depth AS depth, \
                 e.id AS walkedEdgeId, e.fromId AS walkedFromId, e.toId AS walkedToId, \
-                e.kind AS walkedKind, e.source AS walkedSource, e.resolved AS walkedResolved, \
-                e.toDeclaration AS walkedToDeclaration \
+                e.kind AS walkedKind, e.source AS walkedSource, e.engine AS walkedEngine, \
+                e.resolved AS walkedResolved, e.toDeclaration AS walkedToDeclaration \
          FROM walk w \
          JOIN nodes n ON n.id = w.node_id \
          LEFT JOIN edges e ON e.id = w.edge_id \
@@ -372,6 +372,7 @@ fn run_walk(
                     to_id: row.get("walkedToId")?,
                     kind: row.get("walkedKind")?,
                     source: row.get("walkedSource")?,
+                    engine: row.get("walkedEngine")?,
                     resolved: row.get("walkedResolved")?,
                     to_declaration: row.get("walkedToDeclaration")?,
                 }),
@@ -464,7 +465,7 @@ mod tests {
 
     fn make_edge(conn: &Connection, id: &str, from: &str, to: &str, kind: &str) {
         conn.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, ?4, 'tree-sitter', 1)",
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES (?1, ?2, ?3, ?4, 'syntactic', 'tree-sitter', 1)",
             params![id, from, to, kind],
         )
         .unwrap();
@@ -481,17 +482,17 @@ mod tests {
                  INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
                  SELECT 'n' || printf('%08d', i), 'Function', 'n', 'n', 'src/lib.rs', 0, 0, 0, 0, 'rust' FROM seq;
              WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < {parents})
-                 INSERT INTO edges (id, fromId, toId, kind, source, resolved)
-                 SELECT 'e' || printf('%08d', i), 'root', 'n' || printf('%08d', i), 'CALLS', 'tree-sitter', 1 FROM seq;"
+                 INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved)
+                 SELECT 'e' || printf('%08d', i), 'root', 'n' || printf('%08d', i), 'CALLS', 'syntactic', 'tree-sitter', 1 FROM seq;"
         );
         if children > 0 {
             sql.push_str(&format!(
                 "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < {parents} * {children})
-                     INSERT INTO edges (id, fromId, toId, kind, source, resolved)
+                     INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved)
                      SELECT 'g' || printf('%08d', i),
                             'n' || printf('%08d', (i - 1) / {children} + 1),
                             'n' || printf('%08d', {parents} + i),
-                            'CALLS', 'tree-sitter', 1
+                            'CALLS', 'syntactic', 'tree-sitter', 1
                      FROM seq;"
             ));
         }
@@ -548,7 +549,7 @@ mod tests {
                 )
                 .unwrap();
             let mut insert_edge = tx
-                .prepare("INSERT INTO edges (id, fromId, toId, kind, source, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'tree-sitter', 1)")
+                .prepare("INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'syntactic', 'tree-sitter', 1)")
                 .unwrap();
 
             for p in 0..parents {

@@ -40,15 +40,17 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
+use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
+use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
 /// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
-const BULK_INDEX_FLAG: &str = "--bulk-index";
+pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 
 /// Nodes plus edges accumulated before a batch is committed. One `Diff` for
 /// the whole project would mean holding a large repo's entire graph in memory
@@ -175,7 +177,16 @@ pub fn run(
 /// independently readable, and so a failure partway through one language's
 /// walk (an unreadable line, a spawn failure, a nonzero exit) can name that
 /// language directly.
-fn walk_one_language(
+///
+/// `pub(crate)` rather than private since GM-272: `daemon::workspace_reindex`
+/// reuses this exact function, unchanged, to re-walk a *single* language
+/// after its rows were deleted - the same one-shot `--bulk-index` process
+/// this module already spawns for the cold-start walk, just invoked for one
+/// manifest instead of iterated over every discovered one. Nothing about the
+/// batching/commit contract above changes for that caller: a per-language
+/// reindex is still safe to cut anywhere, for the same reason a cold-start
+/// walk is (see this module's own doc comment above [`run`]).
+pub(crate) fn walk_one_language(
     project_root: &Path,
     manifest: &PluginManifest,
     conn: &Mutex<Connection>,
@@ -215,6 +226,30 @@ fn walk_one_language(
     if !status.success() {
         bail!("the {} plugin's bulk index exited with {status}", manifest.language);
     }
+
+    // This language's own half of `record_bulk_index`'s project-wide roll-up
+    // (`storage::schema`'s own doc comment on the two functions has the full
+    // reasoning): `walk_one_language` is the one place that reliably knows
+    // *which* language just finished its walk, so it records that language's
+    // `language_state.bulkIndexedAt` itself, right here, rather than leaving
+    // it to `run`'s caller - which only ever asks for the roll-up as a whole,
+    // once, after every language in this loop is done.
+    //
+    // `plugin::fingerprint(manifest)` is "readily available at the write
+    // site" in exactly the sense this task scopes populating
+    // `pluginFingerprint` to: `manifest` is already in hand here, and
+    // `daemon::registry::indexer_version` already computes the very same
+    // digest over every discovered plugin at daemon startup - so recomputing
+    // it for this one language costs nothing this walk was not already going
+    // to pay for elsewhere in spirit, and it is the one write site this
+    // column has today (see `language_state`'s own DDL comment on who else,
+    // if anyone, would fill it).
+    schema::record_language_bulk_indexed(
+        &conn.lock().unwrap(),
+        &manifest.language,
+        Some(&plugin::fingerprint(manifest)),
+    )
+    .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
 
     Ok(())
 }
@@ -257,7 +292,7 @@ fn hold_the_walk_open_for_tests() {
 /// `linked_symbols`, which [`run`] computes once, project-wide, after every
 /// language's ingest loop like this one has run, not per language (see
 /// [`run`]'s doc comment for why).
-fn ingest<R: BufRead>(
+pub(crate) fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
@@ -269,7 +304,7 @@ fn ingest<R: BufRead>(
     for item in NdjsonReader::new(reader) {
         match item {
             Ok(BulkItem::Node(node)) => {
-                batch.upsert_nodes.push(to_node_record(node));
+                batch.upsert_nodes.push(to_node_record(*node));
                 summary.nodes += 1;
             }
             Ok(BulkItem::Edge(edge)) => {
@@ -322,7 +357,9 @@ fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range, WireEdge, WireNode};
+    use crate::protocol::types::{
+        EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
+    };
     use crate::storage::schema;
     use std::io::Cursor;
 
@@ -353,12 +390,15 @@ mod tests {
             file_path: "src/a.ts".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 2, col: 0 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "typescript".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         })
         .unwrap()
     }
@@ -369,7 +409,8 @@ mod tests {
             from_id: from.to_string(),
             to_id: to.to_string(),
             kind: EdgeKind::Calls,
-            source: EdgeSource::TreeSitter,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
         })

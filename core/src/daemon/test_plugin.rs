@@ -82,14 +82,99 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 /// request that carried an id - see this module's "Counting round trips" doc.
 const REQUEST_LOG: &str = "requests.log";
 
+/// The file each fake plugin process appends one line to per **notification**
+/// it received - a framed message with no `id`, answered with nothing per
+/// JSON-RPC 2.0. Kept apart from [`REQUEST_LOG`] rather than folded into it:
+/// every existing caller of [`requests`]/[`file_changed_requests`] already
+/// assumes each line there is a real id-carrying round trip (GM-270's
+/// `only_the_semantic_pass_capable_language_receives_the_request` among
+/// them), and a notification is a different kind of thing on the wire - it
+/// gets no response frame at all, unlike every entry `REQUEST_LOG` holds.
+/// GM-272 is the first fixture that needs to observe one:
+/// `ControlMessage::WorkspaceChanged` (GM-263) is sent as a notification, and
+/// its whole test-visible existence is "did the plugin see it happen", which
+/// only [`notifications`] can answer.
+const NOTIFICATION_LOG: &str = "notifications.log";
+
+/// Marks that a [`install_stalling`] plugin directory's *very first* framed
+/// request has already been (deliberately) left unanswered - see that
+/// function's doc comment. Written by the process that hits it, and read by
+/// every process spawned against this plugin directory afterward - including
+/// a crash-recovery relaunch, which is a fresh Node process with no memory of
+/// its predecessor's in-memory state, but the same directory on disk.
+const STALL_MARKER: &str = "stalled-once.marker";
+
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
 ///
 /// Laid out exactly as a real one is (`<root>/<language>/plugin.toml`), so
 /// `daemon::manifest::discover(&[root])` picks it up with no test-only path
 /// through discovery.
+///
+/// No `[plugin.capabilities]` table at all - the same "says nothing" shape a
+/// hand-written manifest predating GM-270 has - so `Capabilities::default`
+/// reads it as `semantic_pass = false`: this fixture's plugin is never sent a
+/// `semanticPass` request. Use [`install_semantic_pass_capable`] for a
+/// language GM-270's per-language scheduler should ask for a pass.
 pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, false)
+    install_inner(root, language, extensions, false, false, false, false, &[], &[])
+}
+
+/// [`install`], but the manifest also carries a `[plugin.workspace]` table
+/// with `watch_files`/`exclude_dirs` - GM-272's fixture for a language whose
+/// `daemon::registry::PluginRegistry::workspace_language_matches`/
+/// `route_settled_path` must route a settled path to a per-language reindex
+/// (`watch_files`) or refuse to route one at all (`exclude_dirs`), instead of
+/// the ordinary extension routing every other `install*` fixture here
+/// exercises. Each entry in `watch_files` is written into the manifest
+/// exactly as given - an exact name (`"go.mod"`) or a genuine glob
+/// (`"*.csproj"`) both compile the same way through `daemon::manifest::
+/// read_manifest`'s `Glob::new`, so this fixture needs no separate "glob"
+/// variant to test glob matching specifically.
+pub(crate) fn install_with_workspace(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> PathBuf {
+    install_inner(root, language, extensions, false, false, false, false, watch_files, exclude_dirs)
+}
+
+/// [`install_with_workspace`], but also `[plugin.capabilities] semantic_pass
+/// = true` (like [`install_semantic_pass_capable`]) - GM-272's fixture for
+/// checking that a workspace reindex's semantic phase
+/// (`daemon::workspace_reindex::run`) is asked for, and its
+/// `language_state.semanticPassAt` recorded, exactly for the one language
+/// being reindexed.
+pub(crate) fn install_with_workspace_semantic_pass_capable(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true, false, watch_files, exclude_dirs)
+}
+
+/// [`install`], but the manifest declares `[plugin.capabilities]
+/// semantic_pass = true` - GM-270's fixture for a language whose plugin
+/// `daemon::semantic::run_with_registry`/`run_once` must ask for a
+/// whole-project pass, and whose per-file `fileChanged` round trip
+/// (`watcher::apply::apply_file_change`) must be followed by a `semanticPass`
+/// request too.
+///
+/// The fake plugin's own wire behaviour is unchanged either way - it answers
+/// *any* id-carrying request with an empty `{}` diff, `fileChanged` and
+/// `semanticPass` alike (see this module's own doc comment on
+/// [`requests`]/[`file_changed_requests`]) - so this capability changes only
+/// whether core *sends* the `semanticPass` request at all, which is exactly
+/// what GM-270's tests (`requests.log` assertions) are about. Installing two
+/// languages with different capabilities - one via this function, one via
+/// [`install`] - is what lets a test prove only the capable one ever receives
+/// it.
+pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true, false, &[], &[])
 }
 
 /// [`install`], but the plugin does not answer its handshake until
@@ -117,7 +202,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
 pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
-    install_inner(root, language, extensions, true)
+    install_inner(root, language, extensions, true, false, false, false, &[], &[])
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
@@ -128,13 +213,88 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
         .expect("failed to open the fake plugin's handshake gate");
 }
 
-fn install_inner(root: &Path, language: &str, extensions: &[&str], gated: bool) -> PathBuf {
+/// [`install`], but the plugin completes its handshake normally and then
+/// never answers the *first* framed request it ever sees for this plugin
+/// directory - it still parses that request and logs it to `requests.log`
+/// ([`requests`]), so a test can confirm the request really was received, but
+/// it deliberately never writes the response frame back. Every request after
+/// that first one - including the first one a crash-recovery relaunch's fresh
+/// process sees - is answered normally, exactly like [`install`].
+///
+/// This is task GM-271's fixture: a language whose plugin is up, has shaken
+/// hands, and then hangs on exactly one request - the "semantic engine hangs
+/// or is slow" failure mode `docs/architecture/multi-language-plugins.md`'s
+/// Failure Modes section describes, and exactly the shape nothing but a
+/// per-request timeout can recover from (a debounce, a retry, a bigger read
+/// buffer - none of them help when the peer is simply never going to write
+/// anything for *that* request). "Exactly one request, ever" rather than
+/// "every request forever" is deliberate: it is what lets a test observe the
+/// *whole* recovery cycle - timeout, relaunch, and a subsequent replay that
+/// actually succeeds - rather than an unbounded retry loop that never
+/// converges. The "already stalled once" fact is persisted to
+/// [`STALL_MARKER`] in this plugin's own directory, not held in the process's
+/// memory, specifically so it survives exactly the event this fixture exists
+/// to provoke: a crash-recovery relaunch, which is a brand new Node process
+/// with no memory of what its predecessor already did.
+///
+/// The stalled process itself stays alive and keeps its stdin open (unlike a
+/// crashed plugin, whose pipes are already closed) - so a test using this
+/// fixture is specifically exercising the *timeout* path, not the
+/// pre-existing "process exited" crash-recovery path
+/// `plugin_crash_recovery.rs` already covers. It still exits cleanly if core
+/// closes its stdin (the same `end`-handler exit every fixture here has), and
+/// it dies immediately if killed - which is exactly what
+/// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
+/// it runs past its budget.
+pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, true, false, false, &[], &[])
+}
+
+/// [`install_semantic_pass_capable`], but the fake plugin process also
+/// allocates and holds onto a large buffer right after its handshake - task
+/// GM-274's fixture for `[plugin] memoryLimitMb`: a real Node child process
+/// whose resident memory a test can actually put a low configured limit
+/// under, exercised by `daemon::lifecycle::PluginSupervisor::check_memory_limit`'s
+/// own sampling (`daemon::memory::process_tree_rss_mb`), not by a mock.
+///
+/// `semantic_pass` capable (unlike plain [`install`]) so a test using this
+/// fixture can also prove the *other* half of GM-274: once this language is
+/// suspended, no `semanticPass` request reaches it, even though its manifest
+/// says it would otherwise receive one - the discriminating condition every
+/// other capability test in this module already relies on
+/// ([`install_semantic_pass_capable`]'s own doc comment).
+///
+/// 200MB is comfortably above a bare Node process's baseline RSS
+/// (~20-40MB, measured on this repo's own dev machine) and comfortably below
+/// anything that would make this fixture slow or flaky to allocate - the
+/// point is a real, measurable spike a low test-only `memoryLimitMb` (well
+/// under 200MB, well over the idle baseline) can reliably catch, not a
+/// pathological one.
+pub(crate) fn install_memory_hungry(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+    install_inner(root, language, extensions, false, false, true, true, &[], &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_inner(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    gated: bool,
+    stalling: bool,
+    semantic_pass: bool,
+    memory_hungry: bool,
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language, gated))
+    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling, memory_hungry))
         .expect("failed to write the fake plugin's entry point");
-    fs::write(dir.join("plugin.toml"), manifest(language, extensions))
-        .expect("failed to write the fake plugin's manifest");
+    fs::write(
+        dir.join("plugin.toml"),
+        manifest(language, extensions, semantic_pass, watch_files, exclude_dirs),
+    )
+    .expect("failed to write the fake plugin's manifest");
     dir
 }
 
@@ -152,6 +312,16 @@ pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
 /// Empty (rather than a panic) before the first one, same as [`spawns`].
 pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(REQUEST_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Every **notification** (a framed message with no `id`) this plugin
+/// directory's process(es) have ever received, oldest first, across every
+/// spawn, as `"<method> <filePath>"` - see [`NOTIFICATION_LOG`]'s own doc
+/// comment for why this is a separate log from [`requests`] rather than the
+/// same one. Empty before the first one, same as [`requests`]/[`spawns`].
+pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugin_dir.join(NOTIFICATION_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
 
@@ -182,8 +352,34 @@ pub(crate) fn empty_index() -> Mutex<Connection> {
     Mutex::new(conn)
 }
 
-fn manifest(language: &str, extensions: &[&str]) -> String {
+/// `semantic_pass` controls whether the manifest carries a
+/// `[plugin.capabilities] semantic_pass = true` table at all - see
+/// [`install`]/[`install_semantic_pass_capable`]'s own doc comments. `false`
+/// omits the table entirely rather than writing `semantic_pass = false`
+/// explicitly, matching what a real hand-written manifest predating GM-270
+/// looks like - both read the same way through `Capabilities::default`, but
+/// the omitted-table shape is the one this fixture is standing in for.
+fn manifest(
+    language: &str,
+    extensions: &[&str],
+    semantic_pass: bool,
+    watch_files: &[&str],
+    exclude_dirs: &[&str],
+) -> String {
     let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+    let capabilities = if semantic_pass { "\n[plugin.capabilities]\nsemantic_pass = true\n" } else { "" };
+    // Omitted entirely when both are empty, matching `daemon::manifest`'s own
+    // "an absent [plugin.workspace] table defaults to all three fields empty"
+    // convention - the ordinary fixture (every `install*` call before
+    // GM-272) still parses to exactly the conservative default it always
+    // did.
+    let workspace = if watch_files.is_empty() && exclude_dirs.is_empty() {
+        String::new()
+    } else {
+        let watch = watch_files.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ");
+        let exclude = exclude_dirs.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
+        format!("\n[plugin.workspace]\nwatch_files = [{watch}]\nexclude_dirs = [{exclude}]\n")
+    };
     format!(
         r#"
 [plugin]
@@ -197,7 +393,7 @@ args = ["./plugin.js"]
 
 [plugin.languages]
 extensions = [{extensions}]
-"#
+{capabilities}{workspace}"#
     )
 }
 
@@ -209,13 +405,33 @@ extensions = [{extensions}]
 /// `protocol::jsonrpc` to be a peer, and would rather hang than guess if core
 /// ever sent something it does not understand, since a test that hangs is
 /// easier to diagnose than one that silently agrees with a bug.
-fn entry_point(language: &str, gated: bool) -> String {
+///
+/// `stalling` (see [`install_stalling`]) still logs every request it parses,
+/// but skips the `writeFrame` that would answer the one request this plugin
+/// directory has never yet stalled on ([`STALL_MARKER`]) - every other
+/// request, including every one after that, is answered normally.
+///
+/// `memory_hungry` (see [`install_memory_hungry`]) allocates a large buffer
+/// right after recording the spawn, held in a module-scope `const` for the
+/// rest of the process's life so V8 cannot garbage-collect it out from under
+/// a test sampling this process's RSS - the wire behaviour (handshake,
+/// answering every framed request) is otherwise unchanged.
+fn entry_point(language: &str, gated: bool, stalling: bool, memory_hungry: bool) -> String {
+    let memory_hog = if memory_hungry {
+        "\n// GM-274 fixture (install_memory_hungry): held for this process's whole\n\
+         // lifetime, not just allocated and dropped, so a test's sample actually\n\
+         // sees it.\n\
+         const memoryHog = Buffer.alloc(200 * 1024 * 1024, 1);\n"
+    } else {
+        ""
+    };
     format!(
         r#"// Generated by core/src/daemon/test_plugin.rs - not a real plugin.
 const fs = require("fs");
 const path = require("path");
 
 fs.appendFileSync(path.join(__dirname, "{SPAWN_LOG}"), process.pid + "\n");
+{memory_hog}
 
 // One-shot bulk-index mode (`daemon::bulk_index::run`'s spawn shape:
 // "<command> <args...> --bulk-index <project_root>"): emit a fixed, small
@@ -232,7 +448,7 @@ if (process.argv[2] === "--bulk-index") {{
     qualifiedName: "{language}-n1",
     filePath: "src/{language}-a.src",
     range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    exported: true,
+    visibility: "public",
     language: "{language}",
   }});
   line({{
@@ -242,7 +458,7 @@ if (process.argv[2] === "--bulk-index") {{
     qualifiedName: "{language}-n2",
     filePath: "src/{language}-b.src",
     range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    exported: true,
+    visibility: "public",
     language: "{language}",
   }});
   line({{
@@ -250,7 +466,8 @@ if (process.argv[2] === "--bulk-index") {{
     fromId: "{language}-n1",
     toId: "{language}-n2",
     kind: "CALLS",
-    source: "tree-sitter",
+    source: "syntactic",
+    engine: "tree-sitter",
     resolved: true,
   }});
   process.exit(0);
@@ -303,7 +520,25 @@ process.stdin.on("data", (chunk) => {{
     if (request.id !== undefined && request.id !== null) {{
       const filePath = (request.params && request.params.filePath) || "";
       fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
-      writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
+      // See test_plugin.rs's `install_stalling`/`STALL_MARKER` doc comments:
+      // this plugin directory stalls on its first-ever framed request, and
+      // answers normally forever after - including from a fresh process a
+      // crash-recovery relaunch spawns, which is why the "already stalled
+      // once" fact has to live in a file rather than a variable.
+      const markerPath = path.join(__dirname, "{STALL_MARKER}");
+      const shouldStall = {stalling} && !fs.existsSync(markerPath);
+      if (shouldStall) {{
+        fs.writeFileSync(markerPath, String(process.pid) + "\n");
+        // Deliberately never answer this one request.
+      }} else {{
+        writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
+      }}
+    }} else {{
+      // A notification: no id, no response frame - see
+      // test_plugin.rs's NOTIFICATION_LOG doc comment for why this is a
+      // separate log from REQUEST_LOG above rather than folded into it.
+      const filePath = (request.params && request.params.filePath) || "";
+      fs.appendFileSync(path.join(__dirname, "{NOTIFICATION_LOG}"), request.method + " " + filePath + "\n");
     }}
   }}
 }});

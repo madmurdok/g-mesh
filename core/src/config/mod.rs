@@ -69,19 +69,29 @@ pub struct ProjectConfig {
 }
 
 /// `[plugin]`: how long the language plugin process is allowed to sit idle
-/// before it is put to sleep. See `daemon::plugin` / task #38 for the
-/// consumer - not wired to the real timeout yet.
+/// before it is put to sleep, and (task GM-274) an optional ceiling on its
+/// process tree's resident memory. See `daemon::plugin` / task #38 for the
+/// idle-timeout consumer, and `daemon::lifecycle::PluginSupervisor::
+/// check_memory_limit` / `daemon::memory` for the memory-limit one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PluginConfig {
     pub idle_timeout_minutes: u64,
+    /// `memoryLimitMb` on disk. Absent (`None`, the documented default) means
+    /// exactly today's behaviour - idle sleep only, nothing sampled - per the
+    /// architecture doc's "Plugin memory limit" section: "absent means idle
+    /// sleep only, exactly today's behaviour; a number means idle sleep plus
+    /// the limit." One number for every language's plugin tree; there is no
+    /// per-language override (see that section for why).
+    pub memory_limit_mb: Option<u64>,
 }
 
 impl Default for PluginConfig {
     fn default() -> Self {
         // Documented default: architecture doc, "plugin.idleTimeoutMinutes
-        // (default 1h)".
-        Self { idle_timeout_minutes: 60 }
+        // (default 1h)" and "memoryLimitMb ... absent (the default) = no
+        // limit, idle sleep only".
+        Self { idle_timeout_minutes: 60, memory_limit_mb: None }
     }
 }
 
@@ -264,7 +274,7 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         let config = ProjectConfig {
-            plugin: PluginConfig { idle_timeout_minutes: 15 },
+            plugin: PluginConfig { idle_timeout_minutes: 15, memory_limit_mb: Some(4096) },
             daemon: DaemonConfig { core_idle_timeout_hours: 8 },
             embedding: EmbeddingConfig { model: "custom-model".to_string() },
         };
@@ -272,6 +282,32 @@ mod tests {
 
         let read_back: ProjectConfig = read_toml_or_default(&path).unwrap();
         assert_eq!(read_back, config);
+    }
+
+    /// The other half of the round trip above: `memory_limit_mb` left `None`
+    /// (the documented default) round-trips as `None`, not as a literal
+    /// `0` or an absent-vs-present ambiguity - the acceptance criterion this
+    /// task is judged on at the config layer ("with no key set, behaviour is
+    /// identical").
+    #[test]
+    fn a_project_config_with_no_memory_limit_round_trips_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let config = ProjectConfig {
+            plugin: PluginConfig { idle_timeout_minutes: 60, memory_limit_mb: None },
+            ..ProjectConfig::default()
+        };
+        write_toml(&path, &config).unwrap();
+
+        let read_back: ProjectConfig = read_toml_or_default(&path).unwrap();
+        assert_eq!(read_back.plugin.memory_limit_mb, None);
+
+        // And the field is simply absent from the TOML, not written as some
+        // explicit "off" sentinel - matching every other `Option`-shaped
+        // field this module already round-trips this way.
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("memoryLimitMb"), "{contents}");
     }
 
     #[test]

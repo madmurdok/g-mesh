@@ -1,16 +1,16 @@
-//! GM-293: the second edit of a file in one plugin process's lifetime has to
-//! reach the index.
+//! GM-293 (2.12.1), carried into 3.0.0 by GM-294: the second edit of a file
+//! in one plugin process's lifetime has to reach the index.
 //!
-//! On 2.12.0 it did not (GM-292), and nothing in the suite noticed.
-//! `rusqlite`'s `bundled` feature compiles SQLite with
-//! `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so the
-//! daemon's connection enforced the `edges -> nodes` foreign keys that every
-//! comment in core described as off. The plugin reports any change to a
-//! symbol - a longer body, a moved range, a new signature - as a delete plus
-//! an upsert of the same id, while the edges into it that did not change
-//! (the file's `DEFINES`, a caller's `CALLS` from another file) are not
-//! re-sent. The delete tripped the foreign key, the whole diff rolled back,
-//! and `PluginProcess::apply_file_change` then "replayed" the file against a
+//! On 2.12.0 it did not (GM-292), and release-3.0.0 inherited the same bug
+//! unchanged. Nothing in the suite noticed. `rusqlite`'s `bundled` feature
+//! compiles SQLite with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so the daemon's
+//! connection enforced the `edges -> nodes` foreign keys that every comment in
+//! core described as off. The TS plugin reports any change to a symbol - a
+//! longer body, a moved range, a new signature - as a delete plus an upsert of
+//! the same id, while the edges into it that did not change (the file's
+//! `DEFINES`, a caller's `CALLS` from another file) are not re-sent. The
+//! delete tripped the foreign key, the whole diff rolled back, and
+//! `PluginProcess::apply_file_change` then "replayed" the file against a
 //! plugin whose cache already held the new text: an empty diff, reported as
 //! success. The answer stayed stale, without an error, and the query-time
 //! staleness check then stamped that stale graph fresh.
@@ -28,7 +28,9 @@
 //!    (`storage::connection::open`, not an in-memory database with pragmas of
 //!    the test's choosing) - deterministic about exactly which request
 //!    carries which edit, which is what the cross-file delete/rename case
-//!    needs.
+//!    needs. The semantic gate is left exactly as the daemon leaves it for an
+//!    unsuspended language, so the per-file `semanticPass` that follows each
+//!    reparse commits through the same connection too.
 //!  - The whole stack - shim, daemon, watcher, plugin, MCP - answering
 //!    `get_file_outline`, because "the MCP answer is stale" is the symptom a
 //!    user actually saw, and the layer where the failure used to be
@@ -85,10 +87,19 @@ impl Project {
     }
 
     /// Kills the daemon and its plugin, if this project has them - only ever
-    /// the processes this test's own state directory names.
+    /// the processes this test's own state directory names: the daemon's pid
+    /// file, the legacy single plugin pid file, and the registry's
+    /// per-language one for the bundled plugin.
     fn stop(&self) {
-        for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
-            let Ok(path) = path else { continue };
+        let mut pid_files: Vec<PathBuf> =
+            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())]
+                .into_iter()
+                .flatten()
+                .collect();
+        if let Ok(state) = project_dir(self.root()) {
+            pid_files.push(state.join("plugin-typescript.pid"));
+        }
+        for path in pid_files {
             common::kill_pid_file(&path);
         }
         if let Ok(endpoint) = daemon::endpoint(self.root()) {
@@ -117,6 +128,27 @@ fn ranges_of(conn: &Connection, file_path: &str, name: &str) -> Vec<(i64, i64)> 
         .unwrap()
 }
 
+/// Rows in each node-keyed child table whose node is gone. With foreign keys
+/// off nothing cascades, so every one of these has to be deleted by hand
+/// wherever a node is - and an orphan is inherited by the next node given
+/// that id.
+fn orphans(conn: &Connection) -> Vec<(&'static str, i64)> {
+    ["declarations", "vectors", "placeholder_targets", "containers"]
+        .into_iter()
+        .map(|table| {
+            let count = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE nodeId NOT IN (SELECT id FROM nodes)"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (table, count)
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
 // --- PluginProcess over the production connection --------------------------
 
 const LIB: &str = "lib.ts";
@@ -141,9 +173,16 @@ fn open_production_index(project: &Project) -> Mutex<Connection> {
     Mutex::new(conn)
 }
 
+fn spawn_plugin(project: &Project) -> PluginProcess {
+    PluginProcess::spawn(project.root(), &bundled_manifest(), project.root().join("plugin.pid"))
+        .expect("failed to spawn the JS/TS plugin")
+}
+
+/// One reparse, gated the way `PluginSupervisor::file_changed` gates it for a
+/// language whose semantic pass is not suspended (GM-274).
 fn apply(plugin: &PluginProcess, conn: &Mutex<Connection>, file_path: &str) {
     plugin
-        .apply_file_change(conn, file_path, &EmbeddingPipeline::disabled())
+        .apply_file_change(conn, file_path, &EmbeddingPipeline::disabled(), false)
         .unwrap_or_else(|err| panic!("applying a change to {file_path} failed: {err:#}"));
 }
 
@@ -152,8 +191,7 @@ fn a_declaration_edited_twice_through_a_warm_plugin_cache_is_updated_both_times(
     let project = Project::new();
     project.write(LIB, GREET);
     let conn = open_production_index(&project);
-    let plugin = PluginProcess::spawn(project.root(), &bundled_manifest(), project.root().join("plugin.pid"))
-        .expect("failed to spawn the JS/TS plugin");
+    let plugin = spawn_plugin(&project);
 
     // A cold cache: the whole file arrives as upserts. This always worked.
     apply(&plugin, &conn, LIB);
@@ -183,6 +221,7 @@ fn a_declaration_edited_twice_through_a_warm_plugin_cache_is_updated_both_times(
     let farewell = ranges_of(&conn, LIB, "farewell");
     assert_eq!(farewell.len(), 1, "the appended function must be indexed: {farewell:?}");
     assert!(farewell[0].0 > end + 5, "`farewell` is written after `greet`: {farewell:?}");
+    assert_eq!(orphans(&conn), vec![], "no child row may outlive the nodes these edits deleted");
 }
 
 const HELPERS: &str = "helpers.ts";
@@ -223,8 +262,7 @@ fn renaming_then_deleting_a_symbol_another_file_calls_is_applied() {
     project.write(HELPERS, HELPERS_ORIGINAL);
     project.write(CALLER, CALLER_SOURCE);
     let conn = open_production_index(&project);
-    let plugin = PluginProcess::spawn(project.root(), &bundled_manifest(), project.root().join("plugin.pid"))
-        .expect("failed to spawn the JS/TS plugin");
+    let plugin = spawn_plugin(&project);
 
     apply(&plugin, &conn, HELPERS);
     apply(&plugin, &conn, CALLER);
@@ -250,6 +288,7 @@ fn renaming_then_deleting_a_symbol_another_file_calls_is_applied() {
     let conn = conn.lock().unwrap();
     assert_eq!(ranges_of(&conn, HELPERS, "doomed"), vec![], "a deleted symbol must leave the index");
     assert_eq!(ranges_of(&conn, HELPERS, "renamedHelper").len(), 1);
+    assert_eq!(orphans(&conn), vec![], "no child row may outlive the nodes these edits deleted");
 }
 
 // --- The whole stack, answered over MCP ------------------------------------

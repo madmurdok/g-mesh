@@ -15,7 +15,7 @@
 
 [plugin]
 language = "typescript"
-protocol_version = 1
+protocol_version = 2
 plugin_version = "2.2.0"
 
 [plugin.spawn]
@@ -24,3 +24,37 @@ args = ["dist/src/index.js"]
 
 [plugin.languages]
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+
+[plugin.capabilities]
+# TypeScript's own checker is this plugin's semantic tier (src/semantic.ts) -
+# core may send it a semanticPass request.
+semantic_pass = true
+# Both tiers leave receiver calls (`x.foo()`) unresolved: the structural pass
+# has no type information to know what `x` is, and the semantic pass
+# (src/semanticPass.ts) resolves imports/overloads/declaration targets but
+# does not yet walk method-call receivers to an edge. Honest gap, not a
+# missing feature this manifest should overclaim - see
+# docs/architecture/multi-language-plugins.md's `plugin.toml additions`
+# section for what core does with an "unresolved" declaration (lists the gap
+# in the MCP instructions rather than silently under-reporting call sites).
+receiver_calls = "unresolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+# No file here plays the role go.mod/Cargo.toml/*.csproj play for their
+# languages (a workspace-boundary file whose change moves module/crate
+# roots and forces a per-language reindex): tsconfig.json/package.json's
+# path-mapping and package-boundary facts are already read fresh per file
+# by tsconfigPaths.ts/workspace.ts rather than cached at a project-wide
+# model that a stale read could poison, so there is nothing this field
+# needs to name yet.
+watch_files = []
+# Mirrors this plugin's own walk exclusions (ignorePolicy.ts's
+# HARD_EXCLUDED_DIRS), minus `.git`/`.claude`, which are already excluded
+# at the baseline core level and are not specific to this language - the
+# same split the architecture doc's Go example makes (`vendor`/`testdata`,
+# not `.git`).
+exclude_dirs = ["node_modules", "dist"]
+# A miss-path lookup treats a directory's `index` file as its container's
+# entry point - the Node/bundler convention this repo already indexes.
+entry_points = ["index"]

@@ -7,7 +7,8 @@
 //! Deliberately a small subset of what [`crate::config`] can round-trip:
 //!
 //! - Per-project (`g-mesh config`): `embedding.model` (with a short
-//!   speed/accuracy blurb) and `plugin.idleTimeoutMinutes`.
+//!   speed/accuracy blurb), `plugin.idleTimeoutMinutes`, and (task GM-274)
+//!   `plugin.memoryLimitMb`.
 //! - Global (`g-mesh config --global`): `cleanup.enabled` and
 //!   `cleanup.idleThresholdDays`.
 //!
@@ -91,8 +92,24 @@ pub fn wizard_project<R: BufRead, W: Write>(
         existing.plugin.idle_timeout_minutes,
     )?;
 
+    writeln!(writer)?;
+    writeln!(writer, "Plugin memory limit, in MB, per language's process tree (plugin plus")?;
+    writeln!(writer, "whatever it has spawned - tsserver, rust-analyzer, ...):")?;
+    writeln!(writer, "  off (default) - idle sleep only, exactly today's behaviour")?;
+    writeln!(
+        writer,
+        "  a number - idle sleep stays on, and a tree over this limit is put to sleep too, \
+         with that language's semantic passes suspended until the daemon restarts"
+    )?;
+    let memory_limit_mb = prompt_optional_u64(
+        reader,
+        writer,
+        "Plugin memory limit in MB (leave blank to keep, \"off\" to disable)",
+        existing.plugin.memory_limit_mb,
+    )?;
+
     Ok(ProjectConfig {
-        plugin: PluginConfig { idle_timeout_minutes },
+        plugin: PluginConfig { idle_timeout_minutes, memory_limit_mb },
         daemon: existing.daemon,
         embedding: EmbeddingConfig { model },
     })
@@ -170,6 +187,53 @@ fn prompt_u64<R: BufRead, W: Write>(
     }
 }
 
+/// Prompts for an optional non-negative integer - `plugin.memoryLimitMb`'s
+/// own shape, "empty means off" (see this module's doc comment and the
+/// architecture doc's "Plugin memory limit" section).
+///
+/// Follows this file's own "press enter to keep the current value" rule
+/// exactly like [`prompt_u64`]/[`prompt_bool`]: empty input or EOF answers
+/// `default` unchanged, whatever `default` is - `Some(4096)` stays
+/// `Some(4096)`, `None` stays `None`. That is deliberately not the same
+/// question as "turn the limit off", which needs its own explicit answer
+/// (`"off"`, case-insensitively, or a literal `0` - both read the same way,
+/// since a zero-megabyte limit is not a value anything could usefully mean):
+/// a wizard run that only re-answers the idle timeout must not silently clear
+/// a memory limit someone configured by hand-editing `config.toml` days ago.
+fn prompt_optional_u64<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    prompt: &str,
+    default: Option<u64>,
+) -> Result<Option<u64>> {
+    let hint = match default {
+        Some(value) => value.to_string(),
+        None => "off".to_string(),
+    };
+    loop {
+        write!(writer, "{prompt} [{hint}]: ")?;
+        writer.flush()?;
+
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).context("failed to read wizard input")?;
+        if bytes_read == 0 {
+            return Ok(default);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        if trimmed.eq_ignore_ascii_case("off") {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(0) => return Ok(None),
+            Ok(value) => return Ok(Some(value)),
+            Err(_) => writeln!(writer, "  please enter a whole number, or \"off\" to disable")?,
+        }
+    }
+}
+
 /// Prompts for a yes/no answer, re-prompting on anything else; empty input
 /// or EOF keeps `default`.
 fn prompt_bool<R: BufRead, W: Write>(
@@ -221,12 +285,12 @@ mod tests {
     #[test]
     fn accepting_every_default_leaves_the_project_config_unchanged() {
         let existing = ProjectConfig {
-            plugin: PluginConfig { idle_timeout_minutes: 60 },
+            plugin: PluginConfig { idle_timeout_minutes: 60, memory_limit_mb: Some(4096) },
             daemon: DaemonConfig { core_idle_timeout_hours: 24 },
             embedding: EmbeddingConfig { model: "jina-embeddings-v2-base-code".to_string() },
         };
 
-        let (updated, _) = run_project_wizard(&existing, "\n\n");
+        let (updated, _) = run_project_wizard(&existing, "\n\n\n");
 
         assert_eq!(updated, existing);
     }
@@ -235,19 +299,41 @@ mod tests {
     fn answering_the_project_prompts_writes_exactly_those_values() {
         let existing = ProjectConfig::default();
 
-        let (updated, _) = run_project_wizard(&existing, "custom-model\n15\n");
+        let (updated, _) = run_project_wizard(&existing, "custom-model\n15\n2048\n");
 
         assert_eq!(updated.embedding.model, "custom-model");
         assert_eq!(updated.plugin.idle_timeout_minutes, 15);
+        assert_eq!(updated.plugin.memory_limit_mb, Some(2048));
         // Not asked - carried through from the existing config untouched.
         assert_eq!(updated.daemon, existing.daemon);
+    }
+
+    /// The wizard round-trip test for the new field (this task's own
+    /// acceptance criterion): answering "off" for a project that already has
+    /// a memory limit configured turns it back to `None`, and answering a
+    /// number sets it - both directions of `prompt_optional_u64`.
+    #[test]
+    fn the_memory_limit_prompt_can_set_and_clear_the_field() {
+        let existing = ProjectConfig::default();
+        let (set, _) = run_project_wizard(&existing, "\n\n512\n");
+        assert_eq!(set.plugin.memory_limit_mb, Some(512));
+
+        let (cleared, _) = run_project_wizard(&set, "\n\noff\n");
+        assert_eq!(cleared.plugin.memory_limit_mb, None);
+
+        // Keeping the default (empty input) leaves whichever value was
+        // already there untouched, in either direction.
+        let (kept_off, _) = run_project_wizard(&existing, "\n\n\n");
+        assert_eq!(kept_off.plugin.memory_limit_mb, None);
+        let (kept_set, _) = run_project_wizard(&set, "\n\n\n");
+        assert_eq!(kept_set.plugin.memory_limit_mb, Some(512));
     }
 
     #[test]
     fn a_non_numeric_idle_timeout_is_rejected_and_reprompted() {
         let existing = ProjectConfig::default();
 
-        let (updated, transcript) = run_project_wizard(&existing, "\nnot-a-number\n42\n");
+        let (updated, transcript) = run_project_wizard(&existing, "\nnot-a-number\n42\n\n");
 
         assert_eq!(updated.plugin.idle_timeout_minutes, 42);
         assert!(transcript.contains("please enter a whole number"), "{transcript}");
@@ -262,6 +348,7 @@ mod tests {
 
         assert_eq!(updated.embedding.model, "custom-model");
         assert_eq!(updated.plugin.idle_timeout_minutes, existing.plugin.idle_timeout_minutes);
+        assert_eq!(updated.plugin.memory_limit_mb, existing.plugin.memory_limit_mb);
     }
 
     #[test]
@@ -302,10 +389,11 @@ mod tests {
         let project_root = dir.path();
 
         let existing = config::read_project_config(project_root).unwrap();
-        let (updated, _) = run_project_wizard(&existing, "answered-model\n7\n");
+        let (updated, _) = run_project_wizard(&existing, "answered-model\n7\n256\n");
         config::write_project_config(project_root, &updated).unwrap();
 
         let read_back = config::read_project_config(project_root).unwrap();
+        assert_eq!(read_back.plugin.memory_limit_mb, Some(256));
         assert_eq!(read_back.embedding.model, "answered-model");
         assert_eq!(read_back.plugin.idle_timeout_minutes, 7);
     }

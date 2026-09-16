@@ -1,0 +1,90 @@
+# Post-linking assertions for the bundled TypeScript plugin - GM-277,
+# `g-mesh plugins check plugins/typescript --fixture
+# plugins/typescript/conformance/project --expect
+# plugins/typescript/conformance/expect.toml`.
+#
+# Every entry below is answered by the same handler code the MCP tools use
+# (`core/src/cli/plugin_check/expectations.rs`'s module doc has the full
+# contract: when these run, how a row becomes a string, how `symbol`/`file`
+# resolve an anchor, and what a truncated page does). Each `expect` is a SET
+# of `"filePath:qualifiedName"` strings - order never matters.
+#
+# The project this runs against is ./project - six files, read alongside
+# this one so each case below can be checked by hand against the real
+# source rather than taken on faith.
+
+# --- same-file call, cross-file named import call, and both re-export forms -
+
+[[callers]]
+symbol = "add"
+file = "src/math.ts"
+# double() calls add() within math.ts itself (same-file); main.ts's run()
+# imports { add } and calls it directly (cross-file named import); main.ts's
+# useBarrelStar() imports add under a different local name through index.ts's
+# `export * from "./math"` and calls that - a second declaration re-exporting
+# the very same node, so it must not add a fourth, separate caller entry.
+expect = ["src/math.ts:double", "src/main.ts:run", "src/main.ts:useBarrelStar"]
+
+[[callers]]
+symbol = "double"
+file = "src/math.ts"
+# main.ts's run() reaches `double` through index.ts's *named* re-export
+# (`export { double as twice } from "./math"`) - resolved structurally, by
+# the placeholder re-export walk, no semantic pass required.
+#
+# main.ts's useNamespaceImport() reaches it through `import * as m from
+# "./math"; m.double(4)` - a namespace member call, which the structural
+# pass cannot see at all (no bare name at the use site). This entry is the
+# DISCRIMINATION case: with the semantic pass disabled, `useNamespaceImport`
+# drops out of the actual set and this expectation fails - see
+# core/tests/plugin_check.rs's `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
+expect = ["src/main.ts:run", "src/main.ts:useNamespaceImport"]
+
+[[callers]]
+symbol = "format"
+file = "src/overload.ts"
+# useOverloads() calls format() under both of its overload signatures
+# (format("a") and format(1)) - both must resolve to the one merged
+# declaration, so the caller set has exactly one entry, not two.
+expect = ["src/main.ts:useOverloads"]
+
+# --- references (includes SUPERTYPE_OF, which callers/implementations don't share) -
+
+[[references]]
+symbol = "Greetable"
+file = "src/shapes.ts"
+# Greeter's `implements Greetable` clause is a SUPERTYPE_OF edge, which
+# find_references includes alongside CALLS/REFERENCES (its own
+# USAGE_EDGE_KINDS) but find_callers does not - proving that inclusion.
+expect = ["src/shapes.ts:Greeter"]
+
+# --- implementations ---------------------------------------------------------
+
+[[implementations]]
+symbol = "Greetable"
+file = "src/shapes.ts"
+expect = ["src/shapes.ts:Greeter"]
+
+# --- imports (get_dependencies, one hop, Outgoing) ----------------------------
+
+[[imports]]
+file = "src/main.ts"
+# main.ts imports math.ts (both the named `add` import and the `m` namespace
+# import collapse onto the one File row), index.ts (both `twice` and
+# `addViaBarrel`), util.js (shout) and overload.ts (format).
+expect = ["src/index.ts", "src/math.ts", "src/overload.ts", "src/util.js"]
+
+# --- definition ---------------------------------------------------------------
+
+[[definition]]
+symbol = "format"
+file = "src/overload.ts"
+# The overload's two signature declarations and one implementation
+# declaration are one node under one qualifiedName - find_definition must
+# resolve to exactly that node, not fail as ambiguous.
+expect = ["src/overload.ts:format"]
+
+[[definition]]
+symbol = "Greeter"
+# Unambiguous - no `file` needed to disambiguate.
+expect = ["src/shapes.ts:Greeter"]

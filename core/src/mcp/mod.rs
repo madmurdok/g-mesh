@@ -58,12 +58,19 @@ use crate::ipc::AsyncStream;
 use crate::protocol::types::Position;
 
 mod anchor;
-mod find_callers_callees;
-mod find_definition;
-mod find_implementations;
-mod find_references;
-mod get_dependencies;
+// `pub(crate)` on these five - not `mod` - so `cli::plugin_check::expectations`
+// (GM-277) can call the exact handler functions these modules' own tool
+// methods below call, rather than re-implementing the queries. Every other
+// submodule here stays private to this one: nothing outside `mcp` needs
+// `get_file_outline`/`instructions`/`search_code`/`source`/`tool_result`, and
+// widening them would just be surface nothing uses.
+pub(crate) mod find_callers_callees;
+pub(crate) mod find_definition;
+pub(crate) mod find_implementations;
+pub(crate) mod find_references;
+pub(crate) mod get_dependencies;
 mod get_file_outline;
+mod instructions;
 mod search_code;
 mod source;
 mod tool_result;
@@ -390,6 +397,55 @@ impl GMeshMcpServer {
         }
     }
 
+    /// `get_info`'s `with_instructions` string (GM-262), assembled fresh for
+    /// each session by [`instructions::build`] from the languages actually
+    /// present in this project's index and their capabilities - see that
+    /// module's own doc comment for the full design (why the receiver-call
+    /// gap sentence has to vary per language, the byte budget it renders
+    /// under, and the two fallbacks below).
+    ///
+    /// Two independent data sources feed the builder, and only one of them
+    /// can fail in a way this method has to handle itself:
+    /// - `self.registry.receiver_call_capabilities()` reads
+    ///   `DiscoveredPlugins`, an in-memory value read once at daemon startup
+    ///   (see `PluginRegistry`'s own doc comment) - infallible.
+    /// - `storage::schema::present_languages_with_semantic_state` is a real
+    ///   query against `self.conn`, which - unlike every tool handler above -
+    ///   this method cannot refuse to answer around: `get_info` is called
+    ///   during MCP `initialize`, before a client has asked a single tool
+    ///   question, so there is no error response to return, only better or
+    ///   worse instructions text. `Err` here (a corrupt schema, a locked or
+    ///   otherwise unreadable DB - not the ordinary "cold start, zero File
+    ///   nodes yet" case, which is `Ok(vec![])` and handled by
+    ///   [`instructions::build`] itself) falls back to every *discovered*
+    ///   manifest's capabilities with `semantic_pass_done: false` for all of
+    ///   them - GM-262's own scope note: "if the index isn't open yet, fall
+    ///   back to capabilities only". Forcing `semantic_pass_done` to `false`
+    ///   is what makes that fallback honest under this uncertainty: without
+    ///   a real `language_state` read there is no fact to claim a semantic
+    ///   pass has completed, so only `receiver_calls_structural` (which
+    ///   needs no such fact) can close a language's gap here - see
+    ///   `instructions::has_open_receiver_gap`'s own doc comment for why
+    ///   that field alone is sufficient for a language like Go.
+    fn instructions(&self) -> String {
+        let capabilities = self.registry.receiver_call_capabilities();
+        let present = {
+            let conn = self.conn.lock().unwrap();
+            crate::storage::schema::present_languages_with_semantic_state(&conn)
+        };
+        let present = match present {
+            Ok(present) => present,
+            Err(err) => {
+                eprintln!(
+                    "g-mesh daemon: failed to read present languages for the MCP instructions, \
+                     falling back to manifest capabilities only: {err:#}"
+                );
+                capabilities.keys().map(|language| (language.clone(), false)).collect()
+            }
+        };
+        instructions::build(&instructions::present_languages(present, &capabilities))
+    }
+
     #[tool(
         name = "find_definition",
         description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates."
@@ -480,7 +536,16 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
-        get_dependencies::handle(&self.conn, params.0)
+        // The union of every discovered plugin's declared entry points (GM-273)
+        // - see `PluginRegistry::entry_points` and
+        // `graph::queries::entry_point_rank_expr` for how a miss-path
+        // directory lookup uses it. Read fresh per call rather than cached on
+        // `self`: it is a cheap map walk over data that never changes while
+        // this daemon runs (`daemon::manifest::discover`'s own contract), so
+        // there is nothing a cache would save beyond what the borrow checker
+        // already makes free.
+        let entry_points = self.registry.entry_points();
+        get_dependencies::handle(&self.conn, &entry_points, params.0)
     }
 
     #[tool(
@@ -501,43 +566,19 @@ impl GMeshMcpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GMeshMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // Claude Code truncates this field at 2KB (independent of, and not shared with,
+        // each tool's own 2KB description budget), and with tool search's default
+        // deferred loading this is the only trust signal a model sees before individual
+        // tool schemas even load - so the core anti-grep rule goes first, and the
+        // legitimate exceptions stay concrete rather than getting cut mid-sentence.
+        // `instructions::build` keeps the result under `instructions::
+        // INSTRUCTIONS_BYTE_CEILING` (~1900 bytes, a safety margin under the 2KB cut) for
+        // every language mix it can be asked to render - see that module's own doc
+        // comment (GM-262) for the receiver-call gap this text used to state as a fixed,
+        // TypeScript-only fact and now assembles per project.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("g-mesh", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                // Claude Code truncates this field at 2KB (independent of, and not shared
-                // with, each tool's own 2KB description budget), and with tool search's
-                // default deferred loading this is the only trust signal a model sees
-                // before individual tool schemas even load - so the core anti-grep rule
-                // goes first, and the two legitimate exceptions stay concrete rather than
-                // getting cut mid-sentence. Keep this under ~1900 bytes with a safety
-                // margin; verify with the byte length, not a visual estimate, after editing.
-                "Structural code-graph queries over this project's index. Prefer these over \
-                 grepping when you need definitions, references, call edges or imports.\n\n\
-                 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
-                 (excludes other same-named declarations' call sites, same guarantee either \
-                 way), is already resolved per call site to that exact declaration - do not \
-                 re-check it with grep as a routine habit. Only fall back to grep for one of \
-                 the two specific gaps below, never as a general double-check.\n\n\
-                 `resolved: false` marks the one thing the indexer could not settle alone: an \
-                 edge whose target is in *another* file, where whether that file exports the \
-                 name isn't knowable from the usage alone. Every same-file edge is \
-                 `resolved: true` - never a reason to grep. find_references/find_callers/\
-                 find_callees/find_implementations also carry a response-level \
-                 `allUnresolved: true` when *every* row in a non-empty page is unconfirmed - \
-                 the page otherwise looks complete (`hasMore: false`, plausible results), so \
-                 check this field, not just individual rows. Never set on an empty page.\n\n\
-                 Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
-                 call through a variable receiver (`x.foo()`) produces no edge by design, so \
-                 caller/reference lists for methods can under-report; bare function calls and \
-                 this/super/qualified-type calls have no such gap, and a `hasMore: false` \
-                 page for those is exhaustive. (2) On a project's first index, or a re-index \
-                 after an upgrade, every tool errors with a \"still building\" message - that \
-                 is temporary, retry after a few seconds rather than concluding the symbol \
-                 does not exist.\n\n\
-                 Efficient usage: pass `symbol_name` directly to the four tools above instead \
-                 of calling find_definition first, and raise `limit` for symbols with many \
-                 results instead of paging.",
-            )
+            .with_instructions(self.instructions())
     }
 }
 
@@ -643,7 +684,9 @@ pub struct GetFileOutlineParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetDependenciesParams {
-    /// Project-relative path of the file to start from.
+    /// Project-relative path of the file to start from. Also accepts the
+    /// exact key of a logical container (a Go import path, a Rust module
+    /// path, ...) to anchor on the package as a whole.
     pub file_path: Option<String>,
     /// Opaque node id from a previous result - not a module name or a path.
     /// For either of those use `file_path`; this accepts one anyway rather

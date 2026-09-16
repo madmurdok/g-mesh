@@ -30,6 +30,7 @@ pub mod clean;
 pub mod config_wizard;
 pub mod init;
 pub mod model;
+pub mod plugin_check;
 pub mod plugins;
 pub mod reindex;
 pub mod status;
@@ -72,7 +73,13 @@ pub enum Command {
     Status,
     /// Wipe and rebuild the current project's index from scratch.
     Reindex,
-    /// Inspect the installed language plugins.
+    /// Inspect the installed language plugins, or check one against the
+    /// plugin contract.
+    ///
+    /// `plugin` is a hidden alias: the architecture doc and GM-276 spell the
+    /// conformance kit `g-mesh plugin check` - see `cli::plugin_check`'s doc
+    /// for why it lives in this group instead.
+    #[command(alias = "plugin")]
     Plugins {
         #[command(subcommand)]
         command: PluginsCommand,
@@ -105,6 +112,9 @@ pub enum Command {
 pub enum PluginsCommand {
     /// List the language plugins installed under `~/.g-mesh/plugins/`.
     List,
+    /// Run a plugin against a fixture project through the real index and
+    /// linker, and report every conformance check it fails.
+    Check(plugin_check::PluginCheckArgs),
 }
 
 /// The embedding model's own commands, grouped under `model` rather than
@@ -191,6 +201,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
             PluginsCommand::List => plugins::run(),
+            PluginsCommand::Check(args) => plugin_check::run(&args),
         },
         Command::Model { command } => model::run(&command),
         Command::Clean(args) => clean::run(&args),
@@ -259,7 +270,38 @@ mod tests {
 
         let bare = parse(&["plugins"]).expect_err("`plugins` alone names no action");
         assert_eq!(bare.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
-        assert!(parse(&["plugins", "uninstall"]).is_err(), "only `list` exists today");
+        assert!(parse(&["plugins", "uninstall"]).is_err(), "only `list` and `check` exist today");
+    }
+
+    /// `plugins check` takes the plugin directory positionally and requires
+    /// `--fixture`; the design doc's singular `plugin check` spelling parses
+    /// to the very same command. `--expect` is optional (GM-277) - absent by
+    /// default, since the design doc's own reasoning (report.rs's module
+    /// doc, echoed in `expectations`'s) is that a flag which parses and does
+    /// nothing would read as "expectations passed".
+    #[test]
+    fn plugins_check_takes_a_plugin_dir_and_a_required_fixture() {
+        for group in ["plugins", "plugin"] {
+            match command_of(&[group, "check", "plugins/typescript", "--fixture", "/tmp/fixture"]) {
+                Command::Plugins { command: PluginsCommand::Check(args) } => {
+                    assert_eq!(args.plugin_dir, PathBuf::from("plugins/typescript"));
+                    assert_eq!(args.fixture, PathBuf::from("/tmp/fixture"));
+                    assert_eq!(args.expect, None);
+                }
+                other => panic!("expected `{group} check`, got {other:?}"),
+            }
+        }
+
+        let missing = parse(&["plugins", "check", "plugins/typescript"]).expect_err("--fixture is required");
+        assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
+
+        match command_of(&["plugins", "check", "plugins/typescript", "--fixture", "/f", "--expect", "e.toml"])
+        {
+            Command::Plugins { command: PluginsCommand::Check(args) } => {
+                assert_eq!(args.expect, Some(PathBuf::from("e.toml")));
+            }
+            other => panic!("expected `plugins check`, got {other:?}"),
+        }
     }
 
     /// `model` groups its own subcommands the way `plugins` does, and both of

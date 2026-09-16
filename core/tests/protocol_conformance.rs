@@ -1,4 +1,5 @@
 use std::io::{BufReader, Cursor};
+use std::time::Duration;
 
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::protocol::conformance::{check_bulk_output, check_control_plane_output};
@@ -29,6 +30,55 @@ fn ndjson_fixture_with_invalid_edge_kind_is_rejected() {
         "{:?}",
         report.violations
     );
+}
+
+/// The protocol v2 golden fixture (GM-263): visibility/container/target
+/// fields, and `source`+`engine` on the edges, in the shape a
+/// container-aware plugin (Go, Rust, ...) will send once one exists -
+/// `valid.ndjson` above is the ordinary TS/JS shape (no container, file-scoped
+/// targets); both are v2 as of GM-275.
+#[test]
+fn well_formed_v2_ndjson_fixture_is_conformant() {
+    let report = check_bulk_output(&fixture("valid_v2.ndjson"));
+    assert!(report.is_conformant(), "{:?}", report.violations);
+}
+
+/// Real `--bulk-index` output from the JS/TS plugin as it shipped *before*
+/// GM-275 (protocol v1 - `exported`, no `visibility`; a placeholder's
+/// address packed into `qualifiedName` instead of a `target` field; a bare
+/// `source` with no `engine`). GM-275 retired the normalization that used to
+/// accept this - every plugin core spawns speaks v2 now, so this fixture
+/// exercises the same rejection a live v1 plugin's handshake would hit,
+/// one level down the pipeline (parsing its bulk output, rather than its
+/// handshake payload - see `protocol::handshake`'s own tests for that one).
+#[test]
+fn real_legacy_v1_plugin_output_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("legacy_v1_real_plugin_output.ndjson"));
+    assert!(!report.is_conformant());
+}
+
+/// A `pending_symbol` whose wire line carries no `target` at all - a v2
+/// sender's own mistake, not a legacy shape - and the shape check is what
+/// has to say so, rather than a `WireNode` failing to deserialize at all
+/// further up the pipeline.
+#[test]
+fn placeholder_with_no_target_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("invalid_placeholder_no_target.ndjson"));
+    assert!(!report.is_conformant());
+    assert!(
+        report.violations.iter().any(|v| v.message.contains("pending_symbol")),
+        "{:?}",
+        report.violations
+    );
+}
+
+/// Core, not a plugin, materializes container nodes - one on the wire is
+/// always a conformance violation (Data Model > Logical containers).
+#[test]
+fn container_node_fixture_is_rejected() {
+    let report = check_bulk_output(&fixture("invalid_container_node.ndjson"));
+    assert!(!report.is_conformant());
+    assert!(report.violations.iter().any(|v| v.message.contains("container")), "{:?}", report.violations);
 }
 
 #[test]
@@ -78,9 +128,11 @@ fn seeded_index() -> Connection {
     conn
 }
 
-fn edge(conn: &Connection, id: &str) -> (String, bool) {
-    conn.query_row("SELECT source, resolved FROM edges WHERE id = ?1", [id], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+/// `(source, engine, resolved)` - `source` is the GM-264 tier
+/// (`"syntactic"`/`"semantic"`), `engine` its own column.
+fn edge(conn: &Connection, id: &str) -> (String, String, bool) {
+    conn.query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })
     .unwrap()
 }
@@ -98,8 +150,8 @@ fn edge(conn: &Connection, id: &str) -> (String, bool) {
 #[test]
 fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     let mut conn = seeded_index();
-    assert_eq!(edge(&conn, "e1"), ("tree-sitter".to_string(), false));
-    assert_eq!(edge(&conn, "e2"), ("tree-sitter".to_string(), false));
+    assert_eq!(edge(&conn, "e1"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
+    assert_eq!(edge(&conn, "e2"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
 
     let mut plugin_answer = BufReader::new(Cursor::new(fixture("semantic_pass_upgrade.rpc")));
     let mut core_wrote: Vec<u8> = Vec::new();
@@ -112,19 +164,22 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         // Matches the id both fixtures carry; a mismatch is refused outright.
         RequestId::Number(7),
         &EmbeddingPipeline::disabled(),
+        Duration::from_secs(5),
+        &mut || panic!("on_timeout fired reading a fixture that is already fully buffered"),
     )
     .unwrap();
 
-    // e1 is the one the fixture answers for: tree-sitter/false -> ts-compiler/true.
+    // e1 is the one the fixture answers for: syntactic/tree-sitter/false ->
+    // semantic/ts-compiler/true.
     assert_eq!(
         edge(&conn, "e1"),
-        ("ts-compiler".to_string(), true),
+        ("semantic".to_string(), "ts-compiler".to_string(), true),
         "the answered edge must be confirmed in place"
     );
     // e2 is not in the diff at all, so nothing about it may move.
     assert_eq!(
         edge(&conn, "e2"),
-        ("tree-sitter".to_string(), false),
+        ("syntactic".to_string(), "tree-sitter".to_string(), false),
         "an edge the pass said nothing about must be left exactly as it was"
     );
     let edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();

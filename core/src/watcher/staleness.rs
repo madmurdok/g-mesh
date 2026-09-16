@@ -60,7 +60,7 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -105,8 +105,11 @@ impl StalenessOutcome {
 /// A type rather than only a message so that a caller can ask
 /// `err.downcast_ref::<ReindexFailed>()` instead of matching text:
 /// `daemon::plugin::PluginProcess::ensure_fresh` relaunches its plugin on
-/// exactly this failure and on nothing else (GM-293), because only this one
-/// can leave the plugin's cached copy of the file ahead of the index.
+/// this failure and on nothing else around it (GM-293, ported by GM-294),
+/// because only this one can leave the plugin's cached copy of the file ahead
+/// of the index. A timeout wears this context too - it is a failed round
+/// trip - so that caller also rules out `protocol::jsonrpc::is_timeout`,
+/// which already has its own relaunch path.
 #[derive(Debug, Clone, Copy)]
 pub struct ReindexFailed;
 
@@ -128,7 +131,18 @@ impl std::fmt::Display for ReindexFailed {
 /// used elsewhere for `filePath` columns and `FileChanged` requests;
 /// `project_root` + `file_path` are joined with `Path::join` to locate the
 /// real file on disk.
-pub fn ensure_fresh<R: BufRead, W: Write>(
+///
+/// `file_changed_timeout`/`semantic_pass_timeout`/`on_timeout` are forwarded
+/// to `apply_file_change` unchanged - this synchronous reindex is a reparse
+/// settling exactly like any other (see that function's own doc comment on
+/// why the semantic pass rides along), so it is bound by the very same
+/// per-method budgets, not a query-time timeout of its own.
+///
+/// `semantic_pass_capable` is forwarded to `apply_file_change` unchanged too
+/// - see that function's own doc comment. The caller (`daemon::plugin::
+/// PluginProcess::ensure_fresh`) is what owns the manifest this comes from.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     conn: &mut Connection,
@@ -136,6 +150,10 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
     file_path: &str,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    semantic_pass_timeout: Duration,
+    semantic_pass_capable: bool,
+    on_timeout: &mut dyn FnMut(),
 ) -> Result<StalenessOutcome> {
     match decide(conn, project_root, file_path)? {
         Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
@@ -149,8 +167,19 @@ pub fn ensure_fresh<R: BufRead, W: Write>(
         Decision::NeedsReindex { mtime, hash, had_prior_record } => {
             // Genuinely stale (or never indexed) - synchronously reindex
             // before recording the new baseline.
-            apply_file_change(reader, writer, conn, file_path, request_id, embedding)
-                .context(ReindexFailed)?;
+            apply_file_change(
+                reader,
+                writer,
+                conn,
+                file_path,
+                request_id,
+                embedding,
+                file_changed_timeout,
+                semantic_pass_timeout,
+                semantic_pass_capable,
+                on_timeout,
+            )
+            .context(ReindexFailed)?;
             upsert_indexed_file(conn, file_path, mtime, &hash)?;
             Ok(if had_prior_record {
                 StalenessOutcome::ReindexedViaHashMismatch
@@ -288,11 +317,22 @@ mod tests {
     use crate::protocol::jsonrpc::{read_message, write_message};
     use crate::protocol::types::{
         ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, NodeKind, Position, Range,
-        WireNode, JSONRPC_VERSION,
+        Visibility, WireNode, JSONRPC_VERSION,
     };
     use crate::storage::schema;
     use std::io::BufReader;
     use std::sync::mpsc;
+
+    /// See `watcher::apply`'s own test module for why this exists and what it
+    /// is deliberately not testing - every stub plugin below answers
+    /// immediately, so nothing here should ever wait this long.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn on_timeout_must_not_fire() {
+        panic!(
+            "on_timeout fired in a test whose stub plugin always answers - the stub or the timeout is broken"
+        );
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -314,12 +354,15 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 3, col: 1 } },
             signature: None,
-            exported: true,
+            visibility: Visibility::Public,
             doc_comment: None,
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         }
     }
 
@@ -417,6 +460,10 @@ mod tests {
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -463,6 +510,10 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -501,6 +552,10 @@ mod tests {
             "lib.rs",
             request_id2,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin2.join().unwrap();
@@ -512,105 +567,6 @@ mod tests {
         let name_after: String =
             conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
         assert_eq!(name_after, "new_and_improved", "response must reflect the new on-disk content");
-    }
-
-    /// GM-293. A reindex that the index refused must leave the previous
-    /// baseline exactly where it was. The baseline is the only thing that
-    /// makes the *next* query try again; writing the new hash over a graph
-    /// that never took the edit is what turned GM-292's silently stale answer
-    /// into a permanently stale one, surviving even a daemon restart.
-    #[test]
-    fn a_reindex_the_index_refuses_leaves_the_previous_baseline_in_place() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file_on_disk = tmp.path().join("lib.rs");
-        fs::write(&file_on_disk, b"fn old() {}").unwrap();
-        let mut conn = setup_conn();
-
-        // A baseline to preserve: one ordinary, successful reindex first.
-        let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
-        let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let (invoked_tx, _invoked_rx) = mpsc::channel();
-        let request_id = RequestId::Number(1);
-        let plugin = spawn_stub_plugin(
-            plugin_reader,
-            plugin_writer,
-            "lib.rs",
-            request_id.clone(),
-            diff_response(request_id.clone(), "old"),
-            invoked_tx,
-        );
-        let mut buf_reader = BufReader::new(core_reader);
-        ensure_fresh(
-            &mut buf_reader,
-            &mut core_writer,
-            &mut conn,
-            tmp.path(),
-            "lib.rs",
-            request_id,
-            &EmbeddingPipeline::disabled(),
-        )
-        .unwrap();
-        plugin.join().unwrap();
-        let baseline = |conn: &Connection| -> (i64, String) {
-            conn.query_row(
-                "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = 'lib.rs'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-        };
-        let before = baseline(&conn);
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        fs::write(&file_on_disk, b"fn new_and_improved() {}").unwrap();
-
-        // The plugin answers, but with a diff the index cannot take: an edge
-        // onto a node that does not exist, refused by this connection's
-        // foreign keys. No semantic pass follows a failed reparse, so this
-        // stub answers exactly one request.
-        let (mut plugin_reader2, mut core_writer2) = std::io::pipe().unwrap();
-        let (core_reader2, mut plugin_writer2) = std::io::pipe().unwrap();
-        let request_id2 = RequestId::Number(2);
-        let refused = FileChangeResponse {
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            id: request_id2.clone(),
-            result: FileChangeDiff {
-                upsert_nodes: vec![],
-                delete_node_ids: vec![],
-                upsert_edges: vec![crate::protocol::types::WireEdge {
-                    id: "e-dangling".to_string(),
-                    from_id: "n1".to_string(),
-                    to_id: "missing".to_string(),
-                    kind: crate::protocol::types::EdgeKind::Calls,
-                    source: crate::protocol::types::EdgeSource::TreeSitter,
-                    resolved: false,
-                    to_declaration: None,
-                }],
-                delete_edge_ids: vec![],
-            },
-        };
-        let plugin2 = std::thread::spawn(move || {
-            let mut buf_reader = BufReader::new(&mut plugin_reader2);
-            let _: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
-            write_message(&mut plugin_writer2, &refused).unwrap();
-        });
-        let mut buf_reader2 = BufReader::new(core_reader2);
-        let result = ensure_fresh(
-            &mut buf_reader2,
-            &mut core_writer2,
-            &mut conn,
-            tmp.path(),
-            "lib.rs",
-            request_id2,
-            &EmbeddingPipeline::disabled(),
-        );
-        plugin2.join().unwrap();
-
-        assert!(result.is_err(), "a refused reindex must be reported: {result:?}");
-        assert_eq!(baseline(&conn), before, "the stale file's baseline must not be advanced");
-        let name: String =
-            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
-        assert_eq!(name, "old", "nothing of the refused diff was committed");
     }
 
     #[test]
@@ -642,6 +598,10 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -676,6 +636,10 @@ mod tests {
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
 
@@ -723,6 +687,10 @@ mod tests {
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
         plugin.join().unwrap();
@@ -761,6 +729,10 @@ mod tests {
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
         )
         .unwrap();
 

@@ -199,19 +199,13 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
             let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-            let semantic_outcome =
+            // Per language now (GM-270): `run_once` asks every currently-owed
+            // language and records `language_state.semanticPassAt` (and the
+            // roll-up) itself - see that function's own doc comment.
+            let run =
                 semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
-            match &semantic_outcome {
-                Ok(ran) => semantic_pass_ran = *ran,
-                Err(err) => eprintln!(
-                    "g-mesh: the semantic pass over the already-indexed project failed ({err:#}) - \
-                     its edges keep whatever the structural pass resolved"
-                ),
-            }
-            if semantic_outcome.is_ok() {
-                schema::record_semantic_pass(&conn.lock().unwrap())
-                    .context("failed to record that the semantic pass completed")?;
-            }
+            run.log("the already-indexed project");
+            semantic_pass_ran = run.any_ran();
         }
         None
     } else {
@@ -239,19 +233,9 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // this command owes the pass it just made unreachable, and running it
         // here is also the only way `init`'s promise stays true: that the
         // index is *ready* when it returns, not merely walked.
-        let semantic_outcome =
-            semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
-        match &semantic_outcome {
-            Ok(ran) => semantic_pass_ran = *ran,
-            Err(err) => eprintln!(
-                "g-mesh: the semantic pass over the freshly built index failed ({err:#}) - \
-                 its edges keep whatever the structural pass resolved"
-            ),
-        }
-        if semantic_outcome.is_ok() {
-            schema::record_semantic_pass(&conn.lock().unwrap())
-                .context("failed to record that the semantic pass completed")?;
-        }
+        let run = semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
+        run.log("the freshly built index");
+        semantic_pass_ran = run.any_ran();
         Some(summary)
     };
 

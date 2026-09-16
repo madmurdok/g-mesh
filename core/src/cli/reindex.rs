@@ -109,24 +109,15 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
 
     let state_dir =
         connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
-    let mut semantic_pass_ran = false;
-    let semantic_outcome =
-        semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
-    match &semantic_outcome {
-        Ok(ran) => semantic_pass_ran = *ran,
-        Err(err) => eprintln!(
-            "g-mesh: the semantic pass over the rebuilt index failed ({err:#}) - \
-             its edges keep whatever the structural pass resolved"
-        ),
-    }
-    // `Ok(_)` either way records `semanticPassAt` - see `daemon::semantic`'s
-    // module doc. A wipe (`schema::reset` above) already cleared any previous
-    // value, so this command's own attempt is what decides whether the
-    // rebuilt index is left calling its semantic pass complete.
-    if semantic_outcome.is_ok() {
-        schema::record_semantic_pass(&conn.lock().unwrap())
-            .context("failed to record that the semantic pass completed")?;
-    }
+    // Per language now (GM-270): `run_once` asks every currently-owed
+    // language and records `language_state.semanticPassAt` (and the
+    // project-wide roll-up) itself - see that function's own doc comment. A
+    // wipe (`schema::reset` above) already cleared every language's previous
+    // value, so this run is what decides whether the rebuilt index is left
+    // calling each language's semantic pass complete.
+    let run = semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
+    run.log("the rebuilt index");
+    let semantic_pass_ran = run.any_ran();
 
     Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary, semantic_pass_ran })
 }

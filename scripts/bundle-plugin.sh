@@ -348,7 +348,7 @@ EOF
 
 [plugin]
 language = "typescript"
-protocol_version = 1
+protocol_version = 2
 plugin_version = "$plugin_version"
 
 [plugin.spawn]
@@ -357,6 +357,20 @@ args = []
 
 [plugin.languages]
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+
+# Same capabilities/workspace declarations as the repo's own
+# plugins/typescript/plugin.toml - see that file's comments for the full
+# rationale behind each value; this is the installed copy of the same facts
+# about the same plugin binary, not a second decision.
+[plugin.capabilities]
+semantic_pass = true
+receiver_calls = "unresolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+watch_files = []
+exclude_dirs = ["node_modules", "dist"]
+entry_points = ["index"]
 EOF
 
 	# A bundle that cannot even introduce itself is not worth packaging. Run

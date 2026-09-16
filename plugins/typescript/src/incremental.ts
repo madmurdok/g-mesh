@@ -22,6 +22,7 @@ import {
   type ExtractOptions,
   type ExtractResult,
   type ParsedTree,
+  type PlaceholderTarget,
   type SymbolDeclaration,
 } from "./extract";
 import { createProjectResolver } from "./resolve";
@@ -192,12 +193,30 @@ function nodesEqual(a: ExtractedNode, b: ExtractedNode): boolean {
     a.endLine === b.endLine &&
     a.endCol === b.endCol &&
     a.signature === b.signature &&
-    a.exported === b.exported &&
+    a.visibility === b.visibility &&
     a.docComment === b.docComment &&
     a.language === b.language &&
     a.nativeKind === b.nativeKind &&
     a.hasSyntaxErrors === b.hasSyntaxErrors &&
-    declarationsEqual(a.declarations, b.declarations)
+    declarationsEqual(a.declarations, b.declarations) &&
+    targetsEqual(a.target, b.target)
+  );
+}
+
+/**
+ * `target` compared by value, the same reasoning `declarationsEqual` gives
+ * for `declarations`: each extraction builds a fresh object, so reference
+ * equality would report "changed" on every reparse of an unmodified
+ * placeholder. Every target this plugin builds is file-scoped and
+ * name-keyed ([`fileTarget`] in extract.ts), so a plain field comparison
+ * covers every shape this module ever produces.
+ */
+function targetsEqual(a: PlaceholderTarget | undefined, b: PlaceholderTarget | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    JSON.stringify(a.scope) === JSON.stringify(b.scope) &&
+    JSON.stringify(a.key) === JSON.stringify(b.key) &&
+    a.fromContainer === b.fromContainer
   );
 }
 
@@ -243,6 +262,7 @@ function edgesEqual(a: ExtractedEdge, b: ExtractedEdge): boolean {
     a.toId === b.toId &&
     a.kind === b.kind &&
     a.source === b.source &&
+    a.engine === b.engine &&
     a.resolved === b.resolved &&
     // Part of the edge id already, so two edges that disagree here disagree
     // about `id` too and never reach this comparison as a pair - checked all

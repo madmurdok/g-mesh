@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "2.12.1"
+version = "3.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -18,8 +18,62 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 flate2 = "1"
+# Already resolved into this tree as a transitive dependency of `ignore`
+# (which uses it internally for `.gitignore`-style overrides), so promoting
+# it to a direct dependency for `daemon::manifest`'s `[plugin.workspace]
+# watch_files` glob validation (`*.csproj`, per the multi-language-plugins
+# architecture doc's paper stress test) adds no new subtree to compile -
+# `cargo tree` already has one copy. Chosen over hand-rolling glob matching
+# or reaching for `ignore`'s own `Override` type (built for `.gitignore`
+# semantics - anchoring, negation, directory-only patterns - none of which
+# `watch_files` needs) because `globset::Glob` is exactly "one shell-style
+# pattern, compiled and validated once" with nothing else attached.
+globset = "0.4"
 ignore = "0.4"
 notify = "6"
+# `[plugin] memoryLimitMb` (task GM-274, `daemon::memory`) needs each
+# language plugin's *process-tree* resident memory - the plugin plus whatever
+# it has spawned (tsserver, rust-analyzer, an LSP server behind a bridge) -
+# sampled on the existing idle-check tick. Two ways to get that were weighed:
+#
+# - Hand-rolled platform code: `libproc`/`proc_pidinfo` on macOS,
+#   `/proc/<pid>/status` on Linux, `Toolhelp32`/`GetProcessMemoryInfo` on
+#   Windows - three FFI surfaces, one of which (macOS) has no safe crate in
+#   this tree already and needs raw `extern "C"` bindings to get right, and
+#   all three need their own "list every process, walk parent pids to find
+#   descendants" logic, since none of the three platform APIs answers
+#   "children of pid N" directly either.
+# - `sysinfo`: one already-cross-platform crate that gives RSS
+#   (`Process::memory()`) and parent pid (`Process::parent()`) per process on
+#   all three platforms this daemon ships for, from a single `System::
+#   refresh_processes` snapshot walked exactly the way the hand-rolled version
+#   would have to anyway.
+#
+# `sysinfo` wins here on correctness, not convenience: this repo's own
+# `src/process.rs` already hand-rolls the *much smaller* unix/libc vs.
+# windows-sys split for "is this pid alive" and "kill it" - three lines of
+# behaviour each, trivially testable against a real child process. Resident
+# memory of a whole process tree is a different order of surface (macOS's
+# `proc_pidinfo` struct layout alone is easy to get subtly wrong and hard to
+# unit test without a real memory-hungry process on the CI runner for each of
+# three platforms), and correctness here is exactly what a low `memoryLimitMb`
+# depends on - a sampler that silently underreports would leave a plugin free
+# to keep growing past the limit users set to protect against that.
+# `default-features = false, features = ["system"]` keeps this to the process/
+# memory backend only - the crate's default features (`component`, `disk`,
+# `network`, `user`) pull in CoreFoundation/IOKit bindings on macOS and extra
+# `windows-sys` surface this daemon has no use for, none of which this feature
+# selection links in.
+#
+# Windows is `["system"]`-supported by `sysinfo` too, so sampling is not
+# expected to be a hard no-op there the way the architecture doc's own
+# contingency describes - but this daemon's Windows IPC transport is named
+# pipes rather than the socket every other platform uses, and CI is the only
+# place this has been exercised. See `daemon::memory`'s own doc comment for
+# the documented fallback if a platform's sampling ever does come back empty:
+# `None` with a one-time log, not a failure - `memoryLimitMb` becomes a no-op
+# for that platform rather than taking the daemon down.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 # ONNX Runtime bindings for the local embedding model (see src/embedding).
 #
 # Pinned to rc.9 on purpose, not "latest rc":

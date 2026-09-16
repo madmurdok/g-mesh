@@ -4,6 +4,7 @@ pub mod identity;
 pub mod indexing_status;
 pub mod lifecycle;
 pub mod manifest;
+pub mod memory;
 pub mod plugin;
 pub mod registry;
 pub mod semantic;
@@ -13,6 +14,7 @@ pub mod semantic;
 /// anything that ships.
 #[cfg(test)]
 pub(crate) mod test_plugin;
+pub mod workspace_reindex;
 
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -431,6 +433,16 @@ pub fn run(root: &Path) -> Result<()> {
     // Windows this is a no-op, because a pipe name cannot outlive the process
     // that held it - see `ipc::windows`'s header.
     endpoint.clear_stale();
+    // Same guarantee, same reasoning, one line down: a `plugin-<language>.suspended`
+    // marker (task GM-274's memory-limit suspension - see `daemon::lifecycle
+    // ::PluginSupervisor::check_memory_limit`) left behind by a daemon that
+    // is no longer running has nothing to describe any more - "suspended
+    // until the daemon restarts" (the architecture doc's own wording) means
+    // *this* restart, right here, is what clears it. Cleared unconditionally,
+    // like the socket above, rather than only for languages this daemon goes
+    // on to spawn - a marker for a language nothing touches this run is exactly
+    // as stale as one for a language it does.
+    registry::clear_stale_suspension_markers(&dir);
     // Bound here, before the plugin and long before the bulk walk: from this
     // point a shim's `connect()` succeeds (the kernel queues it on the
     // listener's backlog until the accept loop below is up), which is what
@@ -507,6 +519,7 @@ pub fn run(root: &Path) -> Result<()> {
         dir.clone(),
         discovered,
         timeouts.plugin,
+        project_config.plugin.memory_limit_mb,
         Arc::clone(&embedding),
     ));
 
@@ -651,31 +664,15 @@ pub fn run(root: &Path) -> Result<()> {
         // its own, which is what baseline's eager, pre-registry spawn timing
         // gave for free and this daemon still needs.
         //
-        // Which plugin this asks, and why only one of them, is
-        // `daemon::semantic`'s to say - as is the reason `cli::init` and
-        // `cli::reindex` now run the very same pass off their own walks
-        // rather than leaving it to a daemon start that will never come.
-        // Spawns the plugin if nothing has needed it yet, same as any other
-        // first touch.
-        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
-        match &semantic_outcome {
-            Ok(true) => eprintln!("g-mesh daemon: semantic pass over the freshly built index complete"),
-            Ok(false) => {}
-            Err(err) => eprintln!(
-                "g-mesh daemon: the semantic pass over the freshly built index failed ({err:#}) - \
-                 its edges keep whatever the structural pass resolved"
-            ),
-        }
-        // `Ok(_)` either way - the pass ran, or there was nothing for it to
-        // do (no bundled plugin) - is what `record_semantic_pass`'s own doc
-        // says counts as complete. Only `Err` (the pass was asked for and did
-        // not finish) must leave this unset, so a later start still finds it
-        // owed.
-        if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
-                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
-            }
-        }
+        // Which plugins this asks, and why per language rather than one
+        // hardcoded plugin, is `daemon::semantic`'s to say (GM-270) - as is
+        // the reason `cli::init` and `cli::reindex` now run the very same
+        // pass off their own walks rather than leaving it to a daemon start
+        // that will never come. Spawns each owed language's plugin if
+        // nothing has needed it yet, same as any other first touch; recording
+        // `language_state.semanticPassAt` (and the project-wide roll-up) per
+        // language is `run_with_registry`'s own job now, not this call site's.
+        semantic::run_with_registry(&registry, &conn).log("the freshly built index");
     } else if needs_semantic_pass_retry {
         // The walk this project was owed already happened, in some earlier
         // start or in `cli::init` / `cli::reindex` - `needs_bulk_index` above
@@ -684,26 +681,15 @@ pub fn run(root: &Path) -> Result<()> {
         // (before the watcher, for the same race the comment above this
         // block explains) and against the same registry, so a project whose
         // pass was interrupted gets exactly one more chance at it per daemon
-        // start rather than none.
+        // start rather than none - per language: `run_with_registry` only
+        // ever asks a language that is still owed one (`storage::schema::
+        // owed_semantic_pass_languages`), so a language that already
+        // completed here on some earlier start is not re-run just because
+        // another one still owes its pass.
         eprintln!(
             "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
         );
-        let semantic_outcome = semantic::run_with_registry(&registry, &conn);
-        match &semantic_outcome {
-            Ok(true) => {
-                eprintln!("g-mesh daemon: semantic pass over the previously-interrupted index complete")
-            }
-            Ok(false) => {}
-            Err(err) => eprintln!(
-                "g-mesh daemon: retrying the semantic pass failed ({err:#}) - \
-                 it will be retried again on the next start"
-            ),
-        }
-        if semantic_outcome.is_ok() {
-            if let Err(err) = schema::record_semantic_pass(&conn.lock().unwrap()) {
-                eprintln!("g-mesh daemon: failed to record that the semantic pass completed ({err:#})");
-            }
-        }
+        semantic::run_with_registry(&registry, &conn).log("the previously-interrupted index");
     }
 
     {
@@ -832,13 +818,16 @@ fn watch_and_route_once(
             // answer for into the replay list a sleeping core builds.
             continue;
         }
-        // Routed to whichever language claims this file's extension,
-        // spawning that plugin if this is the first file of its kind
-        // (`daemon::registry::PluginRegistry::file_changed`); applied now if
-        // that plugin is awake, queued for its next wake if it is asleep -
-        // the supervisor it resolves to owns that decision because only it
-        // can read both facts at once.
-        registry.file_changed(conn, file_path);
+        // Routed by `daemon::registry::PluginRegistry::route_settled_path`
+        // (GM-272): a workspace-file match (`[plugin.workspace] watch_files`,
+        // e.g. `go.mod`) triggers that language's per-language reindex
+        // (`daemon::workspace_reindex`); anything else falls back to the
+        // ordinary extension routing this already did before GM-272
+        // (`PluginRegistry::file_changed`) - applied now if that language's
+        // plugin is awake, queued for its next wake if it is asleep, the
+        // supervisor it resolves to owning that decision because only it can
+        // read both facts at once.
+        registry.route_settled_path(conn, file_path);
     }
 }
 
@@ -1403,6 +1392,7 @@ mod tests {
             &root,
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(crate::embedding::EmbeddingPipeline::disabled()),
         );

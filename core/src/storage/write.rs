@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::graph::containers;
+
 /// One declaration of a symbol that has several - a row of the `declarations`
 /// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
 /// (plugins/typescript/src/extract.ts) field for field, which is also the wire
@@ -21,6 +23,27 @@ pub struct DeclarationRecord {
     pub has_body: bool,
 }
 
+/// What a placeholder [`NodeRecord`] is waiting on - the storage-layer mirror
+/// of `protocol::types::PlaceholderTarget`, and the write-side counterpart of
+/// the `placeholder_targets` table (`storage::schema`'s DDL comment on that
+/// table has the full field-by-field rationale). Flat strings rather than the
+/// wire's nested `TargetScope`/`TargetKey` enums, matching this module's own
+/// convention for every other wire-shaped record here (`DeclarationRecord`,
+/// `EdgeRecord.source`): the enum-to-string mapping happens once, at the
+/// wire boundary (`watcher::apply::to_node_record`), so nothing downstream of
+/// it has to match on a protocol type it does not otherwise depend on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderTargetRecord {
+    /// `"file"` | `"container"` - see `placeholder_targets.scopeKind`'s CHECK.
+    pub scope_kind: String,
+    /// A file path or a container key, per `scope_kind`.
+    pub scope: String,
+    /// `"name"` | `"qualifiedName"` - see `placeholder_targets.keyKind`'s CHECK.
+    pub key_kind: String,
+    pub key: String,
+    pub from_container: Option<String>,
+}
+
 pub struct NodeRecord {
     pub id: String,
     pub kind: String,
@@ -32,7 +55,55 @@ pub struct NodeRecord {
     pub end_line: i64,
     pub end_col: i64,
     pub signature: Option<String>,
+    /// Whether this declaration is visible from anywhere, true only when
+    /// `visibility == "public"`. This is a **read-side mirror** of the
+    /// database's own `GENERATED ALWAYS` `exported` column
+    /// (`storage::schema`'s DDL): [`apply_diff`] never writes it, and cannot,
+    /// since SQLite refuses an `INSERT`/`UPDATE` that names a generated
+    /// column at all. It stays a field here, rather than becoming a method
+    /// computed from `visibility`, so every existing reader keeps compiling
+    /// unchanged. (`graph::symbol_links::link_diff` used to be the one that
+    /// mattered, filtering `diff.upsert_nodes` by `.exported` before anything
+    /// was read back; since GM-266 it reads `visibility` itself, because a
+    /// `container`-visible node can answer a placeholder too.) Every
+    /// *constructor* of a `NodeRecord`
+    /// ([`NodeRecord::new`], `watcher::apply::to_node_record`, and this
+    /// module's/`graph::symbol_links`'s own test helpers) is required to set
+    /// this from `visibility` at construction time; that
+    /// single-writer-per-construction-path rule is what keeps the two from
+    /// disagreeing, since the database itself no longer can.
     pub exported: bool,
+    /// `"public"` | `"file"` | `"container"` - the storage mirror of
+    /// `protocol::types::Visibility`, minus the payload (see
+    /// `visibility_container` below). Defaults to `"file"` in
+    /// [`NodeRecord::new`], matching the column's own `DEFAULT 'file'` and
+    /// the exact meaning the old `exported: false` default had.
+    pub visibility: String,
+    /// The container key from `Visibility::Container(key)`. `None` unless
+    /// `visibility == "container"`.
+    pub visibility_container: Option<String>,
+    /// Logical container this declaration is a member of (Data Model >
+    /// Logical containers). `None` for a language with no containers.
+    pub container: Option<String>,
+    /// `container`'s own parent key, as the plugin sent it with this member.
+    /// Not a `nodes` column: it describes the container, so it lands on that
+    /// container's `containers.parentKey` (`graph::containers`, which also
+    /// documents what happens when two members disagree). **Write-side
+    /// only**, like `target` and `declarations` below - a record read back
+    /// through `graph::queries::map_node_row` carries `None` here, and handing
+    /// it straight back to [`apply_diff`] would record its container as a
+    /// root, since `None` is a value ("no parent"), not "unknown".
+    pub container_parent: Option<String>,
+    /// What this node is waiting to be linked onto, for a placeholder node -
+    /// `None` for an ordinary declaration. Write-side only, the same "absent
+    /// says nothing about what is stored" convention `declarations` documents
+    /// just below: a read via `graph::queries::map_node_row` always leaves
+    /// this `None` rather than joining `placeholder_targets`, so a record
+    /// that came *out* of the database must not be handed straight back to
+    /// [`apply_diff`] expecting an existing target row to be preserved - see
+    /// [`apply_diff`]'s own comment on why a `None` here **deletes** any
+    /// existing row instead of leaving it alone.
+    pub target: Option<PlaceholderTargetRecord>,
     pub doc_comment: Option<String>,
     pub language: String,
     pub native_kind: Option<String>,
@@ -53,6 +124,9 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Minimal constructor for the common case; zero/None-fill the rest.
+    /// `visibility`/`exported` default to `"file"`/`false` - private, not
+    /// exported - matching the column's own `DEFAULT 'file'` and the meaning
+    /// the pre-GM-264 `exported: false` default had.
     pub fn new(
         id: impl Into<String>,
         kind: impl Into<String>,
@@ -73,6 +147,11 @@ impl NodeRecord {
             end_col: 0,
             signature: None,
             exported: false,
+            visibility: "file".to_string(),
+            visibility_container: None,
+            container: None,
+            container_parent: None,
+            target: None,
             doc_comment: None,
             language: language.into(),
             native_kind: None,
@@ -87,7 +166,17 @@ pub struct EdgeRecord {
     pub from_id: String,
     pub to_id: String,
     pub kind: String,
+    /// `"syntactic"` | `"semantic"` - the closed tier `edges.source`'s CHECK
+    /// enforces (`storage::schema`'s DDL comment on `edges`). See
+    /// [`EdgeRecord::new`] for how this stays populated with a valid tier
+    /// even for the ~100 call sites across this codebase's test suites that
+    /// still pass a v1 legacy string here.
     pub source: String,
+    /// Free-text engine label (`"tree-sitter"`, `"ts-compiler"`,
+    /// `"go-types"`, `"rust-analyzer"`, ...) - diagnostic only, never matched
+    /// against in a `WHERE` clause the way `source` is. See
+    /// `storage::schema`'s DDL comment on `edges.engine`.
+    pub engine: String,
     pub resolved: bool,
     /// Which of the target's declarations this edge binds, as an ordinal into
     /// its declaration list. `None` for everything that binds no particular
@@ -97,6 +186,17 @@ pub struct EdgeRecord {
 }
 
 impl EdgeRecord {
+    /// `source` accepts either shape found across this codebase's callers:
+    /// a v1 legacy engine string (`"tree-sitter"` | `"ts-compiler"` - what
+    /// every test helper written before GM-264 still passes here) or a v2
+    /// tier (`"syntactic"` | `"semantic"`). [`normalize_legacy_source`] below
+    /// derives the right `(source, engine)` pair either way, so this
+    /// constructor's signature - and therefore every one of its ~100 call
+    /// sites - did not have to change for GM-264's real `source`/`engine`
+    /// split. A caller that already has a distinct engine value (the wire
+    /// boundary, `watcher::apply::to_edge_record`) overwrites `.engine` on
+    /// the result afterwards, the same way `.to_declaration` is already set
+    /// post-construction below.
     pub fn new(
         id: impl Into<String>,
         from_id: impl Into<String>,
@@ -105,15 +205,37 @@ impl EdgeRecord {
         source: impl Into<String>,
         resolved: bool,
     ) -> Self {
+        let (source, engine) = normalize_legacy_source(&source.into());
         Self {
             id: id.into(),
             from_id: from_id.into(),
             to_id: to_id.into(),
             kind: kind.into(),
-            source: source.into(),
+            source,
+            engine,
             resolved,
             to_declaration: None,
         }
+    }
+}
+
+/// Maps a v1 legacy engine string to its `(tier, engine)` pair
+/// (`"tree-sitter"` -> `("syntactic", "tree-sitter")`, `"ts-compiler"` ->
+/// `("semantic", "ts-compiler")` - the same migration
+/// `storage::schema`'s DDL comment on `edges` documents), and passes any
+/// other string through unchanged as both tier and engine - which is exactly
+/// right for a v2 tier string (`"syntactic"`/`"semantic"` map to themselves,
+/// with a caller expected to set a real `.engine` afterwards if it has one -
+/// see [`EdgeRecord::new`]'s own doc comment) and merely inert for anything
+/// else, rather than a hard error: this is a storage-layer convenience, not
+/// the wire's own validation (`protocol::types::normalize_source` is that,
+/// and already rejects an unrecognized wire value before a `WireEdge` ever
+/// reaches here).
+fn normalize_legacy_source(source: &str) -> (String, String) {
+    match source {
+        "tree-sitter" => ("syntactic".to_string(), "tree-sitter".to_string()),
+        "ts-compiler" => ("semantic".to_string(), "ts-compiler".to_string()),
+        other => (other.to_string(), other.to_string()),
     }
 }
 
@@ -141,12 +263,23 @@ impl Diff {
 /// deletes, node upserts, edge upserts, in that order so edge FKs are
 /// always valid mid-transaction. Any failure rolls back the whole diff -
 /// nothing partial is ever committed.
+///
+/// Logical-container membership (`graph::containers`) is maintained inside
+/// the same transaction, in two halves around those writes: `detach` before
+/// anything is deleted (a member leaving its container loses its `DEFINES`
+/// edge while the node is still there to be pointed at), `attach` after
+/// everything is written (container nodes, rows and edges for the members the
+/// diff leaves behind, then a recount that deletes any container left empty).
+/// No diff owns container rows, so no caller has to do anything for them -
+/// see that module's doc for why this is inside the transaction rather than a
+/// pass after it, like linking is.
 pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     if diff.is_empty() {
         return Ok(());
     }
 
     let tx = conn.transaction().context("failed to start transaction")?;
+    let membership = containers::detach(&tx, diff).context("failed to detach container members")?;
 
     for id in &diff.delete_edge_ids {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
@@ -155,12 +288,25 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         // Explicitly, rather than leaning on the child tables' ON DELETE
         // CASCADE: `storage::connection::open` switches `foreign_keys` off on
         // the connection the daemon actually runs on, so the cascade only
-        // fires in tests that switch it on. Left orphaned, declarations would
-        // be handed to whoever next takes this node's id, and a vector would
-        // keep a deleted symbol ranking in `search_code`. A node that is
-        // deleted and re-upserted in the same diff (the plugin's shape for any
-        // changed symbol) loses its vector here and gets a fresh one from
-        // `EmbeddingPipeline::apply`, which embeds every upserted node.
+        // fires in tests that switch it on. Left orphaned, these rows would
+        // be handed to whoever next takes this node's id - `placeholder_targets`
+        // joins `declarations` here for exactly that reason: a placeholder
+        // node deleted (its import/usage removed, or the file it lived in
+        // reparsed without it) must not leave a stale target row for some
+        // *other* node to inherit if it is ever given this same
+        // content-derived id. A vector is worse still: `search_code` scans
+        // `vectors` directly, so an orphaned one keeps a deleted symbol
+        // ranking. A node deleted and re-upserted in the same diff (the TS
+        // plugin's shape for any changed symbol) loses its vector here and
+        // gets a fresh one from `EmbeddingPipeline::apply`, which embeds every
+        // upserted node.
+        //
+        // Until GM-294 this loop did not delete vectors at all, and nothing
+        // noticed, because the connection this comment used to call
+        // foreign-key-free in fact enforced them (GM-292) and the cascade
+        // quietly did the work. `graph::containers::delete_container` and
+        // `daemon::workspace_reindex::delete_language_rows` already deleted
+        // vectors by hand.
         //
         // Edges into the node are deliberately *not* touched. One the plugin
         // did not re-send because its id did not change (a file's `DEFINES`
@@ -169,17 +315,21 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         // file's call to a deleted symbol) is the documented lazy dangling
         // edge, repaired when that file is next reindexed. Both are rows a
         // foreign key would refuse this delete over, which is why enforcement
-        // is off - see `storage::connection::open`.
+        // is off - see `storage::connection::open`. (`containers::detach`
+        // above does remove a member's container `DEFINES` edge, for its own
+        // bookkeeping, and `attach` restores it.)
         tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's declarations")?;
+        tx.execute("DELETE FROM placeholder_targets WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's placeholder target")?;
         tx.execute("DELETE FROM vectors WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's embedding")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
     }
     for node in &diff.upsert_nodes {
         tx.execute(
-            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, exported, docComment, language, nativeKind, hasSyntaxErrors)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 name = excluded.name,
@@ -190,11 +340,20 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 endLine = excluded.endLine,
                 endCol = excluded.endCol,
                 signature = excluded.signature,
-                exported = excluded.exported,
+                visibility = excluded.visibility,
+                visibilityContainer = excluded.visibilityContainer,
                 docComment = excluded.docComment,
                 language = excluded.language,
                 nativeKind = excluded.nativeKind,
-                hasSyntaxErrors = excluded.hasSyntaxErrors",
+                hasSyntaxErrors = excluded.hasSyntaxErrors,
+                container = excluded.container",
+            // `exported` is deliberately absent from both the column list and
+            // the `SET` clause: it is a `GENERATED ALWAYS` column
+            // (`storage::schema`'s DDL) and SQLite refuses to `INSERT`/
+            // `UPDATE` one directly - the database derives it from
+            // `visibility` on every write instead, which is what makes it
+            // impossible for the two to disagree. See `NodeRecord.exported`'s
+            // own doc comment for the write-side field this replaces.
             params![
                 node.id,
                 node.kind,
@@ -206,11 +365,13 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 node.end_line,
                 node.end_col,
                 node.signature,
-                node.exported,
+                node.visibility,
+                node.visibility_container,
                 node.doc_comment,
                 node.language,
                 node.native_kind,
                 node.has_syntax_errors,
+                node.container,
             ],
         )
         .context("failed to upsert node")?;
@@ -247,16 +408,58 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             ])
             .context("failed to insert a declaration")?;
         }
+
+        // `placeholder_targets` is replaced wholesale too, and for the same
+        // "describes how this node is written *now*" reason: a re-upserted
+        // placeholder whose target changed (a reparse that resolves the
+        // import to a different file, say) must not leave its old row
+        // sitting alongside the new one - `nodeId` is this table's own
+        // primary key, so the delete-then-maybe-insert pair below is what
+        // "replace" means for a 1:0-or-1 child, the same shape `vectors`
+        // (`storage::schema`) already uses for its own re-embed. Cleared
+        // unconditionally, then re-inserted only when `node.target` is
+        // `Some`, so a node that *used* to be a placeholder and no longer is
+        // (should never happen in practice - `nativeKind` does not change out
+        // from under one id - but nothing here assumes it cannot) leaves no
+        // orphaned target behind either.
+        tx.prepare_cached("DELETE FROM placeholder_targets WHERE nodeId = ?1")
+            .context("failed to prepare the placeholder target replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's placeholder target")?;
+        if let Some(target) = &node.target {
+            tx.prepare_cached(
+                "INSERT INTO placeholder_targets
+                    (nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .context("failed to prepare the placeholder target insert")?
+            .execute(params![
+                node.id,
+                target.scope_kind,
+                target.scope,
+                target.key_kind,
+                target.key,
+                target.from_container,
+                // Not a field of `PlaceholderTargetRecord`: the requester's
+                // own file is already `node.file_path` by the existing
+                // "a placeholder's filePath is the importing file"
+                // convention (`graph::symbol_links`' module doc) - see
+                // `placeholder_targets.fromFile`'s own DDL comment.
+                node.file_path,
+            ])
+            .context("failed to insert a placeholder target")?;
+        }
     }
     for edge in &diff.upsert_edges {
         tx.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, resolved, toDeclaration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 fromId = excluded.fromId,
                 toId = excluded.toId,
                 kind = excluded.kind,
                 source = excluded.source,
+                engine = excluded.engine,
                 resolved = excluded.resolved,
                 toDeclaration = excluded.toDeclaration",
             params![
@@ -265,11 +468,15 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 edge.to_id,
                 edge.kind,
                 edge.source,
+                edge.engine,
                 edge.resolved,
                 edge.to_declaration
             ],
         )
         .context("failed to upsert edge")?;
+    }
+    if let Some(membership) = membership {
+        containers::attach(&tx, membership).context("failed to attach container members")?;
     }
 
     tx.commit().context("failed to commit diff transaction")?;
@@ -484,9 +691,8 @@ mod tests {
 
     /// `foreign_keys` is switched off on the connection the daemon actually
     /// runs on (`storage::connection::open`), so the child table's ON DELETE
-    /// CASCADE never fires there - the delete has
-    /// to be explicit, or a deleted node's declarations would be inherited by
-    /// whatever next claims its id.
+    /// CASCADE never fires there - the delete has to be explicit, or a deleted
+    /// node's declarations would be inherited by whatever next claims its id.
     #[test]
     fn deleting_a_node_takes_its_declarations_with_it_without_foreign_keys() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -517,10 +723,12 @@ mod tests {
         );
     }
 
-    /// The same hazard one table over (GM-293): `vectors`' ON DELETE CASCADE
-    /// is just as inert without enforcement, and an orphaned embedding is
-    /// worse than an orphaned declaration - `search_code` scans `vectors`
-    /// directly, so it would keep ranking a symbol that no longer exists.
+    /// The same hazard one table over (GM-293, ported by GM-294):
+    /// `vectors`' ON DELETE CASCADE is just as inert without enforcement, and
+    /// an orphaned embedding is worse than an orphaned declaration -
+    /// `search_code` scans `vectors` directly, so it would keep ranking a
+    /// symbol that no longer exists. `apply_diff` never deleted vectors by
+    /// hand before; the connection's accidental enforcement did it instead.
     #[test]
     fn deleting_a_node_takes_its_vector_with_it_without_foreign_keys() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -552,6 +760,204 @@ mod tests {
         assert_eq!(count(&conn, "vectors"), 0, "a deleted node's embedding must not outlive it");
     }
 
+    fn file_scoped_target(scope: &str, key: &str) -> PlaceholderTargetRecord {
+        PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: scope.to_string(),
+            key_kind: "name".to_string(),
+            key: key.to_string(),
+            from_container: None,
+        }
+    }
+
+    fn placeholder(id: &str, importer_file: &str, target: PlaceholderTargetRecord) -> NodeRecord {
+        let mut node =
+            NodeRecord::new(id, "Module", "change", "target.ts#change", importer_file, "typescript");
+        node.native_kind = Some("pending_symbol".to_string());
+        node.target = Some(target);
+        node
+    }
+
+    fn placeholder_target_row(conn: &Connection, node_id: &str) -> (String, String, String, String, String) {
+        conn.query_row(
+            "SELECT scopeKind, scope, keyKind, key, fromFile FROM placeholder_targets WHERE nodeId = ?1",
+            params![node_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    /// The acceptance criterion: `apply_diff` writes a `placeholder_targets`
+    /// row for a node carrying `NodeRecord.target`, with `fromFile` filled in
+    /// from the node's own `filePath` (never a field of the target record
+    /// itself - see `PlaceholderTargetRecord`'s and this table's own DDL
+    /// comment for why).
+    #[test]
+    fn apply_diff_writes_a_placeholder_target_row() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![placeholder("p1", "caller.ts", file_scoped_target("target.ts", "change"))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "placeholder_targets"), 1);
+        assert_eq!(
+            placeholder_target_row(&conn, "p1"),
+            (
+                "file".to_string(),
+                "target.ts".to_string(),
+                "name".to_string(),
+                "change".to_string(),
+                "caller.ts".to_string(),
+            )
+        );
+    }
+
+    /// A node with no target writes no `placeholder_targets` row at all - the
+    /// overwhelming majority of nodes, mirroring `declarations`' own "no rows
+    /// for the ordinary case" shape.
+    #[test]
+    fn a_node_with_no_target_writes_no_placeholder_target_row() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![NodeRecord::new(
+                    "n1",
+                    "Function",
+                    "foo",
+                    "foo",
+                    "src/lib.ts",
+                    "typescript",
+                )],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "placeholder_targets"), 0);
+    }
+
+    /// Re-upserting a placeholder whose target changed (a reparse that
+    /// resolves the import to a different file) replaces the row rather than
+    /// accumulating a second one - the same "replace, don't merge" contract
+    /// `declarations` already has. Discriminates: drop the unconditional
+    /// `DELETE FROM placeholder_targets` this test relies on and the second
+    /// assertion below fails with two rows, or the stale `target.ts` scope.
+    #[test]
+    fn re_upserting_a_placeholder_replaces_its_target_instead_of_accumulating_one() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![placeholder("p1", "caller.ts", file_scoped_target("target.ts", "change"))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![placeholder("p1", "caller.ts", file_scoped_target("other.ts", "change"))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "placeholder_targets"), 1, "must not accumulate a second row");
+        assert_eq!(
+            placeholder_target_row(&conn, "p1").1,
+            "other.ts",
+            "the stale scope must not survive the re-upsert"
+        );
+    }
+
+    /// The acceptance criterion at its sharpest: `PRAGMA foreign_keys` is OFF
+    /// on the connection the daemon actually runs on
+    /// (`storage::connection::open`), so `placeholder_targets`' own `ON
+    /// DELETE CASCADE` never fires there - `apply_diff` itself has to delete
+    /// the row explicitly, exactly like it already does for `declarations`.
+    /// Tested in that same pragma state, not the `foreign_keys = ON` state
+    /// most of this module's tests use, because that is the state that would
+    /// actually hide a regression here: with `foreign_keys` ON, SQLite's own
+    /// cascade would silently paper over a missing explicit delete and this
+    /// test would pass for the wrong reason. Discriminates: comment out the
+    /// `DELETE FROM placeholder_targets WHERE nodeId = ?1` line in the
+    /// `delete_node_ids` loop and the final assertion fails, with the target
+    /// row still present under the deleted node's id.
+    #[test]
+    fn deleting_a_placeholder_node_takes_its_target_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![placeholder("p1", "caller.ts", file_scoped_target("target.ts", "change"))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "placeholder_targets"), 1);
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["p1".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        assert_eq!(
+            count(&conn, "placeholder_targets"),
+            0,
+            "orphaned rows would be handed to the next node given this id"
+        );
+    }
+
+    /// `visibility`/`visibilityContainer`/`container` round-trip through
+    /// `apply_diff`, and `exported` - the `GENERATED ALWAYS` column - tracks
+    /// `visibility` with no write of its own. Discriminates against a
+    /// regression that reintroduces writing `exported` directly (which would
+    /// fail to compile against a generated column) as much as it does against
+    /// one that stops writing `visibility` at all (which would leave every
+    /// node `'file'`/not-exported regardless of what was asked for).
+    #[test]
+    fn visibility_and_container_round_trip_and_exported_is_derived() {
+        let mut conn = setup();
+        let mut node = NodeRecord::new("n1", "Function", "Close", "Server.Close", "server.go", "go");
+        node.visibility = "container".to_string();
+        node.visibility_container = Some("github.com/x/app/server".to_string());
+        node.container = Some("github.com/x/app/server".to_string());
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![node], ..Default::default() }).unwrap();
+
+        let (visibility, visibility_container, container, exported): (
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+        ) = conn
+            .query_row(
+                "SELECT visibility, visibilityContainer, container, exported FROM nodes WHERE id = 'n1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(visibility, "container");
+        assert_eq!(visibility_container.as_deref(), Some("github.com/x/app/server"));
+        assert_eq!(container.as_deref(), Some("github.com/x/app/server"));
+        assert!(!exported, "container visibility is not public");
+
+        let mut public_node = NodeRecord::new("n2", "Function", "Run", "Run", "server.go", "go");
+        public_node.visibility = "public".to_string();
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![public_node], ..Default::default() }).unwrap();
+        let exported: bool =
+            conn.query_row("SELECT exported FROM nodes WHERE id = 'n2'", [], |row| row.get(0)).unwrap();
+        assert!(exported, "public visibility must derive exported = true");
+    }
+
     #[test]
     fn an_edges_declaration_binding_round_trips_and_is_upgradable_in_place() {
         let mut conn = setup();
@@ -580,12 +986,13 @@ mod tests {
         upgraded.to_declaration = Some(1);
         apply_diff(&mut conn, &Diff { upsert_edges: vec![upgraded], ..Default::default() }).unwrap();
 
-        let (source, bound): (String, Option<i64>) = conn
-            .query_row("SELECT source, toDeclaration FROM edges WHERE id = 'e1'", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+        let (source, engine, bound): (String, String, Option<i64>) = conn
+            .query_row("SELECT source, engine, toDeclaration FROM edges WHERE id = 'e1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .unwrap();
-        assert_eq!(source, "ts-compiler");
+        assert_eq!(source, "semantic", "the legacy 'ts-compiler' string maps onto the v2 tier");
+        assert_eq!(engine, "ts-compiler", "and the legacy engine name is preserved in the new column");
         assert_eq!(bound, Some(1));
         assert_eq!(count(&conn, "edges"), 1, "an upgrade updates the row in place");
     }

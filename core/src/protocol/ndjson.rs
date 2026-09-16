@@ -4,9 +4,13 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::protocol::types::{WireEdge, WireNode};
 
+/// `Node` is boxed because protocol v2's `WireNode` (visibility, container,
+/// containerParent, target - GM-263) is now considerably larger than
+/// `WireEdge`; without it, every `BulkItem` - including every `Edge` one -
+/// would pay for the bigger variant's size on the stack.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BulkItem {
-    Node(WireNode),
+    Node(Box<WireNode>),
     Edge(WireEdge),
 }
 
@@ -16,7 +20,7 @@ impl BulkItem {
     /// distinguishes them without a wire-level discriminator field.
     pub fn parse(line: &str) -> Result<Self> {
         if let Ok(node) = serde_json::from_str::<WireNode>(line) {
-            return Ok(BulkItem::Node(node));
+            return Ok(BulkItem::Node(Box::new(node)));
         }
         serde_json::from_str::<WireEdge>(line)
             .map(BulkItem::Edge)
@@ -70,7 +74,7 @@ impl<R: BufRead> Iterator for NdjsonReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{EdgeKind, EdgeSource, NodeKind, Position, Range};
+    use crate::protocol::types::{EdgeKind, NodeKind, Position, Range, SourceTier, Visibility};
     use std::io::{BufReader, Cursor, Read};
 
     fn node_json(id: &str) -> String {
@@ -82,12 +86,15 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 2, col: 0 } },
             signature: None,
-            exported: false,
+            visibility: Visibility::File,
             doc_comment: None,
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
             declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
         })
         .unwrap()
     }
@@ -98,7 +105,8 @@ mod tests {
             from_id: from.to_string(),
             to_id: to.to_string(),
             kind: EdgeKind::Calls,
-            source: EdgeSource::TreeSitter,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
         })

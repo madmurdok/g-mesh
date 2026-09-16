@@ -109,7 +109,7 @@ fn bindings(db: &Path) -> Vec<(String, i64)> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT f.name, e.toDeclaration FROM edges e JOIN nodes f ON f.id = e.fromId
          WHERE e.kind = 'CALLS' AND e.toDeclaration IS NOT NULL
-           AND e.source = 'ts-compiler' AND e.resolved = 1
+           AND e.source = 'semantic' AND e.resolved = 1
          ORDER BY f.name",
     ) else {
         return Vec::new();

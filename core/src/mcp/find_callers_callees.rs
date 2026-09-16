@@ -313,7 +313,7 @@ struct CalleePage {
     excluded_references: Option<ExcludedReferences>,
 }
 
-pub(super) fn handle_callers(
+pub(crate) fn handle_callers(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,
@@ -373,7 +373,7 @@ pub(super) fn handle_callers(
     })
 }
 
-pub(super) fn handle_callees(
+pub(crate) fn handle_callees(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
     params: SymbolQueryParams,

@@ -311,16 +311,56 @@ fn from_root_reporting(
     success(&walk)
 }
 
-fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+/// `file_path` anchors a walk three ways, tried in this order, with no new
+/// tool parameter to pick among them (GM-267 decision 4 - a parameter is a
+/// per-session token tax measured in this project, GM-188, and the
+/// `file_path` argument already disambiguates on its own):
+///
+///  1. **Exact file.** Unchanged from before containers existed.
+///  2. **Exact container key** (`github.com/x/pkg`, `ripgrep::search`, ... -
+///     Data Model > Logical containers), since GM-267. A key is only unique
+///     *within* a language, so more than one match is a real ambiguity - a Go
+///     package and a Rust module sharing the string - and is refused rather
+///     than guessed at, the same stance `entry_point_for` already takes for
+///     two file candidates. This is deliberately **not** reported through
+///     `resolvedFrom`: that field exists for a *substitution* - the tool
+///     answering a question adjacent to the one asked - and choosing the one
+///     node an exact key names outright is not one; `resolvedFrom`'s own doc
+///     comment ties it to "the caller cannot tell a right guess from a wrong
+///     one", which does not apply to an exact match.
+///  3. **Miss-path inference** (`entry_point_for`, unchanged): a directory
+///     prefix or a package-name segment with exactly one entry point behind
+///     it. Tried last because it is the weakest of the three - a guess from
+///     an adjacent fact, not an exact match - and reported via `resolvedFrom`
+///     precisely because it is one.
+fn from_file(
+    conn: &Connection,
+    entry_points: &[String],
+    file_path: &str,
+    shape: &WalkShape,
+) -> Result<CallToolResult, ErrorData> {
     let anchor =
         queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
     if let Some(node) = anchor {
         return from_root(conn, node.id, shape);
     }
-    // Not a file. Before refusing, see whether what was named has exactly one
-    // entry point behind it - `@excalidraw/math` almost always does.
-    if let Some(entry) = entry_point_for(conn, file_path)? {
+
+    let containers = queries::find_containers_by_key(conn, file_path)
+        .map_err(|e| internal_error("failed to look up containers by key", e))?;
+    match containers.len() {
+        0 => {}
+        1 => {
+            let container = containers.into_iter().next().expect("len checked above");
+            return from_root(conn, container.id, shape);
+        }
+        _ => return error(ambiguous_container_message(file_path, &containers)),
+    }
+
+    // Not a file or a container key. Before refusing, see whether what was
+    // named has exactly one entry point behind it - `@excalidraw/math`
+    // almost always does.
+    if let Some(entry) = entry_point_for(conn, entry_points, file_path)? {
         let resolved = ResolvedFrom {
             requested: file_path.to_string(),
             file_path: entry.file_path,
@@ -328,7 +368,20 @@ fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<Ca
         };
         return from_root_reporting(conn, entry.id, shape, Some(resolved));
     }
-    error(no_file_message(conn, file_path)?)
+    error(no_file_message(conn, entry_points, file_path)?)
+}
+
+/// The message for an exact container key that names more than one
+/// container - a real ambiguity (`containers.key` is only unique *within* a
+/// language), not a miss-path guess, so this names the languages rather than
+/// suggesting a fallback the way [`no_file_message`] does.
+fn ambiguous_container_message(key: &str, containers: &[NodeRecord]) -> String {
+    let languages: Vec<&str> = containers.iter().map(|n| n.language.as_str()).collect();
+    format!(
+        "g-mesh: '{key}' names a container in more than one language ({}) - anchor on one of its files \
+         instead, so there is no ambiguity about which one is meant.",
+        languages.join(", "),
+    )
 }
 
 /// How many candidates [`entry_point_for`] asks for. Two would do - the rule
@@ -354,12 +407,20 @@ const ENTRY_POINT_CANDIDATES: usize = 5;
 ///
 /// THE RULE, AND WHY IT IS THIS STRICT
 ///
-/// Both underlying queries order `index.*` first, so "the first candidate is
-/// an entry point and the second is not" is a complete test for *exactly one*
-/// even under their row limit. Anything less unanimous - no entry point, or
-/// two - returns `None` and falls through to the refusal, which lists the
-/// candidates. Guessing between two entry points would be a worse failure than
-/// refusing, because the walk would succeed and answer about the wrong file.
+/// Both underlying queries rank a file matching one of `entry_points` first
+/// (`graph::queries::entry_point_rank_expr` - GM-273 generalized what used to
+/// be a hardcoded `index.*` check into this parameter, one declared per
+/// discovered language rather than one convention baked into the query), so
+/// "the first candidate is an entry point and the second is not" is a
+/// complete test for *exactly one* even under their row limit. Anything less
+/// unanimous - no entry point, or two (a Rust directory can legitimately hold
+/// both `mod.rs` and `lib.rs`) - returns `None` and falls through to the
+/// refusal, which lists the candidates. Guessing between two entry points
+/// would be a worse failure than refusing, because the walk would succeed and
+/// answer about the wrong file - this function does not get to break that tie
+/// by, say, preferring whichever entry point sorted first in `entry_points`;
+/// nothing about declaration order is a meaningful preference between two
+/// files that both plausibly are the package's entry point.
 ///
 /// Two forms are tried, in the same order and for the same reasons
 /// [`no_file_message`] tries them: the path as a directory prefix
@@ -368,19 +429,23 @@ const ENTRY_POINT_CANDIDATES: usize = 5;
 /// directory sharing a package's name does not prove the package lives there -
 /// which is why every substitution is reported back on the response rather
 /// than performed silently.
-fn entry_point_for(conn: &Connection, requested: &str) -> Result<Option<EntryPoint>, ErrorData> {
-    let under = queries::find_files_under(conn, requested, ENTRY_POINT_CANDIDATES)
+fn entry_point_for(
+    conn: &Connection,
+    entry_points: &[String],
+    requested: &str,
+) -> Result<Option<EntryPoint>, ErrorData> {
+    let under = queries::find_files_under(conn, requested, entry_points, ENTRY_POINT_CANDIDATES)
         .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
-    if let Some(entry) = sole_entry_point(under) {
+    if let Some(entry) = sole_entry_point(under, entry_points) {
         return Ok(Some(entry));
     }
 
     let Some(segment) = requested.rsplit('/').next().filter(|s| !s.is_empty() && *s != requested) else {
         return Ok(None);
     };
-    let by_segment = queries::find_files_ending_in_dir(conn, segment, ENTRY_POINT_CANDIDATES)
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, entry_points, ENTRY_POINT_CANDIDATES)
         .map_err(|e| internal_error("failed to look up files by directory name", e))?;
-    Ok(sole_entry_point(by_segment))
+    Ok(sole_entry_point(by_segment, entry_points))
 }
 
 /// The two fields an anchor substitution needs off the chosen node: the id to
@@ -392,28 +457,42 @@ struct EntryPoint {
     file_path: String,
 }
 
-/// The first element of an `index.*`-first candidate list, but only when it is
-/// an entry point and nothing after it is - see [`entry_point_for`] for why
+/// The first element of an entry-point-first candidate list, but only when it
+/// is an entry point and nothing after it is - see [`entry_point_for`] for why
 /// the uniqueness half is what makes this safe to act on.
 ///
 /// Takes the vector by value so the chosen node's strings can be moved out
 /// rather than copied.
-fn sole_entry_point(candidates: Vec<NodeRecord>) -> Option<EntryPoint> {
+fn sole_entry_point(candidates: Vec<NodeRecord>, entry_points: &[String]) -> Option<EntryPoint> {
     let first = candidates.first()?;
-    if !is_entry_point(&first.file_path) {
+    if !is_entry_point(&first.file_path, entry_points) {
         return None;
     }
-    if candidates.get(1).is_some_and(|n| is_entry_point(&n.file_path)) {
+    if candidates.get(1).is_some_and(|n| is_entry_point(&n.file_path, entry_points)) {
         return None;
     }
     let chosen = candidates.into_iter().next()?;
     Some(EntryPoint { id: chosen.id, file_path: chosen.file_path })
 }
 
-/// Matches the same `%/index.%` shape both candidate queries sort by, so the
-/// rule this module acts on and the ordering it relies on cannot drift apart.
-fn is_entry_point(file_path: &str) -> bool {
-    file_path.rsplit('/').next().is_some_and(|name| name.starts_with("index."))
+/// Whether `file_path`'s own file name matches one of `entry_points` - the
+/// same two-shape rule `graph::queries::entry_point_rank_expr` sorts by
+/// (see its doc comment), kept in exact sync so this Rust-side uniqueness
+/// check can never disagree with which row the SQL already put first:
+///
+/// - an entry with no `.` (`"index"`) matches the file's stem under any
+///   extension;
+/// - an entry with a `.` (`"mod.rs"`) matches the file name exactly, with
+///   nothing after it.
+fn is_entry_point(file_path: &str, entry_points: &[String]) -> bool {
+    let Some(name) = file_path.rsplit('/').next() else { return false };
+    entry_points.iter().any(|entry| {
+        if entry.contains('.') {
+            name == entry.as_str()
+        } else {
+            name.starts_with(&format!("{entry}."))
+        }
+    })
 }
 
 /// The not-found answer, with what the index can add to it.
@@ -437,11 +516,11 @@ fn is_entry_point(file_path: &str) -> bool {
 /// resolved (`react` survives, `@excalidraw/math` became an edge to a file and
 /// its placeholder is gone). So there is nothing to look the package name up
 /// in, which is why this matches paths rather than pretending otherwise.
-fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorData> {
+fn no_file_message(conn: &Connection, entry_points: &[String], file_path: &str) -> Result<String, ErrorData> {
     const MAX_FILES: usize = 5;
     let terse = format!("g-mesh: no file '{file_path}' found in the index");
 
-    let under = queries::find_files_under(conn, file_path, MAX_FILES)
+    let under = queries::find_files_under(conn, file_path, entry_points, MAX_FILES)
         .map_err(|e| internal_error("failed to look up files under a prefix", e))?;
     if !under.is_empty() {
         return Ok(format!(
@@ -456,7 +535,7 @@ fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorDa
     let Some(segment) = file_path.rsplit('/').next().filter(|s| !s.is_empty() && *s != file_path) else {
         return Ok(terse);
     };
-    let by_segment = queries::find_files_ending_in_dir(conn, segment, MAX_FILES)
+    let by_segment = queries::find_files_ending_in_dir(conn, segment, entry_points, MAX_FILES)
         .map_err(|e| internal_error("failed to look up files by directory name", e))?;
     if by_segment.is_empty() {
         return Ok(terse);
@@ -487,7 +566,12 @@ fn paths_of(nodes: &[NodeRecord]) -> String {
 /// and a second call to get the answer the first one had the input for. A
 /// path that this index carries is an answerable question however the caller
 /// labelled it, and refusing it on a technicality buys nothing.
-fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_module(
+    conn: &Connection,
+    entry_points: &[String],
+    module_id: &str,
+    shape: &WalkShape,
+) -> Result<CallToolResult, ErrorData> {
     let anchor =
         queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
 
@@ -497,7 +581,7 @@ fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<
             .map_err(|e| internal_error("failed to look up file", e))?
         {
             Some(node) => from_root(conn, node.id, shape),
-            None => error(no_file_message(conn, module_id)?),
+            None => error(no_file_message(conn, entry_points, module_id)?),
         },
     }
 }
@@ -526,8 +610,16 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
     success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked))
 }
 
-pub(super) fn handle(
+/// `entry_points` is the union of every discovered plugin's
+/// `[plugin.workspace] entry_points` - see `daemon::registry::PluginRegistry::entry_points`
+/// and `graph::queries::entry_point_rank_expr` for where it comes from and
+/// how it is used. The caller (`mcp::GMeshMcpServer::get_dependencies`) reads
+/// it off its own `PluginRegistry` once per call, since discovery never
+/// changes while a daemon runs (see `daemon::manifest::discover`'s own
+/// contract) - there is nothing this function would gain by asking twice.
+pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
+    entry_points: &[String],
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -543,8 +635,8 @@ pub(super) fn handle(
         (Some(_), _, _) => {
             error("g-mesh: `resume_token` already carries the walk it continues - call it without `file_path`/`module_id`")
         }
-        (None, Some(file_path), None) => from_file(&conn, &file_path, &shape),
-        (None, None, Some(module_id)) => from_module(&conn, &module_id, &shape),
+        (None, Some(file_path), None) => from_file(&conn, entry_points, &file_path, &shape),
+        (None, None, Some(module_id)) => from_module(&conn, entry_points, &module_id, &shape),
         (None, Some(_), Some(_)) => error("g-mesh: give either `file_path` or `module_id`, not both"),
         (None, None, None) => error("g-mesh: give either `file_path` or `module_id` to start from"),
     }
@@ -556,6 +648,46 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
+
+    /// What a real daemon feeds `handle`/`from_file`/`from_module`/
+    /// `no_file_message` in the bundled, TS-only setup: the bundled plugin's
+    /// own manifest declares `entry_points = ["index"]`
+    /// (`plugins/typescript/plugin.toml`), so this is the one list that
+    /// reproduces the pre-GM-273 hardcoded `index.*` behaviour exactly.
+    fn ts_entry_points() -> Vec<String> {
+        vec!["index".to_string()]
+    }
+
+    /// Shadows [`super::handle`] for every test below that does not care
+    /// about entry points at all, or wants the bundled-TS-setup default -
+    /// see [`ts_entry_points`]. A test exercising a different declared set
+    /// (a fake Rust manifest, an empty one) calls `super::handle` directly
+    /// instead of this wrapper.
+    fn handle(
+        conn: &Arc<Mutex<Connection>>,
+        params: GetDependenciesParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        super::handle(conn, &ts_entry_points(), params)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::from_file`].
+    fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+        super::from_file(conn, &ts_entry_points(), file_path, shape)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::from_module`].
+    fn from_module(
+        conn: &Connection,
+        module_id: &str,
+        shape: &WalkShape,
+    ) -> Result<CallToolResult, ErrorData> {
+        super::from_module(conn, &ts_entry_points(), module_id, shape)
+    }
+
+    /// [`handle`]'s own shadow, for [`super::no_file_message`].
+    fn no_file_message(conn: &Connection, file_path: &str) -> Result<String, ErrorData> {
+        super::no_file_message(conn, &ts_entry_points(), file_path)
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1210,6 +1342,67 @@ mod tests {
         assert_eq!(body["resolvedFrom"]["filePath"], "packages/math/index.ts");
     }
 
+    /// GM-273's acceptance case at the tool level: a fake manifest declaring
+    /// `entry_points = ["mod.rs"]` - Rust's own convention, not TypeScript's
+    /// `"index"` - must resolve a directory lookup to `mod.rs` the same way
+    /// `a_directory_with_one_entry_point_is_answered_too` resolves one to
+    /// `index.ts`. Calls `super::from_file` directly (not the `ts_entry_points`
+    /// shadow above) precisely because this is the one test that must NOT get
+    /// the bundled-TS default.
+    #[test]
+    fn a_directory_with_one_declared_rust_entry_point_is_answered_too() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("crates/math/mod.rs")).unwrap();
+        upsert_node(&mut conn, file("crates/math/point.rs")).unwrap();
+        // Shorter than "crates/math/mod.rs" - if entry-point rank did not
+        // decide the order, `LENGTH(filePath)` would put this one first
+        // instead, and the substitution below would not happen at all.
+        upsert_node(&mut conn, file("crates/math/x.rs")).unwrap();
+        upsert_node(&mut conn, file("app/main.rs")).unwrap();
+        imports(&mut conn, "app/main.rs", "crates/math/mod.rs");
+
+        let body = json_body(
+            &super::from_file(
+                &conn,
+                &["mod.rs".to_string()],
+                "crates/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(body["results"][0]["filePath"], "app/main.rs");
+        assert_eq!(
+            body["resolvedFrom"]["filePath"], "crates/math/mod.rs",
+            "mod.rs must be the file the walk actually started from: {body}"
+        );
+    }
+
+    /// A directory declaring both of a Rust crate root's two conventional
+    /// entry points (`mod.rs` and `lib.rs`) is exactly the "more than one
+    /// entry point" case `entry_point_for`'s doc comment calls out by name -
+    /// still refused, not guessed at, the same rule
+    /// `two_entry_points_still_refuse_and_list_the_candidates` proves for TS.
+    #[test]
+    fn two_declared_rust_entry_points_in_one_directory_still_refuse() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("crates/math/mod.rs")).unwrap();
+        upsert_node(&mut conn, file("crates/math/lib.rs")).unwrap();
+
+        let message = error_text(
+            &super::from_file(
+                &conn,
+                &["mod.rs".to_string(), "lib.rs".to_string()],
+                "crates/math",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert!(message.contains("crates/math/mod.rs"), "the candidates are still named: {message}");
+        assert!(message.contains("crates/math/lib.rs"), "both of them: {message}");
+    }
+
     /// Two entry points is the case where answering would be worse than
     /// refusing: the walk would succeed and describe the wrong file. The old
     /// error, which lists the candidates, is the right outcome.
@@ -1271,5 +1464,177 @@ mod tests {
 
         assert_eq!(json_body(&result)["results"][0]["filePath"], "app/viewport.ts");
         assert!(!raw.contains("resolvedFrom"), "no substitution, no field: {raw}");
+    }
+
+    // -----------------------------------------------------------------
+    // Containers (GM-267): `File -IMPORTS-> container` edges, walked and
+    // anchored on. Built directly at the storage layer - `graph::imports`'s
+    // own tests (`graph::imports::tests`) cover the *linking* of a
+    // container-scoped placeholder onto one of these edges; this module
+    // tests the walk and the anchor resolution once the edge exists, exactly
+    // the split the file-import tests above already follow (`imports` builds
+    // a resolved edge directly rather than going through the linker).
+    // -----------------------------------------------------------------
+
+    fn container_member(id: &str, language: &str, key: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Function", id, id, format!("{key}/{id}.x"), language);
+        node.container = Some(key.to_string());
+        node
+    }
+
+    /// Materializes container `key` (in `language`) with one member - the
+    /// minimal fixture `graph::containers::attach` needs - and returns the
+    /// container's own node id.
+    fn materialize_container(conn: &mut Connection, language: &str, key: &str) -> String {
+        upsert_node(conn, container_member(&format!("member:{language}:{key}"), language, key)).unwrap();
+        crate::graph::containers::container_id(language, key)
+    }
+
+    /// `from` (a File) imports the container at `container_node_id`,
+    /// directly - the walk-time shape `graph::imports` produces after
+    /// linking a container-scoped placeholder, built without the linker for
+    /// the same reason [`imports`] builds a file-to-file edge directly.
+    fn imports_container(conn: &mut Connection, from: &str, container_node_id: &str) {
+        upsert_edge(
+            conn,
+            EdgeRecord::new(
+                format!("e_{from}_{container_node_id}"),
+                from,
+                container_node_id,
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Acceptance: "Outgoing from a file lists containers as well as files."
+    /// Decision 5's row shape, exercised end to end: a container row's
+    /// `qualifiedName` carries its key (`ensure_container` writes the key as
+    /// both `name` and `qualifiedName`), and its `filePath` is `null` rather
+    /// than a fabricated path - the same shape an unresolved import
+    /// placeholder's row already has (`an_unresolved_import_is_reported_
+    /// without_a_file_path_of_its_own` above), at zero extra bytes: no new
+    /// field, because `DependencyNode::from` already branches on `kind !=
+    /// MODULE_KIND` for `file_path` and `kind == FILE_KIND` for
+    /// `qualified_name`, and a container node's stored `kind` is `"Module"`
+    /// (`graph::containers::ensure_container`) - the same branch a
+    /// placeholder already took.
+    #[test]
+    fn outgoing_from_a_file_lists_a_container_alongside_files() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("main.go")).unwrap();
+        upsert_node(&mut conn, file("other.go")).unwrap();
+        imports(&mut conn, "main.go", "other.go");
+        let container_id = materialize_container(&mut conn, "go", "github.com/x/pkg");
+        imports_container(&mut conn, "main.go", &container_id);
+
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap(),
+        );
+        let rows = body["results"].as_array().unwrap();
+
+        let container_row =
+            rows.iter().find(|r| r["id"] == container_id).expect("the container must be a result row");
+        assert_eq!(container_row["kind"], "Module");
+        assert_eq!(
+            container_row["qualifiedName"], "github.com/x/pkg",
+            "decision 5: a container row names its key, not a path"
+        );
+        assert!(
+            container_row["filePath"].is_null(),
+            "decision 5: no fabricated filePath for a node with none: {container_row}"
+        );
+
+        let files: Vec<&str> =
+            rows.iter().filter(|r| r["kind"] == "File").map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(files, vec!["other.go"], "an ordinary file dependency is unaffected");
+    }
+
+    /// Acceptance: "Incoming get_dependencies on a container returns
+    /// importing files" - anchoring directly on an exact container key
+    /// (decision 4), which is not a substitution and so carries no
+    /// `resolvedFrom` (unlike the miss-path/`entry_point_for` case exercised
+    /// by `a_package_specifier_with_one_entry_point_is_answered_not_refused`
+    /// above).
+    #[test]
+    fn incoming_on_a_container_key_returns_the_importing_files() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("a.go")).unwrap();
+        upsert_node(&mut conn, file("b.go")).unwrap();
+        let container_id = materialize_container(&mut conn, "go", "github.com/x/pkg");
+        imports_container(&mut conn, "a.go", &container_id);
+        imports_container(&mut conn, "b.go", &container_id);
+
+        let result = from_file(
+            &conn,
+            "github.com/x/pkg",
+            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        )
+        .unwrap();
+        let body = json_body(&result);
+
+        let mut files: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        files.sort_unstable();
+        assert_eq!(files, vec!["a.go", "b.go"]);
+        assert!(
+            !body.to_string().contains("resolvedFrom"),
+            "an exact container key is a direct anchor, not a substitution (decision 4): {body}"
+        );
+    }
+
+    /// Decision 4's refusal case: a key that names a container in more than
+    /// one language is a real ambiguity (`containers.key` is only unique
+    /// *within* a language), refused with the candidates named rather than
+    /// guessed at - the same stance `two_entry_points_still_refuse_and_list_
+    /// the_candidates` already takes for two file candidates.
+    #[test]
+    fn a_container_key_ambiguous_across_languages_is_refused_with_the_languages_named() {
+        let mut conn = setup();
+        materialize_container(&mut conn, "go", "shared");
+        materialize_container(&mut conn, "rust", "shared");
+
+        let message = error_text(
+            &from_file(
+                &conn,
+                "shared",
+                &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert!(message.contains("go"), "{message}");
+        assert!(message.contains("rust"), "{message}");
+    }
+
+    /// Decision 6: two containers with the storage-level `filePath = ''` in
+    /// common must not collapse into a single result row - a walk-level
+    /// version of `graph::imports::tests::two_containers_imported_by_the_
+    /// same_file_both_link_independently`, at the layer (`ReachedNode`/
+    /// `DependencyNode`) where a `filePath`-keyed dedup would actually bite
+    /// if one existed. `traversal::traverse` dedups by node id
+    /// (`seen_nodes: HashSet<String>` keyed on `node.id`), never by
+    /// `filePath`, so this passed without any code change - it is coverage
+    /// for that fact, not a fix.
+    #[test]
+    fn two_containers_imported_by_the_same_file_are_two_separate_rows() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("main.go")).unwrap();
+        let a = materialize_container(&mut conn, "go", "pkg/a");
+        let b = materialize_container(&mut conn, "go", "pkg/b");
+        imports_container(&mut conn, "main.go", &a);
+        imports_container(&mut conn, "main.go", &b);
+
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap(),
+        );
+        let ids: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+
+        assert_eq!(ids.len(), 2, "two distinct containers must not collapse into one row: {ids:?}");
+        assert!(ids.contains(&a.as_str()), "{ids:?}");
+        assert!(ids.contains(&b.as_str()), "{ids:?}");
     }
 }

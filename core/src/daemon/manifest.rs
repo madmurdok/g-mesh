@@ -31,12 +31,39 @@
 //! installed. `Path::join` already does the right thing for an
 //! already-absolute value (it replaces the base entirely), so no separate
 //! "is it absolute" branch is needed.
+//!
+//! # Capabilities and workspace
+//!
+//! `[plugin.capabilities]` and `[plugin.workspace]` (see
+//! `docs/architecture/multi-language-plugins.md`'s "`plugin.toml`
+//! additions" section) are read and validated exactly like everything else
+//! in this file - same hard-failure rule, same "a manifest is read once at
+//! startup" reasoning - but this module only parses and exposes them.
+//! Nothing here schedules a semantic pass, routes a watched file, or picks
+//! an entry point; those are later consumers reading [`PluginManifest::capabilities`]
+//! and [`PluginManifest::workspace`], not this one. Both sections are
+//! optional: a manifest that omits one entirely gets the conservative
+//! default documented on [`Capabilities::default`] and
+//! [`WorkspaceConfig::default`] respectively - "says nothing" is treated as
+//! "can do the least", not "can do the most", so an old or hand-written
+//! manifest predating this task does not silently opt into a semantic pass
+//! or a resolved receiver-call claim it was never written to back up.
+//!
+//! `watch_files` entries are glob patterns (`globset::Glob`), compiled and
+//! validated here rather than left as raw strings - see this file's
+//! `Cargo.toml` comment for why `globset` and not something else. An exact
+//! file name (`"go.mod"`) is already a valid glob that matches only itself,
+//! so there is no separate "exact name" code path to keep in sync with the
+//! glob one; the architecture doc's paper stress test is what forced globs
+//! onto this field at all (`*.csproj`, `*.sln` - C#'s project files have no
+//! fixed name).
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use globset::Glob;
 use serde::Deserialize;
 
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
@@ -118,6 +145,105 @@ pub fn installed_bundled_root() -> Option<PathBuf> {
     Some(exe.parent()?.join("plugins"))
 }
 
+/// Whether receiver calls (`x.foo()`) resolve to an edge, at one of the two
+/// tiers `[plugin.capabilities]` asks about separately - see
+/// [`Capabilities::receiver_calls`] and
+/// [`Capabilities::receiver_calls_structural`]'s own doc comments, and the
+/// architecture doc's `plugin.toml additions` section, for what "resolved"
+/// means at each tier. A plain `bool` was rejected on purpose: at the call
+/// site (the MCP instruction assembler, a later task) `resolved`/`unresolved`
+/// reads as what it is, where `true`/`false` would leave a reader re-deriving
+/// which boolean state means which English word every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReceiverCallResolution {
+    Resolved,
+    Unresolved,
+}
+
+impl std::fmt::Display for ReceiverCallResolution {
+    /// The same lowercase word the manifest itself uses (`"resolved"` /
+    /// `"unresolved"`) - used by `cli::plugins`' `render` to show
+    /// capabilities without a second mapping to keep in sync with
+    /// [`ReceiverCallResolution`]'s `Deserialize` impl above.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReceiverCallResolution::Resolved => "resolved",
+            ReceiverCallResolution::Unresolved => "unresolved",
+        })
+    }
+}
+
+impl Default for ReceiverCallResolution {
+    /// The conservative default this field takes wherever it is missing -
+    /// an absent `[plugin.capabilities]` table (via [`Capabilities::default`])
+    /// or, once semantic scheduling exists, a plugin that never claims a tier
+    /// resolves receiver calls. Assuming "unresolved" costs an honest gap in
+    /// the MCP instructions; assuming "resolved" would silently drop edges a
+    /// caller was told to expect.
+    fn default() -> Self {
+        ReceiverCallResolution::Unresolved
+    }
+}
+
+/// What core is allowed to ask this plugin to do, and how far each tier's
+/// receiver-call resolution can be trusted - see this module's doc comment
+/// and the architecture doc's `plugin.toml additions` section for what each
+/// field gates. Read from the manifest, not the handshake: routing and MCP
+/// instruction assembly need these before any plugin process exists, and the
+/// manifest is already the startup-time source of truth (same rationale the
+/// architecture doc gives for this choice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Capabilities {
+    /// Whether core may send this plugin a `semanticPass` request - per file
+    /// after a reparse, whole project after a walk. `false` (the default)
+    /// means core never sends one and never requires an (empty-diff) answer
+    /// to one; there is no partial-semantic-pass state to represent.
+    pub semantic_pass: bool,
+    /// Whether receiver calls resolve to edges once this plugin's best
+    /// available tier has run (its semantic tier, if it has one and it has
+    /// run - otherwise the structural tier alone). `Resolved` means the MCP
+    /// instructions do not need to list the receiver-call gap for this
+    /// language; `Unresolved` (the default) means they do.
+    pub receiver_calls: ReceiverCallResolution,
+    /// Whether the *structural* tier alone - before any semantic pass runs,
+    /// or for a plugin with no semantic tier at all - resolves receiver
+    /// calls. Separate from `receiver_calls` because a plugin can be
+    /// `Unresolved` here and `Resolved` there: resolved once
+    /// `semanticPassAt` is set for the language, per the architecture doc's
+    /// comment on this exact pair of fields.
+    pub receiver_calls_structural: ReceiverCallResolution,
+}
+
+/// Which files and directories route to this plugin outside of its claimed
+/// extensions, and which names a miss-path lookup treats as a container's
+/// entry point - see this module's doc comment and the architecture doc's
+/// `plugin.toml additions` section for what each field gates. A manifest
+/// with no `[plugin.workspace]` table at all defaults to all three fields
+/// empty: nothing watched beyond extension-based routing, nothing excluded,
+/// no entry points - the same "says nothing, assumed to do the least" rule
+/// [`Capabilities::default`] follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceConfig {
+    /// Exact file names (any directory) or glob patterns (`*.csproj`),
+    /// already compiled and validated by [`read_manifest`] - see this
+    /// module's doc comment for why an exact name needs no separate
+    /// representation from a glob. A change to a matching file triggers a
+    /// per-language reindex (module paths / crate roots may have moved) -
+    /// the watcher-routing consumer of this field, not built by this task.
+    pub watch_files: Vec<Glob>,
+    /// Directory names this plugin's own walk never descends into, and the
+    /// watcher should never route to it either - matched by exact name, not
+    /// glob, mirroring `fingerprint_ignore`'s shape rather than
+    /// `watch_files`'s.
+    pub exclude_dirs: Vec<String>,
+    /// File or directory names a miss-path lookup treats as this container's
+    /// entry point (e.g. rust: `lib.rs`, `main.rs`, `mod.rs`; typescript:
+    /// `index`). Exact names, not globs.
+    pub entry_points: Vec<String>,
+}
+
 /// One plugin directory's fully-resolved manifest - see this module's doc
 /// comment and the architecture doc's Interfaces section for what each field
 /// means and how `command`/`args` got resolved.
@@ -147,15 +273,26 @@ pub struct PluginManifest {
     /// Kept on the resolved struct for error messages and fingerprinting
     /// (walking every file under it), not just as a read-time detail.
     pub manifest_dir: PathBuf,
+    /// Parsed `[plugin.capabilities]`, or [`Capabilities::default`] if the
+    /// table is absent - see this module's doc comment.
+    pub capabilities: Capabilities,
+    /// Parsed `[plugin.workspace]`, or [`WorkspaceConfig::default`] if the
+    /// table is absent - see this module's doc comment.
+    pub workspace: WorkspaceConfig,
 }
 
 /// Reads and validates `<dir>/plugin.toml`.
 ///
 /// Hard error on: malformed TOML, a missing required field, `language` not
-/// equal to `dir`'s final path component, or an unrecognized
-/// `protocol_version`. Every error names the manifest path; the two
-/// semantic checks additionally name both the declared and expected value,
-/// matching `protocol::handshake::verify`'s error style.
+/// equal to `dir`'s final path component, an unrecognized
+/// `protocol_version`, an unrecognized `[plugin.capabilities]
+/// receiver_calls`/`receiver_calls_structural` value (caught by TOML parsing
+/// itself - see [`ReceiverCallResolution`]'s `Deserialize` impl - so it
+/// fails alongside any other malformed-TOML error, with the manifest path
+/// named the same way), or an invalid `[plugin.workspace] watch_files` glob
+/// pattern. Every error names the manifest path; the two semantic checks on
+/// `language`/`protocol_version` additionally name both the declared and
+/// expected value, matching `protocol::handshake::verify`'s error style.
 pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
 
@@ -191,6 +328,30 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     let command = resolve_path_entry(&plugin.spawn.command, dir);
     let args = plugin.spawn.args.iter().map(|arg| resolve_arg(arg, dir)).collect();
 
+    // `watch_files` entries parse as plain strings (`RawWorkspace`) rather
+    // than straight into `Glob` - unlike `receiver_calls` above, a bad glob
+    // is not a shape TOML itself can reject (any string is syntactically
+    // valid TOML), so it needs its own validation pass, here, with its own
+    // error naming the manifest path, the section, and the bad pattern
+    // itself - the same "validation is a hard failure, not best-effort" rule
+    // as `language`/`protocol_version` above, just for a check TOML parsing
+    // cannot do on its behalf.
+    let watch_files = plugin
+        .workspace
+        .watch_files
+        .iter()
+        .map(|pattern| {
+            Glob::new(pattern).with_context(|| {
+                format!(
+                    "plugin manifest at {} declares an invalid glob \"{}\" in \
+                     [plugin.workspace] watch_files",
+                    manifest_path.display(),
+                    pattern,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(PluginManifest {
         language: plugin.language,
         protocol_version: plugin.protocol_version,
@@ -200,6 +361,12 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         extensions: plugin.languages.extensions,
         fingerprint_ignore: plugin.fingerprint.ignore,
         manifest_dir: dir.to_path_buf(),
+        capabilities: plugin.capabilities,
+        workspace: WorkspaceConfig {
+            watch_files,
+            exclude_dirs: plugin.workspace.exclude_dirs,
+            entry_points: plugin.workspace.entry_points,
+        },
     })
 }
 
@@ -212,6 +379,39 @@ pub struct DiscoveredPlugins {
     pub manifests: HashMap<String, PluginManifest>,
     /// lowercase, leading-dot extension -> language.
     pub routing: HashMap<String, String>,
+}
+
+/// Every language among `manifests` whose `capabilities.semantic_pass` is
+/// `true`, sorted.
+///
+/// The set `daemon::semantic`'s per-language scheduler (GM-270) asks for a
+/// whole-project pass, generalized from the single hardcoded
+/// `plugin::BUNDLED_LANGUAGE` question it replaces - a manifest that never
+/// mentions `[plugin.capabilities]`, or sets `semantic_pass = false`
+/// explicitly, is excluded by [`Capabilities::default`]'s conservative
+/// default, the same way it was already excluded from ever receiving a
+/// `semanticPass` request at all.
+///
+/// Shared by [`crate::daemon::registry::PluginRegistry::semantic_pass_languages`]
+/// (the live-registry view `daemon::semantic::run_with_registry` asks) and
+/// `daemon::semantic::run_once` (which has a bare `&DiscoveredPlugins` and no
+/// registry to ask), so the same filter and the same sort order back both.
+///
+/// Sorted for determinism, not just tidiness: `manifests` is a `HashMap`, and
+/// `run_once` asks each capable language for its pass *sequentially* (see
+/// that function's own doc comment for why concurrently is deliberately not
+/// done) - an unsorted, hash-order-dependent sequence would make which
+/// language runs first (and therefore which one a shared machine's memory
+/// pressure hits) vary between two otherwise identical runs for no reason
+/// anyone could explain from the outside.
+pub fn semantic_pass_capable_languages(manifests: &HashMap<String, PluginManifest>) -> Vec<String> {
+    let mut languages: Vec<String> = manifests
+        .values()
+        .filter(|manifest| manifest.capabilities.semantic_pass)
+        .map(|manifest| manifest.language.clone())
+        .collect();
+    languages.sort();
+    languages
 }
 
 /// Scans `roots` in order for `<root>/<language-dir>/plugin.toml`, calling
@@ -343,6 +543,19 @@ struct RawPlugin {
     /// architecture doc's Data Model section).
     #[serde(default)]
     fingerprint: RawFingerprint,
+    /// `[plugin.capabilities]` is optional, and so is every field inside it -
+    /// `Capabilities` itself carries `#[serde(default)]`, so a table present
+    /// but missing one field (e.g. `semantic_pass` alone, no
+    /// `receiver_calls`) still fills the rest conservatively rather than
+    /// erroring. No separate raw type needed: nothing in this section needs
+    /// resolving beyond what `toml`'s `Deserialize` already does (unlike
+    /// `workspace.watch_files` below, which needs glob compilation
+    /// `read_manifest` does by hand).
+    #[serde(default)]
+    capabilities: Capabilities,
+    /// `[plugin.workspace]` is optional - see [`RawWorkspace`].
+    #[serde(default)]
+    workspace: RawWorkspace,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +574,23 @@ struct RawLanguages {
 struct RawFingerprint {
     #[serde(default)]
     ignore: Vec<String>,
+}
+
+/// `[plugin.workspace]`'s on-disk shape - plain strings, unlike
+/// [`WorkspaceConfig`]'s `watch_files: Vec<Glob>`, because a glob pattern's
+/// validity cannot be checked by `toml`'s `Deserialize` alone (any string is
+/// syntactically valid TOML); [`read_manifest`] compiles and validates each
+/// entry by hand after parsing, the same "raw strings in, resolved values
+/// out" shape `RawSpawn`'s `command`/`args` already use for a different
+/// reason (path resolution instead of glob compilation).
+#[derive(Debug, Default, Deserialize)]
+struct RawWorkspace {
+    #[serde(default)]
+    watch_files: Vec<String>,
+    #[serde(default)]
+    exclude_dirs: Vec<String>,
+    #[serde(default)]
+    entry_points: Vec<String>,
 }
 
 #[cfg(test)]
@@ -798,6 +1028,216 @@ extensions = [".py"]
         assert_eq!(manifest.fingerprint_ignore, Vec::<String>::new());
     }
 
+    /// This task's own acceptance criterion, stated directly: a manifest
+    /// that never mentions `[plugin.capabilities]` or `[plugin.workspace]`
+    /// at all parses to the conservative defaults documented on
+    /// [`Capabilities::default`] and [`WorkspaceConfig::default`] - no
+    /// semantic pass, receiver calls unresolved at both tiers, nothing
+    /// watched, nothing excluded, no entry points. Same fixture body as
+    /// [`a_manifest_with_no_fingerprint_table_defaults_to_an_empty_ignore_list`],
+    /// applying the same "an absent optional table is not an error" rule to
+    /// the two newer sections.
+    #[test]
+    fn a_manifest_with_no_capabilities_or_workspace_table_defaults_conservatively() {
+        let body = format!(
+            r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".py"]
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (_root, dir) = plugin_dir("python", &body);
+
+        let manifest = read_manifest(&dir).unwrap();
+
+        assert_eq!(manifest.capabilities, Capabilities::default());
+        assert!(!manifest.capabilities.semantic_pass);
+        assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
+        assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
+        assert_eq!(manifest.workspace, WorkspaceConfig::default());
+        assert!(manifest.workspace.watch_files.is_empty());
+        assert!(manifest.workspace.exclude_dirs.is_empty());
+        assert!(manifest.workspace.entry_points.is_empty());
+    }
+
+    /// The positive case: every `[plugin.capabilities]` and
+    /// `[plugin.workspace]` field set to a non-default value parses into
+    /// the expected typed struct - including a genuine glob (`*.csproj`,
+    /// straight from the architecture doc's paper-stress-test example)
+    /// alongside an exact file name (`go.mod`), proving both live in
+    /// `watch_files` the same way (see this module's doc comment).
+    #[test]
+    fn parses_capabilities_and_workspace_from_a_well_formed_manifest() {
+        let body = format!(
+            r#"
+[plugin]
+language = "go"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "./g-mesh-plugin-go"
+
+[plugin.languages]
+extensions = [".go"]
+
+[plugin.capabilities]
+semantic_pass = true
+receiver_calls = "resolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+watch_files = ["go.mod", "go.work", "*.csproj"]
+exclude_dirs = ["vendor", "testdata"]
+entry_points = ["lib.rs", "main.rs", "mod.rs"]
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (_root, dir) = plugin_dir("go", &body);
+
+        let manifest = read_manifest(&dir).unwrap();
+
+        assert!(manifest.capabilities.semantic_pass);
+        assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Resolved);
+        assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
+
+        let watch_file_patterns: Vec<&str> = manifest.workspace.watch_files.iter().map(Glob::glob).collect();
+        assert_eq!(watch_file_patterns, vec!["go.mod", "go.work", "*.csproj"]);
+        // An exact name matches only itself; a glob matches the shape the
+        // paper stress test needed it for (C#'s project files, which have
+        // no fixed name) - both through the same `Glob::compile_matcher`,
+        // proving `watch_files` needs no separate "exact name" code path.
+        let go_mod = manifest.workspace.watch_files[0].compile_matcher();
+        assert!(go_mod.is_match("go.mod"));
+        assert!(!go_mod.is_match("other.mod"));
+        let csproj = manifest.workspace.watch_files[2].compile_matcher();
+        assert!(csproj.is_match("MyProject.csproj"));
+        assert!(!csproj.is_match("MyProject.sln"));
+
+        assert_eq!(manifest.workspace.exclude_dirs, vec!["vendor".to_string(), "testdata".to_string()]);
+        assert_eq!(
+            manifest.workspace.entry_points,
+            vec!["lib.rs".to_string(), "main.rs".to_string(), "mod.rs".to_string()]
+        );
+    }
+
+    /// A `[plugin.capabilities]` table that sets only one field still fills
+    /// the rest from [`Capabilities::default`] rather than erroring on the
+    /// missing ones or leaving them at some other implicit value - the
+    /// container-level `#[serde(default)]` on [`Capabilities`] is what makes
+    /// this work, and it is exactly the behavior a plugin author relies on
+    /// when they only have something to say about one field.
+    #[test]
+    fn a_partially_specified_capabilities_table_defaults_the_rest() {
+        let body = format!(
+            r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".py"]
+
+[plugin.capabilities]
+semantic_pass = true
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (_root, dir) = plugin_dir("python", &body);
+
+        let manifest = read_manifest(&dir).unwrap();
+
+        assert!(manifest.capabilities.semantic_pass);
+        assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
+        assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
+    }
+
+    /// This task's other acceptance criterion: an unrecognized
+    /// `receiver_calls` value is a hard failure naming the manifest path.
+    /// Caught by TOML parsing itself (see [`ReceiverCallResolution`]'s
+    /// `Deserialize` impl), so this shares its assertion shape with
+    /// [`rejects_malformed_toml_naming_the_manifest_path`] rather than with
+    /// the hand-written `bail!` checks below it - both are "TOML parsing
+    /// failed", just for a different reason.
+    #[test]
+    fn rejects_an_invalid_receiver_calls_value_naming_the_manifest_path() {
+        let body = format!(
+            r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".py"]
+
+[plugin.capabilities]
+receiver_calls = "maybe"
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (_root, dir) = plugin_dir("python", &body);
+
+        let err = read_manifest(&dir).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+        assert!(message.contains("maybe"), "{message}");
+    }
+
+    /// This task's third acceptance criterion: a `[plugin.workspace]
+    /// watch_files` entry that is not a valid glob is a hard failure naming
+    /// the manifest path. Unlike the `receiver_calls` case above, TOML
+    /// parsing cannot catch this by itself - any string is syntactically
+    /// valid TOML - so [`read_manifest`]'s own glob-compilation step is what
+    /// has to reject it, matching this module's `bail!`/`.with_context`
+    /// error style rather than a `Deserialize` error.
+    #[test]
+    fn rejects_an_invalid_glob_in_watch_files_naming_the_manifest_path() {
+        let body = format!(
+            r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "node"
+args = ["dist/src/index.js"]
+
+[plugin.languages]
+extensions = [".py"]
+
+[plugin.workspace]
+watch_files = ["[unclosed"]
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (_root, dir) = plugin_dir("python", &body);
+
+        let err = read_manifest(&dir).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+        assert!(message.contains("[unclosed"), "{message}");
+    }
+
     #[test]
     fn a_bare_command_with_no_path_separator_is_left_for_path_lookup() {
         assert_eq!(resolve_path_entry("node", Path::new("/plugins/python")), PathBuf::from("node"));
@@ -840,6 +1280,14 @@ extensions = [".py"]
         assert!(manifest.extensions.contains(&".ts".to_string()));
         assert!(manifest.extensions.contains(&".tsx".to_string()));
         assert!(manifest.extensions.contains(&".js".to_string()));
+
+        // This task's acceptance criterion for the bundled manifest: it
+        // carries the capabilities, not just the fields this test already
+        // checked before this task.
+        assert!(manifest.capabilities.semantic_pass);
+        assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
+        assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
+        assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);
     }
 
     /// Task 155's actual acceptance criterion for the rename: discovery must
@@ -857,5 +1305,39 @@ extensions = [".py"]
             .expect("the real bundled plugin directory must satisfy read_manifest");
 
         assert_eq!(manifest.language, "typescript");
+    }
+
+    /// [`semantic_pass_capable_languages`]'s own acceptance criterion: only
+    /// the manifests that actually declared `capabilities.semantic_pass =
+    /// true` come back, sorted, and a manifest that said nothing (the
+    /// conservative default - see [`Capabilities::default`]) is excluded
+    /// exactly like one that said `false` explicitly.
+    #[test]
+    fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
+        let capable = |language: &str| PluginManifest {
+            language: language.to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            plugin_version: "0.0.0".to_string(),
+            command: PathBuf::from("true"),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            fingerprint_ignore: Vec::new(),
+            manifest_dir: PathBuf::from("/dev/null"),
+            capabilities: Capabilities { semantic_pass: true, ..Capabilities::default() },
+            workspace: WorkspaceConfig::default(),
+        };
+        let not_capable =
+            |language: &str| PluginManifest { capabilities: Capabilities::default(), ..capable(language) };
+
+        let mut manifests = HashMap::new();
+        manifests.insert("rust".to_string(), capable("rust"));
+        manifests.insert("go".to_string(), not_capable("go"));
+        manifests.insert("typescript".to_string(), capable("typescript"));
+
+        assert_eq!(
+            semantic_pass_capable_languages(&manifests),
+            vec!["rust".to_string(), "typescript".to_string()],
+            "go declared no semantic_pass capability and must be excluded; the rest sorted"
+        );
     }
 }

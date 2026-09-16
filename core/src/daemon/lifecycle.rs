@@ -40,6 +40,27 @@
 //! *first* and the connection lock inside it, never the other way round - the
 //! MCP handlers that trigger a replay finish with their `lastUsed` write and
 //! release the connection before asking the supervisor for anything.
+//!
+//! # A third thing riding the plugin's idle-check tick (task GM-274)
+//!
+//! `[plugin] memoryLimitMb` (`config::PluginConfig::memory_limit_mb`,
+//! `PluginSupervisor::check_memory_limit`, `daemon::memory`) is not a third
+//! timer - it is a second check the *existing* idle-check tick runs, right
+//! alongside [`PluginSupervisor::sleep_if_idle`]. `IdleTimeouts::tick` is
+//! that period: a quarter of the shorter of the two idle timeouts, clamped
+//! between [`MIN_TICK`] (50ms) and [`MAX_TICK`] (30s) - so in production
+//! (default 1h plugin idle timeout) it is a flat 30s, and in a test that
+//! shortens the idle timeout it scales down with it.
+//!
+//! **Open question, deliberately not solved here**: a plugin that spikes past
+//! `memoryLimitMb` and is put back to sleep by something else (an idle
+//! timeout, a crash) before the next 30-second tick ever samples it is a
+//! spike this mechanism never sees. Nothing about `memoryLimitMb`'s design
+//! promises otherwise - the architecture doc's own "Memory on large repos"
+//! failure mode frames this as a ceiling on *sustained* growth (a cold
+//! `rust-analyzer`/`go/packages` load that keeps climbing), not a guard
+//! against a transient spike - but a tighter sampling interval, or sampling
+//! on some other trigger entirely, is future work this task does not take on.
 
 use std::collections::HashSet;
 use std::fs;
@@ -56,6 +77,7 @@ use crate::config::ProjectConfig;
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::protocol::jsonrpc::is_timeout;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
@@ -258,6 +280,32 @@ pub struct PluginSupervisor {
     /// in-flight reparse holding `inner`. A stale `false` costs one deferred
     /// replay, never a lost one: the flag is set inside the lock that queues.
     pending: AtomicBool,
+    /// `[plugin] memoryLimitMb` (task GM-274), resolved once at daemon
+    /// startup exactly like [`idle_timeout`](Self::idle_timeout) - `None`
+    /// means "off", the documented default: idle sleep only, exactly today's
+    /// behaviour, and [`check_memory_limit`](Self::check_memory_limit) never
+    /// samples anything. See `daemon::memory` for the sampling itself and
+    /// this field's own consumer.
+    memory_limit_mb: Option<u64>,
+    /// Set the instant [`check_memory_limit`](Self::check_memory_limit) finds
+    /// this plugin's process tree over `memory_limit_mb`, and never cleared
+    /// for the rest of this supervisor's life - per the architecture doc's
+    /// "Plugin memory limit" section, suspension "lasts until the daemon
+    /// restarts or the config changes", and since config is read once at
+    /// daemon startup (`daemon::run`, not hot-reloaded), a running daemon has
+    /// no path back to `false` short of exiting. In memory, not in the index
+    /// (decision 5 - see this field's doc comment on [`check_memory_limit`]
+    /// for where it is *also* recorded, for `g-mesh status`), so a restart
+    /// clears it for free by simply not carrying it forward: a fresh
+    /// supervisor starts every language unsuspended, exactly as it starts
+    /// every language awake.
+    semantic_suspended: AtomicBool,
+    /// Guards the "one-time log" half of [`check_memory_limit`](Self::check_memory_limit)'s
+    /// contract for a platform/build where `daemon::memory::process_tree_rss_mb`
+    /// never finds evidence either way (see that function's own doc comment) -
+    /// logged once per supervisor, not once per idle-check tick for the rest
+    /// of this daemon's life.
+    sampling_unavailable_logged: AtomicBool,
 }
 
 impl PluginSupervisor {
@@ -281,6 +329,7 @@ impl PluginSupervisor {
         manifest: PluginManifest,
         pid_file: PathBuf,
         idle_timeout: Option<Duration>,
+        memory_limit_mb: Option<u64>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Result<Arc<Self>> {
         let process = PluginProcess::spawn(project_root, &manifest, pid_file.clone())
@@ -296,6 +345,9 @@ impl PluginSupervisor {
             inner: Mutex::new(SupervisedPlugin { process: Some(process), dirty: DirtyQueue::default() }),
             last_activity: Mutex::new(Instant::now()),
             pending: AtomicBool::new(false),
+            memory_limit_mb,
+            semantic_suspended: AtomicBool::new(false),
+            sampling_unavailable_logged: AtomicBool::new(false),
         }))
     }
 
@@ -304,6 +356,16 @@ impl PluginSupervisor {
     /// the live handshake, so it names the process actually running.
     pub fn language(&self) -> &str {
         &self.manifest.language
+    }
+
+    /// This supervisor's own manifest - GM-272's `daemon::workspace_reindex`
+    /// needs the full `PluginManifest` (its `command`/`args` for the one-shot
+    /// bulk walk, its `capabilities.semantic_pass`), not just [`language`](Self::language).
+    /// Never a *different* manifest than the one this supervisor was spawned
+    /// with - see this struct's own doc comment on the `manifest` field for
+    /// why that invariant matters.
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
     }
 
     /// The pid of the plugin process right now, or `None` while it is asleep.
@@ -340,8 +402,34 @@ impl PluginSupervisor {
         // while is the plugin being *used*, and an idle check that fired in
         // the middle of one would be measuring from the wrong end of it.
         self.touch();
-        if let Err(err) = process.apply_file_change(conn, file_path, &self.embedding) {
-            eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+        // Kept before the call, which consumes `file_path` - only needed on
+        // the timeout branch below, but cloning a file path is cheap next to
+        // everything else a round trip costs.
+        let retry_path = file_path.clone();
+        if let Err(err) =
+            process.apply_file_change(conn, file_path, &self.embedding, self.is_semantic_suspended())
+        {
+            if is_timeout(&err) {
+                // `PluginProcess::apply_file_change`'s own doc comment: a
+                // timed-out request is deliberately not replayed inline (the
+                // plugin may have still been mid-write on it, and the process
+                // behind it has already been killed and relaunched by the
+                // time this error reaches us). Queue it exactly like a file
+                // that changed while the plugin was asleep, so the next
+                // request that touches this language - `replay_pending`,
+                // reached the same way a wake-from-sleep is - sends it again
+                // against the fresh process instead of it being silently
+                // dropped.
+                eprintln!(
+                    "g-mesh daemon: {} plugin timed out applying a file change ({err:#}) - \
+                     the plugin was relaunched and {retry_path} is queued for replay",
+                    self.manifest.language
+                );
+                inner.dirty.push(retry_path);
+                self.pending.store(true, Ordering::SeqCst);
+            } else {
+                eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+            }
         }
     }
 
@@ -386,9 +474,10 @@ impl PluginSupervisor {
 
         let process = inner.process.as_ref().expect("just spawned or already running");
         self.touch();
+        let semantic_suspended = self.is_semantic_suspended();
         let mut replayed = 0;
         for file_path in &queued {
-            match process.apply_file_change(conn, file_path.clone(), &self.embedding) {
+            match process.apply_file_change(conn, file_path.clone(), &self.embedding, semantic_suspended) {
                 Ok(()) => replayed += 1,
                 // One unreadable file must not cost the rest of the queue its
                 // replay; it is reported and the walk carries on, matching how
@@ -417,12 +506,74 @@ impl PluginSupervisor {
     /// In practice this is unreachable at the one call site there is (the
     /// plugin cannot have idled out during its own project's first walk),
     /// which is precisely why it must not be an error.
-    pub fn semantic_pass(&self, conn: &Mutex<Connection>, file_paths: Vec<String>) -> Result<bool> {
+    ///
+    /// `file_count` is forwarded to `PluginProcess::semantic_pass` unchanged.
+    /// See that method and `daemon::plugin::RoundTripTimeouts`'s doc comment
+    /// for why the whole-project timeout has to scale with it.
+    ///
+    /// Suspension (decision 5) is checked first, ahead of even the sleeping
+    /// check: a suspended language answers `Ok(false)` here exactly like a
+    /// sleeping one, whether or not its plugin happens to be awake for
+    /// structural work at the moment this is called - core never sends
+    /// `semanticPass` to a suspended language (per the architecture doc's
+    /// "Plugin memory limit" section), and this is the one place both this
+    /// method's caller (`daemon::semantic::run_with_registry`/`run_once`'s
+    /// per-language scheduler) and `daemon::workspace_reindex`'s
+    /// single-language semantic phase both go through, so gating it here
+    /// covers both without either caller having to know about suspension
+    /// itself.
+    pub fn semantic_pass(
+        &self,
+        conn: &Mutex<Connection>,
+        file_paths: Vec<String>,
+        file_count: usize,
+    ) -> Result<bool> {
+        if self.is_semantic_suspended() {
+            return Ok(false);
+        }
         let inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return Ok(false) };
         self.touch();
-        process.semantic_pass(conn, file_paths, &self.embedding)?;
+        process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
         Ok(true)
+    }
+
+    /// Runs `f` with this supervisor's own serialization lock held - the same
+    /// lock [`file_changed`](Self::file_changed)/[`replay_pending`](Self::replay_pending)/
+    /// [`ensure_fresh`](Self::ensure_fresh)/[`semantic_pass`](Self::semantic_pass)
+    /// already take, each for the duration of its own single round trip to
+    /// the plugin.
+    ///
+    /// GM-272's per-language workspace reindex (`daemon::workspace_reindex`)
+    /// is the motivating caller: deleting this language's rows and re-walking
+    /// them has to be atomic with respect to an ordinary settled edit to one
+    /// of this language's files, or the two can race - a `fileChanged` diff
+    /// committed between the delete and the re-walk would either resurrect
+    /// what the delete just removed (if the walk's own batches land after
+    /// it) or be silently wiped (if the delete runs after it committed). This
+    /// method is what lets that whole sequence share the *one* lock
+    /// `file_changed` already contends on, instead of inventing a second,
+    /// parallel lock a caller could take in the wrong order against this
+    /// one - see this module's own doc comment ("Lock order") for the rule
+    /// `f` itself must keep honoring if it goes on to touch the connection:
+    /// this lock first, the connection's inside it, never the other way
+    /// round.
+    ///
+    /// `f` is handed the live process, if the plugin is currently awake, so
+    /// it can send that process something (GM-272's `workspaceChanged`
+    /// notification) without a second lookup under the same lock. Nothing
+    /// here wakes a sleeping plugin - matching every other method on this
+    /// type, which treats "not currently needed" as a reason not to spawn a
+    /// process a caller has no real work for right now; a workspace reindex
+    /// still runs its delete/walk/link phase regardless (a fresh one-shot
+    /// process the caller owns, not this supervisor's own `inner.process`,
+    /// per `daemon::bulk_index`'s own reasoning for why a bulk walk is
+    /// always its own process), and the reindex is what actually needs the
+    /// language up to date - not this notification.
+    pub fn with_exclusive_access<T>(&self, f: impl FnOnce(Option<&PluginProcess>) -> T) -> T {
+        let inner = self.inner.lock().unwrap();
+        self.touch();
+        f(inner.process.as_ref())
     }
 
     /// Synchronously brings `file_path` up to date if it has changed since it
@@ -474,7 +625,7 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        process.ensure_fresh(conn, file_path, &self.embedding)
+        process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())
     }
 
     /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work.
@@ -506,6 +657,119 @@ impl PluginSupervisor {
         let mut inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.take() else { return };
         self.put_to_sleep(process, reason);
+    }
+
+    /// Whether this language's semantic passes are suspended right now - see
+    /// this struct's own doc comment on the `semantic_suspended` field.
+    /// [`file_changed`](Self::file_changed)/[`replay_pending`](Self::replay_pending)/
+    /// [`ensure_fresh`](Self::ensure_fresh) pass this down to gate the
+    /// per-file `semanticPass` round trip
+    /// (`watcher::apply::apply_file_change`'s `semantic_pass_capable`), and
+    /// [`semantic_pass`](Self::semantic_pass) (the whole-project scheduler)
+    /// checks it directly - see decision 5.
+    pub fn is_semantic_suspended(&self) -> bool {
+        self.semantic_suspended.load(Ordering::SeqCst)
+    }
+
+    /// Samples this supervisor's plugin process tree's resident memory
+    /// (`daemon::memory::process_tree_rss_mb`) on the same tick
+    /// [`sleep_if_idle`](Self::sleep_if_idle) already runs on - see
+    /// `daemon::lifecycle`'s own module doc for that tick's actual period,
+    /// and the architecture doc's "Plugin memory limit" section for the
+    /// behaviour this implements end to end.
+    ///
+    /// A deliberate series of early-outs, in order:
+    ///
+    /// - `memory_limit_mb` unset (`None`, the documented default): returns
+    ///   immediately, before taking any lock or calling into `daemon::memory`
+    ///   at all. This is what makes "no key set means no sampling side
+    ///   effects" a true statement at the unit level, not just a claim about
+    ///   the number compared against - see this task's own acceptance
+    ///   criterion.
+    /// - The plugin is already asleep (idle, or suspended by an earlier call
+    ///   to this same method): nothing to sample, and nothing new to do -
+    ///   suspension already happened, or idle sleep already achieved the same
+    ///   "stop paying for this process" outcome this method exists to reach
+    ///   for an overage.
+    /// - Sampling itself answers `None` (`daemon::memory::process_tree_rss_mb`'s
+    ///   own doc comment: the process already exited under us, or platform
+    ///   enumeration found nothing at all): no evidence of an overage, so
+    ///   this tick is a no-op - logged once per supervisor, not once per
+    ///   tick, via `sampling_unavailable_logged`.
+    /// - Measured, but not over the limit: nothing to do.
+    ///
+    /// Only past every one of those does this actually put the plugin to
+    /// sleep - through the same [`put_to_sleep`](Self::put_to_sleep) tail
+    /// [`sleep_if_idle`](Self::sleep_if_idle)/[`sleep_now`](Self::sleep_now)
+    /// use, with a reason naming both the configured limit and the measured
+    /// figure (the architecture doc's own wording: "the reason naming the
+    /// limit and the measured figure") - and mark this language suspended,
+    /// both in memory (`semantic_suspended`, checked by every semantic-pass
+    /// gate - decision 5) and on disk (a `plugin-<language>.suspended` marker
+    /// next to this supervisor's own pid file - decision 6), so a *separate*
+    /// `g-mesh status` process, which has no running daemon to ask a
+    /// question of, can still report it (see `cli::status`'s own doc comment
+    /// on how every other runtime fact it reports is read the same way, off
+    /// disk).
+    pub fn check_memory_limit(&self) {
+        let Some(limit_mb) = self.memory_limit_mb else { return };
+        let mut inner = self.inner.lock().unwrap();
+        let Some(process) = inner.process.as_ref() else { return };
+        let pid = process.pid();
+
+        let Some(measured_mb) = crate::daemon::memory::process_tree_rss_mb(pid) else {
+            if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "g-mesh daemon: could not sample the {} plugin's process-tree memory \
+                     (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
+                     sample succeeds; logged once",
+                    self.manifest.language
+                );
+            }
+            return;
+        };
+        if measured_mb <= limit_mb {
+            return;
+        }
+
+        let process = inner.process.take().expect("checked Some above");
+        self.semantic_suspended.store(true, Ordering::SeqCst);
+        let reason =
+            format!("memoryLimitMb {limit_mb}MB exceeded - measured {measured_mb}MB across its process tree");
+        self.write_suspended_marker(&reason);
+        self.put_to_sleep(process, &reason);
+    }
+
+    /// Where this language's suspension marker lives - decision 6's "smallest
+    /// consistent mechanism": a file next to this supervisor's own pid file,
+    /// named the same way (`daemon::registry::plugin_suspended_marker_file_name`
+    /// mirrors `plugin_pid_file_name`), so `cli::status`/`cli::stop` find it
+    /// the same way they already find `self.pid_file` - by listing the
+    /// project's state directory, not by asking a live daemon.
+    fn suspended_marker_path(&self) -> PathBuf {
+        self.pid_file
+            .parent()
+            .expect("a pid file is always inside the project's state directory")
+            .join(super::registry::plugin_suspended_marker_file_name(&self.manifest.language))
+    }
+
+    /// Best-effort, atomic-rename write of this language's suspension marker -
+    /// the same temp-then-rename shape [`super::write_pid_file`] already
+    /// uses, so a `cli::status` reading this file never sees a half-written
+    /// one. `reason` is the human-readable string `check_memory_limit` built,
+    /// persisted verbatim because nothing else about *why* a language was
+    /// suspended survives outside the daemon process that decided it.
+    fn write_suspended_marker(&self, reason: &str) {
+        let path = self.suspended_marker_path();
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if let Err(err) = fs::write(&temporary, format!("{reason}\n")) {
+            eprintln!("g-mesh daemon: failed to write suspension marker {}: {err}", temporary.display());
+            return;
+        }
+        if let Err(err) = fs::rename(&temporary, &path) {
+            eprintln!("g-mesh daemon: failed to put suspension marker {} in place: {err}", path.display());
+            let _ = fs::remove_file(&temporary);
+        }
     }
 
     /// Shared tail of the two callers above; the caller has already taken the
@@ -644,6 +908,15 @@ pub fn supervise(
         }
 
         registry.sleep_if_idle_all();
+        // `[plugin] memoryLimitMb` (task GM-274): the second thing this same
+        // tick checks, right alongside idle-sleep - see this module's own
+        // "A third thing riding the plugin's idle-check tick" doc comment.
+        // With `memoryLimitMb` unset for every active supervisor this costs a
+        // `Vec` walk and nothing more (`PluginRegistry::check_memory_limits_all`'s
+        // own doc comment) - the acceptance criterion this call makes true at
+        // the daemon's real tick, not just in a unit test that calls
+        // `check_memory_limit` directly.
+        registry.check_memory_limits_all();
 
         if let Some(idle) = core.idle_beyond(timeouts.core) {
             eprintln!(
@@ -716,6 +989,7 @@ mod tests {
             manifest,
             plugins.path().join("plugin.pid"),
             None,
+            None,
             Arc::new(EmbeddingPipeline::disabled()),
         )
         .expect("the fixture plugin must start");
@@ -743,6 +1017,136 @@ mod tests {
             vec![first_pid, woken_pid],
             "the wake must have spawned this manifest's plugin, not some other one"
         );
+    }
+
+    /// GM-271's acceptance test. Today, before this task's fix, a request the
+    /// plugin never answers blocks `watcher::apply::round_trip`'s read
+    /// forever - `file_changed` below would simply never return, and this
+    /// test would hang rather than fail. With the fix: the request times out
+    /// (a short, test-only `FILE_CHANGED_TIMEOUT_ENV` override - see
+    /// `daemon::plugin::RoundTripTimeouts` - so this test does not wait the
+    /// production 30s budget), the plugin is killed and relaunched through
+    /// the same crash-recovery path an out-of-band kill already used
+    /// (`plugin_crash_recovery.rs`), the file stays dirty rather than being
+    /// silently dropped, a later replay actually delivers it (the fixture
+    /// stalls on its first request only - see
+    /// `test_plugin::install_stalling`'s doc comment), and a second
+    /// language's supervisor - a wholly separate `PluginSupervisor` with its
+    /// own process, exactly as `daemon::registry::PluginRegistry` creates one
+    /// per language - keeps serving normally throughout, because streams are
+    /// per language.
+    #[test]
+    fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_without_blocking_another_language(
+    ) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV, "150");
+
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+
+        let stalling_dir = test_plugin::install_stalling(plugins.path(), "go", &[".go-src"]);
+        let stalling_manifest = read_manifest(&stalling_dir).expect("the fixture manifest must parse");
+        let responsive_dir = test_plugin::install(plugins.path(), "python", &[".python-src"]);
+        let responsive_manifest = read_manifest(&responsive_dir).expect("the fixture manifest must parse");
+
+        let stalling = PluginSupervisor::start(
+            project.path(),
+            stalling_manifest,
+            plugins.path().join("plugin-go.pid"),
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the stalling fixture plugin must still shake hands and start normally");
+        let responsive = PluginSupervisor::start(
+            project.path(),
+            responsive_manifest,
+            plugins.path().join("plugin-python.pid"),
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the responsive fixture plugin must start");
+
+        // The override only has to be visible while `PluginProcess::spawn`
+        // resolves it, above - both supervisors have already captured their
+        // own `RoundTripTimeouts` by value, so removing it now cannot affect
+        // either, and leaving it set any longer than necessary would risk
+        // another test (racing on `ENV_LOCK` right after this one) seeing it.
+        std::env::remove_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV);
+
+        let conn = test_plugin::empty_index();
+        let first_pid = stalling.pid().expect("a freshly started plugin is awake");
+
+        // The discriminating assertion: this call must return once its
+        // timeout elapses, not hang forever waiting for an answer that is
+        // never coming. 10s is a generous multiple of the 150ms override -
+        // this is a hang guard, not a timing assertion (see this repo's
+        // house rule on timing measurements).
+        let start = Instant::now();
+        stalling.file_changed(&conn, "app.go-src".to_string());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "file_changed must return once its timeout elapses, not block on a plugin that never \
+             answers - took {elapsed:?}"
+        );
+
+        // The stalled request was genuinely received (not skipped, dropped,
+        // or refused) before it was left unanswered.
+        assert_eq!(
+            test_plugin::file_changed_requests(&stalling_dir),
+            vec!["app.go-src".to_string()],
+            "the timed-out plugin must have actually seen the request before timing out on it"
+        );
+
+        // The plugin was killed and relaunched: a fresh, different, live pid.
+        let relaunched_pid = stalling.pid().expect("a fresh process must be running after the timeout");
+        assert_ne!(relaunched_pid, first_pid, "the timed-out plugin process must have been relaunched");
+        assert!(
+            crate::daemon::is_process_alive(relaunched_pid),
+            "the relaunched process must actually be running"
+        );
+        assert_eq!(
+            test_plugin::spawns(&stalling_dir),
+            vec![first_pid, relaunched_pid],
+            "exactly one relaunch, of this supervisor's own manifest"
+        );
+
+        // The request is dropped rather than replayed inline - the file
+        // stays dirty for a later replay instead.
+        assert!(stalling.has_pending(), "the timed-out file must stay queued as dirty, not be dropped");
+
+        // Meanwhile, a second language's supervisor - a wholly independent
+        // stream - was never touched by any of the above, and keeps serving
+        // normally.
+        responsive.file_changed(&conn, "app.python-src".to_string());
+        assert_eq!(
+            test_plugin::file_changed_requests(&responsive_dir),
+            vec!["app.python-src".to_string()],
+            "a second language must keep flowing while the first is stuck"
+        );
+        assert_eq!(
+            test_plugin::spawns(&responsive_dir).len(),
+            1,
+            "the second language's plugin was never touched by the first one's timeout"
+        );
+
+        // The dirty file is actually replayed - against the relaunched
+        // process, which (per `install_stalling`'s one-stall-ever contract)
+        // now answers normally, so this succeeds rather than timing out
+        // again.
+        let replayed = stalling.replay_pending(&conn).expect("the queued replay must succeed this time");
+        assert_eq!(replayed, 1, "exactly the one file that was left dirty");
+        assert!(!stalling.has_pending(), "nothing should be left queued after a successful replay");
+        assert_eq!(
+            test_plugin::file_changed_requests(&stalling_dir),
+            vec!["app.go-src".to_string(), "app.go-src".to_string()],
+            "the relaunched process must have seen the same file a second time, and answered it"
+        );
+
+        stalling.sleep_now("test cleanup");
+        responsive.sleep_now("test cleanup");
     }
 
     #[test]
@@ -782,7 +1186,7 @@ mod tests {
         std::env::remove_var(CORE_IDLE_ENV);
 
         let config = ProjectConfig {
-            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5 },
+            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5, memory_limit_mb: None },
             ..ProjectConfig::default()
         };
         let resolved = IdleTimeouts::from_config(&config);
@@ -816,7 +1220,7 @@ mod tests {
         std::env::set_var(PLUGIN_IDLE_ENV, "250");
 
         let config = ProjectConfig {
-            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5 },
+            plugin: crate::config::PluginConfig { idle_timeout_minutes: 5, memory_limit_mb: None },
             ..ProjectConfig::default()
         };
         let resolved = IdleTimeouts::from_config(&config);
@@ -922,5 +1326,119 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         core.request();
         assert_eq!(core.idle_beyond(Some(Duration::from_millis(15))), None);
+    }
+
+    /// Task GM-274's own acceptance criterion at the unit level: "with no key
+    /// set, behaviour is identical". A bare `check_memory_limit` call on a
+    /// plugin whose process tree is genuinely large (the same memory-hungry
+    /// fixture the over-limit test below uses) must leave it running, awake
+    /// and unsuspended - `memory_limit_mb: None` returns before sampling
+    /// anything at all (see that method's own doc comment), so there is no
+    /// number to compare against and nothing this call could have enforced.
+    #[test]
+    fn with_no_memory_limit_configured_an_oversized_plugin_is_left_alone() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let plugin_dir = test_plugin::install_memory_hungry(plugins.path(), "heavy", &[".heavy-src"]);
+        let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+
+        let supervisor = PluginSupervisor::start(
+            project.path(),
+            manifest,
+            plugins.path().join("plugin.pid"),
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the fixture plugin must start");
+
+        let pid_before = supervisor.pid().expect("a freshly started plugin is awake");
+        supervisor.check_memory_limit();
+        assert_eq!(
+            supervisor.pid(),
+            Some(pid_before),
+            "with memoryLimitMb unset, an over-sized plugin must still be left running"
+        );
+        assert!(!supervisor.is_semantic_suspended());
+
+        supervisor.sleep_now("test cleanup");
+    }
+
+    /// The main acceptance test: a plugin whose process tree crosses an
+    /// artificially low `memoryLimitMb` is put to sleep, its language's
+    /// semantic passes are suspended, the next `fileChanged` still wakes it
+    /// and is answered structurally, no `semanticPass` rides along with that
+    /// wake even though this fixture's manifest declares the capability, and
+    /// the whole-project scheduler (`semantic_pass`) respects the suspension
+    /// too.
+    ///
+    /// 100MB sits between `install_memory_hungry`'s own documented margins -
+    /// a bare Node baseline (~20-40MB) and its 200MB hog - so this is not a
+    /// hair's-breadth threshold a slow CI machine could cross by accident in
+    /// either direction.
+    #[test]
+    fn a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let plugin_dir = test_plugin::install_memory_hungry(plugins.path(), "heavy", &[".heavy-src"]);
+        let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+        let conn = test_plugin::empty_index();
+
+        let supervisor = PluginSupervisor::start(
+            project.path(),
+            manifest,
+            plugins.path().join("plugin.pid"),
+            None,
+            Some(100),
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the fixture plugin must start");
+
+        assert!(!supervisor.is_semantic_suspended(), "not suspended before the first sample");
+
+        supervisor.check_memory_limit();
+
+        assert_eq!(supervisor.pid(), None, "a plugin over its memory limit must be put to sleep");
+        assert!(supervisor.is_semantic_suspended(), "its language's semantic passes must be suspended");
+
+        // The next fileChanged still wakes the plugin for structural work -
+        // queued while asleep (exactly like an ordinary idle sleep), then
+        // replayed on the next wake.
+        supervisor.file_changed(&conn, "app.heavy-src".to_string());
+        assert!(supervisor.has_pending());
+        let replayed = supervisor.replay_pending(&conn).expect("the wake must succeed");
+        assert_eq!(replayed, 1);
+        assert!(supervisor.pid().is_some(), "the wake must have relaunched the plugin");
+
+        // Structural work happened...
+        assert_eq!(
+            test_plugin::file_changed_requests(&plugin_dir),
+            vec!["app.heavy-src".to_string()],
+            "the structural fileChanged request must still be answered"
+        );
+        // ...but no semanticPass rode along with it, even though this
+        // fixture's manifest declares `capabilities.semantic_pass = true` and
+        // would otherwise always send one on the same round trip
+        // (`watcher::apply::apply_file_change`'s own doc comment) - the
+        // discriminating assertion this task is judged on.
+        let requests = test_plugin::requests(&plugin_dir);
+        assert!(
+            requests.iter().all(|line| !line.starts_with("semanticPass")),
+            "a suspended language must never receive a semanticPass request: {requests:?}"
+        );
+
+        // Suspension persists across the wake - it is not an idle-sleep
+        // artifact that clears once the plugin wakes back up.
+        assert!(supervisor.is_semantic_suspended());
+
+        // The whole-project scheduler respects it too (decision 5's other
+        // half) - `daemon::semantic::run_with_registry`/`run_once` and
+        // `daemon::workspace_reindex` both go through this same method.
+        assert!(
+            !supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip"),
+            "a suspended language's whole-project semantic pass must not run either"
+        );
+
+        supervisor.sleep_now("test cleanup");
     }
 }

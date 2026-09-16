@@ -11,6 +11,7 @@ use rusqlite::{Connection, Row};
 use serde::Serialize;
 
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
@@ -186,10 +187,14 @@ fn find_candidates_by_name(
     // placeholder is named after the symbol it is waiting for and a re-export
     // one after the symbol it passes through, so without it every file
     // importing or republishing `foo` would offer itself as a candidate `foo`.
+    // Core's container nodes are excluded too, as in `graph::queries`' own
+    // lookups (see the comment at the top of that module): a candidate with
+    // no file to show is not one a caller can re-query into an answer.
     let base_sql = "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
                     n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
                     CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3";
+                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3 \
+                    AND n.nativeKind IS NOT ?4";
 
     fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
         let id: String = row.get("id")?;
@@ -209,7 +214,7 @@ fn find_candidates_by_name(
     pagination::paginate_by_score(
         conn,
         base_sql,
-        &[&name, &PENDING_SYMBOL_NATIVE_KIND, &REEXPORT_NATIVE_KIND],
+        &[&name, &PENDING_SYMBOL_NATIVE_KIND, &REEXPORT_NATIVE_KIND, &CONTAINER_NATIVE_KIND],
         CANDIDATE_PAGE_SIZE,
         cursor,
         map_row,
@@ -490,7 +495,7 @@ fn by_name(
     }
 }
 
-pub(super) fn handle(
+pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
     project_root: &Path,
     embedding: &EmbeddingPipeline,
@@ -638,6 +643,35 @@ mod tests {
         );
         assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
         assert_eq!(body["filePath"], "target.ts");
+    }
+
+    /// A Rust function `app` in module `app`: the module is a core-owned
+    /// container node carrying the same name. Were it a candidate, this
+    /// unambiguous lookup would come back as an ambiguous page offering a
+    /// row with no file behind it.
+    #[test]
+    fn a_container_named_like_its_member_is_not_a_definition_candidate() {
+        let mut conn = setup();
+        let mut member = node_with_span("n1", "app", "app::app", "src/app.rs", (5, 0));
+        member.container = Some("app".to_string());
+        upsert_node(&mut conn, member).unwrap();
+        let candidates = find_candidates_by_name(&conn, "app", None).unwrap();
+        assert_eq!(candidates.results.len(), 1, "the container node must not be ranked");
+
+        let params = FindDefinitionParams {
+            symbol_name: Some("app".to_string()),
+            file_path: None,
+            position: None,
+            cursor: None,
+            include_source: None,
+        };
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+                .unwrap(),
+        );
+        assert_eq!(body["ambiguous"], serde_json::Value::Null);
+        assert_eq!(body["id"], "n1");
+        assert_eq!(body["filePath"], "src/app.rs");
     }
 
     #[test]

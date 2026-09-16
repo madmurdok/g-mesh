@@ -112,7 +112,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::DiscoveredPlugins;
+use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
@@ -150,6 +150,94 @@ pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".pid")) {
+            files.push((language.to_string(), entry.path()));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// Where a language's memory-limit suspension marker is recorded, relative to
+/// the project's state directory (task GM-274, decision 6) - the same
+/// per-language naming convention as [`plugin_pid_file_name`], so
+/// `daemon::lifecycle::PluginSupervisor::suspended_marker_path` can build it
+/// next to that language's own pid file without a second lookup.
+pub(crate) fn plugin_suspended_marker_file_name(language: &str) -> String {
+    format!("plugin-{language}.suspended")
+}
+
+/// Every `plugin-<language>.suspended` marker currently present in
+/// `state_dir`, paired with the language its name encodes and the reason
+/// text `daemon::lifecycle::PluginSupervisor::write_suspended_marker` wrote
+/// into it - [`discovered_pid_files`]'s counterpart for suspension rather
+/// than liveness.
+///
+/// Deliberately independent of [`discovered_pid_files`]: a language
+/// suspended by `[plugin] memoryLimitMb` has *no* pid file by the time
+/// anyone reads this (`PluginSupervisor::check_memory_limit` puts the plugin
+/// to sleep through the same path idle-sleep uses, which removes it - see
+/// `PluginSupervisor::put_to_sleep`), so `cli::status` needs its own listing
+/// to find a suspended language at all, not a field bolted onto a pid-file
+/// row that will already be gone.
+///
+/// Empty - not an error - for a state directory that does not exist or
+/// cannot be listed, matching [`discovered_pid_files`]'s own convention. A
+/// marker that exists but cannot be read is skipped, its reason reported as
+/// `"(unreadable)"` rather than dropping the whole row - unlike a dead pid
+/// (which really does mean "nothing to report"), a marker on disk with no
+/// readable reason is still evidence *something* suspended this language,
+/// and `g-mesh status` should say so rather than silently agreeing with a
+/// stat/read failure.
+pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
+    let mut markers = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir) else { return markers };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
+            let reason = fs::read_to_string(entry.path())
+                .map(|contents| contents.trim().to_string())
+                .unwrap_or_else(|_| "(unreadable)".to_string());
+            markers.push((language.to_string(), reason));
+        }
+    }
+    markers.sort_by(|a, b| a.0.cmp(&b.0));
+    markers
+}
+
+/// Removes every `plugin-<language>.suspended` marker in `state_dir` -
+/// decision 4/5's honest consequence: since config is read once at daemon
+/// startup and never hot-reloaded, "suspended until the daemon restarts or
+/// the config changes" only ever actually clears on a restart in practice
+/// (see `daemon::lifecycle::PluginSupervisor`'s own doc comment on
+/// `semantic_suspended`). This is where that restart takes effect on disk -
+/// called once, early in `daemon::run`, while the project's singleton lock
+/// guarantees no other daemon is serving it (the same guarantee
+/// `endpoint.clear_stale()` right beside it already relies on) - and again by
+/// `cli::stop`'s own state-file cleanup, so a project nothing is serving
+/// never keeps reporting a suspension no daemon remembers deciding.
+///
+/// Best-effort, like every other state-file removal in this daemon: a marker
+/// this fails to remove is stale, not incorrect - the next successful call
+/// (the next start, or the next `stop`) clears it.
+pub fn clear_stale_suspension_markers(state_dir: &Path) {
+    for (_, path) in discovered_suspended_marker_paths(state_dir) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// [`discovered_suspended_markers`]'s sibling for callers that need the path
+/// to remove rather than the reason to display - kept as its own small walk
+/// (rather than reusing `discovered_suspended_markers` and discarding the
+/// reason) so [`clear_stale_suspension_markers`] does not pay for reading
+/// every marker's contents just to delete the file.
+fn discovered_suspended_marker_paths(state_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(state_dir) else { return files };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
             files.push((language.to_string(), entry.path()));
         }
     }
@@ -444,6 +532,11 @@ pub struct PluginRegistry {
     /// Handed to every supervisor as it is created, so all languages honor
     /// the one `plugin.idleTimeoutMinutes` the project configured.
     idle_timeout: Option<Duration>,
+    /// Handed to every supervisor as it is created, exactly like
+    /// `idle_timeout` beside it - `[plugin] memoryLimitMb` (task GM-274) is
+    /// one number for every language, not a per-language override (see the
+    /// architecture doc's "Plugin memory limit" section for why).
+    memory_limit_mb: Option<u64>,
     /// Shared with every supervisor and with the cold-start bulk walk - one
     /// pipeline, one lazily-loaded model, however many plugins ask it to
     /// embed something.
@@ -478,6 +571,16 @@ impl PluginRegistry {
         &self.project_root
     }
 
+    /// The embedding pipeline every supervisor this registry spawns already
+    /// shares - GM-272's `daemon::workspace_reindex` needs the same `&Arc`
+    /// `daemon::bulk_index::walk_one_language` takes, for the same reason
+    /// every other bulk-index caller does (`EmbeddingPipeline::apply` on each
+    /// committed batch). `pub(crate)`, not `pub`: unlike `project_root`, this
+    /// has no caller outside this daemon module tree.
+    pub(crate) fn embedding(&self) -> &Arc<EmbeddingPipeline> {
+        &self.embedding
+    }
+
     /// Builds a registry over `discovered`. Spawns nothing - see this
     /// module's doc comment.
     pub fn new(
@@ -485,6 +588,7 @@ impl PluginRegistry {
         state_dir: PathBuf,
         discovered: DiscoveredPlugins,
         idle_timeout: Option<Duration>,
+        memory_limit_mb: Option<u64>,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
         Self {
@@ -492,6 +596,7 @@ impl PluginRegistry {
             state_dir,
             discovered,
             idle_timeout,
+            memory_limit_mb,
             embedding,
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
@@ -511,6 +616,56 @@ impl PluginRegistry {
         self.discovered.routing.get(&extension).map(String::as_str)
     }
 
+    /// Every language whose manifest routes `file_path` as a **workspace**
+    /// file - GM-272's addition alongside extension routing above, and the
+    /// mechanism `docs/architecture/multi-language-plugins.md`'s "Editing a
+    /// Go file" data-flow paragraph describes for `go.mod`: "`watch_files` ->
+    /// `workspaceChanged` -> per-language reindex".
+    ///
+    /// A language is in the result when **both** hold:
+    ///  - its `[plugin.workspace] watch_files` (`daemon::manifest::
+    ///    WorkspaceConfig::watch_files`, already-compiled globs) matches
+    ///    `file_path`'s **file name alone** - "exact file names (any
+    ///    directory)" per the architecture doc's `plugin.toml additions`
+    ///    section, which is exactly what an exact name is as a `Glob`
+    ///    (`daemon::manifest`'s own doc comment: an exact name needs no
+    ///    separate code path from a genuine glob like `*.csproj`, since both
+    ///    compile through the same `Glob::compile_matcher`);
+    ///  - `file_path` is not [`under_excluded_dir`] of *that same manifest's*
+    ///    `exclude_dirs` - each language's exclusions are its own, matching
+    ///    `[plugin.workspace] exclude_dirs`'s own doc comment ("mirroring
+    ///    the plugin's own walk exclusions").
+    ///
+    /// Sorted, and a `Vec` rather than the first match: nothing in the
+    /// manifest schema forbids two languages from declaring the same
+    /// `watch_files` pattern (a plugin bug, or two plugins that both watch
+    /// `Makefile` for entirely different reasons), and silently routing to
+    /// only one of them would drop the other's reindex with no diagnostic at
+    /// all. Empty is the overwhelmingly common answer - every language whose
+    /// `watch_files` is empty (the bundled TS plugin among them) can never
+    /// appear here, by construction, which is also GM-272's answer to "must
+    /// not break a plugin that does not know `workspaceChanged`": a plugin
+    /// with nothing in `watch_files` is simply never a candidate for this
+    /// routing path, so it is never sent the notification, wakened for the
+    /// reindex, or spawned by it - not a special case, a direct consequence
+    /// of the same emptiness check this docstring already needs.
+    pub fn workspace_language_matches(&self, file_path: &str) -> Vec<String> {
+        let name = file_name_of(file_path);
+        let mut languages: Vec<String> = self
+            .discovered
+            .manifests
+            .values()
+            .filter(|manifest| !manifest.workspace.watch_files.is_empty())
+            .filter(|manifest| {
+                manifest.workspace.watch_files.iter().any(|glob| glob.compile_matcher().is_match(name))
+            })
+            .filter(|manifest| !under_excluded_dir(file_path, &manifest.workspace.exclude_dirs))
+            .map(|manifest| manifest.language.clone())
+            .collect();
+        languages.sort();
+        languages
+    }
+
     /// Whether a plugin was discovered for `language` at all - the same
     /// question [`get_or_spawn`](Self::get_or_spawn) answers with an `Err`
     /// when it fails, exposed here so a caller that wants "nothing to do" to
@@ -521,6 +676,82 @@ impl PluginRegistry {
     /// not a stderr line every time.
     pub fn has_manifest(&self, language: &str) -> bool {
         self.discovered.manifests.contains_key(language)
+    }
+
+    /// The union of every discovered plugin's own `[plugin.workspace]
+    /// entry_points` (`daemon::manifest::WorkspaceConfig::entry_points`),
+    /// deduplicated - what `mcp::get_dependencies` feeds
+    /// `graph::queries::find_files_under`/`find_files_ending_in_dir` (via
+    /// `entry_point_rank_expr`) so a miss-path directory lookup ranks each
+    /// language's own convention first, instead of the single hardcoded
+    /// `index.*` check GM-273 replaced.
+    ///
+    /// "Every discovered manifest", not "only languages this project's index
+    /// actually has files for" - `discovered` (see this struct's own doc
+    /// comment) is read once at startup, before a single file has been
+    /// indexed, and the distinction would need its own query against
+    /// `nodes.language` on the hot path of every `get_dependencies` miss,
+    /// for an outcome that cannot change which candidate wins: a Rust-only
+    /// repo simply has no file named `index.*` for an unused `entry_points`
+    /// convention to falsely match, so an extra candidate a manifest declares
+    /// costs one more no-op `LIKE` test per scanned row (see
+    /// `entry_point_rank_expr`'s cost section), not a wrong answer.
+    ///
+    /// Deduplicated (not just concatenated) because two plugins are free to
+    /// declare the same literal entry point without that meaning anything -
+    /// `entry_point_rank_expr` only cares about the *set* of strings, and a
+    /// duplicate would otherwise double one candidate's `LIKE` cost in the
+    /// generated SQL for no behavioral difference. Sorted first so that
+    /// dedup, and this method's own output, do not depend on `HashMap`
+    /// iteration order - the same "stable regardless of scan order" property
+    /// [`indexer_version`] already goes out of its way to guarantee for
+    /// `DiscoveredPlugins` as a whole.
+    pub fn entry_points(&self) -> Vec<String> {
+        let mut points: Vec<String> = self
+            .discovered
+            .manifests
+            .values()
+            .flat_map(|m| m.workspace.entry_points.iter().cloned())
+            .collect();
+        points.sort();
+        points.dedup();
+        points
+    }
+
+    /// Every discovered manifest's `[plugin.capabilities]`
+    /// (`daemon::manifest::Capabilities`), keyed by language - what
+    /// `mcp::instructions` (GM-262) reads to decide, per language present in
+    /// the index, whether its receiver-call gap
+    /// (`Capabilities::receiver_calls`/`receiver_calls_structural`) is still
+    /// open. `Capabilities` is `Copy` (see its own derive), so this clones
+    /// nothing heavier than the language-id keys - the same cheap shape as
+    /// [`entry_points`](Self::entry_points) above, read fresh per call rather
+    /// than cached for the same reason `mcp::get_dependencies` reads
+    /// `entry_points()` fresh: `discovered` never changes while this daemon
+    /// runs, so there is nothing a cache would save.
+    ///
+    /// "Every discovered manifest", not "only languages this project's index
+    /// actually has files for" - the same distinction
+    /// [`entry_points`](Self::entry_points)'s own doc comment draws, for the
+    /// same reason: this registry has no per-project presence to consult, and
+    /// the caller (`mcp::instructions::build`) already filters by what the
+    /// index reports present before this map is ever indexed into.
+    pub fn receiver_call_capabilities(&self) -> HashMap<String, manifest::Capabilities> {
+        self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
+    }
+
+    /// Every discovered language whose manifest declares
+    /// `capabilities.semantic_pass = true`, sorted - what
+    /// `daemon::semantic::run_with_registry` iterates over to ask each
+    /// language's whole-project semantic pass, generalized (GM-270) from the
+    /// single hardcoded `plugin::BUNDLED_LANGUAGE` question it replaces.
+    ///
+    /// A thin wrapper over `daemon::manifest::semantic_pass_capable_languages`,
+    /// which owns the filter and the sort order (see that function's own doc
+    /// comment) - both shared with `daemon::semantic::run_once`, which has a
+    /// bare `&DiscoveredPlugins` and no registry to ask this of.
+    pub fn semantic_pass_languages(&self) -> Vec<String> {
+        manifest::semantic_pass_capable_languages(&self.discovered.manifests)
     }
 
     /// The supervisor for `language`, spawning its plugin if this is the
@@ -606,12 +837,42 @@ impl PluginRegistry {
             manifest.clone(),
             self.pid_file_for(language),
             self.idle_timeout,
+            self.memory_limit_mb,
             Arc::clone(&self.embedding),
         );
         reservation.settle(spawned)
     }
 
-    /// The watcher thread's entry point, with routing in front of it: hands
+    /// The watcher thread's actual entry point (GM-272): decides, for one
+    /// settled path, whether it is a **workspace** file for some language
+    /// ([`workspace_language_matches`](Self::workspace_language_matches)) or
+    /// an ordinary source file routed by extension
+    /// ([`file_changed`](Self::file_changed)) - never both, and in that
+    /// order, matching the architecture doc's "routes a settled path whose
+    /// file name matches a manifest's watch_files... to that language"
+    /// wording: a workspace match is a *different kind* of event for that
+    /// path (a per-language reindex, not a reparse of the path itself - a
+    /// `go.mod` is never itself an indexable source file), so it supersedes
+    /// extension routing for the same settled path rather than running
+    /// alongside it.
+    ///
+    /// Every matching language is reindexed (see [`workspace_language_matches`](Self::workspace_language_matches)
+    /// on why that can be more than one), each independently - one
+    /// language's reindex failing must not skip another's, the same
+    /// "failures are reported and dropped, never propagated" contract every
+    /// other watcher-thread entry point in this module already has.
+    pub fn route_settled_path(&self, conn: &Mutex<Connection>, file_path: String) {
+        let workspace_languages = self.workspace_language_matches(&file_path);
+        if workspace_languages.is_empty() {
+            self.file_changed(conn, file_path);
+            return;
+        }
+        for language in workspace_languages {
+            self.workspace_file_changed(conn, &language, &file_path);
+        }
+    }
+
+    /// The watcher thread's ordinary (extension-routed) entry point: hands
     /// `file_path` to the supervisor for the language that claims it,
     /// spawning that plugin if this is the first file of its kind.
     ///
@@ -621,6 +882,23 @@ impl PluginRegistry {
     /// dropped" contract `PluginSupervisor::file_changed` already has, for
     /// the same reason: one file the daemon cannot index must not take the
     /// watcher thread, or the other languages, down with it.
+    ///
+    /// GM-272 adds one more silent skip, alongside the existing unclaimed-
+    /// extension one: a file [`under_excluded_dir`] of the claiming
+    /// language's own `[plugin.workspace] exclude_dirs` is not routed at
+    /// all, matching the architecture doc's "watcher should never route to
+    /// it either" for that field, and mirroring
+    /// [`workspace_language_matches`](Self::workspace_language_matches)'s
+    /// identical check on the workspace-routing side - so `dist/bundle.js`
+    /// under the bundled TS plugin's own `exclude_dirs = ["node_modules",
+    /// "dist"]` stops reaching a live plugin process here exactly as it
+    /// already stops being walked by that plugin's own bulk index. Silent,
+    /// not logged via [`unroutable_notice`](Self::unroutable_notice): that
+    /// helper's whole point is naming an extension *nothing* claims, and an
+    /// excluded file's extension is claimed just fine - it is the directory
+    /// that says not to route this one instance of it, which is exactly as
+    /// ordinary and expected as `.gitignore` already is at the filesystem-
+    /// watch layer.
     pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
         let Some(language) = self.language_for(&file_path).map(str::to_string) else {
             if let Some(notice) = self.unroutable_notice(&file_path) {
@@ -629,11 +907,43 @@ impl PluginRegistry {
             return;
         };
 
+        if let Some(manifest) = self.discovered.manifests.get(&language) {
+            if under_excluded_dir(&file_path, &manifest.workspace.exclude_dirs) {
+                return;
+            }
+        }
+
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
             Err(err) => eprintln!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
+            ),
+        }
+    }
+
+    /// Routes one workspace-file match ([`workspace_language_matches`](Self::workspace_language_matches))
+    /// to `language`'s per-language reindex (`daemon::workspace_reindex`),
+    /// spawning that language's supervisor if this is the first file of its
+    /// kind - the workspace-routing counterpart to
+    /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
+    /// with the same "failures are reported and dropped" contract.
+    fn workspace_file_changed(&self, conn: &Mutex<Connection>, language: &str, changed_file: &str) {
+        match self.get_or_spawn(language) {
+            Ok(supervisor) => {
+                if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
+                {
+                    eprintln!(
+                        "g-mesh daemon: failed to reindex the {language} workspace after \
+                         {changed_file} changed: {err:#} - {language}'s index may now be partial \
+                         until the next successful reindex (the same best-effort contract a \
+                         failed cold-start bulk walk already has)"
+                    );
+                }
+            }
+            Err(err) => eprintln!(
+                "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
+                 after {changed_file} changed: {err:#}"
             ),
         }
     }
@@ -719,6 +1029,47 @@ impl PluginRegistry {
         for supervisor in self.active_supervisors() {
             supervisor.sleep_if_idle();
         }
+    }
+
+    /// Samples every active supervisor's plugin process tree against
+    /// `[plugin] memoryLimitMb` - one call to
+    /// [`PluginSupervisor::check_memory_limit`] per spawned language, on the
+    /// same tick [`sleep_if_idle_all`](Self::sleep_if_idle_all) already runs
+    /// on (`daemon::lifecycle::supervise` calls both, back to back). Run
+    /// independently, exactly like `sleep_if_idle_all`: one language's
+    /// process tree being over the limit (or not) never affects another's own
+    /// check, and a language that was never spawned is not in
+    /// [`active_supervisors`](Self::active_supervisors) at all, so this never
+    /// spawns anything new either.
+    ///
+    /// With `memoryLimitMb` unset for the project, every supervisor's own
+    /// `check_memory_limit` returns before sampling anything (see that
+    /// method's own doc comment) - so this call costs one `Vec` walk over
+    /// already-spawned supervisors and nothing more, which is what keeps "no
+    /// key set means no sampling side effects" true even once this is wired
+    /// into the daemon's real tick.
+    pub fn check_memory_limits_all(&self) {
+        for supervisor in self.active_supervisors() {
+            supervisor.check_memory_limit();
+        }
+    }
+
+    /// Whether `language`'s semantic passes are suspended right now - `false`
+    /// for a language that was never spawned (nothing has ever sampled its
+    /// memory, so it cannot have been suspended) as much as for one that was
+    /// spawned and never went over the limit; both read the same way to this
+    /// call's callers (`daemon::semantic`, `daemon::workspace_reindex`
+    /// indirectly through `PluginSupervisor::semantic_pass`'s own gate - this
+    /// method exists for callers that need the answer *without* going through
+    /// that method, none of which this task adds, but kept `pub` alongside it
+    /// for symmetry with `has_pending`/`active_supervisors` above).
+    pub fn is_semantic_suspended(&self, language: &str) -> bool {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .get(language)
+            .and_then(SupervisorSlot::running)
+            .is_some_and(|supervisor| supervisor.is_semantic_suspended())
     }
 
     /// Stops every active supervisor's plugin regardless of idleness - what
@@ -845,6 +1196,38 @@ fn extension_of(file_path: &str) -> Option<String> {
     Some(format!(".{}", extension.to_lowercase()))
 }
 
+/// `some/dir/go.mod` -> `"go.mod"` - the final path segment, matching the
+/// project-relative, forward-slash-joined convention `relative_wire_path`
+/// (`daemon::mod`) already produces for every path this module ever sees.
+/// A path with no `/` at all (a root-level file) returns itself unchanged.
+fn file_name_of(file_path: &str) -> &str {
+    file_path.rsplit('/').next().unwrap_or(file_path)
+}
+
+/// Whether `file_path` sits under a directory literally named one of
+/// `exclude_dirs`, checked against **every path segment except the file name
+/// itself** - the architecture doc's `[plugin.workspace] exclude_dirs`
+/// ("directory names... matched by exact name, not glob") and this task's
+/// own decision 5 ("match directory NAMES on any path segment, not
+/// prefixes"): `vendor/pkg/build.alpha` is excluded by `exclude_dirs =
+/// ["vendor"]` exactly as `pkg/vendor/build.alpha` is - the excluded name can
+/// sit at any depth, not only as a leading path component - while
+/// `vendored-tools/build.alpha` is **not**, because `"vendored-tools" !=
+/// "vendor"` as a whole segment; a prefix/substring match would wrongly
+/// exclude it.
+///
+/// Empty `exclude_dirs` (the common case - most manifests declare none, and
+/// every fixture that predates GM-272) short-circuits without walking the
+/// path at all.
+fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    let mut segments = file_path.split('/');
+    segments.next_back(); // the file name itself names no directory
+    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1286,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
+            None,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
@@ -1145,6 +1529,61 @@ mod tests {
         assert_eq!(registry.language_for("src/App.PYTHON-SRC"), Some("python"));
         assert_eq!(registry.language_for("README.md"), None);
         assert_eq!(registry.language_for("Makefile"), None);
+    }
+
+    /// [`PluginRegistry::entry_points`]'s own test: built directly from
+    /// `PluginManifest` literals rather than [`registry_over`]'s fixture
+    /// plugins - `daemon::test_plugin`'s stub manifests never set
+    /// `[plugin.workspace] entry_points`, and this method's whole job is to
+    /// surface exactly that field. Proves the union-of-discovered-manifests
+    /// plumbing GM-273 wires `mcp::get_dependencies` through (see
+    /// `graph::queries::entry_point_rank_expr`'s doc comment for the other
+    /// end of it), at the layer that actually owns discovery's results.
+    #[test]
+    fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
+        use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
+
+        let manifest = |language: &str, entry_points: &[&str]| PluginManifest {
+            language: language.to_string(),
+            protocol_version: 1,
+            plugin_version: "0.0.0".to_string(),
+            command: PathBuf::from("true"),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            fingerprint_ignore: Vec::new(),
+            manifest_dir: PathBuf::from("/dev/null"),
+            capabilities: Capabilities::default(),
+            workspace: WorkspaceConfig {
+                entry_points: entry_points.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        };
+
+        let mut discovered = DiscoveredPlugins::default();
+        discovered.manifests.insert("typescript".to_string(), manifest("typescript", &["index"]));
+        // Declares the same literal as "typescript" above, on purpose - the
+        // half of this test that proves dedup, not just union.
+        discovered.manifests.insert("also_index".to_string(), manifest("also_index", &["index"]));
+        discovered.manifests.insert("rust".to_string(), manifest("rust", &["mod.rs", "main.rs", "lib.rs"]));
+
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+
+        assert_eq!(
+            registry.entry_points(),
+            vec!["index".to_string(), "lib.rs".to_string(), "main.rs".to_string(), "mod.rs".to_string()],
+            "sorted, deduplicated union of every discovered manifest's own entry_points"
+        );
     }
 
     /// The acceptance criterion for an unclaimed extension: skipped, not an
@@ -1557,5 +1996,190 @@ mod tests {
         assert_eq!(registry.language_for("app.py"), None);
         registry.file_changed(&conn, "app.py".to_string());
         assert!(registry.supervisors.lock().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // GM-272: workspace-file routing (`workspace_language_matches`,
+    // `under_excluded_dir`, `route_settled_path`). The end-to-end "a
+    // matched language actually gets reindexed" acceptance test lives in
+    // `daemon::workspace_reindex`'s own test module, alongside the rest of
+    // the reindex machinery it exercises - what belongs here is the pure
+    // routing *decision*: which language(s) a settled path matches, and
+    // whether `exclude_dirs` rules a match out, both answerable with no
+    // plugin process involved at all.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn file_name_of_returns_the_final_path_segment() {
+        assert_eq!(file_name_of("go.mod"), "go.mod");
+        assert_eq!(file_name_of("a/b/go.mod"), "go.mod");
+        assert_eq!(file_name_of(""), "");
+    }
+
+    #[test]
+    fn under_excluded_dir_matches_a_whole_segment_at_any_depth_never_a_prefix() {
+        let excluded = vec!["vendor".to_string()];
+
+        assert!(under_excluded_dir("vendor/build.alpha", &excluded), "a leading segment must match");
+        assert!(
+            under_excluded_dir("pkg/vendor/deep/build.alpha", &excluded),
+            "a segment at any depth must match, not only a leading one"
+        );
+        assert!(
+            !under_excluded_dir("vendored-tools/build.alpha", &excluded),
+            "a segment that merely starts with the excluded name is not a match - \
+             no prefix matching"
+        );
+        assert!(
+            !under_excluded_dir("build.alpha", &excluded),
+            "the file name itself is never checked as a directory segment"
+        );
+        assert!(
+            !under_excluded_dir("src/vendor.go", &excluded),
+            "the excluded name appearing only in the file name, not as a directory, is not a match"
+        );
+    }
+
+    #[test]
+    fn under_excluded_dir_is_false_with_no_exclude_dirs_configured() {
+        assert!(!under_excluded_dir("vendor/build.alpha", &[]));
+    }
+
+    /// A registry over one fake language installed with `[plugin.workspace]
+    /// watch_files`/`exclude_dirs`, via [`test_plugin::install_with_workspace`],
+    /// the workspace-routing analog of [`registry_over`], which only ever
+    /// installs bare extension-claiming fixtures.
+    fn registry_over_workspace(
+        language: &str,
+        extension: &str,
+        watch_files: &[&str],
+        exclude_dirs: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PluginRegistry) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+
+        let dir = test_plugin::install_with_workspace(
+            plugins.path(),
+            language,
+            &[extension],
+            watch_files,
+            exclude_dirs,
+        );
+
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+        (project, plugins, dir, registry)
+    }
+
+    #[test]
+    fn workspace_language_matches_an_exact_watched_file_name_in_any_directory() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+
+        assert_eq!(registry.workspace_language_matches("go.mod"), vec!["alpha".to_string()]);
+        assert_eq!(
+            registry.workspace_language_matches("nested/dir/go.mod"),
+            vec!["alpha".to_string()],
+            "watch_files matches by file name alone, any directory"
+        );
+        assert!(
+            registry.workspace_language_matches("go.sum").is_empty(),
+            "a different file name must not match"
+        );
+    }
+
+    /// This task's own glob-matching acceptance criterion (e.g. `*.csproj`
+    /// from the architecture doc's paper stress test), reproduced with a
+    /// fixture extension so it exercises the exact same `Glob` compilation
+    /// path a real `*.csproj` pattern would.
+    #[test]
+    fn workspace_language_matches_a_glob_pattern() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("csharp", ".cs-src", &["*.csproj"], &[]);
+
+        assert_eq!(registry.workspace_language_matches("MyProject.csproj"), vec!["csharp".to_string()]);
+        assert_eq!(
+            registry.workspace_language_matches("src/nested/Other.csproj"),
+            vec!["csharp".to_string()]
+        );
+        assert!(
+            registry.workspace_language_matches("MyProject.sln").is_empty(),
+            "a name the glob does not match must not match"
+        );
+    }
+
+    #[test]
+    fn workspace_language_matches_excludes_a_path_under_the_manifests_own_exclude_dirs() {
+        let (_project, _plugins, _dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &["vendor"]);
+
+        assert_eq!(
+            registry.workspace_language_matches("go.mod"),
+            vec!["alpha".to_string()],
+            "an ordinary path is still routed"
+        );
+        assert!(
+            registry.workspace_language_matches("vendor/go.mod").is_empty(),
+            "a go.mod-like file under an excluded directory must not be routed at all"
+        );
+    }
+
+    /// A manifest whose `watch_files` is empty (every fixture predating
+    /// GM-272, and the bundled TS plugin itself) never matches anything -
+    /// the construction this module's `notify_workspace_changed` doc comment
+    /// relies on to say a plugin like TS never even reaches the workspace-
+    /// routing path.
+    #[test]
+    fn a_manifest_with_no_watch_files_never_matches_the_workspace_routing() {
+        let (_project, _plugins, _dirs, registry) = registry_over(&["python"]);
+
+        assert!(registry.workspace_language_matches("go.mod").is_empty());
+        assert!(registry.workspace_language_matches("anything").is_empty());
+    }
+
+    #[test]
+    fn route_settled_path_falls_back_to_ordinary_extension_routing_with_no_workspace_match() {
+        let (_project, _plugins, dirs, registry) = registry_over(&["python"]);
+        let conn = test_plugin::empty_index();
+
+        registry.route_settled_path(&conn, "src/app.python-src".to_string());
+
+        assert_eq!(
+            test_plugin::spawns(&dirs[0]).len(),
+            1,
+            "an ordinary source file with no workspace match must still reach the plugin \
+             through extension routing"
+        );
+    }
+
+    #[test]
+    fn file_changed_does_not_route_a_path_under_its_own_languages_exclude_dirs() {
+        let (_project, _plugins, dir, registry) =
+            registry_over_workspace("alpha", ".alpha-src", &[], &["vendor"]);
+        let conn = test_plugin::empty_index();
+
+        registry.file_changed(&conn, "vendor/thirdparty.alpha-src".to_string());
+        assert!(
+            test_plugin::spawns(&dir).is_empty(),
+            "a file under the claiming language's own exclude_dirs must not be routed at all"
+        );
+
+        registry.file_changed(&conn, "src/app.alpha-src".to_string());
+        assert_eq!(
+            test_plugin::spawns(&dir).len(),
+            1,
+            "an ordinary file of the same language, outside exclude_dirs, must still route"
+        );
     }
 }

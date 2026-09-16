@@ -449,17 +449,29 @@ for any symbol used outside the file declaring it, i.e. the normal case.
 So the same handshake runs one level finer. Where the specifier resolved to a
 project file, the plugin records which local names that import binds and what
 each one is called in the target file, and a usage of such a name gets a
-placeholder node addressed by `<target file>#<imported name>`, with the
-`CALLS`/`REFERENCES`/`SUPERTYPE_OF` edge hung on it. Core
-(`core/src/graph/symbol_links.rs`) then looks for a symbol of that name
-**exported** by that file and, when exactly one fits the edge — a `CALLS`
-edge only ever lands on a `Function`, a `SUPERTYPE_OF` edge only on a `Type`,
-`REFERENCES` on whatever is unambiguous — repoints the edge and marks it
-resolved. Anything else is left alone, on the same rule the extractor's own
-name lookup follows: a missing edge beats a wrong one. In practice that
-leaves `import * as ns` and `default` imports of a *named* default export to
-the semantic layer, along with everything reached through a specifier that did
-not resolve — a package outside the workspace, in practice.
+placeholder node whose target is a structured `placeholder_targets` row —
+`(scopeKind: file, scope: <target file>, keyKind: name, key: <imported
+name>)` — with the `CALLS`/`REFERENCES`/`SUPERTYPE_OF` edge hung on the
+placeholder. (Through schema "7" this address was packed into the
+placeholder's own `qualifiedName` as `<target file>#<name>` instead; a
+still-v1 plugin's address is turned into the same row once, at the wire
+boundary, so this changed nothing a plugin author needs to know.) Core
+(`core/src/graph/symbol_links.rs`) then looks for a **visible** symbol of
+that name in the target scope and, when exactly one fits the edge — a
+`CALLS` edge only ever lands on a `Function`, a `SUPERTYPE_OF` edge only on a
+`Type`, `REFERENCES` on whatever is unambiguous — repoints the edge and
+marks it resolved. Anything else is left alone, on the same rule the
+extractor's own name lookup follows: a missing edge beats a wrong one. In
+practice that leaves `import * as ns` and `default` imports of a *named*
+default export to the semantic layer, along with everything reached through
+a specifier that did not resolve — a package outside the workspace, in
+practice. The same row shape (with `scopeKind: container`) addresses a
+Go/Rust-style symbol reached through a package or module rather than a file
+— see `symbol_links.rs`'s own module doc and
+[`multi-language-plugins.md`](./multi-language-plugins.md)'s Data Model
+section ("Structured placeholder targets", "Visibility") for the schema and
+the container case; this section keeps the TS/JS file-scoped case as the
+worked example.
 
 The file a placeholder addresses is very often not the one declaring the
 symbol. A bare workspace specifier resolves to a package's entry point, and in
@@ -585,7 +597,10 @@ erDiagram
         string filePath
         string range "start/end line-col"
         string signature "functions only"
-        bool exported
+        string visibility "public | file | container"
+        string visibilityContainer "set iff visibility = container"
+        bool exported "GENERATED ALWAYS: 1 iff visibility = public"
+        string container "this node's own container key, if its language has one"
         string docComment "source text for embedding"
         string language "which plugin produced this node"
         string nativeKind "language-specific detail, e.g. trait_impl"
@@ -603,9 +618,17 @@ erDiagram
         string fromId FK
         string toId FK
         string kind "DEFINES, IMPORTS, CALLS, SUPERTYPE_OF, REFERENCES, EXPORTS"
-        string source "tree-sitter | ts-compiler"
+        string source "syntactic | semantic - the closed tier code branches on"
+        string engine "free label - tree-sitter, ts-compiler, go-parser, rust-analyzer, ..."
         bool resolved
         int toDeclaration "which overload this call bound; NULL for all but"
+    }
+    CONTAINERS {
+        string nodeId PK FK "the container's own Module node, nativeKind=container"
+        string language
+        string key "namespaced by language - a Go import path, a Rust module path, ..."
+        string parentKey "NULL for a root (Go package, crate root, top namespace)"
+        int memberCount "maintained by apply_diff; 0 => GC"
     }
     VECTORS {
         string nodeId FK
@@ -622,6 +645,7 @@ erDiagram
     NODES ||--o{ EDGES : "toId"
     NODES ||--o| VECTORS : "has"
     NODES ||--o{ DECLARATIONS : "written as (none unless several)"
+    NODES |o--o| CONTAINERS : "container key (string, not a FK)"
 ```
 
 Granularity is symbol-level: `File`, `Module` (namespace/package/crate),
@@ -639,6 +663,31 @@ for it, so the `IMPORTS` edge has somewhere to point (see
 [Import resolution](#import-resolution)). Such a node's `filePath` is the
 file the specifier is *written in*, not a file it names — nothing else in the
 model works that way, and the query layer accounts for it.
+
+**Visibility and containers, added for multi-language support.** A node's
+`exported: bool` from v1 is now a `GENERATED ALWAYS` column derived from
+`visibility` (`public` / `file` / `container(key)`, stored as
+`visibility`/`visibilityContainer`), so every reader that used to check
+`exported` — `get_file_outline` chief among them — is unaffected. A language
+that groups declarations into a unit coarser than a file (a Go package, a
+Rust module, a C# namespace) gets a `containers` row for that unit, and a
+member node names it in its own `container` column, a plain string key, not
+a foreign key (a member is written before its container's first row exists).
+Neither table is TS/JS-specific: TS simply never populates `container`,
+since the file is already its scope. See
+[`multi-language-plugins.md`](./multi-language-plugins.md)'s Data Model
+section ("Logical containers", "Visibility") for the full schema, the
+per-language container-key table, and why each choice was made — not
+repeated here.
+
+`EDGES.source`'s v1 shape (`'tree-sitter' | 'ts-compiler'` — the tier and the
+one bundled engine conflated into a single two-value check) is likewise
+split: `source` narrows to the closed tier alone (`syntactic` / `semantic` —
+the only values code and queries branch on) and `engine` becomes a free
+label (`tree-sitter`, `ts-compiler`, `go-parser`, `rust-analyzer`, ...), so a
+new language's engine needs neither a schema nor a protocol change. See
+[`multi-language-plugins.md`](./multi-language-plugins.md)'s "Edge source"
+section for the migration note.
 
 <a id="overloads"></a>
 ### Overloads and merged declarations: one node per declaration group
@@ -1121,8 +1170,8 @@ tighter default.
 
 ### Core ↔ language plugin protocol
 
-- **Control plane** (reindex requests, file-changed notifications, status,
-  semantic-pass requests):
+- **Control plane** (reindex requests, file-changed notifications,
+  workspace-file-changed notifications, status, semantic-pass requests):
   JSON-RPC 2.0 with LSP-style framing (`Content-Length` header + JSON body)
   — chosen partly so a `tsserver`-based plugin needs little adapter code.
   Measured against a real `tsserver` (see [TS semantic layer](#ts-semantic-layer)),
@@ -1141,7 +1190,14 @@ tighter default.
 - **Versioning**: a protocol version field is part of the handshake. A
   mismatch is a hard load failure with a clear error — never best-effort
   compatibility (a protocol is code, not data; there's nothing to
-  "reindex" when it doesn't match).
+  "reindex" when it doesn't match). `protocol::types` defines wire v2 (the
+  `Visibility`/`PlaceholderTarget` and `SourceTier`+`engine` shapes above,
+  plus `ControlMessage::WorkspaceChanged`), and `CURRENT_PROTOCOL_VERSION`
+  is `2` — every plugin core spawns, the bundled JS/TS plugin included
+  (GM-275), speaks it. A v1 sender is a hard handshake failure like any
+  other version mismatch. See
+  [`multi-language-plugins.md`](./multi-language-plugins.md)'s "Wire v2"
+  section for the full type definitions.
 - **Conformance**: a shared fixture/golden-file suite validates any plugin
   (first-party or third-party) against the protocol — correct edge
   kinds/types, valid NDJSON framing — independent of how complete that
@@ -1159,9 +1215,11 @@ tighter default.
   already runs (`apply_diff` → `imports::link_diff` →
   `symbol_links::link_diff`) and needs no storage or schema work of its own:
   an edge id is derived from the edge's content, so a re-sent edge is
-  upserted onto its existing row, flipping exactly its `source`
-  (`tree-sitter` → `ts-compiler`) and `resolved` (`false` → `true`) and
-  leaving every edge the pass did not answer for untouched.
+  upserted onto its existing row, flipping exactly its `source` (v1 wire
+  values, as the TS plugin still sends: `tree-sitter` → `ts-compiler`; in
+  wire v2 terms, `(syntactic, tree-sitter)` → `(semantic, ts-compiler)`) and
+  `resolved` (`false` → `true`) and leaving every edge the pass did not
+  answer for untouched.
 
   **Not every answer is an upgrade.** `import * as ns from "./mod"` followed
   by `ns.someExport()` has no edge to upgrade at all: the structural pass
@@ -1189,9 +1247,10 @@ tighter default.
   `export *` branches offering a name — ambiguous to a name-matching walk,
   settled in the language, which hands a consumer the first branch to offer
   it. The other is `export default class Foo {}` imported as
-  `import Bar from "./x"`: the edge is addressed at `x.ts#default`, a name no
-  file ever declares, so no chain will ever produce it — while `definition` at
-  the importer's own binding lands straight on `Foo`. The local name (`Bar`)
+  `import Bar from "./x"`: the edge is addressed at the file/name pair
+  (`x.ts`, `default`), a name no file ever declares, so no chain will ever
+  produce it — while `definition` at the importer's own binding lands
+  straight on `Foo`. The local name (`Bar`)
   is not the difficulty and never reaches the index at all, which is also why
   every importer of that default is answered the same way whatever each of
   them called it (`core/tests/default_export_linking.rs` follows one through
