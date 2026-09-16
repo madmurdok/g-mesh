@@ -1,0 +1,236 @@
+# Post-linking expectations for the Python plugin - `g-mesh plugins check
+# plugins/python --fixture plugins/python/conformance/project --expect
+# plugins/python/conformance/expect.toml`, which `tests/conformance.rs` runs
+# from `cargo test`.
+#
+# These are the acceptance criteria of GM-296 turned into assertions against a
+# *linked* index: the checks above this section prove the plugin's stream is
+# well formed, and only these prove that the edges it emits actually reach the
+# declarations they name. Every category `g-mesh plugins check --expect` can
+# assert is exercised at least once
+# (`core/src/cli/plugin_check/expectations.rs`'s module doc has the
+# format/anchoring/paging contract):
+#
+#   - callers, through a package's `__all__` re-export chain and through a
+#     module-qualified call and a bare imported name, all against one
+#     declaration (`assist`);
+#   - callers, through a relative import two levels up (`assist` again, from
+#     `pkg/sub/deep.py`);
+#   - callers, across a PEP 420 namespace package (`greet`);
+#   - callers, a class-qualified call with the receiver gap made airtight
+#     (`Base.describe` - see that entry's own comment);
+#   - callers, a call through a method's own instance parameter
+#     (`Greeter.render`);
+#   - references (`Base`, which `[[callers]]` cannot reach at all - a base
+#     class and an import line are both usages, never calls);
+#   - references through the `__all__` chain for a *class* (`Greeter`);
+#   - implementations (`Base`, `class Sub(Base)` found by
+#     `find_implementations`);
+#   - imports (`pkg/sub/deep.py`, both of them relative);
+#   - definition, anchored on the module self-announcement node
+#     (`pkg.sub.deep`) - the node `crate::project`'s Decision 1 obliges this
+#     plugin to emit, asserted here to be a real, addressable declaration
+#     rather than an internal detail.
+#
+# Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
+# matters, and an entry missing from the set is as much of a failure as an
+# extra one. A `"filePath:"` row with nothing after the colon is a whole-file
+# row: the usage sits outside any tracked symbol, which for Python is what an
+# `import` line at a module's top level is.
+
+# --- callers: the `__all__` re-export chain, a module-qualified call, a bare
+#     imported name, and a relative import two levels up ----------------------
+
+[[callers]]
+symbol = "assist"
+# `pkg.helpers.assist` is called four ways, and each one is a different row of
+# `src/extractor/bodies.rs`'s own table:
+#
+#   - `pkg/consumer.py:build` calls it as `helper(...)`, imported by
+#     `from pkg import helper`. Nothing in container `pkg` is named `helper`
+#     and nothing in `pkg/__init__.py` declares it, so the only path from that
+#     call to this declaration is core's re-export walk over the `reexport`
+#     node `__all__ = [..., "helper"]` produced - carrying the *rename*, which
+#     is why the published name is `helper` and the target's key is `assist`.
+#     This entry is the `__all__` acceptance criterion.
+#   - `pkg/mod.py:call_through_module` calls it as `helpers.assist(...)`,
+#     where `helpers` came from `from . import helpers` - a module-qualified
+#     call, addressed by `name` key in container `pkg.helpers`.
+#   - `pkg/mod.py:call_through_imported_name` calls it bare, after
+#     `from .helpers import assist`.
+#   - `pkg/sub/deep.py:Deep.describe` calls it as `helpers.assist(...)` too,
+#     but `helpers` got there through `from .. import helpers` - a **relative
+#     import two levels up**, the other acceptance criterion. Its presence
+#     here is what proves the dots resolved to `pkg` rather than to
+#     `pkg.sub`: had they resolved to `pkg.sub`, the placeholder would address
+#     container `pkg.sub.helpers`, which nothing declares, and this row would
+#     simply be absent.
+expect = [
+    "pkg/consumer.py:build",
+    "pkg/mod.py:call_through_module",
+    "pkg/mod.py:call_through_imported_name",
+    "pkg/sub/deep.py:Deep.describe",
+]
+
+# --- callers: across a PEP 420 namespace package -----------------------------
+
+[[callers]]
+symbol = "greet"
+file = "pkg/mod.py"
+# `pkg/plugins/` holds no `__init__.py`, so `pkg.plugins` is a namespace
+# package that exists only because `loader.py`'s own self-announcement node is
+# a member of it (`crate::project`, Decision 3). `load` calling `greet` across
+# that boundary is the edge that would be missing if the parent chain gapped
+# there.
+#
+# `Greeter.render`'s call is the same declaration reached from inside a method
+# body: a bare name in a method resolves to the *module's* `greet`, not to the
+# sibling method `Greeter.greet` - which is Python's own rule, since a class
+# body is not a closure.
+#
+# `file` is given because `pkg/__init__.py` publishes a `reexport` node also
+# named `greet`; naming the file picks the declaration rather than the
+# pass-through.
+expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
+
+# --- callers: a class-qualified call, with the receiver gap made airtight ----
+
+[[callers]]
+symbol = "Base.describe"
+# `describe` is called two ways in `pkg/mod.py`, and only one produces an
+# edge: `call_through_a_class`'s `Base.describe(obj)` is a class-qualified
+# path call, addressed by `qualifiedName` because container `pkg.base` could
+# hold many members merely *named* `describe`. `on_an_unknown_receiver`'s
+# `obj.describe()` is a receiver call on a parameter and is deliberately left
+# out of this expected set.
+#
+# That omission is what makes this an assertion rather than an oversight: if a
+# receiver call ever started producing an edge, `on_an_unknown_receiver` would
+# appear in the *actual* set this check computes, the set would no longer
+# equal what is written here, and the check would fail on the unexpected extra
+# entry - not silently pass because nobody asked.
+#
+# Proven, not just claimed. `src/extractor/bodies.rs` was deliberately broken
+# to give an unresolved receiver the naive "let core sort it out" answer - a
+# `name`-keyed placeholder for `describe` in a container this file imports -
+# and this entry failed with exactly one extra row,
+# `pkg/mod.py:on_an_unknown_receiver`. The break was then reverted and the
+# file checked byte-identical against its backup.
+#
+# `pkg/sub/deep.py:Deep.describe` *overrides* this method and does not call
+# it, so it must not appear either.
+expect = ["pkg/mod.py:call_through_a_class"]
+
+# --- callers: through a method's own instance parameter ----------------------
+
+[[callers]]
+symbol = "Greeter.render"
+# `Greeter.shout` calls `self.render()`. The plugin resolves it by reading the
+# method's **first parameter**, never by trusting the name `self` - see
+# `src/extractor/bodies.rs`, Decision 7. Nothing else calls `render`, so this
+# single row is the whole answer.
+expect = ["pkg/mod.py:Greeter.shout"]
+
+# --- references: usages [[callers]] cannot reach at all ----------------------
+
+[[references]]
+symbol = "Base"
+file = "pkg/base.py"
+# `Base` is never called - it is a class, and `Greeter(name)` is a call to
+# `Greeter`, not to its base - so this is the category `[[callers]]`
+# structurally cannot exercise for it.
+#
+#   - `pkg/mod.py:Greeter` and `pkg/sub/deep.py:Deep` are `SUPERTYPE_OF`
+#     edges, an edge kind `find_references` reports and `find_callers` does
+#     not share;
+#   - `pkg/mod.py:` and `pkg/sub/deep.py:` are whole-file rows: the
+#     `from pkg.base import Base` and `from ..base import Base` lines
+#     themselves, which belong to the file rather than to anything in it.
+#     `pkg/sub/deep.py:`'s presence is the relative-import acceptance case
+#     again, this time for a *named* symbol rather than for a module;
+#   - `pkg/mod.py:module_alias_is_bound` uses it as `base_module.Base()`,
+#     where `base_module` came from `import pkg.base as base_module` - the
+#     aliased-module-import shape, whose alias binds the whole dotted path.
+#
+# `pkg/mod.pyi` declares a `class Greeter(Base)` too and must **not** appear:
+# a `.pyi` stub contributes its `File` node and nothing else
+# (`crate::project`, Decision 6; `src/extractor`, Decision 8). Its absence
+# here is the second half of the stub acceptance criterion, asserted against
+# a linked index rather than against one file's graph.
+#   - `pkg/gaps.py:` is a third import line, the one `gap_2_monkey_patching`
+#     needs. Its `Base.describe = replacement` is a reference to
+#     `Base.describe`, not to `Base`, and it is a `REFERENCES` edge rather
+#     than a `CALLS` one - which is why `pkg/gaps.py:gap_2_monkey_patching`
+#     appears in neither this set nor `Base.describe`'s caller set above.
+expect = [
+    "pkg/gaps.py:",
+    "pkg/mod.py:",
+    "pkg/mod.py:Greeter",
+    "pkg/mod.py:module_alias_is_bound",
+    "pkg/sub/deep.py:",
+    "pkg/sub/deep.py:Deep",
+]
+
+# --- references: a class reached through the `__all__` chain -----------------
+
+[[references]]
+symbol = "Greeter"
+file = "pkg/mod.py"
+# The class half of the `__all__` acceptance criterion. `pkg/consumer.py` does
+# `from pkg import Greeter`, and container `pkg` declares no `Greeter` at all -
+# only the `reexport` node `pkg/__init__.py`'s `__all__` produced, pointing at
+# container `pkg.mod`. Both rows from that file are the chain: the import line
+# itself (the whole-file row) and `build`'s `Greeter(name)`, which is a
+# `REFERENCES` edge rather than a `CALLS` one because core's linker lands a
+# `CALLS` edge only on a `Function`.
+#
+# `pkg/mod.py:call_through_a_class` is the same construction written in the
+# declaring file, resolved directly rather than through the chain.
+expect = [
+    "pkg/consumer.py:",
+    "pkg/consumer.py:build",
+    "pkg/mod.py:call_through_a_class",
+    "pkg/__init__.py:",
+]
+
+# --- implementations: class Sub(Base), found by find_implementations ---------
+
+[[implementations]]
+symbol = "Base"
+file = "pkg/base.py"
+# Both subclasses reach their base across a file boundary, one by an absolute
+# import and one by a relative one two levels up. `pkg/mod.pyi`'s `class
+# Greeter(Base)` is not a third implementor, because the stub emits nothing.
+expect = ["pkg/mod.py:Greeter", "pkg/sub/deep.py:Deep"]
+
+# --- imports (get_dependencies, one hop, Outgoing): both relative ------------
+
+[[imports]]
+file = "pkg/sub/deep.py"
+# `from ..base import Base` and `from .. import helpers`: two dots each, and
+# both land on a container two levels up from the module rather than one.
+# `container:` is how a row with no `filePath` renders, and a container node's
+# `qualifiedName` is its key - so `container:pkg` is the package itself, which
+# `from .. import helpers` reads a member out of, and `container:pkg.base` is
+# the module `from ..base import …` names.
+#
+# It is anchored on *this* file rather than on `pkg/mod.py`, whose imports are
+# more varied, because the kit's session empties and restores the file with
+# the most nodes - `pkg/mod.py` - and core GCs a container whose last member
+# goes, taking every `IMPORTS` edge pointing at it along
+# (`graph::containers`: "importers' placeholders come back on their next
+# reindex", which within one session never happens). An expectation over
+# `pkg/__init__.py`'s imports would be asserting that deliberate core
+# behaviour, not this plugin's.
+expect = ["container:pkg", "container:pkg.base"]
+
+# --- definition: the module self-announcement node ---------------------------
+
+[[definition]]
+symbol = "pkg.sub.deep"
+# `crate::project`'s Decision 1 obliges this plugin to emit, for every
+# non-stub module and `__init__` file with a parent package, one node whose
+# `qualifiedName` is the module's own dotted key. This entry asserts it is a
+# real declaration a lookup can land on - not an internal artefact - and that
+# it lives in the file it describes.
+expect = ["pkg/sub/deep.py:pkg.sub.deep"]

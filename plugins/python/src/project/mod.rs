@@ -247,10 +247,35 @@
 //! (the exact seam GM-296 calls once per file, exactly as
 //! `RustExtractor::extract` calls its Rust counterpart), and
 //! [`ProjectContext::notes`].
+//!
+//! # Decision 8 (GM-296): "is this dotted name one of ours?"
+//!
+//! One question GM-296 turned out to need that this task did not anticipate,
+//! added here rather than in the extractor because it is a fact about the
+//! *project*, not about any one file: [`ProjectContext::has_container`].
+//!
+//! Rust can tell `use serde::Serialize;` from `use crate::a::b::C;` because
+//! `Cargo.toml` names every crate the workspace holds, so
+//! `plugins/rust/src/extractor` emits an `external_module` node for the first
+//! and a `resolved_module` placeholder for the second. Python has no
+//! equivalent manifest - `pyproject.toml`'s `[project] dependencies` is a
+//! list of *distribution* names, which are frequently not the import names
+//! (`pip install pillow` imports as `PIL`), and reading it would be reading
+//! the wrong list. The one honest source is the package tree this module
+//! already computed: `import pkg.sub` names something of ours exactly when
+//! `pkg.sub` is a container key, or a prefix of one, among the files the walk
+//! found.
+//!
+//! The failure direction is the safe one. A container this model never saw -
+//! a module created since the last `load`, a file the walk could not read -
+//! is answered `false`, so the extractor emits an `external_module` node and
+//! the import simply does not link: a missing edge, never a wrong one. The
+//! opposite mistake is impossible, because the set is built from files that
+//! really exist.
 
 mod pyproject;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use g_mesh_plugin_sdk::{walk_project, RelPath};
@@ -333,6 +358,17 @@ pub enum ContainerInfo {
 pub struct ProjectContext {
     roots: Vec<Root>,
     files: BTreeMap<RelPath, ContainerInfo>,
+    /// Every dotted key this project's files make addressable, each file's
+    /// own key together with every ancestor package of it - see this module's
+    /// doc, Decision 8, and [`ProjectContext::has_container`].
+    ///
+    /// Ancestors are materialized rather than computed by prefix-matching at
+    /// lookup time because a prefix match is wrong in one direction that
+    /// matters: `pkg.subtle` starts with `pkg.sub` as a *string* and is not
+    /// under it as a *package*. Storing `pkg` and `pkg.sub` as their own
+    /// entries makes the question an exact set membership, which cannot get
+    /// that case wrong.
+    containers: BTreeSet<String>,
     /// Everything this load could not honestly resolve - a `pyproject.toml`
     /// that would not parse. Never fatal, the same "a project model with
     /// notes is still a complete, deterministic answer for everything it
@@ -376,15 +412,36 @@ impl ProjectContext {
         root_dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.as_str().cmp(b.as_str())));
 
         let mut files = BTreeMap::new();
+        let mut containers = BTreeSet::new();
         for path in &walked {
             let info = match owning_root(&root_dirs, path) {
                 Some(root_dir) => container_info_for(path, root_dir, &mut notes),
                 None => ContainerInfo::Orphan { key: orphan_key(path) },
             };
+            register_container(&mut containers, &info);
             files.insert(path.clone(), info);
         }
 
-        Ok(Self { roots: root_dirs.into_iter().map(|dir| Root { dir }).collect(), files, notes })
+        Ok(Self { roots: root_dirs.into_iter().map(|dir| Root { dir }).collect(), files, containers, notes })
+    }
+
+    /// Whether `key` names a module or package **of this project** - the
+    /// question an absolute `import a.b` has to answer before the extractor
+    /// can decide between a `resolved_module` placeholder (ours, so core may
+    /// link it onto a container node) and an `external_module` node (a
+    /// third-party distribution or the standard library, which core never
+    /// links).
+    ///
+    /// Answered from the package tree [`load`](Self::load) already walked -
+    /// see this module's doc, Decision 8, for why that is the only honest
+    /// source and why a `false` answer can only ever cost a missing edge.
+    /// A `.pyi` stub contributes its key here even though it contributes no
+    /// declarations (Decision 6): the stub's existence is still evidence that
+    /// the dotted name is this project's own, and an import of it that
+    /// resolves onto an empty container is a truthful "we have this module
+    /// and it declares nothing we indexed".
+    pub fn has_container(&self, key: &str) -> bool {
+        self.containers.contains(key)
     }
 
     /// Every root this project model found, in the order [`load`](Self::load)
@@ -576,6 +633,31 @@ impl Stubbed {
 /// dotted key.
 fn orphan_key(path: &RelPath) -> String {
     format!("orphan:{path}")
+}
+
+/// Records `info`'s dotted key, and every package above it, in the set
+/// [`ProjectContext::has_container`] answers from - see this module's doc,
+/// Decision 8.
+///
+/// An [`ContainerInfo::Orphan`] contributes nothing: its key is
+/// `orphan:<path>`, which by construction is not a dotted name any `import`
+/// statement can spell, so recording it could only ever make a nonsense
+/// import look like one of ours.
+fn register_container(containers: &mut BTreeSet<String>, info: &ContainerInfo) {
+    let key = match info {
+        ContainerInfo::Module { key, .. }
+        | ContainerInfo::Package { key, .. }
+        | ContainerInfo::Stub { key } => key.as_str(),
+        ContainerInfo::Orphan { .. } => return,
+    };
+    let mut prefix = String::new();
+    for segment in key.split('.') {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(segment);
+        containers.insert(prefix.clone());
+    }
 }
 
 #[cfg(test)]
@@ -891,6 +973,55 @@ mod tests {
             ContainerInfo::Orphan { .. }
         ));
         assert_eq!(context.container_for(&RelPath::new("pkg/mod.py")), module("pkg.mod", Some("pkg"), "mod"));
+    }
+
+    // --- has_container (Decision 8) --------------------------------------------
+
+    /// Every package above a module is addressable too, so `import pkg` and
+    /// `import pkg.sub` are both "ours" even though only `pkg/sub/deep.py`
+    /// exists as a file.
+    #[test]
+    fn every_package_above_a_module_is_a_container_of_this_project() {
+        let tree = Tree::new("has-container");
+        tree.write("pkg/sub/deep.py", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        for key in ["pkg", "pkg.sub", "pkg.sub.deep"] {
+            assert!(context.has_container(key), "{key} must be one of ours");
+        }
+    }
+
+    /// The case a prefix match would get wrong: `pkg.subtle` shares the
+    /// string `pkg.sub` with nothing it is actually under.
+    #[test]
+    fn a_name_that_merely_shares_a_string_prefix_is_not_one_of_ours() {
+        let tree = Tree::new("has-container-prefix");
+        tree.write("pkg/sub/deep.py", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert!(!context.has_container("pkg.subtle"));
+        assert!(!context.has_container("pkg.su"));
+        assert!(!context.has_container("os"), "the standard library is not this project");
+    }
+
+    /// A `.pyi` stub contributes no declarations (Decision 6) and still
+    /// contributes its key here - see `has_container`'s own doc.
+    #[test]
+    fn a_stub_only_module_is_still_one_of_ours() {
+        let tree = Tree::new("has-container-stub");
+        tree.write("pkg/native.pyi", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert!(context.has_container("pkg.native"));
+    }
+
+    /// An orphan's synthetic key must never make an import look resolvable.
+    #[test]
+    fn an_orphans_synthetic_key_is_not_a_container_any_import_can_name() {
+        let tree = Tree::new("has-container-orphan");
+        tree.write("src/pkg/mod.py", "");
+        tree.write("tools/generate.py", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert!(!context.has_container("orphan:tools/generate.py"));
+        assert!(!context.has_container("tools"));
+        assert!(context.has_container("pkg.mod"));
     }
 
     // --- container_for on a path never seen by load ----------------------------
