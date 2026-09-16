@@ -224,6 +224,10 @@ g-mesh-v<version>-<triple>/
     g-mesh-plugin-rust                    the Rust plugin - a plain cargo
                                            binary, no runtime to embed
     plugin.toml                           how core discovers and spawns it
+  plugins/python/
+    g-mesh-plugin-python                  the Python plugin - a plain cargo
+                                           binary, no runtime to embed
+    plugin.toml                           how core discovers and spawns it
   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 ```
 
@@ -231,7 +235,13 @@ The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
 SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
 target with `cargo build --target <triple>`, the same way `build-targets.sh`
 already builds core, and writes an installed `plugin.toml` naming the binary
-it staged.
+it staged. The Python plugin (GM-298) ships the same way, via
+`scripts/bundle-python-plugin.sh` — it is a tree-sitter-based structural
+extractor written in Rust, not a program run by a Python interpreter, so
+**no Python interpreter is required on the machine being indexed** for the
+structural tier it ships today. A future semantic tier over `pyright` would
+need `pyright` installed separately, the same way the TypeScript plugin's
+semantic tier needs the project's own `node_modules/typescript`.
 
 **No Node.js required.** The plugin is compiled with [Node's single-executable
 application](https://nodejs.org/api/single-executable-applications.html)
@@ -254,9 +264,9 @@ build machine's own Node runtime and cannot be cross-built.
 ### Cutting a release
 
 1. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
-   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml`,
-   which must all agree with it — already bumped to the new version) into
-   `main`.
+   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
+   since GM-298, `plugins/python/Cargo.toml`, which must all agree with it —
+   already bumped to the new version) into `main`.
 2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
    version (every workspace member's, not only core's), working tree and
    branch state, runs `cargo test --workspace`, and creates an annotated

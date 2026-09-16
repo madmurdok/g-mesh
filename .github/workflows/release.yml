@@ -27,8 +27,13 @@
 # the same target, in `plugins/rust/` - see `scripts/bundle-rust-plugin.sh`
 # for why that needs no extra toolchain setup here (unlike the JS/TS plugin,
 # it is built by the Rust toolchain this file already installs for core).
-# Every plugin directory lives where `daemon::manifest::bundled_roots` looks
-# beside the executable.
+# Since GM-298 the same is true of the Python plugin, in `plugins/python/` -
+# it is a tree-sitter structural extractor written in Rust, not a program run
+# by a Python interpreter, so it needs no Python on this runner and no Python
+# on the machine that later runs it either; see
+# `scripts/bundle-python-plugin.sh` for the same reasoning
+# `scripts/bundle-rust-plugin.sh` already gives. Every plugin directory lives
+# where `daemon::manifest::bundled_roots` looks beside the executable.
 # `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
 # section below fixes, and verifies the `.sha256` beside each archive before
 # it unpacks anything.
@@ -41,9 +46,10 @@
 #    against it in the first step of every build job so a mismatch costs a
 #    minute instead of four 90-minute builds. Since GM-288, `wire/Cargo.toml`,
 #    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
-#    version too - `scripts/cut-release.sh` refuses if any of them disagree
-#    (see that script's own header), which is the easiest way to check this
-#    by hand as well.
+#    version too, and since GM-298 so must `plugins/python/Cargo.toml` -
+#    `scripts/cut-release.sh` refuses if any of them disagree (see that
+#    script's own header), which is the easiest way to check this by hand as
+#    well.
 # 2. Tag the commit and push the tag:  `git tag v2.7.0 && git push origin v2.7.0`
 #    The repository has no tags at all today, so this is a deliberate, manual,
 #    human act - nothing in this pipeline creates one.
@@ -151,6 +157,7 @@ on:
       - "scripts/bundle-plugin.sh"
       - "scripts/bundle-go-plugin.sh"
       - "scripts/bundle-rust-plugin.sh"
+      - "scripts/bundle-python-plugin.sh"
       - "scripts/prepare-release-assets.sh"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
@@ -419,11 +426,13 @@ jobs:
 
             echo
             echo "Every archive unpacks to a directory holding the \`g-mesh\` binary, the"
-            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, and"
-            echo "the Go plugin as a static binary in \`plugins/go/\` and the Rust plugin in"
-            echo "\`plugins/rust/\`. The machine running it needs no Node.js, no Go and no"
-            echo "other toolchain; \`g-mesh model fetch\` downloads the embedding model"
-            echo "\`search_code\` needs."
+            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, the"
+            echo "Go plugin as a static binary in \`plugins/go/\`, the Rust plugin in"
+            echo "\`plugins/rust/\` and the Python plugin in \`plugins/python/\`. The machine"
+            echo "running it needs no Node.js, no Go and no other toolchain - and, for the"
+            echo "Python plugin's structural tier, no Python interpreter either; a future"
+            echo "semantic tier would need \`pyright\` installed separately."
+            echo "\`g-mesh model fetch\` downloads the embedding model \`search_code\` needs."
             echo
             echo "### Verifying a download"
             echo
