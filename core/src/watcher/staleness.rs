@@ -410,6 +410,7 @@ mod tests {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id,
                     result: FileChangeDiff::default(),
+                    incomplete: false,
                 },
             )
             .unwrap();
@@ -426,6 +427,7 @@ mod tests {
                 upsert_edges: vec![],
                 delete_edge_ids: vec![],
             },
+            incomplete: false,
         }
     }
 

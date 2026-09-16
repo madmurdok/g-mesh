@@ -51,7 +51,7 @@ use g_mesh_plugin_sdk::wire::{
 };
 use g_mesh_plugin_sdk::{
     run, Extractor, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind,
-    PluginSpec, RelPath, SdkIndex, SemanticEngine,
+    PluginSpec, RelPath, SdkIndex, SemanticAnswer, SemanticEngine,
 };
 
 const LANGUAGE: &str = "toy";
@@ -69,7 +69,9 @@ fn main() -> ! {
         // `semanticPass` and never before, which is what
         // `capabilities.semantic-engine-lazy` checks. Nothing is constructed
         // here - the closure is.
-        Some(Box::new(|| Ok(Box::new(ToyEngine) as Box<dyn SemanticEngine>))),
+        // The factory is handed the project root; this engine reads only the
+        // SDK's index, so it has no use for one.
+        Some(Box::new(|_root| Ok(Box::new(ToyEngine) as Box<dyn SemanticEngine>))),
     )
 }
 
@@ -153,6 +155,9 @@ impl Extractor for ToyExtractor {
                     kind: OpenSiteKind::ReceiverCall,
                     edge_kind: EdgeKind::Calls,
                     from_container: None,
+                    // Nothing was emitted for this site, so there is nothing
+                    // for an answer to replace.
+                    replaces: None,
                 });
             } else {
                 has_syntax_errors = true;
@@ -179,7 +184,7 @@ impl Extractor for ToyExtractor {
 struct ToyEngine;
 
 impl SemanticEngine for ToyEngine {
-    fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> anyhow::Result<FileChangeDiff> {
+    fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
         // Empty means the whole project - the wire's own convention for the
         // pass that follows the cold-start walk.
         let scope: Vec<RelPath> = if files.is_empty() { index.paths() } else { files.to_vec() };
@@ -218,7 +223,9 @@ impl SemanticEngine for ToyEngine {
                 diff.upsert_edges.extend(answer.edges);
             }
         }
-        Ok(diff)
+        // Every site this engine can answer was asked and answered, in
+        // memory, with no budget to run out of: this pass is always complete.
+        Ok(SemanticAnswer::complete(diff))
     }
 }
 
@@ -375,6 +382,8 @@ mod tests {
         );
 
         let answered = ToyEngine.answer(&[], &index).unwrap();
+        assert!(answered.complete);
+        let answered = answered.diff;
         assert_eq!(answered.upsert_edges.len(), 1);
         assert_eq!(answered.upsert_edges[0].source, SourceTier::Semantic);
         assert_eq!(answered.upsert_nodes.len(), 1);
@@ -386,6 +395,10 @@ mod tests {
             ToyExtractor.extract(&(), &RelPath::new("c.toy"), "fn compute\n"),
         );
         let ambiguous = ToyEngine.answer(&[], &index).unwrap();
-        assert_eq!(ambiguous, FileChangeDiff::default(), "two candidates is no answer, not either answer");
+        assert_eq!(
+            ambiguous.diff,
+            FileChangeDiff::default(),
+            "two candidates is no answer, not either answer"
+        );
     }
 }

@@ -112,6 +112,8 @@ pub struct PluginCheck {
     receiver_calls: &'static str,
     receiver_calls_structural: &'static str,
     expect: Option<PathBuf>,
+    skip_semantic_expectations: bool,
+    manifest_extra: Option<String>,
     core_binary: Option<PathBuf>,
 }
 
@@ -142,6 +144,8 @@ impl PluginCheck {
             receiver_calls: "unresolved",
             receiver_calls_structural: "unresolved",
             expect: None,
+            skip_semantic_expectations: false,
+            manifest_extra: None,
             core_binary: None,
         }
     }
@@ -196,6 +200,38 @@ impl PluginCheck {
         self
     }
 
+    /// `--skip-semantic-expectations`: report every `--expect` entry tagged
+    /// `tier = "semantic"` as `Skip` instead of running it.
+    ///
+    /// Pair it with a run whose semantic tier is genuinely absent - the
+    /// structural half of one expectation file, asserted on a machine with no
+    /// toolchain - which is what the Go plugin's own `expect.toml` documents
+    /// as its second way of being run.
+    pub fn skip_semantic_expectations(mut self, skip: bool) -> Self {
+        self.skip_semantic_expectations = skip;
+        self
+    }
+
+    /// TOML appended verbatim to the generated manifest.
+    ///
+    /// The generated manifest carries the keys core's `read_manifest`
+    /// validates and nothing else, which was enough while no SDK plugin had a
+    /// semantic tier of its own. A plugin whose engine is configured *by that
+    /// manifest* - anything on [`crate::lsp::LspBridge`], whose
+    /// `SemanticConfig::from_manifest` reads `[plugin.semantic]` out of the
+    /// same file - cannot be checked without it: the run would write a
+    /// manifest promising `semantic_pass = true` and then hand the plugin no
+    /// server to run.
+    ///
+    /// It is appended, so it may only *add* sections: everything above it is
+    /// already written. That is deliberate - a helper that let a test rewrite
+    /// `language` or `command` would be a helper for checking something other
+    /// than the plugin.
+    pub fn manifest_extra(mut self, toml: impl Into<String>) -> Self {
+        self.manifest_extra = Some(toml.into());
+        self
+    }
+
     /// The `g-mesh` binary to run, overriding both [`G_MESH_BIN_ENV`] and the
     /// search.
     pub fn core_binary(mut self, core_binary: impl Into<PathBuf>) -> Self {
@@ -243,6 +279,9 @@ impl PluginCheck {
         if let Some(expect) = &self.expect {
             command.arg("--expect").arg(expect);
         }
+        if self.skip_semantic_expectations {
+            command.arg("--skip-semantic-expectations");
+        }
 
         let output =
             command.output().with_context(|| format!("failed to run `{} plugins check`", core.display()))?;
@@ -264,6 +303,10 @@ impl PluginCheck {
             let items: Vec<String> = values.iter().map(|value| format!("{value:?}")).collect();
             format!("[{}]", items.join(", "))
         };
+        let extra = match &self.manifest_extra {
+            Some(extra) => format!("\n{}\n", extra.trim_end()),
+            None => String::new(),
+        };
         format!(
             "# Written by g_mesh_plugin_sdk::testing::PluginCheck for one conformance run.\n\
              [plugin]\n\
@@ -281,7 +324,7 @@ impl PluginCheck {
              [plugin.workspace]\n\
              watch_files = {}\n\
              exclude_dirs = {}\n\
-             entry_points = {}\n",
+             entry_points = {}\n{}",
             self.language,
             g_mesh_wire::CURRENT_PROTOCOL_VERSION,
             self.plugin_version,
@@ -293,6 +336,7 @@ impl PluginCheck {
             list(&self.watch_files),
             list(&self.exclude_dirs),
             list(&self.entry_points),
+            extra,
         )
     }
 
@@ -498,6 +542,26 @@ not a check line
         let parsed: toml::Value = toml::from_str(&manifest).expect("the manifest must parse as TOML");
         assert_eq!(parsed["plugin"]["language"].as_str(), Some("toy"));
         assert_eq!(parsed["plugin"]["workspace"]["entry_points"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// `manifest_extra` has to land inside the same `[plugin]` table and
+    /// still parse - an appended section that merely looks right is a
+    /// manifest core rejects at discovery, which presents as a conformance
+    /// run that never starts.
+    #[test]
+    fn manifest_extra_is_appended_as_part_of_the_same_document() {
+        let check = PluginCheck::new("toy", std::env::current_exe().unwrap(), ".")
+            .semantic_pass(true)
+            .manifest_extra(
+                "[plugin.semantic]\ncommand = \"toy-server\"\nimplementation_kinds = [\"protocol\"]\n",
+            );
+        let manifest = check.manifest(Path::new("/tmp/plugin-binary"));
+        let parsed: toml::Value = toml::from_str(&manifest).expect("the manifest must parse as TOML");
+        assert_eq!(parsed["plugin"]["semantic"]["command"].as_str(), Some("toy-server"));
+        // The generated keys are still there, which is what "appended" has to
+        // mean: the extra adds a section, it does not replace the document.
+        assert_eq!(parsed["plugin"]["language"].as_str(), Some("toy"));
+        assert_eq!(parsed["plugin"]["capabilities"]["semantic_pass"].as_bool(), Some(true));
     }
 
     /// No core binary found anywhere must be an error that says what to run -

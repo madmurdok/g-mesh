@@ -410,12 +410,32 @@ watch_files = ["go.mod", "go.work"]
 exclude_dirs = ["vendor", "testdata"]
 # File or directory names a miss-path lookup treats as a container's entry point.
 entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: ["index"]
+
+# GM-289, read by the SDK's LSP bridge and by nothing in core - see
+# "Implementation notes (GM-289)" for why core deliberately does not parse it.
+# Absent means the plugin has no language server behind its semantic tier.
+[plugin.semantic]
+command = "rust-analyzer"       # a bare name is a PATH lookup; a relative path
+                                # resolves against this manifest's directory.
+                                # A plugin may probe a candidate before using
+                                # it - plugins/rust does, because a PATH hit
+                                # can be a rustup proxy for a component that
+                                # is not installed (GM-290)
+args = []
+engine = "rust-analyzer"        # the `engine` label on every edge it emits;
+                                # defaults to the command's file stem
+implementation_kinds = ["trait"]  # nativeKinds asked textDocument/implementation
+[plugin.semantic.env]           # added to the inherited environment, never an
+                                # allowlist - a server has to find its toolchain
+RA_LOG = "error"
+[plugin.semantic.initialization_options]   # passed to `initialize` verbatim
+cachePriming = { enable = false }
 ```
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest
 is already the startup-time source of truth. Validation follows `read_manifest`'s
-hard-failure rule.
+hard-failure rule - which is exactly why `[plugin.semantic]` is not part of it.
 
 ### Wire v2 (`protocol::types`, `CURRENT_PROTOCOL_VERSION = 2`)
 
@@ -589,7 +609,8 @@ pub fn run<E: Extractor>(extractor: E, semantic: Option<Box<dyn SemanticEngine>>
   - id hashing;
   - placeholder builders;
   - a `#[test]` helper that runs `g-mesh plugin check` against a fixture.
-- **`LspBridge: SemanticEngine`:**
+- **`LspBridge: SemanticEngine`** (built in GM-289; see "Implementation notes
+  (GM-289)" below for the seven decisions this sketch left open)**:**
   - spawns the configured server (command from the manifest's
     `[plugin.semantic] command`);
   - runs `initialize`, `didOpen`/`didChange` from the SDK's file cache;
@@ -693,6 +714,117 @@ The toy plugin the SDK's own conformance test drives (`plugins/sdk/toy/`) is a
 line-oriented language with five line shapes. It is built by `cargo build` and
 shipped by nothing: no `plugin.toml` of its own exists outside the scratch
 directory one check writes.
+
+#### Implementation notes (GM-289): the LSP bridge
+
+Built as `plugins/sdk/src/lsp/` (`lsp::LspBridge`), with every decision argued
+in the module it belongs to. Recorded here are the seven the sketch above left
+open, plus the two places it turned out to be *incomplete* rather than merely
+unspecified.
+
+1. **`[plugin.semantic]` lives in `plugin.toml` and core never reads it**
+   (`lsp::config`). The section carries `command`, `args`, `env`, `engine` (the
+   edge label), `implementation_kinds` and a free-form
+   `initialization_options` table. Core's `daemon::manifest` is **unchanged**:
+   it would do nothing with any of these (it never spawns the server, and the
+   memory limit already counts it by sampling the plugin's process *tree*), and
+   a field core parses is a field core hard-fails on - so a typo in a server
+   command would have stopped the plugin being discovered at all, taking its
+   structural tier down to protect a string only the plugin reads. The SDK
+   already re-reads its own manifest for the walk, and reads three more keys
+   out of the same file through the same search order. The env table *adds*
+   variables rather than allowlisting them: a language server is a program that
+   finds a toolchain (`PATH`, `CARGO_HOME`, `GOMODCACHE`, `JAVA_HOME`, …), and
+   an allowlist written by someone who is not that language's maintainer fails
+   silently - the server starts, finds nothing, and answers nothing.
+2. **No LSP crate** (`lsp::client`). The bridge sends six requests and four
+   notifications and reads a URI and two integers out of the replies.
+   `lsp-types` is the whole specification as Rust types (and pins a protocol
+   version); `lsp-server`/`tower-lsp` bring crossbeam or tokio. The SDK is what
+   languages #3-#7 inherit, so a dependency here is paid seven times and
+   removed never. The framing is shared with the control plane
+   (`plugins/sdk/src/framing.rs`), which is one implementation of the byte
+   format rather than two.
+3. **Columns are converted, in both directions** (`lsp::position`). The wire
+   counts Unicode scalar values; LSP counts UTF-16 code units unless the
+   negotiation says otherwise. The bridge offers `utf-32, utf-16, utf-8` in
+   `initialize` and honours what the server picks, converting against the text
+   the SDK's index holds - the same bytes the server was sent in `didOpen`,
+   which is the only reason a conversion computed on this side is true on the
+   other. Both directions are load-bearing and both are tested with a
+   non-ASCII fixture line: dropping either one makes
+   `tests/lsp_bridge.rs`'s definition test emit nothing at all.
+4. **Readiness has a definition for servers that report none.** All begun
+   `$/progress` ended → ready; no progress begun within a two-second settle →
+   ready (a server that answers immediately is not penalised beyond that,
+   once per server rather than once per pass); neither within the readiness
+   budget → the pass asks nothing and reports itself incomplete, so no site is
+   ever recorded as "no target" on the strength of a cold server's silence.
+   Readiness is not only a startup condition: an empty answer that arrives
+   while a progress is in flight is deferred until that progress ends and asked
+   once more, rather than believed or re-asked in a spin.
+5. **Retraction has two rules and one deliberate refusal.** The bridge
+   withdraws its own earlier answers for a file it has finished again and not
+   re-produced, and it withdraws a syntactic edge an answer contradicts - but
+   only when the extractor said which edge that is. That is the new
+   `OpenSite::replaces` field: `from_id` plus `edge_kind` does *not* name an
+   edge (one function calling two same-named methods through different
+   receivers produces two sites with an identical pair), so retracting on that
+   basis would delete correct edges to repair ones that were never wrong. Only
+   the extractor knows which edge it wrote for which site. `plugins/rust` sets
+   it to `None` everywhere, correctly: its open sites are sites it emitted no
+   edge for. The shape that needs it is Go's `placeholderCall`.
+6. **Budgets** (`lsp::Budgets`): a 10s per-request timeout, 20,000 sites per
+   pass, 8 questions in flight, and a whole-pass budget of
+   `max(15 min, 8s × files)` (90s for a per-file pass). Each is inside the
+   limit core kills the plugin at - `max(20 min, 10s × files)` and a flat 120s
+   (`daemon::plugin::RoundTripTimeouts`) - because a bridge that runs to
+   *core's* limit is killed rather than reporting anything, and loses the
+   answers it had already built. A unit test asserts the containment at
+   several project sizes so the two cannot drift apart silently.
+7. **An incomplete pass is a diff plus a flag, not an error.**
+   `FileChangeResponse` gains `incomplete` (absent means `false`, so every
+   plugin written before this keeps answering unchanged), and
+   `watcher::apply::apply_semantic_pass` commits the diff and *then* fails the
+   whole-project pass, which is exactly what leaves
+   `language_state.semanticPassAt` unset for a retry on the next daemon start.
+   A JSON-RPC error was the alternative and is worse: it carries no diff, so
+   reporting that the last hundred sites are missing would throw away the nine
+   thousand the pass did resolve. The SDK's own half is
+   `SemanticAnswer { diff, complete }` (`semantic.rs`) - and the flag is only
+   put on the wire for a *whole-project* pass, because a per-file one has no
+   completion record to protect and the only thing the flag could do there is
+   print a line per keystroke-save, which is the noise the design's "log once"
+   rule exists to prevent.
+
+Two things the sketch above did not say, found while building it:
+
+- **An `Implementation` open site cannot be answered by this bridge, and that
+  is a gap in the *site*, not in the engine.** `plugins/rust` records one for
+  `impl Trait for T` where `T` is declared in another file, at the position of
+  `T` - the subtype - while the edge it wants runs from `T` to the trait.
+  `definition` there answers "where is T" (the wrong end) and `implementation`
+  answers "what implements T" (a different question). The same fact is
+  reachable from the other end, by asking `implementation` on the trait's own
+  node, which is what `implementation_kinds` drives. Closing it properly needs
+  the site to carry the trait as well as the type; until then the bridge counts
+  these sites, logs them and answers nothing, which is honest rather than
+  incomplete-forever.
+- **A request has to land on an identifier.** A node's range starts at the
+  whole declaration (`pub trait Foo` starts at `pub`), and a server asked there
+  resolves a keyword. The bridge aims at the first occurrence of the node's own
+  name inside its range - a heuristic, but a language-agnostic one, with the
+  range's start as the fallback.
+
+The fixture is a real process: `plugins/sdk/fake-lsp/` is a language server
+whose whole behaviour is a JSON script the test writes (readiness mode,
+per-position answers, delays, a crash after *n* requests, silence from the
+*n*th). A mocked client would have tested the easy half and skipped the
+transport, and "the plugin survives its server dying" cannot be faked at all -
+it is a statement about a process. Fourteen integration tests drive it,
+including the readiness gate (which fails, as it must, when the gate is
+removed), both column conversions, the implementation mapping, a request
+timeout, and a crash mid-pass after which the bridge starts a fresh server.
 
 ### Go plugin (`plugins/go`)
 
@@ -1172,7 +1304,8 @@ adds a second CI job that runs it with `go` off `PATH`. Two decisions:
   - It answers open sites and `implementation` for traits, and sees macro
     expansions.
   - It needs `rust-analyzer` on `PATH` or through rustup; without it, structural
-    only.
+    only. See "Implementation notes (GM-290)" for why "on `PATH`" is not the
+    same as "works", and what the plugin does about it.
 - **Distribution:** a cargo binary in the same workspace as core, built by the
   existing native release matrix. See "Implementation notes (GM-288)" below
   for how that turned into `scripts/bundle-rust-plugin.sh`, and why it is not
@@ -1269,6 +1402,163 @@ with the `IMPORTS` edges pointing at it, which is why a module consisting
 only of `pub use` has no container node at all (its re-exports still resolve
 - the walk reads a node's own `container` column, not the `containers`
 table).
+
+#### Implementation notes (GM-290): the rust-analyzer engine
+
+R4, built as `plugins/rust/src/semantic.rs` plus two corrections inside the
+SDK's generic bridge. The bridge was written against the specification and a
+scripted fixture; this was the first time it was pointed at a real language
+server, and two of its rules turned out to be wrong rather than incomplete.
+Both were found by tracing rust-analyzer against this plugin's own
+conformance fixture, and both are recorded here because neither is about
+Rust.
+
+**1. "The server is ready when every progress it began has ended" is false
+for any server whose startup is a sequence.** GM-289's readiness rule (rule 1
+of `plugins/sdk/src/lsp/bridge.rs`) watched the set of in-flight work-done
+tokens and called the server ready the moment it emptied. rust-analyzer
+1.97.1 reports its startup as seven *consecutive* tokens - `Fetching`,
+`Building CrateGraph`, `Roots Scanned`, `Building compile-time-deps`,
+`Loading proc-macros`, `cachePriming`, and a `flycheck` - each begun after
+the previous ended. Traced on the fixture: the set first emptied 5.83s in,
+in a 0.28s gap, and the last token did not end until 14.21s. The first
+version of that trace obeyed GM-289's rule exactly, declared readiness at
+3.38s, and got `null` from all nine questions it then asked - including
+`textDocument/implementation` on a trait with two impls in the same file.
+Nothing was recorded as "no target" (an empty answer records no edge), but
+the pass would have been reported *complete*, which is worse: core would
+have set `semanticPassAt`, dropped Rust's receiver gap from the generated
+instructions, and stood behind an index with no semantic layer in it at all.
+
+The fix replaces both of GM-289's readiness rules with one: the server is
+ready when nothing has been in flight for `Budgets::settle` *continuously*.
+A server that reports no progress is quiet from birth and is ready after
+exactly that period, which is what rule 2 said; a server that reports a
+sequence cannot be fooled by a gap shorter than the settle. The period is
+paid once per server rather than once per pass (`LspClient::settle` latches),
+so the per-file pass after an edit does not spend two of its ninety seconds
+proving a point that was settled at start-up. The same quiet test now gates
+the re-ask of an empty answer, for the same reason.
+
+**2. An implementation answer names a site, and a site is not a
+declaration.** GM-289 mapped each `textDocument/implementation` location
+straight through `SdkIndex::node_at` to the node an edge should start at.
+That holds for Go, whose `implementation` on an interface points at the
+concrete type's declaration. rust-analyzer points at the implementing type's
+name *inside the `impl` header*: for `impl Shape for Square` it answers
+`shapes.rs:67:15`, the `Square` on the `impl` line, not the `struct Square`
+declared 38 lines earlier. No plugin emits a node for an `impl` block - it
+declares nothing of its own - so `node_at` found only the enclosing `File`,
+which is never an answer's target, and the whole sweep produced **zero**
+edges.
+
+So a location that does not land on a declaration this index knows now gets
+one more question: `textDocument/definition` at that same position, which is
+the server's own way of being asked "what is this name". Measured:
+`implementation` on `Loud` answers `shapes.rs:81:14` and
+`beta/src/main.rs:30:14`, and `definition` at those two answers
+`shapes.rs:33:11` (`struct Circle`) and `beta/src/main.rs:28:11` (`struct
+Megaphone`) - the declarations the edges have to start at, one of them in
+another crate. The follow-up is asked only when the first answer did not
+resolve (gopls pays nothing), only for a file this index holds, and never
+recursively.
+
+**3. The `Implementation` open site stays unanswered, and the sweep is why
+that is now a decision rather than a gap.** GM-286 records `impl Trait for T`
+where `T` is declared in another file as an open site at `T`'s position, and
+GM-289 observed that this is unanswerable: the wanted edge runs `T → Trait`,
+`definition` there answers "where is `T`" - the wrong end - and the site
+carries no position for the trait at all. Both suggested fixes were weighed
+and neither was taken:
+
+- *Extend the site to carry the trait's position.* It is a wire-visible
+  change to `OpenSite` that every plugin inherits, to describe one of the two
+  shapes this construct has - and it does not cover the other one at all.
+  `impl Loud for Megaphone` in `crates/beta`, where the trait arrives through
+  `use alpha::prelude::*`, produces no open site of any kind: the extractor
+  resolves a bare *type* name that is neither declared nor imported by item
+  to `Bound::Nothing`, deliberately, so that `Vec` and `String` do not swamp
+  the bridge. A richer site would leave that case exactly where it was.
+- *Rely on the trait-node sweep.* Taken. Asking `implementation` on the
+  trait reconstructs both shapes from the other end, including the one no
+  site exists for, and it needs nothing new on the wire - only correction 2
+  above, which every language on the bridge wanted anyway. The sweep's edges
+  are remembered against the *trait's* file for retraction, because a pass
+  over some implementor's file has no idea the sweep ever happened.
+
+The cost is that `implementation_kinds` must be non-empty for a language to
+get implementation answers at all, and that a trait outside the project is
+never swept - which is correct, since its implementors' edges would point at
+a declaration the index does not hold.
+
+**4. A `rust-analyzer` on `PATH` is not evidence of a rust-analyzer.**
+`~/.cargo/bin/rust-analyzer` is a rustup *proxy*: a symlink to `rustup` that
+exists for every binary rustup knows how to forward, installed or not. On the
+machine this was built on, `which rust-analyzer` answered
+`/Users/…/.cargo/bin/rust-analyzer` while `rust-analyzer --version` exited 1
+with "Unknown binary 'rust-analyzer' in official toolchain" and `rustup which
+rust-analyzer` failed too. Handed to the bridge, that is a server which
+starts and immediately dies - not `ErrorKind::NotFound`, so the bridge's
+permanent degradation never fires and the plugin re-spawns the proxy once per
+pass until `MAX_SERVER_STARTS` stops it four starts later.
+
+So `plugins/rust/src/semantic.rs` resolves *and probes*: the manifest's
+command (a bare name, so the OS does the `PATH` lookup), then `rustup which`,
+each accepted only if `--version` exits 0. One spawn per plugin process, and
+the version it prints goes in the log line. Nothing usable is a factory
+error, which the SDK reports exactly once and turns into an empty,
+*incomplete* diff for the rest of the process's life - "log once and an empty
+diff", with `semanticPassAt` left unset so the receiver gap stays listed
+until the toolchain is actually there.
+
+**5. Exactly one `initializationOption`, and the one that was nearly two is
+the more interesting.** `checkOnSave = false` is uncontroversial: it runs
+`cargo check` for diagnostics this bridge never reads, and it *builds*, which
+wrote a `target/` directory and a `Cargo.lock` into the fixture the first
+time this tier was pointed at one.
+
+`cachePriming.enable = false` was set too, measured as a win, and then taken
+back out - which is worth recording because the first measurement was of the
+wrong thing. Time-to-quiet with priming off is shorter, and on the fixture
+the whole pass is faster: ~7s against ~9.5-13s, four samples each at load
+average 4. But priming is the work that decides whether the *first query* is
+milliseconds or minutes, and turning it off does not remove that work; it
+moves it out of start-up, where `Budgets::readiness` allows ten minutes, and
+into the first `textDocument/definition`, where `Budgets::request` allows ten
+seconds and whose own doc says it assumes "a server that has finished
+indexing". At load average 693 that is exactly what happened: eight questions
+blew the per-request budget and the pass came back incomplete. It is
+correction 1's bug entering through a second door - a server made to look
+ready before it can answer - so the setting is gone and the three-second
+difference is paid.
+
+`procMacro` and `cargo.buildScripts` are deliberately left on for a different
+reason: they are slower and hungrier than either of the above, and unlike
+either they change which edges *exist*.
+
+**The open question above - how long the receiver gap stays listed after
+structural readiness - is answered for a small workspace and still open for a
+large one.** `meta.bulkIndexedAt` is recorded before the pass runs, by
+design, so the gap's duration is exactly the semantic pass's own wall clock.
+Measured with a real `g-mesh init` over this plugin's fixture, three runs at
+load average 3.9-4.7, reading core's own two timestamps out of the index
+rather than timing from outside: `bulkIndexedAt` to `semanticPassAt` is
+**9-10s** (the columns are second-resolution), against the plugin's own
+report of 9.47-9.54s for the pass and 16.8-17.1s for the whole `init`. Peak
+RSS of the plugin's process tree over the same work is **535-555 MiB**,
+essentially all of it rust-analyzer - which is what `[plugin] memoryLimitMb`
+would be sampling, and a useful floor to know: a limit below about 600 MiB
+would suspend this language on any project at all.
+
+Almost all of those ten seconds are rust-analyzer reaching quiet; the
+questions themselves are milliseconds (a warm `definition` measured 6ms, and
+the per-file pass that follows an edit 3.4-77.9ms). The number does not
+extrapolate - a two-crate workspace with no dependencies is the best case,
+and cold-load time is dominated by `cargo metadata` and sysroot discovery
+over the *dependency* graph. "Many minutes on a large workspace, with the
+structural index serving meanwhile" stands as the expectation, and measuring
+it on the Rust bench corpus is still R4 bench work rather than something this
+task settled.
 
 ### Python plugin (`plugins/python`, on the SDK)
 
@@ -1642,6 +1932,81 @@ later change does not have to re-derive them:
    clear, under the same singleton-lock guarantee) and `cli::stop`'s own
    state-file cleanup (once the core is confirmed not listening).
 
+#### Implementation notes (GM-291)
+
+Two things this task settled from measurement, not from re-reading GM-290's
+or GM-274's own notes and assuming they still held once a real rust-analyzer
+was pointed at both mechanisms together.
+
+**1. The 3.2.0 -> 3.3.0 `expect.toml` diff is not *quite* "exactly the
+semantic cases".** Fourteen of the fifteen changed/added rows are
+`tier = "semantic"`, or fixture-only comment additions. One is not:
+`[[references]] file = "crates/alpha/src/shapes.rs"` (untagged, i.e.
+structural) gained `shapes::total_dyn` to its expected set. The cause is not
+a change in structural resolution - it is that GM-290 added `total_dyn`
+(a function taking `&dyn Shape`) to the fixture *as fixture material the new
+semantic cases needed*, and a `&dyn Shape` parameter is an ordinary same-file
+type reference the structural tier has always resolved on its own. Proof
+this is exactly that and nothing more: `tests/conformance.rs`'s own
+`without_a_semantic_tier_the_structural_expectations_still_hold` runs the
+*3.2.0 manifest* (no semantic tier at all) against the *current* fixture and
+this exact row still passes - the structural tier's own behavior did not
+move, only the fixture it is being asked about grew a new symbol. So the
+criterion holds in the sense that matters (no structural *resolution*
+changed) but not in the most literal sense (one non-semantic row's expected
+*text* did change) - recorded here because "exactly the semantic cases" is
+the kind of claim that is worth being precise about rather than rounding up.
+
+**2. `PluginSupervisor::semantic_pass` and `PluginSupervisor::check_memory_limit`
+share one mutex, and that mutex is held for the pass's entire round trip - not
+just to dispatch it.** `check_memory_limit` cannot sample *during* the pass
+that is inflating memory; it can only run before that pass starts or after it
+returns. That matters for this section's own "language_state.semanticPassAt
+is left as it was: if the pass never completed, the receiver gap stays
+listed... and not one moment longer" - the sentence is true as written, but
+"the pass never completed" turns out to be the *less* common outcome for the
+exact scenario `memoryLimitMb` exists to catch: a language's first cold pass
+tripping the very limit its own memory growth crosses. `daemon::semantic
+::run_with_registry`/`run_once` record `language_state.semanticPassAt`
+immediately after `semantic_pass` returns `Ok(true)` - same thread, no yield
+point - while `check_memory_limit`, even if it was already blocked on the
+same lock before the pass began, needs an OS wakeup plus a whole-system
+`sysinfo::refresh_processes` call before it can even measure RSS. Raced with
+real threads over a real rust-analyzer three times, at load averages from
+~15 to ~78 (`core/tests/plugin_memory_limit.rs`): the pass returned at
+13.3s/16.9s/17.3s of wall time and `check_memory_limit` returned 0.412s-0.417s
+later every single time (13.7s/17.3s/17.7s), and `semanticPassAt` was already
+set every time by the time `check_memory_limit` finished. So suspension
+cannot preempt the request that causes it - it only ever catches the *plateau* it leaves
+behind, on whatever the next `check_memory_limit` call after that plateau
+forms happens to be. This is not a defect this task fixes (no code in
+`daemon::lifecycle` changed): it is a previously-unmeasured consequence of
+GM-274's own design worth recording plainly, since the section above reads
+as a stronger guarantee than the mechanism actually gives for a language's
+*first* pass. The test suite built for GM-291 does not assert a fixed winner
+of this race (that would be flaky); it reads which side won and asserts the
+generated instructions are correct for that outcome either way.
+
+**3. The open question - does the sampling interval catch the spike before
+it is gone again - has a cleaner answer than "compare interval to spike
+duration" once the plateau is actually measured.** Sampled at high frequency
+against a real `g-mesh daemon` over GM-290's own fixture: rust-analyzer's RSS
+rises gradually (never more than roughly 65MB between two samples 0.4-1s
+apart, even under load 120-160) to a plateau of 563-580MB, and then *holds
+there* - flat for 19+ seconds of continued sampling after the pass completed,
+never falling back down. So this is not a transient spike a short interval
+might catch and a long one might miss; it is a sustained step function. Any
+sampling interval shorter than the plateau's own lifetime (which, absent
+something else putting the plugin to sleep first, is indefinite - nothing
+about rust-analyzer's own behavior ever releases that memory back) will
+eventually observe it, including the production default (a flat 30s tick at
+`idleTimeoutMinutes = 60`, confirmed catching it within one to two ticks in
+`core/tests/plugin_memory_limit.rs`'s own real-daemon test). The genuine
+limit on "catches it before it's gone" is not the tick period at all - it is
+finding a moment where `check_memory_limit` can actually acquire
+`PluginSupervisor::inner` (note 2, above), which for a *sustained* plateau it
+eventually always can.
+
 ## Data Flow
 
 ### Cold start in a mixed Go + Rust repo
@@ -1788,11 +2153,20 @@ moving target under development).
 - **Memory ceiling:** decided. `[plugin] memoryLimitMb`, off by default (see
   Interfaces). Still open: whether the sampling interval (the idle-check timer) is
   fine-grained enough to catch a fast rust-analyzer load spike before the OS does.
-  Measure in R4.
-- **rust-analyzer cold-load time vs `semanticPassAt`.** On a large workspace the
-  receiver gap may stay in the instructions for many minutes after the structural
-  index is ready. That is acceptable under the honest-partial-availability rule, but
-  it should be measured on the Rust corpus in R4.
+  R4 measured the *floor* rather than the spike: the Rust plugin's whole process
+  tree peaks at 535-555 MiB on a two-crate fixture, essentially all of it
+  rust-analyzer, so a limit below about 600 MiB suspends this language on any
+  project at all. Whether the sampler catches a spike on a large workspace is
+  still bench work.
+- **rust-analyzer cold-load time vs `semanticPassAt`.** Measured for a small
+  workspace in R4 and still open for a large one. Because `meta.bulkIndexedAt` is
+  recorded before the pass, the gap's duration *is* the pass's wall clock: 9-10s on
+  the Rust plugin's own two-crate fixture, almost all of it rust-analyzer reaching
+  quiet rather than answering. That does not extrapolate - cold-load time is
+  dominated by `cargo metadata` and sysroot discovery over the dependency graph,
+  which the fixture does not have - so "many minutes on a large workspace" stands
+  as the expectation, and measuring it on the Rust bench corpus is still R4 bench
+  work. See "Implementation notes (GM-290)".
 - **go.work and multi-module repos.** Container keys are import paths, so they
   compose. go/packages loading across modules needs checking on a real multi-module
   corpus, and no candidate above is one.

@@ -479,25 +479,28 @@ results instead of paging.";
         }
     }
 
+    /// Rust as it is present in an index whose semantic pass has not landed:
+    /// the shipped capabilities, and `semantic_pass_done = false`.
+    ///
+    /// It read a hand-written capability literal until GM-290, because the
+    /// manifest it was modelling did not exist yet - it was the *hypothetical*
+    /// future Rust, used to exercise the multi-language naming branch before
+    /// there was a rust-analyzer tier to produce it. GM-290 shipped exactly
+    /// those capabilities, so the literal is gone and this reads the manifest
+    /// like its Go counterpart: a test that models a manifest is a test that
+    /// can disagree with one.
     fn rust_pre_semantic() -> PresentLanguage {
         PresentLanguage {
             language: "rust".to_string(),
-            capabilities: Capabilities {
-                semantic_pass: true,
-                receiver_calls: ReceiverCallResolution::Resolved,
-                receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            },
+            capabilities: bundled_rust_capabilities(),
             semantic_pass_done: false,
         }
     }
 
     /// The bundled Rust plugin's own `[plugin.capabilities]`, read off
     /// `plugins/rust/plugin.toml` rather than transcribed - so a later edit
-    /// to that manifest changes what [`rust_only_lists_the_receiver_gap_with_no_semantic_tier_yet`]
-    /// asserts instead of quietly disagreeing with it. Unlike
-    /// [`rust_pre_semantic`] above (a *hypothetical* future manifest, used to
-    /// exercise the multi-language naming branch before GM-290 exists), this
-    /// reads the manifest as GM-286 actually shipped it.
+    /// to that manifest changes what the two `rust_only_*` tests assert
+    /// instead of quietly disagreeing with it.
     fn bundled_rust_capabilities() -> Capabilities {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/rust");
         crate::daemon::manifest::read_manifest(&dir)
@@ -569,30 +572,52 @@ results instead of paging.";
         assert_eq!(build(&[]), ORIGINAL_INSTRUCTIONS, "no index yet must read the same as it always has");
     }
 
-    /// GM-287's own acceptance criterion: a Rust-only index still lists the
-    /// receiver-call gap, checked against the shipped manifest rather than a
-    /// hand-written capability literal (`bundled_rust_capabilities`'s own
-    /// doc). `plugins/rust/plugin.toml` declares both `receiver_calls` and
-    /// `receiver_calls_structural` as `"unresolved"` - there is no semantic
-    /// tier at all yet (GM-290, R4 of the design doc's rollout), so
-    /// `semantic_pass_done` cannot close the gap either way, unlike Go's
-    /// `go_present`/`bundled_go_capabilities` pair on the sibling release
-    /// branch this module's own git history shows once GM-281/GM-282 land
-    /// here.
+    /// GM-287's own acceptance criterion, and the half of it GM-290 did not
+    /// change: a Rust-only index whose semantic pass has not landed still
+    /// lists the receiver-call gap, checked against the shipped manifest
+    /// rather than a hand-written capability literal
+    /// (`bundled_rust_capabilities`'s own doc).
+    ///
+    /// Until GM-290 this ran for `semantic_pass_done` of *both* values,
+    /// because `plugins/rust/plugin.toml` declared `receiver_calls =
+    /// "unresolved"` and a pass that could never resolve one could never
+    /// close the gap either. It now declares `"resolved"`, so the two values
+    /// have genuinely different answers and each has its own test - the same
+    /// pair `go_present`'s two tests have had since GM-281.
+    ///
+    /// This is also the permanent state of a machine with no rust-analyzer:
+    /// the plugin answers every `semanticPass` with an empty *incomplete*
+    /// diff, `semanticPassAt` is never set, and the gap stays listed. That is
+    /// the whole reason the degradation reports incomplete rather than
+    /// complete.
     #[test]
-    fn rust_only_lists_the_receiver_gap_with_no_semantic_tier_yet() {
-        for semantic_pass_done in [false, true] {
-            let rendered = build(&[PresentLanguage {
-                language: "rust".to_string(),
-                capabilities: bundled_rust_capabilities(),
-                semantic_pass_done,
-            }]);
-            assert_eq!(
-                rendered, ORIGINAL_INSTRUCTIONS,
-                "a single gapped language reads as it always has, semantic_pass_done = {semantic_pass_done}"
-            );
-            assert!(rendered.contains("produces no edge by design"));
-        }
+    fn rust_only_before_its_semantic_pass_lists_the_receiver_gap() {
+        let rendered = build(&[rust_pre_semantic()]);
+        assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
+        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+    }
+
+    /// And what the same index reads once rust-analyzer has answered
+    /// (GM-290): the receiver-call gap drops out of the text entirely,
+    /// leaving only the still-building one, renumbered out of its `(2)`.
+    ///
+    /// This is the assertion behind "how long does the gap stay listed" - the
+    /// answer being "until this flips", which core sets from
+    /// `language_state.semanticPassAt` the moment a *complete* whole-project
+    /// pass lands.
+    #[test]
+    fn rust_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+        let mut rust = rust_pre_semantic();
+        rust.semantic_pass_done = true;
+        let rendered = build(&[rust]);
+        assert!(
+            rendered.contains("One real gap"),
+            "rust-analyzer resolves every receiver call once its whole-project pass has completed"
+        );
+        assert!(!rendered.contains("Two real gaps"));
+        assert!(!rendered.contains("variable receiver"));
+        assert!(rendered.contains("still building"), "the second gap must survive renumbering");
     }
 
     /// GM-297's own acceptance criterion 2: a Python-only index still lists

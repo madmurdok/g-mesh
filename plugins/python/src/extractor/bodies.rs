@@ -565,6 +565,13 @@ impl<'a, 's> Bodies<'a, 's> {
             kind: OpenSiteKind::ReceiverCall,
             edge_kind: EdgeKind::Calls,
             from_container: Some(self.module.key.clone()),
+            // Always `None` here, for the same reason `plugins/rust` gives:
+            // the field names a structural edge a semantic answer would
+            // contradict, and this extractor writes no edge at all for a
+            // receiver call (Decision 7 in this module's doc). There is
+            // nothing to retract, so claiming otherwise would ask the bridge
+            // to delete an edge that was never emitted.
+            replaces: None,
         });
     }
 

@@ -97,7 +97,10 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let file_path = file_path.into();
-    round_trip(
+    // A structural reparse has nothing to be incomplete about - the plugin
+    // either extracted the file or it did not - so this round trip's report is
+    // deliberately dropped here and read only for a `semanticPass`.
+    let _structural = round_trip(
         reader,
         writer,
         conn,
@@ -154,7 +157,8 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     timeout: Duration,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
-    round_trip(
+    let whole_project = file_paths.is_empty();
+    let outcome = round_trip(
         reader,
         writer,
         conn,
@@ -163,7 +167,44 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
         embedding,
         timeout,
         on_timeout,
-    )
+    )?;
+
+    // The diff is committed by now, deliberately: an incomplete pass is a
+    // *partial* answer, not a failed one, and everything it did resolve is as
+    // real as any other semantic edge (`protocol::types::
+    // FileChangeResponse::incomplete` says why the plugin does not report this
+    // as a JSON-RPC error instead). What is left to do is refuse to call the
+    // pass finished, which for a whole-project pass is exactly what an `Err`
+    // here means to `daemon::semantic`: `language_state.semanticPassAt` stays
+    // unset and the next daemon start asks this language again.
+    //
+    // A per-file pass has no completion flag to protect, so an incomplete one
+    // is worth a line and nothing more - failing it would only make
+    // `apply_file_change` log the same thing twice.
+    if outcome.incomplete {
+        if whole_project {
+            bail!(
+                "the plugin reported an incomplete whole-project semantic pass - its diff is committed, \
+                 but the pass is not recorded as done"
+            );
+        }
+        eprintln!(
+            "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
+             this pass did resolve"
+        );
+    }
+    Ok(())
+}
+
+/// What one round trip reported about itself, beyond the diff it already
+/// committed - today only [`FileChangeResponse::incomplete`], which is
+/// meaningless for a `fileChanged` and load-bearing for a `semanticPass`.
+///
+/// A struct rather than a bare `bool` so that the one thing [`round_trip`]
+/// returns keeps a name at both call sites: `let _ = round_trip(...)` reads
+/// as "nothing to say", where a discarded bare `bool` reads as a bug.
+struct RoundTrip {
+    incomplete: bool,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -225,7 +266,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     embedding: &EmbeddingPipeline,
     timeout: Duration,
     on_timeout: &mut dyn FnMut(),
-) -> Result<()> {
+) -> Result<RoundTrip> {
     let method = method_name(&message);
     let request =
         ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: Some(request_id.clone()), message };
@@ -260,7 +301,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     if let Err(err) = embedding.apply(conn, &diff) {
         eprintln!("g-mesh daemon: failed to embed the {method} diff: {err:#}");
     }
-    Ok(())
+    Ok(RoundTrip { incomplete: response.incomplete })
 }
 
 /// The wire `method` string for a control message, for error messages that
@@ -542,7 +583,7 @@ mod tests {
             }
             write_message(
                 &mut writer,
-                &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result },
+                &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result, incomplete: false },
             )
             .unwrap();
         })
@@ -710,6 +751,7 @@ mod tests {
         let request_id = RequestId::Number(1);
         let canned_response = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff {
                 upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -786,6 +828,7 @@ mod tests {
         let request_id = RequestId::String("req-2".to_string());
         let canned_response = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() },
         };
@@ -827,6 +870,7 @@ mod tests {
         let request_id = RequestId::Number(10);
         let wrong_id_response = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: RequestId::Number(999), // deliberately does not match the request
             result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
         };
@@ -870,6 +914,7 @@ mod tests {
         let request_id = RequestId::Number(3);
         let empty_response = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff::default(),
         };
@@ -911,6 +956,7 @@ mod tests {
         mut writer: std::io::PipeWriter,
         expected_file_paths: Vec<String>,
         result: FileChangeDiff,
+        incomplete: bool,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf_reader = BufReader::new(&mut reader);
@@ -924,7 +970,7 @@ mod tests {
             }
             write_message(
                 &mut writer,
-                &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result },
+                &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result, incomplete },
             )
             .unwrap();
         })
@@ -965,6 +1011,7 @@ mod tests {
             plugin_writer,
             vec!["src/lib.rs".to_string()],
             FileChangeDiff { upsert_edges: vec![upgraded], ..Default::default() },
+            false,
         );
 
         let mut buf_reader = BufReader::new(core_reader);
@@ -1007,6 +1054,7 @@ mod tests {
         let request_id = RequestId::Number(4);
         let structural = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff {
                 upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -1064,6 +1112,7 @@ mod tests {
         let request_id = RequestId::Number(5);
         let structural = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
         };
@@ -1122,6 +1171,7 @@ mod tests {
         let request_id = RequestId::Number(6);
         let structural = FileChangeResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
+            incomplete: false,
             id: request_id.clone(),
             result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
         };
@@ -1170,7 +1220,8 @@ mod tests {
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
         let mut conn = setup_conn();
 
-        let plugin = spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default());
+        let plugin =
+            spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false);
 
         let mut buf_reader = BufReader::new(core_reader);
         apply_semantic_pass(
@@ -1187,6 +1238,79 @@ mod tests {
         plugin.join().unwrap();
 
         assert_eq!(count(&conn, "edges"), 0);
+    }
+
+    /// A plugin that answers a whole-project pass with `incomplete` (GM-289's
+    /// `FileChangeResponse::incomplete`) gets both halves of what it asked
+    /// for: the diff it did manage is committed, and the pass is reported as
+    /// *not* finished, which is what stops `daemon::semantic` recording
+    /// `language_state.semanticPassAt` for that language.
+    #[test]
+    fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
+        let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+        let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+        let mut conn = setup_conn();
+
+        let plugin = spawn_semantic_stub(
+            plugin_reader,
+            plugin_writer,
+            Vec::new(),
+            FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
+            true,
+        );
+
+        let mut buf_reader = BufReader::new(core_reader);
+        let outcome = apply_semantic_pass(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            Vec::new(),
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
+        );
+        plugin.join().unwrap();
+
+        let err = outcome.expect_err("an incomplete pass must not be reported as a completed one");
+        assert!(format!("{err:#}").contains("incomplete"), "{err:#}");
+        assert_eq!(
+            count(&conn, "nodes"),
+            1,
+            "what the pass did resolve is committed - an incomplete pass is partial, not failed"
+        );
+    }
+
+    /// The same flag on a *per-file* pass is a log line, not a failure: there
+    /// is no completion record for one to protect, and failing it would only
+    /// make `apply_file_change` print the same thing twice.
+    #[test]
+    fn an_incomplete_per_file_pass_is_not_an_error() {
+        let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+        let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+        let mut conn = setup_conn();
+
+        let plugin = spawn_semantic_stub(
+            plugin_reader,
+            plugin_writer,
+            vec!["src/lib.rs".to_string()],
+            FileChangeDiff::default(),
+            true,
+        );
+
+        let mut buf_reader = BufReader::new(core_reader);
+        apply_semantic_pass(
+            &mut buf_reader,
+            &mut core_writer,
+            &mut conn,
+            vec!["src/lib.rs".to_string()],
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
+        )
+        .expect("a per-file pass reports incompleteness without failing");
+        plugin.join().unwrap();
     }
 
     /// The derived id has to be distinguishable from the file change it

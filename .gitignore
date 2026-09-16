@@ -4,6 +4,12 @@
 # offering it as untracked.
 /target
 /core/target
+# The Rust plugin's conformance fixture is a real cargo workspace, and since
+# GM-290 a real rust-analyzer is pointed at it. Its `Cargo.lock` is checked in
+# (see that fixture's own Cargo.toml); a `target/` only appears if someone
+# turns `checkOnSave` back on in plugins/rust/plugin.toml, and it must not
+# become untracked noise if they do.
+/plugins/rust/conformance/project/target/
 # Release archives produced by scripts/build-targets.sh.
 /dist/
 .DS_Store

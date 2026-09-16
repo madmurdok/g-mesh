@@ -5,3 +5,17 @@
 name = "beta-crate"
 version = "0.1.0"
 edition = "2021"
+
+# Added by GM-290, and only the semantic tier needs it: the structural plugin
+# reads this file for workspace membership and crate roots and has never
+# cared what a crate depends on. rust-analyzer does - without this edge in
+# cargo's own graph, `use alpha::…` in main.rs is an unresolved import to it,
+# `impl Loud for Megaphone` implements nothing, and
+# `textDocument/implementation` on `alpha`'s `Loud` answers with alpha's impl
+# alone. That would make the cross-crate half of this fixture look like a
+# bridge defect rather than a missing dependency.
+#
+# It does not make this crate compile - see main.rs's own comment, which is
+# about a `use` real rustc rejects on purpose - and nothing ever builds it.
+[dependencies]
+alpha = { path = "../alpha" }

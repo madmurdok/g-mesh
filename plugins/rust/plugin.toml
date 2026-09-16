@@ -21,7 +21,17 @@
 [plugin]
 language = "rust"
 protocol_version = 2
-plugin_version = "0.1.0"
+# Must equal this crate's `Cargo.toml` `version`, and `src/semantic.rs`'s
+# `the_manifest_version_matches_the_crates` is what enforces it. It went
+# unchecked until GM-290 and had drifted three releases: this said 0.1.0 while
+# the crate was at 3.3.0. Nothing caught it because nothing read both - core
+# reads this file, the plugin announced `env!("CARGO_PKG_VERSION")` in its
+# handshake, and the two screens a person consults about one plugin (`g-mesh
+# plugins list` and core's protocol-mismatch message) named different
+# versions. GM-290 made them one value rather than two, by telling the plugin
+# which manifest core read (`daemon::manifest::MANIFEST_PATH_ENV`), so the
+# manifest is now the version that ships and a stale one ships stale.
+plugin_version = "3.4.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-rust"
@@ -30,16 +40,71 @@ command = "../../target/debug/g-mesh-plugin-rust"
 extensions = [".rs"]
 
 [plugin.capabilities]
-# No semantic tier yet (GM-285 is the project model; GM-286 is the
-# tree-sitter extractor; rust-analyzer over the SDK's LspBridge is R4 in the
-# design doc's Rollout table). `false` means core never sends `semanticPass`
-# and never requires an answer to one.
-semantic_pass = false
-# Receiver calls (`x.m()`) are an open site with no structural answer - the
-# design doc's Rust plugin section lists this as a documented structural gap,
-# and it stays "unresolved" in both fields until the semantic release lands.
-receiver_calls = "unresolved"
+# The rust-analyzer tier, over the SDK's generic `LspBridge` (GM-290, R4 in
+# the design doc's Rollout table). `true` is what makes core send
+# `semanticPass` at all, and it puts this plugin under
+# `capabilities.semantic-engine-lazy`: the engine must not exist until the
+# first one arrives (see src/main.rs, which passes a factory).
+semantic_pass = true
+# Receiver calls (`x.m()`) are an open site the structural tier answers with
+# nothing and the semantic tier answers exactly - so the two fields differ,
+# which is the shape `core::mcp::instructions` reads to decide how long to
+# keep listing Rust's receiver-call gap: until a semantic pass has actually
+# landed for this language, and not one moment longer.
+receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+
+# How to start rust-analyzer. Read by *this plugin*, never by core - core has
+# no use for the fields and validating them would make a typo here take the
+# structural tier down with it (see plugins/sdk/src/lsp/config.rs's module
+# doc for the argument in full).
+[plugin.semantic]
+# A bare name: a `PATH` lookup, with `rustup which rust-analyzer` as the
+# fallback. Both candidates are probed with `--version` before either is
+# used, because `~/.cargo/bin/rust-analyzer` is a rustup *proxy* that exists
+# whether or not the component behind it does - see src/semantic.rs, which
+# has the measurement. Edit this to point at a specific binary and it will be
+# used as written, probed and not searched around.
+command = "rust-analyzer"
+engine = "rust-analyzer"
+# The `nativeKind` this extractor gives a `trait_item` (src/extractor/
+# decls.rs). It is the one language-shaped fact the bridge is handed rather
+# than knowing: these are the nodes it asks `textDocument/implementation`
+# about, which is how an `impl` in *another crate* of the workspace becomes a
+# `SUPERTYPE_OF` edge - no `use` in that crate resolves structurally when the
+# trait arrives through a glob import, so nothing but this sweep finds it.
+implementation_kinds = ["trait"]
+
+# rust-analyzer's own settings, passed through verbatim as
+# `initializationOptions`. Exactly one is set, and the two that are
+# deliberately left alone cost more than it saves.
+#
+# `checkOnSave` runs `cargo check` to produce diagnostics this bridge never
+# reads. Worse, it *builds*: it wrote a `target/` directory and a `Cargo.lock`
+# into the fixture the very first time this tier was pointed at it. Off.
+#
+# `cachePriming` was turned off here first, and putting it back is a measured
+# correction rather than a second thought. Priming is the work that decides
+# whether the first query is milliseconds or minutes, and turning it off does
+# not remove that work - it moves it out of rust-analyzer's start-up, where
+# the bridge's readiness budget is ten minutes, and into the first
+# `textDocument/definition`, where the budget is ten seconds
+# (`Budgets::request`, whose own doc says it assumes "a server that has
+# finished indexing"). Measured on this plugin's conformance fixture: with
+# priming off the whole-project pass takes about 7s at load average 4 - and
+# at load average 693 eight of its questions blew the ten-second per-request
+# budget and the pass came back incomplete. With priming on it is ~3-6s
+# slower in the good case and the slow part is inside the budget that can
+# absorb it. That is the same mistake GM-289's readiness rule made, entering
+# through a different door: a server made to look ready before it can answer.
+#
+# `procMacro` and `cargo.buildScripts` stay on for a different reason. They
+# are slower and hungrier than either of the above, and unlike either of them
+# they change which edges *exist* - a project whose impls come from a derive
+# macro would silently lose them. Missing edge beats wrong edge, but neither
+# beats the edge being there.
+[plugin.semantic.initialization_options]
+checkOnSave = false
 
 [plugin.workspace]
 # A workspace's own Cargo.toml, or a crate's: either can move crate roots or

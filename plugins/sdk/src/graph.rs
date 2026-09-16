@@ -142,6 +142,26 @@ pub struct OpenSite {
     /// (`PlaceholderTarget::from_container`). `None` for a language with no
     /// containers.
     pub from_container: Option<String>,
+    /// The id of the syntactic edge this site's answer *replaces*, when the
+    /// structural tier emitted one it is not sure of.
+    ///
+    /// Almost always `None`: an open site usually exists precisely because
+    /// nothing could be emitted for it, and there is then no edge to replace.
+    /// The shape that needs it is the one `plugins/go/semantic.go` calls a
+    /// `placeholderCall` - a `CALLS` edge the structural tier emitted on a
+    /// guess (`T(x)` looks like a call, and turns out to be a conversion)
+    /// which a semantic answer can contradict.
+    ///
+    /// It exists because the semantic tier cannot work it out: `from_id` and
+    /// [`edge_kind`](OpenSite::edge_kind) do not name an edge - one function
+    /// calling two same-named methods through different receivers produces two
+    /// sites with an identical pair - so an engine that retracted on that basis
+    /// would delete correct edges to repair ones that were never wrong. Only
+    /// the extractor knows which edge it wrote for which site, so only the
+    /// extractor can say. A semantic engine retracts this id when its answer
+    /// lands somewhere else, and leaves it alone when the answer confirms it
+    /// (see [`crate::lsp::LspBridge`]'s retraction rules).
+    pub replaces: Option<String>,
 }
 
 /// The `nativeKind` of a node that stands in for something outside its own
