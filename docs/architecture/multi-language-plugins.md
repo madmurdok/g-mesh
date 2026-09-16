@@ -1399,6 +1399,109 @@ became a real `PASS` the moment real declarations existed, and
 `capabilities.semantic-engine-lazy` still legitimately skips because
 `semantic_pass = false`.
 
+#### What language #4 actually cost (GM-300)
+
+Zero. `git diff --stat <parent> <merge> -- core/` on all four Python merges
+(GM-295 project model, GM-296 structural extractor, GM-297 conformance
+assertions, GM-298 distribution) is empty for three of them; `plugins/sdk/`
+is empty for all four. The one non-empty result, GM-297's
+`core/src/mcp/instructions.rs` (+40/-0), is a test, not a capability change:
+every added line sits inside `#[cfg(test)] mod tests` (that module starts at
+line 415 of the file; the diff starts at line 505), adding
+`bundled_python_capabilities()` - a copy of the existing
+`bundled_go_capabilities`/`bundled_rust_capabilities` pattern, reading
+`plugins/python/plugin.toml` rather than transcribing it - and one
+`#[test] fn python_only_lists_the_receiver_gap_with_no_semantic_tier_yet`,
+which asserts that a Python-only index renders the same receiver-gap
+sentence the existing Rust test proves for Rust. The generator itself did
+not change: it was already written to generalize over "any present language
+with `receiver_calls: unresolved` and no semantic pass" for GM-281 (Go), and
+Rust and now Python both exercise that same code path unchanged. One
+confound is worth ruling out explicitly, since GM-290 (Rust's semantic
+release) landed a real core fix the same week: it cannot have leaked in here
+because `release-3.3.0` is not an ancestor of `release-3.4.0` -
+`git merge-base --is-ancestor <GM-290 merge> release-3.4.0` returns false;
+`release-3.4.0` branches off `main` at the point `release-3.2.0` was merged,
+one step before `release-3.3.0` exists.
+
+Plugin size backs the same conclusion. Counting `git ls-files <dir> | xargs
+wc -l`, splitting each `.rs` file at its own trailing `#[cfg(test)] mod
+tests` (verified per file, not assumed - every plugin here puts tests at the
+bottom) and treating `extractor/tests.rs` and `tests/*.rs` as wholly test:
+
+| | implementation | tests | conformance fixtures+expect | config/docs | total |
+|---|---:|---:|---:|---:|---:|
+| `plugins/python` | 3,876 | 2,042 | 489 | 292 | 6,699 |
+| `plugins/rust` | 4,013 | 2,032 | 542 | 246 | 6,833 |
+| `plugins/go` | 4,843 | 2,866 | 417 | 229 | 8,355 |
+| `plugins/typescript` | 8,200 | 6,914 | 177 | 816 | 16,107 |
+
+Python's implementation is 137 lines *smaller* than the Rust structural tier
+it mirrors (Rust here is `release-3.4.0`'s copy, before GM-290 added the
+semantic engine on `release-3.3.0` - structural to structural, not
+structural to semantic), and the two plugins' test line counts are within
+0.5% of each other. Go and TypeScript are not on the same axis: Go already
+carries a semantic tier (`semantic.go`, 1,013 lines) and reimplements the
+wire protocol itself (`wire.go`, `jsonrpc.go`) because it cannot import a
+Rust crate; TypeScript predates the SDK entirely and carries its own
+semantic pass (`semanticPass.ts`, 1,242 lines) plus the workspace/incremental
+machinery the SDK now centralizes. The ~2.4x gap between the two SDK-based
+plugins (~6,700-6,800 lines each) and pre-SDK TypeScript (16,107) is closer
+to what "a plugin, not core surgery" is actually claiming credit for than
+the Python-vs-Rust gap is.
+
+SDK reuse is total and unextended: every `g_mesh_plugin_sdk::` item Python
+imports - `run`, `PluginSpec`, `Extractor`, `FileGraph`, `FileGraphBuilder`,
+`NodeSpec`, `OpenSite`/`OpenSiteKind`, `PlaceholderKind`, `RelPath`,
+`walk_project`, `BASELINE_EXCLUDED_DIRS`, `ids::{edge_id, node_id}`, the
+whole `wire` module, `testing::{PluginCheck, Verdict}` - is the same surface
+`plugins/rust` imports, and `plugins/sdk/` did not change for Python (above).
+The one candidate for "worked around" is `ProjectContext::has_container`
+(GM-296, Decision 8): Python's manifest cannot name import units
+(`pyproject.toml`'s `[project] dependencies` lists distribution names, not
+import names - `pillow` imports as `PIL`), so the plugin computes "is this
+dotted name ours" from its own package tree instead of trusting a manifest -
+the same shape `plugins/rust/src/extractor/keys.rs` already resolves
+`a::b` against `Cargo.toml`-declared crates
+(`a_bare_first_segment_is_a_child_module_before_it_is_an_external_crate`),
+entirely inside the Rust plugin, not the SDK. Rust already carries this
+exact kind of language-specific resolution logic itself; Python needing its
+own copy is the established pattern repeating, not a gap the SDK should have
+closed.
+
+Duration, from the tracker, caveat first: `created_at`/`updated_at` are
+wall-clock timestamps in a session that ran several tasks concurrently, not
+effort - they do not separate one task's working time from time spent
+waiting or on siblings. GM-295 (Python project model): created 08:34:29Z,
+updated 15:19:30Z, same day -> 6h45m. GM-296 (Python structural extractor,
+`complexity_hint: high`): created 08:34:29Z, updated 16:40:14Z -> 8h06m.
+GM-285 (Rust project model): created 2026-09-15 13:32:52Z, updated
+2026-09-16 11:03:44Z -> 21h31m, crossing an overnight gap. GM-286 (Rust
+structural extractor, also `complexity_hint: high`, worked by the opus
+subagent after a session interruption per its own completion summary):
+created 2026-09-15 13:32:52Z, updated 2026-09-16 13:52:45Z -> 24h20m, also
+overnight. The Rust pair's wall-clock span is roughly 3x the Python pair's,
+but most of that gap is the overnight idle period the Rust timestamps
+straddle and GM-286's own interruption, not a clean measurement of building
+speed. The only defensible reading: Python's structural tier did not take
+longer to build than Rust's, and the tracker has nothing more precise than
+that to offer either way.
+
+What this covers, and what it does not: the structural tier only. GM-299
+(Python's semantic tier, a pyright bridge) is deferred and unbuilt, and this
+document's own Open Questions already name Python's dynamic dispatch as a
+gap that persists "even with pyright." A semantic tier is exactly where Rust
+needed its one real core fix (GM-290 - core did not tell a spawned plugin
+which manifest it had read), for a *different* language's semantic engine.
+This result says nothing about whether Python's semantic tier will need
+core work; it is silent on that until GM-299 is built. Had `has_container`
+required a new SDK function instead of reusing `walk_project`, or had the
+GM-297 conformance work needed the instructions *generator* to change rather
+than exercise it, this section would report the opposite finding - the
+generalization would have been narrower than R1 claimed, and the C#/C++/
+Java/Kotlin plans in the stress test above should have been revisited before
+being built. Neither happened.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated
