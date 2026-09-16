@@ -3,11 +3,38 @@
 # plugins/python/conformance/expect.toml`, which `tests/conformance.rs` runs
 # from `cargo test`.
 #
-# These are the acceptance criteria of GM-296 turned into assertions against a
-# *linked* index: the checks above this section prove the plugin's stream is
-# well formed, and only these prove that the edges it emits actually reach the
-# declarations they name. Every category `g-mesh plugins check --expect` can
-# assert is exercised at least once
+# These are the acceptance criteria of GM-296, and since GM-299 of the pyright
+# tier as well, turned into assertions against a *linked* index: the checks
+# above this section prove the plugin's stream is well formed, and only these
+# prove that the edges it emits actually reach the declarations they name.
+#
+# **`tier = "semantic"`** marks the three entries that need a real pyright
+# behind the SDK's `LspBridge` - decision 6 of
+# `core/src/cli/plugin_check/expectations.rs`'s own module doc, the same way
+# `plugins/rust/conformance/expect.toml` marks its five.
+# `tests/conformance.rs` runs this file three ways, and the three together are
+# the whole point:
+#
+#   1. with the manifest this plugin ships, where all ten entries run and pass;
+#   2. with 3.4.0's own manifest (`semantic_pass = false`, no
+#      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
+#      three report `Skip` and the other seven - every structural entry here -
+#      keep passing;
+#   3. with 3.4.0's manifest and *without* the skip flag, where those three
+#      must FAIL.
+#
+# Arm 3 is the discrimination, and it is not decoration: measured, it fails
+# exactly three entries, each for the reason it was written -
+#
+#   callers[2]  missing through_a_base_annotation, module_alias_is_bound
+#   callers[3]  empty, wanted through_a_subclass   (the subclass's override)
+#   callers[4]  missing through_a_variable          (a local, typed by inference)
+#
+# - which is how this file is known to be measuring the pyright tier rather
+# than describing it.
+#
+# Every category `g-mesh plugins check --expect` can assert is exercised at
+# least once
 # (`core/src/cli/plugin_check/expectations.rs`'s module doc has the
 # format/anchoring/paging contract):
 #
@@ -17,15 +44,19 @@
 #   - callers, through a relative import two levels up (`assist` again, from
 #     `pkg/sub/deep.py`);
 #   - callers, across a PEP 420 namespace package (`greet`);
-#   - callers, a class-qualified call with the receiver gap made airtight
-#     (`Base.describe` - see that entry's own comment);
-#   - callers, a call through a method's own instance parameter
-#     (`Greeter.render`);
+#   - callers, a class-qualified call, plus the receiver calls pyright answers
+#     and the one it does not (`Base.describe`, semantic - see that entry's
+#     own comment, which is the sharpest one in this file);
+#   - callers, the same call spelling resolved to a subclass's override
+#     (`Deep.describe`, semantic - `Base.describe`'s exact control);
+#   - callers, a call through a method's own instance parameter, and one
+#     through a local typed only by inference (`Greeter.render`, semantic);
 #   - references (`Base`, which `[[callers]]` cannot reach at all - a base
 #     class and an import line are both usages, never calls);
 #   - references through the `__all__` chain for a *class* (`Greeter`);
 #   - implementations (`Base`, `class Sub(Base)` found by
-#     `find_implementations`);
+#     `find_implementations`) - deliberately still structural after GM-299,
+#     because pyright implements no `textDocument/implementation` at all;
 #   - imports (`pkg/sub/deep.py`, both of them relative);
 #   - definition, anchored on the module self-announcement node
 #     (`pkg.sub.deep`) - the node `crate::project`'s Decision 1 obliges this
@@ -93,43 +124,83 @@ file = "pkg/mod.py"
 # pass-through.
 expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
 
-# --- callers: a class-qualified call, with the receiver gap made airtight ----
+# --- callers: a class-qualified call, plus the receiver calls pyright answers
+#     and the one it does not (GM-299) --------------------------------------
 
 [[callers]]
 symbol = "Base.describe"
-# `describe` is called two ways in `pkg/mod.py`, and only one produces an
-# edge: `call_through_a_class`'s `Base.describe(obj)` is a class-qualified
-# path call, addressed by `qualifiedName` because container `pkg.base` could
-# hold many members merely *named* `describe`. `on_an_unknown_receiver`'s
-# `obj.describe()` is a receiver call on a parameter and is deliberately left
-# out of this expected set.
+tier = "semantic"
+# Through 3.4.0 this entry was the receiver gap's airtight *proof of absence*:
+# `describe` was called two ways in `pkg/mod.py` and only `call_through_a_class`'s
+# class-qualified `Base.describe(obj)` produced an edge, so the set was one
+# row and the other call's absence was the assertion. (Proven, not claimed:
+# `src/extractor/bodies.rs` was deliberately broken to give an unresolved
+# receiver the naive "let core sort it out" answer, and this entry failed with
+# exactly one extra row.)
 #
-# That omission is what makes this an assertion rather than an oversight: if a
-# receiver call ever started producing an edge, `on_an_unknown_receiver` would
-# appear in the *actual* set this check computes, the set would no longer
-# equal what is written here, and the check would fail on the unexpected extra
-# entry - not silently pass because nobody asked.
+# GM-299 turns it over, and the honest set is now **three rows and not four**,
+# which is what makes this the sharpest entry in the file:
 #
-# Proven, not just claimed. `src/extractor/bodies.rs` was deliberately broken
-# to give an unresolved receiver the naive "let core sort it out" answer - a
-# `name`-keyed placeholder for `describe` in a container this file imports -
-# and this entry failed with exactly one extra row,
-# `pkg/mod.py:on_an_unknown_receiver`. The break was then reverted and the
-# file checked byte-identical against its backup.
+#   - `pkg/mod.py:call_through_a_class` is the structural one, unchanged.
+#   - `pkg/callers.py:through_a_base_annotation` is `obj.describe()` where
+#     `obj: Base`. pyright reads the annotation; the structural tier records a
+#     receiver open site and no edge.
+#   - `pkg/mod.py:module_alias_is_bound` is `base_module.Base().describe()` -
+#     a receiver that is a *call result*, which nothing structural can type
+#     and which pyright types without being asked twice.
+#   - `pkg/mod.py:on_an_unknown_receiver` is `obj.describe()` where `obj` has
+#     **no annotation**, and it is absent *with pyright running*. That is the
+#     Python-specific half of this task's honesty requirement, asserted rather
+#     than merely written in the README: a `receiver_calls = "resolved"`
+#     manifest does not mean every receiver call resolves, it means the ones
+#     whose type a checker can infer do. pyright answers `null` here, the
+#     bridge records nothing (missing edge beats wrong edge), and this set
+#     stays at three. If that ever became four, the pass would have started
+#     guessing.
 #
 # `pkg/sub/deep.py:Deep.describe` *overrides* this method and does not call
-# it, so it must not appear either.
-expect = ["pkg/mod.py:call_through_a_class"]
+# it, so it must not appear either - and the call that reaches the override
+# is asserted separately, below, as the pair that makes both entries
+# measurements rather than one claim written twice.
+expect = [
+    "pkg/mod.py:call_through_a_class",
+    "pkg/mod.py:module_alias_is_bound",
+    "pkg/callers.py:through_a_base_annotation",
+]
 
-# --- callers: through a method's own instance parameter ----------------------
+# --- callers: the same call spelling, resolved to a SUBCLASS's override -----
+
+[[callers]]
+symbol = "Deep.describe"
+tier = "semantic"
+# `pkg/callers.py:through_a_subclass` writes `deep.describe()` where
+# `deep = Deep()`. Character for character the same shape as
+# `through_a_base_annotation` above; the only difference is the receiver's
+# type, which is precisely what only a semantic tier knows.
+#
+# The two entries are exact sets and are each other's control: a pass that
+# resolved every `describe()` to the base's declaration fails *here* on the
+# missing row, and a pass that resolved them all to the override fails
+# *above* on the missing rows. One of them passing alone would prove nothing.
+expect = ["pkg/callers.py:through_a_subclass"]
+
+# --- callers: through a method's own instance parameter, and through a local
+#     whose type comes from its initializer -----------------------------------
 
 [[callers]]
 symbol = "Greeter.render"
-# `Greeter.shout` calls `self.render()`. The plugin resolves it by reading the
-# method's **first parameter**, never by trusting the name `self` - see
-# `src/extractor/bodies.rs`, Decision 7. Nothing else calls `render`, so this
-# single row is the whole answer.
-expect = ["pkg/mod.py:Greeter.shout"]
+tier = "semantic"
+# `pkg/mod.py:Greeter.shout` calls `self.render()`, which the *structural*
+# tier resolves by reading the method's first parameter and never the name
+# `self` (`src/extractor/bodies.rs`, Decision 7). That half needs no
+# toolchain and is pinned where none is needed: `src/extractor/tests.rs`'s
+# `a_call_through_a_methods_first_parameter_resolves_to_that_class`.
+#
+# `pkg/callers.py:through_a_variable` is the semantic half: `greeter.render()`
+# where `greeter = Greeter(name)`. No annotation anywhere - the type comes
+# from the initializer, which is inference rather than declaration, and is
+# the most ordinary shape in Python code that has no type hints at all.
+expect = ["pkg/mod.py:Greeter.shout", "pkg/callers.py:through_a_variable"]
 
 # --- references: usages [[callers]] cannot reach at all ----------------------
 
@@ -162,7 +233,21 @@ file = "pkg/base.py"
 #     `Base.describe`, not to `Base`, and it is a `REFERENCES` edge rather
 #     than a `CALLS` one - which is why `pkg/gaps.py:gap_2_monkey_patching`
 #     appears in neither this set nor `Base.describe`'s caller set above.
+#   - `pkg/callers.py:` and `pkg/callers.py:through_a_base_annotation` are
+#     GM-299's: the `from pkg.base import Base` line, and the *annotation*
+#     `obj: Base`, which is an ordinary structural `REFERENCES` edge in both
+#     arms. The call inside that function is the semantic half and is
+#     asserted separately, under `Base.describe`.
+#
+# `pkg/dynamic.py` must **not** appear, and its absence is the fixture for
+# gap 4: `from pkg.base import *` is recorded as a container import and a `*`
+# re-export, never as a reference to any particular name, so nothing here
+# points at `Base` - not structurally, and not with pyright either, because
+# the bridge only ever asks about open sites and a bare star-imported name is
+# deliberately not one.
 expect = [
+    "pkg/callers.py:",
+    "pkg/callers.py:through_a_base_annotation",
     "pkg/gaps.py:",
     "pkg/mod.py:",
     "pkg/mod.py:Greeter",
@@ -186,7 +271,14 @@ file = "pkg/mod.py"
 #
 # `pkg/mod.py:call_through_a_class` is the same construction written in the
 # declaring file, resolved directly rather than through the chain.
+#
+# `pkg/callers.py:` and `pkg/callers.py:through_a_variable` are GM-299's, and
+# structural in both arms: an import line, and `Greeter(name)`, which is a
+# `REFERENCES` edge onto the class rather than a `CALLS` one for the same
+# reason `pkg/consumer.py:build`'s is.
 expect = [
+    "pkg/callers.py:",
+    "pkg/callers.py:through_a_variable",
     "pkg/consumer.py:",
     "pkg/consumer.py:build",
     "pkg/mod.py:call_through_a_class",
@@ -201,6 +293,20 @@ file = "pkg/base.py"
 # Both subclasses reach their base across a file boundary, one by an absolute
 # import and one by a relative one two levels up. `pkg/mod.pyi`'s `class
 # Greeter(Base)` is not a third implementor, because the stub emits nothing.
+#
+# Untagged, and that is a decision GM-299 had to make rather than inherit.
+# `plugins/rust`'s equivalent gains a cross-crate implementor from the
+# bridge's `textDocument/implementation` sweep; pyright answers that request
+# with `{"code":-32601,"message":"Unhandled method"}` and advertises no
+# `implementationProvider`, so the manifest's `implementation_kinds` is empty
+# and no sweep runs for Python at all. This set is therefore exactly the
+# structural one in both arms, and `find_implementations` on a Python class is
+# exactly as complete - and as incomplete - as it was in 3.4.0.
+#
+# `pkg/dynamic.py:Megaphone` is the case that would have needed the sweep:
+# `class Megaphone(Speaker)` where `Speaker` arrived through
+# `from pkg.base import *`. It is absent here and stays absent, which is the
+# honest report - see `plugins/python/README.md`.
 expect = ["pkg/mod.py:Greeter", "pkg/sub/deep.py:Deep"]
 
 # --- imports (get_dependencies, one hop, Outgoing): both relative ------------

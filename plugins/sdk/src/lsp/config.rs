@@ -54,6 +54,33 @@
 //! level, a server-specific switch. Nothing here removes a variable: a plugin
 //! that wants a scrubbed environment has a bigger question to answer than
 //! this file can.
+//!
+//! # Settings: `initializationOptions` is not the only channel, and for some
+//! servers it is not a channel at all (GM-299)
+//!
+//! GM-289 modelled "the server's own settings" as
+//! [`SemanticConfig::initialization_options`] alone, because that is how
+//! rust-analyzer takes them and the specification presents it as the place a
+//! client states what it wants. LSP has a second channel - the server *asks*,
+//! with a `workspace/configuration` request naming a section - and pyright
+//! uses only that one. Measured against pyright-langserver 1.1.414 on the
+//! Python plugin's own conformance fixture, same fixture and same settings
+//! value, one variable changed:
+//!
+//! ```text
+//! initializationOptions {"python":{"analysis":{"typeCheckingMode":"off"}}}
+//!   -> 4 diagnostics, severity 1     (the default "standard" run, unchanged)
+//! workspace/configuration reply {"analysis":{"typeCheckingMode":"off"}}
+//!   -> 1 diagnostic,  severity 2     (and the log line "Setting pythonPath…")
+//! ```
+//!
+//! So [`SemanticConfig::settings`] exists beside
+//! [`SemanticConfig::initialization_options`] rather than replacing it: the
+//! two are different mechanisms, servers differ in which they read, and a
+//! bridge that knows only one silently ships a server running on defaults.
+//! Neither is language-specific - `workspace/configuration` is a base-protocol
+//! method - so both live here, and a manifest states whichever its server
+//! actually reads.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -105,6 +132,22 @@ pub struct SemanticConfig {
     /// ordinary TOML table and it arrives as the JSON object the server
     /// expects.
     pub initialization_options: Option<serde_json::Value>,
+    /// What to answer a server's own `workspace/configuration` request with,
+    /// keyed by the `section` it asks for (`python`, `pyright`, `gopls`).
+    ///
+    /// The second settings channel, and for pyright the only one that works -
+    /// see this module's doc for the measurement. A section the server asks
+    /// for and this map does not hold is answered `null`, which is "no
+    /// configuration for that section" and is what every server handles; a
+    /// section this map holds and the server never asks for is simply never
+    /// sent. Empty - the default - is exactly the behaviour before this
+    /// existed.
+    ///
+    /// A plugin may add to it at run time, which is the point of it being a
+    /// public field: a setting like pyright's `python.pythonPath` names a
+    /// path inside the project being indexed, and a manifest shipped beside
+    /// the plugin binary cannot know that path.
+    pub settings: BTreeMap<String, serde_json::Value>,
 }
 
 impl SemanticConfig {
@@ -123,6 +166,7 @@ impl SemanticConfig {
             engine,
             implementation_kinds: Vec::new(),
             initialization_options: None,
+            settings: BTreeMap::new(),
         }
     }
 
@@ -173,6 +217,19 @@ impl SemanticConfig {
         }
         config.implementation_kinds = semantic.implementation_kinds;
         config.initialization_options = semantic.initialization_options.map(to_json);
+        // A `settings` that is not a table is the manifest saying something
+        // this reader cannot act on, and the rule for a present-and-broken
+        // section is the same one `command` follows: report it rather than
+        // silently shipping a server on defaults.
+        if let Some(settings) = semantic.settings {
+            let toml::Value::Table(table) = settings else {
+                anyhow::bail!(
+                    "{}: [plugin.semantic] settings must be a table of LSP sections",
+                    path.display()
+                )
+            };
+            config.settings = table.into_iter().map(|(section, value)| (section, to_json(value))).collect();
+        }
         Ok(Some(config))
     }
 }
@@ -245,6 +302,8 @@ struct RawSemantic {
     implementation_kinds: Vec<String>,
     #[serde(default)]
     initialization_options: Option<toml::Value>,
+    #[serde(default)]
+    settings: Option<toml::Value>,
 }
 
 #[cfg(test)]
@@ -285,6 +344,7 @@ mod tests {
         assert!(config.env.is_empty());
         assert!(config.implementation_kinds.is_empty());
         assert_eq!(config.initialization_options, None);
+        assert!(config.settings.is_empty(), "no settings is the pre-GM-299 behaviour: answer null");
     }
 
     #[test]
@@ -301,7 +361,11 @@ mod tests {
                  [plugin.semantic.initialization_options]\n\
                  priming = true\n\
                  depth = 3\n\
-                 roots = [\"a\", \"b\"]\n",
+                 roots = [\"a\", \"b\"]\n\n\
+                 [plugin.semantic.settings.toy]\n\
+                 mode = \"basic\"\n\n\
+                 [plugin.semantic.settings.toy.analysis]\n\
+                 depth = 1\n",
             ),
         )
         .unwrap()
@@ -317,6 +381,22 @@ mod tests {
             config.initialization_options,
             Some(serde_json::json!({ "priming": true, "depth": 3, "roots": ["a", "b"] }))
         );
+        // Keyed by the section a server asks `workspace/configuration` for,
+        // with whatever nesting that section's own schema has below it.
+        assert_eq!(config.settings.keys().collect::<Vec<_>>(), vec!["toy"]);
+        assert_eq!(
+            config.settings["toy"],
+            serde_json::json!({ "mode": "basic", "analysis": { "depth": 1 } })
+        );
+    }
+
+    /// `settings` that is not a table of sections is a manifest this reader
+    /// cannot act on - reported, never shipped as "the server runs on
+    /// defaults".
+    #[test]
+    fn settings_that_are_not_a_table_of_sections_are_reported() {
+        let manifest = "[plugin.semantic]\ncommand = \"toy-server\"\nsettings = \"python\"\n";
+        assert!(read("scalar-settings", Some(manifest)).is_err());
     }
 
     /// A section that is present and broken is an error, not a silent "no

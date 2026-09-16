@@ -739,6 +739,7 @@ dependencies = [
  "g-mesh-plugin-sdk",
  "g-mesh-wire",
  "serde",
+ "serde_json",
  "toml",
  "tree-sitter",
  "tree-sitter-python",

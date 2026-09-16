@@ -25,6 +25,13 @@ g-mesh-wire = { path = "../../wire" }
 # one already vetted.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+# The semantic tier's settings (GM-299). `SemanticConfig::settings` is a map of
+# LSP section to `serde_json::Value`, because that is what goes on the wire to
+# the server, so a plugin that puts `python.pythonPath` there needs the type.
+# Already in this workspace's graph twice over - `g-mesh-plugin-sdk` depends on
+# it for the protocol itself, and `tree-sitter` below pulls it in as well - so
+# this adds a user rather than a crate.
+serde_json = "1"
 # The structural tier's parser (GM-296). tree-sitter rather than Python's own
 # `ast` module or a hand-written parser, for the reason the design doc gives
 # for every plugin on this SDK: an error-tolerant parser is the requirement
