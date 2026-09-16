@@ -35,4 +35,4 @@
 # is exactly the ambiguity this layout is meant to remove.
 [workspace]
 resolver = "2"
-members = ["core", "plugins/sdk", "wire"]
+members = ["core", "plugins/rust", "plugins/sdk", "wire"]
