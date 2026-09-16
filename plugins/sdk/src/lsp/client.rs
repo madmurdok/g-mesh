@@ -106,9 +106,20 @@ pub(crate) struct LspClient {
     /// which is the difference between "there is no definition there" and
     /// "ask again when it has finished loading".
     active_progress: BTreeMap<String, ()>,
-    /// Whether any progress has ever begun. A server that reports none is not
-    /// penalised for it - see [`super::bridge`]'s readiness rules.
-    progress_begun: bool,
+    /// Since when [`active_progress`](LspClient::active_progress) has been
+    /// empty, or `None` while something is in flight.
+    ///
+    /// This, rather than "is it empty right now", is what readiness is
+    /// measured against - see [`super::bridge::LspBridge`]'s readiness rules
+    /// and the rust-analyzer trace that made the difference load-bearing. It
+    /// starts at the client's own birth so that a server which never reports
+    /// progress becomes quiet purely by the clock.
+    idle_since: Option<Instant>,
+    /// Whether this server has already been quiet for a full settle once -
+    /// see [`LspClient::settle`]. It lives here rather than on the bridge
+    /// because it is a fact about *this* server: the next one starts up all
+    /// over again, and a flag that dies with the client cannot be left stale.
+    settled: bool,
     /// Set once the server's stdout has closed, so a caller that polls again
     /// after a crash is told the same thing rather than blocking.
     closed: bool,
@@ -168,7 +179,8 @@ impl LspClient {
             next_id: 1,
             encoding: PositionEncoding::Utf16,
             active_progress: BTreeMap::new(),
-            progress_begun: false,
+            idle_since: Some(Instant::now()),
+            settled: false,
             closed: false,
         };
         client.initialize(config, root, deadline)?;
@@ -221,15 +233,32 @@ impl LspClient {
         self.encoding
     }
 
-    /// Whether the server has told us it is busy - a work-done progress that
-    /// began and has not ended.
-    pub(crate) fn busy(&self) -> bool {
-        !self.active_progress.is_empty()
+    /// Whether the server has reported nothing in flight for at least
+    /// `quiet` - which is what "this server has stopped working" means for a
+    /// server that reports its work in a *sequence* of tokens rather than in
+    /// one.
+    ///
+    /// `Duration::ZERO` asks only "is anything in flight right now", which is
+    /// the right question once a server has already shown, once, that it has
+    /// finished starting up.
+    pub(crate) fn quiet_for(&self, quiet: Duration) -> bool {
+        self.idle_since.is_some_and(|since| since.elapsed() >= quiet)
     }
 
-    /// Whether the server has ever reported progress at all.
-    pub(crate) fn progress_begun(&self) -> bool {
-        self.progress_begun
+    /// Whether this server is ready to be believed, latching the first time
+    /// it is.
+    ///
+    /// The first answer costs a full `quiet` period of silence; every answer
+    /// after that costs only "nothing is in flight right now". A server
+    /// proves what shape it is once - see [`super::bridge::LspBridge`]'s doc
+    /// on readiness - and a per-file pass that follows an edit must not pay
+    /// for that proof again.
+    pub(crate) fn settle(&mut self, quiet: Duration) -> bool {
+        if self.settled {
+            return self.quiet_for(Duration::ZERO);
+        }
+        self.settled = self.quiet_for(quiet);
+        self.settled
     }
 
     /// Whether this server is gone.
@@ -357,6 +386,10 @@ impl LspClient {
     /// clears it - servers do send those, and a token stuck "active" forever
     /// would make this client believe a ready server is busy for the rest of
     /// its life.
+    ///
+    /// Every `begin` also clears [`idle_since`](LspClient::idle_since), and
+    /// the `end` that empties the set starts it again, so the quiet *period*
+    /// - not the instantaneous emptiness of the set - is what a caller reads.
     fn track_progress(&mut self, params: Option<&Value>) {
         let Some(params) = params else { return };
         let Some(token) = params.get("token") else { return };
@@ -366,12 +399,14 @@ impl LspClient {
         };
         match params.get("value").and_then(|value| value.get("kind")).and_then(Value::as_str) {
             Some("begin") => {
-                self.progress_begun = true;
                 self.active_progress.insert(token, ());
+                self.idle_since = None;
             }
             Some("end") => {
-                self.progress_begun = true;
                 self.active_progress.remove(&token);
+                if self.active_progress.is_empty() {
+                    self.idle_since = Some(Instant::now());
+                }
             }
             _ => {}
         }

@@ -17,6 +17,9 @@
 //! ```json
 //! {
 //!   "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 40 },
+//!   "//": "or a sequence, which is what a real server's startup looks like:",
+//!   "//readiness": { "phases": [{ "token": "fetch", "holdMs": 40 },
+//!                               { "token": "index", "beginAfterMs": 20, "holdMs": 40 }] },
 //!   "positionEncoding": "utf-16",
 //!   "answers": [
 //!     { "uri": "…/b.toy", "line": 1, "character": 3,
@@ -103,6 +106,30 @@ struct Readiness {
     begin_after_ms: u64,
     #[serde(default)]
     end_after_ms: u64,
+    /// A *sequence* of work-done tokens, each begun after the previous one
+    /// ended - what a real rust-analyzer's startup looks like (`Fetching`,
+    /// then `Building CrateGraph`, then `Roots Scanned`, …) and the shape
+    /// that makes "no progress is in flight" a false reading of "the server
+    /// has finished". When this is non-empty it replaces the single token
+    /// above, and the server counts itself indexing until the last phase
+    /// ends - so the gaps *between* phases are answerable-looking moments
+    /// where the honest answer is still nothing.
+    #[serde(default)]
+    phases: Vec<Phase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Phase {
+    /// The token, so that a client tracking them by name sees genuinely
+    /// different ones rather than one token restarted.
+    token: String,
+    /// How long after the previous phase ended this one begins - the gap.
+    #[serde(default)]
+    begin_after_ms: u64,
+    /// How long this phase runs before it ends.
+    #[serde(default)]
+    hold_ms: u64,
 }
 
 /// A second burst of indexing, begun while the client is mid-pass - what a
@@ -282,6 +309,29 @@ fn start_progress(script: &Script, indexing: Arc<AtomicBool>) {
         return;
     }
     indexing.store(true, Ordering::SeqCst);
+    if !readiness.phases.is_empty() {
+        std::thread::spawn(move || {
+            let mut stdout = std::io::stdout();
+            for phase in &readiness.phases {
+                std::thread::sleep(Duration::from_millis(phase.begin_after_ms));
+                notify(
+                    &mut stdout,
+                    "$/progress",
+                    json!({ "token": phase.token, "value": { "kind": "begin", "title": phase.token } }),
+                );
+                std::thread::sleep(Duration::from_millis(phase.hold_ms));
+                notify(
+                    &mut stdout,
+                    "$/progress",
+                    json!({ "token": phase.token, "value": { "kind": "end" } }),
+                );
+            }
+            // Only now: the gaps between phases are not readiness, which is
+            // the whole point of this shape.
+            indexing.store(false, Ordering::SeqCst);
+        });
+        return;
+    }
     std::thread::spawn(move || {
         let mut stdout = std::io::stdout();
         std::thread::sleep(Duration::from_millis(readiness.begin_after_ms));
