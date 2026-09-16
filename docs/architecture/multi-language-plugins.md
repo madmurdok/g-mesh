@@ -1700,6 +1700,81 @@ later change does not have to re-derive them:
    clear, under the same singleton-lock guarantee) and `cli::stop`'s own
    state-file cleanup (once the core is confirmed not listening).
 
+#### Implementation notes (GM-291)
+
+Two things this task settled from measurement, not from re-reading GM-290's
+or GM-274's own notes and assuming they still held once a real rust-analyzer
+was pointed at both mechanisms together.
+
+**1. The 3.2.0 -> 3.3.0 `expect.toml` diff is not *quite* "exactly the
+semantic cases".** Fourteen of the fifteen changed/added rows are
+`tier = "semantic"`, or fixture-only comment additions. One is not:
+`[[references]] file = "crates/alpha/src/shapes.rs"` (untagged, i.e.
+structural) gained `shapes::total_dyn` to its expected set. The cause is not
+a change in structural resolution - it is that GM-290 added `total_dyn`
+(a function taking `&dyn Shape`) to the fixture *as fixture material the new
+semantic cases needed*, and a `&dyn Shape` parameter is an ordinary same-file
+type reference the structural tier has always resolved on its own. Proof
+this is exactly that and nothing more: `tests/conformance.rs`'s own
+`without_a_semantic_tier_the_structural_expectations_still_hold` runs the
+*3.2.0 manifest* (no semantic tier at all) against the *current* fixture and
+this exact row still passes - the structural tier's own behavior did not
+move, only the fixture it is being asked about grew a new symbol. So the
+criterion holds in the sense that matters (no structural *resolution*
+changed) but not in the most literal sense (one non-semantic row's expected
+*text* did change) - recorded here because "exactly the semantic cases" is
+the kind of claim that is worth being precise about rather than rounding up.
+
+**2. `PluginSupervisor::semantic_pass` and `PluginSupervisor::check_memory_limit`
+share one mutex, and that mutex is held for the pass's entire round trip - not
+just to dispatch it.** `check_memory_limit` cannot sample *during* the pass
+that is inflating memory; it can only run before that pass starts or after it
+returns. That matters for this section's own "language_state.semanticPassAt
+is left as it was: if the pass never completed, the receiver gap stays
+listed... and not one moment longer" - the sentence is true as written, but
+"the pass never completed" turns out to be the *less* common outcome for the
+exact scenario `memoryLimitMb` exists to catch: a language's first cold pass
+tripping the very limit its own memory growth crosses. `daemon::semantic
+::run_with_registry`/`run_once` record `language_state.semanticPassAt`
+immediately after `semantic_pass` returns `Ok(true)` - same thread, no yield
+point - while `check_memory_limit`, even if it was already blocked on the
+same lock before the pass began, needs an OS wakeup plus a whole-system
+`sysinfo::refresh_processes` call before it can even measure RSS. Raced with
+real threads over a real rust-analyzer three times, at load averages from
+~15 to ~78 (`core/tests/plugin_memory_limit.rs`): the pass returned at
+13.3s/16.9s/17.3s of wall time and `check_memory_limit` returned 0.412s-0.417s
+later every single time (13.7s/17.3s/17.7s), and `semanticPassAt` was already
+set every time by the time `check_memory_limit` finished. So suspension
+cannot preempt the request that causes it - it only ever catches the *plateau* it leaves
+behind, on whatever the next `check_memory_limit` call after that plateau
+forms happens to be. This is not a defect this task fixes (no code in
+`daemon::lifecycle` changed): it is a previously-unmeasured consequence of
+GM-274's own design worth recording plainly, since the section above reads
+as a stronger guarantee than the mechanism actually gives for a language's
+*first* pass. The test suite built for GM-291 does not assert a fixed winner
+of this race (that would be flaky); it reads which side won and asserts the
+generated instructions are correct for that outcome either way.
+
+**3. The open question - does the sampling interval catch the spike before
+it is gone again - has a cleaner answer than "compare interval to spike
+duration" once the plateau is actually measured.** Sampled at high frequency
+against a real `g-mesh daemon` over GM-290's own fixture: rust-analyzer's RSS
+rises gradually (never more than roughly 65MB between two samples 0.4-1s
+apart, even under load 120-160) to a plateau of 563-580MB, and then *holds
+there* - flat for 19+ seconds of continued sampling after the pass completed,
+never falling back down. So this is not a transient spike a short interval
+might catch and a long one might miss; it is a sustained step function. Any
+sampling interval shorter than the plateau's own lifetime (which, absent
+something else putting the plugin to sleep first, is indefinite - nothing
+about rust-analyzer's own behavior ever releases that memory back) will
+eventually observe it, including the production default (a flat 30s tick at
+`idleTimeoutMinutes = 60`, confirmed catching it within one to two ticks in
+`core/tests/plugin_memory_limit.rs`'s own real-daemon test). The genuine
+limit on "catches it before it's gone" is not the tick period at all - it is
+finding a moment where `check_memory_limit` can actually acquire
+`PluginSupervisor::inner` (note 2, above), which for a *sustained* plateau it
+eventually always can.
+
 ## Data Flow
 
 ### Cold start in a mixed Go + Rust repo
