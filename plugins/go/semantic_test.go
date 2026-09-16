@@ -309,6 +309,54 @@ func TestSemanticPassPerFileAnswersOnlyThatFile(t *testing.T) {
 	}
 }
 
+// An edge this process emitted for a file, and did not produce again when
+// that file was re-checked, is retracted by id - otherwise a long-lived
+// daemon accumulates semantic edges out of declarations that have moved.
+// Nothing else deletes them: the structural `fileChanged` diff only ever
+// deletes edges it emitted itself, and it never emitted these.
+func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
+	requireGoToolchain(t)
+	root := writeProbeProject(t)
+
+	state := newPluginState(root)
+	before := state.handleSemanticPass(nil)
+
+	var dotCall string
+	for _, edge := range before.UpsertEdges {
+		for _, node := range before.UpsertNodes {
+			if node.ID == edge.ToID && node.Target.Scope.Container == "example.com/probe/dotted" {
+				dotCall = edge.ID
+			}
+		}
+	}
+	if dotCall == "" {
+		t.Fatal("the first pass did not emit the dot-imported call this test retracts")
+	}
+
+	// The dot import and the call it made possible are gone; the package
+	// still compiles, so this is a re-check with a real answer, not a load
+	// failure that would have answered empty for a different reason.
+	rewritten := "package probe\n\nfunc dotImported() string {\n\treturn \"dot\"\n}\n"
+	if err := os.WriteFile(filepath.Join(canonicalizeProjectRoot(root), "dotuse.go"), []byte(rewritten), 0o644); err != nil {
+		t.Fatalf("rewrite dotuse.go: %v", err)
+	}
+
+	after := state.handleSemanticPass([]string{"dotuse.go"})
+	retracted := false
+	for _, id := range after.DeleteEdgeIds {
+		if id == dotCall {
+			retracted = true
+		}
+	}
+	if !retracted {
+		t.Fatalf("the re-check did not retract the edge it no longer produces; deletes were %v",
+			after.DeleteEdgeIds)
+	}
+	if len(after.UpsertEdges) != 0 {
+		t.Fatalf("the re-checked file should produce no semantic edge at all now, got %+v", after.UpsertEdges)
+	}
+}
+
 // The design doc's "Semantic engine missing" failure mode: no `go` binary,
 // one log line, an empty diff, and a structural graph that is completely
 // untouched.
