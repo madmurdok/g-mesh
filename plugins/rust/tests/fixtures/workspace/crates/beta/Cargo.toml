@@ -1,0 +1,7 @@
+# A dashed package name, to exercise crate-name normalization (`-` -> `_`,
+# container key `beta_crate`) in the same fixture that proves the workspace
+# resolves two member crates.
+[package]
+name = "beta-crate"
+version = "0.1.0"
+edition = "2021"

@@ -732,6 +732,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-plugin-rust"
+version = "3.2.0"
+dependencies = [
+ "anyhow",
+ "g-mesh-plugin-sdk",
+ "g-mesh-wire",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "g-mesh-plugin-sdk"
 version = "3.2.0"
 dependencies = [

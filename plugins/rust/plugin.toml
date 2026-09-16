@@ -1,0 +1,50 @@
+# Bundled Rust plugin manifest. See docs/architecture/multi-language-plugins.md
+# ("Interfaces > `plugin.toml` additions") for the schema this file follows,
+# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# rules it must satisfy. `language` must equal this directory's own name
+# ("rust"), the same rule plugins/typescript's manifest documents.
+#
+# `command` is a dev-time path into the workspace's own `target/` (relative to
+# this manifest's directory, `plugins/rust/`), not a packaged layout - this
+# task (GM-285) builds the project model only, and where a released binary
+# actually lives is the release-matrix task's decision (the design doc's
+# Rust plugin section: "a cargo binary in the same workspace as core, built
+# by the existing native release matrix"). `g-mesh plugins check plugins/rust
+# --fixture <dir>` run from the repository root, after `cargo build -p
+# g-mesh-plugin-rust`, is what this path is for today.
+
+[plugin]
+language = "rust"
+protocol_version = 2
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "../../target/debug/g-mesh-plugin-rust"
+
+[plugin.languages]
+extensions = [".rs"]
+
+[plugin.capabilities]
+# No semantic tier yet (GM-285 is the project model; GM-286 is the
+# tree-sitter extractor; rust-analyzer over the SDK's LspBridge is R4 in the
+# design doc's Rollout table). `false` means core never sends `semanticPass`
+# and never requires an answer to one.
+semantic_pass = false
+# Receiver calls (`x.m()`) are an open site with no structural answer - the
+# design doc's Rust plugin section lists this as a documented structural gap,
+# and it stays "unresolved" in both fields until the semantic release lands.
+receiver_calls = "unresolved"
+receiver_calls_structural = "unresolved"
+
+[plugin.workspace]
+# A workspace's own Cargo.toml, or a crate's: either can move crate roots or
+# the module tree (members/exclude, [lib]/[[bin]] paths), so either must
+# trigger the per-language reindex this plugin answers with a fresh
+# `load_project` (see `ProjectContext::reload` / `Extractor::load_project`).
+watch_files = ["Cargo.toml"]
+# cargo's own build output - never source, and excluded from the walk the
+# same way `node_modules`/`dist` are for TypeScript.
+exclude_dirs = ["target"]
+# A miss-path lookup's container-entry-point names: `lib.rs`/`main.rs` are a
+# crate's own root file, `mod.rs` is a directory-module's.
+entry_points = ["lib.rs", "main.rs", "mod.rs"]

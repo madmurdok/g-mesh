@@ -1,0 +1,33 @@
+[package]
+name = "g-mesh-plugin-rust"
+version = "3.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "g-mesh's Rust language plugin: Cargo.toml/workspace/module-tree project model (GM-285), tree-sitter extraction (GM-286)"
+
+[lib]
+name = "g_mesh_plugin_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "g-mesh-plugin-rust"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-wire = { path = "../../wire" }
+# `Cargo.toml` parsing for the project model (`project::cargo_manifest`) -
+# crate roots and workspace membership, read as data, never by invoking
+# `cargo` itself. Already a dependency of `g-mesh-plugin-sdk` (for its own
+# `plugin.toml`), so this adds no new crate to the workspace's dependency
+# graph, only a second user of one already vetted.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# `tests/workspace_changed.rs` drives the plugin's control-plane wire
+# directly (hand-rolled `Content-Length` framing, no SDK-published client
+# harness - see that test's own module doc) and needs to build/read the JSON
+# frames it sends and receives.
+serde_json = "1"

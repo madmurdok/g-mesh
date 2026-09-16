@@ -1,0 +1,7 @@
+# A small fixture workspace for `plugins/rust`'s own tests: two member
+# crates (`alpha`, `beta-crate`), exercising the project model's workspace
+# membership resolution - see `crates/alpha/src/lib.rs` for the module-tree
+# shapes (a `#[path]` module, a nested `mod.rs`, an inline module and an
+# orphan file) this fixture is really here to prove.
+[workspace]
+members = ["crates/alpha", "crates/beta"]
