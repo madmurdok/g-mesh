@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestRunBulkIndexEmitsOneNodePerGoFile(t *testing.T) {
+func TestRunBulkIndexEmitsEveryGoFilesGraph(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "main.go", "package main\n\nfunc main() {}\n")
 	writeFile(t, root, "internal/util.go", "package internal\n")
@@ -18,23 +18,37 @@ func TestRunBulkIndexEmitsOneNodePerGoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runBulkIndex failed: %v", err)
 	}
-	if summary.filesProcessed != 2 || summary.nodesEmitted != 2 {
-		t.Fatalf("summary = %+v, want 2 files and 2 nodes (vendor/ excluded)", summary)
+	// main.go: a File node plus `main`, and the DEFINES edge between them
+	// (`main` is not capitalized, so there is no EXPORTS edge).
+	// internal/util.go: a File node and nothing else. vendor/ is excluded.
+	if summary.filesProcessed != 2 || summary.nodesEmitted != 3 || summary.edgesEmitted != 1 {
+		t.Fatalf("summary = %+v, want 2 files, 3 nodes, 1 edge (vendor/ excluded)", summary)
 	}
 
 	scanner := bufio.NewScanner(&out)
 	seenPaths := map[string]bool{}
+	kinds := map[string]int{}
 	for scanner.Scan() {
+		var record map[string]json.RawMessage
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			t.Fatalf("emitted line did not parse as JSON: %v\nline: %s", err, scanner.Text())
+		}
+		if _, isEdge := record["fromId"]; isEdge {
+			var edge wireEdge
+			if err := json.Unmarshal(scanner.Bytes(), &edge); err != nil {
+				t.Fatalf("edge line did not parse as a wireEdge: %v", err)
+			}
+			kinds["edge:"+edge.Kind]++
+			continue
+		}
 		var node wireNode
 		if err := json.Unmarshal(scanner.Bytes(), &node); err != nil {
-			t.Fatalf("emitted line did not parse as a wireNode: %v\nline: %s", err, scanner.Text())
-		}
-		if node.Kind != "File" {
-			t.Errorf("kind = %q, want File", node.Kind)
+			t.Fatalf("node line did not parse as a wireNode: %v\nline: %s", err, scanner.Text())
 		}
 		if node.ID == "" {
 			t.Error("node has no id")
 		}
+		kinds["node:"+node.Kind]++
 		seenPaths[node.FilePath] = true
 	}
 	if err := scanner.Err(); err != nil {
@@ -42,6 +56,9 @@ func TestRunBulkIndexEmitsOneNodePerGoFile(t *testing.T) {
 	}
 	if !seenPaths["main.go"] || !seenPaths["internal/util.go"] {
 		t.Fatalf("seenPaths = %v, want main.go and internal/util.go", seenPaths)
+	}
+	if kinds["node:File"] != 2 || kinds["node:Function"] != 1 || kinds["edge:DEFINES"] != 1 {
+		t.Fatalf("kinds = %v, want 2 File nodes, 1 Function node and 1 DEFINES edge", kinds)
 	}
 }
 
@@ -61,19 +78,26 @@ func TestRunBulkIndexIsIDStableAcrossRepeatedRuns(t *testing.T) {
 		var ids []string
 		scanner := bufio.NewScanner(&out)
 		for scanner.Scan() {
-			var node wireNode
-			if err := json.Unmarshal(scanner.Bytes(), &node); err != nil {
+			// Every record, node and edge alike, carries an `id` - and both
+			// have to be stable, since core keys upserts and deletes on
+			// them either way.
+			var record struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
 				t.Fatalf("bad line: %v", err)
 			}
-			ids = append(ids, node.ID)
+			ids = append(ids, record.ID)
 		}
 		return ids
 	}
 
 	first := ids()
 	second := ids()
-	if len(first) != 2 || len(second) != 2 {
-		t.Fatalf("expected 2 nodes per run, got %d and %d", len(first), len(second))
+	// a.go: one File node. b/b.go: a File node, `F`, and the DEFINES and
+	// EXPORTS edges from the one to the other - five lines in all.
+	if len(first) != 5 || len(second) != 5 {
+		t.Fatalf("expected 5 records per run, got %d and %d", len(first), len(second))
 	}
 	for i := range first {
 		if first[i] != second[i] {

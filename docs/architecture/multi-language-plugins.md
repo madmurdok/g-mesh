@@ -743,6 +743,141 @@ GM-281 do not have to re-derive them:
    regardless of extension), but a release archive should not depend on that
    fallback when naming the file correctly costs one generated manifest.
 
+#### Implementation notes (GM-280)
+
+GM-280 replaced the scaffold's File-node-only extractor with the real
+`go/parser` structural tier: declarations, containers, visibility,
+`DEFINES`/`EXPORTS`, the three placeholder shapes, open sites and an
+id-keyed incremental diff. `go/types` semantics stay GM-281's; the semantic
+pass still answers every request with an empty diff. Eight decisions this
+task had to settle rather than infer, recorded here so GM-281/GM-282 do not
+have to re-derive them:
+
+1. **Local scope is tracked by the walk itself, never read off the AST.**
+   `go/ast`'s `Object`/`Scope` fields look like they answer "is this name
+   local", and they are both deprecated *and* wrong for this: the parser
+   resolves names with no type information, and under `AllErrors` whatever
+   it managed is partial in a way nothing flags. So `plugins/go/scope.go`
+   builds the chain from the declarations the walk actually sees, which
+   behaves identically on a complete and on a partial AST. A name the chain
+   binds is dropped without ever asking what it is bound to - parameters,
+   named results, receivers, type parameters, `:=`, local `var`/`const`/
+   `type`, closure parameters, `if`/`for`/`switch`/`select` init bindings,
+   type-switch bindings and range variables. Statements are walked in
+   source order and a name is bound at the point it is declared, so
+   `helper := helper()` still reads the package-level `helper` on the
+   right. Labels are not tracked at all but *skipped* (a `LabeledStmt`'s
+   label and a `BranchStmt`'s label are never visited), which is exact
+   rather than approximate: a label lives in its own namespace and can
+   never denote a package symbol. Ambiguity resolves the same way
+   everywhere in this tier - toward the missing edge. The two places it
+   bites are a composite-literal key that is a bare identifier (a struct
+   field name and a map key are the same syntax, so it is skipped; a key
+   that is not a bare identifier is unambiguous and is walked) and a
+   selection through a value, which becomes an open site.
+2. **Dot, blank and aliased imports, each decided.** An **alias** binds the
+   alias and changes nothing else. A **blank** import binds nothing and
+   still gets its placeholder and `IMPORTS` edge - the dependency is the
+   only thing such an import states, and `get_dependencies` would be wrong
+   to omit it. A **dot** import binds every exported name of another
+   package into this file invisibly, and the set of those names is exactly
+   what a structural tier cannot see; so a file containing one emits **no
+   own-container placeholders at all**, keeping only what stays exact
+   (direct same-file hits, which are lexical, and qualified `pkg.F()` uses
+   through other imports, which name their container). Guessing the other
+   way would produce a wrong edge every time the name really came from the
+   dot import and the own package happened to declare one too. The name an
+   unaliased import binds is guessed from the path's last segment, with
+   major-version suffixes handled (`.../v2`, `gopkg.in/yaml.v2`); a wrong
+   guess degrades to an open site, never to a wrong edge.
+3. **Method sets are not modelled, only declarations.** `func (s *Server)
+   Close()` and `func (s Server) Close()` both become `Server.Close` with
+   `nativeKind = "method"` and the receiver kind in the printed signature;
+   Go forbids declaring both, so the normalization can never merge two
+   distinct declarations. A generic receiver normalizes the same way
+   (`*Stack[T]` → `Stack`). An interface method is `I.M`,
+   `nativeKind = "interface_method"` - a *declaration*, never an
+   implementation claim. **Struct embedding promotes methods, and nothing
+   structural says so**: an embedded field is walked as an ordinary type
+   reference and no promoted method is invented. Interface satisfaction is
+   the same case: Go's interfaces are structural, so no `SUPERTYPE_OF`
+   edge exists at this tier at all, including for the `var _ I = (*T)(nil)`
+   idiom, which does state it syntactically but is one spelling among
+   several. Both belong to GM-281's `types.Implements` / method-set pass.
+4. **`containerParent` is always absent, and core is fine with it.** Go
+   packages are flat (this doc's own Logical containers table). A container
+   with no parent yields an empty `parent_chain`, which makes Go's
+   `container(pkg)` visibility exactly "the same package and nothing else"
+   - exactly Go's own rule for an unexported name. GM-265's gap rule
+   (an ancestor with no members truncates the chain) cannot bite here,
+   because Go has no way to produce an intermediate container at all. This
+   was verified rather than assumed: the fixture declares `helper`,
+   unexported, in two different packages, and `plugins/go/conformance/
+   expect.toml` asserts each one's caller set is exactly its own package's.
+5. **`package main`, two packages in one directory, and generated files.**
+   `main` is *not* special: it gets the ordinary directory-derived import
+   path (`github.com/example/app/cmd`), which is what `go list` calls it
+   too, so two `main` packages in one repository get two containers instead
+   of colliding on the name. An external test package (`package x_test`) is
+   Go's one legal two-packages-in-one-directory case and gets
+   `<import path>_test`, keyed off the *package clause* rather than the file
+   name (Go reserves that suffix for external test packages); an *internal*
+   test file is an ordinary member of the package it tests, which is what
+   lets it reach unexported symbols. Two packages in one directory that are
+   not a test pair is illegal Go but reachable on disk, and both land in the
+   same container key - the same answer `go list` gives before it reports
+   the error, with a bounded consequence (a name declared in both becomes
+   ambiguous and core refuses to link it). **Generated files are indexed
+   like any other**: they are real, compiled, callable code, and dropping
+   them would make `find_callers` silently incomplete for everything they
+   call. Whether one is *interesting* is a query's question, and a
+   repository that considers generated output not-source already says so in
+   `.gitignore`, which the walk honours.
+6. **`init` is kept, and disambiguated in `nativeKind`.** A package may have
+   any number of `func init()`, and so may one file, so they collide on
+   qualifiedName and therefore on node id. Skipping them was rejected: an
+   `init` body is ordinary code making ordinary calls, and with no node to
+   hang them on every one of those calls would lose its caller. So the first
+   `init` of a file is `nativeKind = "init"`, the second `"init#1"`, and so
+   on in source order - `nativeKind` participates in the node id, so the ids
+   are distinct and stable as long as the order of a file's inits is (adding
+   one at the end changes nothing about the ones before it). Two inits in
+   one file share a qualifiedName and are therefore ambiguous to any name
+   lookup, which is correct: nothing in Go can name an `init` to call it.
+7. **Build constraints are indexed, every alternative.** `//go:build` and
+   `_windows.go` change nothing structurally - a node id carries the file
+   path, so `sys_windows.go`'s and `sys_linux.go`'s `Platform` are two
+   distinct nodes that never collapse. GM-281's `go/packages` pass only ever
+   type-checks the host `GOOS`/`GOARCH`, so files excluded by the host's
+   constraints keep this structural graph and receive no semantic upgrade -
+   this doc's "Go build constraints" failure mode, documented rather than
+   hidden.
+8. **The workspace model is parsed by hand, and `workspaceChanged` now has
+   real work.** `plugins/go/workspace.go` reads every `go.mod` in the tree
+   plus `go.work`'s `use` directives, and takes the union: a `go.work` is not
+   required for a multi-module repository (nested `go.mod` files alone make
+   one), and a workspace may name a directory the walk would skip. A
+   directory belongs to the *innermost* module containing it, so a nested
+   module owns its own subtree. `golang.org/x/mod/modfile` was rejected to
+   keep `plugins/go/go.mod` at zero requirements (GM-279's decision 3, same
+   trade-off), and `go list -m` was rejected because it would make the
+   *structural* tier depend on a toolchain, which this doc's Constraints
+   forbid. With no `go.mod` anywhere the container key falls back to the
+   project-relative directory, which still links same-package uses across
+   one directory's files and can never match an import specifier - the right
+   failure, since a directory with no module is not importable in Go either.
+   `workspaceChanged` reloads that model and drops the whole per-file cache,
+   because a cached graph carries the old container keys inside its nodes.
+
+Two things GM-280 deliberately left to its successors. The **open sites**
+(`x.M()` receiver calls and value field accesses) are collected per file in
+plugin memory with the position, the selected name and the enclosing
+symbol/caller ids, and never sent to core - GM-281 consumes them.
+`plugins/go/conformance/expect.toml` is **minimal on purpose**: GM-282 owns
+the full Go expectations file, and the entries there now exist only to prove
+GM-280's own end-to-end claim (that a container-scoped placeholder is an
+address core resolves) with a comparison that was shown capable of failing.
+
 ### Rust plugin (`plugins/rust`, on the SDK)
 
 - **Structure:** tree-sitter-rust.

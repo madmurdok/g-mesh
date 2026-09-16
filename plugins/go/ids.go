@@ -34,15 +34,15 @@ func nodeIDFor(filePath, kind, qualifiedName, nativeKind string) string {
 
 // edgeIDFor mirrors extract.ts's edgeIdFor: identity is the (from, kind,
 // to) triple, plus - only when set - the declaration ordinal a semantic
-// pass bound the edge to (GM-281's concern; unused by this scaffold, which
-// emits no edges at all yet - GM-280's). Unlike nodeIDFor's nativeKind, an
-// absent toDeclaration contributes *nothing* to the hashed string, not an
-// empty field - see extract.ts's own doc comment on edgeIdFor for why:
-// every edge a structural pass emits (which never binds a declaration
-// ordinal) must keep exactly the id it would have without this parameter
-// existing at all.
-//
-//lint:ignore U1000 kept for GM-280/GM-281, which need it once this plugin emits edges
+// pass bound the edge to. Go has no overload sets, so nothing this plugin
+// emits ever binds one and every caller here passes nil; the parameter
+// exists because the id scheme is shared with the TS plugin and must stay
+// field-for-field identical to it. Unlike nodeIDFor's nativeKind, an absent
+// toDeclaration contributes *nothing* to the hashed string, not an empty
+// field - see extract.ts's own doc comment on edgeIdFor for why: every edge
+// a structural pass emits (which never binds a declaration ordinal) must
+// keep exactly the id it would have without this parameter existing at all.
+
 func edgeIDFor(fromID, kind, toID string, toDeclaration *int) string {
 	binding := ""
 	if toDeclaration != nil {

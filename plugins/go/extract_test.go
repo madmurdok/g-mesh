@@ -47,8 +47,11 @@ func TestComputeFileNodeMatchesTheDesignDocsWorkedExample(t *testing.T) {
 	if node.Language != "go" {
 		t.Fatalf("language = %q, want go", node.Language)
 	}
+	// computeFileNode itself never decides this - extractFile sets it from
+	// what the parser reported (extract_decls_test.go covers that), so the
+	// node this constructor returns on its own is unflagged.
 	if node.HasSyntaxErrors {
-		t.Fatal("hasSyntaxErrors must be false for this scaffold")
+		t.Fatal("computeFileNode must not flag syntax errors on its own")
 	}
 	if node.Range.Start != (wirePosition{0, 0}) {
 		t.Fatalf("range.start = %+v, want (0, 0)", node.Range.Start)

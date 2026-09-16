@@ -45,13 +45,17 @@ extensions = [".go"]
 # that will grow a real semantic tier should not lock in "core never asks"
 # before that tier exists, and this plugin already answers every
 # semanticPass honestly (an empty diff - see control.go's
-# handleSemanticPass). See this doc's "Implementation notes (GM-279)" below
+# handleSemanticPass). See the design doc's "Implementation notes (GM-279)"
 # for the semantic-engine-marker decision this capability implies.
 semantic_pass = true
-# This scaffold emits no edges at all yet (File nodes only - GM-280 adds
-# symbols and edges), so receiver calls are unresolved at both tiers -
-# an honest "nothing yet", not an overclaim either GM-280 or GM-281 would
-# have to walk back later.
+# `x.M()` needs to know the receiver's type, which only go/types can answer,
+# so GM-280's structural tier emits no edge for one at all - it records an
+# open site instead (plugins/go/open_sites.go) and leaves the gap declared
+# here, where the MCP instructions read it. Both stay "unresolved" until
+# GM-281 lands the pass that answers those sites, at which point
+# `receiver_calls` becomes "resolved" and `receiver_calls_structural` stays
+# as it is: the structural tier will still not answer them, the semantic one
+# will.
 receiver_calls = "unresolved"
 receiver_calls_structural = "unresolved"
 

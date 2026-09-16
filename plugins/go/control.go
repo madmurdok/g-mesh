@@ -12,68 +12,180 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
-// pluginState is this process's whole memory: the last File-node range
-// this plugin sent for each file it has seen since it started, keyed by
-// project-relative path. A fresh process - every control-plane session,
-// and every one-shot --bulk-index run - starts with none of this, the same
-// "cold" starting point plugins/typescript/src/incremental.ts's own cache
-// has. That is why `fileChanged` on a file this process has never
-// reparsed always answers with an upsert, even when nothing has actually
-// changed since an earlier bulk walk: that walk was a *different*
-// process, with its own cache.
+func sortStrings(values []string) { sort.Strings(values) }
+
+// cachedFile is the last graph this process emitted for one file, keyed by
+// id on both sides so the next extraction of that file can be diffed against
+// it without re-deriving anything.
+type cachedFile struct {
+	nodes map[string]wireNode
+	edges map[string]wireEdge
+	// The file's open sites (open_sites.go) as of that same extraction.
+	// Replaced wholesale, never merged, so they cannot describe code that is
+	// no longer there. Read by GM-281's semantic pass; nothing sends them.
+	openSites []openSite
+}
+
+// pluginState is this process's whole memory: the project root, the
+// workspace's module layout, and the last graph this plugin sent for each
+// file it has seen since it started, keyed by project-relative path.
+//
+// A fresh process - every control-plane session, and every one-shot
+// --bulk-index run - starts with none of this, the same "cold" starting
+// point plugins/typescript/src/incremental.ts's own cache has. That is why
+// `fileChanged` on a file this process has never reparsed always answers
+// with a full upsert, even when nothing has actually changed since an
+// earlier bulk walk: that walk was a *different* process, with its own
+// cache.
 type pluginState struct {
 	projectRoot string
-	lastRange   map[string]wireRange
+	workspace   *workspace
+	files       map[string]cachedFile
 }
 
 func newPluginState(projectRoot string) *pluginState {
-	return &pluginState{projectRoot: projectRoot, lastRange: map[string]wireRange{}}
+	return &pluginState{
+		projectRoot: projectRoot,
+		workspace:   loadWorkspace(projectRoot),
+		files:       map[string]cachedFile{},
+	}
 }
 
-// handleFileChanged recomputes relPath's sole node (the File node - see
-// extract.go) from what is on disk right now and diffs it against what
-// this process last sent for that path.
+// handleFileChanged re-extracts relPath from what is on disk right now and
+// diffs the result, by id, against what this process last sent for that
+// path.
 //
-// Comparing by range alone - not the whole node - is deliberate and
-// sufficient, not a shortcut: every other field of a File node (id, kind,
-// name, qualifiedName, filePath, visibility, language, hasSyntaxErrors) is
-// a pure function of relPath alone and never of file content, so range is
-// the only field that can possibly have changed. That is also exactly what
-// core/src/cli/plugin_check/checks.rs's id-stability.whitespace-edit
-// exercises: a whitespace-only edit before the file's last newline moves
-// nothing in it (see extract.go's textEndPosition doc comment), so the
-// cached and freshly computed ranges compare equal and this answers with
-// an empty diff, which is what that check requires.
+// # Why the diff compares whole records, not a shortcut
+//
+// GM-279's scaffold compared File-node *ranges*, which was sufficient when a
+// file produced exactly one node whose every other field was a function of
+// its path. With real declarations that is no longer true: an edit can
+// change a signature, a doc comment, a visibility or a container without
+// moving anything, and it can change a range without changing anything else.
+// Comparing the whole record is the only version that cannot miss one of
+// those, and it is what makes both halves of the contract hold at once:
+//
+//   - a whitespace-only edit before the file's last newline moves no range
+//     and changes no field, so every record compares equal and the diff is
+//     empty - `id-stability.whitespace-edit`;
+//   - a real edit to a declaration moves that declaration's range and every
+//     later one in the file, so each of those records is re-sent with its
+//     new range - `id-stability.declaration-edit-applies`, which compares
+//     the result against a fresh bulk walk of the edited tree.
+//
+// The comparison is by value on a struct of comparable fields plus one
+// pointer (`Target`), which is why it goes through nodesEqual rather than
+// `==`: two placeholders with equal targets must compare equal even though
+// their pointers differ.
 func (s *pluginState) handleFileChanged(relPath string) fileChangeDiff {
 	diff := emptyDiff()
 
 	abs := filepath.Join(s.projectRoot, filepath.FromSlash(relPath))
 	content, err := os.ReadFile(abs)
 	if err != nil {
-		if _, had := s.lastRange[relPath]; had {
-			diff.DeleteNodeIds = append(diff.DeleteNodeIds, nodeIDFor(relPath, "File", relPath, ""))
-			delete(s.lastRange, relPath)
+		// Gone from disk: delete everything this process said about it.
+		// Edges first in the diff's own lists is not required by anything -
+		// core applies deletes as a set - but a file that is no longer there
+		// leaves neither nodes nor edges behind.
+		previous, had := s.files[relPath]
+		if !had {
+			return diff
 		}
+		for id := range previous.edges {
+			diff.DeleteEdgeIds = append(diff.DeleteEdgeIds, id)
+		}
+		for id := range previous.nodes {
+			diff.DeleteNodeIds = append(diff.DeleteNodeIds, id)
+		}
+		sortStrings(diff.DeleteEdgeIds)
+		sortStrings(diff.DeleteNodeIds)
+		delete(s.files, relPath)
 		return diff
 	}
 
-	node := computeFileNode(relPath, content)
-	if previous, ok := s.lastRange[relPath]; ok && previous == node.Range {
-		return diff
+	graph := extractFile(s.workspace, relPath, content)
+	previous := s.files[relPath]
+
+	next := cachedFile{
+		nodes:     make(map[string]wireNode, len(graph.nodes)),
+		edges:     make(map[string]wireEdge, len(graph.edges)),
+		openSites: graph.openSites,
 	}
-	diff.UpsertNodes = append(diff.UpsertNodes, node)
-	s.lastRange[relPath] = node.Range
+	// Emission order is preserved in the diff (File node first, then
+	// declarations, then placeholders), because it costs nothing and makes
+	// the stream readable to a human diffing two runs by eye.
+	for _, node := range graph.nodes {
+		next.nodes[node.ID] = node
+		if before, existed := previous.nodes[node.ID]; !existed || !nodesEqual(before, node) {
+			diff.UpsertNodes = append(diff.UpsertNodes, node)
+		}
+	}
+	for _, edge := range graph.edges {
+		next.edges[edge.ID] = edge
+		if before, existed := previous.edges[edge.ID]; !existed || before != edge {
+			diff.UpsertEdges = append(diff.UpsertEdges, edge)
+		}
+	}
+	for id := range previous.edges {
+		if _, still := next.edges[id]; !still {
+			diff.DeleteEdgeIds = append(diff.DeleteEdgeIds, id)
+		}
+	}
+	for id := range previous.nodes {
+		if _, still := next.nodes[id]; !still {
+			diff.DeleteNodeIds = append(diff.DeleteNodeIds, id)
+		}
+	}
+	// Map iteration order is randomized in Go, and a diff whose delete lists
+	// shuffle between two otherwise identical runs is a diff no one can
+	// compare by eye - and would make this plugin's own tests depend on the
+	// runtime's hash seed.
+	sortStrings(diff.DeleteEdgeIds)
+	sortStrings(diff.DeleteNodeIds)
+
+	s.files[relPath] = next
 	return diff
+}
+
+// reloadWorkspace re-reads the project's module layout and forgets every
+// cached file - see the `workspaceChanged` case in handleEnvelope.
+func (s *pluginState) reloadWorkspace() {
+	s.workspace = loadWorkspace(s.projectRoot)
+	s.files = map[string]cachedFile{}
+}
+
+// openSitesFor returns the unresolved selections this process currently
+// holds for a file - GM-281's input, and nothing core ever sees.
+func (s *pluginState) openSitesFor(relPath string) []openSite {
+	return s.files[relPath].openSites
+}
+
+// nodesEqual compares two wire nodes by value, including the placeholder
+// target behind the one pointer field.
+func nodesEqual(a, b wireNode) bool {
+	if a.Target == nil || b.Target == nil {
+		if a.Target != b.Target {
+			return false
+		}
+	} else if *a.Target != *b.Target {
+		return false
+	}
+	a.Target, b.Target = nil, nil
+	return a == b
 }
 
 // handleSemanticPass answers every semanticPass request - per-file or
 // whole-project alike, core's own filePaths convention (an empty list
 // means "everything") - with an empty diff. There is no semantic engine
-// yet to ask (go/types lands in GM-281): this scaffold's structural pass
-// already produces this plugin's whole honest answer, so an "upgrade"
-// pass has nothing to add.
+// yet to ask (go/types lands in GM-281): the structural pass produces this
+// plugin's whole honest answer today, and the questions it deliberately
+// refused - the open sites this process is already collecting per file
+// (openSitesFor, open_sites.go) - have nobody to put them to yet. Answering
+// with an empty diff rather than a guess is what keeps the receiver gap
+// declared in plugin.toml true.
 //
 // Deliberately does *not* write the conformance kit's semantic-engine
 // marker (session.go's MARKER_DIR_ENV contract, mirrored from
@@ -144,13 +256,22 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 
 	case "workspaceChanged":
 		// A notification, never a request - core always follows it with a
-		// per-language reindex of its own (see
-		// core/src/protocol/types.rs's ControlMessage::WorkspaceChanged
-		// doc comment), so a plugin never has to answer with a diff. This
-		// scaffold caches nothing at the workspace level (no module map -
-		// that is GM-280/GM-281's concern once one exists to invalidate),
-		// so there is nothing to do beyond logging it.
+		// per-language reindex of its own (see core/src/protocol/types.rs's
+		// ControlMessage::WorkspaceChanged doc comment), so a plugin never
+		// has to answer with a diff.
+		//
+		// There *is* now something to invalidate, which there was not in
+		// GM-279: a go.mod/go.work edit can rename a module or add one, and
+		// every container key in the affected subtree is computed from that
+		// (workspace.go). So the module layout is reloaded from disk and the
+		// per-file cache is dropped wholesale - a cached graph carries the
+		// old container keys inside its nodes, so keeping it would make the
+		// next `fileChanged` diff against a graph that no longer describes
+		// how this project is laid out. Dropping it costs one full re-upsert
+		// per file core then asks about, which is exactly what the reindex
+		// core follows this with does anyway.
 		logf("workspace file changed: %s", workspaceChangedFilePath(env.Params))
+		state.reloadWorkspace()
 		return
 
 	case "status":

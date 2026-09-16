@@ -39,6 +39,17 @@
 //! two diverging copies, since `core/tests/fixtures/plugin_check/typescript/`
 //! used to exist purely for this test and CI had nothing to iterate.
 //!
+//! `the_go_plugin_passes_on_its_own_fixture` and
+//! `the_go_plugin_satisfies_its_own_expectations_file` do the same for the
+//! bundled Go plugin (also built by `core/build.rs`) over
+//! `../plugins/go/conformance/{project,expect.toml}` - a multi-file package,
+//! a second package reached through an import, an external `_test` package
+//! and a `go.work` naming two modules. They are what puts the Go plugin's
+//! conformance run in core's own CI, which is what the design doc asks for
+//! ("The same fixtures run in core's CI for every bundled plugin"), and they
+//! are GM-280's end-to-end evidence that the container-scoped placeholders
+//! that plugin emits are addresses core's linker actually resolves.
+//!
 //! # `--expect` (GM-277)
 //!
 //! `the_typescript_plugin_satisfies_its_own_expectations_file` runs the same
@@ -103,6 +114,21 @@ fn ts_conformance_project() -> PathBuf {
 
 fn ts_conformance_expect() -> PathBuf {
     ts_plugin_dir().join("conformance/expect.toml")
+}
+
+/// The bundled Go plugin (GM-279's scaffold, GM-280's real extractor) and its
+/// own conformance pair, laid out exactly like the TS plugin's: the binary
+/// `core/build.rs` builds, the fixture, and the expectations file.
+fn go_plugin_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/go")
+}
+
+fn go_conformance_project() -> PathBuf {
+    go_plugin_dir().join("conformance/project")
+}
+
+fn go_conformance_expect() -> PathBuf {
+    go_plugin_dir().join("conformance/expect.toml")
 }
 
 /// The fake plugin: a conformant plugin for the toy `.fk` language, plus one
@@ -705,6 +731,28 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
 }
 
+/// The bundled Go plugin against its own fixture - a multi-file package, a
+/// second package reached through an import, an external `_test` package and
+/// a `go.work` naming two modules.
+///
+/// The two capability checks are both `SKIP`, for different reasons and both
+/// correctly: the manifest declares `semantic_pass = true`, so
+/// `semantic-pass-undeclared` does not apply, and the plugin has no semantic
+/// engine to start yet (go/types is GM-281), so it writes no
+/// semantic-engine marker and `semantic-engine-lazy` has no evidence either
+/// way. When GM-281 lands that second one becomes a `PASS` and this test
+/// should say so.
+#[test]
+fn the_go_plugin_passes_on_its_own_fixture() {
+    let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
+    assert!(run.success, "{}", run.stdout);
+    for id in ALL_CHECKS {
+        let expected = if id.starts_with("capabilities.") { "SKIP" } else { "PASS" };
+        assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
+    }
+    assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
+}
+
 // ============================================================================
 // GM-277: `--expect <expect.toml>` - post-linking assertions against the
 // same query code the MCP tools use. See `core/src/cli/plugin_check/
@@ -785,6 +833,32 @@ fn the_typescript_plugin_satisfies_its_own_expectations_file() {
     );
     assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
     assert!(expectation_results.iter().any(|id| id.starts_with("expectations.definition")), "{}", run.stdout);
+    for id in expectation_results {
+        assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
+    }
+}
+
+/// The Go plugin's own expectations, through the real linker and the real
+/// MCP handlers - GM-280's end-to-end proof that a container-scoped
+/// placeholder is an address core actually resolves.
+///
+/// Deliberately a smaller set than the TS plugin's (GM-282 owns the full Go
+/// expectations file), so this asserts the two kinds that file does carry
+/// rather than every kind the kit supports. `[[implementations]]` in
+/// particular is absent on purpose: Go's interfaces are structural, so
+/// `SUPERTYPE_OF` edges are go/types' answer and arrive with GM-281.
+#[test]
+fn the_go_plugin_satisfies_its_own_expectations_file() {
+    let run = run_check_with_expect(&go_plugin_dir(), &go_conformance_project(), &go_conformance_expect());
+    assert!(run.success, "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+    let expectation_results: Vec<&String> = run
+        .outcomes
+        .keys()
+        .filter(|id| id.starts_with("expectations.") && *id != "expectations.file")
+        .collect();
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }

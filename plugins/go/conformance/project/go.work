@@ -1,0 +1,12 @@
+go 1.22
+
+// Two modules, so the fixture exercises the multi-module shape the design
+// doc leaves as an open question ("go.work and multi-module repos"): a
+// declaration's container key is its *own* module's path plus its directory,
+// so tools/gen.go is `github.com/example/tools` and not
+// `github.com/example/app/tools`, which is what a single-module reading of
+// the same tree would have produced.
+use (
+	.
+	./tools
+)
