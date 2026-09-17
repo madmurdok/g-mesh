@@ -400,6 +400,8 @@ impl Declarer<'_, '_> {
                 // re-export shape - this module republishes whatever that one
                 // exports, which is exactly `*` at both ends.
                 "wildcard_import" => {
+                    #[cfg(test)]
+                    crate::census::note_glob(!external);
                     if !external {
                         self.emitter.reexport(
                             "*",

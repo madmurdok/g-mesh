@@ -280,7 +280,11 @@ impl<'a, 's> Bodies<'a, 's> {
             self.visit_parameter_expressions(parameters, &id);
         }
         if let Some(return_type) = inner.child_by_field_name("return_type") {
+            #[cfg(test)]
+            crate::census::push_ctx(crate::census::Ctx::Annotation);
             self.visit(return_type, &id);
+            #[cfg(test)]
+            crate::census::pop_ctx();
         }
 
         // The instance parameter, for `self.member(...)` - see Decision 7.
@@ -365,6 +369,8 @@ impl<'a, 's> Bodies<'a, 's> {
             } else {
                 argument
             };
+            #[cfg(test)]
+            crate::census::push_ctx(crate::census::Ctx::Base);
             let bound = match base.kind() {
                 "identifier" => self.resolve_bare(text(base, self.source), Some(NodeKind::Type)),
                 "attribute" => match dotted_segments(base, self.source) {
@@ -372,10 +378,14 @@ impl<'a, 's> Bodies<'a, 's> {
                     None => Bound::Nothing,
                 },
                 _ => {
+                    #[cfg(test)]
+                    crate::census::pop_ctx();
                     self.visit(base, subtype);
                     continue;
                 }
             };
+            #[cfg(test)]
+            crate::census::pop_ctx();
             match bound {
                 Bound::Here(to, _) => self.emitter.resolved_edge(EdgeKind::SupertypeOf, subtype, &to),
                 Bound::There { target, name, .. } => {
@@ -393,9 +403,13 @@ impl<'a, 's> Bodies<'a, 's> {
         for decorator in decorators(outer) {
             let mut cursor = decorator.walk();
             let children: Vec<Node> = decorator.named_children(&mut cursor).collect();
+            #[cfg(test)]
+            crate::census::push_ctx(crate::census::Ctx::Decorator);
             for child in children {
                 self.visit(child, from);
             }
+            #[cfg(test)]
+            crate::census::pop_ctx();
         }
     }
 
@@ -407,7 +421,15 @@ impl<'a, 's> Bodies<'a, 's> {
         for parameter in children {
             for field in ["type", "value"] {
                 if let Some(child) = parameter.child_by_field_name(field) {
+                    #[cfg(test)]
+                    if field == "type" {
+                        crate::census::push_ctx(crate::census::Ctx::Annotation);
+                    }
                     self.visit(child, from);
+                    #[cfg(test)]
+                    if field == "type" {
+                        crate::census::pop_ctx();
+                    }
                 }
             }
         }
@@ -421,7 +443,15 @@ impl<'a, 's> Bodies<'a, 's> {
     fn assignment(&mut self, node: Node, from: &str) {
         for field in ["type", "right", "value"] {
             if let Some(child) = node.child_by_field_name(field) {
+                #[cfg(test)]
+                if field == "type" {
+                    crate::census::push_ctx(crate::census::Ctx::Annotation);
+                }
                 self.visit(child, from);
+                #[cfg(test)]
+                if field == "type" {
+                    crate::census::pop_ctx();
+                }
             }
         }
         if let Some(left) = node.child_by_field_name("left") {
@@ -513,7 +543,14 @@ impl<'a, 's> Bodies<'a, 's> {
             _ => self.visit(function, from),
         }
         if let Some(arguments) = node.child_by_field_name("arguments") {
+            // A call's arguments are ordinary expression position, whatever
+            // position the call itself sits in - `@route("/x", Foo)` is a
+            // decorator, `Foo` inside it is not a decorator name.
+            #[cfg(test)]
+            crate::census::push_ctx(crate::census::Ctx::Other);
             self.visit(arguments, from);
+            #[cfg(test)]
+            crate::census::pop_ctx();
         }
     }
 
@@ -522,7 +559,11 @@ impl<'a, 's> Bodies<'a, 's> {
     /// A single-segment name used as a value, a type or a callee.
     fn bare(&mut self, node: Node, from: &str, is_call: bool) {
         let name = text(node, self.source);
+        #[cfg(test)]
+        crate::census::push_call(is_call);
         let bound = self.resolve_bare(name, None);
+        #[cfg(test)]
+        crate::census::pop_call();
         self.emit(bound, from, node, is_call, node);
     }
 
@@ -536,7 +577,11 @@ impl<'a, 's> Bodies<'a, 's> {
             self.walk_receiver(node, from, is_call);
             return;
         };
+        #[cfg(test)]
+        crate::census::push_call(is_call);
         let bound = self.resolve_path(&segments);
+        #[cfg(test)]
+        crate::census::pop_call();
         // The *name* position is where a placeholder's range and an open
         // site's position belong - the last segment, not the whole chain.
         let at = node.child_by_field_name("attribute").unwrap_or(node);
@@ -584,8 +629,19 @@ impl<'a, 's> Bodies<'a, 's> {
                 return Bound::Here(decl.id.clone(), decl.kind);
             }
             if frame.binds(name) {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::BareLocal, name);
                 return Bound::Nothing;
             }
+        }
+        #[cfg(test)]
+        match self.model.lookup_import(name) {
+            Some(Import::Module { .. }) => {
+                crate::census::record(crate::census::Reason::BareImportedModule, name)
+            }
+            Some(Import::External) => crate::census::record(crate::census::Reason::BareExternalImport, name),
+            None => crate::census::record(crate::census::Reason::BareUnknown, name),
+            Some(Import::Item { .. }) => {}
         }
         match self.model.lookup_import(name) {
             Some(Import::Item { container, name }) => Bound::There {
@@ -651,7 +707,11 @@ impl<'a, 's> Bodies<'a, 's> {
                         // `super::decls`). A placeholder addressed at our own
                         // container could never be answered by anything, so
                         // emitting one would be litter, not an edge.
-                        None => Bound::Nothing,
+                        None => {
+                            #[cfg(test)]
+                            crate::census::record(crate::census::Reason::DottedOwnMissing, last);
+                            Bound::Nothing
+                        }
                     };
                 }
                 Bound::There {
@@ -661,7 +721,11 @@ impl<'a, 's> Bodies<'a, 's> {
                 }
             }
             Qualifier::Opaque => Bound::Receiver,
-            Qualifier::External => Bound::Nothing,
+            Qualifier::External => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::DottedExternal, last);
+                Bound::Nothing
+            }
         }
     }
 
