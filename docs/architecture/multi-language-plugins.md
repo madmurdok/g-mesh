@@ -1560,6 +1560,465 @@ structural index serving meanwhile" stands as the expectation, and measuring
 it on the Rust bench corpus is still R4 bench work rather than something this
 task settled.
 
+### Python plugin (`plugins/python`, on the SDK)
+
+Language #3, and the first one built entirely from the paper stress test's own
+row rather than from a design section written in advance - which is the point of
+the row existing. Same shape as `plugins/rust`: a Rust crate on `plugins/sdk`,
+a `ProjectContext` computed once per `load_project`, an extractor that asks it
+one question per file.
+
+#### Implementation notes (GM-295)
+
+`plugins/python/src/project/` is the project model - roots, container keys, and
+nothing else; its module doc argues all seven decisions in full. Four are worth
+lifting out because a later language will meet them again:
+
+1. **No source is parsed to build the package tree.** Rust needs a scanner
+   because `mod foo;` is a *statement*; Python's module structure is a pure
+   function of the path on disk, so the SDK's `walk_project` output is the whole
+   input. Language #4 should check which of the two it is before writing a
+   scanner: Java and Kotlin are Python-shaped, C# and C++ are not.
+2. **A module is a container *and* a member of its parent.** `from pkg.sub.mod
+   import f` needs `pkg.sub.mod` to be a container; `from pkg.sub import mod`
+   needs `mod` to be a *member* of `pkg.sub`. Python has no `mod child;`
+   statement to hang the second on, so `ContainerInfo::Module` carries both the
+   own key and the `parent`/`name` pair, and GM-296 must emit the extra
+   self-announcement node. This is also what keeps `parent_chain` gap-free
+   across a PEP 420 namespace package: the namespace directory gets a member the
+   moment anything directly inside it announces itself, with no
+   namespace-specific machinery at all. The one residual gap - an *intermediate*
+   namespace package with no direct content of its own - is accepted, not
+   hidden: it is the missing-edge side of the rule, and manufacturing a
+   canonical announcer would couple a file to a container its own text says
+   nothing about.
+3. **Roots are three sources tried in order, first one wins outright**:
+   `pyproject.toml` hints (`[tool.poetry] packages[].from`, `[tool.setuptools]
+   package-dir[""]`), then a `src/` that actually holds Python, then the project
+   root as a fallback. A project that declares its layout is never
+   second-guessed by what is on disk, so a stray `src/` beside a declared root
+   contributes orphans rather than a phantom root - pinned by
+   `a_declared_root_is_not_joined_by_a_stray_src_directory`, because the doc
+   first promised the opposite and the failure is silent.
+4. **`.pyi` stubs are indexed but never announce themselves.** A stub computes
+   the *same* key its sibling module would, which is what `DECLARATION_OF` will
+   need later; letting it also emit the Decision-2 membership node would put two
+   files' declarations under one container and make `from pkg import mod`
+   ambiguous - a wrong answer where skipping is merely a missing one.
+
+`plugins/python/src/extractor/` is a File-only stub until GM-296. The
+conformance kit already passes on it (13 passed, 2 skipped: no declarations yet
+to edit, and `semantic_pass = false`), which is the same pre-extractor state
+`plugins/rust` documented before GM-286.
+
+#### Implementation notes (GM-296)
+
+Built as `plugins/python/src/extractor/`, on tree-sitter-python. The eight
+decisions this task had to settle are each argued in full in the module named
+beside them; `plugins/python/README.md` is the reader-facing summary, including
+the gap list. Recorded here are the four places the row above, and GM-295's own
+notes, turned out to be *wrong* rather than merely incomplete, so that language
+#4 does not copy them.
+
+1. **A `qualifiedName` needs the whole lexical path, not just the enclosing
+   class.** The task's own sketch is `f`, `C`, `C.m`, `outer.inner` - which
+   leaves a method of a *nested* class unspecified, and the obvious reading
+   (`Inner.m`, named by its immediate parent) is not injective. One file may
+   hold `class Request: class Inner:` and `class Response: class Inner:`, and a
+   node's id is `(filePath, kind, qualifiedName, nativeKind)`, so both `Inner.m`
+   collapse to one node and the second silently replaces the first. The answer
+   is `Outer.Inner.m` - which is also CPython's own `__qualname__` for it. This
+   is the *same* failure `plugins/rust`'s GM-286 notes record for two inline
+   modules each declaring `helper`: it is not a Rust quirk, it is what happens
+   whenever a language can nest two namespaces of one name in one file, and
+   language #4 should assume it applies until it has checked that it does not.
+   (Where this plugin departs from `__qualname__` is the `<locals>` marker
+   CPython inserts for a function nested in a function: `nativeKind` already
+   separates `function` from `method`, so the marker would spell a fact the
+   node states twice.)
+
+2. **`self.m()` is resolvable in Python too, and not by trusting the name.**
+   The row above gives Rust `Self::f()` / `self.f()` -> the impl type's method
+   and gives Python nothing of the kind, on the reasonable-looking grounds that
+   `self` is a convention rather than a keyword and a structural tier must not
+   trust a convention. That reasoning is right about the *name* and wrong about
+   the *construct*: what the language guarantees is that the **first parameter**
+   of a method is the instance it was called on, which is a fact about the
+   parameter's position, not its spelling. So `<first parameter>.m(...)`
+   resolves to the enclosing class's own member, `@staticmethod` is excluded the
+   way Python itself excludes it, and code that names the parameter `s` or `cls`
+   resolves identically. The general lesson for language #4: before writing off
+   a receiver as unknowable, check whether the language *declares* the receiver
+   somewhere - it often does, in a place the convention is merely pointing at.
+
+3. **A structural tier needs to know which dotted names are the project's
+   own, and Python's manifest cannot tell it.** The row above says nothing about
+   external modules, and GM-295's project model had no query for it, because
+   Rust and Go both get the answer free (`Cargo.toml` names every crate,
+   `go.mod` every module path). `pyproject.toml`'s `[project] dependencies` is
+   *not* that list: it holds distribution names, which routinely differ from
+   import names (`pip install pillow` imports as `PIL`), so reading it would be
+   reading the wrong list confidently. The only honest source is the package
+   tree the walk already produced, which is why `ProjectContext::has_container`
+   (Decision 8, added by this task) exists. Language #4's check: does its
+   manifest name *import* units or *distribution* units? If the latter, it has
+   this problem.
+
+4. **`__all__` had to be read as a re-export, and nothing else.** GM-295's
+   notes settle that `__all__` is not visibility. What they leave open, and what
+   this task found, is that reading it as a re-export is not optional
+   decoration: `from pkg import Greeter` against a package whose `__init__`
+   declares nothing has **no** path to `pkg/mod.py`'s class except core's
+   re-export walk, so without the `reexport` nodes the single most common
+   Python import shape resolves to nothing. The same is true of
+   `from mod import *`, which needs the `*`-at-both-ends shape for the same
+   reason. Both are pinned end to end in `conformance/expect.toml` rather than
+   only in a unit test, because the failure is invisible in one file's graph -
+   the placeholder looks fine; it simply never links.
+
+Two facts about core that this plugin now depends on, both already documented
+there: `graph::containers::parent_chain` stops at a memberless ancestor, which
+is what the module self-announcement node (GM-295's Decision 1, emitted here)
+closes for PEP 420 namespace packages; and a `name`-keyed placeholder walks
+re-export chains while a `qualifiedName`-keyed one does not, which is why a
+module-qualified call (`helpers.assist()`) keeps a `name` key and a
+class-qualified one (`Base.describe()`) does not.
+
+The kit now reports 14 passed, 1 skipped: `id-stability.declaration-edit-applies`
+became a real `PASS` the moment real declarations existed, and
+`capabilities.semantic-engine-lazy` still legitimately skips because
+`semantic_pass = false`.
+
+#### What language #4 actually cost (GM-300)
+
+Zero. `git diff --stat <parent> <merge> -- core/` on all four Python merges
+(GM-295 project model, GM-296 structural extractor, GM-297 conformance
+assertions, GM-298 distribution) is empty for three of them; `plugins/sdk/`
+is empty for all four. The one non-empty result, GM-297's
+`core/src/mcp/instructions.rs` (+40/-0), is a test, not a capability change:
+every added line sits inside `#[cfg(test)] mod tests` (that module starts at
+line 415 of the file; the diff starts at line 505), adding
+`bundled_python_capabilities()` - a copy of the existing
+`bundled_go_capabilities`/`bundled_rust_capabilities` pattern, reading
+`plugins/python/plugin.toml` rather than transcribing it - and one
+`#[test] fn python_only_lists_the_receiver_gap_with_no_semantic_tier_yet`,
+which asserts that a Python-only index renders the same receiver-gap
+sentence the existing Rust test proves for Rust. The generator itself did
+not change: it was already written to generalize over "any present language
+with `receiver_calls: unresolved` and no semantic pass" for GM-281 (Go), and
+Rust and now Python both exercise that same code path unchanged. One
+confound is worth ruling out explicitly, since GM-290 (Rust's semantic
+release) landed a real core fix the same week: it cannot have leaked in here
+because `release-3.3.0` is not an ancestor of `release-3.4.0` -
+`git merge-base --is-ancestor <GM-290 merge> release-3.4.0` returns false;
+`release-3.4.0` branches off `main` at the point `release-3.2.0` was merged,
+one step before `release-3.3.0` exists.
+
+Plugin size backs the same conclusion. Counting `git ls-files <dir> | xargs
+wc -l`, splitting each `.rs` file at its own trailing `#[cfg(test)] mod
+tests` (verified per file, not assumed - every plugin here puts tests at the
+bottom) and treating `extractor/tests.rs` and `tests/*.rs` as wholly test:
+
+| | implementation | tests | conformance fixtures+expect | config/docs | total |
+|---|---:|---:|---:|---:|---:|
+| `plugins/python` | 3,876 | 2,042 | 489 | 292 | 6,699 |
+| `plugins/rust` | 4,013 | 2,032 | 542 | 246 | 6,833 |
+| `plugins/go` | 4,843 | 2,866 | 417 | 229 | 8,355 |
+| `plugins/typescript` | 8,200 | 6,914 | 177 | 816 | 16,107 |
+
+Python's implementation is 137 lines *smaller* than the Rust structural tier
+it mirrors (Rust here is `release-3.4.0`'s copy, before GM-290 added the
+semantic engine on `release-3.3.0` - structural to structural, not
+structural to semantic), and the two plugins' test line counts are within
+0.5% of each other. Go and TypeScript are not on the same axis: Go already
+carries a semantic tier (`semantic.go`, 1,013 lines) and reimplements the
+wire protocol itself (`wire.go`, `jsonrpc.go`) because it cannot import a
+Rust crate; TypeScript predates the SDK entirely and carries its own
+semantic pass (`semanticPass.ts`, 1,242 lines) plus the workspace/incremental
+machinery the SDK now centralizes. The ~2.4x gap between the two SDK-based
+plugins (~6,700-6,800 lines each) and pre-SDK TypeScript (16,107) is closer
+to what "a plugin, not core surgery" is actually claiming credit for than
+the Python-vs-Rust gap is.
+
+SDK reuse is total and unextended: every `g_mesh_plugin_sdk::` item Python
+imports - `run`, `PluginSpec`, `Extractor`, `FileGraph`, `FileGraphBuilder`,
+`NodeSpec`, `OpenSite`/`OpenSiteKind`, `PlaceholderKind`, `RelPath`,
+`walk_project`, `BASELINE_EXCLUDED_DIRS`, `ids::{edge_id, node_id}`, the
+whole `wire` module, `testing::{PluginCheck, Verdict}` - is the same surface
+`plugins/rust` imports, and `plugins/sdk/` did not change for Python (above).
+The one candidate for "worked around" is `ProjectContext::has_container`
+(GM-296, Decision 8): Python's manifest cannot name import units
+(`pyproject.toml`'s `[project] dependencies` lists distribution names, not
+import names - `pillow` imports as `PIL`), so the plugin computes "is this
+dotted name ours" from its own package tree instead of trusting a manifest -
+the same shape `plugins/rust/src/extractor/keys.rs` already resolves
+`a::b` against `Cargo.toml`-declared crates
+(`a_bare_first_segment_is_a_child_module_before_it_is_an_external_crate`),
+entirely inside the Rust plugin, not the SDK. Rust already carries this
+exact kind of language-specific resolution logic itself; Python needing its
+own copy is the established pattern repeating, not a gap the SDK should have
+closed.
+
+Duration, from the tracker, caveat first: `created_at`/`updated_at` are
+wall-clock timestamps in a session that ran several tasks concurrently, not
+effort - they do not separate one task's working time from time spent
+waiting or on siblings. GM-295 (Python project model): created 08:34:29Z,
+updated 15:19:30Z, same day -> 6h45m. GM-296 (Python structural extractor,
+`complexity_hint: high`): created 08:34:29Z, updated 16:40:14Z -> 8h06m.
+GM-285 (Rust project model): created 2026-09-15 13:32:52Z, updated
+2026-09-16 11:03:44Z -> 21h31m, crossing an overnight gap. GM-286 (Rust
+structural extractor, also `complexity_hint: high`, worked by the opus
+subagent after a session interruption per its own completion summary):
+created 2026-09-15 13:32:52Z, updated 2026-09-16 13:52:45Z -> 24h20m, also
+overnight. The Rust pair's wall-clock span is roughly 3x the Python pair's,
+but most of that gap is the overnight idle period the Rust timestamps
+straddle and GM-286's own interruption, not a clean measurement of building
+speed. The only defensible reading: Python's structural tier did not take
+longer to build than Rust's, and the tracker has nothing more precise than
+that to offer either way.
+
+What this covers, and what it does not. The paragraph above was written of
+the structural tier alone, while GM-299 (Python's semantic tier, a pyright
+bridge) was still deferred. It has since landed, so the open question it left
+now has an answer, and the answer is worth stating in the same breath as the
+claim rather than only in the notes below: **no core change, and one generic
+SDK field.** The field is `SemanticConfig::settings`, which answers
+`workspace/configuration` - needed because pyright ignores
+`initializationOptions` entirely (GM-299 proved it with a one-variable A/B:
+the same settings object produced 4 diagnostics through one channel and 1
+through the other). So the honest scorecard for language #4 is *not* "zero
+changes outside the plugin": it is zero to core, one to the SDK, and that one
+is protocol surface any LSP server might need rather than a Python
+accommodation - which is the distinction the R1 claim actually rests on. A
+semantic tier is exactly where Rust needed its one real core fix (GM-290 -
+core did not tell a spawned plugin which manifest it had read), so Python
+getting away with an SDK field is a genuine result rather than a formality.
+This document's own Open Questions already name Python's dynamic dispatch as
+a gap that persists "even with pyright." Had `has_container`
+required a new SDK function instead of reusing `walk_project`, or had the
+GM-297 conformance work needed the instructions *generator* to change rather
+than exercise it, this section would report the opposite finding - the
+generalization would have been narrower than R1 claimed, and the C#/C++/
+Java/Kotlin plans in the stress test above should have been revisited before
+being built. Neither happened.
+
+#### Implementation notes (GM-299): the pyright engine
+
+Built as `plugins/python/src/semantic.rs` plus one addition inside the SDK's
+generic bridge. GM-290 was the first time `LspBridge` met a real language
+server; this was the first time it met a *second* one, and the value of that
+is that it separates "what the bridge assumed" from "what rust-analyzer
+happens to do". Four of the five findings below are the second kind, and none
+of them is about Python.
+
+**What it cost core and the SDK.** GM-300's own note ends by saying it is
+silent on whether Python's semantic tier would need core work. The answer is
+**no core capability change** and **one SDK addition**.
+
+Core's diff is `core/src/mcp/instructions.rs`, +54/-27, and every changed line
+sits inside `#[cfg(test)] mod tests` (that module starts at line 415; the three
+hunks start at 514, 626 and 643) - the same shape and the same file GM-300
+reports for GM-297. What changed there is what *had* to: GM-297 wrote
+`python_only_lists_the_receiver_gap_with_no_semantic_tier_yet` to read
+`plugins/python/plugin.toml` rather than transcribe it, precisely so that a
+pyright tier landing would break it, and it did. It is now the pair
+`python_only_before_…`/`python_only_after_…`, exactly the transition GM-290
+made for Rust. The *generator* is untouched: Python flipping to
+`receiver_calls = "resolved"` exercises a branch written for Go in GM-281 and
+used by Rust since GM-290.
+
+The SDK addition is `SemanticConfig::settings` (finding 2 below), and it is
+generic protocol surface rather than a Python accommodation:
+`workspace/configuration` is a base-protocol method and the next server that
+takes its settings that way needs nothing further. So the "zero" of GM-300
+becomes "zero core capability, one generic SDK field, one test that was built
+to fail this way" once a second engine exists - a weaker claim than R1's and
+still a strong one.
+
+**1. `pyright-langserver` has no `--version`, so GM-290's probe does not
+transfer.** GM-290's rule - a candidate is accepted for *answering*
+`--version`, not for existing - is right and is kept. Its implementation is
+not portable:
+
+```text
+$ node_modules/.bin/pyright-langserver --version
+Error: Connection input stream is not set. Use arguments of createConnection
+or set command line parameters: '--node-ipc', '--stdio' or '--socket={number}'
+$ echo $?
+1
+```
+
+The npm package ships two `"bin"` entries, `pyright` (a CLI) and
+`pyright-langserver` (a server), and only the CLI answers. So each candidate is
+probed through its **CLI twin** - same directory, same npx invocation, one name
+changed. The general lesson for language #5: the thing you can ask for a
+version may not be the thing you are about to run, and "probe it" has to mean
+"probe the same installation", not "probe the same file".
+
+Two consequences fell straight out of that. `args = ["--stdio"]` is
+**mandatory** in the manifest, where rust-analyzer needed no args at all - a
+manifest that omits it configures a server that exits before reading a byte.
+And the probe is now **bounded** (`PROBE_BUDGET`, 60s, the child killed rather
+than waited on), which `plugins/rust`'s unbounded `Command::output()` is not:
+rust-analyzer's `--version` is ~20ms of local work, while the measured costs
+here are 0.89s for a `node_modules` probe and 4.94s for an `npx` one that has
+to populate npm's cache - and an unreachable registry does not fail fast.
+
+**2. `initializationOptions` is not the settings channel, for pyright it is not
+a channel at all.** GM-289 modelled a server's settings as
+`initializationOptions`, and the task that scheduled this work repeats that
+("initialization options: basic type checking; the project's own venv"). LSP
+has a second channel - the server *asks*, with `workspace/configuration` - and
+GM-289's client answered that with a fixed array of `null`s, which is exactly
+right for rust-analyzer and exactly wrong here. One variable changed, same
+fixture, same value:
+
+```text
+initializationOptions {"python":{"analysis":{"typeCheckingMode":"off"}}}
+  -> 4 diagnostics, severity 1     (identical to the no-settings run)
+workspace/configuration reply {"analysis":{"typeCheckingMode":"off"}}
+  -> 1 diagnostic,  severity 2
+```
+
+and, for the venv, `python.pythonPath` through the same channel makes pyright
+log `Setting pythonPath for service "…"`, while a deliberately bogus path turns
+`Assuming Python version 3.9.6.final.0` into `Unable to get Python version from
+interpreter` - a discriminating pair in both directions.
+
+So `SemanticConfig::settings` is a map of LSP *section* to JSON, read from
+`[plugin.semantic.settings]`, answered positionally by
+`client::server_request_reply`. It sits *beside* `initialization_options`
+rather than replacing it: the two are different mechanisms and servers differ
+in which they read. A plugin may also add to it at run time, which is how
+`python.pythonPath` gets in at all - it names a path inside the project being
+indexed, and a manifest ships beside the plugin binary.
+
+**3. `textDocument/implementation` is optional, and the obvious manifest value
+would have been catastrophic rather than merely useless.** `plugins/rust` sets
+`implementation_kinds = ["trait"]`; the obvious Python reading is `["class"]`.
+pyright advertises no `implementationProvider` and answers the request with
+`{"code":-32601,"message":"Unhandled method textDocument/implementation"}`. The
+bridge reads a JSON-RPC error as a *refused question* - correctly, since a
+server that errors has not said "nothing there" - which marks the file
+uncovered and the pass **incomplete**. One wrong word in the manifest would
+therefore have meant: every class asked, every answer an error, every pass
+incomplete, `semanticPassAt` never set, and the receiver gap listed forever -
+on a tier that otherwise works. `implementation_kinds = []` is the shipped
+value and the manifest says why at length.
+
+The cost is honest and stated in the plugin README: `find_implementations` for
+Python is exactly as structural as it was in 3.4.0, and a subclass whose base
+arrived through a star import (`conformance/project/pkg/dynamic.py`) is
+invisible to it. The general lesson: `implementation_kinds` is the one manifest
+key whose wrong value fails *closed on the whole pass* rather than on itself,
+so a language's plugin has to check the server's `initialize` result rather
+than assume the request exists.
+
+**4. The bridge's question set is narrower than "what the engine could
+answer", and that is where this task's own description was wrong.** The task
+says the tier "sees re-exports pyright resolves that the structural tier could
+not". pyright *does* resolve them - asked directly at `class Megaphone(Speaker)`
+where `Speaker` arrived through `from pkg.base import *`, it answers
+`pkg/base.py:11:6` - and the tier still does not see it, because the bridge
+asks one question per **open site** and `plugins/python`'s extractor records an
+open site only for a receiver call. A bare name that resolves to nothing is
+deliberately not one (it would make the open-site set mostly builtins). So the
+limit here is not the engine's reach but the structural tier's question list,
+and closing it would be a change to `OpenSiteKind`, not to a manifest. Worth
+knowing before language #5 writes the same sentence into its own task.
+
+**5. A `.pyi` stub next to its module makes every `definition` answer
+ambiguous, and GM-295's Decision 6 silently saves the tier.** pyright answers
+`greeter.render()` with **two** locations - `pkg/mod.pyi` and `pkg/mod.py` -
+because a stub shadows its module for a type checker. The bridge refuses an
+answer whose locations disagree (that is the linker's job, not a guess of
+its own), so two *addressable* nodes would have produced no edge. It works only
+because GM-295 decided a `.pyi` contributes its `File` node and nothing else:
+`node_at` finds the `File`, `is_addressable` rejects it, and one target
+survives. That decision was taken to keep `from pkg import mod` unambiguous and
+had nothing to do with a semantic tier; had stubs been indexed as declarations,
+this tier would have emitted *zero* edges for every stubbed module, and the
+symptom would have been an empty caller list rather than an error.
+
+**Readiness, measured, and deliberately not changed.** pyright's `$/progress`
+is one token with an empty title, created through
+`window/workDoneProgress/create`, and its whole life is ~0.18s - nothing like
+rust-analyzer's seven sequential tokens over 14.21s. It arrives ~0.63s *after*
+`didOpen`, so the 2s settle covers the gap with a 3.2x margin, and readiness
+lands at ~3.06s of which 2.0s is the settle itself.
+
+The measurement that matters is the counterfactual: asking pyright the same
+nine questions with the settle set to **zero** - the first at 0.28s, before the
+progress token had even begun - returns **byte-identical answers**, the first
+request taking 773ms and the rest 2-9ms. pyright analyses on demand; its
+progress token is a background diagnostics pass, not an indexing gate. So for
+Python the readiness rule is pure latency: about 2.0s of a 3.3-3.5s
+whole-project pass, ~60%, is the bridge waiting for a server that was ready
+before it was asked.
+
+`Budgets::settle` is per-bridge and `LspBridge::with_budgets` would let this
+plugin shorten it. **It is deliberately left at the default.** The measurement
+is of one server version, on one twelve-file fixture, with nothing installed in
+the environment; "a server made to look ready before it can answer" is the exact
+bug GM-290 found twice, and the failure mode of getting it wrong is a pass that
+reports itself complete having resolved nothing. Two seconds of a cold start is
+a cheap insurance premium, and a per-engine settle is a decision for whoever
+measures it on a real corpus rather than for whoever noticed it first.
+
+**Cold load, memory and the gap, on the twelve-file conformance fixture.**
+Three `g-mesh init` runs against an isolated `G_MESH_HOME` with only the Python
+plugin discovered (`G_MESH_PLUGIN_ROOTS_OVERRIDE`), the project carrying its
+own `node_modules` so resolution branch 2 is what answered, reading core's own
+two timestamps back out of the index rather than timing from outside:
+
+| | rep A | rep B | rep C |
+|---|---:|---:|---:|
+| load average at start (1m) | 6.00 | 5.97 | 5.53 |
+| `g-mesh init`, `real` / `user` / `sys` | 11.23 / 22.02 / 1.44 | 10.29 / 21.37 / 1.31 | 10.44 / 21.47 / 1.39 |
+| plugin's own report for the pass | 3.59s | 3.43s | 3.39s |
+| `bulkIndexedAt` → `semanticPassAt` | 4s | 4s | 3s |
+| peak process-tree RSS | 130.8 MiB | 130.7 MiB | 132.1 MiB |
+| …of which node/pyright | 125.1 | 125.1 | 126.4 |
+
+`user` at roughly twice `real` says the whole `init` is doing parallel work
+rather than waiting on something, which is what makes these timings a
+measurement of the code rather than of the machine. The gap column is
+second-resolution, which is all `language_state` stores.
+
+Peak RSS is the whole tree, which is what `[plugin] memoryLimitMb` samples, and
+it splits 5.6-5.7 MiB of plugin to 125-126 MiB of node: **pyright costs about a
+quarter of what rust-analyzer does** (535-555 MiB in GM-290), so the ~600 MiB
+floor that note records for Rust is not the floor here - a limit around 200 MiB
+would leave Python room on a fixture this size. The sampler walks the tree
+about twice a second, so the peak is a lower bound rather than an exact
+maximum.
+
+A second set of three reps taken earlier, at load averages 3.41, 18.47 and
+18.81, gives 3.31-3.47s for the pass and 128.6-131.6 MiB peak - indistinguishable
+from the quiet set. That is itself the finding: the pass is 2.0s of fixed
+settle plus ~1.4s of work, and neither is CPU-bound enough for a six-fold
+change in this machine's load to show. The per-file pass that follows an edit is
+33-36ms, because `LspClient::settle` latches: a server that has proved its
+shape once is never made to prove it again.
+
+**The `npx` branch costs 74 MiB that nothing gets to use.** Same fixture, same
+three-rep harness, with the project's `node_modules` removed and nothing on
+`PATH`, so branch 3 is what answered (the log line says so, which is what it is
+for): the pass takes 4.13s instead of ~3.4s, the gap is 6s instead of 3-4s, and
+peak tree RSS is **204.1 MiB instead of 130.8** - `npm` itself stays resident
+beside the server it launched, at 73.7 MiB, for the whole life of the pass. It
+is a *parent* of the node process, so `process_tree_rss_mb` charges the plugin
+for it and `[plugin] memoryLimitMb` would too. That is a 56% memory surcharge
+for a launcher that has finished launching, and it is the strongest argument
+for the ordering: `npx` works, and it should be the branch nobody reaches.
+
+None of this extrapolates. Twelve files with no third-party dependencies is the
+best case; pyright's cold load on a real project is dominated by resolving
+imports against a venv's `site-packages` and by the typeshed it bundles, which
+this fixture does not exercise at all. "Many minutes on a large repository"
+remains the expectation for every engine on this bridge, and measuring it on a
+Python bench corpus is bench work this task did not do.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated
@@ -1895,6 +2354,12 @@ What it leaves for later, deliberately:
 - the C++ preprocessor and include paths, which belong to clangd and
   `compile_commands.json`, and not to core;
 - Python's dynamic dispatch, which stays a documented gap even with pyright.
+  Built and measured in GM-299: pyright answers a receiver whose type it can
+  infer (a local from its initializer, a parameter from its annotation, a call
+  result) and answers `null` for an unannotated parameter, which is the most
+  ordinary shape in un-hinted Python. `plugins/python/README.md` states the
+  whole boundary; the fixture asserts the `null` case by the *absence* of a
+  caller row.
 
 ## Rollout
 

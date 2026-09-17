@@ -1,0 +1,53 @@
+[package]
+name = "g-mesh-plugin-python"
+version = "3.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "g-mesh's Python language plugin: pyproject.toml/src-layout/namespace-package project model (GM-295), tree-sitter-python structural extraction (GM-296)"
+
+[lib]
+name = "g_mesh_plugin_python"
+path = "src/lib.rs"
+
+[[bin]]
+name = "g-mesh-plugin-python"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-wire = { path = "../../wire" }
+# `pyproject.toml` parsing for the project model (`project::pyproject`) - read
+# as data, never by executing `setup.py` or any other project code (the
+# task's own constraint). Already a dependency of `g-mesh-plugin-sdk` (for its
+# own `plugin.toml`) and of `g-mesh-plugin-rust` (for `Cargo.toml`), so this
+# adds no new crate to the workspace's dependency graph, only a third user of
+# one already vetted.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# The semantic tier's settings (GM-299). `SemanticConfig::settings` is a map of
+# LSP section to `serde_json::Value`, because that is what goes on the wire to
+# the server, so a plugin that puts `python.pythonPath` there needs the type.
+# Already in this workspace's graph twice over - `g-mesh-plugin-sdk` depends on
+# it for the protocol itself, and `tree-sitter` below pulls it in as well - so
+# this adds a user rather than a crate.
+serde_json = "1"
+# The structural tier's parser (GM-296). tree-sitter rather than Python's own
+# `ast` module or a hand-written parser, for the reason the design doc gives
+# for every plugin on this SDK: an error-tolerant parser is the requirement
+# (`Extractor`'s own contract - "a syntax error is a normal answer"), and
+# `ast.parse` is all-or-nothing on a half-typed file, which is exactly the
+# file someone is about to ask a question about. It would also mean shelling
+# out to a `python3` this plugin cannot assume exists, at a version whose
+# grammar it cannot control.
+#
+# THE ONE NON-OBVIOUS CONSEQUENCE IS ALREADY PAID FOR. `tree-sitter` pulls in
+# `serde_json`'s `preserve_order` feature, which cargo unifies across the
+# packages built together and which therefore changes `serde_json::Value`'s
+# key order inside `core` on any workspace-wide build -
+# `plugins/rust/Cargo.toml`'s own header documents the measurement. This crate
+# adds a *second* user of a dependency already in that graph, so it changes
+# nothing about which builds are affected; it is recorded here only so a
+# reader of this file does not have to find the other one to learn it.
+tree-sitter = "0.25"
+tree-sitter-python = "0.25"

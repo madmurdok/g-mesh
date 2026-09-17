@@ -163,6 +163,47 @@ jobs:
         working-directory: plugins/typescript
         run: npm ci
 
+      # pyright is a *test* dependency of `plugins/python`, the same way
+      # rust-analyzer is one of `plugins/rust` (GM-290's step above) - since
+      # GM-299 the Python plugin's semantic tier drives a real
+      # pyright-langserver, and its tests fail naming the missing binary
+      # rather than skipping. Both jobs below need it: `cargo nextest run
+      # --workspace` runs the crate's own suite, and the conformance loop
+      # runs `plugins check plugins/python`, whose `session` check fails
+      # outright when the engine cannot start.
+      #
+      # `npm install` here, not `npm ci`, and no lockfile: there is no
+      # package.json in the repository to install *from*. plugins/python
+      # gitignores node_modules/, package.json and package-lock.json, because
+      # the install has to live beside the plugin rather than inside
+      # conformance/project/ - the kit copies the fixture and `copy_tree`
+      # drops symlinks, so an npm `.bin` would not survive the copy, and
+      # pyright's 5,205 bundled typeshed stubs would land in the walk as if
+      # they were the project's own declarations. The cost of that choice is
+      # this step: unlike rustup's machine-wide rust-analyzer, an npm install
+      # is per-directory, so every runner and every fresh worktree needs its
+      # own.
+      #
+      # `pyright --version` is the check, not `pyright-langserver --version`:
+      # the language server has no such flag and exits 1 with "Connection
+      # input stream is not set", so it cannot report its own health. The two
+      # binaries are `"bin"` entries of one package, and the plugin probes
+      # through the same CLI twin at run time for the same reason
+      # (plugins/python/src/semantic.rs).
+      #
+      # Windows is deliberately included. The Python plugin ships on all four
+      # triples (GM-298), so its semantic tier should be tested on all four -
+      # and this is the first time the `.cmd` shim path npm creates there is
+      # exercised for real rather than unit-tested (GM-299 lists it as
+      # unverified). A Windows failure in this step is therefore information
+      # about that path, not noise to route around.
+      - name: Install pyright
+        working-directory: plugins/python
+        shell: bash
+        run: |
+          npm install pyright
+          ./node_modules/.bin/pyright --version
+
       # The plugin's own suite (protocol.ts/extract.ts/bulkIndex.ts/
       # incremental.ts/semanticPass.ts unit and e2e tests) was not run in CI
       # before GM-275 - only `npm ci` was, so build.rs had something to

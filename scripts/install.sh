@@ -27,6 +27,12 @@
 #   plugins/rust/                the Rust plugin (a plain cargo binary,
 #                                needing no runtime of its own) and its own
 #                                plugin.toml (GM-288)
+#   plugins/python/              the Python plugin (a plain cargo binary,
+#                                needing no runtime of its own, and no Python
+#                                interpreter on this machine for the
+#                                structural tier it ships today - a future
+#                                semantic tier would need pyright installed
+#                                separately) and its own plugin.toml (GM-298)
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
 # Core cannot index a TypeScript project without the JS/TS plugin, and it

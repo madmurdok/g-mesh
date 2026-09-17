@@ -508,6 +508,22 @@ results instead of paging.";
             .capabilities
     }
 
+    /// The bundled Python plugin's own `[plugin.capabilities]`, read off
+    /// `plugins/python/plugin.toml` rather than transcribed - the same
+    /// `bundled_rust_capabilities`/`bundled_go_capabilities` pattern, so a
+    /// later edit to that manifest changes what the two `python_only_*` tests
+    /// assert instead of quietly disagreeing with it. That is not
+    /// hypothetical: GM-299 landed the pyright tier and flipped
+    /// `receiver_calls` to `"resolved"`, and the single test that used to read
+    /// this had to become the pair below - which is the failure mode this
+    /// helper exists to produce rather than avoid.
+    fn bundled_python_capabilities() -> Capabilities {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/python");
+        crate::daemon::manifest::read_manifest(&dir)
+            .expect("the bundled Python plugin's manifest must be readable")
+            .capabilities
+    }
+
     fn typescript_present() -> PresentLanguage {
         PresentLanguage {
             language: "typescript".to_string(),
@@ -602,6 +618,57 @@ results instead of paging.";
             rendered.contains("One real gap"),
             "rust-analyzer resolves every receiver call once its whole-project pass has completed"
         );
+        assert!(!rendered.contains("Two real gaps"));
+        assert!(!rendered.contains("variable receiver"));
+        assert!(rendered.contains("still building"), "the second gap must survive renumbering");
+    }
+
+    /// GM-297's own acceptance criterion 2, and the half GM-299 did not
+    /// change: a Python-only index whose semantic pass has not landed still
+    /// lists the receiver-call gap, checked against the shipped manifest
+    /// rather than a hand-written capability literal
+    /// (`bundled_python_capabilities`'s own doc).
+    ///
+    /// Until GM-299 this ran for `semantic_pass_done` of *both* values,
+    /// because `plugins/python/plugin.toml` declared `receiver_calls =
+    /// "unresolved"` and a pass that could never resolve one could never
+    /// close the gap either. It now declares `"resolved"`, so the two values
+    /// have genuinely different answers and each has its own test - the same
+    /// transition `rust_only_*` records for GM-290.
+    ///
+    /// This is also the permanent state of a machine with no pyright: the
+    /// plugin answers every `semanticPass` with an empty *incomplete* diff,
+    /// `semanticPassAt` is never set, and the gap stays listed.
+    #[test]
+    fn python_only_before_its_semantic_pass_lists_the_receiver_gap() {
+        let rendered = build(&[PresentLanguage {
+            language: "python".to_string(),
+            capabilities: bundled_python_capabilities(),
+            semantic_pass_done: false,
+        }]);
+        assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
+        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+    }
+
+    /// And what the same index reads once pyright has answered (GM-299): the
+    /// receiver-call gap drops out of the generated text entirely.
+    ///
+    /// Worth reading beside `plugins/python/README.md`, which says at length
+    /// that pyright resolves a receiver call only when it can infer the
+    /// receiver's type - an unannotated parameter stays unresolved for ever.
+    /// These instructions are generated from one manifest field and cannot
+    /// express that, which is exactly why the honest statement of what
+    /// `resolved: true` covers for Python lives in the plugin's README and
+    /// not here: this is a switch, and Python's answer is a paragraph.
+    #[test]
+    fn python_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+        let rendered = build(&[PresentLanguage {
+            language: "python".to_string(),
+            capabilities: bundled_python_capabilities(),
+            semantic_pass_done: true,
+        }]);
+        assert!(rendered.contains("One real gap"), "pyright answered, so the gap is no longer listed");
         assert!(!rendered.contains("Two real gaps"));
         assert!(!rendered.contains("variable receiver"));
         assert!(rendered.contains("still building"), "the second gap must survive renumbering");

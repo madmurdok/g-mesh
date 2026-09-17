@@ -1,0 +1,150 @@
+# Bundled Python plugin manifest. See docs/architecture/multi-language-plugins.md
+# ("Interfaces > `plugin.toml` additions") for the schema this file follows,
+# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# rules it must satisfy. `language` must equal this directory's own name
+# ("python"), the same rule every other bundled plugin's manifest follows.
+#
+# `command` is a dev-time path into the workspace's own `target/` (relative
+# to this manifest's directory, `plugins/python/`), not a packaged layout -
+# the same dev-checkout contract `plugins/rust/plugin.toml` documents for
+# itself, and for the same reason: this plugin is an ordinary member of the
+# repository's cargo workspace, built by `cargo build` like `core` itself,
+# so it needs no `core/build.rs` step the way the Node and Go plugins do.
+# `g-mesh plugins check plugins/python --fixture <dir>` run from the
+# repository root, after `cargo build -p g-mesh-plugin-python`, is what this
+# path is for today. A release archive does not reuse this file - see
+# `scripts/bundle-rust-plugin.sh`'s own header for why, and expect a
+# `scripts/bundle-python-plugin.sh` to do the same one-line `command`
+# rewrite when this plugin is distributed.
+
+[plugin]
+language = "python"
+protocol_version = 2
+# Must equal this crate's `Cargo.toml` `version`, and `src/semantic.rs`'s
+# `the_manifest_version_matches_the_crates` is what enforces it. It had
+# already drifted by the time GM-299 added that check: this said 0.1.0 (the
+# value GM-295 scaffolded) while the crate had been carried to 3.4.0 by the
+# workspace's own release bumps. Nothing caught it because nothing read both -
+# core reads this file for `g-mesh plugins list` and for its protocol-mismatch
+# message, the plugin announced `env!("CARGO_PKG_VERSION")` in its handshake,
+# and the two screens a person consults about one plugin named different
+# versions. This is the same drift `plugins/rust/plugin.toml`'s own header
+# records, found the same way and fixed the same way.
+plugin_version = "3.4.0"
+
+[plugin.spawn]
+command = "../../target/debug/g-mesh-plugin-python"
+
+[plugin.languages]
+# `.pyi` stubs are claimed too, so an edit to one reaches this plugin and
+# reindexes - see `project`'s module doc ("Decision 6: `.pyi` stubs") for
+# what the project model does with a stub once it is walked: it is indexed
+# (so the plugin never silently drops a file it claims) but never folded into
+# its sibling module's container, because 3.0.0 deliberately did not build
+# `DECLARATION_OF` and a stub's declarations merged into the same container
+# as its `.py` twin would be an unresolvable, silently wrong ambiguity rather
+# than an honestly missing edge.
+extensions = [".py", ".pyi"]
+
+[plugin.capabilities]
+# The pyright tier, over the SDK's generic `LspBridge` (GM-299). `true` is
+# what makes core send `semanticPass` at all, and it puts this plugin under
+# `capabilities.semantic-engine-lazy`: the engine must not exist until the
+# first one arrives (see src/main.rs, which passes a factory).
+semantic_pass = true
+# Receiver calls (`obj.m()`) are an open site the structural tier answers with
+# nothing and the semantic tier answers *when it can* - so the two fields
+# differ, which is the shape `core::mcp::instructions` reads to decide how
+# long to keep listing Python's receiver-call gap: until a semantic pass has
+# actually landed for this language, and not one moment longer.
+#
+# "resolved" here is narrower for Python than for Go or Rust, and the README
+# says so in the words a user needs: pyright resolves a receiver whose type it
+# can infer - a local from its initializer, a parameter from its annotation -
+# and answers `null` for one it cannot, which is every unannotated parameter,
+# every attribute created at run time, and everything reached through
+# `getattr`. The field is a statement about the *tier*, not a promise about
+# every call site; the gap list is the promise.
+receiver_calls = "resolved"
+receiver_calls_structural = "unresolved"
+
+# How to start pyright. Read by *this plugin*, never by core - core has no use
+# for the fields and validating them would make a typo here take the
+# structural tier down with it (see plugins/sdk/src/lsp/config.rs's module doc
+# for the argument in full).
+[plugin.semantic]
+# A bare name: a `PATH` lookup, then the indexed project's own
+# `node_modules/.bin`, then `npx --yes pyright-langserver`. Each candidate is
+# proved by running its *CLI twin* (`pyright --version`), never the server
+# itself, because `pyright-langserver --version` exits 1 with "Connection
+# input stream is not set" - it has no such flag. See src/semantic.rs, which
+# has the measurement. Edit this to point at a specific binary and it will be
+# used as written, probed and not searched around.
+command = "pyright-langserver"
+# NOT optional, unlike rust-analyzer's empty argv. `pyright-langserver` with
+# no transport argument prints the error above and exits before reading a
+# byte of stdin, so a manifest that omits this configures a server that can
+# never start.
+args = ["--stdio"]
+engine = "pyright"
+# EMPTY ON PURPOSE, and it is the one key here that would silently break the
+# whole tier if it were filled in with the obvious value. The Rust plugin sets
+# `implementation_kinds = ["trait"]` and the bridge asks
+# `textDocument/implementation` on every trait; the obvious Python reading is
+# `["class"]`, and pyright answers every such request with
+# `{"code":-32601,"message":"Unhandled method textDocument/implementation"}` -
+# it advertises no `implementationProvider` at all. The bridge reads a
+# JSON-RPC error as a refused question, marks that file uncovered and reports
+# the pass INCOMPLETE, so one wrong word here would mean `semanticPassAt` is
+# never set and the receiver gap is listed forever. `find_implementations` for
+# Python is therefore exactly as structural as it was before this tier
+# existed, and the case that would have needed the sweep - a subclass whose
+# base arrived through a star import - stays a documented gap
+# (conformance/project/pkg/dynamic.py, and README gap 4).
+implementation_kinds = []
+
+# pyright's settings. NOT `initialization_options`: measured on 1.1.414, the
+# same object passed as `initializationOptions` changes nothing at all, while
+# the same object returned from the `workspace/configuration` request pyright
+# sends right after `initialized` changes both the diagnostics and the
+# interpreter it uses. `[plugin.semantic.settings]` is keyed by the section a
+# server asks for; pyright asks for `python` and `pyright`.
+#
+# `typeCheckingMode` is the only thing stated here, and it is a cost setting
+# rather than a correctness one: it decides which diagnostics pyright
+# computes, and this bridge reads none of them. Type *inference* - the part
+# that answers `textDocument/definition` - is identical at every level.
+# Measured on conformance/project: 4 diagnostics at "basic", 39 at "strict".
+#
+# `python.pythonPath` is deliberately NOT here. A project's virtual
+# environment is a path inside the project being indexed, and this file ships
+# beside the plugin binary; src/semantic.rs's `interpreter` finds
+# `<root>/.venv/bin/python` (or the `venv`/Windows spellings) and merges it
+# into this same section at factory time.
+[plugin.semantic.settings.python.analysis]
+typeCheckingMode = "basic"
+
+[plugin.workspace]
+# Any of these moving can move where this project's roots are (`pyproject.toml`
+# packaging hints) or, for `setup.cfg`/`setup.py`, describe packaging this
+# plugin does not parse but still cannot rule out having moved something -
+# see `project`'s module doc ("Decision 4: roots") for why only
+# `pyproject.toml`'s own content is actually read. Any of the three still
+# triggers the same per-language reindex `workspaceChanged` drives, because a
+# plugin that goes stale on an unread file is worse than one that reindexes
+# on a no-op edit.
+watch_files = ["pyproject.toml", "setup.cfg", "setup.py"]
+# A miss-path lookup's container-entry-point name: `__init__` is a package's
+# own file, matched as a bare stem under either extension this plugin claims
+# (`__init__.py`, `__init__.pyi`) - `graph::queries::entry_point_rank_expr`'s
+# own "a bare entry point matches the stem under any extension" rule, the
+# same one `typescript`'s `"index"` relies on.
+entry_points = ["__init__"]
+# Never real source - see `project`'s module doc for why these exact seven
+# names and why this list is duplicated (not shared as code) between this file
+# and `project::EXCLUDE_DIRS`. `node_modules` is the odd one out and was added
+# by GM-299: it is where a project-local pyright is installed - which
+# src/semantic.rs's second resolution branch actively invites - and pyright
+# bundles typeshed, so leaving it in the walk means indexing 5,205 `.pyi`
+# stubs as if they were the project's own declarations.
+exclude_dirs = [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"]

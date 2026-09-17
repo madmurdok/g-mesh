@@ -31,7 +31,7 @@ protocol_version = 2
 # versions. GM-290 made them one value rather than two, by telling the plugin
 # which manifest core read (`daemon::manifest::MANIFEST_PATH_ENV`), so the
 # manifest is now the version that ships and a stale one ships stale.
-plugin_version = "3.3.0"
+plugin_version = "3.4.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-rust"

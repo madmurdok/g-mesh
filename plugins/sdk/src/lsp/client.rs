@@ -99,6 +99,12 @@ pub(crate) struct LspClient {
     stdin: ChildStdin,
     incoming: Receiver<Value>,
     next_id: i64,
+    /// What to answer `workspace/configuration` with, by section - see
+    /// [`SemanticConfig::settings`](super::config::SemanticConfig::settings).
+    /// Copied out of the config at start-up because a server may ask at any
+    /// moment, including from inside [`LspClient::poll`], where the config is
+    /// not in scope.
+    settings: BTreeMap<String, Value>,
     /// How the server counts columns, from the negotiation in `initialize`.
     encoding: PositionEncoding,
     /// Work-done progress tokens the server has begun and not ended. While
@@ -177,6 +183,7 @@ impl LspClient {
             stdin,
             incoming,
             next_id: 1,
+            settings: config.settings.clone(),
             encoding: PositionEncoding::Utf16,
             active_progress: BTreeMap::new(),
             idle_since: Some(Instant::now()),
@@ -350,7 +357,7 @@ impl LspClient {
             // presents.
             (Some(method), Some(id)) => {
                 let id = id.clone();
-                let result = server_request_reply(method, message.get("params"));
+                let result = server_request_reply(method, message.get("params"), &self.settings);
                 let _ = self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                 Poll::Noise
             }
@@ -481,9 +488,20 @@ impl Drop for LspClient {
 /// `workspace/configuration` is the one that cannot be answered with a bare
 /// `null`: it asks for *n* settings and the specification says the answer is
 /// an array of *n* values, so a scalar makes a server that trusts its own
-/// protocol index into nothing. `null` per item means "no configuration for
-/// that section", which is true here - this client carries no user settings -
-/// and is what every server handles.
+/// protocol index into nothing. One value per item, in the order asked.
+///
+/// Each item names a `section`, and that is the whole of the lookup:
+/// `settings` is keyed by section name, a section it holds is answered with
+/// its value, and anything else - a section nobody configured, an item with
+/// no `section` at all - is answered `null`, which means "no configuration
+/// for that section" and is what every server handles. GM-289 answered
+/// `null` unconditionally, which was correct only for a server that takes its
+/// settings through `initializationOptions`; pyright takes them **only**
+/// here, and the measurement is in [`super::config`]'s module doc.
+///
+/// The `scopeUri` an item may also carry is deliberately ignored: this client
+/// opens exactly one workspace folder, so every scope is that folder and a
+/// per-scope answer would be the same answer with more ways to get it wrong.
 ///
 /// Everything else gets `null`, which covers
 /// `window/workDoneProgress/create` (an acknowledgement),
@@ -492,17 +510,29 @@ impl Drop for LspClient {
 /// invents. None of these is language-specific: they are base-protocol
 /// methods.
 ///
-/// A free function because it reads nothing about the client, which is also
-/// what lets its own test call the real thing rather than a copy of it.
-fn server_request_reply(method: &str, params: Option<&Value>) -> Value {
+/// A free function because it reads nothing about the client beyond the map
+/// it is handed, which is also what lets its own test call the real thing
+/// rather than a copy of it.
+fn server_request_reply(method: &str, params: Option<&Value>, settings: &BTreeMap<String, Value>) -> Value {
     match method {
         "workspace/configuration" => {
             let items = params
                 .and_then(|params| params.get("items"))
                 .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            Value::Array(vec![Value::Null; items])
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("section")
+                            .and_then(Value::as_str)
+                            .and_then(|section| settings.get(section))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            )
         }
         _ => Value::Null,
     }
@@ -543,12 +573,43 @@ mod tests {
     /// real spawned server, is in `tests/lsp_bridge.rs`.
     #[test]
     fn a_configuration_request_is_answered_one_value_per_item() {
+        let none = BTreeMap::new();
         let items = json!({ "items": [{}, {}, {}] });
-        assert_eq!(server_request_reply("workspace/configuration", Some(&items)), json!([null, null, null]));
-        assert_eq!(server_request_reply("workspace/configuration", None), json!([]));
+        assert_eq!(
+            server_request_reply("workspace/configuration", Some(&items), &none),
+            json!([null, null, null])
+        );
+        assert_eq!(server_request_reply("workspace/configuration", None, &none), json!([]));
 
         let token = json!({ "token": "t" });
-        assert_eq!(server_request_reply("window/workDoneProgress/create", Some(&token)), Value::Null);
-        assert_eq!(server_request_reply("client/registerCapability", None), Value::Null);
+        assert_eq!(server_request_reply("window/workDoneProgress/create", Some(&token), &none), Value::Null);
+        assert_eq!(server_request_reply("client/registerCapability", None, &none), Value::Null);
+    }
+
+    /// The GM-299 half: a configured section is answered with its value, in
+    /// the order asked, and everything else stays `null`. pyright asks for
+    /// `python` and `pyright` together and indexes the answer positionally,
+    /// so the order and the length are the contract, not just the contents.
+    #[test]
+    fn a_configured_section_is_answered_with_its_value_and_the_rest_stay_null() {
+        let mut settings = BTreeMap::new();
+        settings.insert("python".to_string(), json!({ "analysis": { "typeCheckingMode": "basic" } }));
+
+        let items = json!({ "items": [
+            { "scopeUri": "file:///p", "section": "python" },
+            { "scopeUri": "file:///p", "section": "pyright" },
+            { "scopeUri": "file:///p" },
+        ] });
+        assert_eq!(
+            server_request_reply("workspace/configuration", Some(&items), &settings),
+            json!([{ "analysis": { "typeCheckingMode": "basic" } }, null, null]),
+        );
+
+        // A section nobody asks for is never sent, and asking twice answers
+        // twice - a server may re-request after a `didChangeConfiguration`.
+        let twice = json!({ "items": [{ "section": "python" }, { "section": "python" }] });
+        let answer = server_request_reply("workspace/configuration", Some(&twice), &settings);
+        assert_eq!(answer.as_array().map(Vec::len), Some(2));
+        assert_eq!(answer[0], answer[1]);
     }
 }
