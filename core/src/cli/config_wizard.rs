@@ -101,6 +101,17 @@ pub fn wizard_project<R: BufRead, W: Write>(
         "  a number - idle sleep stays on, and a tree over this limit is put to sleep too, \
          with that language's semantic passes suspended until the daemon restarts"
     )?;
+    // The one place a person actually chooses this number, so the one place
+    // the guarantee has to be stated in the terms they will hold it to. See
+    // GM-304's notes in docs/architecture/multi-language-plugins.md for why a
+    // ceiling is not on offer, and config::PluginConfig::memory_limit_mb.
+    writeln!(writer)?;
+    writeln!(writer, "This is a circuit breaker, not a ceiling: a tree found over the limit is")?;
+    writeln!(writer, "stopped so it cannot keep exceeding it, but it is NOT held under the limit")?;
+    writeln!(writer, "in the first place. A language server can cross the number once and by a")?;
+    writeln!(writer, "wide margin - a real rust-analyzer measured here climbed to 563-580MB over")?;
+    writeln!(writer, "a 13-17s first pass before anything could stop it. Leave headroom: pick a")?;
+    writeln!(writer, "number you can afford to overshoot, not the most you have free.")?;
     let memory_limit_mb = prompt_optional_u64(
         reader,
         writer,
@@ -327,6 +338,23 @@ mod tests {
         assert_eq!(kept_off.plugin.memory_limit_mb, None);
         let (kept_set, _) = run_project_wizard(&set, "\n\n\n");
         assert_eq!(kept_set.plugin.memory_limit_mb, Some(512));
+    }
+
+    /// GM-304's user-facing half. The decision that `memoryLimitMb` is a
+    /// circuit breaker rather than a ceiling is only worth making if the
+    /// person choosing the number is told which one they are getting - someone
+    /// typing 600 on a machine with 1GB free is otherwise expecting a cap the
+    /// daemon holds them under. This prompt is where that choice is made, so
+    /// the wording is part of the behaviour and is asserted like any other
+    /// part of it: both that the limit can be exceeded and roughly by how
+    /// much, in the figures GM-291 actually measured.
+    #[test]
+    fn the_memory_limit_prompt_says_the_limit_can_be_exceeded_once() {
+        let (_, transcript) = run_project_wizard(&ProjectConfig::default(), "\n\n512\n");
+
+        assert!(transcript.contains("circuit breaker, not a ceiling"), "{transcript}");
+        assert!(transcript.contains("NOT held under the limit"), "{transcript}");
+        assert!(transcript.contains("563-580MB"), "{transcript}");
     }
 
     #[test]

@@ -2057,6 +2057,20 @@ memoryLimitMb = 4096        # optional; absent (the default) = no limit, idle sl
 
 - **Off by default.** Absent means exactly today's behaviour: a plugin is only put
   to sleep after `idleTimeoutMinutes` without requests.
+- **What the number guarantees: a circuit breaker, not a ceiling** (GM-304).
+  `memoryLimitMb` does **not** promise that a plugin's process tree will never
+  exceed it. It promises that a tree found over it is stopped, so it cannot go on
+  exceeding it. The plugin is allowed to cross the limit once - in practice by a
+  lot, and for the length of one whole `semanticPass`: measured against a real
+  rust-analyzer over this repo's own fixture (GM-291), the tree climbed from
+  ~5.4MB to a 563-580MB plateau over 13-17 seconds and was suspended a few
+  hundred milliseconds after that pass returned. Someone setting `600` on a
+  machine with 1GB to spare should read that as "rust-analyzer may reach 600MB
+  and a bit before anything stops it", not as a cap the daemon holds it under.
+  "A bit" is bounded only by how fast the tree grows while nothing can act, which
+  for a cold language-server load is hundreds of megabytes. The argument for why
+  this is the only guarantee a sampler *can* give - and why "just sample more
+  often" does not change it - is in the GM-304 notes below.
 - **When set,** idle sleep keeps working, and the limit is enforced alongside it.
   - It applies to **each language plugin's process tree separately**: the plugin
     plus its children, so tsserver, rust-analyzer and a language server behind the
@@ -2068,9 +2082,16 @@ memoryLimitMb = 4096        # optional; absent (the default) = no limit, idle sl
 - **Enforcement.**
   - The supervisor samples the tree's resident memory on the same timer that already
     drives idle-sleep checks.
-  - Over the limit, it puts that plugin to sleep through the existing
-    `sleep_now(reason)` path, with the reason naming the limit and the measured
-    figure, and suspends semantic passes for that language.
+  - An over-limit reading is **confirmed by a second sample, taken in the same
+    check**, before anything is acted on (GM-307). One sample is one instant, and a
+    process tree's membership changes between instants - a `rustc` a `rust-analyzer`
+    shelled out to is a real member of the tree while it lives and gone again a
+    moment later. Suspension is irreversible for this daemon's life; declining to
+    suspend costs at most one tick. The second sample is only ever taken on the path
+    that is about to act, so a healthy tree still costs one scan per tick.
+  - Over the limit on both, it puts that plugin to sleep through the existing
+    `sleep_now(reason)` path, with the reason naming the limit and both measured
+    figures, and suspends semantic passes for that language.
   - The next `fileChanged` wakes the plugin for structural work only. Core does not
     send `semanticPass` to a suspended language, and a plugin starts its semantic
     engine lazily on the first `semanticPass` (a conformance-kit check). So the
@@ -2123,6 +2144,17 @@ later change does not have to re-derive them:
    ceiling on *sustained* growth (a cold `rust-analyzer`/`go/packages` load
    that keeps climbing), not a guard against a transient spike. A tighter
    interval, or sampling on a different trigger, is future work.
+
+   **Closed by GM-304** (notes below), and not in the direction this decision
+   expected. The interval was never the binding constraint: GM-291 measured
+   the thing being caught as a plateau that is never given back, which any
+   interval observes. What is bounded is the *guarantee* - `memoryLimitMb` is
+   a circuit breaker, not a ceiling, and a sampler cannot be a ceiling
+   whatever its interval or its locking. This decision's own last sentence
+   ("a ceiling on sustained growth... not a guard against a transient spike")
+   was closer to right than the word "ceiling" elsewhere in this section; what
+   it lacked was a mechanism that *checks* for "sustained", which GM-307's
+   confirming sample now supplies.
 4. **"Until the daemon restarts or the config changes" is honestly just
    "until it restarts".** `config::read_project_config` is read once, at
    `daemon::run` startup, and nothing in this daemon hot-reloads
@@ -2233,6 +2265,143 @@ limit on "catches it before it's gone" is not the tick period at all - it is
 finding a moment where `check_memory_limit` can actually acquire
 `PluginSupervisor::inner` (note 2, above), which for a *sustained* plateau it
 eventually always can.
+
+#### Implementation notes (GM-304): ceiling or circuit breaker
+
+GM-291 left this section describing a mechanism stronger than the one that
+exists, and GM-274's own notes read as a *ceiling* - the plugin is stopped
+before it can exceed the limit - while what is built is a *circuit breaker* -
+the plugin is allowed to exceed it once and is then suspended so it cannot do
+so repeatedly. Both are defensible guarantees. This task's job was to pick
+one and say so rather than to move the contradiction, and deciding it turned
+out to settle the implementation question too.
+
+**The decision is: circuit breaker.** Four arguments, in descending order of
+how much they settle.
+
+**1. A sampler cannot be a ceiling, whatever its locking looks like.** Sampling
+is retrospective by construction: `process_tree_rss_mb` reports memory that is
+*already resident*. By the time any number crosses a threshold, the allocation
+that crossed it has happened. The only mechanisms that can stop a process
+before it exceeds a figure are the ones where the kernel refuses the
+allocation - `setrlimit(RLIMIT_AS/RLIMIT_DATA)`, a cgroup `memory.max`, a
+Windows job object - and all three are the wrong shape here on three separate
+counts: they bound a *process*, not the lazily-spawned tree `memoryLimitMb` is
+defined over (decision 2); they kill with an allocation failure or an OOM
+rather than suspending, which breaks this section's own "the next `fileChanged`
+wakes the plugin for structural work only"; and they are three more bespoke
+platform surfaces, exactly what GM-274's decision 1 weighed and declined. So
+"ceiling" was never on this mechanism's menu. It was a description of a
+different mechanism that would have to be built instead of this one, not a
+stricter setting of this one.
+
+**2. Changing the locking would change the overshoot's size, not the kind of
+guarantee.** GM-291's finding is real: `semantic_pass` holds
+`PluginSupervisor::inner` for its whole synchronous round trip, so
+`check_memory_limit` can only run before a pass starts or after it returns.
+Suppose that were fixed - the check reads the pid under the lock, releases it,
+samples, re-acquires. It could then sample *during* a pass. It still could not
+act during one: suspending means taking the process out of `inner`, which needs
+the lock the pass is holding. And even a check that could act instantly would
+be chasing a moving number - GM-291 measured rust-analyzer's RSS rising by up
+to ~65MB between samples 0.4-1s apart. At any sampling rate there is a window
+in which the tree is over the limit and nothing knows yet. The overshoot would
+fall from "one whole pass" to "one sample interval". That is a magnitude
+improvement to a circuit breaker; it is not a ceiling.
+
+**3. The locking is not only an obstacle - it is what makes the breaker fire
+promptly, and narrowing it would make suspension *later*.** This is the
+counter-intuitive one, and it is why no locking changed in this task. Today a
+`check_memory_limit` that arrives while a pass is running blocks on `inner` and
+therefore samples at the first instant after the pass returns - which is exactly
+when the tree is at its plateau. Narrow the hold and that same call samples
+immediately instead, mid-ramp, reads a number far under the limit, and returns
+having done nothing; suspension then waits for a later tick. GM-291's own
+`core/tests/plugin_memory_limit.rs` demonstrates this concretely: its checking
+thread gets a 50ms head start, and at 50ms a real rust-analyzer's tree is still
+at its ~5.4MB baseline. Under today's locking that call blocks and catches the
+580MB plateau; under a narrowed lock it would read 5MB and the test's single
+`check_memory_limit` call would suspend nothing. The "obvious improvement"
+makes the mechanism worse at the one job it has.
+
+**4. GM-307 closes it: a hard ceiling could not be stated truthfully anyway.**
+The number a ceiling would be enforced against is a single sample of a tree
+whose membership changes underneath it (see the GM-307 notes below). A
+guarantee phrased as "never exceeds N" would be false at its own boundary for
+reasons that have nothing to do with the plugin.
+
+**What changed as a result.** No locking, and no change to when the check runs.
+Two things:
+
+- The guarantee is now stated as a circuit breaker everywhere a user meets it -
+  this section's own bullet list, `config::PluginConfig::memory_limit_mb`'s doc
+  comment, and the `g-mesh config` wizard's prompt, which is where someone
+  actually chooses the number. The wizard says plainly that the tree may exceed
+  the limit once and by how much, citing GM-291's measured 563-580MB plateau,
+  because the person typing `600` on a machine with 1GB free is the person this
+  distinction is for.
+- `check_memory_limit` confirms an over-limit reading with a second sample
+  before suspending (GM-307's finding applied to the product path first).
+
+GM-274's decision 3 and `daemon::lifecycle`'s module doc both carried this as
+an open question about the *sampling interval*. It is closed, and it was never
+about the interval: GM-291 measured the thing being caught as a plateau that is
+never given back, which any interval observes. What bounds the mechanism is
+argument 1 - that a sampler reports what has already happened.
+
+#### Implementation notes (GM-307): one sample is one instant
+
+`daemon::memory::tests::a_freshly_spawned_childs_memory_is_included_in_its_parents_tree`
+asserted that adding a live child could never make its parent's process-tree
+RSS look smaller, comparing an aggregate sampled before the spawn against one
+sampled after it. It passes alone and fails inside a full suite run.
+
+The assumption is false, and the reason is sharper than "sampling is noisy
+under memory pressure": **the tree it measures is not the test's own.** In a
+full `cargo test --lib` run the test binary is running hundreds of tests
+concurrently, several of which spawn Node plugins and whole `g-mesh daemon`
+subprocesses - every one of them a member of the tree rooted at the test
+process. The difference between the two aggregates is dominated by other
+tests' children coming and going. Measured on this repository: 350MB then
+180MB at load 105-121; 487MB then 290MB at load 21-41; 597MB then 421MB at
+load 20-27 - each with a ~1MB `sleep` added in between. A 170-200MB fall in
+milliseconds is not the OS reclaiming pages from one process.
+
+Two controls fix what that means. Run alone, the old assertion passed 5/5 even
+at load 195-215 - so it is the shared tree, not the machine's load, that
+falsifies it. And with `process_tree_sample`'s descendant walk deliberately
+severed, so decision 2 is comprehensively broken, the old assertion still
+*passed* while its replacement failed. It was both unsound and insensitive:
+failing when nothing was wrong, passing when the thing it guarded was gone.
+
+So the fix is not a wider tolerance on the same subtraction:
+
+- **The sampler answers about members, not just totals.**
+  `daemon::memory::process_tree_sample` returns a `ProcessTreeSample` carrying
+  every pid the walk reached with its own RSS, and `process_tree_rss_mb`
+  becomes a thin reading of it. Decision 2's actual claim is about
+  *membership* - the freshly spawned child is in the walk - and membership is
+  answerable inside one snapshot, where no other test's process can move
+  anything. The test now asserts the child is a member, has RSS of its own,
+  and that the total is its members' sum.
+- **`check_memory_limit` confirms before it acts.** The same fact bites the
+  product path, where one aggregate drives a decision that is irreversible for
+  this daemon's life: a `rustc` or build script that a `rust-analyzer` shelled
+  out to is a genuine member of the plugin's tree for as long as it lives, and
+  an instant that happens to contain one is the *transient spike* GM-274's
+  decision 3 explicitly says this mechanism does not exist to catch. So an
+  over-limit reading is confirmed by a second sample, and the language is
+  suspended only if that one is over the limit too. The asymmetry is
+  deliberate - suspension is irreversible, while declining to suspend costs at
+  most one tick, because what the breaker exists to catch is by measurement a
+  plateau that is never given back. The confirming sample is taken only on the
+  path that is about to act, so the common case still costs one scan per tick.
+
+Verified as an A/B rather than asserted: both assertions were run in the same
+binary, in the same suite, against the same tree. Over 8 full-suite reps at
+load 20-52 the old assertion failed twice and the replacement failed zero
+times; across 11 full-suite runs and 5 isolated runs the replacement has not
+failed once.
 
 ## Data Flow
 
