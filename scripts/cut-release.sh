@@ -7,7 +7,7 @@
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
 #   scripts/cut-release.sh <version> --push       # ...and push the tag
-#   scripts/cut-release.sh <version> --skip-tests # skip the `cargo test --workspace` run
+#   scripts/cut-release.sh <version> --skip-tests # skip the cargo test runs (--workspace and -p g-mesh)
 #
 # This script does NOT bump the version - that already happened as the
 # release branch's first commit. What it does instead is VERIFY that
@@ -96,6 +96,54 @@
 # after a preflight check fails post-test (e.g. to fix --push without paying
 # for the suite twice) - use it deliberately, not as a default habit.
 #
+# GM-302: `cargo test --workspace` above is GM-288's deliberate choice, but a
+# workspace is not the configuration that ships. `build-targets.sh` builds
+# core package-scoped, from `core/` (`cd core && cargo build`, no `-p`) -
+# `plugins/rust` and `plugins/python` (and whatever THEY pull in) are not in
+# that graph, whereas `--workspace` builds every one of them alongside core in
+# the same cargo invocation. Cargo unifies features across everything built
+# together, so this is a real question, not a hypothetical one: does anything
+# plugins/rust or plugins/python depend on change what CORE itself links?
+#
+# The concrete instance that prompted this: `plugins/rust` and
+# `plugins/python` both depend on `tree-sitter`, which depends on
+# `serde_json` with its `preserve_order` feature (swaps `serde_json::Map`'s
+# backing store from `BTreeMap`, sorted, to `IndexMap`, insertion-ordered).
+#
+#   cargo tree -p g-mesh -e features | grep -c preserve_order   -> 0
+#   cargo tree              -e features | grep -c preserve_order   -> 1
+#
+# Read at face value that says core's own JSON key order differs between the
+# two builds - a real concern, since MCP tool results and schemas are JSON.
+# MEASURED rather than stopped at that reading (this repo's own house rule:
+# an argument from a `cargo tree` line is worth less than checking what
+# actually gets linked): `tree-sitter`'s need for `preserve_order` is a
+# BUILD-dependency of tree-sitter's own code generation, and cargo's
+# resolver v2 keeps build-dependencies and proc-macros (`rmcp-macros` needs
+# the same feature, as a proc-macro) in a separate "host artifact" feature
+# resolution from the normal/target graph a linked binary or library actually
+# draws from - which is exactly why `cargo tree -e normal,features,
+# no-proc-macro` (excluding precisely those two host-only edge kinds) reads 0
+# on BOTH the scoped and the workspace view. Confirmed three more ways, not
+# just argued: (1) `cargo build --workspace -v`'s rustc invocation for the
+# `g-mesh` bin, AND for core's own lib/test targets under `cargo test
+# --workspace`, both pass `--extern serde_json=` the identical compiled unit
+# (features `["alloc","default","std"]`, no `preserve_order`) - so does
+# `plugins/rust`'s own bin/test targets, for the same reason; (2) that unit's
+# Cargo fingerprint records those exact features; (3) a real `g-mesh mcp-shim`
+# process, spoken to over its actual NDJSON wire protocol with a hand-framed
+# `initialize` + `tools/list`, returns a BYTE-IDENTICAL response - every tool
+# schema's property order included - whether the binary was built scoped or
+# workspace-wide. So today, core's shipped JSON key order does not actually
+# diverge from what `cargo test --workspace` exercises; `check_core_feature_
+# isolation` below is the standing check that this stays true, since nothing
+# about resolver v2's host/target separation is guaranteed by this script,
+# only observed. `cargo test -p g-mesh` further down is the general backstop
+# underneath that specific check: it actually builds and runs core's own
+# suite in the exact scope that ships, so a divergence of any kind - this
+# one, or one a future dependency introduces that this narrow check does not
+# anticipate - has to fail a real test to reach a release.
+#
 # ---------------------------------------------------------------------------
 # WHAT IT REFUSES ON
 #
@@ -113,6 +161,12 @@
 #     disagreeing with core's version (GM-303)
 #   - plugins/go's or plugins/typescript's plugin.toml `plugin_version`
 #     disagreeing with that plugin's own manifest of record (GM-303)
+#   - core's own normal dependency graph reaching serde_json's
+#     `preserve_order` feature (GM-302) - see that comment above for why this
+#     is checked directly instead of trusted to stay absent
+#   - `cargo test --workspace` failing, OR `cargo test -p g-mesh` failing
+#     (GM-302 added the second one; GM-288's comment on the first explains why
+#     both run rather than either replacing the other)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -134,7 +188,7 @@ usage: scripts/cut-release.sh <version> [--push] [--skip-tests]
 
   <version>      the release version, X.Y.Z, matching core/Cargo.toml
   --push         also push the tag (starts the build/publish workflow)
-  --skip-tests   skip the `cargo test --workspace` run before tagging
+  --skip-tests   skip the cargo test runs (--workspace and -p g-mesh, GM-302) before tagging
 EOF
 }
 
@@ -283,6 +337,47 @@ check_self_versioned_plugin_versions() {
 	log "self-versioned plugin_version agrees with its own manifest: typescript $ts_manifest_version, go $go_manifest_version"
 }
 
+# GM-302: refuses if core's own NORMAL (non-build, non-proc-macro) dependency
+# graph reaches serde_json's `preserve_order` feature - see this script's
+# header comment for the full investigation. `-e normal,features,
+# no-proc-macro` is the edge-kind filter that excludes precisely the two host
+# contexts (tree-sitter's build-dependency, rmcp-macros' proc-macro) that
+# today carry `preserve_order` into `cargo tree -e features`'s default,
+# all-edge-kinds reading without ever reaching a linked artifact - so this is
+# the command that actually answers "does core's shipped JSON key order
+# differ", not the broader one. Cheap and fast on purpose (no build, just
+# resolver output) so it runs before the ten-plus-minute test suite rather
+# than after it.
+#
+# Demonstrated to have teeth, not just to pass today: temporarily adding
+# `features = ["preserve_order"]` to core/Cargo.toml's own `serde_json` line
+# flips this command's count from 0 to 1 and this function from passing to
+# dying - see GM-302's completion notes for the transcript. Reverted before
+# that commit; core's `serde_json` line is untouched by this task.
+check_core_feature_isolation() {
+	local runtime_hits
+	runtime_hits="$(cargo tree -p g-mesh -e normal,features,no-proc-macro 2>/dev/null | grep -c preserve_order || true)"
+	if [ "$runtime_hits" -ne 0 ]; then
+		die "core's own normal dependency graph now reaches serde_json's preserve_order feature ($runtime_hits edge(s) via 'cargo tree -p g-mesh -e normal,features,no-proc-macro') - core's shipped JSON key order would differ from what cargo test --workspace exercises; see this script's GM-302 header comment before proceeding"
+	fi
+	log "core's runtime dependency graph does not reach preserve_order (GM-302): cargo tree -p g-mesh -e normal,features,no-proc-macro -> 0"
+
+	# Informational only, never a failure: the raw, all-edge-kinds count
+	# `cargo tree -e features` reports by default (what GM-302's own
+	# investigation started from, and what plugins/rust/Cargo.toml's and
+	# plugins/python/Cargo.toml's own comments point at) still disagrees
+	# between the scoped and workspace views. Logged so a reader who only ran
+	# the bare commands from those comments is not left thinking this
+	# function missed something - the check above already confirmed that
+	# specific disagreement is host-only and does not reach anything linked.
+	local scoped_all workspace_all
+	scoped_all="$(cargo tree -p g-mesh -e features 2>/dev/null | grep -c preserve_order || true)"
+	workspace_all="$(cargo tree -e features 2>/dev/null | grep -c preserve_order || true)"
+	if [ "$scoped_all" != "$workspace_all" ]; then
+		log "note: cargo tree -e features (all edge kinds, cargo's default) still disagrees - $scoped_all (scoped) vs $workspace_all (workspace); confirmed host-only (tree-sitter's build-dependency, rmcp-macros' proc-macro) by the runtime-scoped check above, so this is not gated on"
+	fi
+}
+
 # owner/repo parsed from the `origin` remote, for printing real URLs at the
 # end rather than a placeholder someone has to mentally substitute.
 origin_slug() {
@@ -382,6 +477,11 @@ main() {
 	check_crate_backed_plugin_versions "$crate_version"
 	check_self_versioned_plugin_versions
 
+	# GM-302: cheap (no build) and fast, so it runs before the ten-plus-minute
+	# suite below rather than after it - see this script's header comment and
+	# the function's own for the full investigation.
+	check_core_feature_isolation
+
 	if [ "$skip_tests" -eq 1 ]; then
 		log "skipping cargo test (--skip-tests)"
 	else
@@ -399,7 +499,30 @@ main() {
 		(cd "$REPO_ROOT" && cargo test --workspace) ||
 			die "cargo test --workspace failed - fix the failure before cutting a release"
 		test_end="$(date +%s)"
-		log "cargo test passed in $((test_end - test_start))s"
+		log "cargo test --workspace passed in $((test_end - test_start))s"
+
+		# GM-302: --workspace above is deliberate (GM-288's comment on it,
+		# just above, explains why) and stays - this is IN ADDITION, not a
+		# replacement. `check_core_feature_isolation` already confirmed core's
+		# own linked serde_json is the same in both configurations today, but
+		# that confirmation is a property of this repository's CURRENT
+		# dependency graph, not a standing guarantee the way a type system
+		# would give - a future dependency change could shift it without that
+		# narrow check anticipating the new shape. This run is the general
+		# backstop underneath it: it actually builds and tests core in the
+		# exact package scope `build-targets.sh` ships (`cd core && cargo
+		# build`, no `-p`, which is what `-p g-mesh` from the workspace root
+		# resolves the same way - both exclude plugins/rust and
+		# plugins/python from the graph entirely), so ANY divergence between
+		# what ships and what `--workspace` above just tested - this one, or
+		# a different one neither check above was written for - has to fail
+		# a real test to reach a release.
+		log "running cargo test -p g-mesh - the exact package scope build-targets.sh ships (GM-302)"
+		test_start="$(date +%s)"
+		(cd "$REPO_ROOT" && cargo test -p g-mesh) ||
+			die "cargo test -p g-mesh failed - the shipped configuration itself is broken, even though cargo test --workspace passed; fix it before cutting a release (see GM-302)"
+		test_end="$(date +%s)"
+		log "cargo test -p g-mesh passed in $((test_end - test_start))s"
 	fi
 
 	log "tagging $tag on $(git -C "$REPO_ROOT" rev-parse --short main)"
