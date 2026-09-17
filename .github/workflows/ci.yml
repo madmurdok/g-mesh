@@ -211,22 +211,11 @@ jobs:
       # plugin surfaced only through the Rust integration tests that happen
       # to exercise the same path, if any did.
       #
-      # `npm run build` here, and that is GM-312's correction to GM-275's own
-      # reasoning: this step used to say it "needs only what `npm ci` above
-      # just installed", which is false - `npm test` is `node --test
-      # dist/test`, so it needs the TypeScript *compiled*, not merely the
-      # dependencies fetched. On a developer machine dist/ has been there
-      # since day one; in CI it is produced by `core/build.rs` during the
-      # Rust steps, which run AFTER this one. So every runner failed here
-      # with `Cannot find module '.../plugins/typescript/dist/test'` the
-      # first time this workflow was ever run on a commit newer than GM-275
-      # - four red runners, one missing line. Building here also means the
-      # plugin's own suite gates on the same dist/ the Rust tests will use.
+      # Runs before the slower Rust steps; `pretest` in package.json builds
+      # the plugin, so this needs only what `npm ci` above installed.
       - name: JS/TS plugin tests (npm test)
         working-directory: plugins/typescript
-        run: |
-          npm run build
-          npm test
+        run: npm test
 
       # The Go plugin is a second bundled plugin with a real toolchain
       # dependency, and the same "test dependency, not only a packaging one"
