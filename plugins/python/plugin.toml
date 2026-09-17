@@ -30,6 +30,12 @@ protocol_version = 2
 # and the two screens a person consults about one plugin named different
 # versions. This is the same drift `plugins/rust/plugin.toml`'s own header
 # records, found the same way and fixed the same way.
+# GM-303 wrote down the general rule this is one case of: a plugin that
+# joins the cargo workspace tracks the release version (transitively, via
+# its own crate's version); a plugin built by its own separate toolchain
+# (plugins/go, plugins/typescript) tracks its own manifest of record
+# instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
+# rules, not one".
 plugin_version = "3.5.0"
 
 [plugin.spawn]

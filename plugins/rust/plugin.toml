@@ -31,6 +31,12 @@ protocol_version = 2
 # versions. GM-290 made them one value rather than two, by telling the plugin
 # which manifest core read (`daemon::manifest::MANIFEST_PATH_ENV`), so the
 # manifest is now the version that ships and a stale one ships stale.
+# GM-303 wrote down the general rule this is one case of: a plugin that
+# joins the cargo workspace tracks the release version (transitively, via
+# its own crate's version); a plugin built by its own separate toolchain
+# (plugins/go, plugins/typescript) tracks its own manifest of record
+# instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
+# rules, not one".
 plugin_version = "3.5.0"
 
 [plugin.spawn]

@@ -40,6 +40,45 @@
 # only fixed: this decision is what the next language plugin's manifest
 # should follow too.
 #
+# GM-303: `plugin.toml`'s own `plugin_version` - a different field from every
+# manifest `[package] version` above, and checked by a different rule, not
+# the same one repeated. `g-mesh plugins list` prints it and core names it in
+# a protocol-mismatch message, so whichever rule applies to a given plugin is
+# the number a person reads first about it - and the four bundled plugins do
+# not all follow the same one:
+#
+#   - plugins/rust and plugins/python ARE cargo workspace members (their
+#     Cargo.toml is already in OTHER_WORKSPACE_MANIFESTS above), and each has
+#     its own test forcing `plugin_version` to equal ITS crate's version
+#     (`the_manifest_version_matches_the_crates`, added by GM-290 and GM-299
+#     after finding it had drifted - plugins/rust/plugin.toml still said
+#     0.1.0 three releases after the crate reached 3.3.0). Chained with the
+#     check above, that makes `plugin_version` the release version for these
+#     two, transitively - so `check_crate_backed_plugin_versions` below
+#     checks it directly against `$crate_version`, the same way
+#     `check_workspace_versions` does for the Cargo manifests.
+#   - plugins/go and plugins/typescript are NOT workspace members - a
+#     separate Go module and a separate npm package, each bumped by hand for
+#     the plugin's OWN capability changes and nothing else
+#     (plugins/typescript/package.json: 2.0.0 -> 2.1.0 for becoming a
+#     self-contained Node SEA, -> 2.2.0 for the --run-node entry path;
+#     plugins/go/wire.go's `pluginVersion` const: 0.1.0 -> 0.2.0 for the
+#     go/types semantic tier). Forcing these to the release version would
+#     make the number lie - g-mesh 3.5.0 shipped no change to the Go plugin
+#     at all - so what `check_self_versioned_plugin_versions` below checks
+#     instead is INTERNAL agreement: plugin.toml's copy against that
+#     plugin's own manifest of record (package.json's `.version`, or the
+#     `pluginVersion` const). Each already has a test for this too
+#     (`every_declaration_of_the_bundled_plugins_version_agrees` in
+#     core/src/daemon/manifest.rs; `TestPluginVersionMatchesTheManifest` in
+#     plugins/go/manifest_test.go) - this script re-checks it directly by
+#     reading the files, so drift is still caught under --skip-tests, and for
+#     Go, without a Go toolchain on PATH (`go test` cannot run at all then).
+#
+# docs/architecture/plugin-modularity.md ("plugin_version: two rules, not
+# one") is where a plugin author reads this before adding a fifth plugin;
+# this comment is the enforcement side of that same decision.
+#
 # It tags `main`, and only after the release branch has already been merged
 # into it - the tag is meant to point at the code someone gets by cloning, not
 # at a branch tip nobody else can see. It does not create the release branch,
@@ -70,6 +109,10 @@
 #   - a version string that is not `X.Y.Z`
 #   - `core/Cargo.toml`'s version disagreeing with the argument
 #   - any other workspace member's version disagreeing with core's (GM-288)
+#   - plugins/rust's or plugins/python's plugin.toml `plugin_version`
+#     disagreeing with core's version (GM-303)
+#   - plugins/go's or plugins/typescript's plugin.toml `plugin_version`
+#     disagreeing with that plugin's own manifest of record (GM-303)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -150,6 +193,94 @@ check_workspace_versions() {
 		die "fix every listed manifest's [package] version to $core_version before tagging"
 	fi
 	log "workspace versions agree: $core_version (core, ${OTHER_WORKSPACE_MANIFESTS[*]})"
+}
+
+# GM-303: bundled plugins whose plugin.toml `plugin_version` must equal the
+# release version because the crate it's built from already does (see this
+# script's header comment for the full rule and why Go/TypeScript are not
+# here). A new cargo-workspace plugin's manifest is a deliberate addition to
+# this list, the same fail-closed shape OTHER_WORKSPACE_MANIFESTS uses.
+CRATE_BACKED_PLUGIN_MANIFESTS=(
+	"plugins/rust/plugin.toml"
+	"plugins/python/plugin.toml"
+)
+
+# The `plugin_version` of a plugin.toml's `[plugin]` section. Same
+# restriction as `package_version` and for the same reason: scoping to the
+# section it's declared in is what keeps this correct if the key ever
+# appears elsewhere too.
+plugin_toml_version() {
+	awk '
+		/^\[/ { in_plugin = ($0 == "[plugin]") }
+		in_plugin && /^plugin_version[[:space:]]*=/ {
+			gsub(/[",]/, "", $3); print $3; exit
+		}
+	' "$1"
+}
+
+# Refuses if plugins/rust's or plugins/python's plugin.toml `plugin_version`
+# disagrees with `$core_version` - the release-tracking half of GM-303's
+# rule. Collects every mismatch before dying, same reasoning as
+# `check_workspace_versions`.
+check_crate_backed_plugin_versions() {
+	local core_version="$1" manifest path mismatches=()
+	for manifest in "${CRATE_BACKED_PLUGIN_MANIFESTS[@]}"; do
+		path="$REPO_ROOT/$manifest"
+		[ -f "$path" ] || die "plugin manifest not found: $manifest (update CRATE_BACKED_PLUGIN_MANIFESTS in this script if it moved or was removed)"
+		local plugin_version
+		plugin_version="$(plugin_toml_version "$path")"
+		[ -n "$plugin_version" ] || die "could not determine plugin_version from $manifest"
+		if [ "$plugin_version" != "$core_version" ]; then
+			mismatches+=("$manifest says $plugin_version")
+		fi
+	done
+	if [ ${#mismatches[@]} -gt 0 ]; then
+		local line
+		echo "cut-release: plugin_version drift - core/Cargo.toml says $core_version, but:" >&2
+		for line in "${mismatches[@]}"; do
+			echo "  - $line" >&2
+		done
+		die "fix every listed plugin.toml's plugin_version to $core_version before tagging"
+	fi
+	log "crate-backed plugin_version agrees: $core_version (${CRATE_BACKED_PLUGIN_MANIFESTS[*]})"
+}
+
+# Refuses if plugins/typescript's or plugins/go's plugin.toml
+# `plugin_version` disagrees with that plugin's own manifest of record - the
+# self-versioned half of GM-303's rule. Deliberately NOT compared against
+# `$core_version`: these two are not cargo workspace members and their
+# version tracks the plugin's own history, not the release train (see this
+# script's header comment).
+check_self_versioned_plugin_versions() {
+	local mismatches=()
+
+	local ts_manifest_version ts_package_version
+	ts_manifest_version="$(plugin_toml_version "$REPO_ROOT/plugins/typescript/plugin.toml")"
+	[ -n "$ts_manifest_version" ] || die "could not determine plugin_version from plugins/typescript/plugin.toml"
+	ts_package_version="$(grep -m1 '"version"' "$REPO_ROOT/plugins/typescript/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+	[ -n "$ts_package_version" ] || die "could not determine .version from plugins/typescript/package.json"
+	if [ "$ts_manifest_version" != "$ts_package_version" ]; then
+		mismatches+=("plugins/typescript/plugin.toml says $ts_manifest_version, plugins/typescript/package.json says $ts_package_version")
+	fi
+
+	local go_manifest_version go_const_version
+	go_manifest_version="$(plugin_toml_version "$REPO_ROOT/plugins/go/plugin.toml")"
+	[ -n "$go_manifest_version" ] || die "could not determine plugin_version from plugins/go/plugin.toml"
+	go_const_version="$(grep -E -m1 '^[[:space:]]*pluginVersion[[:space:]]*=' "$REPO_ROOT/plugins/go/wire.go" | sed -E 's/.*"([^"]+)".*/\1/')"
+	[ -n "$go_const_version" ] || die "could not determine pluginVersion from plugins/go/wire.go"
+	if [ "$go_manifest_version" != "$go_const_version" ]; then
+		mismatches+=("plugins/go/plugin.toml says $go_manifest_version, plugins/go/wire.go says $go_const_version")
+	fi
+
+	if [ ${#mismatches[@]} -gt 0 ]; then
+		local line
+		echo "cut-release: plugin_version disagrees with the plugin's own manifest of record:" >&2
+		for line in "${mismatches[@]}"; do
+			echo "  - $line" >&2
+		done
+		die "fix the listed plugin.toml (or its counterpart) so the two agree before tagging"
+	fi
+	log "self-versioned plugin_version agrees with its own manifest: typescript $ts_manifest_version, go $go_manifest_version"
 }
 
 # owner/repo parsed from the `origin` remote, for printing real URLs at the
@@ -245,6 +376,11 @@ main() {
 	# own hand-pinned version - see this script's header comment for why this
 	# is a second check here rather than workspace-level inheritance.
 	check_workspace_versions "$crate_version"
+
+	# GM-303: plugin.toml's `plugin_version`, checked by two different rules
+	# for two different reasons - see this script's header comment.
+	check_crate_backed_plugin_versions "$crate_version"
+	check_self_versioned_plugin_versions
 
 	if [ "$skip_tests" -eq 1 ]; then
 		log "skipping cargo test (--skip-tests)"

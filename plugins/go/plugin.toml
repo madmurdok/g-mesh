@@ -12,6 +12,12 @@ protocol_version = 2
 # 0.2.0 is GM-281, which added the go/types semantic tier. Kept equal to
 # wire.go's `pluginVersion` by plugins/go/manifest_test.go - nothing on the
 # core side compares the two, so the plugin's own suite is what does.
+# scripts/cut-release.sh re-checks the same agreement directly at release
+# time, since `go test` does not run there. This plugin's OWN semver, not
+# g-mesh's release version, because this is a separate Go module, not a
+# cargo workspace member - GM-303 wrote the general rule down
+# (docs/architecture/plugin-modularity.md, "plugin_version: two rules, not
+# one"), of which this is one case and plugins/typescript's is the other.
 plugin_version = "0.2.0"
 
 [plugin.spawn]

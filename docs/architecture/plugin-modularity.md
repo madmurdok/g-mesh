@@ -221,7 +221,7 @@ language = "python"          # must equal the containing directory's name;
 protocol_version = 1         # must equal core's CURRENT_PROTOCOL_VERSION;
                               # a fast pre-check before ever spawning — the
                               # live Handshake remains the authoritative check
-plugin_version = "0.1.0"     # free-form, shown by `g-mesh plugins list`
+plugin_version = "0.1.0"     # see "plugin_version: two rules, not one" below
 
 [plugin.spawn]
 command = "node"             # argv[0]: resolved on $PATH if it has no path
@@ -261,6 +261,47 @@ scheduler and workspace routing added on top of this design (task GM-269);
 see [`multi-language-plugins.md`](./multi-language-plugins.md)'s "`plugin.toml`
 additions" section for the full field list, defaults, and the rationale behind
 each one — not repeated here.
+
+**`plugin_version`: two rules, not one (GM-303).** It is what
+`g-mesh plugins list` prints and what core names in a protocol-mismatch
+message, so whichever rule applies to a given plugin, it is the number a
+person reads first when reporting a bug about it — and it must therefore
+never be free-form the way the original comment above called it. Which rule
+applies depends on how the plugin is built, and conflating the two is exactly
+the mistake to avoid:
+
+- **`plugins/rust` and `plugins/python` are ordinary members of this
+  repository's own cargo workspace** (see `Cargo.toml` and the GM-288 header
+  in `scripts/cut-release.sh`). Their crate `version` is already forced to
+  equal core's own at every release cut, so `plugin_version` tracking that
+  crate version — `the_manifest_version_matches_the_crates` in each plugin's
+  `src/semantic.rs`, added by GM-290 and GM-299 after finding the two had
+  drifted — makes it, transitively, **the g-mesh release version**. A plugin
+  that joins the cargo workspace follows this rule.
+- **`plugins/go` and `plugins/typescript` are not workspace members at all** —
+  a separate Go module and a separate npm package, each with its own release
+  history, bumped by hand for the plugin's *own* capability changes and
+  nothing else (`plugins/typescript/package.json`: 2.0.0 → 2.1.0 for becoming
+  a self-contained Node SEA, → 2.2.0 for the `--run-node` entry path;
+  `plugins/go/wire.go`'s `pluginVersion` const: 0.1.0 → 0.2.0 for the
+  go/types semantic tier). Tying these to the release version would make the
+  number lie — g-mesh 3.5.0 shipped no change to the Go plugin at all — so
+  what has to hold instead is **internal agreement**: `plugin.toml`'s copy
+  against the plugin's own manifest of record (`package.json`'s `.version`,
+  or the `pluginVersion` const), which each plugin's own test already checks
+  (`every_declaration_of_the_bundled_plugins_version_agrees` in
+  `core/src/daemon/manifest.rs`; `TestPluginVersionMatchesTheManifest` in
+  `plugins/go/manifest_test.go`) and `scripts/cut-release.sh` re-checks
+  directly, so the drift is caught even under `--skip-tests` and without a Go
+  toolchain on `PATH`. A plugin built by its own separate toolchain — not
+  added to the cargo workspace — follows this rule instead.
+
+A fifth plugin's author: pick the rule by which category the plugin falls
+into (joins the cargo workspace, or ships its own toolchain), add it to the
+matching list in `scripts/cut-release.sh`, and this file's example above
+still applies unchanged — only which rule the number obeys was ever in
+question, not the field's existence or its meaning to a reader of
+`g-mesh plugins list`.
 
 **Built-in baseline ignore, applied to every plugin regardless of
 manifest**: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
