@@ -723,6 +723,16 @@ mod tests {
         let dir = bundled_typescript_plugin_dir();
         let manifest = read_manifest(&dir).expect("failed to read the bundled plugin's manifest");
 
+        // Same check `daemon::plugin::PluginState::spawn` makes before
+        // spawning for real - see that function's doc comment. Without it,
+        // an unbuilt `dist/` still lets `node` spawn successfully here and
+        // fails only once its stdout closes with no handshake, which names
+        // nothing about npm.
+        if let Some(hint) = crate::daemon::plugin::missing_node_entry_hint(&manifest.command, &manifest.args)
+        {
+            panic!("{hint}");
+        }
+
         let mut plugin = std::process::Command::new(&manifest.command)
             .args(&manifest.args)
             .stdin(std::process::Stdio::piped())
