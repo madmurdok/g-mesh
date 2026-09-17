@@ -14,6 +14,8 @@
 //! See `project`'s module doc for the project model itself, and
 //! `extractor`'s for why `extract` is presently a stub.
 
+#[cfg(test)]
+pub(crate) mod census;
 pub mod extractor;
 pub mod project;
 pub mod semantic;

@@ -842,6 +842,239 @@ including the readiness gate (which fails, as it must, when the gate is
 removed), both column conversions, the implementation mapping, a request
 timeout, and a crash mid-pass after which the bridge starts a fresh server.
 
+#### Implementation notes (GM-314): the open-site volume, measured
+
+**The answer is to change nothing about the question list, and to fix the
+budget instead.** GM-299's finding 4 - the limit on what a semantic tier
+recovers is the bridge's *question list*, not the engine - is confirmed, and
+measuring the alternatives on real corpora says the list is already the right
+one and already too long. (That note is filed under the Python plugin below;
+this one sits here because the finding is about `OpenSite` and `Budgets`, which
+are the SDK's, and because half the numbers are Rust's.) Every candidate widening adds 21-93% more
+questions to recover, at the very most, 0.3-26% of them; and on three of the
+four corpora measured **the question list the plugins emit today already
+exceeds `Budgets::max_sites` (20,000)**, which `questions()` silently truncates
+and `SemanticAnswer { complete: !plan.truncated }` then reports as an incomplete
+pass - so `language_state.semanticPassAt` is never set, and the receiver gap
+those plugins' MCP instructions promise to close stays listed forever. That is
+a live defect in 3.5.0, found by measuring the alternatives rather than by
+adding one.
+
+**The corpora.** Four real checkouts, named so the numbers can be reproduced.
+`g-mesh-bench`'s own corpora are both TypeScript (`excalidraw`,
+`task-tracker-mcp`), so neither language could use them.
+
+| corpus | language | files walked | commit |
+|---|---|---:|---|
+| `django/django` | Python | 2,932 | `2abf9d2cf8602f0ddc0db4ec1a33769b41b4232a` |
+| `pallets/flask` | Python | 83 | `d73fa1cdcbd8b1465c151db8924ba58b1dd14e35` |
+| `tokio-rs/tokio` | Rust | 799 | `cf782c5b917b7ea21b6f97f07104ebf16d35f5f8` |
+| g-mesh itself | Rust | 187 | `b236222`, via `git archive` |
+
+Two per language, deliberately far apart on the axis that turns out to matter.
+Django is a large, old, essentially unannotated codebase (`grep -rc ' -> '`
+finds 76 arrow-annotated lines in 2,932 files); Flask is small, modern and
+fully annotated, and its annotation bucket is 19× Django's on 3% of the files.
+g-mesh is measured from a clean `git archive` of the release tip rather than
+from the worktree, because the worktree contains this task's own census code
+and would otherwise count it - 21,836 sites against the clean tree's 21,659,
+which is the size of the self-reference.
+
+**The method, and what it can be wrong about.** Counts come from the
+extractors' own `resolve_bare`/`resolve_path`, instrumented by a `#[cfg(test)]`
+census module in each plugin (`plugins/python/src/census.rs`,
+`plugins/rust/src/census.rs`) whose every call site is also `#[cfg(test)]`, so
+none of it is compiled into a plugin binary and no production behaviour changes.
+The census walks exactly the file set `--bulk-index` would - the manifests' own
+extensions and `exclude_dirs` through `walk_project` - and reproduces
+`lsp::bridge::questions` exactly, including that `Implementation` sites are
+counted unanswerable and never asked and that `implementation_kinds` adds one
+question per matching node (`["trait"]` for Rust, `[]` for Python). So the
+*site* counts are the extractor's own decisions rather than a regex's guess at
+them, and are exact.
+
+That the instrumentation cannot ship is enforced by the compiler rather than
+asserted: the module is declared `#[cfg(test)] pub(crate) mod census;`, so a
+single unguarded call would fail a non-test build with "use of undeclared
+crate or module", and `nm target/debug/g-mesh-plugin-{python,rust} | grep -c
+census` is `0` for both. And that the census can tell its own buckets apart was
+checked before it was spent on: run against the twelve-file Python conformance
+fixture it returns 40 excluded names, 36 of them `str`, one of them `Speaker`
+in base-class position - which is precisely the site GM-299 found by hand, in
+precisely the bucket the shape-2 argument turns on.
+
+The "could an engine answer it" column is not exact, and errs in one direction.
+It asks whether the name is declared *anywhere* in the same project, by string,
+which counts `list`, `str` and `cfg` as hits because Django declares a method
+named `list` and tokio a function named `cfg`. It is an upper bound, and a
+loose one. The Python builtin list came from this machine's `python3`
+(3.9.6, `dir(builtins)`, 152 names), which is missing 3.11's `ExceptionGroup`,
+`aiter` and `anext` - all three appear in the corpora - so the builtin share is
+understated too. Both errors make the recovered yield look larger than it is.
+
+**Where the budget already stands, before adding anything.**
+
+| corpus | questions built today | vs `max_sites` = 20,000 |
+|---|---:|---|
+| Django | 87,832 | **4.39× - truncated, pass reports incomplete** |
+| tokio | 27,750 | **1.39× - truncated** |
+| g-mesh | 21,663 | **1.08× - truncated** |
+| Flask | 1,825 | 0.09× - fits |
+
+`max(15 min, 8s × files)` is not what binds. Django's pass budget is 8s × 2,932
+= 6.5 hours, inside core's own 10s × 2,932 = 8.1 hours; at eight questions in
+flight and the 2-9ms warm request latency GM-299 measured for pyright, 87,832
+questions is about 100 seconds of work. Even at 100ms a request it is 18
+minutes. The count cap is therefore roughly two orders of magnitude tighter
+than the clock it was justified against - GM-289's own note reasons "20,000
+sites is about four minutes, well inside the floor below", which is right
+arithmetic about a number that turns out to be exceeded by the *first* real
+project either plugin meets. A 189-file repository is not "an order of
+magnitude larger than anything measured".
+
+**Shape 1: every unresolved bare name.** The naive shape, and the one the
+exclusion exists to prevent.
+
+| corpus | added sites | as % of today's list | of which the project declares the name (upper bound) |
+|---|---:|---:|---:|
+| Django | +23,320 | +26.5% | 77 (0.33%) |
+| Flask | +1,704 | +93.4% | 14 (0.82%) |
+| tokio | +5,858 | +21.1% | 1,094 (18.7%) |
+| g-mesh | +5,468 | +25.2% | 1,405 (25.7%) |
+
+For Python the exclusion is vindicated to three significant figures. Django's
+23,320 additional questions are drawn from **253 distinct names**, of which
+23,022 occurrences (98.7%) are builtins or dunders; Flask's 1,704 come from 71
+names, 1,656 (97.2%) builtins. The top of Django's histogram is `str` (2,247),
+`len` (2,137), `super` (1,829), `list` (1,688), `isinstance` (1,640) - exactly
+the flood `bodies`' Decision 7 predicted, and the non-builtin residue is 298
+occurrences of 141 names which are overwhelmingly class-body attributes the
+LEGB walk deliberately does not bind (`CHOICES`, `NUMBER`,
+`sql_delete_constraint`), not cross-file names.
+
+Rust's numbers are genuinely different, and the difference is not `Vec` and
+`String`. Those are there - `Option` (753), `Result` (474), `Sized` (309),
+`Send` (287), `Vec` (233), `Box` (216) head tokio's unresolved-type histogram,
+and `_`, the inferred-type placeholder, appears 80 times and is not a name at
+all. But a quarter of g-mesh's own unresolved names are names g-mesh declares:
+`Diff` (109), `Connection` (93), `SymbolQueryParams` (69). The cause is
+measured rather than guessed: the census records whether a glob `use` is in
+scope for the module each name sits in, and **2,052 of g-mesh's 5,468 (37.5%)
+are under one**, against 359 of tokio's 5,858 (6.1%). That is
+`mod tests { use super::*; }`, the single most common Rust file shape g-mesh
+writes, and it is the exact structural analogue of GM-299's `Speaker`.
+
+**Shape 2: a position where a declaration is expected.** The narrowing the task
+that scheduled this work expected to pay, and the one that pays least.
+
+| corpus | position | added sites | answerable (upper bound) |
+|---|---|---:|---:|
+| Django | base class / decorator / annotation | 163 / 1,215 / 36 = **1,414** | **1** |
+| Flask | base class / decorator / annotation | 18 / 31 / 684 = **733** | **6** |
+| tokio | supertrait + `impl Tr for T` | **373** | 12 |
+| g-mesh | supertrait + `impl Tr for T` | **80** | 4 |
+| tokio | attribute (Rust's decorator) | **11,463** | 658 are `derive` arguments |
+| g-mesh | attribute | **3,051** | 821 are `derive` arguments |
+
+Restricting to declaration positions removes 94% of shape 1's volume in Django
+and keeps essentially none of its value: **one site in 2,932 files**
+(`ChoiceFormSet`, in a base-class position). Django's 1,215 decorator sites are
+100% builtins - `property` (603), `classmethod` (597), `staticmethod` (110) -
+and Flask's 684 annotation sites are 100% builtins, because a fully annotated
+modern Python file is mostly `str`, `int`, `bool` and `None`. The one shape
+GM-299 named by hand, a base class arriving through a star import, is a
+population of **one** across Django and **zero** across Flask; Django has 13
+files with a project-internal `from x import *` and exactly one unresolved bare
+name inside any of them.
+
+Rust attributes are worse than Python decorators, and worse than they look.
+Of tokio's 11,463 attribute names, 5,622 are `#[cfg(...)]` arguments and 4,407
+are attribute heads - `cfg` (1,627), `feature` (1,280), `test` (1,191),
+`target_os` (870), `all` (675), `not` (548). These are conditional-compilation
+predicates: not symbols, not resolvable by any engine, and not even in a
+namespace. Only 658 - 5.7% - are `derive` arguments, the sole attribute
+argument that is a symbol at all, and of those the ones whose name the project
+declares are `Copy` and `Debug` colliding with unrelated local declarations.
+`plugins/rust` does not walk attribute items at all today, and the measurement
+says that is the right amount of work to do on them.
+
+**Shape 3: what a star import could plausibly have introduced.** Python: one
+site in Django, none in Flask. Rust: 2,052 in g-mesh and 359 in tokio, as
+above. The finding that made this task worth doing turns out to be a Rust
+finding wearing Python clothes - which is the GM-299 note's own point, that the
+question list is an architectural limit rather than a Python one, arriving at
+an answer opposite in sign for the two languages.
+
+**Shape 4, what the distribution suggested once visible.** Two things. First,
+the *vocabulary* is tiny: Django's whole excluded bucket is 253 distinct names
+and Flask's is 71, so the flood is not 23,320 different questions but 253
+questions asked 92 times each on average. A per-name answer cache would collapse
+it - which is an argument for a *cheaper* engine protocol, not for a wider
+question list, because the answers would all be "not in this index". Second,
+the Rust value concentrates in **value** position under a glob, not type
+position: g-mesh's `BareUnknownValue` bucket is 1,965 sites of which 700 name
+project declarations (`row`, `KEY_NAME`, `JSONRPC_VERSION`), a 36% hit rate
+against 20% for types. The exclusion Decision 7 argues for is about types; the
+bucket it silently also excludes is the one with the better yield.
+
+**Commands.** Each census run is one command; the analysis is `python3` over
+the TSVs it writes.
+
+```text
+GM314_CORPUS=<corpus> GM314_OUT=<dir> cargo test -p g-mesh-plugin-python --lib \
+    census::run::open_site_census -- --ignored --nocapture
+GM314_CORPUS=<corpus> GM314_OUT=<dir> cargo test -p g-mesh-plugin-rust --lib \
+    census::run::open_site_census -- --ignored --nocapture
+```
+
+Both are `#[ignore]`d, so `cargo test --workspace` never runs them and CI never
+needs a corpus. Django's run is 33.8s for 2,932 files, tokio's 7.0s for 799,
+at load averages 5.97-13.48 on a machine 14 days up - the census is
+tree-sitter parsing and nothing else, and no language server is started.
+
+**The recommendation, in three parts.**
+
+1. **Leave `OpenSiteKind` and both extractors' Decision 7 alone.** No shape
+   measured here earns its questions. Python's best case is 1,414 added
+   questions for 1 recovered edge; Rust's best case in a declaration position is
+   373 added for 12. The exclusion was written as a fear ("would swamp the
+   bridge") and is now a number: on Django it would be 23,320 questions of
+   which 23,022 are `print` and `len`.
+2. **Fix the truncation, which is the real finding.** `max_sites` binds on
+   three of four real corpora *today*, and the failure is silent-then-total: the
+   list is cut in `scope` order, the pass reports incomplete, `semanticPassAt`
+   stays unset, and the tier's whole user-visible benefit is withheld from
+   exactly the large projects it was built for. Two candidate repairs, neither
+   of which this task implemented: raise `max_sites` towards what the time
+   budget already permits (the arithmetic above says 100× headroom for Python,
+   and rust-analyzer's per-request cost on a real corpus was not measured here,
+   so its own headroom is unknown), or stop letting truncation fail the pass -
+   commit what was answered, record how far the list got, and resume from there
+   on the next pass, which is what GM-289's finding 7 already argues for the
+   *diff* and not yet for the *list*.
+3. **If a shape is ever added, it is Rust's glob-scope names - and not as a
+   semantic question.** The 2,052 g-mesh sites under a `use super::*` do not
+   need an engine: the extractor already knows the module has a glob and which
+   container the glob names, and the container is one this index holds. A
+   `PendingSymbol` placeholder keyed `TargetKey::Name` into that container costs
+   zero bridge budget, resolves through the linker that already exists, and
+   fails to a missing edge when the name is not there - the failure direction
+   both extractors already prefer. The open question that stops this being a
+   recommendation to implement today is what to do when more than one glob is in
+   scope, where two placeholders would be ambiguous and core would rightly
+   refuse both.
+
+**What could not be measured here.** rust-analyzer's per-request latency on a
+real corpus (so part 2's headroom argument is Python arithmetic only); whether a
+raised `max_sites` survives an end-to-end pass against Django with a real
+pyright, which is bench work and needs a Python corpus in `g-mesh-bench`; and
+whether the glob placeholder of part 3 resolves cleanly in practice. None of
+the four repositories measured licenses a claim about "Python projects" or
+"Rust projects" in general - Django and Flask disagree with each other about
+annotation density by a factor of 19, and g-mesh and tokio disagree about
+glob-scope share by a factor of six, which is itself the reason two corpora per
+language were measured rather than one.
+
 ### Go plugin (`plugins/go`)
 
 - **Structure:** `go/parser` with `parser.ParseComments | parser.AllErrors`.
