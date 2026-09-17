@@ -252,6 +252,45 @@ impl LspClient {
         self.idle_since.is_some_and(|since| since.elapsed() >= quiet)
     }
 
+    /// Tells this client that a document was just sent a `didOpen`/`didChange`
+    /// it has not yet reacted to, so [`quiet_for`](LspClient::quiet_for) stops
+    /// reporting a quiet period that predates the edit - GM-309.
+    ///
+    /// `settle` latching once per server (GM-290, see [`LspClient::settle`])
+    /// means every pass after the first asks `quiet_for(Duration::ZERO)`
+    /// rather than paying the settle again - correct once the server has
+    /// actually caught up with whatever the pass just sent it, and wrong in
+    /// the gap right after: a server does not begin reporting progress for an
+    /// edit the instant it receives one, and measured for pyright
+    /// (`docs/architecture/multi-language-plugins.md`, "Readiness, measured,
+    /// and deliberately not changed") that gap is ~0.6s. A question answered
+    /// empty inside it is answered by a server that has not yet noticed the
+    /// edit, and [`super::bridge`]'s per-answer deferral - "an empty answer
+    /// while the server is indexing is re-asked once" - only catches that
+    /// when `idle_since` is fresh enough to say so.
+    ///
+    /// So this resets it, but only when the client is not already busy: if a
+    /// progress is in flight `idle_since` is `None`, which already means
+    /// "not quiet" more strongly than any timestamp could, and overwriting it
+    /// with `Some(now)` would make a client that is genuinely mid-progress
+    /// read as quiet for the instant before the next `$/progress` message
+    /// corrects it. When the client *is* idle, resetting the clock buys
+    /// [`Budgets::settle`](super::bridge::Budgets::settle) worth of
+    /// scepticism toward the next empty answer - the same quiet period
+    /// readiness already trusts, not a longer one - and if the server never
+    /// reports anything for this edit at all, the deferred question is asked
+    /// again once that period passes and the second answer, empty or not, is
+    /// believed - exactly the server-that-reports-no-progress case
+    /// [`LspClient::settle`] already handles for start-up. It costs nothing
+    /// when no question lands in the gap, and at most one settle when one
+    /// does - never a settle paid by every pass, which is the guarantee
+    /// GM-290 measured and this must not spend back.
+    pub(crate) fn mark_edited(&mut self) {
+        if self.idle_since.is_some() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
     /// Whether this server is ready to be believed, latching the first time
     /// it is.
     ///

@@ -2019,6 +2019,66 @@ this fixture does not exercise at all. "Many minutes on a large repository"
 remains the expectation for every engine on this bridge, and measuring it on a
 Python bench corpus is bench work this task did not do.
 
+#### Implementation notes (GM-309): the didChange race
+
+GM-299's readiness measurement above states the pyright number this task
+starts from: `$/progress` arrives ~0.63s after `didOpen`, and the settle
+(`LspClient::settle`, GM-290) is paid once per server rather than once per
+pass. Put those two facts together for a per-file pass that follows an edit,
+rather than for the cold-start pass GM-299 measured, and there is a gap
+between them GM-299 named but did not close: for up to that ~0.6s after a
+`didChange`, the server has emitted no progress for the new edit at all, and
+`LspBridge`'s readiness gate - `wait_ready` asking only `quiet_for(Duration::
+ZERO)` once a server has settled once - has no way to tell "nothing is
+happening" from "the server has not noticed yet". An empty answer landing in
+that window read as "no target", which is wrong in the direction this design
+always prefers safe: a missing edge, not a wrong one, but still a real gap
+between what the design doc promises ("an empty answer before readiness is
+never recorded as 'no target'") and what a per-file pass actually did.
+
+**Forcing it, rather than reasoning about it again.** `tests/lsp_bridge.rs`'s
+`a_didchange_race_is_not_recorded_as_no_target` runs two passes against the
+fake server: the first lets `settled` latch the ordinary way (no progress, a
+server that becomes ready by the clock), the second edits the one file in
+scope and asks about it alone - a per-file pass, exactly what core runs after
+one reparse. The fake server's `reindexOnChange` script answers `null` to
+everything from the moment `didChange` arrives until a scripted delay after
+it, then a hold, then it reveals the real answer - a server that has not yet
+reacted to the edit, not one that is merely slow. Run against the code as
+GM-299 left it, the second pass's question is answered and believed in under
+2ms: the client had been quiet for minutes by the time the edit was sent, so
+`quiet_for(budgets.settle)` was already satisfied before the server had any
+chance to say otherwise, and the empty answer retracted the very edge pass
+one had just found. That is the failure this section exists to report having
+reproduced, not inferred.
+
+**The fix does not touch the latch.** `LspClient::mark_edited` (called from
+`sync_documents` right after every `didOpen`/`didChange`) resets how long the
+client has been quiet, but only when it was not already known to be busy -
+and only for the purposes of `run_pass`'s own per-answer deferral rule
+("an empty answer while the server is indexing is re-asked once"), which
+already existed for the *during*-progress case (GM-289) and simply did not
+cover the *before-any-progress* one. `wait_ready` still asks
+`quiet_for(Duration::ZERO)` once `settled`, and answers it exactly as
+promptly as before - a pass with no question landing in the narrow post-edit
+window pays nothing extra, same as GM-290 measured (33-36ms). A question that
+does land there is deferred and re-asked once the client has been
+continuously quiet for a full settle, which - because the server's own
+`$/progress begin` necessarily interrupts that quiet period if one is coming
+- cannot fire before the server has had its say. The reset applies to
+`didOpen` as well as `didChange`, symmetrically: a file this server has never
+seen is at least as likely to start it reanalysing as an edit to one already
+open, and the cost of covering it is the same bounded deferral, never a
+resurrected per-pass wait.
+
+**What is still true, and what changed.** "A missing edge, never a wrong
+one" still holds - GM-309 tightens *how often* the gap can produce a missing
+edge, it does not change which direction a mistake falls in. And the numbers
+GM-299 measured are untouched: the settle is still paid once per server, the
+per-file pass is still tens of milliseconds when nothing races it, and this
+fix spends latency only on the specific question that happens to be asked
+inside the gap - never on the pass as a whole.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated
