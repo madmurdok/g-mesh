@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig};
+use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig, ServerReadiness};
 use g_mesh_plugin_sdk::wire::{
     EdgeKind, NodeKind, Position, Range, SourceTier, TargetKey, TargetScope, WireEdge, WireNode,
 };
@@ -591,6 +591,154 @@ fn a_didchange_race_is_not_recorded_as_no_target() {
         2,
         "the site was asked once, deferred on the early null, and asked again - not answered \
          once and trusted"
+    );
+}
+
+/// GM-310, the half that must not regress: a manifest saying `on-demand`
+/// about a server that is in fact a rust-analyzer does not cost an edge.
+///
+/// This is the test the whole mechanism is chosen to pass. `on-demand` skips
+/// the start-up quiet period, so the first question of the first pass goes out
+/// at once - and the scripted server here is the traced rust-analyzer shape:
+/// a *sequence* of work-done tokens, answering `null` to everything from
+/// `initialized` until the last of them ends. Under the rejected alternative -
+/// "an on-demand server has a settle of zero" - that first `null` is measured
+/// against a zero-length quiet period, passes trivially, and is recorded as
+/// "there is no such symbol": one missing edge bought with two seconds, which
+/// this design refuses to trade.
+///
+/// What makes it safe instead is the rule that was already there and is
+/// deliberately left alone. `run_pass` defers an empty answer that arrives
+/// while the client has *not* been continuously quiet for a whole
+/// `budgets.settle`, and a deferred question returns to the queue only when
+/// that same continuous quiet arrives. A server mid-sequence cannot supply it:
+/// the gaps between its phases are shorter than the settle (traced on
+/// rust-analyzer 1.97.1 at 157-182ms against a 2s settle), and its own next
+/// `begin` clears the clock. So the early `null` is not believed, the site is
+/// re-asked after the sequence really ends, and the edge is the one the
+/// server's truthful answer produces.
+///
+/// The phase sequence begins after a real delay rather than at `initialized`,
+/// and that is load-bearing: rust-analyzer's own first token begins ~313ms
+/// after `didOpen` (measured), and it is *that* window - ready-looking, no
+/// progress yet, nothing truthful to say - the first question has to land in
+/// for this test to be about anything. With `beginAfterMs: 0` the bridge would
+/// simply wait for the in-flight progress in `wait_ready` and never exercise
+/// the deferral at all.
+///
+/// Shown capable of failing: with `LspClient::quiet_for` reduced to "is
+/// anything in flight right now" - GM-289's rule 1, the bug GM-290 found
+/// twice - this test fails with zero semantic edges while reporting the pass
+/// complete, which is the worse half of that bug and exactly what it is here
+/// to catch.
+#[test]
+fn an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand() {
+    let scratch = Scratch::new("on-demand-wrong");
+    let (index, _) = fixture(&scratch);
+    let mut config = scratch.server(json!({
+        // The rust-analyzer shape: a sequence, and a pre-progress window in
+        // front of it that looks exactly like a server with nothing to do.
+        "readiness": { "phases": [
+            { "token": "fetching", "beginAfterMs": 300, "holdMs": 60 },
+            { "token": "cachePriming", "beginAfterMs": 60, "holdMs": 60 },
+        ]},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    // The manifest's claim, and it is the wrong one about this server.
+    config.readiness = ServerReadiness::OnDemand;
+
+    let mut budgets = budgets();
+    // 2000ms against a 60ms scripted gap - a 33x margin, the same order
+    // `a_gap_between_two_progress_phases_is_not_readiness` argues for and for
+    // the same reason: the gap is a `sleep` on a machine that may be loaded,
+    // and a settle merely twice as long lets a stretched gap satisfy it,
+    // which is the bug passing itself off as the fix.
+    budgets.settle = Duration::from_millis(2_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let load = uptime();
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&answer).len(),
+        1,
+        "an `on-demand` manifest must not make an indexing server's early null final ({load}): {:#?}",
+        answer.diff
+    );
+    assert!(answer.complete, "{load}");
+}
+
+/// GM-310, the half the saving comes from: a server whose manifest says
+/// `on-demand` is not made to prove, by waiting, a shape its plugin author
+/// already traced.
+///
+/// One fixture, one scripted server, one variable: the same server that
+/// reports no progress at all and answers the site correctly from its first
+/// millisecond, run once under each readiness claim. The `indexed` arm is
+/// today's behaviour - the first pass waits out a whole settle before asking
+/// anything - and the `on-demand` arm asks at once. Both must produce the
+/// same one edge, or the measurement is of a bridge that got faster by
+/// answering less.
+///
+/// The settle is 900ms, and the second assertion is deliberately **relative**
+/// rather than a second absolute bound. The claim is "this arm did not pay the
+/// settle", and the honest test of it is the gap between the two arms: an
+/// absolute ceiling on the on-demand arm would also be measuring how long this
+/// machine takes to fork a process and complete a handshake, which is a
+/// different quantity and one that has been between load average 6 and 995 on
+/// the machine this was written on. Both arms absorb a slow machine together,
+/// so the difference survives what a ceiling would not - while still failing
+/// loudly if `on-demand` ever started waiting, since the two arms would then
+/// come back within noise of each other.
+///
+/// This is the cheap observation that shows the arms are genuinely different
+/// before anything is concluded from the difference. It is the same shape
+/// `the_settle_is_paid_once_per_server_rather_than_once_per_pass` uses for the
+/// first-versus-second-pass split, one variable over.
+#[test]
+fn an_on_demand_server_does_not_wait_out_a_settle_its_manifest_says_it_does_not_need() {
+    let scratch = Scratch::new("on-demand-saving");
+    let (index, _) = fixture(&scratch);
+    let script = json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    });
+
+    let mut elapsed = Vec::new();
+    for readiness in [ServerReadiness::Indexed, ServerReadiness::OnDemand] {
+        let mut config = scratch.server(script.clone());
+        config.readiness = readiness;
+        let mut budgets = budgets();
+        budgets.settle = Duration::from_millis(900);
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+        let started = std::time::Instant::now();
+        let answer = pass(&mut bridge, &index);
+        elapsed.push(started.elapsed());
+        assert_eq!(
+            semantic_edges(&answer).len(),
+            1,
+            "{readiness:?} must answer the same site: {:#?}",
+            answer.diff
+        );
+        assert!(answer.complete, "{readiness:?}");
+    }
+
+    let load = uptime();
+    assert!(
+        elapsed[0] >= Duration::from_millis(800),
+        "the indexed arm waits out the settle: {:?} ({load})",
+        elapsed[0]
+    );
+    let saved = elapsed[0].saturating_sub(elapsed[1]);
+    assert!(
+        saved >= Duration::from_millis(500),
+        "the on-demand arm must skip most of the 900ms settle: indexed {:?}, on-demand {:?}, \
+         saved only {saved:?} ({load})",
+        elapsed[0],
+        elapsed[1]
     );
 }
 
