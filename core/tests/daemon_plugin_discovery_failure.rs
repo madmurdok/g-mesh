@@ -23,8 +23,9 @@ use g_mesh::daemon;
 use g_mesh::protocol::types::CURRENT_PROTOCOL_VERSION;
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A minimal, otherwise-well-formed `plugin.toml` claiming `.foo` - the
 /// fields `daemon::manifest::read_manifest` requires, nothing else.
@@ -82,15 +83,10 @@ impl Drop for Project {
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 #[test]
@@ -110,7 +106,8 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
         .expect("failed to spawn the daemon");
 
     let status = {
-        let deadline = Instant::now() + TIMEOUT;
+        let timeout = common::startup_timeout();
+        let deadline = Instant::now() + timeout;
         loop {
             match daemon.try_wait().expect("failed to poll the daemon") {
                 Some(status) => break status,
@@ -118,7 +115,7 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
                     let _ = daemon.kill();
                     panic!(
                         "a daemon whose plugin discovery must hard-fail did not exit within \
-                         {TIMEOUT:?} - it may have limped into a partially-started state instead"
+                         {timeout:?} - it may have limped into a partially-started state instead"
                     );
                 }
                 None => std::thread::sleep(Duration::from_millis(10)),

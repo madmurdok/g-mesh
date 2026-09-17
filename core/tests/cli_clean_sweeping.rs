@@ -39,7 +39,6 @@ use g_mesh::paths::HOME_ENV;
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A `G_MESH_HOME` belonging to one test and nothing else, so a sweep inside
 /// it is safe by construction rather than by every test remembering to scope
@@ -191,26 +190,22 @@ impl Drop for Project<'_> {
 /// is not the same thing as `remove_dir_all` returning `Ok`. See its one
 /// caller for why the difference matters.
 fn delete_until_gone(path: &Path) {
-    let deadline = Instant::now() + TIMEOUT;
+    let timeout = common::startup_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         let _ = fs::remove_dir_all(path);
         if !path.exists() {
             return;
         }
-        assert!(Instant::now() < deadline, "{} could not be deleted within {TIMEOUT:?}", path.display());
+        assert!(Instant::now() < deadline, "{} could not be deleted within {timeout:?}", path.display());
         thread::sleep(Duration::from_millis(20));
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 fn stdout_of(output: &Output) -> String {

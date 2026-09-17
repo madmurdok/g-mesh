@@ -10,8 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -19,7 +17,6 @@ use g_mesh::storage::connection::project_dir;
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Project {
     dir: tempfile::TempDir,
@@ -147,15 +144,14 @@ fn read_pid(path: &Path) -> u32 {
         .expect("pid file does not contain a pid")
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: delegates to [`common::wait_for`] with [`common::startup_timeout`]
+/// rather than polling against a file-local constant - see that function's
+/// doc comment for why. This file's own fixed 10s deadline was exactly what
+/// flaked under load: `stop_clears_the_state_a_crashed_daemon_left_behind`
+/// timed out waiting for the plugin to spawn with the machine at load
+/// 169-298, nothing to do with `stop` itself being broken.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// The acceptance criterion: both processes gone, the socket released, and

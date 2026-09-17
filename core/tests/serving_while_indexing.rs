@@ -26,10 +26,32 @@
 //! detached daemon, a real plugin walk, and a real `rmcp` client asking real
 //! questions over the socket.
 //!
+//! # GM-301: the two durations are measured, not guessed
+//!
+//! "Well below it" used to be two fixed constants, 1s and 3s, picked once on
+//! whoever's laptop was idle at the time. That is a bet that spawning a
+//! process and getting the OS to schedule it to bind a socket always costs
+//! about the same - which a machine doing other real work at the same time
+//! does not honor: three observed failures here were `ConnectionClosed` on
+//! the shim's own connect, at a load of 45-60, with a control run on the
+//! unmodified base commit failing the same binary *worse*. The daemon was
+//! never slow to bind; the process tree just was not getting scheduled inside
+//! a 1-second window that had nothing to do with how big the walk was.
+//!
+//! [`calibrate`] replaces the guess with a real measurement taken on this
+//! machine, right before each run that needs it, and [`bootstrap_budget`] and
+//! [`walk_held_open`] derive generous multiples of it. The *relation* the
+//! acceptance criterion depends on - the bootstrap budget staying a fraction
+//! of the walk-held-open window - is preserved by construction rather than by
+//! two numbers that happened to still be in the right ratio: whatever this
+//! machine's connect-and-ask costs right now, the walk stays held open at
+//! least three times that long past it.
+//!
 //! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
 //! `npm run build` there whenever this crate is built.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -45,19 +67,6 @@ mod common;
 use common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-
-/// Long enough that a client connecting, initializing and asking one question
-/// is comfortably inside the window, and short enough that the suite does not
-/// notice. Nothing is asserted about this number itself - only that the walk
-/// it belongs to is still running when the first call is made.
-const WALK_HELD_OPEN: Duration = Duration::from_millis(3_000);
-
-/// Deliberately a fraction of [`WALK_HELD_OPEN`]: this is the budget the shim
-/// gives the daemon to *bind*, and the whole point of the change under test is
-/// that binding no longer waits for the walk. A shim that still had to wait
-/// for the walk would fail here rather than time out somewhere later, which is
-/// what makes this the acceptance criterion and not a detail.
-const SHORT_BOOTSTRAP_BUDGET: Duration = Duration::from_millis(1_000);
 
 /// One file importing another - enough of a graph for `find_definition` to
 /// have a real, checkable answer, and small enough that the walk's natural
@@ -155,13 +164,21 @@ impl Drop for Project {
 /// A client over a real shim, with the walk held open and the bootstrap budget
 /// shortened. Both knobs travel through the shim's own environment into the
 /// daemon it spawns, which inherits it.
-async fn connect_with_a_slow_walk(project: &Project) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    connect_with(project, Some(WALK_HELD_OPEN)).await
-}
-
 async fn connect_with(
     project: &Project,
     hold_the_walk_open: Option<Duration>,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    connect_with_budget(project, hold_the_walk_open, bootstrap_budget().await).await
+}
+
+/// [`connect_with`], but with the shim's own bootstrap budget passed in
+/// explicitly rather than derived from [`bootstrap_budget`] - the escape
+/// hatch [`calibrate`] needs so measuring a real bind does not depend on the
+/// number that measurement itself produces.
+async fn connect_with_budget(
+    project: &Project,
+    hold_the_walk_open: Option<Duration>,
+    bootstrap_budget: Duration,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
@@ -171,7 +188,7 @@ async fn connect_with(
             .arg("mcp-shim")
             .current_dir(&root)
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
-            .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", SHORT_BOOTSTRAP_BUDGET.as_millis().to_string());
+            .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", bootstrap_budget.as_millis().to_string());
         if let Some(delay) = hold_the_walk_open {
             cmd.env("G_MESH_BULK_INDEX_DELAY_MS", delay.as_millis().to_string());
         }
@@ -184,6 +201,64 @@ async fn connect_with(
     ().serve(transport)
         .await
         .expect("the shim must reach the daemon while its cold-start walk is still running")
+}
+
+/// GM-301: measures how long a completely ordinary connect-and-ask takes on
+/// this machine right now - spawn the shim, let it bootstrap a real daemon
+/// with nothing artificially delayed, wait for the (tiny, unforced) walk to
+/// finish, and ask one question - so [`bootstrap_budget`] and
+/// [`walk_held_open`] can be generous multiples of a real number instead of a
+/// guess written on whoever's laptop was idle at the time.
+///
+/// Measured once per test binary and cached: every test in this file runs in
+/// the same process against the same machine, so a second measurement would
+/// just pay the cost again for the same answer. If two tests race this before
+/// either has cached anything, both measure something real off the same
+/// machine; whichever `set` wins is fine, and the loser still returns its own
+/// real measurement rather than a stale or fabricated one.
+async fn calibrate() -> (Duration, Duration) {
+    static CACHED: OnceLock<(Duration, Duration)> = OnceLock::new();
+    if let Some(cached) = CACHED.get() {
+        return *cached;
+    }
+    let project = Project::new();
+    let bind_started = Instant::now();
+    // A large, fixed budget of its own - not `bootstrap_budget()`, which is
+    // what this measurement calibrates. Using it here would be circular: a
+    // slow-but-real bind has to be measured faithfully rather than cut off by
+    // the very number that is about to be derived from it.
+    let client = connect_with_budget(&project, None, Duration::from_secs(60)).await;
+    let bind_time = bind_started.elapsed();
+    wait_until_indexed(project.root());
+    let call_started = Instant::now();
+    let _ = find_definition(&client, "connect").await;
+    let call_time = call_started.elapsed();
+    client.cancel().await.expect("failed to shut the calibration client down");
+    let measured = (bind_time, call_time);
+    let _ = CACHED.set(measured);
+    measured
+}
+
+/// The budget the shim gives a freshly spawned daemon to bind its socket - a
+/// generous multiple of an actually-measured bind (see [`calibrate`]),
+/// floored near the old fixed constant so an idle run keeps roughly its old,
+/// fast shape, and capped so a genuinely wedged machine still fails within a
+/// bounded time rather than hanging the suite.
+async fn bootstrap_budget() -> Duration {
+    let (bind_time, _) = calibrate().await;
+    (bind_time * 8).clamp(Duration::from_millis(1_000), Duration::from_secs(30))
+}
+
+/// How long a test holds a walk open past its last commit. At least three
+/// times [`bootstrap_budget`] - the relation `a_walk_that_outlasts_the_
+/// bootstrap_timeout_is_answered_with_still_indexing_rather_than_losing_the_
+/// client` depends on, see this module's header - and comfortably past a full
+/// calibrated connect-and-ask, so the timed call in that test has the same
+/// margin the calibration run itself needed.
+async fn walk_held_open() -> Duration {
+    let (bind_time, call_time) = calibrate().await;
+    let budget = bootstrap_budget().await;
+    ((bind_time + call_time) * 6).max(budget * 3).clamp(Duration::from_millis(3_000), Duration::from_secs(90))
 }
 
 async fn find_definition(
@@ -217,13 +292,19 @@ fn body(result: &CallToolResult) -> Value {
 async fn a_walk_that_outlasts_the_bootstrap_timeout_is_answered_with_still_indexing_rather_than_losing_the_client(
 ) {
     let project = Project::new();
+    // Warms the calibration cache (see `calibrate`) before the clock starts -
+    // otherwise the one-off cost of measuring this machine's own speed would
+    // count against the very budget it is calibrating, on whichever test
+    // happens to run first.
+    let hold_open = walk_held_open().await;
     let started = Instant::now();
-    let client = connect_with_a_slow_walk(&project).await;
+    let client = connect_with(&project, Some(hold_open)).await;
 
     let during_the_walk = find_definition(&client, "connect").await;
     assert!(
-        started.elapsed() < WALK_HELD_OPEN,
-        "this call has to land while the walk is still running, and it took {:?}",
+        started.elapsed() < hold_open,
+        "this call has to land while the walk is still running, and it took {:?} against a budget \
+         of {hold_open:?}",
         started.elapsed()
     );
 
@@ -257,7 +338,14 @@ async fn a_walk_that_outlasts_the_bootstrap_timeout_is_answered_with_still_index
     );
     assert_eq!(text(&with_the_answer_committed), g_mesh::mcp::STILL_INDEXING);
 
-    wait_until_indexed(project.root());
+    // Not the plain `wait_until_indexed` the other tests in this file use:
+    // this walk's own completion was deliberately pushed back by `hold_open`
+    // (see `calibrate`), which under real contention can be a large fraction
+    // of `common`'s default 90s budget on its own - so the wait for the real
+    // walk to finish has to get at least that much added on top, or a
+    // calibration generous enough to survive the connect race would leave
+    // this wait no room to survive the walk it was built to hold open.
+    common::wait_until_indexed_within(project.root(), hold_open + Duration::from_secs(90));
 
     // Same client, same session, nothing reconnected or re-initialized: the
     // status is consulted per call, so the next one simply works.
@@ -306,7 +394,7 @@ async fn a_restart_against_an_already_walked_project_never_reports_itself_as_sti
 
     // Held open for ten times the window the first phase needed, so that a
     // walk this daemon must not do could not possibly go unnoticed.
-    let restarted = connect_with(&project, Some(WALK_HELD_OPEN * 10)).await;
+    let restarted = connect_with(&project, Some(walk_held_open().await * 10)).await;
 
     let first_call = find_definition(&restarted, "connect").await;
     assert_ne!(

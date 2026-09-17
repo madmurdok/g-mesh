@@ -24,7 +24,6 @@ use serde_json::{json, Value};
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Every tool the MVP promises, whatever order the router lists them in.
@@ -149,15 +148,10 @@ fn spawn_shim_with_project_dir_env(cwd: &Path, project_dir_env: &Path) -> Child 
         .expect("failed to spawn the shim")
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// Runs `initialize` + `tools/list` over one duplex channel and returns the
@@ -176,10 +170,11 @@ where
         let _ = tx.send(list_tools(writer, reader));
     });
 
-    match rx.recv_timeout(TIMEOUT) {
+    let timeout = common::startup_timeout();
+    match rx.recv_timeout(timeout) {
         Ok(Ok(names)) => names,
         Ok(Err(err)) => panic!("MCP session failed: {err}"),
-        Err(err) => panic!("MCP session did not finish within {TIMEOUT:?}: {err}"),
+        Err(err) => panic!("MCP session did not finish within {timeout:?}: {err}"),
     }
 }
 
@@ -243,13 +238,14 @@ fn round_trip_through_shim(shim: &mut Child) -> Vec<String> {
 }
 
 fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
-    let deadline = Instant::now() + TIMEOUT;
+    let timeout = common::startup_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().expect("failed to poll the child process") {
             Some(status) => return status,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
-                panic!("child process did not exit within {TIMEOUT:?}");
+                panic!("child process did not exit within {timeout:?}");
             }
             None => thread::sleep(Duration::from_millis(10)),
         }

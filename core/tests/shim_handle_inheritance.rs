@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -35,24 +35,24 @@ mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
-/// Generous, because it covers a daemon cold-starting a real JS/TS plugin.
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Not generous, and that is the point. Once the shim is gone, EOF is either
 /// immediate or never - there is no third case where it merely takes a while,
 /// so a budget this size fails fast on the bug rather than idling toward a
-/// harness timeout.
+/// harness timeout. Unlike [`common::startup_timeout`]'s budgets, this one is
+/// not waiting on a process to get spawned and scheduled - it is waiting on
+/// this pipe's own last write handle being closed, which is a kernel-local
+/// event with nothing left to wait on once the shim and its daemon both exist
+/// or don't, so it does not inherit the same load sensitivity and stays a
+/// fixed, tight bound (GM-301 looked at this file and left it as-is).
 const EOF_BUDGET: Duration = Duration::from_secs(10);
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant - this file's own
+/// old 30s bootstrap budget covered a daemon cold-starting a real JS/TS
+/// plugin, the same spawn-and-schedule wait every other file in this family
+/// has.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 #[test]
