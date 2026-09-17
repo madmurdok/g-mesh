@@ -57,6 +57,57 @@ fn indexed_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// The other half of this module's timeout story - GM-301. `wait_until_indexed`
+/// above is about "did the walk finish"; this is about everything that came
+/// before it in a dozen other test files: the pid file existing, the socket
+/// answering, the lock reading `Serving`, the plugin pid file showing up. Each
+/// of those used to poll against its own hand-picked, file-local constant
+/// (10s in most, 20s or 30s in a couple that had already been bitten once) -
+/// which is how `cli_stop.rs` and `wedged_daemon.rs` each independently
+/// flaked under nothing more exotic than other work sharing the machine:
+/// spawning a process and getting it scheduled to bind a socket or write a
+/// pid file is not free, and a fixed 10s budget that was never revisited
+/// since whoever wrote it had a quiet laptop is not a promise the daemon ever
+/// made.
+///
+/// One number for the whole family fixes that once rather than per file, and
+/// overriding it for an unusually loaded box - or an unusually fast one that
+/// wants tests to fail faster - takes one env var instead of an edit to
+/// thirteen files.
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 60;
+
+/// [`DEFAULT_STARTUP_TIMEOUT_SECS`], or `G_MESH_TEST_STARTUP_TIMEOUT_SECS` if
+/// it names a parsable number. Same "unparsable is not fatal" rule as
+/// [`indexed_timeout`], for the same reason.
+pub fn startup_timeout() -> Duration {
+    let secs = std::env::var("G_MESH_TEST_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Polls `ready` every 10ms until it returns `true`, or panics naming `what`
+/// once `timeout` has elapsed.
+///
+/// A hang guard, not a timing assertion: nothing here claims the daemon
+/// *should* answer within `timeout`, only that a test that has waited that
+/// long is looking at something genuinely stuck rather than something merely
+/// slow. Pass [`startup_timeout`] unless a specific test has its own,
+/// documented reason to want a different bound - most of this suite's
+/// `wait_for` helpers used to duplicate this loop against a file-local
+/// constant; this is the one copy.
+pub fn wait_for(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what} within {timeout:?}");
+}
+
 /// Blocks until the daemon serving `root` has recorded a completed
 /// cold-start walk.
 ///
@@ -73,8 +124,23 @@ fn indexed_timeout() -> Duration {
 /// bound, so a caller that waits for the connection first can never read the
 /// previous generation's marker and believe the new walk is done.
 pub fn wait_until_indexed(root: &Path) {
+    wait_until_indexed_within(root, indexed_timeout());
+}
+
+/// [`wait_until_indexed`], but with the deadline passed in explicitly instead
+/// of always reading [`indexed_timeout`].
+///
+/// GM-301: exists for callers like `serving_while_indexing.rs` that hold a
+/// walk open on purpose (`bulk_index::WALK_DELAY_ENV`) for a duration derived
+/// from *this machine's own measured speed*, which under real contention can
+/// legitimately be a large fraction of [`indexed_timeout`]'s default 90s - a
+/// calibrated hold of, say, 70s left only 20s of that budget for the walk to
+/// actually finish once the hold expired, which is not a fair deadline for
+/// the same machine that just needed 70s to justify the hold in the first
+/// place. Such a caller should pass a deadline that accounts for its own
+/// hold, not the bare default.
+pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
     let db = project_dir(root).expect("failed to resolve the state directory").join("index.db");
-    let timeout = indexed_timeout();
     let deadline = Instant::now() + timeout;
     // Kept across attempts so the timeout can say *why* the last read failed.
     // Treating every failure as "not yet" is right for the transient cases

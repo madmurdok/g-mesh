@@ -17,10 +17,9 @@ use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-// Generous relative to daemon_core.rs's 10s: this path also pays for a Node
-// process start and a real tree-sitter parse, not just SQLite/socket setup.
-const TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Project {
     dir: tempfile::TempDir,
@@ -56,19 +55,14 @@ fn spawn_daemon(root: &Path) -> Child {
         .expect("failed to spawn the daemon")
 }
 
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant. The old 20s
+/// (versus `daemon_core.rs`'s 10s) was generous for paying for a Node process
+/// start and a real tree-sitter parse on top of SQLite/socket setup - now
+/// folded into the one shared, load-adaptive budget every file in this family
+/// uses.
 fn wait_for(what: &str, ready: impl FnMut() -> bool) {
-    wait_for_within(what, TIMEOUT, ready);
-}
-
-fn wait_for_within(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {what}");
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// How many nodes the index holds under a given name. `Ok(0)` for a database

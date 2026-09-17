@@ -20,8 +20,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -29,7 +27,6 @@ use g_mesh::storage::connection::project_dir;
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Project {
     dir: tempfile::TempDir,
@@ -94,15 +91,10 @@ impl Drop for Project {
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 fn stdout_of(output: &Output) -> String {

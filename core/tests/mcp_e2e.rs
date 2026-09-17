@@ -9,7 +9,6 @@
 //! stays pinned by something that does not share the server's own code.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -22,7 +21,6 @@ use tokio::process::Command;
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Name plus the parameters a caller must supply - the half of each schema a
 /// follow-up ticket is not allowed to quietly change.
@@ -93,15 +91,10 @@ fn is_alive(pid: u32) -> bool {
     daemon::is_process_alive(pid)
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 #[tokio::test]

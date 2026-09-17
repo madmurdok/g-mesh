@@ -38,10 +38,6 @@ mod common;
 use common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-/// Deadline for anything this test waits on. Generous - it is a hang guard,
-/// not a timing assertion; the timings being asserted are the configured
-/// timeouts below.
-const TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// The plugin's shortened idle timeout. Not as short as it could be: the test
@@ -203,15 +199,14 @@ impl Drop for Daemon {
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant - this file's old
+/// 30s was already explicitly documented as "a hang guard, not a timing
+/// assertion" (the timings actually under test are [`PLUGIN_IDLE`] and
+/// [`CORE_IDLE`], both asserted on their own terms below), which is exactly
+/// what the shared budget is for.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 fn recorded_pid(path: &Path) -> u32 {
@@ -232,10 +227,11 @@ fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
         let _ = tx.send(converse(stream, requests));
     });
 
-    match rx.recv_timeout(TIMEOUT) {
+    let timeout = common::startup_timeout();
+    match rx.recv_timeout(timeout) {
         Ok(Ok(responses)) => responses,
         Ok(Err(err)) => panic!("MCP session failed: {err}"),
-        Err(err) => panic!("MCP session did not finish within {TIMEOUT:?}: {err}"),
+        Err(err) => panic!("MCP session did not finish within {timeout:?}: {err}"),
     }
 }
 
@@ -365,7 +361,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     // --- the next request wakes it and replays the queue -----------------
     // Deliberately a question about the *other* file: the wake is owed to the
     // queue, not to what this particular call happened to ask about.
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + common::startup_timeout();
     loop {
         let responses = mcp_session(&endpoint, vec![outline_request(1, "src/beta.ts")]);
         assert_eq!(
