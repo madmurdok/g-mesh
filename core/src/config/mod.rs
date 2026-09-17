@@ -69,8 +69,8 @@ pub struct ProjectConfig {
 }
 
 /// `[plugin]`: how long the language plugin process is allowed to sit idle
-/// before it is put to sleep, and (task GM-274) an optional ceiling on its
-/// process tree's resident memory. See `daemon::plugin` / task #38 for the
+/// before it is put to sleep, and (task GM-274) an optional circuit breaker on
+/// its process tree's resident memory. See `daemon::plugin` / task #38 for the
 /// idle-timeout consumer, and `daemon::lifecycle::PluginSupervisor::
 /// check_memory_limit` / `daemon::memory` for the memory-limit one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -83,6 +83,15 @@ pub struct PluginConfig {
     /// sleep only, exactly today's behaviour; a number means idle sleep plus
     /// the limit." One number for every language's plugin tree; there is no
     /// per-language override (see that section for why).
+    ///
+    /// **A circuit breaker, not a ceiling** (GM-304). A tree found over this
+    /// number is stopped so it cannot keep exceeding it; it is not held under
+    /// the number in the first place, and cannot be, because sampling reports
+    /// memory that is already resident. A plugin may cross this figure once
+    /// and by a wide margin - measured against a real rust-analyzer, by the
+    /// whole 563-580MB of a cold semantic pass. The architecture doc's
+    /// "Plugin memory limit" section carries the argument; the `g-mesh config`
+    /// wizard says the same thing to whoever is choosing the number.
     pub memory_limit_mb: Option<u64>,
 }
 

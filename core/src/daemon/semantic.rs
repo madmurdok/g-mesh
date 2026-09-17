@@ -71,8 +71,12 @@
 //! `go/packages` type-checking a big module graph - see the architecture
 //! doc's "Memory on large repos" failure mode), and running two of them at
 //! once on a developer's machine during a cold start is exactly the kind of
-//! spike `[plugin] memoryLimitMb` exists to guard against, not something this
-//! scheduler should manufacture by racing them. Nothing here would need to
+//! sustained overage `[plugin] memoryLimitMb` exists to catch, not something
+//! this scheduler should manufacture by racing them. ("Catch", not "prevent":
+//! GM-304 settled that the limit is a circuit breaker rather than a ceiling,
+//! so it would stop two such engines only *after* both had loaded - see
+//! `PluginSupervisor::check_memory_limit`. Which is the stronger reason not
+//! to race them here, not a weaker one.) Nothing here would need to
 //! change structurally to go concurrent later (each language's request is
 //! already independent - a different plugin process, a different
 //! `language_state` row), but that is a decision for whenever the memory
