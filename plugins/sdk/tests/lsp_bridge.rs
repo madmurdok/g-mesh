@@ -479,6 +479,121 @@ fn an_empty_answer_while_the_server_reindexes_is_asked_again() {
     assert!(answer.complete);
 }
 
+/// This machine's load average, read fresh for every timing-sensitive
+/// assertion - see the house rule that a timing measurement without it is
+/// worse than none. `uptime`'s exact column layout is not parsed; the whole
+/// line is enough to tell a quiet run from one sharing the box with
+/// something else.
+fn uptime() -> String {
+    std::process::Command::new("uptime")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_else(|| "uptime unavailable".to_string())
+}
+
+/// GM-309: `LspClient::settle` latches once per server (GM-290's correction,
+/// kept - see `the_settle_is_paid_once_per_server_rather_than_once_per_pass`
+/// above), so from a server's second pass on, `LspBridge`'s readiness gate asks only
+/// "is anything in flight *right now*", not "has it been quiet for a whole
+/// settle". That is correct once the server has actually caught up with
+/// whatever the pass just sent it - and false in the gap right after a
+/// `didChange`, before the server has emitted *any* progress for that edit.
+/// GM-299 measured this gap for pyright at ~0.6s and reasoned that it was
+/// safe (a missing edge, never a wrong one) without constructing a case that
+/// forces it. This test is that case.
+///
+/// The fake server's `reindexOnChange` answers `null` to everything from the
+/// moment `didChange` arrives until a scripted delay after it, then a hold,
+/// then it reveals the real answer - modelling a server that has not yet
+/// noticed the edit, not one that is merely slow to answer. The first
+/// question, sent immediately after the change, is answered by a local pipe
+/// in low single-digit milliseconds even on a machine this loaded (measured:
+/// under 2ms end to end before this fix existed to defer it at all - see the
+/// "before" evidence this test's own history carries), so `beginAfterMs` of
+/// 200 is not a coin flip against it, it is the race forced by construction.
+///
+/// `budgets.settle` is set well *above* `beginAfterMs`, and that ordering is
+/// load-bearing rather than incidental: `run_pass` requeues a deferred
+/// question the moment the client has been continuously quiet for one whole
+/// settle, with no idea a server is about to speak. If settle were shorter
+/// than `beginAfterMs`, the retry would itself fire before the server's
+/// progress begins and land back in the same unrevealed gap - re-proving the
+/// bug on the second try instead of testing the fix. With settle longer, the
+/// server's own `$/progress` begin necessarily interrupts the quiet period
+/// first (clearing it, since a client mid-progress is never "quiet"), so the
+/// retry cannot fire until a full settle *after* progress has ended - by
+/// which point `revealed` is already true.
+///
+/// Unfixed, `run_pass`'s deferral test is `!client.quiet_for(budgets.settle)`,
+/// and a client whose server settled minutes ago (during pass one, in this
+/// test's setup) is already quiet for far longer than one settle the instant
+/// `didChange` is sent - so the early `null` is believed, no edge is emitted,
+/// and the pass reports itself complete. Fixed, the same `didChange` resets
+/// how long the client has been quiet *for the purposes of that judgement*,
+/// so the early `null` is deferred and the site is asked again once the
+/// server is quiet for real - which does not happen until after the
+/// `reindexOnChange` cycle has ended and revealed the true answer.
+#[test]
+fn a_didchange_race_is_not_recorded_as_no_target() {
+    let scratch = Scratch::new("didchange-race");
+    let mut index = fixture(&scratch).0;
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "reindexOnChange": { "beginAfterMs": 200, "holdMs": 150 },
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    // Well above `beginAfterMs` above (5x) - see this test's own doc on why
+    // that ordering, not just the margin, is what makes the retry land after
+    // `revealed` rather than in the same unrevealed gap as the first ask.
+    budgets.settle = Duration::from_millis(1_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    // Pass one: the server has no progress to report at all, so it becomes
+    // ready purely by the clock, and `settled` latches - the state every
+    // per-file pass after the first edit actually starts from.
+    let first = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&first).len(), 1, "the baseline pass resolves the site: {:#?}", first.diff);
+
+    // Edit b.toy - same open site, same position, different bytes - so
+    // `sync_documents` sends `didChange`, not `didOpen`. A per-file pass over
+    // just that file is what core runs after one reparse.
+    let b = RelPath::new("src/b.toy");
+    let graph = index.entry(&b).expect("the fixture has it").graph.clone();
+    index.insert(b.clone(), format!("{B_TOY}// edited\n"), graph);
+
+    let before = asked(&log, "textDocument/definition");
+    let uptime_before = uptime();
+    let started = std::time::Instant::now();
+    let second = bridge.answer(&[b], &index).expect("the bridge answers");
+    let elapsed = started.elapsed();
+    let uptime_after = uptime();
+    let after = asked(&log, "textDocument/definition");
+    eprintln!(
+        "a_didchange_race_is_not_recorded_as_no_target: pass two took {elapsed:?}; \
+         uptime before {uptime_before:?}, after {uptime_after:?}"
+    );
+
+    assert_eq!(
+        semantic_edges(&second).len(),
+        1,
+        "the early null must not be believed over the real answer the server gives once it has \
+         caught up with the edit: {:#?}",
+        second.diff
+    );
+    assert!(second.complete, "the site was eventually answered, not left outstanding");
+    assert_eq!(
+        after - before,
+        2,
+        "the site was asked once, deferred on the early null, and asked again - not answered \
+         once and trusted"
+    );
+}
+
 /// `textDocument/implementation` on a node whose `nativeKind` the manifest
 /// lists, and the `SUPERTYPE_OF` edge it produces - from the implementor to
 /// the thing implemented, which is the direction `find_implementations` walks.

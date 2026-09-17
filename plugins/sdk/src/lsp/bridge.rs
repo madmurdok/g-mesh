@@ -231,6 +231,33 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// arrives before the server is quiet again is therefore re-asked once, after
 /// the quiet period returns, and only the second empty answer is believed.
 ///
+/// **That rule only fires once the client has noticed the server is busy**
+/// (GM-309). `LspClient::settle` latches once per server, so from a server's
+/// second pass on `wait_ready` asks only "is anything in flight right now" -
+/// which a client whose server settled passes ago answers "yes, quiet" the
+/// instant a `didChange` is sent, because nothing has happened yet to make it
+/// otherwise. A server does not begin reporting progress for an edit the
+/// instant it receives one - measured for pyright at ~0.6s after `didOpen`
+/// (the design doc's "Readiness, measured, and deliberately not changed") -
+/// and an empty answer inside that gap was, before GM-309, indistinguishable
+/// from a real "no target": `run_pass`'s own deferral test reads
+/// `client.quiet_for(budgets.settle)`, and a quiet period that has already
+/// run for minutes clears it trivially. `LspClient::mark_edited`, called from
+/// `sync_documents` right after each `didOpen`/`didChange`, is the fix: it
+/// resets how long the client has been quiet *for the purposes of that
+/// judgement* whenever the client was not already known to be busy, so the
+/// deferral rule above covers the gap before progress begins and not only
+/// the progress itself. It does not resurrect a per-pass settle - `wait_ready`
+/// still asks only `quiet_for(Duration::ZERO)` once settled, and answers that
+/// question truthfully however recently `mark_edited` ran - it only changes
+/// what a *specific* empty answer, arriving in the narrow window right after
+/// an edit, is measured against. `tests/lsp_bridge.rs`'s
+/// `a_didchange_race_is_not_recorded_as_no_target` forces the window with a
+/// server scripted to answer nothing truthful until a real delay after
+/// `didChange` has passed, and fails without this reset: the early `null`
+/// is recorded as final in under two milliseconds, retracting the very edge
+/// pass one had just found.
+///
 /// # Retraction (decision 5)
 ///
 /// Two rules, and a third that is deliberately absent.
@@ -418,6 +445,9 @@ impl LspBridge {
                             "contentChanges": [{ "text": entry.source }],
                         }),
                     );
+                    // GM-309: the server has not necessarily reacted to this
+                    // edit yet - see `LspClient::mark_edited`.
+                    client.mark_edited();
                     opened.insert(path.clone(), OpenDocument { version, text_hash: hash });
                 }
                 None => {
@@ -432,6 +462,10 @@ impl LspBridge {
                             }
                         }),
                     );
+                    // Same reasoning as `didChange` above: a file this server
+                    // has never seen is at least as likely to start it
+                    // reanalysing as an edit to one it already had open.
+                    client.mark_edited();
                     opened.insert(path.clone(), OpenDocument { version: 1, text_hash: hash });
                 }
             }
