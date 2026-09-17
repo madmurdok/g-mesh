@@ -621,6 +621,55 @@ struct PluginState {
     io: PluginIo,
 }
 
+/// Catches a node-launched plugin's missing entry point before it is ever
+/// spawned, instead of letting `Command::spawn` succeed on `node` itself
+/// (genuinely on `$PATH`) only for node to exit before the handshake once it
+/// can't find the script. That latter shape - `spawn()` succeeds,
+/// `handshake::perform` then reports "plugin closed its stdout before
+/// sending a handshake" - is exactly what an unbuilt bundled JS/TS plugin
+/// looks like (`core/build.rs` downgrades a failed `npm run build` to a
+/// warning, so `dist/src/index.js` can genuinely not exist here), and that
+/// message names the symptom, never the missing build. Checked here, not by
+/// making `handshake::perform` itself smarter, because only the caller
+/// knows whether this was even a node script to begin with - a non-node
+/// plugin (the Go binary, a third-party SDK plugin) that fails its
+/// handshake for some other reason must keep getting that other reason.
+///
+/// Not limited to the bundled TypeScript plugin by name: the remedy named
+/// below (`npm ci && npm run build`, run in the entry's own npm package) is
+/// equally correct for any node-based plugin discovered from a
+/// `plugin.toml`, found by walking up from the entry for the nearest
+/// `package.json` rather than assuming `plugins/typescript`'s exact layout.
+///
+/// `pub(crate)` rather than private: `daemon::manifest`'s own
+/// `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`
+/// test spawns the bundled plugin directly (it has to - it is checking the
+/// handshake against a manifest read from disk, not through this module's
+/// `PluginManifest`) and hits the exact same unbuilt-plugin failure; reusing
+/// this check there keeps both call sites naming the same cause and the
+/// same fix instead of the generic message drifting back in on one side.
+pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option<String> {
+    let is_node = command.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem == "node");
+    let entry = Path::new(args.first()?);
+    if !is_node || entry.is_file() {
+        return None;
+    }
+    let package_dir = entry.ancestors().find(|dir| dir.join("package.json").is_file());
+    Some(match package_dir {
+        Some(dir) => format!(
+            "the plugin's entry point {} does not exist - it has not been built yet. Run `npm ci && npm run \
+             build` in {}",
+            entry.display(),
+            dir.display()
+        ),
+        None => format!(
+            "the plugin's entry point {} does not exist - it has not been built yet (run `npm ci && npm run \
+             build` in its package directory)",
+            entry.display()
+        ),
+    })
+}
+
 impl PluginState {
     /// Spawns `manifest`'s plugin for `project_root` and reads its handshake
     /// off stdout, hard-failing - matching `handshake::verify`'s "a protocol
@@ -630,6 +679,10 @@ impl PluginState {
     /// and every crash relaunch (`PluginProcess::relaunch`): both need
     /// exactly the same startup sequence.
     fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
+        if let Some(hint) = missing_node_entry_hint(&manifest.command, &manifest.args) {
+            bail!(hint);
+        }
+
         let mut child = Command::new(&manifest.command)
             .args(&manifest.args)
             .arg(project_root)
@@ -1600,6 +1653,16 @@ mod tests {
     /// `daemon::registry::indexer_version` and its own tests.)
     #[test]
     fn the_bundled_plugins_build_is_fingerprintable_from_the_test_binary() {
+        // Same unbuilt-plugin check the actual spawn path makes (see
+        // `missing_node_entry_hint`'s doc comment) - without it, this test's
+        // own assertion below fails as "unavailable" != "unavailable"
+        // (`assert_ne!` printing both sides identically, since both are the
+        // same degraded constant), which names nothing about why.
+        let bundled_manifest = bundled_manifest();
+        if let Some(hint) = missing_node_entry_hint(&bundled_manifest.command, &bundled_manifest.args) {
+            panic!("{hint}");
+        }
+
         let bundled = bundled_fingerprint();
 
         assert_ne!(
