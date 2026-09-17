@@ -21,6 +21,7 @@
 //! | 5. What a semantic answer may retract | [`LspBridge`] |
 //! | 6. Per-request, per-pass and concurrency budgets | [`Budgets`] |
 //! | 7. Reporting a pass that did not finish | [`SemanticAnswer`](crate::SemanticAnswer) |
+//! | 8. A server's readiness *shape*, declared rather than waited out | [`config`] and [`ServerReadiness`] |
 //!
 //! # Generic by construction
 //!
@@ -84,4 +85,4 @@ mod config;
 mod position;
 
 pub use bridge::{Budgets, LspBridge};
-pub use config::SemanticConfig;
+pub use config::{SemanticConfig, ServerReadiness};

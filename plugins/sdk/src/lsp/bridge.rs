@@ -226,6 +226,32 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// per-file pass that follows every edit would spend two of its ninety
 /// seconds proving a point that was already settled.
 ///
+/// **And a manifest may say the shape instead of waiting to be shown it**
+/// (GM-310). `[plugin.semantic] readiness = "on-demand"` -
+/// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand) -
+/// starts the client with that latch already set, so the very first pass
+/// waits only for whatever is in flight now. It is not a shorter settle:
+/// [`Budgets::settle`] keeps its value and both of its other jobs, because
+/// those jobs want the opposite number. Traced, pyright answers a cross-file
+/// `definition` correctly 41-146ms *before* its own `$/progress` token
+/// begins, and that token begins 1.26-1.33s after `didOpen` - so the number
+/// that would make its start-up cheap is a number too small to keep GM-309's
+/// post-edit deferral honest on the same server. One shape key and one
+/// unchanged duration, rather than one duration asked to be two things.
+///
+/// What keeps the claim safe when it is *wrong* is everything this section
+/// already describes, still running. `sync_documents` marks the client edited
+/// after every `didOpen`, so when the first question of the first pass goes
+/// out the client has been quiet for milliseconds; `run_pass` defers every
+/// empty answer that arrives while the client has not been quiet for a full
+/// settle, and re-asks it only after a *continuous* settle of quiet - which a
+/// server that is genuinely indexing cannot hand out. An `on-demand` manifest
+/// in front of a rust-analyzer therefore produces the same edges it produces
+/// today, at the same moment, having spent one deferral per question instead
+/// of one wait per pass. `tests/lsp_bridge.rs`'s
+/// `an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
+/// is that case, and it is the test that fails if any of the above is removed.
+///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
 /// arrives before the server is quiet again is therefore re-asked once, after

@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::config::SemanticConfig;
+use super::config::{SemanticConfig, ServerReadiness};
 use super::position::{file_uri, PositionEncoding};
 use crate::framing::{read_frame, write_message};
 
@@ -125,6 +125,15 @@ pub(crate) struct LspClient {
     /// see [`LspClient::settle`]. It lives here rather than on the bridge
     /// because it is a fact about *this* server: the next one starts up all
     /// over again, and a flag that dies with the client cannot be left stale.
+    ///
+    /// It starts `true` for a
+    /// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand)
+    /// server (GM-310). That is the whole of that feature: "on demand" means
+    /// *born in the state every server reaches after its first settle*, which
+    /// is a state this client already had, that `wait_ready` already reads,
+    /// and that GM-290 already measured on every pass after the first. No new
+    /// rule, no second state machine - one server-shaped fact setting a latch
+    /// that exists.
     settled: bool,
     /// Set once the server's stdout has closed, so a caller that polls again
     /// after a crash is told the same thing rather than blocking.
@@ -187,7 +196,7 @@ impl LspClient {
             encoding: PositionEncoding::Utf16,
             active_progress: BTreeMap::new(),
             idle_since: Some(Instant::now()),
-            settled: false,
+            settled: config.readiness == ServerReadiness::OnDemand,
             closed: false,
         };
         client.initialize(config, root, deadline)?;
@@ -299,6 +308,15 @@ impl LspClient {
     /// proves what shape it is once - see [`super::bridge::LspBridge`]'s doc
     /// on readiness - and a per-file pass that follows an edit must not pay
     /// for that proof again.
+    ///
+    /// A server whose manifest declares
+    /// [`ServerReadiness::OnDemand`] starts with that latch already set
+    /// (GM-310): the proof is the plugin author's trace rather than this
+    /// process's own two seconds of waiting. Note what is *not* skipped -
+    /// `quiet_for(Duration::ZERO)` still answers "is something in flight right
+    /// now", so an on-demand server that happens to be mid-progress when a
+    /// pass begins is still waited for, exactly as an indexed one is on its
+    /// second pass.
     pub(crate) fn settle(&mut self, quiet: Duration) -> bool {
         if self.settled {
             return self.quiet_for(Duration::ZERO);

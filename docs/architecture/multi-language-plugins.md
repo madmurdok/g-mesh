@@ -425,6 +425,22 @@ args = []
 engine = "rust-analyzer"        # the `engine` label on every edge it emits;
                                 # defaults to the command's file stem
 implementation_kinds = ["trait"]  # nativeKinds asked textDocument/implementation
+readiness = "indexed"           # GM-310. "indexed" (the default): the server
+                                # builds a start-up index, so the bridge waits
+                                # for one continuous Budgets::settle of quiet
+                                # before asking anything. "on-demand": the
+                                # server resolves each question as it is asked
+                                # (pyright does; its $/progress is background
+                                # diagnostics), so the start-up wait is skipped
+                                # and nothing else is. Every other sceptical
+                                # rule keeps running, so a wrong claim costs
+                                # latency rather than an edge: it cannot record
+                                # "no target" anywhere "indexed" would not have
+                                # recorded it too. A value that is
+                                # neither is a hard error, not a default: the
+                                # default is the slow answer, and a typo'd
+                                # `on_demand` would silently cost what the key
+                                # exists to save
 [plugin.semantic.env]           # added to the inherited environment, never an
                                 # allowlist - a server has to find its toolchain
 RA_LOG = "error"
@@ -2078,6 +2094,182 @@ GM-299 measured are untouched: the settle is still paid once per server, the
 per-file pass is still tens of milliseconds when nothing races it, and this
 fix spends latency only on the specific question that happens to be asked
 inside the gap - never on the pass as a whole.
+
+#### Implementation notes (GM-310): readiness is a shape, not a duration
+
+GM-299's note ends by refusing to shorten pyright's settle and saying why: one
+server version, one twelve-file fixture, and "a server made to look ready
+before it can answer" is the bug GM-290 found twice. That refusal was right and
+is kept. What it left open is the thing it measured - with `Budgets::settle`
+forced to zero, pyright returns **byte-identical answers**, so roughly 2.0s of
+a 3.4s pass is the bridge waiting for a server that was ready before it was
+asked - and this task closes it without taking the trade GM-299 declined.
+
+**Both servers were traced again, from scratch, by a client that speaks the
+same handshake `LspClient` does** (same capabilities, same
+`workspace/configuration` reply, `initialized` sent the instant the response
+arrives rather than after a fixed sleep). Machine: 8 cores, 32 GiB; load
+average 30.0-31.2 for the three pyright reps, 33.2 for the rust-analyzer
+prober run and 40.8 for its observer run.
+
+pyright 1.1.414, this plugin's own conformance fixture, eleven files opened,
+three reps:
+
+| | rep A | rep B | rep C |
+|---|---:|---:|---:|
+| `initialize` answered | 434ms | 401ms | 423ms |
+| `didOpen`, 11 files | 445ms | 405ms | 428ms |
+| **first correct cross-file `definition`** | **1665ms** | **1603ms** | **1614ms** |
+| `$/progress` BEGIN (one token, empty title) | 1707ms | 1720ms | 1761ms |
+| `$/progress` END | 2199ms | 2193ms | 2178ms |
+| `didOpen` → progress BEGIN | 1261ms | 1316ms | 1332ms |
+| answer *before* progress BEGIN | 41ms | 117ms | 146ms |
+
+The correct answer arrives **41-146ms before the progress token begins**, three
+times out of three. GM-299 inferred this from a zero-settle counterfactual;
+this is the direct observation, and it says the same thing: that token is a
+background diagnostics pass, not an indexing gate.
+
+rust-analyzer 1.97.1, `plugins/rust`'s conformance fixture, ten files opened,
+one question per second:
+
+```text
+  313ms  BEGIN Fetching                    ← 13 tokens, 6 distinct names, re-used
+ 4427ms  cross-crate `definition` on `describe`   CORRECT
+12094ms  `implementation` on `Loud`               CORRECT
+12334ms  END cachePriming (the last token)
+13431ms  receiver call `square.area()`            CORRECT - empty until here
+```
+
+Quiet runs between phases: 313, 182, 0, 3, 88, 0, 0, 0, 5 ms. The **largest gap
+is 182ms**, against a 2s settle - so the settle is not slack that could be
+trimmed, it is the 11x margin that stops a gap being read as the end.
+
+**The chosen mechanism: `[plugin.semantic] readiness = "on-demand" |
+"indexed"`, defaulting to `indexed`.** `on-demand` starts `LspClient` with its
+`settled` latch already set, which means *born in the state every server
+reaches after its first settle* - a state this client already had, that
+`wait_ready` already reads, and that GM-290 already measured on every pass
+after the first. One field, one line of behaviour, no second state machine.
+`Budgets::settle` is untouched.
+
+**Why not simply shorten the settle, which `LspBridge::with_budgets` already
+allows.** Because that one number does two jobs, and pyright wants opposite
+values for them. Job A is start-up readiness, where pyright wants ~0. Job B is
+GM-309's post-edit scepticism, which needs the settle to stay **above** this
+server's own didOpen-to-progress gap - traced above at **1.26-1.33s**, twice
+GM-299's 0.63s on a quieter machine. A settle short enough to win A loses B on
+the same server and re-opens the bug closed one release ago. GM-309, landing
+first, is what made the shape key possible *and* what rules the number out.
+
+**Why not probe - ask one cheap question early and see whether the answer is
+trustworthy.** This was designed as carefully as it can be: not "did it
+answer", which an unready server satisfies with a wrong empty, but "did it
+answer *what the index already knows*" - `definition` on a declaration's own
+name, whose correct answer is that declaration. The trace kills it anyway, and
+in a way no amount of care fixes. rust-analyzer answers the cross-crate
+`definition` **correctly at 4427ms** and the receiver call **empty until
+13431ms**, in one session, from one server. A probe would have declared
+readiness at 4.4s on the first and recorded the second as "no target". The
+self-definition probe is in fact the *last* thing this server answers
+(12094ms), so it is conservative here by accident and not by design. A question
+answered is not a server ready - measured, rather than feared.
+
+**Why not adapt within a session from observed progress behaviour, or shorten
+the settle once a server has demonstrated it answers before progress.** Twice
+over, and the first reason covers both. The whole cost is on the *first* pass,
+because `LspClient::settle` has latched since GM-290 and a per-file pass
+already costs tens of milliseconds - so a demonstration can only arrive after
+the pass that would have paid for it, and there is nothing left for it to
+save. And rust-analyzer's early progress stream carries no signal to adapt
+from anyway: 13 tokens under 6 names, `Fetching` beginning three separate
+times, tokens interleaving, and nothing observable at t<4s predicting that
+`cachePriming` is still running at 12.3s.
+
+**The measurement that changed the method, and is the argument against every
+"ask early to find out" scheme.** The first rust-analyzer trace polled at 100ms
+and accumulated 422 outstanding requests. It opened a **7465ms quiet run** in
+the middle of start-up - long enough that even the 2s settle would have
+declared readiness inside it - and ended in a `content modified` storm. The
+undisturbed run's largest gap is 157ms. So asking questions during
+rust-analyzer's start-up starves its background work and *manufactures* the
+gap that readiness exists to survive. A scheme that learns by asking changes
+the thing it is measuring, in the dangerous direction.
+
+**What makes an `on-demand` claim safe when it is wrong.** It removes the
+blanket wait and nothing else. `sync_documents` marks the client edited after
+every `didOpen` (GM-309), so when the first question of the first pass goes out
+the client has been quiet for milliseconds, not for the life of the process;
+`run_pass` defers every empty answer arriving before a full settle of
+continuous quiet, and returns a deferred question only when that continuous
+quiet arrives - which a server genuinely mid-sequence cannot supply, its own
+next `begin` clearing the clock. So `on-demand` in front of a rust-analyzer
+produces the same edges at the same moment, having spent one deferral per
+question instead of one wait per pass.
+
+The guarantee is worth stating exactly rather than generously, because the
+generous version is false: `on-demand` **cannot record "no target" in any case
+where `indexed` would not record it too**, which is not the same as "never".
+Both believe a second empty answer given after a full continuous settle of
+quiet, so a server that indexes for seconds while reporting no `$/progress` at
+all defeats both equally - that exposure belongs to `Budgets::settle` and to
+GM-290's decision to make a silent server ready by the clock, and this key
+neither widens nor narrows it. `tests/lsp_bridge.rs`'s
+`an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
+is exactly that case. It was shown to fail two ways: with `quiet_for` reduced
+to "is anything in flight now" (GM-289's rule 1) it reports **0 edges in
+10.7ms and calls the pass complete**; and with `on-demand` implemented as the
+rejected zero settle it is the **only** test in the file that fails - no
+pre-existing test catches that, which is why it had to be written.
+
+**What it saves, measured.** The Python conformance arm run eight times per
+value, interleaved in one process so both arms see the same machine, with
+`assert_conformant()` on every run - so the faster arm is provably not the one
+that answered less. Every run reported the identical `4 node(s)/4 edge(s)`.
+Load average 6.1-8.1 throughout; `real 67.13 / user 45.70 / sys 7.64` for the
+whole harness, so it was working rather than waiting. Reps 1-3 are warm-up and
+excluded; reps 4-8 are the steady state:
+
+| whole-project pass, 12 files | rep4 | rep5 | rep6 | rep7 | rep8 | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| `indexed` | 3.349 | 3.360 | 3.311 | 3.376 | 3.301 | **3.339s** |
+| `on-demand` | 2.264 | 2.285 | 2.273 | 2.330 | 2.275 | **2.285s** |
+
+**The saving is 1.054s, 31.6%.** The spread inside each arm is ~70ms, fifteen
+times smaller than the gap between them, which is what makes this a
+measurement rather than two numbers. It is about *half* the 2.0s GM-299's
+zero-settle counterfactual implied, and the difference is not a disappointment
+but the reason to measure rather than subtract: the pass overlaps part of the
+settle with work it has to do regardless - the spawn, the handshake, the
+`didOpen`s - so removing the wait does not remove its whole duration.
+
+**Two costs, both real and neither hidden.** The per-file pass that follows an
+edit goes from 30.3-38.5ms (mean 34.0ms) to 85.6-101.1ms (mean 91.1ms),
+**+57ms**: with the cold pass finishing a second earlier, pyright's background
+diagnostics token is more often still in flight when the next pass starts, and
+`wait_ready` correctly waits for it - which is the bridge doing its job, not a
+regression in it. Net over both passes, 3.373s → 2.376s, a saving of
+**0.997s**. And when the deferral fires it costs a whole settle: of eleven
+`on-demand` whole-project reps across both harness runs, **two** came back at
+4.089s and 4.275s instead of ~2.3s - about 1.8-2.0s high, which is one
+deferred question paying one 2s settle. That is the safety net working, priced
+exactly as designed, and it is why `on-demand` is a claim a plugin makes
+deliberately rather than a default.
+
+**Where each value is set, and why the Rust one is written out.**
+`plugins/python/plugin.toml` says `on-demand`; `plugins/rust/plugin.toml` says
+`indexed`, which is the default, stated explicitly so the trace that justifies
+it has somewhere to live. Both manifests' claims are asserted in their plugin's
+`the_shipped_manifest_configures_the_server_this_module_expects`, which exists
+precisely so a shipped manifest cannot rot unnoticed.
+
+**None of this extrapolates**, and the direction of the error is worth naming.
+Twelve files with no third-party dependencies is pyright's best case; on a real
+project its cold load is dominated by resolving imports against a venv's
+`site-packages`, which this fixture does not exercise at all. A fixed 1.05s
+saved off a 3.3s pass is 32%; off a two-minute pass it is nothing. The claim
+this key makes - *this server does not gate answers on a start-up index* -
+stays true at any size; the saving does not.
 
 ### MCP instructions
 
