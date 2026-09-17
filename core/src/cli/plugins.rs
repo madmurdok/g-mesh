@@ -3,29 +3,52 @@
 //! install, not of any one indexed project.
 //!
 //! See `docs/architecture/plugin-modularity.md`'s Interfaces section for the
-//! behavior this implements: every manifest found under either discovery
-//! root is reported, tagged with which root it came from
-//! ([`PluginStatus::Bundled`] or [`PluginStatus::Installed`]); a manifest
-//! that fails to parse is listed with an error string rather than silently
-//! dropped or aborting the whole command - unlike daemon startup (see
-//! [`crate::daemon::manifest::discover`], which hard-fails on the first bad
-//! manifest), a listing tool's job is to surface what is there, including
-//! what is broken.
+//! behavior this implements: every *effective* plugin - one entry per
+//! language, exactly the set `daemon::manifest::discover` would hand the
+//! daemon to spawn from these same roots - is reported, tagged with which
+//! root it came from ([`PluginStatus::Bundled`] or [`PluginStatus::Installed`]);
+//! a manifest that fails to parse is listed with an error string rather than
+//! silently dropped or aborting the whole command - unlike daemon startup
+//! (see [`crate::daemon::manifest::discover`], which hard-fails on the first
+//! bad manifest), a listing tool's job is to surface what is there,
+//! including what is broken.
 //!
 //! # Why this does not just call `daemon::manifest::discover`
 //!
 //! `discover()` returns only the merged, daemon-ready result: one manifest
 //! per language (an earlier root's entry silently shadows a same-named later
 //! one) and a hard error the instant any manifest fails to parse or two
-//! languages claim the same extension. None of that fits a listing command:
-//! this needs to know *which root* each manifest came from (`discover()`
-//! throws that away once it merges into one `HashMap`), it must keep going
-//! after a bad manifest instead of aborting, and extension-routing conflicts
-//! are a daemon-startup concern this command has no reason to duplicate. So
-//! this module walks each root itself, calling
+//! languages claim the same extension. Two of those three properties do not
+//! fit a listing command: this needs to know *which root* each manifest came
+//! from (`discover()` throws that away once it merges into one `HashMap`),
+//! and it must keep going after a bad manifest instead of aborting the whole
+//! scan (extension-routing conflicts are the one property this command does
+//! duplicate `discover()`'s stance on by *not* re-checking them - a daemon-
+//! startup concern this command has no reason to raise on its own). So this
+//! module walks each root itself, calling
 //! [`crate::daemon::manifest::read_manifest`] per plugin directory found -
 //! the same per-manifest primitive `discover()` uses - rather than reusing
 //! `discover()`'s all-or-nothing merge.
+//!
+//! The one property this module *must* keep from `discover()`, on pain of
+//! exactly the bug GM-306 fixed: **an earlier root's language shadows the
+//! same language in a later one**, the same "earlier root wins" rule
+//! `discover()` applies and this file's own [`default_roots`] already
+//! documents as the precedence order. `list_from_roots` used to skip that
+//! step - it walked every root and `extend`ed the results with no
+//! deduplication at all, on the theory (recorded, and wrong, in a comment on
+//! [`default_roots`] that has since been corrected) that the installed and
+//! checkout bundled roots are never both real on the same machine. They are
+//! both real on any machine that built the binary it is running, and on
+//! every developer's machine besides - which is every machine anyone
+//! reading this comment is likely to run `cargo build` on - so every plugin
+//! this install ships was printed twice, invisibly on the one machine shape
+//! (a user's, with no checkout) where nobody would notice. [`list_from_roots`]
+//! now re-applies the same shadow rule `discover()` uses, so what this
+//! command prints is never wider than what the daemon would actually spawn:
+//! a checkout root's `plugin_version` disagreeing with an installed root's
+//! (increasingly possible as of GM-303's `plugin_version` rule) shows only
+//! the version that would actually run, not both.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -102,7 +125,10 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Every plugin this install has, across both discovery roots.
+/// Every plugin this install has - one entry per language, the same
+/// language set `daemon::manifest::discover` would hand the daemon to spawn
+/// from these same roots (see [`list_from_roots`] for the shadow rule that
+/// guarantees this).
 pub fn list() -> Result<Vec<PluginInfo>> {
     list_from_roots(&default_roots()?)
 }
@@ -116,8 +142,17 @@ pub fn list() -> Result<Vec<PluginInfo>> {
 /// Delegating the bundled half to [`manifest::bundled_roots`] rather than
 /// re-deriving it is what keeps this listing honest about what the daemon
 /// would actually spawn: both the installed layout (a release archive's
-/// `plugins/` beside the executable) and the checkout layout are reported, and
-/// on any real machine only one of them exists - see that function for why.
+/// `plugins/` beside the executable) and the checkout layout are reported.
+/// They are *not* mutually exclusive - a checkout that has ever built its
+/// own binary (`cargo build`, no install step involved) has both a
+/// `target/<profile>/plugins/`-shaped installed root (once anything
+/// populates it, e.g. a bundled release unpacked over a checkout, or a
+/// developer copying one in) and its always-real `CARGO_MANIFEST_DIR/../plugins`
+/// checkout root live at once; that is every developer's machine, and every
+/// machine that produced the binary it is running. This function's job is
+/// only to name both roots in precedence order and let [`list_from_roots`]
+/// decide which one wins per language when both are real - not to assume
+/// only one of them ever is.
 fn default_roots() -> Result<Vec<(PathBuf, PluginStatus)>> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let user_root = home.join(".g-mesh").join("plugins");
@@ -126,14 +161,45 @@ fn default_roots() -> Result<Vec<(PathBuf, PluginStatus)>> {
     Ok(roots)
 }
 
-/// Scans each of `roots` in order, reporting every plugin directory found
-/// under it (see [`scan_root`]) - the testable core of [`list`], parameterized
+/// Scans each of `roots` in order, reporting one entry per language found
+/// under them (see [`scan_root`]) - the testable core of [`list`], parameterized
 /// over the roots so a test can point it at a fixture directory instead of
 /// the real `~/.g-mesh/plugins/`.
+///
+/// # Shadowing: the earlier root wins, same as `discover()`
+///
+/// A language already reported from an earlier root is skipped when the
+/// same language turns up again under a later one - `HashSet`-tracked as
+/// entries accumulate, in the same root order `roots` was given in. This is
+/// not a display-only policy invented here: it is `daemon::manifest::discover`'s
+/// own "an earlier root's entry silently shadows a same-named later one"
+/// rule (see that function's doc comment), reapplied so that what this
+/// command prints never disagrees with what the daemon would actually spawn
+/// from the same roots. The alternative - printing one line per root
+/// regardless of language, as this function did before GM-306 - means every
+/// plugin an install ships is listed twice on any machine where the
+/// installed and checkout bundled roots are both real (see [`default_roots`]),
+/// and silently picks whichever root's entry happens to render last as the
+/// one a reader's eye lands on, with no indication that only the *other* one
+/// is what actually gets spawned.
+///
+/// The key an entry shadows by is [`PluginInfo::language`] - the manifest's
+/// own declared language for a parsed entry, or the containing directory
+/// name for one that failed to parse (see [`scan_root`]) - not the manifest
+/// content itself, so a later root's *different* `plugin_version` for the
+/// same language is exactly the disagreement this is meant to resolve in
+/// the daemon's favor, not surface twice.
 fn list_from_roots(roots: &[(PathBuf, PluginStatus)]) -> Result<Vec<PluginInfo>> {
+    let mut seen_languages = std::collections::HashSet::new();
     let mut infos = Vec::new();
     for (root, status) in roots {
-        infos.extend(scan_root(root, *status)?);
+        for info in scan_root(root, *status)? {
+            if seen_languages.insert(info.language.clone()) {
+                infos.push(info);
+            }
+            // else: an earlier, higher-precedence root already reported this
+            // language - shadowed, same as `discover()`'s own rule.
+        }
     }
     Ok(infos)
 }
@@ -371,6 +437,86 @@ mod tests {
         let plugins = list_from_roots(&[(missing, PluginStatus::Bundled)]).unwrap();
 
         assert!(plugins.is_empty());
+    }
+
+    /// A minimal well-formed `plugin.toml` body for a given language and
+    /// version - the `list_from_roots` analog of `daemon::manifest`'s own
+    /// `manifest_toml` test helper, needed here because this module's tests
+    /// otherwise only ever exercise the *real* bundled JS/TS manifest
+    /// ([`BUNDLED_JS_TS_MANIFEST`]), which cannot vary its own version to
+    /// build the two-roots-disagree fixtures below.
+    fn plugin_toml(language: &str, plugin_version: &str) -> String {
+        format!(
+            r#"
+[plugin]
+language = "{language}"
+protocol_version = {version}
+plugin_version = "{plugin_version}"
+
+[plugin.spawn]
+command = "node"
+
+[plugin.languages]
+extensions = [".{language}"]
+"#,
+            version = crate::protocol::types::CURRENT_PROTOCOL_VERSION,
+        )
+    }
+
+    /// GM-306's regression test, stated directly: on a machine where two
+    /// roots both offer the *same* language - exactly the installed-root-
+    /// beside-the-executable-plus-checkout-root shape [`default_roots`]'s
+    /// doc comment now explains is the common case, not the rare one - that
+    /// language must be listed once, not once per root. Before GM-306,
+    /// `list_from_roots` had no deduplication at all, so this reproduces
+    /// "every bundled plugin printed twice" (the actual bug, observed on a
+    /// real installed archive) at the smallest scale that still exercises
+    /// the real code path: two real roots, one real language, `Bundled`
+    /// status both times exactly as `bundled_roots()` tags them.
+    #[test]
+    fn a_language_offered_by_two_roots_is_listed_once_not_twice() {
+        let (_root_a, root_a) = fixture_root(&[("typescript", &plugin_toml("typescript", "2.2.0"))]);
+        let (_root_b, root_b) = fixture_root(&[("typescript", &plugin_toml("typescript", "2.2.0"))]);
+
+        let plugins =
+            list_from_roots(&[(root_a, PluginStatus::Bundled), (root_b, PluginStatus::Bundled)]).unwrap();
+
+        assert_eq!(
+            plugins.len(),
+            1,
+            "typescript is offered by both roots and must be listed once, not once per root: {plugins:?}"
+        );
+    }
+
+    /// This task's other acceptance criterion: which root wins when two
+    /// roots disagree - about a plugin's version, the case a checkout root
+    /// and an installed root actually hit in practice (see the module doc
+    /// comment) - is a decided, tested behavior, not an accident of
+    /// iteration order. The decision: the *earlier*, higher-precedence root
+    /// wins, matching `daemon::manifest::discover`'s own shadow rule (see
+    /// [`list_from_roots`]'s doc comment) - so what a user reads from
+    /// `plugins list` always names the version the daemon would actually
+    /// spawn from these same roots, never the shadowed one.
+    #[test]
+    fn when_two_roots_disagree_about_a_plugin_version_the_earlier_root_wins() {
+        let (_first, first_root) = fixture_root(&[("python", &plugin_toml("python", "1.0.0"))]);
+        let (_second, second_root) = fixture_root(&[("python", &plugin_toml("python", "2.0.0"))]);
+
+        let plugins =
+            list_from_roots(&[(first_root, PluginStatus::Installed), (second_root, PluginStatus::Bundled)])
+                .unwrap();
+
+        assert_eq!(plugins.len(), 1, "{plugins:?}");
+        assert_eq!(
+            plugins[0].outcome,
+            PluginOutcome::Loaded {
+                version: "1.0.0".to_string(),
+                status: PluginStatus::Installed,
+                capabilities: Capabilities::default(),
+            },
+            "the earlier root (first_root, here tagged Installed) must win over the later \
+             root's disagreeing version - the later root's 2.0.0 must not appear at all"
+        );
     }
 
     #[test]
