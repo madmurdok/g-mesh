@@ -30,7 +30,7 @@ protocol_version = 2
 # and the two screens a person consults about one plugin named different
 # versions. This is the same drift `plugins/rust/plugin.toml`'s own header
 # records, found the same way and fixed the same way.
-plugin_version = "3.4.0"
+plugin_version = "3.5.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-python"
