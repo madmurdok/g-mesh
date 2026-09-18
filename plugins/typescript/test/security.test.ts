@@ -189,7 +189,7 @@ test("the tsserver child does not execute a malicious tsconfig.json `plugins` en
       "tsserver must never require() a project's compilerOptions.plugins entry",
     );
   } finally {
-    project.stop();
+    await project.stop();
     await cleanup(root);
   }
 });
