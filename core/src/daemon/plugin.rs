@@ -670,6 +670,82 @@ pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option
     })
 }
 
+/// Catches a cargo-workspace-built plugin's missing binary before it is ever
+/// spawned - the same shape of problem [`missing_node_entry_hint`] catches
+/// for a node-launched one, just on the other side of the check. There the
+/// *launcher* (`node`) genuinely exists and the *entry* named in `args` is
+/// what's missing; here there is no separate launcher - `command` itself is
+/// the plugin binary - so it is `command`, not an argument, that has to be
+/// tested for existence. `Command::spawn` on a missing `command` fails with a
+/// bare `No such file or directory (os error 2)`, naming neither cargo nor
+/// the fact that this is a build output at all, which is exactly the symptom
+/// traced while verifying GM-301: a `cargo test -p g-mesh` run that never
+/// built sibling workspace members failed the daemon's cold-start walk with
+/// that raw OS error, four tests deep before the daemon log (not the test
+/// failure itself) named the real cause.
+///
+/// Triggered by the path shape both bundled cargo-workspace plugins declare
+/// today (`plugins/python/plugin.toml`, `plugins/rust/plugin.toml`:
+/// `../../target/debug/g-mesh-plugin-<language>`, resolved by
+/// `daemon::manifest::resolve_path_entry` against the manifest's own
+/// directory) rather than by name, so a future third plugin that joins the
+/// cargo workspace the same way is covered without this function learning
+/// its name - the same "generic over the mechanism, not the specific
+/// plugin" choice `missing_node_entry_hint`'s own doc comment makes for node.
+/// A binary built by some other means that merely happens to live under a
+/// directory named `target/debug` or `target/release` would false-positive
+/// on this check; nothing in this codebase does that today, and the
+/// generic spawn-failure message below is still correct if one ever did.
+///
+/// Names `cargo build --workspace` specifically, not a per-crate `cargo
+/// build -p <name>`: the daemon's cold-start walk (`daemon::bulk_index::run`)
+/// spawns every *discovered* plugin unconditionally, regardless of which
+/// languages the project being indexed actually contains (see that module's
+/// own doc comment), so a checkout missing even one workspace-built plugin's
+/// binary needs the whole-workspace build to get unstuck, not just the one
+/// crate the failure happened to name.
+pub(crate) fn missing_workspace_binary_hint(command: &Path) -> Option<String> {
+    if command.is_file() {
+        return None;
+    }
+    let profile_dir = command.parent()?;
+    let profile = profile_dir.file_name().and_then(|name| name.to_str())?;
+    if profile != "debug" && profile != "release" {
+        return None;
+    }
+    let target_dir = profile_dir.parent()?;
+    if target_dir.file_name().and_then(|name| name.to_str()) != Some("target") {
+        return None;
+    }
+    let workspace_root = target_dir.parent().filter(|root| root.join("Cargo.toml").is_file());
+    Some(match workspace_root {
+        Some(root) => format!(
+            "the plugin binary {} does not exist - it has not been built yet. Run `cargo build --workspace` in {}",
+            command.display(),
+            root.display()
+        ),
+        None => format!(
+            "the plugin binary {} does not exist - it has not been built yet (run `cargo build --workspace` in \
+             the repository root)",
+            command.display()
+        ),
+    })
+}
+
+/// Every "is this plugin's binary simply missing" check this module knows,
+/// tried in turn - the one entry point both spawn sites
+/// ([`PluginState::spawn`] and `daemon::bulk_index::walk_one_language`) call,
+/// so a third such check joins both call sites by joining this function
+/// rather than by becoming a third thing each spawn site has to remember to
+/// call. [`missing_node_entry_hint`] and [`missing_workspace_binary_hint`]
+/// never both match the same manifest - the former requires `command` itself
+/// to be `node` (found on `$PATH`, so never "missing"), the latter requires
+/// `command` itself to be the thing that's missing - so trying both costs
+/// nothing on the manifest that matches neither.
+pub(crate) fn missing_plugin_binary_hint(command: &Path, args: &[String]) -> Option<String> {
+    missing_node_entry_hint(command, args).or_else(|| missing_workspace_binary_hint(command))
+}
+
 impl PluginState {
     /// Spawns `manifest`'s plugin for `project_root` and reads its handshake
     /// off stdout, hard-failing - matching `handshake::verify`'s "a protocol
@@ -679,7 +755,7 @@ impl PluginState {
     /// and every crash relaunch (`PluginProcess::relaunch`): both need
     /// exactly the same startup sequence.
     fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
-        if let Some(hint) = missing_node_entry_hint(&manifest.command, &manifest.args) {
+        if let Some(hint) = missing_plugin_binary_hint(&manifest.command, &manifest.args) {
             bail!(hint);
         }
 
@@ -1470,6 +1546,78 @@ mod tests {
             "the fixture must actually exercise the scaled branch, not the floor"
         );
         assert_eq!(timeouts.semantic_pass_project_timeout(file_count as usize), expected);
+    }
+
+    /// GM-316: a missing `target/debug/g-mesh-plugin-*` binary - exactly the
+    /// shape `plugins/python/plugin.toml` and `plugins/rust/plugin.toml`
+    /// declare - must name the binary, say it was never built, and name
+    /// `cargo build --workspace`, not the bare `No such file or directory`
+    /// `Command::spawn` would otherwise report.
+    #[test]
+    fn missing_workspace_binary_hint_names_the_binary_and_the_build_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-python");
+        // Deliberately not created - this is the "never built" case.
+
+        let hint =
+            missing_workspace_binary_hint(&binary).expect("a missing target/debug binary must get a hint");
+        assert!(hint.contains(&binary.display().to_string()), "{hint}");
+        assert!(hint.contains("has not been built yet"), "{hint}");
+        assert!(hint.contains("cargo build --workspace"), "{hint}");
+        assert!(
+            hint.contains(&workspace.path().display().to_string()),
+            "the hint should name the workspace root: {hint}"
+        );
+    }
+
+    /// The `release` profile is just as much a cargo build output as `debug`.
+    #[test]
+    fn missing_workspace_binary_hint_also_matches_the_release_profile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = workspace.path().join("target").join("release").join("g-mesh-plugin-rust");
+        let hint =
+            missing_workspace_binary_hint(&binary).expect("a missing target/release binary must get a hint");
+        assert!(hint.contains("cargo build --workspace"), "{hint}");
+    }
+
+    /// A binary that exists gets no hint at all - the common case, and the
+    /// one that must stay cheap (no I/O beyond the one `is_file` check) on
+    /// every ordinary spawn.
+    #[test]
+    fn missing_workspace_binary_hint_is_none_once_the_binary_exists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path().join("target").join("debug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("g-mesh-plugin-python");
+        std::fs::write(&binary, b"").unwrap();
+        assert_eq!(missing_workspace_binary_hint(&binary), None);
+    }
+
+    /// A path that is simply missing, but not under a cargo `target/<profile>`
+    /// directory, is not this check's business - the generic spawn-failure
+    /// message is left to name it, the same way `missing_node_entry_hint`
+    /// declines a non-node command.
+    #[test]
+    fn missing_workspace_binary_hint_ignores_a_missing_path_outside_target() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = workspace.path().join("bin").join("g-mesh-plugin-go");
+        assert_eq!(missing_workspace_binary_hint(&binary), None);
+    }
+
+    /// [`missing_plugin_binary_hint`] tries the node-entry check first and
+    /// falls back to the workspace-binary check - both spawn sites
+    /// (`PluginState::spawn`, `daemon::bulk_index::walk_one_language`) call
+    /// only this, so it has to actually dispatch to the workspace check for a
+    /// non-node manifest, not just the node one every existing caller already
+    /// exercised.
+    #[test]
+    fn missing_plugin_binary_hint_dispatches_to_the_workspace_check_for_a_non_node_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-python");
+        let hint =
+            missing_plugin_binary_hint(&binary, &[]).expect("a missing workspace binary must get a hint");
+        assert!(hint.contains("cargo build --workspace"), "{hint}");
     }
 
     /// A pathological file count must not overflow the multiplication into a
