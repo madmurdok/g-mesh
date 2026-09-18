@@ -36,6 +36,25 @@ async function makeProject(files: Record<string, string>): Promise<string> {
   return root;
 }
 
+/**
+ * tsserver reports every path with forward slashes, on every platform -
+ * including Windows - while `path.join` below (used to build the *expected*
+ * side from `root`) produces the OS's own separator, `\` there. Both name the
+ * same file; only the spelling differs. Full rationale, and the regression
+ * test that proves it against a constructed Windows-style path, live next to
+ * the same helper in semantic.test.ts (GM-322) - duplicated here rather than
+ * shared, matching this file's own `makeProject`/`cleanup` above.
+ */
+function normalizeSlashes(p: string): string {
+  return p.split("\\").join("/");
+}
+
+/** `assert.equal` for two paths that may disagree only in separator style -
+ * see `normalizeSlashes` above. */
+function assertSamePath(actual: string, expected: string, message?: string): void {
+  assert.equal(normalizeSlashes(actual), normalizeSlashes(expected), message);
+}
+
 async function cleanup(root: string): Promise<void> {
   await fs.rm(root, { recursive: true, force: true });
 }
@@ -172,13 +191,13 @@ test("the tsserver child does not execute a malicious tsconfig.json `plugins` en
     // to load the project (which would also have skipped the plugin).
     const definitions = await project.definition(file, { line: 1, offset: 17 });
     assert.equal(definitions.length, 1, "sanity: the fixture must still answer semantic queries");
-    assert.equal(definitions[0].file, file);
+    assertSamePath(definitions[0].file, file);
 
     // And it must have read the very tsconfig.json carrying the plugins entry
     // - otherwise "the plugin did not run" would only mean "the config never
     // reached the compiler".
-    assert.equal(
-      await project.configuredProjectFor(file),
+    assertSamePath(
+      (await project.configuredProjectFor(file)) ?? "",
       path.join(root, "tsconfig.json"),
       "sanity: the malicious tsconfig must be the config actually in force",
     );
