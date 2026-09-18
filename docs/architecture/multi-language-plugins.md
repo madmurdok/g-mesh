@@ -3057,6 +3057,18 @@ moving target under development).
 
 ## Open Questions / Risks
 
+- **Python's intermediate namespace packages:** closed as permanent-by-design
+  (GM-313). A namespace package with no direct content of its own has no file
+  that could announce it to its parent, so `parent_chain` has a gap there and
+  a visibility check can refuse a link a complete chain would allow - a
+  missing edge, never a wrong one. Manufacturing an announcer was rejected in
+  GM-295 because it would make one file responsible for a node its own text
+  says nothing about. GM-313 measured the shape rather than assuming it rare:
+  it occurs 9 times in django/django and 6 in pallets/flask, but in both
+  corpora every occurrence is a test-fixture or examples tree rather than the
+  importable package tree, so the gap is rare where it would cost anything.
+  Revisit only if a real project is hurt, or when `DECLARATION_OF` lands.
+
 - **Memory ceiling:** decided. `[plugin] memoryLimitMb`, off by default (see
   Interfaces). Still open: whether the sampling interval (the idle-check timer) is
   fine-grained enough to catch a fast rust-analyzer load spike before the OS does.
