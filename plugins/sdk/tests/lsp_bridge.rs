@@ -1188,3 +1188,188 @@ fn a_server_that_asks_with_nothing_configured_is_answered_null() {
     let text = std::fs::read_to_string(&received).expect("the server wrote down what it was answered");
     assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!([null, null]), "{text}");
 }
+
+// --- the site ceiling (GM-319) ----------------------------------------------
+
+/// Adds a file of `sites` unresolved receiver calls, one per line, each with
+/// its own calling declaration.
+///
+/// One caller per site rather than one per file, deliberately: two sites that
+/// share a `from_id` and resolve to the same target are the *same* edge, and
+/// `Answers` deduplicates it - so a fixture built the other way would count
+/// half the edges it thinks it has, and a test about retracting them would be
+/// measuring the deduplication instead.
+fn crowd_file(scratch: &Scratch, index: &mut SdkIndex, relative: &str, sites: usize) {
+    let source: String = (0..sites).map(|line| format!("  r{line}.m()\n")).collect();
+    scratch.write(relative, &source);
+
+    let path = RelPath::new(relative);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+    builder.file_node(range(0, 0, sites as u32, 0));
+    for line in 0..sites as u32 {
+        let name = format!("{}#{line}", relative.replace(['/', '.'], "_"));
+        let caller = builder.add_node(
+            NodeSpec::new(NodeKind::Function, &name, &name, range(line, 0, line, 10))
+                .native_kind("function")
+                .in_container("pkg", None)
+                .public(),
+        );
+        builder.open_site(OpenSite {
+            from_id: caller,
+            position: Position { line, col: 5 },
+            name: "m".to_string(),
+            kind: OpenSiteKind::ReceiverCall,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some("pkg".to_string()),
+            replaces: None,
+        });
+    }
+    index.insert(path, source, builder.finish());
+}
+
+/// **The GM-319 regression.** A repository whose open sites outnumber the
+/// pre-GM-319 ceiling of 20,000 must still record a *completed* whole-project
+/// pass. An incomplete one leaves `language_state.semanticPassAt` unset - and
+/// leaves it unset forever, because nothing about the project changes to make
+/// the next pass smaller: the receiver-call gap stays in every session's MCP
+/// instructions and the whole pass is redone on every daemon start. GM-314
+/// measured 87,832 questions for Django, 27,750 for tokio and 21,995 for
+/// g-mesh itself (GM-319's re-count), so this is not a hypothetical size.
+///
+/// Everything but `max_sites` is loosened here so that a loaded machine
+/// cannot fail this for a reason the test is not about; `max_sites` is read
+/// from `Budgets::default()` rather than written down, which is the whole
+/// point. On the pre-GM-319 default this fails at `complete`.
+#[test]
+fn a_project_larger_than_the_old_ceiling_still_completes_its_pass() {
+    const SITES: usize = 21_000;
+    const OLD_CEILING: usize = 20_000;
+    const FILES: usize = 40;
+
+    const { assert!(SITES > OLD_CEILING, "this fixture must be over the ceiling that used to cut it") };
+    let shipped = Budgets::default().max_sites;
+
+    let scratch = Scratch::new("ceiling");
+    let mut index = SdkIndex::new();
+    for file in 0..FILES {
+        crowd_file(&scratch, &mut index, &format!("src/crowd{file}.toy"), SITES / FILES);
+    }
+
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [],
+        "log": log.to_string_lossy(),
+    }));
+    let budgets = Budgets {
+        request: Duration::from_secs(120),
+        max_sites: shipped,
+        concurrency: 8,
+        project_floor: Duration::from_secs(600),
+        per_file: Duration::from_secs(600),
+        single_file: Duration::from_secs(600),
+        readiness: Duration::from_secs(60),
+        settle: Duration::from_millis(150),
+    };
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(
+        answer.complete,
+        "a {SITES}-site project must record a completed pass, not one reported cut short - the \
+         shipped ceiling is {shipped}"
+    );
+    // A server that answers nothing still *answers* every question - "nothing
+    // there" is an answer. Counting the requests is what proves the ceiling
+    // let the list through, rather than that the questions were cheap.
+    assert_eq!(
+        asked(&log, "textDocument/definition"),
+        SITES,
+        "every site must have been put to the server, not merely counted"
+    );
+}
+
+/// A pass the ceiling cuts short must not retract an earlier pass's answers
+/// about a file it never reached.
+///
+/// Before GM-319 the cut fell wherever the *n*th question happened to be,
+/// which is usually the middle of a file. Every question that file did
+/// contribute was asked and answered, so `run_pass` reported it covered, and
+/// `retract_stale` reads covered as "this pass is now the whole truth about
+/// that file" - withdrawing the edges an earlier, complete pass emitted for
+/// the sites this one was cut before reaching. Correct edges deleted to
+/// account for questions nobody asked, which is the direction the bridge's
+/// retraction rules exist to forbid.
+///
+/// Two files of two sites each and a ceiling of three. Three is the whole
+/// arithmetic: it can only be spent by cutting the second file in half.
+#[test]
+fn a_ceiling_that_cuts_a_pass_short_retracts_nothing_it_did_not_ask_about() {
+    let scratch = Scratch::new("ceiling-retract");
+    let mut index = SdkIndex::new();
+
+    // The declaration every site resolves to, in a file of its own so that no
+    // answer lands inside the file that asked - and with no sites, so it
+    // costs the ceiling nothing.
+    let decl = RelPath::new("src/decl.toy");
+    let decl_source = "fn target\n";
+    scratch.write("src/decl.toy", decl_source);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &decl);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "target", "target", range(0, 3, 0, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(decl, decl_source.to_string(), builder.finish());
+
+    crowd_file(&scratch, &mut index, "src/x.toy", 2);
+    crowd_file(&scratch, &mut index, "src/y.toy", 2);
+
+    let mut answers = Vec::new();
+    for file in ["src/x.toy", "src/y.toy"] {
+        for line in 0..2u32 {
+            answers.push(json!({
+                "uri": scratch.uri(file),
+                "line": line,
+                "character": 5,
+                "definition": { "uri": scratch.uri("src/decl.toy"), "line": 0, "character": 4 },
+            }));
+        }
+    }
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+
+    let mut budgets = budgets();
+    budgets.max_sites = 3;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    // A per-file pass over `y.toy` alone fits under the same ceiling, and is
+    // what gives the whole-project pass below something to be tempted to
+    // retract. (Core sends exactly this after every settled reparse.)
+    let first = bridge.answer(&[RelPath::new("src/y.toy")], &index).expect("the bridge answers");
+    assert!(first.complete, "two questions fit under a ceiling of three");
+    assert_eq!(semantic_edges(&first).len(), 2, "y.toy's own sites: {:#?}", first.diff);
+
+    // Now the whole project, at a ceiling that fits `decl.toy` (nothing) and
+    // `x.toy` (two) but not `y.toy`'s two as well.
+    let second = pass(&mut bridge, &index);
+    assert!(!second.complete, "a pass the ceiling cut short is not a completed pass");
+    assert!(
+        second.diff.delete_edge_ids.is_empty(),
+        "a file the ceiling stopped this pass from reaching keeps the answers it already has - \
+         retracted {:?}",
+        second.diff.delete_edge_ids
+    );
+    assert_eq!(
+        semantic_edges(&second).len(),
+        2,
+        "and the file that did fit is asked about in full: {:#?}",
+        second.diff
+    );
+}
