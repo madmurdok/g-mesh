@@ -1071,7 +1071,9 @@ tree-sitter parsing and nothing else, and no language server is started.
    so its own headroom is unknown), or stop letting truncation fail the pass -
    commit what was answered, record how far the list got, and resume from there
    on the next pass, which is what GM-289's finding 7 already argues for the
-   *diff* and not yet for the *list*.
+   *diff* and not yet for the *list*. (GM-319 took the first, measured
+   rust-analyzer's latency to size it, and argued the second down - see
+   "Implementation notes (GM-319)" below.)
 3. **If a shape is ever added, it is Rust's glob-scope names - and not as a
    semantic question.** The 2,052 g-mesh sites under a `use super::*` do not
    need an engine: the extractor already knows the module has a glob and which
@@ -1094,6 +1096,165 @@ the four repositories measured licenses a claim about "Python projects" or
 annotation density by a factor of 19, and g-mesh and tokio disagree about
 glob-scope share by a factor of six, which is itself the reason two corpora per
 language were measured rather than one.
+
+#### Implementation notes (GM-319): the ceiling, and why not resumption
+
+**`Budgets::max_sites` goes from 20,000 to 1,000,000, and truncation starts
+cutting between files instead of inside one.** GM-314 handed this task two
+candidate repairs and said neither had been implemented: raise the ceiling, or
+stop letting truncation fail the pass and resume from a cursor on the next one.
+The first is what shipped, the second was weighed and refused, and the case for
+each is below rather than only its conclusion - the refusal is the part a later
+reader is most likely to want to reopen.
+
+**The measurement the decision turns on, which GM-314 could not take.** Its
+headroom argument was pyright arithmetic only ("rust-analyzer's per-request
+cost on a real corpus was not measured here, so its own headroom is unknown").
+It is measured now, by driving a real `rust-analyzer` through the real bridge
+over a real corpus - `plugins/rust/tests/semantic_pass_measurement.rs`, which
+is `#[ignore]`d and needs `GM319_CORPUS`, so `cargo test --workspace` never
+runs it and CI never needs a corpus (the same contract `plugins/{python,rust}/src/census.rs` has).
+Each arm below is one whole-project pass over a clean `git archive` of
+`release-3.5.0` (6051d0a), 190 files and 21,995 questions, differing in
+`max_sites` and nothing else:
+
+| arm | `max_sites` | asked | wall | complete | edges | ms/request | load before → after |
+|---|---:|---:|---:|---|---:|---:|---|
+| A, as shipped in 3.5.0 (cold) | 20,000 | 20,000 | 182.5s | **false** | 1,649 | 73.0 | 39.96 → 86.58 |
+| A again, warm | 20,000 | 20,000 | 40.7s | **false** | 1,649 | 16.3 | 13.85 → 9.60 |
+| B, this task, warm | 1,000,000 | **21,995** | 51.8s | **true** | **1,921** | 18.9 | 9.38 → 9.59 |
+
+Arm A is the defect, reproduced against a real server on this repository rather
+than argued from the source: 1,995 questions never asked, the pass reported
+incomplete, and therefore `language_state.semanticPassAt` never set for Rust on
+g-mesh's own checkout. Arm B is the same pass, complete.
+
+**Only the warm pair is a comparison, and it is in the table twice for that
+reason.** The first arm A ran cold - it was what created the corpus's `target/`
+for rust-analyzer - at a load average of 40 rising to 87, so its 182.5s and the
+warm arm B's 51.8s differ mostly in cache and machine, not in `max_sites`;
+reading a speedup out of that pair would have been reading the load. Re-run
+warm at a comparable load, arm A takes 40.7s, so the honest cost of the fix is
+**+1,995 questions (+10%) for +11.1s (+27%)**, and what it buys is **272 more
+semantic edges and 144 more placeholder nodes** - a difference in output, not
+only in a flag, which is what makes the two arms demonstrably distinguishable
+rather than a boolean that could have been flipped by anything. Every run was
+`/usr/bin/time -p`'d with `user`+`sys` well above `real` (arm B: real 60.3,
+user 93.8, sys 14.9), so the time is work rather than waiting.
+
+**73 milliseconds is the number to size against.** Arm A cold is 9.1ms of wall
+clock per question at eight in flight, or **73ms per request** serialized; the
+warm runs are 16-19ms. The conservative reading is the one used below, because
+sizing a ceiling against the best case is how the last one was set.
+rust-analyzer is in any case the slowest engine either plugin drives: 2-9×
+pyright's 2-9ms warm latency (GM-299) even on its own warm runs, and 8-36× on
+the cold one. What it says about the clock:
+
+- `per_file` is 8s, so at 73ms and eight in flight one file's budget buys about
+  **877 questions**. The densest corpus measured is g-mesh at **116**
+  questions per file (tokio 35, Django 30, Flask 22).
+- That ratio is **independent of project size**, because both sides scale with
+  the file count. The clock therefore has ~7.6× headroom over the worst real
+  density at *every* size, and the 15-minute floor - which only binds under 113
+  files - buys 98,600 questions at the same latency.
+
+So the clock was never what was wrong. A count is: it is a constant where the
+thing it stands in for scales, which is exactly how a ceiling nothing had
+reached in review became one that a 190-file repository walks straight through.
+The old comment's arithmetic ("20,000 sites is about four minutes") was right
+about a number that the first three real corpora exceeded.
+
+**Why 1,000,000 and not a formula.** A ceiling derived from the clock -
+`concurrency × pass_budget ÷ per-request cost` - is the shape this argument
+points at, and it was tried on paper and dropped. The bridge has no per-request
+cost until it has run a pass, and the only figure it holds a priori is
+`Budgets::request`, the 10-second timeout; substituting that gives g-mesh a
+ceiling of 1,216 questions, twenty times tighter than the number this defect is
+about, because it prices every request as the pathological one. A formula would
+therefore need a measured latency constant per engine - a constant either way,
+with a function wrapped around it - and it would take away the property
+`Budgets` is documented to have, that every field is a plain value a test can
+make small. One million is the same job done plainly: 11.4× Django's list, 45×
+g-mesh's, and about 230MB - 144 bytes of `Question` each, which
+`the_site_ceiling_bounds_what_one_question_list_can_cost` pins, plus ~100 bytes
+of the strings it holds (2,210,074 bytes across g-mesh's 21,995 sites,
+measured) - paid only by a project that genuinely has a million open sites, and
+whose index is already holding every one of them when the list is built.
+`the_site_ceiling_clears_every_corpus_that_has_been_counted` is the standing
+check, and it fails at 20,000 on three of the four corpora.
+
+**The second defect, found while cutting the list differently.** The old cut
+was `asking.truncate(max_sites)`, which lands wherever the *n*th question falls
+- usually the middle of a file. Every question that file did contribute was
+asked and answered, so `run_pass` returned it in `covered`; `retract_stale`
+reads `covered` as "this pass is now the whole truth about that file" and
+withdraws every edge an earlier pass emitted for a site this one was cut before
+reaching. Correct edges deleted to account for questions nobody asked, which is
+the one direction the bridge's retraction rules exist to forbid. It cannot
+happen on a first pass (there is no baseline yet), which is why no fixture
+caught it. `questions()` now stops at the last *whole* file that fits, so a
+file is either asked about completely or never named - and a file never named
+is not covered, so its earlier answers stand. One file may exceed the ceiling
+by itself and is taken anyway when it is the first with anything to ask, since
+a pass that asks nothing about it forever is the worse of the two failures and
+the only one that costs an edge. The same hazard existed in the "nothing to
+ask" branch, which retracted every file in scope even when `max_sites` was zero
+and the list had been refused rather than found empty; that branch now returns
+an incomplete pass with an empty diff.
+
+**Why not resumption.** It is the honest shape for a truncated pass and it is
+what GM-289's decision 7 already argues for the *diff*, so refusing it needs
+three reasons rather than a preference:
+
+1. **Nothing would drive it.** `daemon::semantic` asks a language for a
+   whole-project pass once per daemon start, and only while that language is
+   still *owed* one (`storage::schema::owed_semantic_pass_languages`). There is
+   no loop that asks again inside one daemon lifetime, so a cursor kept in the
+   bridge advances one chunk per daemon *restart*. Django at the old ceiling
+   would have needed five restarts, each paying a cold pyright load, to record
+   one pass. Convergence that is a function of how often somebody reboots the
+   daemon is not convergence. (`cli::reindex` is the one caller that always
+   asks, and it is no help here: it wipes the graph first, so it restarts the
+   sweep rather than continuing it.)
+2. **It would relabel the cliff, not remove it.** A resumed sweep can only
+   report `complete` once it has covered every file; until then the pass is
+   honestly incomplete and `semanticPassAt` stays unset - which is the state
+   this defect *is*, reached over more passes. The version that closes the gap
+   sooner records completion **per file**, and `FileChangeResponse` carries one
+   boolean for the whole pass, so that is a core change and a different task.
+3. **It repairs one of four doors.** A pass ends short when the ceiling cuts
+   it, when the deadline runs out, when the server dies, or when a question is
+   refused. Resumption built for the ceiling alone leaves the other three - and
+   the deadline is the one with a measurement behind it and the one that scales
+   with the project, so once the ceiling is sized rather than guessed it is the
+   least likely of the four to be what a real repository meets. The
+   per-request door is already on record as reachable in
+   `plugins/rust/plugin.toml`'s `cachePriming` note: at load average 693, eight
+   of the conformance fixture's questions blew the ten-second budget and that
+   pass came back incomplete - on twelve files.
+
+**What a later task inherits if it builds it anyway.** The file-boundary cut
+above is precisely the cursor such a design needs, and it is already in place:
+truncation now stops at a file, so "where did the last pass get to" is a path
+rather than an offset into a list that is rebuilt from a changing index. The
+rule for a file set that changed between passes follows from machinery that
+already exists rather than needing to be invented - every settled reparse gets
+its own per-file semantic pass (`watcher::apply::apply_file_change`), so a file
+that changed during a sweep has already been answered for and the sweep owes it
+nothing; a file added during one is reached on the next turn of the cursor.
+What is genuinely missing is only item 1: a driver in core that re-asks an
+incomplete language within one daemon lifetime, bounded so a permanently
+failing engine cannot spin.
+
+**What this does not fix, stated rather than left to be discovered.** The cliff
+moved; it did not go. A repository of roughly 8,600 files at g-mesh's density,
+or 33,000 at Django's, reaches 1,000,000 questions and has its pass cut short
+again - reported incomplete, which is the same honest and retryable answer a
+dead server or a spent deadline already gets, and not a silent one. And the
+end-to-end pass against Django with a real pyright that GM-314 wanted is still
+not run: the arms above are Rust and rust-analyzer, so the claim proved on a
+real corpus is that *this* repository's pass now completes, with Django's
+headroom still resting on arithmetic.
 
 ### Go plugin (`plugins/go`)
 
