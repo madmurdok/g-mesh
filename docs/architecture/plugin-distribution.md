@@ -349,6 +349,50 @@ below.
 
 ## Open Questions / Risks
 
+- **Should `LspBridge` live in core rather than in the SDK?** Raised while
+  asking why the Go plugin cannot use it. The barrier is not Go the language
+  but Go the *implementation language of that plugin*: `LspBridge` is a Rust
+  struct in `plugins/sdk`, and a separate Go module cannot import a Rust
+  crate. Moving it into core would sever the link between a plugin's
+  implementation language and whether it can have a semantic tier at all.
+
+  What makes this more plausible than it first sounds is that nearly
+  everything the bridge needs already crosses the plugin/core boundary: open
+  sites are on the wire, `OpenSite::replaces` is on the wire, `native_kind`
+  (which decides what is implementable) is on the wire, `[plugin.semantic]`
+  is in a manifest core already reads, and core holds the full graph with
+  positions plus the file contents the watcher maintains - which is exactly
+  what mapping an LSP `Location` back to a node requires. The bridge sits in
+  the SDK for historical reasons rather than because that is where its inputs
+  are.
+
+  The benefit is not fixing Go. It is removing one implementation of
+  readiness, budgets, retraction and deferral per SDK - rules this project has
+  already corrected four times against real servers (GM-289, GM-290, GM-309,
+  GM-310), and a second copy would inherit none of those corrections, only
+  their absence. It would also shrink a plugin to pure structural extraction,
+  which is the "language N+1 is cheap" premise carried further than it
+  currently goes.
+
+  A separate sidecar process - speaking our plugin protocol on one side and
+  LSP on the other - was considered and is worse: a third process per
+  language, and it would still need the index to map an answer onto a node,
+  which core is better placed to hold than a proxy is.
+
+  **This would not change Go**, and that is worth stating so the two questions
+  are not conflated. Go declines the bridge on merit, not on language: its
+  semantics come from `go/types` through `packages.Load`, a batch API suited
+  to walking a whole project, where `gopls` is built for interactive editing.
+  Moving the bridge would give Go the *option*; taking it would mean trading a
+  fitter tool for a less fit one and adding an external dependency, since a Go
+  developer has `go` by definition and `gopls` is a separate install.
+
+  Deliberately NOT scheduled. It touches the wire contract and the path this
+  project has repaired four times, and doing that in the middle of the
+  TypeScript port would put two large changes on the same code at once. After
+  4.0.0 there is exactly one non-Rust plugin left, so the cost of waiting is
+  low - which is the argument for writing it down now and deciding later.
+
 - ~~Is TypeScript's free semantic tier worth 87 MB?~~ **Decided: no.** Not on a
   size threshold but on uniformity - we do not know the audience, and a special
   case is only defensible with a number nobody has. Recorded under Chosen
