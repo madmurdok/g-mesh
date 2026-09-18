@@ -125,19 +125,33 @@ GM-299: probe candidates, log one line, answer an empty incomplete diff, keep
 the gap listed). Uniform and small. TypeScript is the only language that would
 lose something.
 
-**S3. Structural always; semantic per-language and optional.** The base archive
-carries every structural tier - they are 4.9-8.4 MB each and cost nothing worth
-optimising - and a semantic tier is fetched per language by explicit command.
-"All-in-one" and "small" become the same build with a different set of optional
-components fetched, not two products.
+**S3. Structural always; a semantic bundle fetched per language from g-mesh's
+own releases.** Considered and dropped once S2 was chosen, because it has no
+content: if no server is ever bundled, there is nothing for g-mesh to host and
+fetch. The only thing a user installs for semantics is the upstream server
+itself, from upstream. S3 would have been a second distribution channel for
+something that is not ours to distribute.
 
 ## Chosen Approach
 
-**C + S3, staged.** The base archive carries core plus four structural plugins
-and nothing else; semantic tiers are external, resolved at run time, and
-`g-mesh plugins install <language>` is the explicit way to get what a given
-language's semantics needs. TypeScript's structural tier is ported to Rust so it
-stops being the exception.
+**C + S2.** One format for every language, with no exceptions: a plugin is a
+small structural binary, and **no plugin ever bundles its language server**.
+Every semantic tier resolves an external program at run time and degrades
+honestly when it is absent. TypeScript's structural tier is ported to Rust so it
+stops being the exception; `g-mesh plugins install <language>` installs the
+*plugin*, never a server.
+
+The decision was taken on uniformity rather than on a size threshold, and the
+reason is worth recording because it is not a technical one: **we do not know
+the audience.** A special case for TypeScript is only justified if TypeScript
+users are the majority, and nobody here has that number. Absent it, one format
+that is the same for all four languages beats a format that is better for one of
+them and different for the rest - and it is also the format that makes a fifth
+language cheap, which is the premise `plugins/sdk` exists to defend.
+
+Note that Go already complies: its semantic tier is compiled into the plugin but
+requires the `go` toolchain on PATH, so it too resolves something external and
+degrades without it. After the TypeScript port, all four behave the same way.
 
 Projected base archive: core 36 MB + four structural plugins at roughly 5-8 MB
 each ≈ **60-70 MB unpacked**, against 147 MB today; compressed, roughly 20 MB
@@ -335,9 +349,11 @@ below.
 
 ## Open Questions / Risks
 
-- **Is TypeScript's free semantic tier worth 87 MB?** This design says no, but it
-  is the single reversible-with-difficulty decision here and the one to push back
-  on. The answer may differ for an audience that is mostly TypeScript.
+- ~~Is TypeScript's free semantic tier worth 87 MB?~~ **Decided: no.** Not on a
+  size threshold but on uniformity - we do not know the audience, and a special
+  case is only defensible with a number nobody has. Recorded under Chosen
+  Approach. The consequence stands and is not softened: TypeScript users who
+  install no language server get structural answers only.
 - **Should the daemon re-discover plugins without a restart?** It would make
   install and remove take effect immediately, at the cost of a filesystem watch
   on the plugin roots and a re-entrancy question during an in-flight pass. Left
