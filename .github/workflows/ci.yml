@@ -531,6 +531,16 @@ jobs:
       # without actually removing anything. The iteration cap is a sanity
       # backstop, not an expected path - normal images have shipped one or
       # two `go` binaries, not twenty.
+      # Safe here and nowhere else: a GitHub-hosted runner is a throwaway VM
+      # that is destroyed when the job ends, so `sudo rm -f` on a system
+      # binary costs nothing and leaves nothing behind. Do NOT lift this loop
+      # onto a real machine to try something out - GM-318 learned that the
+      # hard way when an experiment with the same shape let PATH fall through
+      # to the real system and deleted a developer's own Go install. If you
+      # need to exercise this logic locally, build the PATH from nothing
+      # (`env -i PATH=<only fake dirs>`) rather than subtracting from the one
+      # you inherited: a subtraction that misses leaves the real system in
+      # the blast radius.
       - name: Delete every go binary reachable on PATH
         shell: bash
         run: |
