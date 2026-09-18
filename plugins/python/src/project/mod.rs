@@ -111,13 +111,25 @@
 //! section) exists specifically to avoid. The gap this leaves is the safe
 //! kind `parent_chain`'s own doc describes: "a gap can make the visibility
 //! check refuse a link that a complete chain would allow (a missing edge),
-//! never allow one it should refuse (a wrong edge)" - and it is also rare in
-//! practice, since a namespace package with genuinely nothing directly
-//! inside it, at every level, is an unusual repository shape. GM-296 is not
-//! expected to solve this; a future `DECLARATION_OF`-style mechanism or an
-//! explicit "announce every namespace-package ancestor, deduplicated by
-//! core" wire addition would be the place to, if it is ever measured to
-//! matter.
+//! never allow one it should refuse (a wrong edge).
+//!
+//! GM-313 measured how often the shape occurs, because this doc originally
+//! called it "an unusual repository shape" and that was a guess. It is not
+//! unusual: django/django has **9** directories with no `__init__` and no
+//! direct `.py` but Python beneath them, and pallets/flask has **6**. What is
+//! true, and is the reason the gap stays accepted, is *where* they are - in
+//! both corpora every one of them is a test fixture tree or an examples
+//! directory (`tests/test_apps`, `examples/tutorial`,
+//! `tests/migrations/faulty_migrations/namespace`), never the importable
+//! package tree the index is asked about. So the correct claim is not that
+//! the shape is rare but that it is rare *where it would cost anything*, and
+//! the measurement says so rather than intuition.
+//!
+//! Confirmed permanent-by-design (GM-313). GM-296 was not expected to solve
+//! it and neither is anything else until a real project is hurt by it; a
+//! future `DECLARATION_OF`-style mechanism or an explicit "announce every
+//! namespace-package ancestor, deduplicated by core" wire addition would be
+//! the place to.
 //!
 //! # Decision 4: roots
 //!
