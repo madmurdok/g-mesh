@@ -102,7 +102,7 @@ test("the tsserver child is not started until a semantic question is actually as
     assert.equal(definitions.length, 1);
     assert.equal(project.isRunning, true, "the first query must start the child");
 
-    project.stop();
+    await project.stop();
     assert.equal(project.isRunning, false, "stop() must end the child");
 
     // Restart is lazy and transparent, mirroring how core relaunches a dead
@@ -111,7 +111,7 @@ test("the tsserver child is not started until a semantic question is actually as
     assert.equal(again.length, 1);
     assert.equal(project.isRunning, true);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -133,7 +133,7 @@ test("the conformance kit's semantic-engine marker is written when the child sta
     await project.definition(file, positionOf(source, "alpha();", 1));
     assert.equal(existsSync(marker), true, "the first query starts the child, and must say so");
   } finally {
-    project.stop();
+    await project.stop();
     if (previous === undefined) delete process.env[PLUGIN_CHECK_MARKER_DIR_ENV];
     else process.env[PLUGIN_CHECK_MARKER_DIR_ENV] = previous;
     await fs.rm(root, { recursive: true, force: true });
@@ -165,7 +165,7 @@ test("a tsserver that dies fails only the work in flight - the plugin survives a
     const recovered = await project.definition(file, position);
     assert.equal(recovered.length, 1, "the next query must transparently start a fresh child");
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -203,7 +203,7 @@ test("resolves a real cross-file declaration in this plugin's own source tree", 
     // not an inferred project that happened to guess the same answer.
     assert.equal(await project.configuredProjectFor(indexPath), path.join(PLUGIN_ROOT, "tsconfig.json"));
   } finally {
-    project.stop();
+    await project.stop();
   }
 });
 
@@ -253,7 +253,7 @@ test("respects the project's tsconfig, including a paths alias, when resolving a
 
     assert.equal(await project.configuredProjectFor(mainPath), path.join(root, "tsconfig.json"));
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -274,7 +274,7 @@ test("a project with no tsconfig.json is still answerable, through an inferred p
     // synthetic name must never be reported as if it were a real tsconfig.
     assert.equal(await project.configuredProjectFor(bPath), null);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -288,7 +288,7 @@ test("a missing tsserver is a clean failure, not a crash", async () => {
       /tsserver/,
     );
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
