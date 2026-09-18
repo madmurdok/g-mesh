@@ -234,6 +234,20 @@ Five smaller ones, for completeness:
   answer for them is a node this index holds, so recording them would make the
   open-site set mostly builtins. The cost is that a star-imported name shares
   their fate (gap 4 above).
+
+  That used to be a prediction. GM-314 measured it, and the exclusion stands
+  because the numbers are not close. On django/django (2,932 files) recording
+  every unresolved bare name adds **23,320** questions to the 87,832 this
+  plugin already asks - and 23,022 of them, 98.7%, are builtins and dunders
+  (`str` 2,247, `len` 2,137, `super` 1,829). Of that whole added set, **one**
+  names something this index actually holds. Narrowing to positions where a
+  declaration is expected - base class, decorator, annotation - drops 94% of
+  the volume and keeps none of the value: Django's 1,215 decorator sites are
+  100% builtins, and pallets/flask's 684 annotation sites are 100% builtins.
+  So gap 4's `Speaker` is real, stays unanswered, and paying 23,320 questions
+  to recover it is not a trade worth making. The shape that *might* be worth
+  it is Rust's glob-scope names, and structurally rather than as a semantic
+  question - the design doc's GM-314 notes carry that argument.
 - **A module's container holds its methods too, so a name shared by a
   top-level function and a method is ambiguous.** Every declaration of a file
   carries the module's container key, including `C.m` - so a lookup addressed

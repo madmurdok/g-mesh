@@ -112,6 +112,20 @@ Two smaller ones, for completeness:
   that `Vec` and `String` do not become questions. The semantic tier finds it
   from the other end, by asking rust-analyzer which types implement the
   trait; `conformance/project/crates/beta/src/main.rs` is that case.
+
+  GM-314 put numbers on both halves of that. The exclusion is worth keeping:
+  on tokio-rs/tokio, recording every unresolved bare name adds 5,858 questions
+  to the 27,750 already asked, and the type histogram is `Option` 753,
+  `Result` 474, `Sized` 309, `Send` 287, `Vec` 233, `Box` 216 - the list this
+  bullet names, measured. But Rust is where the *loss* is real, unlike Python:
+  **2,052 of g-mesh's own 5,468 excluded names (37.5%) sit under a glob**,
+  almost all of it `mod tests { use super::*; }`, which is why `Diff`,
+  `Connection` and `SymbolQueryParams` come back unresolved in this
+  repository's own tree. The recommendation there is not a wider question list
+  but a structural one: the extractor already knows the module has a glob and
+  which container it names, so a `name`-keyed placeholder into that container
+  costs the bridge nothing and fails to a missing edge. What blocks it is two
+  globs in scope at once, which would make the placeholder ambiguous.
 - **A path call through a `pub use` chain** (`a::b::f()` where `a::b`
   re-exports `f`) does not resolve: a type-qualified path is addressed by
   `qualifiedName`, and core walks re-export chains for `name` keys only. A
