@@ -148,6 +148,59 @@ pub fn run(
     let mut manifests: Vec<&PluginManifest> = discovered.manifests.values().collect();
     manifests.sort_by(|a, b| a.language.cmp(&b.language));
 
+    // Decided, not inherited: one language's `walk_one_language` failure
+    // (`?`, not a collected-and-continued error) fails this whole walk,
+    // even for a project that contains not one file of that language -
+    // every *discovered* plugin is walked unconditionally regardless of
+    // what the project contains (see this module's own doc comment above
+    // [`run`]), so a checkout with an unbuilt Python plugin cannot index a
+    // pure-Go project either. GM-316 traced the failure this produces
+    // (`missing_plugin_binary_hint` fixes the message; this comment is
+    // about whether the failure itself is right) and chose to keep it,
+    // for the same reason `daemon::mod::run` already gives for treating
+    // this whole call as fatal: an index that silently skipped a language
+    // and kept going would look exactly like a complete one to every
+    // caller downstream - `find_references`, `find_definition`, every MCP
+    // tool - which has no way to tell "this symbol truly does not exist"
+    // from "the plugin that would have found it never got to run". That is
+    // the shape GM-292 cost a whole release to notice: a failure that kept
+    // answering, wrongly, is worse than one that stops and says why,
+    // because a wrong answer is trusted right up until someone happens to
+    // check it by hand, and a missing one is not trusted by construction.
+    // Downgrading this to "skip the language that failed, index the rest"
+    // would need `bulk_index` to pre-scan the project's file extensions
+    // before walking so a language genuinely absent from the project could
+    // be told apart from one merely unbuilt - explicitly out of scope per
+    // this module's own doc comment - and even then would still let a
+    // project that *does* contain Python serve a graph missing it while
+    // reporting itself indexed. Neither risk is worth the partial index.
+    //
+    // What this does mean for a user with no Python in their project: the
+    // cost is a one-time `cargo build --workspace`, not an ongoing tax for
+    // not using Python. Discovery finds every bundled plugin unconditionally
+    // (`daemon::manifest::discover`), so a dev checkout has always needed
+    // every bundled plugin's toolchain available before the first index -
+    // Go on `$PATH`, `npm ci && npm run build` for TypeScript - the same
+    // requirement this repo's own build docs list as a one-time setup step,
+    // never as a per-project opt-in. Python and Rust joining the cargo
+    // workspace (GM-303) only moved their share of that one-time cost onto
+    // `cargo build --workspace`, which a contributor already runs to get
+    // `g-mesh` itself in the common case (`cargo build` with no `-p` at the
+    // workspace root builds every member; there is no default-member
+    // override in this workspace's `Cargo.toml`). The gap this task actually
+    // found is narrower than "no Python": it is a *scoped* build
+    // (`cargo build -p g-mesh`, or `cargo test -p g-mesh --test <name>`,
+    // exactly the shape a contributor reaches for while iterating on `core`
+    // alone) that built the daemon without its sibling workspace binaries.
+    // The fixed message names the exact command that closes that gap; this
+    // paragraph is the argument for why the daemon still refuses to start
+    // in the meantime rather than starting without Python. And a released
+    // binary never sees this at all - `plugins/python/plugin.toml`'s own
+    // header notes its `command` is a dev-checkout path; an installed
+    // archive gets a manifest whose `command` names a staged binary that
+    // shipped with it (`scripts/bundle-rust-plugin.sh` and its
+    // not-yet-written Python counterpart), so a real end user with no
+    // interest in Python never has a `target/debug/` path to be missing.
     for manifest in manifests {
         walk_one_language(project_root, manifest, conn, &mut summary, embedding)?;
     }
@@ -193,6 +246,21 @@ pub(crate) fn walk_one_language(
     summary: &mut BulkIndexSummary,
     embedding: &EmbeddingPipeline,
 ) -> Result<()> {
+    // Same check `daemon::plugin::PluginState::spawn` makes before spawning
+    // the interactive process - see `plugin::missing_plugin_binary_hint`'s
+    // doc comment. Without it, a missing `target/debug/g-mesh-plugin-*`
+    // binary (an unbuilt cargo-workspace plugin - python, rust) fails
+    // `Command::spawn` below with a bare `No such file or directory (os
+    // error 2)`, wrapped only in "failed to spawn the {language} plugin's
+    // bulk index ({command})" - naming neither cargo nor the fact that this
+    // is a build output at all. That is the exact message traced while
+    // verifying GM-301 (GM-316): the daemon's cold-start walk failing this
+    // way names every test waiting on the plugin it starves, not the plugin
+    // that was never built.
+    if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
+        bail!("failed to spawn the {} plugin's bulk index: {hint}", manifest.language);
+    }
+
     let mut child = Command::new(&manifest.command)
         .args(&manifest.args)
         .arg(BULK_INDEX_FLAG)
