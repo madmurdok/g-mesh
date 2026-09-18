@@ -842,6 +842,26 @@ including the readiness gate (which fails, as it must, when the gate is
 removed), both column conversions, the implementation mapping, a request
 timeout, and a crash mid-pass after which the bridge starts a fresh server.
 
+#### Implementation notes (GM-315): the decision, which is to change nothing
+
+GM-314 measured; this is the decision it licenses, recorded so the question is
+not reopened from scratch. **No shape is added to `OpenSiteKind`, and both
+Decision 7s stand as written** - Python's in `plugins/python/src/extractor/
+bodies.rs`, Rust's in `plugins/rust/src/extractor/bodies.rs`. Each README now
+carries the numbers beside its own exclusion rather than only the argument, so
+the next reader inherits the measurement instead of the fear it replaced.
+
+Two things this decision is *not*. It is not a claim that nothing is lost:
+GM-299's `Speaker` is a real missing edge and stays one, and on Rust 37.5% of
+g-mesh's own excluded names sit under a glob. And it is not a claim that the
+bridge is in good shape - GM-314 found the opposite while counting, which is
+GM-319: the question list the plugins emit *today* already exceeds
+`Budgets::max_sites` on three of four real corpora, so the pass is truncated,
+reported incomplete, and `semanticPassAt` is never set. Widening a list that
+is already being cut off would have made that worse while looking like an
+improvement. Fix the budget first; revisit the list, if ever, only for Rust's
+glob-scope names and only structurally.
+
 #### Implementation notes (GM-314): the open-site volume, measured
 
 **The answer is to change nothing about the question list, and to fix the
