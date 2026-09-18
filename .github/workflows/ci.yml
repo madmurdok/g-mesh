@@ -415,6 +415,13 @@ jobs:
   # semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
   # already proved that at the unit level, and this job is its CI-facing,
   # end-to-end counterpart.
+  #
+  # GM-318: "a `go` binary off PATH" used to be built by filtering PATH.
+  # That premise broke once this image started shipping a second `go` from
+  # a SYSTEM directory (GM-312), because a system directory cannot be
+  # filtered out of PATH without taking unrelated tools with it - see the
+  # "Delete every go binary" step below for the failed directory-filtering
+  # approach and why deleting the file instead is what fixed it.
   go-plugin-without-toolchain:
     name: Go plugin conformance (no toolchain on PATH)
     runs-on: ubuntu-22.04
@@ -436,10 +443,10 @@ jobs:
       # without a toolchain - see that file). The staged binary itself needs
       # no toolchain to run; only its semantic tier does, by shelling out to
       # `go list`/`go env` through golang.org/x/tools/go/packages, which is
-      # exactly what this job strips PATH of below, after the build. Without
-      # this step the binary is never produced at all, and the check step
-      # would fail on "failed to spawn" - a real failure, but not the one
-      # this job exists to prove.
+      # exactly what this job deletes below, after the build. Without this
+      # step the binary is never produced at all, and the check step would
+      # fail on "failed to spawn" - a real failure, but not the one this job
+      # exists to prove.
       #
       # `cache: true`, matching the `test` job's own note: GM-281 gave
       # plugins/go/go.mod its first real dependency (golang.org/x/tools),
@@ -451,77 +458,116 @@ jobs:
           cache-dependency-path: plugins/go/go.sum
 
       # Builds `g-mesh` and, as a side effect of core/build.rs, the Go
-      # plugin binary - with `go` still on PATH, unlike the check step below.
+      # plugin binary - with `go` still on PATH, unlike the steps below.
       - name: Build g-mesh and the Go plugin
         run: cargo build --manifest-path core/Cargo.toml --bin g-mesh
 
-      # Filters every directory that holds a `go` out of PATH rather than
-      # deleting a hardcoded one, since which directory `actions/setup-go`
-      # prepended is this step's own business, not something to hardcode and
-      # have drift. Verified rather than assumed (this repo's own rule): the
-      # step fails outright if `go` still resolves after filtering, so a
-      # change to how the runner provides the toolchain breaks this job
-      # loudly instead of quietly running the "no toolchain" job with a
-      # toolchain present.
+      # Used to filter every directory that holds a `go` out of PATH rather
+      # than deleting a hardcoded one, since which directory
+      # `actions/setup-go` prepended is this step's own business, not
+      # something to hardcode and have drift - and, verified rather than
+      # assumed (this repo's own rule), refused outright if `go` still
+      # resolved after filtering.
       #
-      # GM-312: that guard earned its keep, and then the step had to learn
-      # what it caught. It used to filter exactly ONE directory - the one
-      # `command -v go` happened to name first - and the runner image now
-      # carries a second `go` elsewhere, so the check correctly refused with
-      # "go is still resolvable on PATH after filtering out
-      # /opt/hostedtoolcache/go/1.27.1/x64/bin". Filtering in a loop until no
-      # `go` resolves handles however many copies an image ships, and the
-      # loop is bounded by the number of PATH entries because each pass
-      # removes the directory it just found.
-      - name: Compute PATH without the Go toolchain
-        id: no_go_path
+      # GM-312 made that loop handle more than one `go` (this image carries
+      # a second one, from `actions/setup-go`'s hostedtoolcache directory and
+      # an OS package), and found the approach's ceiling doing it: the
+      # second `go` lives at /usr/bin/go, a SYSTEM directory, and removing a
+      # PATH entry removes everything else in it too - dropping /usr/bin to
+      # hide `go` would take `git`, `curl` and most of the rest of this job
+      # with it, and the resulting failure would name none of that. The
+      # refusal ("go is installed in the system directory ... this job
+      # cannot hide it without removing unrelated tools") was correct: on
+      # THIS image, with THAT mechanism, the job's premise no longer held.
+      #
+      # GM-318: the mechanism, not the premise, was the problem. Filtering
+      # PATH only ever has directory-sized moves available, and a system
+      # directory mixes the one binary this job needs gone with others it
+      # cannot touch. Deleting the FILE - the one binary literally named
+      # `go`, wherever `command -v` finds it - has no such mixing: removing
+      # `/usr/bin/go` never removes `/usr/bin/git`, so there is no longer a
+      # directory this job needs to refuse, and the whole case-statement
+      # guard for "is this a system directory" goes away with it. The
+      # runner is a disposable VM this job (and this workflow) never
+      # returns to, so deleting a system package's binary here is scoped to
+      # this one job and costs nothing beyond it.
+      #
+      # Two other fixes were considered and set aside:
+      #   - A minimal, hand-built PATH (only the directories the check step
+      #     below actually needs) sounds smaller, and was tried: that step's
+      #     `cargo run` reads `G_MESH_HOME` from `.cargo/config.toml`'s
+      #     `[env]` table, which cargo injects itself, so bypassing `cargo
+      #     run` for a direct `target/debug/g-mesh` call to dodge PATH
+      #     entirely would silently lose that. Keeping `cargo run` on a
+      #     PATH trimmed to "just enough" instead leaves it re-running its
+      #     own freshness check on every invocation, and a rebuild spuriously
+      #     triggered with no linker on that trimmed PATH fails as "linker
+      #     `cc` not found" (reproduced locally against a throwaway crate) -
+      #     a confusing failure that proves nothing about Go, and a worse
+      #     diagnosis than what this job already gives today.
+      #   - A container image with no Go installed is closest to a real
+      #     end-user machine and immune to this exact image drift, but
+      #     trades a five-line shell loop for an image pin, a workspace
+      #     mount and a Rust-toolchain-version match to maintain against
+      #     THIS job's `RUST_VERSION` - overhead this job does not need
+      #     when deleting the file is this direct.
+      # (A third option, shadowing `go` with a binary that exists but
+      # fails, was rejected without trying it: LookPath would still
+      # succeed, only the later exec would fail, which is a DIFFERENT
+      # scenario from no toolchain at all and would not test what this job
+      # exists to prove.)
+      #
+      # `sudo`: /usr/bin/go is root-owned on this image (the hostedtoolcache
+      # copy is not, but sudo is harmless there too, and GitHub-hosted
+      # Ubuntu runners grant it passwordlessly). `hash -r` after each
+      # removal clears bash's remembered command locations - not observed
+      # to be load-bearing on this runner's bash (`command -v` re-checked
+      # correctly without it in local testing), but cheap enough to keep as
+      # a defense this job does not want to have to rediscover it needs.
+      # The existence check after `rm` is what makes a permission failure
+      # loud instead of silent: `rm -f` does not error on a file that was
+      # never there, but `set -e` still stops the step if deletion was
+      # refused, and the explicit `[ -e ]` catches a `rm` that exits 0
+      # without actually removing anything. The iteration cap is a sanity
+      # backstop, not an expected path - normal images have shipped one or
+      # two `go` binaries, not twenty.
+      - name: Delete every go binary reachable on PATH
         shell: bash
         run: |
           set -euo pipefail
-          filtered="$PATH"
-          while go_path="$(PATH="$filtered" command -v go 2>/dev/null)"; do
-            go_dir="$(dirname "$go_path")"
-            # Removing a PATH entry removes everything else in it too, which
-            # is harmless for a toolchain directory that exists to hold one
-            # toolchain and ruinous for a system one - dropping /usr/bin to
-            # hide `go` would take `git`, `curl` and most of this job with
-            # it, and the resulting failure would name none of that. If an
-            # image ever ships go from a system directory, this job's whole
-            # premise (a machine with no Go toolchain) needs rethinking
-            # rather than a bigger hammer.
-            case "$go_dir" in
-              /usr/bin | /bin | /usr/sbin | /sbin | /usr/local/bin)
-                echo "go is installed in the system directory $go_dir - this job cannot hide it without \
-                      removing unrelated tools, so its premise does not hold on this image" >&2
-                exit 1
-                ;;
-            esac
-            trimmed="$(printf '%s' "$filtered" | tr ':' '\n' | grep -vxF "$go_dir" | paste -sd: -)"
-            if [ "$trimmed" = "$filtered" ]; then
-              echo "go resolves to $go_path but $go_dir is not a PATH entry - refusing to claim this job \
-                    tests anything" >&2
+          count=0
+          while go_path="$(command -v go 2>/dev/null)"; do
+            count=$((count + 1))
+            if [ "$count" -gt 20 ]; then
+              echo "still finding a go binary after removing $count of them - something is replacing it \
+                    faster than this loop can delete it, or command -v is not seeing the deletions" >&2
               exit 1
             fi
-            echo "removing $go_dir from PATH"
-            filtered="$trimmed"
+            echo "deleting $go_path"
+            sudo rm -f "$go_path"
+            hash -r
+            if [ -e "$go_path" ]; then
+              echo "$go_path still exists after rm - this job cannot prove its premise without deleting it" >&2
+              exit 1
+            fi
           done
-          echo "path=$filtered" >> "$GITHUB_OUTPUT"
+          echo "removed $count go binaries; none resolve on PATH any more"
 
       # `--skip-semantic-expectations`: the four `tier = "semantic"` entries
       # (three `[[callers]]`, one `[[implementations]]`) report `Skip`
       # instead of running, and the rest of the same file - bare and
       # package-qualified calls, references, imports, definition - must
-      # still pass. `PATH` is overridden for this one step only, so every
-      # earlier step (and cargo/git themselves here) keep the toolchain they
-      # needed to get this far.
+      # still pass. No PATH override on this step, unlike before GM-318: the
+      # step above deleted every `go` binary this job could find, from the
+      # job's real, unmodified PATH, so there is nothing left to override -
+      # and this step still checks that directly below rather than trusting
+      # the step above, in case a later change reintroduces one.
       - name: g-mesh plugins check plugins/go (--skip-semantic-expectations, no Go on PATH)
         shell: bash
-        env:
-          PATH: ${{ steps.no_go_path.outputs.path }}
         run: |
           set -euo pipefail
           if command -v go >/dev/null 2>&1; then
-            echo "go must not be resolvable in this step - PATH override did not take" >&2
+            echo "go must not be resolvable in this step - deleting it did not take" >&2
             exit 1
           fi
           cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
