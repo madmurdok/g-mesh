@@ -48,6 +48,62 @@ async function makeProject(files: Record<string, string>): Promise<string> {
   return root;
 }
 
+/**
+ * tsserver reports every path with forward slashes, on every platform -
+ * including Windows. Pinned against a real Windows CI run (GM-322,
+ * run 35363320719): its answer for a file under
+ * `...\Temp\gmesh-semantic-uqbMIM\...` came back as
+ * `C:/Users/RUNNER~1/AppData/Local/Temp/gmesh-semantic-uqbMIM/src/util.ts`,
+ * forward slashes throughout, spawned on Windows the whole time. `path.join`
+ * - used everywhere below to build the *expected* side from `root` - produces
+ * the OS's own separator instead, which is `\` there.
+ *
+ * Both name the same file; only the spelling differs, and treating them as
+ * unequal is a test bug, not a product bug (see `indexedPathOf` in
+ * semanticPass.ts, and the regression test in this file below, for why the
+ * product code that actually consumes these paths already tolerates this).
+ * tsserver's spelling is what this file normalizes *to*, not away from: it is
+ * the one consistent, platform-independent form actually observed on the
+ * wire, it is already what this plugin stores everywhere else it keeps a path
+ * (`toPosixPath` in ignorePolicy.ts also settles on forward slashes), and
+ * collapsing to the OS's native separator instead would silently break again
+ * the day a test runs on a third path convention this plugin has never seen.
+ * On POSIX this is a no-op on both sides - `path.join` output there is
+ * already forward-slash-only - so it changes nothing about what these
+ * assertions check anywhere but Windows.
+ */
+function normalizeSlashes(p: string): string {
+  return p.split("\\").join("/");
+}
+
+/** `assert.equal` for two paths that may disagree only in separator style -
+ * see `normalizeSlashes` above for why that disagreement is not a real one. */
+function assertSamePath(actual: string, expected: string, message?: string): void {
+  assert.equal(normalizeSlashes(actual), normalizeSlashes(expected), message);
+}
+
+// The demonstration `normalizeSlashes` needs and macOS cannot produce on its
+// own: a real backslash-separated Windows path, constructed by hand rather
+// than by `path.join` (which never emits backslashes on this platform). This
+// is the regression test for the bug itself - it fails without
+// `normalizeSlashes` and would have caught GM-322 before it ever reached CI.
+test("a tsserver-style forward-slash path and a path.join-style native path name the same file", () => {
+  const tsserverAnswer = "C:/Users/RUNNER~1/AppData/Local/Temp/gmesh-semantic-uqbMIM/src/util.ts";
+  const windowsNativePath = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\gmesh-semantic-uqbMIM\\src\\util.ts";
+
+  // The bug, reproduced directly: naive string equality treats these as two
+  // different files, which is exactly what turned 222 and 223 red once
+  // GM-321's teardown fix stopped EBUSY from masking them.
+  assert.notEqual(tsserverAnswer, windowsNativePath, "sanity: the two spellings must actually differ as strings");
+
+  // The fix: once both sides are normalized to forward slashes, they agree.
+  assertSamePath(tsserverAnswer, windowsNativePath);
+
+  // And a mismatched path must still fail - normalizing must not make the
+  // assertion vacuous.
+  assert.throws(() => assertSamePath(tsserverAnswer, "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\other\\src\\util.ts"));
+});
+
 // --- compiler selection ---------------------------------------------------
 
 test("tsserver resolution prefers the project's own TypeScript over the bundled copy", async () => {
@@ -188,7 +244,7 @@ test("resolves a real cross-file declaration in this plugin's own source tree", 
 
     assert.equal(definitions.length, 1, "FrameReader must resolve to exactly one declaration");
     const [definition] = definitions;
-    assert.equal(definition.file, path.join(PLUGIN_ROOT, "src", "jsonrpc.ts"));
+    assertSamePath(definition.file, path.join(PLUGIN_ROOT, "src", "jsonrpc.ts"));
 
     // Verify against the file itself rather than a pinned line number: the
     // reported span must actually be the `FrameReader` class declaration.
@@ -201,7 +257,10 @@ test("resolves a real cross-file declaration in this plugin's own source tree", 
 
     // And it must have been answered under this project's own tsconfig.json,
     // not an inferred project that happened to guess the same answer.
-    assert.equal(await project.configuredProjectFor(indexPath), path.join(PLUGIN_ROOT, "tsconfig.json"));
+    assertSamePath(
+      (await project.configuredProjectFor(indexPath)) ?? "",
+      path.join(PLUGIN_ROOT, "tsconfig.json"),
+    );
   } finally {
     await project.stop();
   }
@@ -241,17 +300,20 @@ test("respects the project's tsconfig, including a paths alias, when resolving a
     // (a) the aliased *specifier* resolves to the file it names.
     const moduleDefinition = await project.definition(mainPath, positionOf(source, '"@app/util"', 3));
     assert.equal(moduleDefinition.length, 1);
-    assert.equal(moduleDefinition[0].file, path.join(root, "src", "util.ts"));
+    assertSamePath(moduleDefinition[0].file, path.join(root, "src", "util.ts"));
 
     // (b) a symbol imported through that alias resolves to its declaration,
     // which is the answer the semantic pass actually needs.
     const symbolDefinition = await project.definition(mainPath, positionOf(source, "helper(41)", 1));
     assert.equal(symbolDefinition.length, 1);
-    assert.equal(symbolDefinition[0].file, path.join(root, "src", "util.ts"));
+    assertSamePath(symbolDefinition[0].file, path.join(root, "src", "util.ts"));
     const util = (await fs.readFile(symbolDefinition[0].file, "utf8")).split("\n");
     assert.ok(util[symbolDefinition[0].start.line - 1].includes("function helper"));
 
-    assert.equal(await project.configuredProjectFor(mainPath), path.join(root, "tsconfig.json"));
+    assertSamePath(
+      (await project.configuredProjectFor(mainPath)) ?? "",
+      path.join(root, "tsconfig.json"),
+    );
   } finally {
     await project.stop();
     await fs.rm(root, { recursive: true, force: true });
@@ -269,7 +331,7 @@ test("a project with no tsconfig.json is still answerable, through an inferred p
     const source = await fs.readFile(bPath, "utf8");
     const definitions = await project.definition(bPath, positionOf(source, "alpha(1)", 1));
     assert.equal(definitions.length, 1);
-    assert.equal(definitions[0].file, path.join(root, "a.js"));
+    assertSamePath(definitions[0].file, path.join(root, "a.js"));
     // No config was applied, and the caller can tell - an inferred project's
     // synthetic name must never be reported as if it were a real tsconfig.
     assert.equal(await project.configuredProjectFor(bPath), null);

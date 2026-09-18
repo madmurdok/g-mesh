@@ -1000,6 +1000,26 @@ class ProjectIndex {
    * project, gitignored, hard-excluded (`node_modules`), or an extension this
    * plugin does not parse. A declaration in any of those is a real answer to
    * the language's question and not one this graph can point at.
+   *
+   * `absolute` is every `DefinitionLocation.file` this pass ever reads
+   * (`declarationBindingAt`, `addressOf`, `declarationAt` all route through
+   * here), and on Windows tsserver spells it with forward slashes regardless
+   * of what the rest of the process uses - confirmed on real Windows CI
+   * (GM-322, run 35363320719): `C:/Users/.../src/util.ts`, not `C:\Users\...`.
+   * `this.roots`, by contrast, is built from `path.resolve`/
+   * `canonicalizeProjectRoot`, which spell it with the OS's own separator.
+   * That mismatch does **not** need fixing here: Node's `path.relative` on
+   * win32 treats `/` and `\` as interchangeable separators in *both* of its
+   * arguments (it is not POSIX-only leniency - verified directly with
+   * `path.win32.relative` against a hand-built `C:\...` root and a `C:/...`
+   * answer, see semantic.test.ts's regression test), so `path.relative(root,
+   * absolute)` already normalizes the split correctly whichever way
+   * `absolute` is spelled, and the `toPosixPath` below then settles the
+   * *result* to this index's own forward-slash convention. Nothing upstream
+   * of this function needs to pre-normalize `absolute` before calling it.
+   * `configuredProjectFor`'s answer (a bare `tsconfig.json` path, never
+   * routed through here) has no such consumer in product code - it is a
+   * test-only diagnostic - so it carries no equivalent risk.
    */
   indexedPathOf(absolute: string): string | undefined {
     for (const root of this.roots) {
