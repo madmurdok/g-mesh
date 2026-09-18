@@ -17,6 +17,8 @@
 //! looks for a server and the two things pyright does differently from
 //! rust-analyzer.
 
+#[cfg(test)]
+pub(crate) mod census;
 pub mod extractor;
 pub mod project;
 pub mod semantic;

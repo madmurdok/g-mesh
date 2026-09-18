@@ -30,7 +30,13 @@ protocol_version = 2
 # and the two screens a person consults about one plugin named different
 # versions. This is the same drift `plugins/rust/plugin.toml`'s own header
 # records, found the same way and fixed the same way.
-plugin_version = "3.4.0"
+# GM-303 wrote down the general rule this is one case of: a plugin that
+# joins the cargo workspace tracks the release version (transitively, via
+# its own crate's version); a plugin built by its own separate toolchain
+# (plugins/go, plugins/typescript) tracks its own manifest of record
+# instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
+# rules, not one".
+plugin_version = "3.5.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-python"
@@ -87,6 +93,40 @@ command = "pyright-langserver"
 # never start.
 args = ["--stdio"]
 engine = "pyright"
+
+# pyright resolves a question when it is asked. GM-310 traced it against this
+# plugin's own conformance fixture, three reps, and all three agree:
+#
+#   didOpen (11 files)                     405-445ms
+#   first CORRECT cross-file definition   1603-1665ms
+#   $/progress BEGIN (one token, no title) 1707-1761ms
+#   $/progress END                         2178-2199ms
+#
+# The correct answer arrives 41-146ms BEFORE the progress token begins. That
+# token is a background diagnostics pass, not an indexing gate, so the
+# bridge's default readiness rule - wait for one continuous `Budgets::settle`
+# of quiet after it ends - is spent waiting for a server that could already
+# answer. Measured on the real whole-project pass over this fixture, five
+# steady-state reps of each value interleaved in one process at load average
+# 6.1-8.1: 3.339s with "indexed" against 2.285s with this, a saving of
+# 1.054s (31.6%), with a ~70ms spread inside each arm. The per-file pass that
+# follows an edit costs 57ms MORE (34.0ms -> 91.1ms), because the cold pass
+# now finishes while pyright's background token may still be in flight and the
+# next pass correctly waits for it. Net over both, 0.997s. See the design
+# doc's "Implementation notes (GM-310)" for the tables.
+#
+# What this does NOT do is shorten the settle. `Budgets::settle` stays 2s and
+# keeps its other job - GM-309's post-edit scepticism, which needs it to stay
+# ABOVE this server's own didOpen-to-progress gap, traced here at 1.26-1.33s.
+# `readiness = "on-demand"` skips only the start-up wait, by starting the
+# client in the state every server reaches after its first settle; the
+# deferral that re-asks an empty answer keeps running, so if this claim were
+# ever wrong about a future pyright the cost would be latency rather than an
+# edge - that deferral cannot record "no target" anywhere "indexed" would not
+# have recorded it too, which is the exact guarantee, stated in
+# `ServerReadiness::OnDemand`.
+readiness = "on-demand"
+
 # EMPTY ON PURPOSE, and it is the one key here that would silently break the
 # whole tier if it were filled in with the obvious value. The Rust plugin sets
 # `implementation_kinds = ["trait"]` and the bridge asks

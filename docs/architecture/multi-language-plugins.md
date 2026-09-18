@@ -425,6 +425,22 @@ args = []
 engine = "rust-analyzer"        # the `engine` label on every edge it emits;
                                 # defaults to the command's file stem
 implementation_kinds = ["trait"]  # nativeKinds asked textDocument/implementation
+readiness = "indexed"           # GM-310. "indexed" (the default): the server
+                                # builds a start-up index, so the bridge waits
+                                # for one continuous Budgets::settle of quiet
+                                # before asking anything. "on-demand": the
+                                # server resolves each question as it is asked
+                                # (pyright does; its $/progress is background
+                                # diagnostics), so the start-up wait is skipped
+                                # and nothing else is. Every other sceptical
+                                # rule keeps running, so a wrong claim costs
+                                # latency rather than an edge: it cannot record
+                                # "no target" anywhere "indexed" would not have
+                                # recorded it too. A value that is
+                                # neither is a hard error, not a default: the
+                                # default is the slow answer, and a typo'd
+                                # `on_demand` would silently cost what the key
+                                # exists to save
 [plugin.semantic.env]           # added to the inherited environment, never an
                                 # allowlist - a server has to find its toolchain
 RA_LOG = "error"
@@ -825,6 +841,420 @@ it is a statement about a process. Fourteen integration tests drive it,
 including the readiness gate (which fails, as it must, when the gate is
 removed), both column conversions, the implementation mapping, a request
 timeout, and a crash mid-pass after which the bridge starts a fresh server.
+
+#### Implementation notes (GM-315): the decision, which is to change nothing
+
+GM-314 measured; this is the decision it licenses, recorded so the question is
+not reopened from scratch. **No shape is added to `OpenSiteKind`, and both
+Decision 7s stand as written** - Python's in `plugins/python/src/extractor/
+bodies.rs`, Rust's in `plugins/rust/src/extractor/bodies.rs`. Each README now
+carries the numbers beside its own exclusion rather than only the argument, so
+the next reader inherits the measurement instead of the fear it replaced.
+
+Two things this decision is *not*. It is not a claim that nothing is lost:
+GM-299's `Speaker` is a real missing edge and stays one, and on Rust 37.5% of
+g-mesh's own excluded names sit under a glob. And it is not a claim that the
+bridge is in good shape - GM-314 found the opposite while counting, which is
+GM-319: the question list the plugins emit *today* already exceeds
+`Budgets::max_sites` on three of four real corpora, so the pass is truncated,
+reported incomplete, and `semanticPassAt` is never set. Widening a list that
+is already being cut off would have made that worse while looking like an
+improvement. Fix the budget first; revisit the list, if ever, only for Rust's
+glob-scope names and only structurally.
+
+#### Implementation notes (GM-314): the open-site volume, measured
+
+**The answer is to change nothing about the question list, and to fix the
+budget instead.** GM-299's finding 4 - the limit on what a semantic tier
+recovers is the bridge's *question list*, not the engine - is confirmed, and
+measuring the alternatives on real corpora says the list is already the right
+one and already too long. (That note is filed under the Python plugin below;
+this one sits here because the finding is about `OpenSite` and `Budgets`, which
+are the SDK's, and because half the numbers are Rust's.) Every candidate widening adds 21-93% more
+questions to recover, at the very most, 0.3-26% of them; and on three of the
+four corpora measured **the question list the plugins emit today already
+exceeds `Budgets::max_sites` (20,000)**, which `questions()` silently truncates
+and `SemanticAnswer { complete: !plan.truncated }` then reports as an incomplete
+pass - so `language_state.semanticPassAt` is never set, and the receiver gap
+those plugins' MCP instructions promise to close stays listed forever. That is
+a live defect in 3.5.0, found by measuring the alternatives rather than by
+adding one.
+
+**The corpora.** Four real checkouts, named so the numbers can be reproduced.
+`g-mesh-bench`'s own corpora are both TypeScript (`excalidraw`,
+`task-tracker-mcp`), so neither language could use them.
+
+| corpus | language | files walked | commit |
+|---|---|---:|---|
+| `django/django` | Python | 2,932 | `2abf9d2cf8602f0ddc0db4ec1a33769b41b4232a` |
+| `pallets/flask` | Python | 83 | `d73fa1cdcbd8b1465c151db8924ba58b1dd14e35` |
+| `tokio-rs/tokio` | Rust | 799 | `cf782c5b917b7ea21b6f97f07104ebf16d35f5f8` |
+| g-mesh itself | Rust | 187 | `b236222`, via `git archive` |
+
+Two per language, deliberately far apart on the axis that turns out to matter.
+Django is a large, old, essentially unannotated codebase (`grep -rc ' -> '`
+finds 76 arrow-annotated lines in 2,932 files); Flask is small, modern and
+fully annotated, and its annotation bucket is 19× Django's on 3% of the files.
+g-mesh is measured from a clean `git archive` of the release tip rather than
+from the worktree, because the worktree contains this task's own census code
+and would otherwise count it - 21,836 sites against the clean tree's 21,659,
+which is the size of the self-reference.
+
+**The method, and what it can be wrong about.** Counts come from the
+extractors' own `resolve_bare`/`resolve_path`, instrumented by a `#[cfg(test)]`
+census module in each plugin (`plugins/python/src/census.rs`,
+`plugins/rust/src/census.rs`) whose every call site is also `#[cfg(test)]`, so
+none of it is compiled into a plugin binary and no production behaviour changes.
+The census walks exactly the file set `--bulk-index` would - the manifests' own
+extensions and `exclude_dirs` through `walk_project` - and reproduces
+`lsp::bridge::questions` exactly, including that `Implementation` sites are
+counted unanswerable and never asked and that `implementation_kinds` adds one
+question per matching node (`["trait"]` for Rust, `[]` for Python). So the
+*site* counts are the extractor's own decisions rather than a regex's guess at
+them, and are exact.
+
+That the instrumentation cannot ship is enforced by the compiler rather than
+asserted: the module is declared `#[cfg(test)] pub(crate) mod census;`, so a
+single unguarded call would fail a non-test build with "use of undeclared
+crate or module", and `nm target/debug/g-mesh-plugin-{python,rust} | grep -c
+census` is `0` for both. And that the census can tell its own buckets apart was
+checked before it was spent on: run against the twelve-file Python conformance
+fixture it returns 40 excluded names, 36 of them `str`, one of them `Speaker`
+in base-class position - which is precisely the site GM-299 found by hand, in
+precisely the bucket the shape-2 argument turns on.
+
+The "could an engine answer it" column is not exact, and errs in one direction.
+It asks whether the name is declared *anywhere* in the same project, by string,
+which counts `list`, `str` and `cfg` as hits because Django declares a method
+named `list` and tokio a function named `cfg`. It is an upper bound, and a
+loose one. The Python builtin list came from this machine's `python3`
+(3.9.6, `dir(builtins)`, 152 names), which is missing 3.11's `ExceptionGroup`,
+`aiter` and `anext` - all three appear in the corpora - so the builtin share is
+understated too. Both errors make the recovered yield look larger than it is.
+
+**Where the budget already stands, before adding anything.**
+
+| corpus | questions built today | vs `max_sites` = 20,000 |
+|---|---:|---|
+| Django | 87,832 | **4.39× - truncated, pass reports incomplete** |
+| tokio | 27,750 | **1.39× - truncated** |
+| g-mesh | 21,663 | **1.08× - truncated** |
+| Flask | 1,825 | 0.09× - fits |
+
+`max(15 min, 8s × files)` is not what binds. Django's pass budget is 8s × 2,932
+= 6.5 hours, inside core's own 10s × 2,932 = 8.1 hours; at eight questions in
+flight and the 2-9ms warm request latency GM-299 measured for pyright, 87,832
+questions is about 100 seconds of work. Even at 100ms a request it is 18
+minutes. The count cap is therefore roughly two orders of magnitude tighter
+than the clock it was justified against - GM-289's own note reasons "20,000
+sites is about four minutes, well inside the floor below", which is right
+arithmetic about a number that turns out to be exceeded by the *first* real
+project either plugin meets. A 189-file repository is not "an order of
+magnitude larger than anything measured".
+
+**Shape 1: every unresolved bare name.** The naive shape, and the one the
+exclusion exists to prevent.
+
+| corpus | added sites | as % of today's list | of which the project declares the name (upper bound) |
+|---|---:|---:|---:|
+| Django | +23,320 | +26.5% | 77 (0.33%) |
+| Flask | +1,704 | +93.4% | 14 (0.82%) |
+| tokio | +5,858 | +21.1% | 1,094 (18.7%) |
+| g-mesh | +5,468 | +25.2% | 1,405 (25.7%) |
+
+For Python the exclusion is vindicated to three significant figures. Django's
+23,320 additional questions are drawn from **253 distinct names**, of which
+23,022 occurrences (98.7%) are builtins or dunders; Flask's 1,704 come from 71
+names, 1,656 (97.2%) builtins. The top of Django's histogram is `str` (2,247),
+`len` (2,137), `super` (1,829), `list` (1,688), `isinstance` (1,640) - exactly
+the flood `bodies`' Decision 7 predicted, and the non-builtin residue is 298
+occurrences of 141 names which are overwhelmingly class-body attributes the
+LEGB walk deliberately does not bind (`CHOICES`, `NUMBER`,
+`sql_delete_constraint`), not cross-file names.
+
+Rust's numbers are genuinely different, and the difference is not `Vec` and
+`String`. Those are there - `Option` (753), `Result` (474), `Sized` (309),
+`Send` (287), `Vec` (233), `Box` (216) head tokio's unresolved-type histogram,
+and `_`, the inferred-type placeholder, appears 80 times and is not a name at
+all. But a quarter of g-mesh's own unresolved names are names g-mesh declares:
+`Diff` (109), `Connection` (93), `SymbolQueryParams` (69). The cause is
+measured rather than guessed: the census records whether a glob `use` is in
+scope for the module each name sits in, and **2,052 of g-mesh's 5,468 (37.5%)
+are under one**, against 359 of tokio's 5,858 (6.1%). That is
+`mod tests { use super::*; }`, the single most common Rust file shape g-mesh
+writes, and it is the exact structural analogue of GM-299's `Speaker`.
+
+**Shape 2: a position where a declaration is expected.** The narrowing the task
+that scheduled this work expected to pay, and the one that pays least.
+
+| corpus | position | added sites | answerable (upper bound) |
+|---|---|---:|---:|
+| Django | base class / decorator / annotation | 163 / 1,215 / 36 = **1,414** | **1** |
+| Flask | base class / decorator / annotation | 18 / 31 / 684 = **733** | **6** |
+| tokio | supertrait + `impl Tr for T` | **373** | 12 |
+| g-mesh | supertrait + `impl Tr for T` | **80** | 4 |
+| tokio | attribute (Rust's decorator) | **11,463** | 658 are `derive` arguments |
+| g-mesh | attribute | **3,051** | 821 are `derive` arguments |
+
+Restricting to declaration positions removes 94% of shape 1's volume in Django
+and keeps essentially none of its value: **one site in 2,932 files**
+(`ChoiceFormSet`, in a base-class position). Django's 1,215 decorator sites are
+100% builtins - `property` (603), `classmethod` (597), `staticmethod` (110) -
+and Flask's 684 annotation sites are 100% builtins, because a fully annotated
+modern Python file is mostly `str`, `int`, `bool` and `None`. The one shape
+GM-299 named by hand, a base class arriving through a star import, is a
+population of **one** across Django and **zero** across Flask; Django has 13
+files with a project-internal `from x import *` and exactly one unresolved bare
+name inside any of them.
+
+Rust attributes are worse than Python decorators, and worse than they look.
+Of tokio's 11,463 attribute names, 5,622 are `#[cfg(...)]` arguments and 4,407
+are attribute heads - `cfg` (1,627), `feature` (1,280), `test` (1,191),
+`target_os` (870), `all` (675), `not` (548). These are conditional-compilation
+predicates: not symbols, not resolvable by any engine, and not even in a
+namespace. Only 658 - 5.7% - are `derive` arguments, the sole attribute
+argument that is a symbol at all, and of those the ones whose name the project
+declares are `Copy` and `Debug` colliding with unrelated local declarations.
+`plugins/rust` does not walk attribute items at all today, and the measurement
+says that is the right amount of work to do on them.
+
+**Shape 3: what a star import could plausibly have introduced.** Python: one
+site in Django, none in Flask. Rust: 2,052 in g-mesh and 359 in tokio, as
+above. The finding that made this task worth doing turns out to be a Rust
+finding wearing Python clothes - which is the GM-299 note's own point, that the
+question list is an architectural limit rather than a Python one, arriving at
+an answer opposite in sign for the two languages.
+
+**Shape 4, what the distribution suggested once visible.** Two things. First,
+the *vocabulary* is tiny: Django's whole excluded bucket is 253 distinct names
+and Flask's is 71, so the flood is not 23,320 different questions but 253
+questions asked 92 times each on average. A per-name answer cache would collapse
+it - which is an argument for a *cheaper* engine protocol, not for a wider
+question list, because the answers would all be "not in this index". Second,
+the Rust value concentrates in **value** position under a glob, not type
+position: g-mesh's `BareUnknownValue` bucket is 1,965 sites of which 700 name
+project declarations (`row`, `KEY_NAME`, `JSONRPC_VERSION`), a 36% hit rate
+against 20% for types. The exclusion Decision 7 argues for is about types; the
+bucket it silently also excludes is the one with the better yield.
+
+**Commands.** Each census run is one command; the analysis is `python3` over
+the TSVs it writes.
+
+```text
+GM314_CORPUS=<corpus> GM314_OUT=<dir> cargo test -p g-mesh-plugin-python --lib \
+    census::run::open_site_census -- --ignored --nocapture
+GM314_CORPUS=<corpus> GM314_OUT=<dir> cargo test -p g-mesh-plugin-rust --lib \
+    census::run::open_site_census -- --ignored --nocapture
+```
+
+Both are `#[ignore]`d, so `cargo test --workspace` never runs them and CI never
+needs a corpus. Django's run is 33.8s for 2,932 files, tokio's 7.0s for 799,
+at load averages 5.97-13.48 on a machine 14 days up - the census is
+tree-sitter parsing and nothing else, and no language server is started.
+
+**The recommendation, in three parts.**
+
+1. **Leave `OpenSiteKind` and both extractors' Decision 7 alone.** No shape
+   measured here earns its questions. Python's best case is 1,414 added
+   questions for 1 recovered edge; Rust's best case in a declaration position is
+   373 added for 12. The exclusion was written as a fear ("would swamp the
+   bridge") and is now a number: on Django it would be 23,320 questions of
+   which 23,022 are `print` and `len`.
+2. **Fix the truncation, which is the real finding.** `max_sites` binds on
+   three of four real corpora *today*, and the failure is silent-then-total: the
+   list is cut in `scope` order, the pass reports incomplete, `semanticPassAt`
+   stays unset, and the tier's whole user-visible benefit is withheld from
+   exactly the large projects it was built for. Two candidate repairs, neither
+   of which this task implemented: raise `max_sites` towards what the time
+   budget already permits (the arithmetic above says 100× headroom for Python,
+   and rust-analyzer's per-request cost on a real corpus was not measured here,
+   so its own headroom is unknown), or stop letting truncation fail the pass -
+   commit what was answered, record how far the list got, and resume from there
+   on the next pass, which is what GM-289's finding 7 already argues for the
+   *diff* and not yet for the *list*. (GM-319 took the first, measured
+   rust-analyzer's latency to size it, and argued the second down - see
+   "Implementation notes (GM-319)" below.)
+3. **If a shape is ever added, it is Rust's glob-scope names - and not as a
+   semantic question.** The 2,052 g-mesh sites under a `use super::*` do not
+   need an engine: the extractor already knows the module has a glob and which
+   container the glob names, and the container is one this index holds. A
+   `PendingSymbol` placeholder keyed `TargetKey::Name` into that container costs
+   zero bridge budget, resolves through the linker that already exists, and
+   fails to a missing edge when the name is not there - the failure direction
+   both extractors already prefer. The open question that stops this being a
+   recommendation to implement today is what to do when more than one glob is in
+   scope, where two placeholders would be ambiguous and core would rightly
+   refuse both.
+
+**What could not be measured here.** rust-analyzer's per-request latency on a
+real corpus (so part 2's headroom argument is Python arithmetic only); whether a
+raised `max_sites` survives an end-to-end pass against Django with a real
+pyright, which is bench work and needs a Python corpus in `g-mesh-bench`; and
+whether the glob placeholder of part 3 resolves cleanly in practice. None of
+the four repositories measured licenses a claim about "Python projects" or
+"Rust projects" in general - Django and Flask disagree with each other about
+annotation density by a factor of 19, and g-mesh and tokio disagree about
+glob-scope share by a factor of six, which is itself the reason two corpora per
+language were measured rather than one.
+
+#### Implementation notes (GM-319): the ceiling, and why not resumption
+
+**`Budgets::max_sites` goes from 20,000 to 1,000,000, and truncation starts
+cutting between files instead of inside one.** GM-314 handed this task two
+candidate repairs and said neither had been implemented: raise the ceiling, or
+stop letting truncation fail the pass and resume from a cursor on the next one.
+The first is what shipped, the second was weighed and refused, and the case for
+each is below rather than only its conclusion - the refusal is the part a later
+reader is most likely to want to reopen.
+
+**The measurement the decision turns on, which GM-314 could not take.** Its
+headroom argument was pyright arithmetic only ("rust-analyzer's per-request
+cost on a real corpus was not measured here, so its own headroom is unknown").
+It is measured now, by driving a real `rust-analyzer` through the real bridge
+over a real corpus - `plugins/rust/tests/semantic_pass_measurement.rs`, which
+is `#[ignore]`d and needs `GM319_CORPUS`, so `cargo test --workspace` never
+runs it and CI never needs a corpus (the same contract `plugins/{python,rust}/src/census.rs` has).
+Each arm below is one whole-project pass over a clean `git archive` of
+`release-3.5.0` (6051d0a), 190 files and 21,995 questions, differing in
+`max_sites` and nothing else:
+
+| arm | `max_sites` | asked | wall | complete | edges | ms/request | load before → after |
+|---|---:|---:|---:|---|---:|---:|---|
+| A, as shipped in 3.5.0 (cold) | 20,000 | 20,000 | 182.5s | **false** | 1,649 | 73.0 | 39.96 → 86.58 |
+| A again, warm | 20,000 | 20,000 | 40.7s | **false** | 1,649 | 16.3 | 13.85 → 9.60 |
+| B, this task, warm | 1,000,000 | **21,995** | 51.8s | **true** | **1,921** | 18.9 | 9.38 → 9.59 |
+
+Arm A is the defect, reproduced against a real server on this repository rather
+than argued from the source: 1,995 questions never asked, the pass reported
+incomplete, and therefore `language_state.semanticPassAt` never set for Rust on
+g-mesh's own checkout. Arm B is the same pass, complete.
+
+**Only the warm pair is a comparison, and it is in the table twice for that
+reason.** The first arm A ran cold - it was what created the corpus's `target/`
+for rust-analyzer - at a load average of 40 rising to 87, so its 182.5s and the
+warm arm B's 51.8s differ mostly in cache and machine, not in `max_sites`;
+reading a speedup out of that pair would have been reading the load. Re-run
+warm at a comparable load, arm A takes 40.7s, so the honest cost of the fix is
+**+1,995 questions (+10%) for +11.1s (+27%)**, and what it buys is **272 more
+semantic edges and 144 more placeholder nodes** - a difference in output, not
+only in a flag, which is what makes the two arms demonstrably distinguishable
+rather than a boolean that could have been flipped by anything. Every run was
+`/usr/bin/time -p`'d with `user`+`sys` well above `real` (arm B: real 60.3,
+user 93.8, sys 14.9), so the time is work rather than waiting.
+
+**73 milliseconds is the number to size against.** Arm A cold is 9.1ms of wall
+clock per question at eight in flight, or **73ms per request** serialized; the
+warm runs are 16-19ms. The conservative reading is the one used below, because
+sizing a ceiling against the best case is how the last one was set.
+rust-analyzer is in any case the slowest engine either plugin drives: 2-9×
+pyright's 2-9ms warm latency (GM-299) even on its own warm runs, and 8-36× on
+the cold one. What it says about the clock:
+
+- `per_file` is 8s, so at 73ms and eight in flight one file's budget buys about
+  **877 questions**. The densest corpus measured is g-mesh at **116**
+  questions per file (tokio 35, Django 30, Flask 22).
+- That ratio is **independent of project size**, because both sides scale with
+  the file count. The clock therefore has ~7.6× headroom over the worst real
+  density at *every* size, and the 15-minute floor - which only binds under 113
+  files - buys 98,600 questions at the same latency.
+
+So the clock was never what was wrong. A count is: it is a constant where the
+thing it stands in for scales, which is exactly how a ceiling nothing had
+reached in review became one that a 190-file repository walks straight through.
+The old comment's arithmetic ("20,000 sites is about four minutes") was right
+about a number that the first three real corpora exceeded.
+
+**Why 1,000,000 and not a formula.** A ceiling derived from the clock -
+`concurrency × pass_budget ÷ per-request cost` - is the shape this argument
+points at, and it was tried on paper and dropped. The bridge has no per-request
+cost until it has run a pass, and the only figure it holds a priori is
+`Budgets::request`, the 10-second timeout; substituting that gives g-mesh a
+ceiling of 1,216 questions, twenty times tighter than the number this defect is
+about, because it prices every request as the pathological one. A formula would
+therefore need a measured latency constant per engine - a constant either way,
+with a function wrapped around it - and it would take away the property
+`Budgets` is documented to have, that every field is a plain value a test can
+make small. One million is the same job done plainly: 11.4× Django's list, 45×
+g-mesh's, and about 230MB - 144 bytes of `Question` each, which
+`the_site_ceiling_bounds_what_one_question_list_can_cost` pins, plus ~100 bytes
+of the strings it holds (2,210,074 bytes across g-mesh's 21,995 sites,
+measured) - paid only by a project that genuinely has a million open sites, and
+whose index is already holding every one of them when the list is built.
+`the_site_ceiling_clears_every_corpus_that_has_been_counted` is the standing
+check, and it fails at 20,000 on three of the four corpora.
+
+**The second defect, found while cutting the list differently.** The old cut
+was `asking.truncate(max_sites)`, which lands wherever the *n*th question falls
+- usually the middle of a file. Every question that file did contribute was
+asked and answered, so `run_pass` returned it in `covered`; `retract_stale`
+reads `covered` as "this pass is now the whole truth about that file" and
+withdraws every edge an earlier pass emitted for a site this one was cut before
+reaching. Correct edges deleted to account for questions nobody asked, which is
+the one direction the bridge's retraction rules exist to forbid. It cannot
+happen on a first pass (there is no baseline yet), which is why no fixture
+caught it. `questions()` now stops at the last *whole* file that fits, so a
+file is either asked about completely or never named - and a file never named
+is not covered, so its earlier answers stand. One file may exceed the ceiling
+by itself and is taken anyway when it is the first with anything to ask, since
+a pass that asks nothing about it forever is the worse of the two failures and
+the only one that costs an edge. The same hazard existed in the "nothing to
+ask" branch, which retracted every file in scope even when `max_sites` was zero
+and the list had been refused rather than found empty; that branch now returns
+an incomplete pass with an empty diff.
+
+**Why not resumption.** It is the honest shape for a truncated pass and it is
+what GM-289's decision 7 already argues for the *diff*, so refusing it needs
+three reasons rather than a preference:
+
+1. **Nothing would drive it.** `daemon::semantic` asks a language for a
+   whole-project pass once per daemon start, and only while that language is
+   still *owed* one (`storage::schema::owed_semantic_pass_languages`). There is
+   no loop that asks again inside one daemon lifetime, so a cursor kept in the
+   bridge advances one chunk per daemon *restart*. Django at the old ceiling
+   would have needed five restarts, each paying a cold pyright load, to record
+   one pass. Convergence that is a function of how often somebody reboots the
+   daemon is not convergence. (`cli::reindex` is the one caller that always
+   asks, and it is no help here: it wipes the graph first, so it restarts the
+   sweep rather than continuing it.)
+2. **It would relabel the cliff, not remove it.** A resumed sweep can only
+   report `complete` once it has covered every file; until then the pass is
+   honestly incomplete and `semanticPassAt` stays unset - which is the state
+   this defect *is*, reached over more passes. The version that closes the gap
+   sooner records completion **per file**, and `FileChangeResponse` carries one
+   boolean for the whole pass, so that is a core change and a different task.
+3. **It repairs one of four doors.** A pass ends short when the ceiling cuts
+   it, when the deadline runs out, when the server dies, or when a question is
+   refused. Resumption built for the ceiling alone leaves the other three - and
+   the deadline is the one with a measurement behind it and the one that scales
+   with the project, so once the ceiling is sized rather than guessed it is the
+   least likely of the four to be what a real repository meets. The
+   per-request door is already on record as reachable in
+   `plugins/rust/plugin.toml`'s `cachePriming` note: at load average 693, eight
+   of the conformance fixture's questions blew the ten-second budget and that
+   pass came back incomplete - on twelve files.
+
+**What a later task inherits if it builds it anyway.** The file-boundary cut
+above is precisely the cursor such a design needs, and it is already in place:
+truncation now stops at a file, so "where did the last pass get to" is a path
+rather than an offset into a list that is rebuilt from a changing index. The
+rule for a file set that changed between passes follows from machinery that
+already exists rather than needing to be invented - every settled reparse gets
+its own per-file semantic pass (`watcher::apply::apply_file_change`), so a file
+that changed during a sweep has already been answered for and the sweep owes it
+nothing; a file added during one is reached on the next turn of the cursor.
+What is genuinely missing is only item 1: a driver in core that re-asks an
+incomplete language within one daemon lifetime, bounded so a permanently
+failing engine cannot spin.
+
+**What this does not fix, stated rather than left to be discovered.** The cliff
+moved; it did not go. A repository of roughly 8,600 files at g-mesh's density,
+or 33,000 at Django's, reaches 1,000,000 questions and has its pass cut short
+again - reported incomplete, which is the same honest and retryable answer a
+dead server or a spent deadline already gets, and not a silent one. And the
+end-to-end pass against Django with a real pyright that GM-314 wanted is still
+not run: the arms above are Rust and rust-analyzer, so the claim proved on a
+real corpus is that *this* repository's pass now completes, with Django's
+headroom still resting on arithmetic.
 
 ### Go plugin (`plugins/go`)
 
@@ -2019,6 +2449,242 @@ this fixture does not exercise at all. "Many minutes on a large repository"
 remains the expectation for every engine on this bridge, and measuring it on a
 Python bench corpus is bench work this task did not do.
 
+#### Implementation notes (GM-309): the didChange race
+
+GM-299's readiness measurement above states the pyright number this task
+starts from: `$/progress` arrives ~0.63s after `didOpen`, and the settle
+(`LspClient::settle`, GM-290) is paid once per server rather than once per
+pass. Put those two facts together for a per-file pass that follows an edit,
+rather than for the cold-start pass GM-299 measured, and there is a gap
+between them GM-299 named but did not close: for up to that ~0.6s after a
+`didChange`, the server has emitted no progress for the new edit at all, and
+`LspBridge`'s readiness gate - `wait_ready` asking only `quiet_for(Duration::
+ZERO)` once a server has settled once - has no way to tell "nothing is
+happening" from "the server has not noticed yet". An empty answer landing in
+that window read as "no target", which is wrong in the direction this design
+always prefers safe: a missing edge, not a wrong one, but still a real gap
+between what the design doc promises ("an empty answer before readiness is
+never recorded as 'no target'") and what a per-file pass actually did.
+
+**Forcing it, rather than reasoning about it again.** `tests/lsp_bridge.rs`'s
+`a_didchange_race_is_not_recorded_as_no_target` runs two passes against the
+fake server: the first lets `settled` latch the ordinary way (no progress, a
+server that becomes ready by the clock), the second edits the one file in
+scope and asks about it alone - a per-file pass, exactly what core runs after
+one reparse. The fake server's `reindexOnChange` script answers `null` to
+everything from the moment `didChange` arrives until a scripted delay after
+it, then a hold, then it reveals the real answer - a server that has not yet
+reacted to the edit, not one that is merely slow. Run against the code as
+GM-299 left it, the second pass's question is answered and believed in under
+2ms: the client had been quiet for minutes by the time the edit was sent, so
+`quiet_for(budgets.settle)` was already satisfied before the server had any
+chance to say otherwise, and the empty answer retracted the very edge pass
+one had just found. That is the failure this section exists to report having
+reproduced, not inferred.
+
+**The fix does not touch the latch.** `LspClient::mark_edited` (called from
+`sync_documents` right after every `didOpen`/`didChange`) resets how long the
+client has been quiet, but only when it was not already known to be busy -
+and only for the purposes of `run_pass`'s own per-answer deferral rule
+("an empty answer while the server is indexing is re-asked once"), which
+already existed for the *during*-progress case (GM-289) and simply did not
+cover the *before-any-progress* one. `wait_ready` still asks
+`quiet_for(Duration::ZERO)` once `settled`, and answers it exactly as
+promptly as before - a pass with no question landing in the narrow post-edit
+window pays nothing extra, same as GM-290 measured (33-36ms). A question that
+does land there is deferred and re-asked once the client has been
+continuously quiet for a full settle, which - because the server's own
+`$/progress begin` necessarily interrupts that quiet period if one is coming
+- cannot fire before the server has had its say. The reset applies to
+`didOpen` as well as `didChange`, symmetrically: a file this server has never
+seen is at least as likely to start it reanalysing as an edit to one already
+open, and the cost of covering it is the same bounded deferral, never a
+resurrected per-pass wait.
+
+**What is still true, and what changed.** "A missing edge, never a wrong
+one" still holds - GM-309 tightens *how often* the gap can produce a missing
+edge, it does not change which direction a mistake falls in. And the numbers
+GM-299 measured are untouched: the settle is still paid once per server, the
+per-file pass is still tens of milliseconds when nothing races it, and this
+fix spends latency only on the specific question that happens to be asked
+inside the gap - never on the pass as a whole.
+
+#### Implementation notes (GM-310): readiness is a shape, not a duration
+
+GM-299's note ends by refusing to shorten pyright's settle and saying why: one
+server version, one twelve-file fixture, and "a server made to look ready
+before it can answer" is the bug GM-290 found twice. That refusal was right and
+is kept. What it left open is the thing it measured - with `Budgets::settle`
+forced to zero, pyright returns **byte-identical answers**, so roughly 2.0s of
+a 3.4s pass is the bridge waiting for a server that was ready before it was
+asked - and this task closes it without taking the trade GM-299 declined.
+
+**Both servers were traced again, from scratch, by a client that speaks the
+same handshake `LspClient` does** (same capabilities, same
+`workspace/configuration` reply, `initialized` sent the instant the response
+arrives rather than after a fixed sleep). Machine: 8 cores, 32 GiB; load
+average 30.0-31.2 for the three pyright reps, 33.2 for the rust-analyzer
+prober run and 40.8 for its observer run.
+
+pyright 1.1.414, this plugin's own conformance fixture, eleven files opened,
+three reps:
+
+| | rep A | rep B | rep C |
+|---|---:|---:|---:|
+| `initialize` answered | 434ms | 401ms | 423ms |
+| `didOpen`, 11 files | 445ms | 405ms | 428ms |
+| **first correct cross-file `definition`** | **1665ms** | **1603ms** | **1614ms** |
+| `$/progress` BEGIN (one token, empty title) | 1707ms | 1720ms | 1761ms |
+| `$/progress` END | 2199ms | 2193ms | 2178ms |
+| `didOpen` → progress BEGIN | 1261ms | 1316ms | 1332ms |
+| answer *before* progress BEGIN | 41ms | 117ms | 146ms |
+
+The correct answer arrives **41-146ms before the progress token begins**, three
+times out of three. GM-299 inferred this from a zero-settle counterfactual;
+this is the direct observation, and it says the same thing: that token is a
+background diagnostics pass, not an indexing gate.
+
+rust-analyzer 1.97.1, `plugins/rust`'s conformance fixture, ten files opened,
+one question per second:
+
+```text
+  313ms  BEGIN Fetching                    ← 13 tokens, 6 distinct names, re-used
+ 4427ms  cross-crate `definition` on `describe`   CORRECT
+12094ms  `implementation` on `Loud`               CORRECT
+12334ms  END cachePriming (the last token)
+13431ms  receiver call `square.area()`            CORRECT - empty until here
+```
+
+Quiet runs between phases: 313, 182, 0, 3, 88, 0, 0, 0, 5 ms. The **largest gap
+is 182ms**, against a 2s settle - so the settle is not slack that could be
+trimmed, it is the 11x margin that stops a gap being read as the end.
+
+**The chosen mechanism: `[plugin.semantic] readiness = "on-demand" |
+"indexed"`, defaulting to `indexed`.** `on-demand` starts `LspClient` with its
+`settled` latch already set, which means *born in the state every server
+reaches after its first settle* - a state this client already had, that
+`wait_ready` already reads, and that GM-290 already measured on every pass
+after the first. One field, one line of behaviour, no second state machine.
+`Budgets::settle` is untouched.
+
+**Why not simply shorten the settle, which `LspBridge::with_budgets` already
+allows.** Because that one number does two jobs, and pyright wants opposite
+values for them. Job A is start-up readiness, where pyright wants ~0. Job B is
+GM-309's post-edit scepticism, which needs the settle to stay **above** this
+server's own didOpen-to-progress gap - traced above at **1.26-1.33s**, twice
+GM-299's 0.63s on a quieter machine. A settle short enough to win A loses B on
+the same server and re-opens the bug closed one release ago. GM-309, landing
+first, is what made the shape key possible *and* what rules the number out.
+
+**Why not probe - ask one cheap question early and see whether the answer is
+trustworthy.** This was designed as carefully as it can be: not "did it
+answer", which an unready server satisfies with a wrong empty, but "did it
+answer *what the index already knows*" - `definition` on a declaration's own
+name, whose correct answer is that declaration. The trace kills it anyway, and
+in a way no amount of care fixes. rust-analyzer answers the cross-crate
+`definition` **correctly at 4427ms** and the receiver call **empty until
+13431ms**, in one session, from one server. A probe would have declared
+readiness at 4.4s on the first and recorded the second as "no target". The
+self-definition probe is in fact the *last* thing this server answers
+(12094ms), so it is conservative here by accident and not by design. A question
+answered is not a server ready - measured, rather than feared.
+
+**Why not adapt within a session from observed progress behaviour, or shorten
+the settle once a server has demonstrated it answers before progress.** Twice
+over, and the first reason covers both. The whole cost is on the *first* pass,
+because `LspClient::settle` has latched since GM-290 and a per-file pass
+already costs tens of milliseconds - so a demonstration can only arrive after
+the pass that would have paid for it, and there is nothing left for it to
+save. And rust-analyzer's early progress stream carries no signal to adapt
+from anyway: 13 tokens under 6 names, `Fetching` beginning three separate
+times, tokens interleaving, and nothing observable at t<4s predicting that
+`cachePriming` is still running at 12.3s.
+
+**The measurement that changed the method, and is the argument against every
+"ask early to find out" scheme.** The first rust-analyzer trace polled at 100ms
+and accumulated 422 outstanding requests. It opened a **7465ms quiet run** in
+the middle of start-up - long enough that even the 2s settle would have
+declared readiness inside it - and ended in a `content modified` storm. The
+undisturbed run's largest gap is 157ms. So asking questions during
+rust-analyzer's start-up starves its background work and *manufactures* the
+gap that readiness exists to survive. A scheme that learns by asking changes
+the thing it is measuring, in the dangerous direction.
+
+**What makes an `on-demand` claim safe when it is wrong.** It removes the
+blanket wait and nothing else. `sync_documents` marks the client edited after
+every `didOpen` (GM-309), so when the first question of the first pass goes out
+the client has been quiet for milliseconds, not for the life of the process;
+`run_pass` defers every empty answer arriving before a full settle of
+continuous quiet, and returns a deferred question only when that continuous
+quiet arrives - which a server genuinely mid-sequence cannot supply, its own
+next `begin` clearing the clock. So `on-demand` in front of a rust-analyzer
+produces the same edges at the same moment, having spent one deferral per
+question instead of one wait per pass.
+
+The guarantee is worth stating exactly rather than generously, because the
+generous version is false: `on-demand` **cannot record "no target" in any case
+where `indexed` would not record it too**, which is not the same as "never".
+Both believe a second empty answer given after a full continuous settle of
+quiet, so a server that indexes for seconds while reporting no `$/progress` at
+all defeats both equally - that exposure belongs to `Budgets::settle` and to
+GM-290's decision to make a silent server ready by the clock, and this key
+neither widens nor narrows it. `tests/lsp_bridge.rs`'s
+`an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
+is exactly that case. It was shown to fail two ways: with `quiet_for` reduced
+to "is anything in flight now" (GM-289's rule 1) it reports **0 edges in
+10.7ms and calls the pass complete**; and with `on-demand` implemented as the
+rejected zero settle it is the **only** test in the file that fails - no
+pre-existing test catches that, which is why it had to be written.
+
+**What it saves, measured.** The Python conformance arm run eight times per
+value, interleaved in one process so both arms see the same machine, with
+`assert_conformant()` on every run - so the faster arm is provably not the one
+that answered less. Every run reported the identical `4 node(s)/4 edge(s)`.
+Load average 6.1-8.1 throughout; `real 67.13 / user 45.70 / sys 7.64` for the
+whole harness, so it was working rather than waiting. Reps 1-3 are warm-up and
+excluded; reps 4-8 are the steady state:
+
+| whole-project pass, 12 files | rep4 | rep5 | rep6 | rep7 | rep8 | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| `indexed` | 3.349 | 3.360 | 3.311 | 3.376 | 3.301 | **3.339s** |
+| `on-demand` | 2.264 | 2.285 | 2.273 | 2.330 | 2.275 | **2.285s** |
+
+**The saving is 1.054s, 31.6%.** The spread inside each arm is ~70ms, fifteen
+times smaller than the gap between them, which is what makes this a
+measurement rather than two numbers. It is about *half* the 2.0s GM-299's
+zero-settle counterfactual implied, and the difference is not a disappointment
+but the reason to measure rather than subtract: the pass overlaps part of the
+settle with work it has to do regardless - the spawn, the handshake, the
+`didOpen`s - so removing the wait does not remove its whole duration.
+
+**Two costs, both real and neither hidden.** The per-file pass that follows an
+edit goes from 30.3-38.5ms (mean 34.0ms) to 85.6-101.1ms (mean 91.1ms),
+**+57ms**: with the cold pass finishing a second earlier, pyright's background
+diagnostics token is more often still in flight when the next pass starts, and
+`wait_ready` correctly waits for it - which is the bridge doing its job, not a
+regression in it. Net over both passes, 3.373s → 2.376s, a saving of
+**0.997s**. And when the deferral fires it costs a whole settle: of eleven
+`on-demand` whole-project reps across both harness runs, **two** came back at
+4.089s and 4.275s instead of ~2.3s - about 1.8-2.0s high, which is one
+deferred question paying one 2s settle. That is the safety net working, priced
+exactly as designed, and it is why `on-demand` is a claim a plugin makes
+deliberately rather than a default.
+
+**Where each value is set, and why the Rust one is written out.**
+`plugins/python/plugin.toml` says `on-demand`; `plugins/rust/plugin.toml` says
+`indexed`, which is the default, stated explicitly so the trace that justifies
+it has somewhere to live. Both manifests' claims are asserted in their plugin's
+`the_shipped_manifest_configures_the_server_this_module_expects`, which exists
+precisely so a shipped manifest cannot rot unnoticed.
+
+**None of this extrapolates**, and the direction of the error is worth naming.
+Twelve files with no third-party dependencies is pyright's best case; on a real
+project its cold load is dominated by resolving imports against a venv's
+`site-packages`, which this fixture does not exercise at all. A fixed 1.05s
+saved off a 3.3s pass is 32%; off a two-minute pass it is nothing. The claim
+this key makes - *this server does not gate answers on a start-up index* -
+stays true at any size; the saving does not.
+
 ### MCP instructions
 
 The fixed text keeps its current rules. The receiver-call gap sentence is generated
@@ -2057,6 +2723,20 @@ memoryLimitMb = 4096        # optional; absent (the default) = no limit, idle sl
 
 - **Off by default.** Absent means exactly today's behaviour: a plugin is only put
   to sleep after `idleTimeoutMinutes` without requests.
+- **What the number guarantees: a circuit breaker, not a ceiling** (GM-304).
+  `memoryLimitMb` does **not** promise that a plugin's process tree will never
+  exceed it. It promises that a tree found over it is stopped, so it cannot go on
+  exceeding it. The plugin is allowed to cross the limit once - in practice by a
+  lot, and for the length of one whole `semanticPass`: measured against a real
+  rust-analyzer over this repo's own fixture (GM-291), the tree climbed from
+  ~5.4MB to a 563-580MB plateau over 13-17 seconds and was suspended a few
+  hundred milliseconds after that pass returned. Someone setting `600` on a
+  machine with 1GB to spare should read that as "rust-analyzer may reach 600MB
+  and a bit before anything stops it", not as a cap the daemon holds it under.
+  "A bit" is bounded only by how fast the tree grows while nothing can act, which
+  for a cold language-server load is hundreds of megabytes. The argument for why
+  this is the only guarantee a sampler *can* give - and why "just sample more
+  often" does not change it - is in the GM-304 notes below.
 - **When set,** idle sleep keeps working, and the limit is enforced alongside it.
   - It applies to **each language plugin's process tree separately**: the plugin
     plus its children, so tsserver, rust-analyzer and a language server behind the
@@ -2068,9 +2748,16 @@ memoryLimitMb = 4096        # optional; absent (the default) = no limit, idle sl
 - **Enforcement.**
   - The supervisor samples the tree's resident memory on the same timer that already
     drives idle-sleep checks.
-  - Over the limit, it puts that plugin to sleep through the existing
-    `sleep_now(reason)` path, with the reason naming the limit and the measured
-    figure, and suspends semantic passes for that language.
+  - An over-limit reading is **confirmed by a second sample, taken in the same
+    check**, before anything is acted on (GM-307). One sample is one instant, and a
+    process tree's membership changes between instants - a `rustc` a `rust-analyzer`
+    shelled out to is a real member of the tree while it lives and gone again a
+    moment later. Suspension is irreversible for this daemon's life; declining to
+    suspend costs at most one tick. The second sample is only ever taken on the path
+    that is about to act, so a healthy tree still costs one scan per tick.
+  - Over the limit on both, it puts that plugin to sleep through the existing
+    `sleep_now(reason)` path, with the reason naming the limit and both measured
+    figures, and suspends semantic passes for that language.
   - The next `fileChanged` wakes the plugin for structural work only. Core does not
     send `semanticPass` to a suspended language, and a plugin starts its semantic
     engine lazily on the first `semanticPass` (a conformance-kit check). So the
@@ -2123,6 +2810,17 @@ later change does not have to re-derive them:
    ceiling on *sustained* growth (a cold `rust-analyzer`/`go/packages` load
    that keeps climbing), not a guard against a transient spike. A tighter
    interval, or sampling on a different trigger, is future work.
+
+   **Closed by GM-304** (notes below), and not in the direction this decision
+   expected. The interval was never the binding constraint: GM-291 measured
+   the thing being caught as a plateau that is never given back, which any
+   interval observes. What is bounded is the *guarantee* - `memoryLimitMb` is
+   a circuit breaker, not a ceiling, and a sampler cannot be a ceiling
+   whatever its interval or its locking. This decision's own last sentence
+   ("a ceiling on sustained growth... not a guard against a transient spike")
+   was closer to right than the word "ceiling" elsewhere in this section; what
+   it lacked was a mechanism that *checks* for "sustained", which GM-307's
+   confirming sample now supplies.
 4. **"Until the daemon restarts or the config changes" is honestly just
    "until it restarts".** `config::read_project_config` is read once, at
    `daemon::run` startup, and nothing in this daemon hot-reloads
@@ -2233,6 +2931,143 @@ limit on "catches it before it's gone" is not the tick period at all - it is
 finding a moment where `check_memory_limit` can actually acquire
 `PluginSupervisor::inner` (note 2, above), which for a *sustained* plateau it
 eventually always can.
+
+#### Implementation notes (GM-304): ceiling or circuit breaker
+
+GM-291 left this section describing a mechanism stronger than the one that
+exists, and GM-274's own notes read as a *ceiling* - the plugin is stopped
+before it can exceed the limit - while what is built is a *circuit breaker* -
+the plugin is allowed to exceed it once and is then suspended so it cannot do
+so repeatedly. Both are defensible guarantees. This task's job was to pick
+one and say so rather than to move the contradiction, and deciding it turned
+out to settle the implementation question too.
+
+**The decision is: circuit breaker.** Four arguments, in descending order of
+how much they settle.
+
+**1. A sampler cannot be a ceiling, whatever its locking looks like.** Sampling
+is retrospective by construction: `process_tree_rss_mb` reports memory that is
+*already resident*. By the time any number crosses a threshold, the allocation
+that crossed it has happened. The only mechanisms that can stop a process
+before it exceeds a figure are the ones where the kernel refuses the
+allocation - `setrlimit(RLIMIT_AS/RLIMIT_DATA)`, a cgroup `memory.max`, a
+Windows job object - and all three are the wrong shape here on three separate
+counts: they bound a *process*, not the lazily-spawned tree `memoryLimitMb` is
+defined over (decision 2); they kill with an allocation failure or an OOM
+rather than suspending, which breaks this section's own "the next `fileChanged`
+wakes the plugin for structural work only"; and they are three more bespoke
+platform surfaces, exactly what GM-274's decision 1 weighed and declined. So
+"ceiling" was never on this mechanism's menu. It was a description of a
+different mechanism that would have to be built instead of this one, not a
+stricter setting of this one.
+
+**2. Changing the locking would change the overshoot's size, not the kind of
+guarantee.** GM-291's finding is real: `semantic_pass` holds
+`PluginSupervisor::inner` for its whole synchronous round trip, so
+`check_memory_limit` can only run before a pass starts or after it returns.
+Suppose that were fixed - the check reads the pid under the lock, releases it,
+samples, re-acquires. It could then sample *during* a pass. It still could not
+act during one: suspending means taking the process out of `inner`, which needs
+the lock the pass is holding. And even a check that could act instantly would
+be chasing a moving number - GM-291 measured rust-analyzer's RSS rising by up
+to ~65MB between samples 0.4-1s apart. At any sampling rate there is a window
+in which the tree is over the limit and nothing knows yet. The overshoot would
+fall from "one whole pass" to "one sample interval". That is a magnitude
+improvement to a circuit breaker; it is not a ceiling.
+
+**3. The locking is not only an obstacle - it is what makes the breaker fire
+promptly, and narrowing it would make suspension *later*.** This is the
+counter-intuitive one, and it is why no locking changed in this task. Today a
+`check_memory_limit` that arrives while a pass is running blocks on `inner` and
+therefore samples at the first instant after the pass returns - which is exactly
+when the tree is at its plateau. Narrow the hold and that same call samples
+immediately instead, mid-ramp, reads a number far under the limit, and returns
+having done nothing; suspension then waits for a later tick. GM-291's own
+`core/tests/plugin_memory_limit.rs` demonstrates this concretely: its checking
+thread gets a 50ms head start, and at 50ms a real rust-analyzer's tree is still
+at its ~5.4MB baseline. Under today's locking that call blocks and catches the
+580MB plateau; under a narrowed lock it would read 5MB and the test's single
+`check_memory_limit` call would suspend nothing. The "obvious improvement"
+makes the mechanism worse at the one job it has.
+
+**4. GM-307 closes it: a hard ceiling could not be stated truthfully anyway.**
+The number a ceiling would be enforced against is a single sample of a tree
+whose membership changes underneath it (see the GM-307 notes below). A
+guarantee phrased as "never exceeds N" would be false at its own boundary for
+reasons that have nothing to do with the plugin.
+
+**What changed as a result.** No locking, and no change to when the check runs.
+Two things:
+
+- The guarantee is now stated as a circuit breaker everywhere a user meets it -
+  this section's own bullet list, `config::PluginConfig::memory_limit_mb`'s doc
+  comment, and the `g-mesh config` wizard's prompt, which is where someone
+  actually chooses the number. The wizard says plainly that the tree may exceed
+  the limit once and by how much, citing GM-291's measured 563-580MB plateau,
+  because the person typing `600` on a machine with 1GB free is the person this
+  distinction is for.
+- `check_memory_limit` confirms an over-limit reading with a second sample
+  before suspending (GM-307's finding applied to the product path first).
+
+GM-274's decision 3 and `daemon::lifecycle`'s module doc both carried this as
+an open question about the *sampling interval*. It is closed, and it was never
+about the interval: GM-291 measured the thing being caught as a plateau that is
+never given back, which any interval observes. What bounds the mechanism is
+argument 1 - that a sampler reports what has already happened.
+
+#### Implementation notes (GM-307): one sample is one instant
+
+`daemon::memory::tests::a_freshly_spawned_childs_memory_is_included_in_its_parents_tree`
+asserted that adding a live child could never make its parent's process-tree
+RSS look smaller, comparing an aggregate sampled before the spawn against one
+sampled after it. It passes alone and fails inside a full suite run.
+
+The assumption is false, and the reason is sharper than "sampling is noisy
+under memory pressure": **the tree it measures is not the test's own.** In a
+full `cargo test --lib` run the test binary is running hundreds of tests
+concurrently, several of which spawn Node plugins and whole `g-mesh daemon`
+subprocesses - every one of them a member of the tree rooted at the test
+process. The difference between the two aggregates is dominated by other
+tests' children coming and going. Measured on this repository: 350MB then
+180MB at load 105-121; 487MB then 290MB at load 21-41; 597MB then 421MB at
+load 20-27 - each with a ~1MB `sleep` added in between. A 170-200MB fall in
+milliseconds is not the OS reclaiming pages from one process.
+
+Two controls fix what that means. Run alone, the old assertion passed 5/5 even
+at load 195-215 - so it is the shared tree, not the machine's load, that
+falsifies it. And with `process_tree_sample`'s descendant walk deliberately
+severed, so decision 2 is comprehensively broken, the old assertion still
+*passed* while its replacement failed. It was both unsound and insensitive:
+failing when nothing was wrong, passing when the thing it guarded was gone.
+
+So the fix is not a wider tolerance on the same subtraction:
+
+- **The sampler answers about members, not just totals.**
+  `daemon::memory::process_tree_sample` returns a `ProcessTreeSample` carrying
+  every pid the walk reached with its own RSS, and `process_tree_rss_mb`
+  becomes a thin reading of it. Decision 2's actual claim is about
+  *membership* - the freshly spawned child is in the walk - and membership is
+  answerable inside one snapshot, where no other test's process can move
+  anything. The test now asserts the child is a member, has RSS of its own,
+  and that the total is its members' sum.
+- **`check_memory_limit` confirms before it acts.** The same fact bites the
+  product path, where one aggregate drives a decision that is irreversible for
+  this daemon's life: a `rustc` or build script that a `rust-analyzer` shelled
+  out to is a genuine member of the plugin's tree for as long as it lives, and
+  an instant that happens to contain one is the *transient spike* GM-274's
+  decision 3 explicitly says this mechanism does not exist to catch. So an
+  over-limit reading is confirmed by a second sample, and the language is
+  suspended only if that one is over the limit too. The asymmetry is
+  deliberate - suspension is irreversible, while declining to suspend costs at
+  most one tick, because what the breaker exists to catch is by measurement a
+  plateau that is never given back. The confirming sample is taken only on the
+  path that is about to act, so the common case still costs one scan per tick.
+
+Verified as an A/B rather than asserted: both assertions were run in the same
+binary, in the same suite, against the same tree. Over 8 full-suite reps at
+load 20-52 the old assertion failed twice and the replacement failed zero
+times; across 11 full-suite runs and 5 isolated runs the replacement has not
+failed once.
 
 ## Data Flow
 
@@ -2382,6 +3217,18 @@ moving target under development).
 - The choice goes to the bench task.
 
 ## Open Questions / Risks
+
+- **Python's intermediate namespace packages:** closed as permanent-by-design
+  (GM-313). A namespace package with no direct content of its own has no file
+  that could announce it to its parent, so `parent_chain` has a gap there and
+  a visibility check can refuse a link a complete chain would allow - a
+  missing edge, never a wrong one. Manufacturing an announcer was rejected in
+  GM-295 because it would make one file responsible for a node its own text
+  says nothing about. GM-313 measured the shape rather than assuming it rare:
+  it occurs 9 times in django/django and 6 in pallets/flask, but in both
+  corpora every occurrence is a test-fixture or examples tree rather than the
+  importable package tree, so the gap is rare where it would cost anything.
+  Revisit only if a real project is hurt, or when `DECLARATION_OF` lands.
 
 - **Memory ceiling:** decided. `[plugin] memoryLimitMb`, off by default (see
   Interfaces). Still open: whether the sampling interval (the idle-check timer) is

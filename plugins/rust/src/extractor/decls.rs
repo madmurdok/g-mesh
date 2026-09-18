@@ -455,6 +455,8 @@ impl Declarer<'_, '_> {
                 }
             }
             LeafKind::Glob => {
+                #[cfg(test)]
+                crate::census::note_glob(&module.key);
                 if republishes {
                     // `*` at both ends: core's own spelling for "this scope
                     // republishes everything that one does".

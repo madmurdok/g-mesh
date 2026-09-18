@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-rust"
-version = "3.4.0"
+version = "3.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's Rust language plugin: Cargo.toml/workspace/module-tree project model (GM-285), tree-sitter extraction (GM-286)"
@@ -32,25 +32,44 @@ serde = { version = "1", features = ["derive"] }
 # question about. It is also the same grammar family every other plugin in
 # this design uses, so the shape of an extractor is one shape.
 #
-# ONE NON-OBVIOUS CONSEQUENCE, MEASURED RATHER THAN ASSUMED. `tree-sitter`
-# depends on `serde_json` with its `preserve_order` feature, which swaps
-# `serde_json::Map`'s backing store from `BTreeMap` (keys sorted) to
-# `IndexMap` (keys in insertion order). Cargo unifies features across the
-# packages *being built together*, so this reaches `core` in a workspace-wide
-# build - `cargo test --workspace`, or a bare `cargo build` at the root -
-# and changes the key order of any JSON core builds through `Value` rather
-# than through a derive.
+# ONE NON-OBVIOUS-LOOKING CONSEQUENCE, MEASURED RATHER THAN LEFT AT THE FIRST
+# READING (GM-302). `tree-sitter` depends on `serde_json` with its
+# `preserve_order` feature, which swaps `serde_json::Map`'s backing store from
+# `BTreeMap` (keys sorted) to `IndexMap` (keys in insertion order):
 #
 #   cargo tree -p g-mesh    -e features | grep -c preserve_order  -> 0
 #   cargo tree              -e features | grep -c preserve_order  -> 1
 #
-# It does **not** reach the shipped binary: `scripts/build-targets.sh` builds
-# core from `core/`, package-scoped, where tree-sitter is not in the graph at
-# all. So the effect is confined to workspace-wide builds, and the whole
-# suite passes under it (nothing asserts sorted JSON keys) - but a CI
-# workspace run is exercising a core whose `Value` key order differs from the
-# released one, which is worth knowing before blaming a diff on something
-# else.
+# Read at face value, that says cargo's feature unification carries
+# `preserve_order` into `core` on any workspace-wide build (`cargo test
+# --workspace`, or a bare `cargo build` at the root), changing the key order
+# of any JSON core builds through `Value` rather than through a derive. IT
+# DOES NOT, and this is the "measured rather than assumed" part: `tree-sitter`
+# needs `preserve_order` as a BUILD-dependency of its own code generation, and
+# cargo's resolver v2 keeps build-dependencies and proc-macros in a separate
+# "host artifact" feature resolution from the normal/target graph a linked
+# binary or library actually draws from - which is exactly why `cargo tree -e
+# normal,features,no-proc-macro` (excluding those two host-only edge kinds)
+# reads 0 on BOTH views above, not just the scoped one. Confirmed beyond that
+# filtered `cargo tree` reading, too: `cargo build --workspace -v`'s rustc
+# invocation for both the `g-mesh` bin and core's own lib/test targets under
+# `cargo test --workspace` link the identical compiled `serde_json` unit
+# (features `["alloc","default","std"]`, no `preserve_order`) that the
+# package-scoped, shipped build does; and a real `g-mesh mcp-shim`, spoken to
+# over its actual wire protocol, returns a byte-identical `tools/list`
+# response - every schema's property order included - built either way.
+#
+# So core's shipped JSON key order does not, today, differ from what `cargo
+# test --workspace` exercises, and `scripts/build-targets.sh`'s package-scoped
+# build (where tree-sitter is not in the graph at all) was never the reason -
+# the reason is resolver v2's host/target separation, which holds regardless
+# of build scope. `scripts/cut-release.sh`'s `check_core_feature_isolation`
+# (GM-302) is the standing check that this stays true, since nothing pins
+# that separation down the way a type system would - a future dependency that
+# pulls the same feature in as a NORMAL dependency of something core links
+# would flip it, and that function is written to catch exactly that (verified
+# by injecting precisely that change temporarily and watching it fail - see
+# GM-302's completion notes).
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 

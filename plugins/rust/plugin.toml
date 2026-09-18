@@ -31,7 +31,13 @@ protocol_version = 2
 # versions. GM-290 made them one value rather than two, by telling the plugin
 # which manifest core read (`daemon::manifest::MANIFEST_PATH_ENV`), so the
 # manifest is now the version that ships and a stale one ships stale.
-plugin_version = "3.4.0"
+# GM-303 wrote down the general rule this is one case of: a plugin that
+# joins the cargo workspace tracks the release version (transitively, via
+# its own crate's version); a plugin built by its own separate toolchain
+# (plugins/go, plugins/typescript) tracks its own manifest of record
+# instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
+# rules, not one".
+plugin_version = "3.5.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-rust"
@@ -74,6 +80,26 @@ engine = "rust-analyzer"
 # `SUPERTYPE_OF` edge - no `use` in that crate resolves structurally when the
 # trait arrives through a glob import, so nothing but this sweep finds it.
 implementation_kinds = ["trait"]
+
+# The default, stated out loud so the trace behind it has somewhere to live.
+# GM-310 asked whether this server could be told to answer without waiting, as
+# `plugins/python` now is, and the answer is a flat no. Traced against this
+# plugin's own conformance fixture (rust-analyzer 1.97.1, undisturbed run):
+#
+#   13 $/progress tokens between 313ms and 12334ms under 6 distinct names
+#   (`Fetching` begins three separate times), largest gap between them 182ms
+#   cross-crate `definition` on `describe`   CORRECT from 4427ms
+#   receiver call `square.area()`            EMPTY until 13431ms
+#   `implementation` on `Loud`               CORRECT from 12094ms
+#
+# The second and third lines are the whole argument against every cheaper
+# scheme. This server answers one question correctly nine seconds before it
+# can answer another, so no probe - however much ground truth it checks
+# against - can ask one thing and conclude anything about the rest. And the
+# 182ms gap is why the 2s settle is not slack: it is the margin that keeps a
+# gap between two start-up phases from being read as the end of them, which
+# is the bug GM-290 found twice.
+readiness = "indexed"
 
 # rust-analyzer's own settings, passed through verbatim as
 # `initializationOptions`. Exactly one is set, and the two that are

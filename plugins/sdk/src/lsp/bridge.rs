@@ -40,12 +40,47 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 ///   the same budget core grants a whole *file*, so one stuck site can cost
 ///   at most what one file was allowed. It exists for the site that makes a
 ///   server pathological, not for the normal case.
-/// - **`max_sites` (20,000).** A cap, not a target: at eight questions in
-///   flight and even 100ms of server work each, 20,000 sites is about four
-///   minutes, well inside the floor below. It is here so that a repository an
-///   order of magnitude larger than anything measured cannot turn one pass
-///   into an unbounded one - and hitting it reports the pass incomplete
-///   rather than pretending the rest were answered.
+/// - **`max_sites` (1,000,000).** A ceiling on how long a question *list* may
+///   get, and - since GM-319 - nothing else. It used to be justified as a
+///   stand-in for the clock ("at eight questions in flight and even 100ms of
+///   server work each, 20,000 sites is about four minutes"), which was right
+///   arithmetic about a number that the first real repositories exceeded.
+///   GM-314 counted what the plugins actually emit: Django 87,832 questions,
+///   tokio 27,750, **g-mesh itself 21,995** - three of four corpora over the
+///   old 20,000, so their passes were cut short, reported incomplete, and
+///   `language_state.semanticPassAt` was never set for them. A ceiling that a
+///   190-file repository walks through is not protecting against "an order of
+///   magnitude larger than anything measured".
+///
+///   What bounds a pass is the deadline below, and the reason the count does
+///   not need to help is `request`: no single question can hang past ten
+///   seconds, so the work between here and the deadline is bounded whatever
+///   the list's length. And unlike a count, the deadline *scales with the
+///   project* - `per_file × files` - which is what a large repository needs
+///   and what a constant can never express. Measured (GM-319, by driving a
+///   real rust-analyzer over g-mesh's own 190 files rather than assuming):
+///   20,000 questions in 182.5s cold at eight in flight, which is **73ms per
+///   request**, and 16-19ms on warm runs. 73 is what is sized against here,
+///   because sizing against the best case is how the previous ceiling was set.
+///   At 73ms, `per_file` (8s) buys about 877 questions per file, against the
+///   densest corpus measured at 116 (g-mesh; tokio is 35, Django 30). So the
+///   clock has roughly 7.6× headroom over the worst real density *at every
+///   project size*, and the ceiling's job is only to stop a pathological input
+///   from materialising an unbounded `Vec`.
+///
+///   One million is where that job is done and no further: 11.4× Django's
+///   list, 45× g-mesh's, and about 230MB - 144 bytes of `Question` each, which
+///   `the_site_ceiling_bounds_what_one_question_list_can_cost` pins, plus
+///   ~100 bytes of the strings it holds (2,210,074 bytes across g-mesh's
+///   21,995 sites, measured). Paid only by a project that genuinely has a
+///   million open sites, and whose index is already holding every one of them
+///   when the list is built. It still *moves* the cliff rather than removing
+///   it (a ~8,600-file repository at g-mesh's density would reach it), and
+///   that is deliberate: a pass cut short reports itself
+///   incomplete, which is the same honest, retryable answer a dead server or
+///   a spent deadline gets. See `docs/architecture/multi-language-plugins.md`,
+///   "Implementation notes (GM-319)", for why resuming was weighed and not
+///   built.
 /// - **`concurrency` (8).** Language servers answer requests concurrently, and
 ///   a single outstanding question spends most of a pass waiting for a
 ///   round trip rather than for an answer. Eight is enough to keep a warm
@@ -68,7 +103,8 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 pub struct Budgets {
     /// How long one `definition`/`implementation` request may take.
     pub request: Duration,
-    /// How many questions one pass may ask at all.
+    /// How long one pass's question list may get. A ceiling on the list, not
+    /// a budget for the work - see this type's doc.
     pub max_sites: usize,
     /// How many requests may be outstanding at once.
     pub concurrency: usize,
@@ -90,7 +126,7 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             request: Duration::from_secs(10),
-            max_sites: 20_000,
+            max_sites: 1_000_000,
             concurrency: 8,
             project_floor: Duration::from_secs(15 * 60),
             per_file: Duration::from_secs(8),
@@ -226,10 +262,63 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// per-file pass that follows every edit would spend two of its ninety
 /// seconds proving a point that was already settled.
 ///
+/// **And a manifest may say the shape instead of waiting to be shown it**
+/// (GM-310). `[plugin.semantic] readiness = "on-demand"` -
+/// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand) -
+/// starts the client with that latch already set, so the very first pass
+/// waits only for whatever is in flight now. It is not a shorter settle:
+/// [`Budgets::settle`] keeps its value and both of its other jobs, because
+/// those jobs want the opposite number. Traced, pyright answers a cross-file
+/// `definition` correctly 41-146ms *before* its own `$/progress` token
+/// begins, and that token begins 1.26-1.33s after `didOpen` - so the number
+/// that would make its start-up cheap is a number too small to keep GM-309's
+/// post-edit deferral honest on the same server. One shape key and one
+/// unchanged duration, rather than one duration asked to be two things.
+///
+/// What keeps the claim safe when it is *wrong* is everything this section
+/// already describes, still running. `sync_documents` marks the client edited
+/// after every `didOpen`, so when the first question of the first pass goes
+/// out the client has been quiet for milliseconds; `run_pass` defers every
+/// empty answer that arrives while the client has not been quiet for a full
+/// settle, and re-asks it only after a *continuous* settle of quiet - which a
+/// server that is genuinely indexing cannot hand out. An `on-demand` manifest
+/// in front of a rust-analyzer therefore produces the same edges it produces
+/// today, at the same moment, having spent one deferral per question instead
+/// of one wait per pass. `tests/lsp_bridge.rs`'s
+/// `an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
+/// is that case, and it is the test that fails if any of the above is removed.
+///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
 /// arrives before the server is quiet again is therefore re-asked once, after
 /// the quiet period returns, and only the second empty answer is believed.
+///
+/// **That rule only fires once the client has noticed the server is busy**
+/// (GM-309). `LspClient::settle` latches once per server, so from a server's
+/// second pass on `wait_ready` asks only "is anything in flight right now" -
+/// which a client whose server settled passes ago answers "yes, quiet" the
+/// instant a `didChange` is sent, because nothing has happened yet to make it
+/// otherwise. A server does not begin reporting progress for an edit the
+/// instant it receives one - measured for pyright at ~0.6s after `didOpen`
+/// (the design doc's "Readiness, measured, and deliberately not changed") -
+/// and an empty answer inside that gap was, before GM-309, indistinguishable
+/// from a real "no target": `run_pass`'s own deferral test reads
+/// `client.quiet_for(budgets.settle)`, and a quiet period that has already
+/// run for minutes clears it trivially. `LspClient::mark_edited`, called from
+/// `sync_documents` right after each `didOpen`/`didChange`, is the fix: it
+/// resets how long the client has been quiet *for the purposes of that
+/// judgement* whenever the client was not already known to be busy, so the
+/// deferral rule above covers the gap before progress begins and not only
+/// the progress itself. It does not resurrect a per-pass settle - `wait_ready`
+/// still asks only `quiet_for(Duration::ZERO)` once settled, and answers that
+/// question truthfully however recently `mark_edited` ran - it only changes
+/// what a *specific* empty answer, arriving in the narrow window right after
+/// an edit, is measured against. `tests/lsp_bridge.rs`'s
+/// `a_didchange_race_is_not_recorded_as_no_target` forces the window with a
+/// server scripted to answer nothing truthful until a real delay after
+/// `didChange` has passed, and fails without this reset: the early `null`
+/// is recorded as final in under two milliseconds, retracting the very edge
+/// pass one had just found.
 ///
 /// # Retraction (decision 5)
 ///
@@ -418,6 +507,9 @@ impl LspBridge {
                             "contentChanges": [{ "text": entry.source }],
                         }),
                     );
+                    // GM-309: the server has not necessarily reacted to this
+                    // edit yet - see `LspClient::mark_edited`.
+                    client.mark_edited();
                     opened.insert(path.clone(), OpenDocument { version, text_hash: hash });
                 }
                 None => {
@@ -432,6 +524,10 @@ impl LspBridge {
                             }
                         }),
                     );
+                    // Same reasoning as `didChange` above: a file this server
+                    // has never seen is at least as likely to start it
+                    // reanalysing as an edit to one it already had open.
+                    client.mark_edited();
                     opened.insert(path.clone(), OpenDocument { version: 1, text_hash: hash });
                 }
             }
@@ -537,47 +633,84 @@ struct Questions {
     /// and a pass that stays permanently "incomplete" for a reason no retry
     /// can change would keep a language owed a pass forever.
     unanswerable: usize,
-    /// Whether the site budget cut the list short.
+    /// Whether [`Budgets::max_sites`] cut the list short - which, per that
+    /// field's doc, now means the project is past a ceiling no measured
+    /// corpus comes near rather than merely large.
     truncated: bool,
 }
 
-/// Builds the question list for `scope`.
+/// Builds the question list for `scope`, in scope order, stopping at the last
+/// **whole file** that fits under [`Budgets::max_sites`].
+///
+/// The file boundary is load-bearing and was not here before GM-319. A cut
+/// taken mid-file leaves that file with some of its questions asked and the
+/// rest silently dropped - and `run_pass` then reports it in `covered`,
+/// because every question it *did* hold was sent and answered. `retract_stale`
+/// reads `covered` as "this pass is the whole truth about that file now" and
+/// withdraws every edge an earlier pass emitted for a site this one never
+/// reached. Correct edges deleted to make room for questions nobody asked, in
+/// other words, which is the one direction `LspBridge`'s retraction rules
+/// exist to forbid. Cutting between files makes the hazard unreachable rather
+/// than unlikely: a file is either asked about completely or not named at all,
+/// and a file not named is not covered, so its earlier answers stand.
+///
+/// One file may exceed the ceiling on its own - a generated file, a giant
+/// table - and is taken anyway when it is the first with anything to ask.
+/// The alternative is a pass that asks nothing about it forever, and the
+/// deadline still bounds the work either way; an overrun of one file is the
+/// smaller of the two failures, and the only one that cannot cost an edge.
+/// A `max_sites` of zero is the exception to the exception, and stays a way
+/// to ask nothing at all.
+///
+/// `unanswerable` counts only the files that were admitted, for the same
+/// reason: a file the ceiling never reached has not had its sites *skipped*,
+/// and reporting them in that log line would describe work this pass declined
+/// to consider as work it looked at and turned down.
 fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budgets: &Budgets) -> Questions {
-    let mut asking = Vec::new();
+    let mut asking: Vec<Question> = Vec::new();
     let mut unanswerable = 0usize;
+    let mut truncated = false;
     for path in scope {
         let Some(entry) = index.entry(path) else { continue };
+        let mut for_file = Vec::new();
+        let mut skipped = 0usize;
         for site in &entry.graph.open_sites {
             if site.kind == OpenSiteKind::Implementation {
-                unanswerable += 1;
+                skipped += 1;
                 continue;
             }
-            asking.push(Question {
+            for_file.push(Question {
                 file: path.clone(),
                 position: site.position,
                 ask: Ask::Definition(site.clone()),
             });
         }
-        if config.implementation_kinds.is_empty() {
-            continue;
-        }
-        for node in &entry.graph.nodes {
-            let implementable = node
-                .native_kind
-                .as_deref()
-                .is_some_and(|kind| config.implementation_kinds.iter().any(|want| want == kind));
-            if !implementable {
-                continue;
+        if !config.implementation_kinds.is_empty() {
+            for node in &entry.graph.nodes {
+                let implementable = node
+                    .native_kind
+                    .as_deref()
+                    .is_some_and(|kind| config.implementation_kinds.iter().any(|want| want == kind));
+                if !implementable {
+                    continue;
+                }
+                for_file.push(Question {
+                    file: path.clone(),
+                    position: name_position(&entry.source, node),
+                    ask: Ask::Implementation { anchor: node.id.clone() },
+                });
             }
-            asking.push(Question {
-                file: path.clone(),
-                position: name_position(&entry.source, node),
-                ask: Ask::Implementation { anchor: node.id.clone() },
-            });
         }
+        // Room for all of it, or nothing asked yet and a ceiling that is not
+        // simply zero - the one case a file is admitted over the ceiling.
+        let fits = asking.len() + for_file.len() <= budgets.max_sites;
+        if !fits && !(asking.is_empty() && budgets.max_sites > 0) {
+            truncated = true;
+            break;
+        }
+        unanswerable += skipped;
+        asking.append(&mut for_file);
     }
-    let truncated = asking.len() > budgets.max_sites;
-    asking.truncate(budgets.max_sites);
     Questions { asking, unanswerable, truncated }
 }
 
@@ -1189,6 +1322,16 @@ impl SemanticEngine for LspBridge {
             );
         }
         if plan.asking.is_empty() {
+            if plan.truncated {
+                // An empty list the ceiling produced, not one the scope did:
+                // `max_sites` is zero, so not one file was admitted. Nothing
+                // was asked, so nothing is covered - and in particular nothing
+                // may be retracted, which is what this branch used to do to
+                // every file in scope on the strength of a list it had refused
+                // to build (GM-319). An unasked site is not a site that went
+                // away.
+                return Ok(SemanticAnswer::incomplete(FileChangeDiff::default()));
+            }
             // Nothing to ask means nothing to start a compiler for. The files
             // in scope are still *covered*, so an earlier pass's answers about
             // sites that have since gone away are retracted.
@@ -1199,10 +1342,7 @@ impl SemanticEngine for LspBridge {
                 self.emitted.insert(file.clone(), Vec::new());
             }
             let (diff, _) = answers.finish();
-            // `truncated` with nothing to ask means the site budget is zero,
-            // which is a pass that covered nothing however empty its question
-            // list looks.
-            return Ok(SemanticAnswer { diff, complete: !plan.truncated });
+            return Ok(SemanticAnswer::complete(diff));
         }
 
         let language = self.language.clone();
@@ -1318,6 +1458,63 @@ mod tests {
         };
         builder.add_node(NodeSpec::new(NodeKind::Type, name, name, range).native_kind("trait"));
         builder.finish().nodes.remove(0)
+    }
+
+    /// **GM-319.** The ceiling has to clear the question list every corpus
+    /// anyone has actually counted, because a corpus over it is a project
+    /// whose whole-project pass can never be recorded as finished - the diff
+    /// is committed, `core::watcher::apply::apply_semantic_pass` fails the
+    /// pass, `language_state.semanticPassAt` stays unset, the language's
+    /// receiver-call gap is listed in every session's MCP instructions, and
+    /// the whole pass is repeated on every daemon start.
+    ///
+    /// The numbers are GM-314's census, re-counted for g-mesh by GM-319. They
+    /// are written down here rather than left in a document because this is
+    /// the assertion that would have caught the defect: at the previous
+    /// 20,000 it fails on three of the four.
+    #[test]
+    fn the_site_ceiling_clears_every_corpus_that_has_been_counted() {
+        // corpus, questions the plugins build for it (GM-314 / GM-319).
+        let measured = [
+            ("django/django", 87_832usize),
+            ("tokio-rs/tokio", 27_750),
+            ("g-mesh itself", 21_995),
+            ("pallets/flask", 1_825),
+        ];
+        let ceiling = Budgets::default().max_sites;
+        for (corpus, questions) in measured {
+            assert!(
+                ceiling >= questions,
+                "{corpus} builds {questions} questions and the ceiling is {ceiling}: its pass \
+                 would be cut short and never recorded as complete"
+            );
+        }
+        let largest = measured.iter().map(|(_, n)| *n).max().unwrap();
+        assert!(
+            ceiling >= largest * 4,
+            "and with room to spare - the largest corpus measured is {largest}, and a ceiling \
+             sized to exactly what has been seen is one the next repository walks through"
+        );
+    }
+
+    /// What the ceiling costs if a project ever reaches it, so the figure this
+    /// type's doc quotes is checked rather than asserted.
+    ///
+    /// The list is a second copy of open sites the index already holds, so
+    /// the number that matters is the marginal one; it is bounded here at the
+    /// order of magnitude, not to the byte, because `Question`'s layout is
+    /// the compiler's business and a test that pinned it exactly would fail
+    /// on a field reordering that costs nothing.
+    #[test]
+    fn the_site_ceiling_bounds_what_one_question_list_can_cost() {
+        let per_question = std::mem::size_of::<Question>();
+        let worst = Budgets::default().max_sites.saturating_mul(per_question);
+        assert!(
+            worst <= 512 * 1024 * 1024,
+            "a full question list is {} bytes of `Question` ({per_question} each) - past the \
+             point where the ceiling is protecting anything",
+            worst
+        );
     }
 
     /// A request has to land on the identifier, not on the keyword the

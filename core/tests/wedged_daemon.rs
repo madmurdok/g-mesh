@@ -47,16 +47,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use g_mesh::cli::status::{self, CoreState};
 use g_mesh::daemon::{self, DaemonLock};
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-/// Deadline for anything these tests wait on - a hang guard, not a timing
-/// assertion.
-const TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Project {
     dir: tempfile::TempDir,
@@ -189,15 +188,11 @@ fn read_pid(path: &Path) -> u32 {
         .expect("pid file does not contain a pid")
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: delegates to [`common::wait_for`] with [`common::startup_timeout`]
+/// instead of this file's old fixed 20s deadline - part of the same family of
+/// flakes as `cli_stop.rs`, seen failing under load in this same session.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// `status` used to answer "not running" here, because it reads `daemon.pid`

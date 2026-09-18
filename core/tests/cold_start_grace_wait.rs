@@ -58,9 +58,18 @@ mod common;
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Generous next to the shim's own bootstrap budget: nothing in this file
-/// depends on the socket bind timing task 105's suite exercises, so this
-/// only needs to be long enough that it is never itself the bottleneck.
-const BOOTSTRAP_BUDGET: Duration = Duration::from_millis(2_000);
+/// depends on the socket bind timing task 105's suite exercises, so this only
+/// needs to be long enough that it is never itself the bottleneck.
+///
+/// GM-301: a fixed 2s was tight enough to *become* the bottleneck under real
+/// contention on the machine (spawning a process and getting it scheduled to
+/// bind is not free - see `serving_while_indexing.rs`'s header, which
+/// documents the same failure for the same reason). Since nothing here
+/// depends on this being short, it borrows the whole suite's shared,
+/// load-adaptive budget instead of guessing its own fixed number.
+fn bootstrap_budget() -> Duration {
+    common::startup_timeout()
+}
 
 /// How long the grace-window test leaves its call waiting before releasing the
 /// walk. Only the *test* sleeps here, and only between dispatching a call and
@@ -183,7 +192,7 @@ async fn connect_holding(
             .arg("mcp-shim")
             .current_dir(&root)
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
-            .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", BOOTSTRAP_BUDGET.as_millis().to_string())
+            .env("G_MESH_BOOTSTRAP_TIMEOUT_MS", bootstrap_budget().as_millis().to_string())
             .env(WALK_DELAY_ENV, hold_the_walk_open.as_millis().to_string())
             .env(
                 g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV,

@@ -52,15 +52,26 @@
 //! (default 1h plugin idle timeout) it is a flat 30s, and in a test that
 //! shortens the idle timeout it scales down with it.
 //!
-//! **Open question, deliberately not solved here**: a plugin that spikes past
-//! `memoryLimitMb` and is put back to sleep by something else (an idle
-//! timeout, a crash) before the next 30-second tick ever samples it is a
-//! spike this mechanism never sees. Nothing about `memoryLimitMb`'s design
-//! promises otherwise - the architecture doc's own "Memory on large repos"
-//! failure mode frames this as a ceiling on *sustained* growth (a cold
-//! `rust-analyzer`/`go/packages` load that keeps climbing), not a guard
-//! against a transient spike - but a tighter sampling interval, or sampling
-//! on some other trigger entirely, is future work this task does not take on.
+//! A plugin that spikes past `memoryLimitMb` and is put back to sleep by
+//! something else (an idle timeout, a crash) before the next 30-second tick
+//! ever samples it is a spike this mechanism never sees, and that is by
+//! design rather than by omission: `memoryLimitMb` is a **circuit breaker on
+//! a sustained overage**, not a ceiling. GM-304 settled that question and the
+//! architecture doc's "Plugin memory limit" section carries the argument;
+//! [`PluginSupervisor::check_memory_limit`]'s own doc comment carries the
+//! consequence, which is that it confirms an over-limit reading with a second
+//! sample before suspending anything.
+//!
+//! What GM-274 filed as an open question about the *interval* turned out not
+//! to be about the interval at all. GM-291 measured the thing being caught: a
+//! real `rust-analyzer`'s RSS ramps to a plateau of 563-580MB and holds there
+//! indefinitely, never given back. Any interval shorter than "forever"
+//! observes that, including the production 30s. What actually bounds how soon
+//! suspension happens is when `check_memory_limit` can acquire
+//! [`PluginSupervisor::inner`], which `semantic_pass` holds for a whole
+//! synchronous round trip - and, counter-intuitively, that blocking is what
+//! makes the breaker fire *promptly* on a language's first cold pass rather
+//! than what stops it. See the architecture doc's GM-304 notes.
 
 use std::collections::HashSet;
 use std::fs;
@@ -697,6 +708,45 @@ impl PluginSupervisor {
     ///   this tick is a no-op - logged once per supervisor, not once per
     ///   tick, via `sampling_unavailable_logged`.
     /// - Measured, but not over the limit: nothing to do.
+    /// - Measured over the limit **once**: still nothing to do yet. A second,
+    ///   confirming sample is taken, and the language is suspended only if
+    ///   that one is over the limit too - see "Why a confirming sample"
+    ///   below.
+    ///
+    /// # Why a confirming sample (GM-304, GM-307)
+    ///
+    /// `memoryLimitMb` is a **circuit breaker**, not a ceiling: the plugin is
+    /// allowed to cross the limit once and is then suspended so it cannot go
+    /// on doing so (the architecture doc's "Plugin memory limit" section
+    /// argues why a sampler cannot be anything else). What that decision
+    /// makes enforceable is a *sustained* overage, and a single aggregate
+    /// sample is not evidence of one.
+    ///
+    /// The reason is `daemon::memory`'s, not a general worry about noise: a
+    /// process tree's membership is not stable. A `rust-analyzer` shells out
+    /// to `rustc` and to build scripts; a `tsserver` forks on a project
+    /// reload. Each is a genuine member of the tree while it lives, and each
+    /// leaves again. GM-307 measured a tree fall 170MB between two snapshots
+    /// milliseconds apart for exactly that reason, with nothing having grown
+    /// or shrunk at all. So one over-limit aggregate says only "at this
+    /// instant the tree included enough processes to cross the limit", which
+    /// is the *transient spike* GM-274's decision 3 explicitly says this
+    /// mechanism does not exist to catch.
+    ///
+    /// The confirming sample is asked for only on the path that is about to
+    /// act, and the asymmetry is deliberate: suspension is irreversible for
+    /// this daemon's life (see the `semantic_suspended` field), while
+    /// *declining* to suspend costs at most one tick, because what the
+    /// breaker exists to catch is by measurement a plateau that is never
+    /// given back (GM-291's implementation notes: flat for 19+ seconds and
+    /// counting, at 563-580MB). An irreversible decision is worth confirming;
+    /// a reversible one self-corrects on the next tick for free.
+    ///
+    /// Nothing sleeps between the two samples - each
+    /// `sysinfo::refresh_processes` is a whole-system scan that costs about
+    /// 0.4s on its own (GM-291's measured `check_memory_limit` duration), so
+    /// the gap is real without this method holding `inner` any longer than
+    /// the work itself takes.
     ///
     /// Only past every one of those does this actually put the plugin to
     /// sleep - through the same [`put_to_sleep`](Self::put_to_sleep) tail
@@ -712,32 +762,74 @@ impl PluginSupervisor {
     /// on how every other runtime fact it reports is read the same way, off
     /// disk).
     pub fn check_memory_limit(&self) {
+        self.check_memory_limit_sampled_by(crate::daemon::memory::process_tree_rss_mb);
+    }
+
+    /// [`check_memory_limit`](Self::check_memory_limit)'s whole body, with the
+    /// sampler as a parameter so this module's own tests can drive the one
+    /// thing a real sampler cannot be asked to produce on demand: a specific
+    /// *sequence* of readings. The public method above is the only non-test
+    /// caller and always passes `daemon::memory::process_tree_rss_mb`.
+    ///
+    /// A seam rather than a mock of the whole check: everything that decides
+    /// anything - the early-outs, the confirming sample, the suspension and
+    /// its marker - is this function, exercised for real by every test below
+    /// and by production alike. Only the number comes from elsewhere.
+    fn check_memory_limit_sampled_by(&self, sample: impl Fn(u32) -> Option<u64>) {
         let Some(limit_mb) = self.memory_limit_mb else { return };
         let mut inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return };
         let pid = process.pid();
 
-        let Some(measured_mb) = crate::daemon::memory::process_tree_rss_mb(pid) else {
-            if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
-                eprintln!(
-                    "g-mesh daemon: could not sample the {} plugin's process-tree memory \
-                     (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
-                     sample succeeds; logged once",
-                    self.manifest.language
-                );
-            }
+        let Some(measured_mb) = sample(pid) else {
+            self.log_sampling_unavailable_once(pid);
             return;
         };
         if measured_mb <= limit_mb {
             return;
         }
 
+        // One over-limit reading is one instant, and an instant can hold a
+        // transient member of the tree that is gone again by the next scan -
+        // see this method's "Why a confirming sample" section. Suspension is
+        // irreversible, so it waits for a second reading that agrees.
+        let Some(confirmed_mb) = sample(pid) else {
+            self.log_sampling_unavailable_once(pid);
+            return;
+        };
+        if confirmed_mb <= limit_mb {
+            eprintln!(
+                "g-mesh daemon: the {} plugin's process tree read {measured_mb}MB against a \
+                 memoryLimitMb of {limit_mb}MB, but a confirming sample read {confirmed_mb}MB - \
+                 treating that as a transient member of the tree rather than a sustained overage, \
+                 and leaving the plugin running",
+                self.manifest.language
+            );
+            return;
+        }
+
         let process = inner.process.take().expect("checked Some above");
         self.semantic_suspended.store(true, Ordering::SeqCst);
-        let reason =
-            format!("memoryLimitMb {limit_mb}MB exceeded - measured {measured_mb}MB across its process tree");
+        let reason = format!(
+            "memoryLimitMb {limit_mb}MB exceeded - measured {measured_mb}MB across its process \
+             tree and confirmed at {confirmed_mb}MB by a second sample"
+        );
         self.write_suspended_marker(&reason);
         self.put_to_sleep(process, &reason);
+    }
+
+    /// The "no evidence either way" log, emitted once per supervisor rather
+    /// than once per idle-check tick for the rest of this daemon's life - see
+    /// the `sampling_unavailable_logged` field's own doc comment.
+    fn log_sampling_unavailable_once(&self, pid: u32) {
+        if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
+            eprintln!(
+                "g-mesh daemon: could not sample the {} plugin's process-tree memory \
+                 (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
+                 sample succeeds; logged once",
+                self.manifest.language
+            );
+        }
     }
 
     /// Where this language's suspension marker lives - decision 6's "smallest
@@ -1438,6 +1530,124 @@ mod tests {
             !supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip"),
             "a suspended language's whole-project semantic pass must not run either"
         );
+
+        supervisor.sleep_now("test cleanup");
+    }
+
+    /// A sampler that hands out a scripted sequence of readings and counts how
+    /// many were asked for - the one thing a real
+    /// `daemon::memory::process_tree_rss_mb` cannot be made to do, and the
+    /// whole reason `check_memory_limit_sampled_by` takes its sampler as a
+    /// parameter. Past the end of the script it keeps answering the last
+    /// reading, so a test that scripts fewer readings than are taken fails on
+    /// the call count rather than on a panic from somewhere unrelated.
+    fn scripted_sampler(readings: Vec<Option<u64>>) -> (impl Fn(u32) -> Option<u64>, Arc<AtomicUsize>) {
+        assert!(!readings.is_empty(), "a scripted sampler needs at least one reading");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let sampler = move |_pid: u32| {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            readings[index.min(readings.len() - 1)]
+        };
+        (sampler, calls)
+    }
+
+    /// A supervisor over the cheapest real plugin fixture there is - this
+    /// module's plain `install`, not the 200MB `install_memory_hungry` - since
+    /// the three tests below script their own readings and so have no use for
+    /// a process that is genuinely large. Returns the temp dirs too: dropped
+    /// early, the pid-file writes fail.
+    fn supervisor_with_limit(
+        limit_mb: Option<u64>,
+    ) -> (Arc<PluginSupervisor>, tempfile::TempDir, tempfile::TempDir) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let plugin_dir = test_plugin::install(plugins.path(), "scripted", &[".scripted-src"]);
+        let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+        let supervisor = PluginSupervisor::start(
+            project.path(),
+            manifest,
+            plugins.path().join("plugin.pid"),
+            None,
+            limit_mb,
+            Arc::new(EmbeddingPipeline::disabled()),
+        )
+        .expect("the fixture plugin must start");
+        (supervisor, project, plugins)
+    }
+
+    /// GM-304/GM-307's own acceptance criterion, and the discriminating half
+    /// of it: one over-limit reading is one instant, and an instant can hold a
+    /// `rustc` or a build script that is gone again by the next scan. A
+    /// reading that is not confirmed must leave the plugin exactly as it was -
+    /// awake, unsuspended, no marker on disk - because suspension is
+    /// irreversible for this daemon's life while declining to suspend costs
+    /// one tick.
+    ///
+    /// Paired with the test below, which scripts the same first reading and a
+    /// *confirming* second one: the two differ in nothing but that second
+    /// number, so between them they show the confirmation is what decides,
+    /// not the limit or the fixture.
+    #[test]
+    fn an_unconfirmed_over_limit_sample_leaves_the_plugin_running() {
+        let (supervisor, _project, _plugins) = supervisor_with_limit(Some(100));
+        let pid_before = supervisor.pid().expect("a freshly started plugin is awake");
+
+        let (sampler, calls) = scripted_sampler(vec![Some(500), Some(40)]);
+        supervisor.check_memory_limit_sampled_by(sampler);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "an over-limit reading must be confirmed, not acted on");
+        assert_eq!(
+            supervisor.pid(),
+            Some(pid_before),
+            "a transient over-limit instant must not put the plugin to sleep"
+        );
+        assert!(!supervisor.is_semantic_suspended(), "nor suspend its language");
+        assert!(
+            !supervisor.suspended_marker_path().exists(),
+            "nor leave a suspension marker g-mesh status would report"
+        );
+
+        supervisor.sleep_now("test cleanup");
+    }
+
+    /// The other arm: the same first reading, confirmed. Everything GM-274's
+    /// own acceptance test asserts still happens - asleep, suspended, marker
+    /// written - and the reason names both readings, so whoever reads
+    /// `g-mesh status` can see the evidence the decision was made on rather
+    /// than one number.
+    #[test]
+    fn a_confirmed_over_limit_sample_suspends_the_language() {
+        let (supervisor, _project, _plugins) = supervisor_with_limit(Some(100));
+        assert!(supervisor.pid().is_some(), "a freshly started plugin is awake");
+
+        let (sampler, calls) = scripted_sampler(vec![Some(500), Some(480)]);
+        supervisor.check_memory_limit_sampled_by(sampler);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly the reading and its confirmation");
+        assert_eq!(supervisor.pid(), None, "a confirmed overage must put the plugin to sleep");
+        assert!(supervisor.is_semantic_suspended(), "and suspend its language");
+        let marker = std::fs::read_to_string(supervisor.suspended_marker_path())
+            .expect("a suspended language must leave a marker for g-mesh status");
+        assert!(marker.contains("500MB"), "the marker must name the reading: {marker}");
+        assert!(marker.contains("480MB"), "and the confirming sample beside it: {marker}");
+    }
+
+    /// The common case costs exactly one scan, not two: a tree under its limit
+    /// is the reading every tick takes for every configured language for the
+    /// whole life of a healthy daemon, and `sysinfo::refresh_processes` is a
+    /// whole-system walk. The confirming sample is only ever paid for on the
+    /// path that is about to suspend something.
+    #[test]
+    fn a_reading_under_the_limit_costs_a_single_sample() {
+        let (supervisor, _project, _plugins) = supervisor_with_limit(Some(100));
+
+        let (sampler, calls) = scripted_sampler(vec![Some(40), Some(500)]);
+        supervisor.check_memory_limit_sampled_by(sampler);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "an under-limit reading is the end of the tick");
+        assert!(supervisor.pid().is_some(), "and the plugin is left running");
+        assert!(!supervisor.is_semantic_suspended());
 
         supervisor.sleep_now("test cleanup");
     }

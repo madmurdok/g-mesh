@@ -474,6 +474,7 @@ fn set_python_path(config: &mut SemanticConfig, python: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use g_mesh_plugin_sdk::lsp::ServerReadiness;
 
     /// A path names one binary and is never searched around - see
     /// [`candidates`]' doc and GM-290's own rule.
@@ -721,6 +722,13 @@ mod tests {
             config.settings.get("python"),
             Some(&serde_json::json!({ "analysis": { "typeCheckingMode": "basic" } })),
             "the one channel pyright does read"
+        );
+        assert_eq!(
+            config.readiness,
+            ServerReadiness::OnDemand,
+            "pyright answers a cross-file definition 41-146ms before its own $/progress token \
+             begins - traced three times, see plugin.toml and the design doc's GM-310 notes. \
+             This is the key that takes the whole-project pass from 3.339s to 2.285s"
         );
     }
 

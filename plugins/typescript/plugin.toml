@@ -16,6 +16,18 @@
 [plugin]
 language = "typescript"
 protocol_version = 2
+# This plugin's OWN semver, not g-mesh's release version - GM-303 wrote down
+# why (docs/architecture/plugin-modularity.md, "plugin_version: two rules,
+# not one"): this directory is a separate npm package, not a member of the
+# cargo workspace the release version is cut from, so it is bumped by hand
+# for its own capability changes - 2.1.0 for becoming a self-contained Node
+# SEA, 2.2.0 for the --run-node entry path (see `git log` on this file and on
+# package.json) - and must equal package.json's `.version`, which the
+# handshake follows via scripts/generate-version.js. Two tests hold that
+# agreement: `every_declaration_of_the_bundled_plugins_version_agrees` and
+# `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`,
+# both in core/src/daemon/manifest.rs. scripts/cut-release.sh re-checks it
+# directly at release time too, since neither test runs under --skip-tests.
 plugin_version = "2.2.0"
 
 [plugin.spawn]

@@ -94,12 +94,15 @@ impl Bodies<'_, '_> {
     pub(crate) fn visit(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         match node.kind() {
             // Handled by the declaration pass, or deliberately not read.
-            "use_declaration"
-            | "extern_crate_declaration"
-            | "line_comment"
-            | "block_comment"
-            | "attribute_item"
-            | "inner_attribute_item" => {}
+            "use_declaration" | "extern_crate_declaration" | "line_comment" | "block_comment" => {}
+            "attribute_item" | "inner_attribute_item" => {
+                // Production: nothing. The census (GM-314) resolves the names
+                // written here without emitting anything, to measure the
+                // shape `#[derive(Serialize)]` would add if attributes ever
+                // became open sites.
+                #[cfg(test)]
+                self.census_attribute(node, module, block);
+            }
             // Decision 5: a `macro_rules!` body is token trees, not code. It
             // is not parsed, and the items it expands to are a documented
             // structural gap.
@@ -157,6 +160,64 @@ impl Bodies<'_, '_> {
                 self.path_use(node, module, block, from, Some(NodeKind::Type), EdgeKind::References)
             }
             _ => self.visit_children(node, module, block, from),
+        }
+    }
+
+    /// GM-314, test-only: resolve every name written inside an attribute
+    /// without emitting anything, so the census can count what
+    /// `#[derive(Serialize)]`-shaped sites would cost. The attribute's own
+    /// macro path is [`Ctx::AttrHead`](crate::census::Ctx::AttrHead); names in
+    /// its token tree are [`Ctx::AttrArg`](crate::census::Ctx::AttrArg).
+    #[cfg(test)]
+    fn census_attribute(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {
+        let Some(attribute) = (0..node.named_child_count())
+            .filter_map(|index| node.named_child(index))
+            .find(|child| child.kind() == "attribute")
+        else {
+            return;
+        };
+        let token_tree = attribute.child_by_field_name("arguments");
+        // The attribute's own head name, which decides whether its arguments
+        // are symbols (`derive`), predicates (`cfg`), or something else.
+        let head_name = (0..attribute.named_child_count())
+            .filter_map(|index| attribute.named_child(index))
+            .find(|child| Some(*child) != token_tree)
+            .map(|child| text(child, self.source).rsplit("::").next().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        let arg_ctx = match head_name.as_str() {
+            "derive" => crate::census::Ctx::AttrDeriveArg,
+            "cfg" | "cfg_attr" => crate::census::Ctx::AttrCfgArg,
+            _ => crate::census::Ctx::AttrOtherArg,
+        };
+        let mut cursor = attribute.walk();
+        for child in attribute.named_children(&mut cursor) {
+            let head = Some(child) != token_tree;
+            crate::census::push_ctx(if head { crate::census::Ctx::AttrHead } else { arg_ctx });
+            self.census_names(child, module, block);
+            crate::census::pop_ctx();
+        }
+    }
+
+    /// Every `identifier`/`type_identifier`/`scoped_identifier` under `node`,
+    /// resolved for its census side effect and otherwise discarded.
+    #[cfg(test)]
+    fn census_names(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {
+        match node.kind() {
+            "identifier" | "type_identifier" => {
+                let _ = self.resolve_bare(text(node, self.source), module, block, Some(NodeKind::Type));
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(segments) = flatten_path(node, self.source) {
+                    let _ = self.resolve_path(&segments, module, block, Some(NodeKind::Type));
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                for child in children {
+                    self.census_names(child, module, block);
+                }
+            }
         }
     }
 
@@ -503,6 +564,8 @@ impl Bodies<'_, '_> {
         want: Option<NodeKind>,
     ) -> Bound {
         if self.scopes.binds(name) {
+            #[cfg(test)]
+            crate::census::record(crate::census::Reason::BareLocal, name, &module.key);
             return Bound::Nothing;
         }
         // `Self` in type position is the impl's own type; as a path root it
@@ -512,10 +575,18 @@ impl Bodies<'_, '_> {
                 (Some(block), Some(NodeKind::Type)) => {
                     match self.model.lookup_name(&module.key, &block.self_type, Some(NodeKind::Type)) {
                         Some(decl) => Bound::Here(decl.id.clone()),
-                        None => Bound::Nothing,
+                        None => {
+                            #[cfg(test)]
+                            crate::census::record(crate::census::Reason::BareSelf, name, &module.key);
+                            Bound::Nothing
+                        }
                     }
                 }
-                _ => Bound::Nothing,
+                _ => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::BareSelf, name, &module.key);
+                    Bound::Nothing
+                }
             };
         }
         if let Some(decl) = self.model.lookup_name(&module.key, name, want) {
@@ -526,14 +597,30 @@ impl Bodies<'_, '_> {
                 target: container_target(container, TargetKey::Name(name.clone()), &module.key),
                 name: name.clone(),
             },
-            Some(Import::External) => Bound::Nothing,
+            Some(Import::External) => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::BareExternalImport, name, &module.key);
+                Bound::Nothing
+            }
             // A type nothing here declares or imports is almost always from
             // another crate; a *call* to such a name came through a glob
             // import or the prelude, and only the semantic tier knows which.
             None => {
                 if want == Some(NodeKind::Function) {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::OpenUnresolvedCall, name, &module.key);
                     Bound::Open
                 } else {
+                    #[cfg(test)]
+                    crate::census::record(
+                        if want == Some(NodeKind::Type) {
+                            crate::census::Reason::BareUnknownType
+                        } else {
+                            crate::census::Reason::BareUnknownValue
+                        },
+                        name,
+                        &module.key,
+                    );
                     Bound::Nothing
                 }
             }
@@ -590,8 +677,16 @@ impl Bodies<'_, '_> {
                     name: tail.to_string(),
                 }
             }
-            PathTarget::ExternalCrate(_) => Bound::Nothing,
-            PathTarget::Unresolved => Bound::Open,
+            PathTarget::ExternalCrate(_) => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::DottedExternal, tail, &module.key);
+                Bound::Nothing
+            }
+            PathTarget::Unresolved => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::OpenUnresolvedPath, tail, &module.key);
+                Bound::Open
+            }
         }
     }
 
@@ -609,7 +704,11 @@ impl Bodies<'_, '_> {
         if type_name == "Self" {
             return match block {
                 Some(block) if prefix.is_empty() => self.self_member(block, member, module),
-                _ => Bound::Open,
+                _ => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::OpenUnresolvedPath, member, &module.key);
+                    Bound::Open
+                }
             };
         }
 
@@ -618,11 +717,17 @@ impl Bodies<'_, '_> {
                 // An associated function on a generic parameter - `T::new()`.
                 // Which type that is at each call site is exactly what a
                 // structural tier cannot know.
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::OpenUnresolvedPath, member, &module.key);
                 return Bound::Open;
             }
             match self.model.lookup_import(&module.key, type_name) {
                 Some(Import::Item { container, name }) => (container.clone(), name.clone()),
-                Some(Import::External) => return Bound::Nothing,
+                Some(Import::External) => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::DottedExternal, member, &module.key);
+                    return Bound::Nothing;
+                }
                 // Declared here, or reached through a glob import: the own
                 // module is the only address worth trying, and a wrong guess
                 // simply finds nothing.
@@ -631,8 +736,16 @@ impl Bodies<'_, '_> {
         } else {
             match resolve_module_path(prefix, module, self.model, self.project) {
                 PathTarget::Container(container) => (container, type_name.to_string()),
-                PathTarget::ExternalCrate(_) => return Bound::Nothing,
-                PathTarget::Unresolved => return Bound::Open,
+                PathTarget::ExternalCrate(_) => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::DottedExternal, member, &module.key);
+                    return Bound::Nothing;
+                }
+                PathTarget::Unresolved => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::OpenUnresolvedPath, member, &module.key);
+                    return Bound::Open;
+                }
             }
         };
 
@@ -774,7 +887,11 @@ impl Bodies<'_, '_> {
 
     fn supertype_to(&mut self, subtype: &str, supertype: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {
         let Some(segments) = flatten_path(supertype, self.source) else { return };
+        #[cfg(test)]
+        crate::census::push_ctx(crate::census::Ctx::Supertype);
         let bound = self.resolve_path(&segments, module, block, Some(NodeKind::Type));
+        #[cfg(test)]
+        crate::census::pop_ctx();
         let subtype = subtype.to_string();
         self.emit(bound, EdgeKind::SupertypeOf, &subtype, supertype, module, OpenSiteKind::Implementation);
     }

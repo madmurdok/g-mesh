@@ -5,11 +5,33 @@
 // each plugin's entry point relative to this same crate's manifest
 // directory, so the two stay in sync by construction.
 //
-// Best-effort, for both plugins: a workflow that never touches the
-// daemon<->plugin path (e.g. `cargo check` on a machine with no Node or Go
-// toolchain) should not be blocked on either being installed - the
-// plugin-spawning tests will fail with a clear "failed to spawn" error
-// instead, which is diagnosis enough.
+// Best-effort, for both plugins, deliberately - a warning, never a hard
+// `panic!`/`process::exit`, even when the build step is missing entirely
+// (no npm, no Go). The alternative - failing the build itself - was
+// considered and rejected: `cargo check`/`cargo build` are run constantly by
+// someone editing Rust who has never touched a plugin and has no reason to
+// have Node installed, and a workflow that never exercises the
+// daemon<->plugin path should not gain a new, unrelated toolchain
+// requirement just because this crate happens to also own two plugin
+// builds. A test that actually spawns a plugin genuinely cannot work
+// without it, so that failure is real; a plain `cargo check` failing for
+// the same reason would not be.
+//
+// What was not acceptable, and is what this file used to do, is leaving
+// that later test failure to explain itself. "The plugin-spawning tests
+// will fail with a clear error" was the original promise here, and it was
+// false in practice: `daemon::plugin`'s handshake read reports "plugin
+// closed its stdout before sending a handshake" when node can't find
+// dist/src/index.js, which names the symptom and nothing about npm, node,
+// or a build step at all. GM-291, GM-296, GM-299 and this release's own
+// verification pass each lost time to that message before finding this
+// file. Two things now close that gap instead of one: this build step's own
+// warning below names the missing `node_modules` and the exact fix
+// (`npm ci && npm run build` in plugins/typescript) whenever it can tell
+// that's the cause rather than a real `tsc` failure; and
+// `daemon::plugin::PluginState::spawn` checks the entry file exists before
+// ever spawning `node`, so the same missing build now fails at test time
+// with that same command named, not with a bare "closed its stdout".
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,12 +78,36 @@ fn build_ts_plugin(manifest_dir: &Path) {
 
     match Command::new(NPM).arg("run").arg("build").current_dir(&plugin_dir).status() {
         Ok(status) if status.success() => {}
+        // `npm run build` invokes `tsc` out of `node_modules/.bin`, which a
+        // fresh clone does not have until `npm ci` has populated it - that
+        // failure (exit status 127, "tsc: not found") is indistinguishable
+        // from a real break in the warning below unless `node_modules`
+        // itself is checked directly, which is why that check, not the exit
+        // status, decides which message prints. Naming the cause and the
+        // one-line fix here is the whole point of this diagnostic: four
+        // separate pieces of work (GM-291, GM-296, GM-299, this release's
+        // own verification) instead hit this as five `core` tests failing
+        // with "failed to spawn the JS/TS plugin: plugin closed its stdout
+        // before sending a handshake" - a symptom with no mention of npm at
+        // all - and each first suspected its own change before tracing it
+        // back here.
+        Ok(status) if !plugin_dir.join("node_modules").is_dir() => println!(
+            "cargo:warning=plugins/typescript/node_modules is missing, so `npm run build` in {} exited with \
+             {status} instead of building - the JS/TS plugin's dist/ was never produced. Run `npm ci && npm run \
+             build` in plugins/typescript; skipping this leaves dist/ missing and core's plugin-spawning tests \
+             will fail later with \"failed to spawn ... plugin closed its stdout before sending a handshake\", \
+             which does not name this as the cause",
+            plugin_dir.display()
+        ),
         Ok(status) => println!(
-            "cargo:warning=`{NPM} run build` in {} exited with {status} - the JS/TS plugin's dist/ may be stale",
+            "cargo:warning=`{NPM} run build` in {} exited with {status} - the JS/TS plugin's dist/ may be stale. \
+             `node_modules` is present, so this looks like a real build failure rather than a missing `npm ci`; \
+             run `npm run build` there directly to see tsc's own output",
             plugin_dir.display()
         ),
         Err(err) => println!(
-            "cargo:warning=failed to run `{NPM} run build` in {}: {err} - the JS/TS plugin's dist/ may be stale or missing",
+            "cargo:warning=failed to run `{NPM} run build` in {}: {err} - the JS/TS plugin's dist/ may be stale or \
+             missing (is npm on PATH? try `npm ci && npm run build` in plugins/typescript)",
             plugin_dir.display()
         ),
     }

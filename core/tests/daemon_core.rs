@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::ipc;
@@ -24,7 +24,6 @@ mod common;
 use common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Every tool the MVP promises, whatever order the router lists them in.
@@ -85,15 +84,10 @@ fn spawn_daemon(root: &Path) -> Child {
         .expect("failed to spawn the daemon")
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// Runs one MCP conversation over a fresh connection - `initialize`, the
@@ -111,10 +105,11 @@ fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
         let _ = tx.send(converse(stream, requests));
     });
 
-    match rx.recv_timeout(TIMEOUT) {
+    let timeout = common::startup_timeout();
+    match rx.recv_timeout(timeout) {
         Ok(Ok(responses)) => responses,
         Ok(Err(err)) => panic!("MCP session failed: {err}"),
-        Err(err) => panic!("MCP session did not finish within {TIMEOUT:?}: {err}"),
+        Err(err) => panic!("MCP session did not finish within {timeout:?}: {err}"),
     }
 }
 

@@ -298,6 +298,14 @@ export class SemanticServer {
   private stderrTail = "";
   private seq = 0;
   private exited: Error | null = null;
+  // Resolved only once the *OS process* is confirmed gone (the child's own
+  // "exit" event, not this class's logical `exited` flag - see the note on
+  // `waitForExit` below for why the two are not the same thing).
+  private processExited = false;
+  private resolveProcessExited!: () => void;
+  private readonly processExitedPromise = new Promise<void>((resolve) => {
+    this.resolveProcessExited = resolve;
+  });
 
   constructor(projectRoot: string, options: SemanticServerOptions) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -351,14 +359,20 @@ export class SemanticServer {
     });
 
     // Spawn itself failing (no such file, EACCES) surfaces here, not as a
-    // throw from spawn().
+    // throw from spawn(). Node does not guarantee an "exit" event follows a
+    // failed spawn on every platform, so this is also where `waitForExit`'s
+    // promise gets its one unconditional resolution - the fallback that keeps
+    // it from hanging forever when the child never really came into being.
     this.child.on("error", (err: Error) => {
       this.fail(new Error(`tsserver could not be started: ${err.message}`));
+      this.markProcessExited();
     });
 
     // A checker OOM lands here rather than taking this process with it -
     // which is the whole point of the subprocess. Everything in flight is
     // failed so the pass can degrade to "left unresolved" instead of hanging.
+    // This is also the only place the OS process is *actually* known to be
+    // gone (see `waitForExit`) - `dispose()` below only asks it to go.
     this.child.on("exit", (code, signal) => {
       const detail = this.stderrTail.trim();
       this.fail(
@@ -366,7 +380,14 @@ export class SemanticServer {
           `tsserver exited (code=${code}, signal=${signal})${detail === "" ? "" : `: ${detail}`}`,
         ),
       );
+      this.markProcessExited();
     });
+  }
+
+  private markProcessExited(): void {
+    if (this.processExited) return;
+    this.processExited = true;
+    this.resolveProcessExited();
   }
 
   /** False once the child has died or been disposed. The owner uses this to
@@ -441,12 +462,64 @@ export class SemanticServer {
     });
   }
 
-  /** Frees the child's whole footprint back to the OS - the reclaim path the
-   * in-process shape does not have. Idempotent. */
+  /**
+   * Frees the child's whole footprint back to the OS - the reclaim path the
+   * in-process shape does not have. Idempotent.
+   *
+   * **Asks, does not confirm.** `child.kill()` sends the signal and returns
+   * synchronously; the process only actually terminates on a later event-loop
+   * tick (measured: ~12ms on macOS between `kill()` returning and the child's
+   * own "exit" event, node20/darwin). `this.exited` therefore flips to
+   * "logically dead" here - callers must stop treating this instance as
+   * usable immediately, and `isAlive`/`fail()` need that synchronous
+   * guarantee - but the OS process is not yet reaped. A caller that needs the
+   * stronger guarantee ("the process is actually gone") wants `waitForExit()`
+   * below, not this method's return.
+   *
+   * Kept synchronous on purpose: this is also what the module's `process.on
+   * ("exit")` hook calls (`installExitHook`), and Node forbids async work in
+   * an "exit" handler - there is no event loop left to run it on. A
+   * synchronous fire-and-forget primitive is therefore the one shape this
+   * method can have; `waitForExit()` is the layer that adds confirmation for
+   * every *other* caller, which can afford to wait.
+   */
   dispose(): void {
     const alreadyDead = this.exited !== null;
+    // Re-ref right before asking it to die: the child is normally unref'd so
+    // an *idle* one never keeps this process's event loop alive (the class
+    // doc above), but a fully unref'd process handle can mean libuv never
+    // runs the loop iteration that reaps it and dispatches "exit" at all -
+    // measured directly: without this, `waitForExit()` below hung
+    // indefinitely in a test file where nothing else was scheduled on the
+    // loop afterward. The same ref/unref shape already used for an in-flight
+    // request's timeout timer, applied here for the same reason: while
+    // something is genuinely waiting on this child, the loop must not treat
+    // it as done with.
+    this.child.ref();
     this.child.kill();
     if (!alreadyDead) this.fail(new Error("tsserver was disposed"));
+  }
+
+  /**
+   * Resolves once the child's OS process has actually terminated - the "exit"
+   * event, not `dispose()` returning. Already resolved if that has already
+   * happened (including for a child that never started at all).
+   *
+   * This exists because of a real bug it fixes (GM-321): every caller used to
+   * treat `dispose()` returning as "the child is gone" and act on that
+   * immediately - most visibly `SemanticProject.stop()`'s test callers, which
+   * `fs.rm()` the child's own `cwd` right after. POSIX tolerates unlinking a
+   * directory a process still has open; Windows does not
+   * (`EBUSY: resource busy or locked, rmdir ...`), which is what made the race
+   * visible at all - the plugin's JS/TS suite ran on Windows CI for the first
+   * time on 2026-09-18 and turned it up as 16 failures, all in this shape.
+   * The same family as GM-320 (g-mesh's own daemon surviving a SIGTERM its
+   * caller believed had already taken effect): a termination request was
+   * being treated as a completed termination. `waitForExit()` is the fix -
+   * confirm before moving on, rather than assume.
+   */
+  waitForExit(): Promise<void> {
+    return this.processExitedPromise;
   }
 }
 
@@ -470,8 +543,11 @@ export interface SemanticProjectOptions {
  * query and, like core's own handling of a dead plugin, is replaced lazily on
  * the next query if it died.
  *
- * **Stopped with the plugin.** `stop()` kills it; so does the module's
- * process-exit hook, so an abrupt teardown cannot orphan a checker.
+ * **Stopped with the plugin.** `stop()` kills it and waits for it to actually
+ * be gone (see `SemanticServer.waitForExit`); so does the module's
+ * process-exit hook, so an abrupt teardown cannot orphan a checker. The wait
+ * matters for a caller that acts on the child's absence right after - a
+ * project root reused for something else, or, in tests, removed from disk.
  */
 /**
  * `g-mesh plugins check`'s plugin-side marker contract (core's
@@ -620,15 +696,26 @@ export class SemanticProject {
     return name;
   }
 
-  /** Stops the child, if one is running. Idempotent; a later query starts a
-   * fresh one, which is what makes this safe to call on an idle timer as well
-   * as at shutdown. */
-  stop(): void {
+  /**
+   * Stops the child, if one is running, and waits for the OS process to
+   * actually be gone before resolving (GM-321 - see
+   * `SemanticServer.waitForExit` for why that wait exists at all). Idempotent;
+   * a later query starts a fresh one, which is what makes this safe to call
+   * on an idle timer as well as at shutdown.
+   *
+   * `isRunning` already reads false the instant this is *called*, not once
+   * it resolves: `this.server` is cleared synchronously, before the await, so
+   * a caller that only checks liveness (rather than acting on the process's
+   * absence, e.g. removing its cwd) never had to wait in the first place.
+   */
+  async stop(): Promise<void> {
     if (this.server === null) return;
     this.options.onLog?.(`stopping tsserver for ${this.projectRoot}`);
-    this.server.dispose();
+    const server = this.server;
+    server.dispose();
     this.server = null;
     this.opened.clear();
+    await server.waitForExit();
   }
 }
 
@@ -649,8 +736,13 @@ export function semanticProjectFor(projectRoot: string, options?: SemanticProjec
   return project;
 }
 
-/** Teardown counterpart, called on the plugin's own shutdown path. */
-export function stopSemanticProjects(): void {
-  for (const project of PROJECTS.values()) project.stop();
+/**
+ * Teardown counterpart, called on the plugin's own shutdown path. Waits for
+ * every child to actually exit (see `SemanticProject.stop`) rather than only
+ * asking each one to - index.ts awaits this before `process.exit(0)`, so a
+ * confirmed-dead child, not just a signaled one, is what "shut down" means.
+ */
+export async function stopSemanticProjects(): Promise<void> {
+  await Promise.all(Array.from(PROJECTS.values(), (project) => project.stop()));
   PROJECTS.clear();
 }

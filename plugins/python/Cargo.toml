@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-python"
-version = "3.4.0"
+version = "3.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's Python language plugin: pyproject.toml/src-layout/namespace-package project model (GM-295), tree-sitter-python structural extraction (GM-296)"
@@ -41,13 +41,20 @@ serde_json = "1"
 # out to a `python3` this plugin cannot assume exists, at a version whose
 # grammar it cannot control.
 #
-# THE ONE NON-OBVIOUS CONSEQUENCE IS ALREADY PAID FOR. `tree-sitter` pulls in
-# `serde_json`'s `preserve_order` feature, which cargo unifies across the
-# packages built together and which therefore changes `serde_json::Value`'s
-# key order inside `core` on any workspace-wide build -
-# `plugins/rust/Cargo.toml`'s own header documents the measurement. This crate
-# adds a *second* user of a dependency already in that graph, so it changes
-# nothing about which builds are affected; it is recorded here only so a
-# reader of this file does not have to find the other one to learn it.
+# THE ONE NON-OBVIOUS-LOOKING CONSEQUENCE TURNED OUT NOT TO BE ONE (GM-302).
+# `tree-sitter` pulls in `serde_json`'s `preserve_order` feature, and a raw
+# `cargo tree -e features` reading makes it look like cargo's feature
+# unification carries that into `core`'s own `serde_json::Value` key order on
+# any workspace-wide build. `plugins/rust/Cargo.toml`'s own header has the
+# full measurement: that feature reaches `core` only through tree-sitter's
+# BUILD-dependency and rmcp-macros' proc-macro use, both of which cargo's
+# resolver v2 keeps separate from the normal/target graph a linked artifact
+# actually draws from - confirmed by an edge-kind-filtered `cargo tree`, by
+# the actual rustc invocations for core's linked `serde_json`, and by a
+# byte-identical real `tools/list` response between a scoped and a
+# workspace-wide build. This crate adds a *second* user of a dependency
+# already in that graph, so it changes nothing about which builds are
+# affected either way; it is recorded here only so a reader of this file does
+# not have to find the other one to learn it.
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"

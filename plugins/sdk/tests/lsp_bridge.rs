@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig};
+use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig, ServerReadiness};
 use g_mesh_plugin_sdk::wire::{
     EdgeKind, NodeKind, Position, Range, SourceTier, TargetKey, TargetScope, WireEdge, WireNode,
 };
@@ -477,6 +477,269 @@ fn an_empty_answer_while_the_server_reindexes_is_asked_again() {
         answer.diff
     );
     assert!(answer.complete);
+}
+
+/// This machine's load average, read fresh for every timing-sensitive
+/// assertion - see the house rule that a timing measurement without it is
+/// worse than none. `uptime`'s exact column layout is not parsed; the whole
+/// line is enough to tell a quiet run from one sharing the box with
+/// something else.
+fn uptime() -> String {
+    std::process::Command::new("uptime")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_else(|| "uptime unavailable".to_string())
+}
+
+/// GM-309: `LspClient::settle` latches once per server (GM-290's correction,
+/// kept - see `the_settle_is_paid_once_per_server_rather_than_once_per_pass`
+/// above), so from a server's second pass on, `LspBridge`'s readiness gate asks only
+/// "is anything in flight *right now*", not "has it been quiet for a whole
+/// settle". That is correct once the server has actually caught up with
+/// whatever the pass just sent it - and false in the gap right after a
+/// `didChange`, before the server has emitted *any* progress for that edit.
+/// GM-299 measured this gap for pyright at ~0.6s and reasoned that it was
+/// safe (a missing edge, never a wrong one) without constructing a case that
+/// forces it. This test is that case.
+///
+/// The fake server's `reindexOnChange` answers `null` to everything from the
+/// moment `didChange` arrives until a scripted delay after it, then a hold,
+/// then it reveals the real answer - modelling a server that has not yet
+/// noticed the edit, not one that is merely slow to answer. The first
+/// question, sent immediately after the change, is answered by a local pipe
+/// in low single-digit milliseconds even on a machine this loaded (measured:
+/// under 2ms end to end before this fix existed to defer it at all - see the
+/// "before" evidence this test's own history carries), so `beginAfterMs` of
+/// 200 is not a coin flip against it, it is the race forced by construction.
+///
+/// `budgets.settle` is set well *above* `beginAfterMs`, and that ordering is
+/// load-bearing rather than incidental: `run_pass` requeues a deferred
+/// question the moment the client has been continuously quiet for one whole
+/// settle, with no idea a server is about to speak. If settle were shorter
+/// than `beginAfterMs`, the retry would itself fire before the server's
+/// progress begins and land back in the same unrevealed gap - re-proving the
+/// bug on the second try instead of testing the fix. With settle longer, the
+/// server's own `$/progress` begin necessarily interrupts the quiet period
+/// first (clearing it, since a client mid-progress is never "quiet"), so the
+/// retry cannot fire until a full settle *after* progress has ended - by
+/// which point `revealed` is already true.
+///
+/// Unfixed, `run_pass`'s deferral test is `!client.quiet_for(budgets.settle)`,
+/// and a client whose server settled minutes ago (during pass one, in this
+/// test's setup) is already quiet for far longer than one settle the instant
+/// `didChange` is sent - so the early `null` is believed, no edge is emitted,
+/// and the pass reports itself complete. Fixed, the same `didChange` resets
+/// how long the client has been quiet *for the purposes of that judgement*,
+/// so the early `null` is deferred and the site is asked again once the
+/// server is quiet for real - which does not happen until after the
+/// `reindexOnChange` cycle has ended and revealed the true answer.
+#[test]
+fn a_didchange_race_is_not_recorded_as_no_target() {
+    let scratch = Scratch::new("didchange-race");
+    let mut index = fixture(&scratch).0;
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "reindexOnChange": { "beginAfterMs": 200, "holdMs": 150 },
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    // Well above `beginAfterMs` above (5x) - see this test's own doc on why
+    // that ordering, not just the margin, is what makes the retry land after
+    // `revealed` rather than in the same unrevealed gap as the first ask.
+    budgets.settle = Duration::from_millis(1_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    // Pass one: the server has no progress to report at all, so it becomes
+    // ready purely by the clock, and `settled` latches - the state every
+    // per-file pass after the first edit actually starts from.
+    let first = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&first).len(), 1, "the baseline pass resolves the site: {:#?}", first.diff);
+
+    // Edit b.toy - same open site, same position, different bytes - so
+    // `sync_documents` sends `didChange`, not `didOpen`. A per-file pass over
+    // just that file is what core runs after one reparse.
+    let b = RelPath::new("src/b.toy");
+    let graph = index.entry(&b).expect("the fixture has it").graph.clone();
+    index.insert(b.clone(), format!("{B_TOY}// edited\n"), graph);
+
+    let before = asked(&log, "textDocument/definition");
+    let uptime_before = uptime();
+    let started = std::time::Instant::now();
+    let second = bridge.answer(&[b], &index).expect("the bridge answers");
+    let elapsed = started.elapsed();
+    let uptime_after = uptime();
+    let after = asked(&log, "textDocument/definition");
+    eprintln!(
+        "a_didchange_race_is_not_recorded_as_no_target: pass two took {elapsed:?}; \
+         uptime before {uptime_before:?}, after {uptime_after:?}"
+    );
+
+    assert_eq!(
+        semantic_edges(&second).len(),
+        1,
+        "the early null must not be believed over the real answer the server gives once it has \
+         caught up with the edit: {:#?}",
+        second.diff
+    );
+    assert!(second.complete, "the site was eventually answered, not left outstanding");
+    assert_eq!(
+        after - before,
+        2,
+        "the site was asked once, deferred on the early null, and asked again - not answered \
+         once and trusted"
+    );
+}
+
+/// GM-310, the half that must not regress: a manifest saying `on-demand`
+/// about a server that is in fact a rust-analyzer does not cost an edge.
+///
+/// This is the test the whole mechanism is chosen to pass. `on-demand` skips
+/// the start-up quiet period, so the first question of the first pass goes out
+/// at once - and the scripted server here is the traced rust-analyzer shape:
+/// a *sequence* of work-done tokens, answering `null` to everything from
+/// `initialized` until the last of them ends. Under the rejected alternative -
+/// "an on-demand server has a settle of zero" - that first `null` is measured
+/// against a zero-length quiet period, passes trivially, and is recorded as
+/// "there is no such symbol": one missing edge bought with two seconds, which
+/// this design refuses to trade.
+///
+/// What makes it safe instead is the rule that was already there and is
+/// deliberately left alone. `run_pass` defers an empty answer that arrives
+/// while the client has *not* been continuously quiet for a whole
+/// `budgets.settle`, and a deferred question returns to the queue only when
+/// that same continuous quiet arrives. A server mid-sequence cannot supply it:
+/// the gaps between its phases are shorter than the settle (traced on
+/// rust-analyzer 1.97.1 at 157-182ms against a 2s settle), and its own next
+/// `begin` clears the clock. So the early `null` is not believed, the site is
+/// re-asked after the sequence really ends, and the edge is the one the
+/// server's truthful answer produces.
+///
+/// The phase sequence begins after a real delay rather than at `initialized`,
+/// and that is load-bearing: rust-analyzer's own first token begins ~313ms
+/// after `didOpen` (measured), and it is *that* window - ready-looking, no
+/// progress yet, nothing truthful to say - the first question has to land in
+/// for this test to be about anything. With `beginAfterMs: 0` the bridge would
+/// simply wait for the in-flight progress in `wait_ready` and never exercise
+/// the deferral at all.
+///
+/// Shown capable of failing: with `LspClient::quiet_for` reduced to "is
+/// anything in flight right now" - GM-289's rule 1, the bug GM-290 found
+/// twice - this test fails with zero semantic edges while reporting the pass
+/// complete, which is the worse half of that bug and exactly what it is here
+/// to catch.
+#[test]
+fn an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand() {
+    let scratch = Scratch::new("on-demand-wrong");
+    let (index, _) = fixture(&scratch);
+    let mut config = scratch.server(json!({
+        // The rust-analyzer shape: a sequence, and a pre-progress window in
+        // front of it that looks exactly like a server with nothing to do.
+        "readiness": { "phases": [
+            { "token": "fetching", "beginAfterMs": 300, "holdMs": 60 },
+            { "token": "cachePriming", "beginAfterMs": 60, "holdMs": 60 },
+        ]},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    // The manifest's claim, and it is the wrong one about this server.
+    config.readiness = ServerReadiness::OnDemand;
+
+    let mut budgets = budgets();
+    // 2000ms against a 60ms scripted gap - a 33x margin, the same order
+    // `a_gap_between_two_progress_phases_is_not_readiness` argues for and for
+    // the same reason: the gap is a `sleep` on a machine that may be loaded,
+    // and a settle merely twice as long lets a stretched gap satisfy it,
+    // which is the bug passing itself off as the fix.
+    budgets.settle = Duration::from_millis(2_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let load = uptime();
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&answer).len(),
+        1,
+        "an `on-demand` manifest must not make an indexing server's early null final ({load}): {:#?}",
+        answer.diff
+    );
+    assert!(answer.complete, "{load}");
+}
+
+/// GM-310, the half the saving comes from: a server whose manifest says
+/// `on-demand` is not made to prove, by waiting, a shape its plugin author
+/// already traced.
+///
+/// One fixture, one scripted server, one variable: the same server that
+/// reports no progress at all and answers the site correctly from its first
+/// millisecond, run once under each readiness claim. The `indexed` arm is
+/// today's behaviour - the first pass waits out a whole settle before asking
+/// anything - and the `on-demand` arm asks at once. Both must produce the
+/// same one edge, or the measurement is of a bridge that got faster by
+/// answering less.
+///
+/// The settle is 900ms, and the second assertion is deliberately **relative**
+/// rather than a second absolute bound. The claim is "this arm did not pay the
+/// settle", and the honest test of it is the gap between the two arms: an
+/// absolute ceiling on the on-demand arm would also be measuring how long this
+/// machine takes to fork a process and complete a handshake, which is a
+/// different quantity and one that has been between load average 6 and 995 on
+/// the machine this was written on. Both arms absorb a slow machine together,
+/// so the difference survives what a ceiling would not - while still failing
+/// loudly if `on-demand` ever started waiting, since the two arms would then
+/// come back within noise of each other.
+///
+/// This is the cheap observation that shows the arms are genuinely different
+/// before anything is concluded from the difference. It is the same shape
+/// `the_settle_is_paid_once_per_server_rather_than_once_per_pass` uses for the
+/// first-versus-second-pass split, one variable over.
+#[test]
+fn an_on_demand_server_does_not_wait_out_a_settle_its_manifest_says_it_does_not_need() {
+    let scratch = Scratch::new("on-demand-saving");
+    let (index, _) = fixture(&scratch);
+    let script = json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    });
+
+    let mut elapsed = Vec::new();
+    for readiness in [ServerReadiness::Indexed, ServerReadiness::OnDemand] {
+        let mut config = scratch.server(script.clone());
+        config.readiness = readiness;
+        let mut budgets = budgets();
+        budgets.settle = Duration::from_millis(900);
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+        let started = std::time::Instant::now();
+        let answer = pass(&mut bridge, &index);
+        elapsed.push(started.elapsed());
+        assert_eq!(
+            semantic_edges(&answer).len(),
+            1,
+            "{readiness:?} must answer the same site: {:#?}",
+            answer.diff
+        );
+        assert!(answer.complete, "{readiness:?}");
+    }
+
+    let load = uptime();
+    assert!(
+        elapsed[0] >= Duration::from_millis(800),
+        "the indexed arm waits out the settle: {:?} ({load})",
+        elapsed[0]
+    );
+    let saved = elapsed[0].saturating_sub(elapsed[1]);
+    assert!(
+        saved >= Duration::from_millis(500),
+        "the on-demand arm must skip most of the 900ms settle: indexed {:?}, on-demand {:?}, \
+         saved only {saved:?} ({load})",
+        elapsed[0],
+        elapsed[1]
+    );
 }
 
 /// `textDocument/implementation` on a node whose `nativeKind` the manifest
@@ -924,4 +1187,189 @@ fn a_server_that_asks_with_nothing_configured_is_answered_null() {
     drop(bridge);
     let text = std::fs::read_to_string(&received).expect("the server wrote down what it was answered");
     assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!([null, null]), "{text}");
+}
+
+// --- the site ceiling (GM-319) ----------------------------------------------
+
+/// Adds a file of `sites` unresolved receiver calls, one per line, each with
+/// its own calling declaration.
+///
+/// One caller per site rather than one per file, deliberately: two sites that
+/// share a `from_id` and resolve to the same target are the *same* edge, and
+/// `Answers` deduplicates it - so a fixture built the other way would count
+/// half the edges it thinks it has, and a test about retracting them would be
+/// measuring the deduplication instead.
+fn crowd_file(scratch: &Scratch, index: &mut SdkIndex, relative: &str, sites: usize) {
+    let source: String = (0..sites).map(|line| format!("  r{line}.m()\n")).collect();
+    scratch.write(relative, &source);
+
+    let path = RelPath::new(relative);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+    builder.file_node(range(0, 0, sites as u32, 0));
+    for line in 0..sites as u32 {
+        let name = format!("{}#{line}", relative.replace(['/', '.'], "_"));
+        let caller = builder.add_node(
+            NodeSpec::new(NodeKind::Function, &name, &name, range(line, 0, line, 10))
+                .native_kind("function")
+                .in_container("pkg", None)
+                .public(),
+        );
+        builder.open_site(OpenSite {
+            from_id: caller,
+            position: Position { line, col: 5 },
+            name: "m".to_string(),
+            kind: OpenSiteKind::ReceiverCall,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some("pkg".to_string()),
+            replaces: None,
+        });
+    }
+    index.insert(path, source, builder.finish());
+}
+
+/// **The GM-319 regression.** A repository whose open sites outnumber the
+/// pre-GM-319 ceiling of 20,000 must still record a *completed* whole-project
+/// pass. An incomplete one leaves `language_state.semanticPassAt` unset - and
+/// leaves it unset forever, because nothing about the project changes to make
+/// the next pass smaller: the receiver-call gap stays in every session's MCP
+/// instructions and the whole pass is redone on every daemon start. GM-314
+/// measured 87,832 questions for Django, 27,750 for tokio and 21,995 for
+/// g-mesh itself (GM-319's re-count), so this is not a hypothetical size.
+///
+/// Everything but `max_sites` is loosened here so that a loaded machine
+/// cannot fail this for a reason the test is not about; `max_sites` is read
+/// from `Budgets::default()` rather than written down, which is the whole
+/// point. On the pre-GM-319 default this fails at `complete`.
+#[test]
+fn a_project_larger_than_the_old_ceiling_still_completes_its_pass() {
+    const SITES: usize = 21_000;
+    const OLD_CEILING: usize = 20_000;
+    const FILES: usize = 40;
+
+    const { assert!(SITES > OLD_CEILING, "this fixture must be over the ceiling that used to cut it") };
+    let shipped = Budgets::default().max_sites;
+
+    let scratch = Scratch::new("ceiling");
+    let mut index = SdkIndex::new();
+    for file in 0..FILES {
+        crowd_file(&scratch, &mut index, &format!("src/crowd{file}.toy"), SITES / FILES);
+    }
+
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [],
+        "log": log.to_string_lossy(),
+    }));
+    let budgets = Budgets {
+        request: Duration::from_secs(120),
+        max_sites: shipped,
+        concurrency: 8,
+        project_floor: Duration::from_secs(600),
+        per_file: Duration::from_secs(600),
+        single_file: Duration::from_secs(600),
+        readiness: Duration::from_secs(60),
+        settle: Duration::from_millis(150),
+    };
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(
+        answer.complete,
+        "a {SITES}-site project must record a completed pass, not one reported cut short - the \
+         shipped ceiling is {shipped}"
+    );
+    // A server that answers nothing still *answers* every question - "nothing
+    // there" is an answer. Counting the requests is what proves the ceiling
+    // let the list through, rather than that the questions were cheap.
+    assert_eq!(
+        asked(&log, "textDocument/definition"),
+        SITES,
+        "every site must have been put to the server, not merely counted"
+    );
+}
+
+/// A pass the ceiling cuts short must not retract an earlier pass's answers
+/// about a file it never reached.
+///
+/// Before GM-319 the cut fell wherever the *n*th question happened to be,
+/// which is usually the middle of a file. Every question that file did
+/// contribute was asked and answered, so `run_pass` reported it covered, and
+/// `retract_stale` reads covered as "this pass is now the whole truth about
+/// that file" - withdrawing the edges an earlier, complete pass emitted for
+/// the sites this one was cut before reaching. Correct edges deleted to
+/// account for questions nobody asked, which is the direction the bridge's
+/// retraction rules exist to forbid.
+///
+/// Two files of two sites each and a ceiling of three. Three is the whole
+/// arithmetic: it can only be spent by cutting the second file in half.
+#[test]
+fn a_ceiling_that_cuts_a_pass_short_retracts_nothing_it_did_not_ask_about() {
+    let scratch = Scratch::new("ceiling-retract");
+    let mut index = SdkIndex::new();
+
+    // The declaration every site resolves to, in a file of its own so that no
+    // answer lands inside the file that asked - and with no sites, so it
+    // costs the ceiling nothing.
+    let decl = RelPath::new("src/decl.toy");
+    let decl_source = "fn target\n";
+    scratch.write("src/decl.toy", decl_source);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &decl);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "target", "target", range(0, 3, 0, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(decl, decl_source.to_string(), builder.finish());
+
+    crowd_file(&scratch, &mut index, "src/x.toy", 2);
+    crowd_file(&scratch, &mut index, "src/y.toy", 2);
+
+    let mut answers = Vec::new();
+    for file in ["src/x.toy", "src/y.toy"] {
+        for line in 0..2u32 {
+            answers.push(json!({
+                "uri": scratch.uri(file),
+                "line": line,
+                "character": 5,
+                "definition": { "uri": scratch.uri("src/decl.toy"), "line": 0, "character": 4 },
+            }));
+        }
+    }
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+
+    let mut budgets = budgets();
+    budgets.max_sites = 3;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    // A per-file pass over `y.toy` alone fits under the same ceiling, and is
+    // what gives the whole-project pass below something to be tempted to
+    // retract. (Core sends exactly this after every settled reparse.)
+    let first = bridge.answer(&[RelPath::new("src/y.toy")], &index).expect("the bridge answers");
+    assert!(first.complete, "two questions fit under a ceiling of three");
+    assert_eq!(semantic_edges(&first).len(), 2, "y.toy's own sites: {:#?}", first.diff);
+
+    // Now the whole project, at a ceiling that fits `decl.toy` (nothing) and
+    // `x.toy` (two) but not `y.toy`'s two as well.
+    let second = pass(&mut bridge, &index);
+    assert!(!second.complete, "a pass the ceiling cut short is not a completed pass");
+    assert!(
+        second.diff.delete_edge_ids.is_empty(),
+        "a file the ceiling stopped this pass from reaching keeps the answers it already has - \
+         retracted {:?}",
+        second.diff.delete_edge_ids
+    );
+    assert_eq!(
+        semantic_edges(&second).len(),
+        2,
+        "and the file that did fit is asked about in full: {:#?}",
+        second.diff
+    );
 }

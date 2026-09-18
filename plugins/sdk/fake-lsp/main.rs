@@ -144,6 +144,37 @@ struct Reindex {
     hold_ms: u64,
 }
 
+/// The GM-309 shape, and the reason it is a separate table from [`Reindex`]:
+/// that one begins its progress *deterministically*, tied to a request count,
+/// so a test built on it can never land in the gap this one exists to reach.
+///
+/// A real server does not begin reporting progress for an edit the instant it
+/// receives `didChange` - it notices the edit, decides to re-analyse, and
+/// only then opens a work-done token. Measured for pyright
+/// (`docs/architecture/multi-language-plugins.md`, "Readiness, measured, and
+/// deliberately not changed"): the token arrives ~0.63s *after* `didOpen`.
+/// This is the same shape after `didChange`, scripted with real milliseconds
+/// rather than a request count, so a client that asks in the meantime is
+/// genuinely racing the server's own recognition of the edit - not a fixture
+/// rigged to make one side win.
+///
+/// Until the cycle this starts has *ended*, every question is answered
+/// `null` regardless of `answers` - not only while the progress is in
+/// flight, but in the gap beforehand too, where a server that has not yet
+/// noticed the edit has nothing truthful to say about it either. That is
+/// the whole point: the empty answer a client gets by asking too early is a
+/// real "I don't know yet", and the question this fixture exists to force is
+/// whether the bridge believes it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReindexOnChange {
+    /// How long after `didChange` arrives before the server begins telling
+    /// anyone about it.
+    begin_after_ms: u64,
+    /// How long the progress runs once begun.
+    hold_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Script {
@@ -151,6 +182,8 @@ struct Script {
     readiness: Option<Readiness>,
     #[serde(default)]
     reindex: Option<Reindex>,
+    #[serde(default)]
+    reindex_on_change: Option<ReindexOnChange>,
     /// Answer `null` to everything while a progress is in flight - a server
     /// that has not finished loading and says so only through `$/progress`.
     /// This is the behaviour the readiness gate exists for: without the gate,
@@ -208,6 +241,17 @@ fn main() {
     // the threads that end one, and read by every answer when
     // `nullWhileIndexing` is set.
     let indexing = Arc::new(AtomicBool::new(false));
+    // Whether a `didChange` has started a `reindexOnChange` cycle at all -
+    // see [`ReindexOnChange`]. Without this, a script carrying the table
+    // would null every answer from the first request on, including the ones
+    // asked before any edit exists to be racing.
+    let changed = Arc::new(AtomicBool::new(false));
+    // Whether that cycle has completed. `false` covers both the gap before
+    // its progress begins and the progress itself, which is the one thing
+    // `indexing` alone cannot say: `indexing` is false in that gap too, and a
+    // script that only checked it would answer truthfully before the server
+    // has any right to.
+    let revealed = Arc::new(AtomicBool::new(false));
 
     while let Some(message) = read_frame(&mut reader) {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
@@ -275,6 +319,13 @@ fn main() {
                     Some(_) if script.null_while_indexing && indexing.load(Ordering::SeqCst) => {
                         respond(&mut stdout, id, Value::Null)
                     }
+                    // GM-309's window: a `didChange` has started a
+                    // `reindexOnChange` cycle and it has not yet ended,
+                    // whether or not its progress has even begun - see
+                    // [`ReindexOnChange`].
+                    Some(_) if changed.load(Ordering::SeqCst) && !revealed.load(Ordering::SeqCst) => {
+                        respond(&mut stdout, id, Value::Null)
+                    }
                     Some(answer) if method.ends_with("definition") => {
                         let result = answer.definition.as_ref().map(Location::to_json).unwrap_or(Value::Null);
                         respond(&mut stdout, id, result)
@@ -302,10 +353,18 @@ fn main() {
                     let _ = std::fs::write(path, serde_json::to_string(&answer).unwrap_or_default());
                 }
             }
-            // Everything else - `didOpen`, `didChange`, `$/cancelRequest` - is
-            // accepted and ignored. A request this fixture does not know still
-            // gets an answer, because a client left waiting on one would hang
-            // for a reason that has nothing to do with the test.
+            // A `didChange` starts the GM-309 clock, if one is scripted - see
+            // [`ReindexOnChange`]. Every `didChange` restarts it, which is
+            // fine for the one fixture that uses this: it edits one file once.
+            "textDocument/didChange" if script.reindex_on_change.is_some() => {
+                changed.store(true, Ordering::SeqCst);
+                begin_reindex_on_change(&script, Arc::clone(&indexing), Arc::clone(&revealed));
+            }
+            // Everything else - `didOpen`, `didChange` with nothing scripted,
+            // `$/cancelRequest` - is accepted and ignored. A request this
+            // fixture does not know still gets an answer, because a client
+            // left waiting on one would hang for a reason that has nothing to
+            // do with the test.
             _ => {
                 if id.is_some() && !method.is_empty() {
                     respond(&mut stdout, id, Value::Null);
@@ -412,6 +471,33 @@ fn begin_reindex(script: &Script, indexing: Arc<AtomicBool>) {
             &mut std::io::stdout(),
             "$/progress",
             json!({ "token": "reindex", "value": { "kind": "end" } }),
+        );
+    });
+}
+
+/// Begins the GM-309 clock a `didChange` starts - see [`ReindexOnChange`].
+/// Unlike [`begin_reindex`], the `begin` is written from a spawned thread
+/// after a real sleep, not synchronously before an answer: this is what makes
+/// the gap between the edit and the server's own recognition of it a real
+/// span of wall-clock time rather than something the fixture can order away.
+fn begin_reindex_on_change(script: &Script, indexing: Arc<AtomicBool>, revealed: Arc<AtomicBool>) {
+    let Some(cfg) = script.reindex_on_change.clone() else { return };
+    std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        std::thread::sleep(Duration::from_millis(cfg.begin_after_ms));
+        indexing.store(true, Ordering::SeqCst);
+        notify(
+            &mut stdout,
+            "$/progress",
+            json!({ "token": "reindex-on-change", "value": { "kind": "begin", "title": "reindexing" } }),
+        );
+        std::thread::sleep(Duration::from_millis(cfg.hold_ms));
+        indexing.store(false, Ordering::SeqCst);
+        revealed.store(true, Ordering::SeqCst);
+        notify(
+            &mut stdout,
+            "$/progress",
+            json!({ "token": "reindex-on-change", "value": { "kind": "end" } }),
         );
     });
 }

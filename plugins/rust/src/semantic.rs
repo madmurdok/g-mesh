@@ -177,6 +177,7 @@ fn probe(candidate: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use g_mesh_plugin_sdk::lsp::ServerReadiness;
 
     /// A path names one binary and is never searched around - see
     /// [`resolve`]'s doc.
@@ -235,6 +236,13 @@ mod tests {
             None,
             "cache priming stays on: turning it off moves the indexing work into the first request's \
              ten-second budget - see plugin.toml's own comment, and the measurement in it: {options}"
+        );
+        assert_eq!(
+            config.readiness,
+            ServerReadiness::Indexed,
+            "rust-analyzer answers a cross-crate definition at 4.4s and a receiver call not until \
+             13.4s in the same session (GM-310's trace), so nothing it says early generalises. \
+             The default, stated so the trace has somewhere to live"
         );
     }
 

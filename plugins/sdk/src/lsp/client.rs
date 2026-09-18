@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::config::SemanticConfig;
+use super::config::{SemanticConfig, ServerReadiness};
 use super::position::{file_uri, PositionEncoding};
 use crate::framing::{read_frame, write_message};
 
@@ -125,6 +125,15 @@ pub(crate) struct LspClient {
     /// see [`LspClient::settle`]. It lives here rather than on the bridge
     /// because it is a fact about *this* server: the next one starts up all
     /// over again, and a flag that dies with the client cannot be left stale.
+    ///
+    /// It starts `true` for a
+    /// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand)
+    /// server (GM-310). That is the whole of that feature: "on demand" means
+    /// *born in the state every server reaches after its first settle*, which
+    /// is a state this client already had, that `wait_ready` already reads,
+    /// and that GM-290 already measured on every pass after the first. No new
+    /// rule, no second state machine - one server-shaped fact setting a latch
+    /// that exists.
     settled: bool,
     /// Set once the server's stdout has closed, so a caller that polls again
     /// after a crash is told the same thing rather than blocking.
@@ -187,7 +196,7 @@ impl LspClient {
             encoding: PositionEncoding::Utf16,
             active_progress: BTreeMap::new(),
             idle_since: Some(Instant::now()),
-            settled: false,
+            settled: config.readiness == ServerReadiness::OnDemand,
             closed: false,
         };
         client.initialize(config, root, deadline)?;
@@ -252,6 +261,45 @@ impl LspClient {
         self.idle_since.is_some_and(|since| since.elapsed() >= quiet)
     }
 
+    /// Tells this client that a document was just sent a `didOpen`/`didChange`
+    /// it has not yet reacted to, so [`quiet_for`](LspClient::quiet_for) stops
+    /// reporting a quiet period that predates the edit - GM-309.
+    ///
+    /// `settle` latching once per server (GM-290, see [`LspClient::settle`])
+    /// means every pass after the first asks `quiet_for(Duration::ZERO)`
+    /// rather than paying the settle again - correct once the server has
+    /// actually caught up with whatever the pass just sent it, and wrong in
+    /// the gap right after: a server does not begin reporting progress for an
+    /// edit the instant it receives one, and measured for pyright
+    /// (`docs/architecture/multi-language-plugins.md`, "Readiness, measured,
+    /// and deliberately not changed") that gap is ~0.6s. A question answered
+    /// empty inside it is answered by a server that has not yet noticed the
+    /// edit, and [`super::bridge`]'s per-answer deferral - "an empty answer
+    /// while the server is indexing is re-asked once" - only catches that
+    /// when `idle_since` is fresh enough to say so.
+    ///
+    /// So this resets it, but only when the client is not already busy: if a
+    /// progress is in flight `idle_since` is `None`, which already means
+    /// "not quiet" more strongly than any timestamp could, and overwriting it
+    /// with `Some(now)` would make a client that is genuinely mid-progress
+    /// read as quiet for the instant before the next `$/progress` message
+    /// corrects it. When the client *is* idle, resetting the clock buys
+    /// [`Budgets::settle`](super::bridge::Budgets::settle) worth of
+    /// scepticism toward the next empty answer - the same quiet period
+    /// readiness already trusts, not a longer one - and if the server never
+    /// reports anything for this edit at all, the deferred question is asked
+    /// again once that period passes and the second answer, empty or not, is
+    /// believed - exactly the server-that-reports-no-progress case
+    /// [`LspClient::settle`] already handles for start-up. It costs nothing
+    /// when no question lands in the gap, and at most one settle when one
+    /// does - never a settle paid by every pass, which is the guarantee
+    /// GM-290 measured and this must not spend back.
+    pub(crate) fn mark_edited(&mut self) {
+        if self.idle_since.is_some() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
     /// Whether this server is ready to be believed, latching the first time
     /// it is.
     ///
@@ -260,6 +308,15 @@ impl LspClient {
     /// proves what shape it is once - see [`super::bridge::LspBridge`]'s doc
     /// on readiness - and a per-file pass that follows an edit must not pay
     /// for that proof again.
+    ///
+    /// A server whose manifest declares
+    /// [`ServerReadiness::OnDemand`] starts with that latch already set
+    /// (GM-310): the proof is the plugin author's trace rather than this
+    /// process's own two seconds of waiting. Note what is *not* skipped -
+    /// `quiet_for(Duration::ZERO)` still answers "is something in flight right
+    /// now", so an on-demand server that happens to be mid-progress when a
+    /// pass begins is still waited for, exactly as an indexed one is on its
+    /// second pass.
     pub(crate) fn settle(&mut self, quiet: Duration) -> bool {
         if self.settled {
             return self.quiet_for(Duration::ZERO);

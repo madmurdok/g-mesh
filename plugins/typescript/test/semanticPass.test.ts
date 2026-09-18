@@ -52,7 +52,7 @@ async function pass(root: string, filePaths: string[] = []): Promise<SemanticPas
   try {
     return await runSemanticPass(root, filePaths, { project });
   } finally {
-    project.stop();
+    await project.stop();
   }
 }
 
@@ -242,7 +242,7 @@ test("two `export *` branches offering one name resolve to the branch TypeScript
     // An upgraded edge is the structural pass's own; nothing here retracts it.
     assert.deepEqual(diff.deleteEdgeIds, []);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -261,7 +261,7 @@ test("swapping the two `export *` statements swaps the declaration the pass land
     // reimplemented.
     assert.equal(diff.upsertEdges[0].toId, await declarationId(root, "b.ts", "mutate"));
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -276,7 +276,7 @@ test("a whole-project pass finds the same edge without being told which file to 
     assert.equal(diff.upsertEdges.length, 1);
     assert.equal(diff.upsertEdges[0].toId, await declarationId(root, "a.ts", "mutate"));
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -329,7 +329,7 @@ test("a default export imported under another name is upgraded onto the class it
       "the declaration travels once, however many edges point at it",
     );
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -358,7 +358,7 @@ test("an indirect default, re-exported through a barrel, is followed to the decl
     assert.equal(diff.upsertEdges[0].resolved, true);
     assert.equal(diff.upsertEdges[0].toId, await declarationId(root, "src/widget.ts", "Widget"));
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -387,7 +387,7 @@ test("an anonymous default is left to the structural layer, which already matche
       "a name the target file declares itself is never worth a checker",
     );
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -439,7 +439,7 @@ export function run(): string {
     // Only the invented edge is this pass's to retract later.
     assert.deepEqual(diff.deleteEdgeIds, []);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -490,7 +490,7 @@ test("a barrel whose branches all end outside the index leaves the edge alone", 
     assert.deepEqual(diff.upsertEdges, [], "a missing edge beats one onto a file core never indexed");
     assert.deepEqual(diff.upsertNodes, []);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -515,7 +515,7 @@ export function run(): string {
     // question worth a ~265MB child.
     assert.equal(project.isRunning, false, "nothing to ask must mean nothing spawned");
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -537,7 +537,7 @@ test("a name the target file declares itself is left to the structural layer", a
     assert.deepEqual(diff.upsertEdges, []);
     assert.equal(project.isRunning, false, "and no checker is started to decide that");
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -566,7 +566,7 @@ export function run(): number {
     assert.deepEqual(result.upsertEdges, []);
     assert.equal(project.isRunning, false);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -680,7 +680,7 @@ export function useNumber(): number {
       "two signatures and the implementation TypeScript never shows a caller",
     );
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -717,7 +717,7 @@ export function useBoth(): number {
     assert.notEqual(bound.get(0)!.id, bound.get(1)!.id, "two bindings, two edges");
     assert.deepEqual(diff.deleteEdgeIds, [collapsed.id]);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -759,7 +759,7 @@ test("an overloaded method called through `this` binds the matching signature", 
     assert.equal(bound.get(0)!.fromId, structural.get("byName")!.fromId);
     assert.equal(bound.get(1)!.fromId, structural.get("byIndex")!.fromId);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -784,7 +784,7 @@ test("a call of an ordinary function is never asked about, so no child is starte
     assert.deepEqual(diff.deleteEdgeIds, []);
     assert.equal(project.isRunning, false, "deciding that costs no ~265MB child");
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -914,7 +914,7 @@ export function run(): number {
       `the failure must be reported: ${JSON.stringify(logged)}`,
     );
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -933,7 +933,7 @@ test("a checker that dies costs the pass its answers, not the plugin", async () 
     const diff = await runSemanticPass(root, ["caller.ts"], { project });
     assert.deepEqual(diff.upsertEdges, []);
   } finally {
-    project.stop();
+    await project.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
 });

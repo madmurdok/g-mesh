@@ -15,8 +15,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
@@ -31,7 +29,6 @@ mod common;
 use common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One file importing another - enough to prove import edges survive the
 /// rebuild relinked, not just present.
@@ -146,15 +143,10 @@ impl Drop for Project {
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
 }
 
 /// A node id no real walk would ever produce, planted directly in the index

@@ -279,9 +279,16 @@ function main(): void {
   // deliberately rather than by a backstop. Nothing here starts one: the
   // checker is spawned by the first semantic question asked of it and this
   // is a no-op for the (common) run where none ever is.
+  //
+  // Awaited (GM-321): `stopSemanticProjects` only resolves once every child
+  // has actually exited, not merely been asked to. Calling `process.exit(0)`
+  // straight after signaling it, as this used to, raced the child's own
+  // teardown - the plugin process could be gone before tsserver was, which
+  // is the same shape of bug as GM-320 (a daemon whose caller believed a
+  // SIGTERM was a completed shutdown). Nothing here changes what got killed;
+  // it changes when this process is allowed to say the killing is done.
   process.stdin.on("end", () => {
-    stopSemanticProjects();
-    process.exit(0);
+    void stopSemanticProjects().then(() => process.exit(0));
   });
 }
 
