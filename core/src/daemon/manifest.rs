@@ -1453,16 +1453,23 @@ watch_files = ["[unclosed"]
     /// `../../target/debug/...`), with only the `.exe` spelling present on
     /// disk, must resolve `command` to that `.exe` path - not fail, and not
     /// silently keep the unsuffixed spelling that `Command::spawn` could
-    /// never find. This exercises `resolve_path_entry` itself (which always
-    /// uses the real `std::env::consts::EXE_SUFFIX`), so it only proves the
-    /// fix on a host where that constant is non-empty; the suffix-parameterized
-    /// tests above cover the Windows arm unconditionally.
+    /// never find. This one exercises `resolve_path_entry` itself, which
+    /// always uses the real [`std::env::consts::EXE_SUFFIX`], so what it
+    /// proves differs by host: the fallback on Windows, and that the fallback
+    /// stays a no-op everywhere else. It runs on every platform for exactly
+    /// that reason - an earlier version returned early when the constant was
+    /// empty, so it had never executed anywhere but Windows CI by the time it
+    /// got there, and it arrived broken (GM-335).
+    ///
+    /// The assertion is on the contract rather than on a spelling: that the
+    /// resolved command is a file that exists, under the platform's own name
+    /// for it. Comparing `PathBuf`s literally would fail on Windows for a
+    /// reason that has nothing to do with the fix - `dir.join("../a/b")`
+    /// keeps the forward slashes the manifest wrote, while `with_file_name`
+    /// rebuilds the last component with a backslash, so two paths naming the
+    /// same file compare unequal.
     #[test]
     fn a_manifest_command_resolves_to_the_exe_suffixed_binary_when_only_it_exists() {
-        if std::env::consts::EXE_SUFFIX.is_empty() {
-            // Nothing to prove on this platform - see doc comment above.
-            return;
-        }
         let body = format!(
             r#"
 [plugin]
@@ -1471,23 +1478,35 @@ protocol_version = {version}
 plugin_version = "0.1.0"
 
 [plugin.spawn]
-command = "../../target/debug/g-mesh-plugin-python"
+command = "../target/debug/g-mesh-plugin-python"
 
 [plugin.languages]
 extensions = [".py"]
 "#,
             version = CURRENT_PROTOCOL_VERSION,
         );
+        // One `..`, not two: `plugin_dir` puts the manifest at `<root>/python`,
+        // one level under the temp root, where the real tree has it two
+        // (`plugins/python`). The count has to match the fixture it is
+        // resolved against, or the path lands outside the tempdir entirely -
+        // which is the other half of how this test arrived broken.
         let (root, dir) = plugin_dir("python", &body);
         let target_debug = root.path().join("target").join("debug");
         fs::create_dir_all(&target_debug).unwrap();
-        fs::write(target_debug.join(format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX)), b"")
-            .unwrap();
+        let built = target_debug.join(format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&built, b"").unwrap();
 
         let manifest = read_manifest(&dir).unwrap();
+        assert!(
+            manifest.command.is_file(),
+            "the resolved command must name a file that exists; got {}",
+            manifest.command.display()
+        );
         assert_eq!(
-            manifest.command,
-            target_debug.join(format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX)),
+            manifest.command.file_name(),
+            built.file_name(),
+            "the resolved command must carry this platform's executable spelling; got {}",
+            manifest.command.display()
         );
     }
 
