@@ -89,8 +89,9 @@
 #
 # The Windows target ships a `.zip`, and a POSIX shell has no portable
 # unzipper. Running this under Git Bash / MSYS would mean pretending; instead
-# it refuses with the three manual steps that actually work. Native Windows
-# support would be a separate `install.ps1`, not a branch of this file.
+# it refuses and points at `scripts/install.ps1` (GM-208), which does the same
+# download-verify-unpack-advise sequence in PowerShell, the interpreter
+# actually present on every target machine this script cannot serve.
 #
 # ---------------------------------------------------------------------------
 # TESTING IT WITHOUT A RELEASE
@@ -154,9 +155,10 @@ usage: install.sh [--version X.Y.Z] [--install-dir DIR] [--target TRIPLE] [--for
   -h, --help         this message
 
 Installs macOS (Intel/Apple Silicon) and x86_64 Linux (glibc) builds.
-Windows is not supported by this script: that target ships a .zip - download
-it from the releases page and unpack it, keeping g-mesh.exe and plugins/
-together in one directory.
+Windows is not supported by this script: that target ships a .zip, which a
+POSIX shell has no portable way to unpack. Use scripts/install.ps1 instead:
+
+  irm https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.ps1 | iex
 EOF
 }
 
@@ -213,8 +215,13 @@ windows_not_supported() {
 install: this script cannot install g-mesh on Windows.
 
 The Windows build ships as a .zip, which a POSIX shell has no portable way to
-unpack, so rather than half-installing it this script stops here. Install it
-by hand instead - it is three steps:
+unpack, so rather than half-installing it this script stops here. Use
+scripts/install.ps1 instead - it is the same download/verify/unpack sequence,
+in PowerShell:
+
+  irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex
+
+Or by hand, if you would rather not run a script - it is three steps:
 
   1. Download g-mesh-v<version>-x86_64-pc-windows-msvc.zip from
      https://github.com/$REPO/releases
