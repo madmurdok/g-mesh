@@ -228,27 +228,89 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
     assert_released_everything(&project, &mut daemon_process, plugin_pid);
 }
 
-/// The other arm of the check: a `cargo clean`, a deleted worktree, a swept
-/// `/tmp` build. The daemon runs from a copy of the test binary precisely so
-/// the copy can be deleted without touching the one cargo built - and its
-/// project root is left entirely alone, so the only thing that can end it is
-/// the executable.
+/// Copies the g-mesh binary into a directory of its own and returns both, so
+/// the copy can be taken away without touching the one cargo built. The
+/// `TempDir` is returned rather than dropped because dropping it deletes the
+/// directory - the caller has to hold it for as long as the daemon runs.
 ///
 /// The copy still finds the repository's plugins: `manifest::bundled_roots`
 /// resolves them through `env!("CARGO_MANIFEST_DIR")`, which is compiled into
 /// the binary rather than derived from where it happens to sit.
-#[test]
-fn a_daemon_whose_own_executable_is_deleted_stops_itself() {
-    let project = Project::new();
+fn daemon_from_a_copy_of_the_binary() -> (tempfile::TempDir, PathBuf) {
     let bin_dir = tempfile::tempdir().expect("failed to create a directory for the daemon's binary");
     let copied_bin = bin_dir.path().join(Path::new(BIN).file_name().expect("the test binary has a name"));
     std::fs::copy(BIN, &copied_bin).expect("failed to copy the g-mesh binary");
+    (bin_dir, copied_bin)
+}
+
+/// The other arm of the check: a `cargo clean`, a deleted worktree, a swept
+/// `/tmp` build. The project root is left entirely alone, so the only thing
+/// that can end this daemon is the executable.
+///
+/// Unix only, and not because Windows is uninteresting - because the premise
+/// is unavailable there. Windows holds a mandatory lock on the image of a
+/// running process, so `remove_file` on a running `.exe` fails with
+/// `PermissionDenied` ("Access is denied.", os error 5) and the test cannot
+/// even set itself up; it is the *unlink* that Unix permits while the inode
+/// lives on, which is the whole situation this check exists to detect. The
+/// sibling below covers Windows with the orphaning that platform does have,
+/// and covers it here too.
+#[cfg(unix)]
+#[test]
+fn a_daemon_whose_own_executable_is_deleted_stops_itself() {
+    let project = Project::new();
+    let (_bin_dir, copied_bin) = daemon_from_a_copy_of_the_binary();
 
     let mut daemon_process = Daemon::spawn(&copied_bin, project.root());
     let plugin_pid = wait_until_fully_up(&project);
     assert!(daemon_process.is_running(), "the daemon must be up before its binary is taken away");
 
     std::fs::remove_file(&copied_bin).expect("failed to delete the daemon's own executable");
+    assert!(project.root().exists(), "the project root is deliberately untouched by this test");
+
+    common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
+    assert_released_everything(&project, &mut daemon_process, plugin_pid);
+}
+
+/// The same verdict reached the way an *upgrade* reaches it, on every
+/// platform: the executable is moved aside rather than unlinked.
+///
+/// This is not a Windows workaround wearing a test's clothes. Renaming a
+/// running executable is what a self-updating installer does - it is how
+/// `scripts/install.sh` and `scripts/install.ps1` replace a g-mesh that is
+/// currently serving a project - and Windows permits it precisely because its
+/// lock is on the image's contents, not on its name. So this covers the
+/// likeliest real-world way a daemon's binary leaves from under it, and it
+/// was not covered on any platform before.
+///
+/// What it rests on, and what a failure here would mean: `orphan_check` asks
+/// `std::env::current_exe()`, and this test is only meaningful if that keeps
+/// answering the path the process was started from after the rename. On Unix
+/// it does - `/proc/self/exe` and its equivalents resolve the inode, and a
+/// renamed file reports its old path as `NotFound`. On Windows
+/// `GetModuleFileNameW` reads the loader's record of the image path, captured
+/// at load and not rewritten by a later rename, so it should answer the same
+/// way. "Should" is doing real work in that sentence: it was not verified on
+/// a Windows machine, only reasoned about, and this test is what decides it.
+/// If it fails there with the daemon still running, the finding is not about
+/// the test - it is that `orphan_check` cannot see this kind of orphaning on
+/// Windows, and `lifecycle.rs` is what has to change.
+#[test]
+fn a_daemon_whose_own_executable_is_renamed_away_stops_itself() {
+    let project = Project::new();
+    let (bin_dir, copied_bin) = daemon_from_a_copy_of_the_binary();
+
+    let mut daemon_process = Daemon::spawn(&copied_bin, project.root());
+    let plugin_pid = wait_until_fully_up(&project);
+    assert!(daemon_process.is_running(), "the daemon must be up before its binary is moved aside");
+
+    // Within the same directory, so this is a rename and never a copy across
+    // filesystems - the upgrade case, where the old binary is parked next to
+    // the new one rather than removed while something still holds it open.
+    let moved_aside = bin_dir.path().join("g-mesh.superseded");
+    std::fs::rename(&copied_bin, &moved_aside).expect("failed to move the daemon's own executable aside");
+    assert!(moved_aside.exists(), "the executable must still exist under its new name");
+    assert!(!copied_bin.exists(), "nothing may remain at the path the daemon was started from");
     assert!(project.root().exists(), "the project root is deliberately untouched by this test");
 
     common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
