@@ -212,28 +212,46 @@ jobs:
           }
           Write-Host "install.ps1 parses cleanly under PowerShell $($PSVersionTable.PSVersion)"
 
-      # GM-342, the half that is informational ON PURPOSE for now. Every bug
-      # the manual review found is in PSScriptAnalyzer's range, so it is worth
-      # running - but nobody here has seen its output on this file, and
-      # turning an unseen lint into a required gate is how a gate starts
-      # failing for reasons unrelated to the change in front of it. The first
-      # real run decides: quiet, and `continue-on-error` comes off and this
-      # becomes a gate; noisy, and the triage belongs in its own diff.
-      - name: install.ps1 lint (informational until its output has been read)
+      # GM-342. This was informational for exactly one run, which is what the
+      # decision was waiting on. Run 35464832833 reported 25 findings:
+      #
+      #   23  PSAvoidUsingWriteHost
+      #    1  PSReviewUnusedParameter           line 354, 'Force'
+      #    1  PSAvoidOverwritingBuiltInCmdlets  line 169, 'Write-Log'
+      #
+      # So the rule is a gate now, with one exclusion. `PSAvoidUsingWriteHost`
+      # is 23 of the 25 and is simply wrong here: this is a CLI installer
+      # whose entire job is to talk to the person running it, and its output
+      # is deliberately not on the pipeline where a caller might capture it.
+      # Excluded by name rather than by lowering the severity floor, so the
+      # other two - and anything new - still fail the job.
+      #
+      # `PSReviewUnusedParameter` earned the step its keep on the first run:
+      # `Install-GMesh` declares `[switch]$Force` and never mentions it again,
+      # calling `Test-InstallDir -Dir $InstallDir` without it, while
+      # `Test-InstallDir` declares no `$Force` of its own and reads one
+      # anyway. It resolves today only because PowerShell looks a variable up
+      # through the caller's scope - so `-Force` works by dynamic scoping
+      # rather than by being passed, and under `Set-StrictMode -Version
+      # Latest` a call from any other scope would throw rather than default to
+      # false. Filed rather than fixed blind: nothing has ever executed this
+      # script (GM-333), so "it works today" is itself unverified.
+      - name: install.ps1 lint
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        continue-on-error: true
         run: |
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber | Out-Null
           }
-          $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' -Severity Error,Warning
+          $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' `
+            -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost
           if (-not $found) {
             Write-Host 'PSScriptAnalyzer: nothing to report'
             return
           }
           $found | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200 | Write-Host
-          Write-Host "PSScriptAnalyzer reported $($found.Count) finding(s) - informational, see this step's comment in ci.yml"
+          Write-Host "::error file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s)"
+          exit 1
 
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate
