@@ -32,6 +32,21 @@
 //! already-absolute value (it replaces the base entirely), so no separate
 //! "is it absolute" branch is needed.
 //!
+//! `command` gets one more step a plain `args` entry does not: [`resolve_exe_suffix`]
+//! falls back to the platform's suffixed spelling (`.exe` on Windows) when the
+//! path as joined doesn't exist. `plugins/python/plugin.toml` and
+//! `plugins/rust/plugin.toml` name their `command` as a cargo build output
+//! (`../../target/debug/g-mesh-plugin-<language>`), and cargo always emits
+//! `<name>.exe` there on Windows - never the suffix-less name the manifest
+//! (deliberately platform-neutral, per GM-335) actually writes - so without
+//! this fallback those two plugins are unspawnable from any Windows checkout,
+//! not just in CI. The Go plugin needs no such fallback (`plugins/go/plugin.toml`'s
+//! own comment explains why: its build step names the binary explicitly, with
+//! no suffix, on every platform) and the suffixed spelling is only ever used
+//! once confirmed to exist on disk - see [`resolve_exe_suffix`]'s own doc
+//! comment for why a spelling that resolves to nothing either way is left
+//! alone rather than guessed at.
+//!
 //! # Capabilities and workspace
 //!
 //! `[plugin.capabilities]` and `[plugin.workspace]` (see
@@ -539,13 +554,61 @@ fn has_path_separator(value: &str) -> bool {
 }
 
 /// Resolves `command` per this module's doc comment: unchanged if it looks
-/// like a bare command name, else joined against `dir`.
+/// like a bare command name, else joined against `dir` and passed through
+/// [`resolve_exe_suffix`] for the platform-suffix fallback.
 fn resolve_path_entry(value: &str, dir: &Path) -> PathBuf {
     if has_path_separator(value) {
-        dir.join(value)
+        resolve_exe_suffix(dir.join(value), std::env::consts::EXE_SUFFIX)
     } else {
         PathBuf::from(value)
     }
+}
+
+/// Falls back to the platform's suffixed spelling (e.g. `.exe` on Windows)
+/// for a resolved `command` path that does not exist as written - see this
+/// module's doc comment for why cargo's two workspace-built plugins need
+/// this and the Go plugin does not.
+///
+/// Only actually switches to the suffixed spelling once it is confirmed to
+/// exist (`suffixed.is_file()`): a spelling that resolves to nothing on disk
+/// either way is left exactly as the manifest wrote it, rather than guessed
+/// at, so a genuinely-missing binary still names the path this function
+/// actually resolved when [`crate::daemon::plugin::missing_workspace_binary_hint`]
+/// separately decides what to report for it (that function re-derives the
+/// suffixed spelling itself for its message, via the same [`exe_suffixed`]
+/// this function uses, rather than trusting `command` to already carry it -
+/// see its own doc comment).
+///
+/// `suffix` is a parameter, not read from [`std::env::consts::EXE_SUFFIX`]
+/// internally, so a test can exercise the Windows arm (`".exe"`) from any
+/// host - the constant itself is fixed at compile time to whatever platform
+/// built the test binary.
+fn resolve_exe_suffix(resolved: PathBuf, suffix: &str) -> PathBuf {
+    if resolved.is_file() {
+        return resolved;
+    }
+    match exe_suffixed(&resolved, suffix) {
+        Some(suffixed) if suffixed.is_file() => suffixed,
+        _ => resolved,
+    }
+}
+
+/// Appends `suffix` to `path`'s file name, unless `path` already has an
+/// extension or `suffix` is empty (the non-Windows case, where
+/// [`std::env::consts::EXE_SUFFIX`] is `""` and this must be a no-op).
+/// Pure and filesystem-independent - both [`resolve_exe_suffix`] (which adds
+/// the "does the suffixed spelling actually exist" check on top) and
+/// `daemon::plugin::missing_workspace_binary_hint` (which uses the suffixed
+/// spelling to name what a spawn attempt was actually missing, whether or
+/// not it exists) share this one decision of what the suffixed spelling
+/// *is*, rather than each re-deriving it.
+pub(crate) fn exe_suffixed(path: &Path, suffix: &str) -> Option<PathBuf> {
+    if suffix.is_empty() || path.extension().is_some() {
+        return None;
+    }
+    let mut name = path.file_name()?.to_os_string();
+    name.push(suffix);
+    Some(path.with_file_name(name))
 }
 
 /// Resolves one `args` entry the same way as [`resolve_path_entry`], but
@@ -1302,6 +1365,130 @@ watch_files = ["[unclosed"]
     #[test]
     fn an_arg_with_no_path_separator_is_left_untouched() {
         assert_eq!(resolve_arg("--verbose", Path::new("/plugins/python")), "--verbose");
+    }
+
+    // -----------------------------------------------------------------
+    // GM-335: Windows `.exe` suffix fallback
+    // -----------------------------------------------------------------
+    //
+    // `exe_suffixed` and `resolve_exe_suffix` both take the platform suffix
+    // as a parameter rather than reading `std::env::consts::EXE_SUFFIX`
+    // internally, specifically so the Windows arm (`".exe"`) can be
+    // exercised from any host - these tests pass it explicitly rather than
+    // `cfg!(windows)`-gating anything away on macOS/Linux.
+
+    #[test]
+    fn exe_suffixed_appends_the_suffix_to_an_extensionless_path() {
+        assert_eq!(
+            exe_suffixed(Path::new("/plugins/python/g-mesh-plugin-python"), ".exe"),
+            Some(PathBuf::from("/plugins/python/g-mesh-plugin-python.exe")),
+        );
+    }
+
+    #[test]
+    fn exe_suffixed_is_none_for_an_empty_suffix() {
+        // The non-Windows case: `std::env::consts::EXE_SUFFIX` is `""` there,
+        // and this must be a no-op.
+        assert_eq!(exe_suffixed(Path::new("/plugins/python/g-mesh-plugin-python"), ""), None);
+    }
+
+    #[test]
+    fn exe_suffixed_is_none_for_a_path_that_already_has_an_extension() {
+        assert_eq!(exe_suffixed(Path::new("/plugins/typescript/dist/src/index.js"), ".exe"), None);
+    }
+
+    /// The fix under test: a cargo-workspace plugin's binary, present only
+    /// under its Windows spelling, must still resolve. This is the test that
+    /// catches GM-335 being reintroduced - it fails if `resolve_exe_suffix`
+    /// is reverted to returning `resolved` unconditionally (verified below by
+    /// disabling the fix and re-running).
+    #[test]
+    fn resolve_exe_suffix_falls_back_to_the_suffixed_spelling_when_only_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsuffixed = dir.path().join("g-mesh-plugin-python");
+        let suffixed = dir.path().join("g-mesh-plugin-python.exe");
+        fs::write(&suffixed, b"").unwrap();
+        // Deliberately not creating `unsuffixed` - this is exactly the shape
+        // `cargo build --workspace` leaves on Windows: only the `.exe` exists.
+
+        assert_eq!(resolve_exe_suffix(unsuffixed, ".exe"), suffixed);
+    }
+
+    #[test]
+    fn resolve_exe_suffix_prefers_the_unsuffixed_spelling_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsuffixed = dir.path().join("g-mesh-plugin-go");
+        fs::write(&unsuffixed, b"").unwrap();
+        // A `.exe` sibling existing too would be surprising for this plugin,
+        // but even so the unsuffixed spelling that's actually there wins -
+        // this is the Go plugin's real shape (its own build step never
+        // produces a suffixed binary at all).
+
+        assert_eq!(resolve_exe_suffix(unsuffixed.clone(), ".exe"), unsuffixed);
+    }
+
+    #[test]
+    fn resolve_exe_suffix_leaves_a_genuinely_missing_path_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsuffixed = dir.path().join("g-mesh-plugin-python");
+        // Neither spelling exists - the "never built" case.
+
+        assert_eq!(resolve_exe_suffix(unsuffixed.clone(), ".exe"), unsuffixed);
+    }
+
+    #[test]
+    fn resolve_exe_suffix_is_a_no_op_on_a_platform_with_no_exe_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsuffixed = dir.path().join("g-mesh-plugin-python");
+        fs::write(dir.path().join("g-mesh-plugin-python.exe"), b"").unwrap();
+
+        // Even with a `.exe` sibling sitting right there, an empty suffix
+        // (what `std::env::consts::EXE_SUFFIX` actually is on macOS/Linux)
+        // must never switch to it.
+        assert_eq!(resolve_exe_suffix(unsuffixed.clone(), ""), unsuffixed);
+    }
+
+    /// End-to-end through `read_manifest`: a `plugin.toml` shaped exactly
+    /// like `plugins/python/plugin.toml` (a relative `command` into
+    /// `../../target/debug/...`), with only the `.exe` spelling present on
+    /// disk, must resolve `command` to that `.exe` path - not fail, and not
+    /// silently keep the unsuffixed spelling that `Command::spawn` could
+    /// never find. This exercises `resolve_path_entry` itself (which always
+    /// uses the real `std::env::consts::EXE_SUFFIX`), so it only proves the
+    /// fix on a host where that constant is non-empty; the suffix-parameterized
+    /// tests above cover the Windows arm unconditionally.
+    #[test]
+    fn a_manifest_command_resolves_to_the_exe_suffixed_binary_when_only_it_exists() {
+        if std::env::consts::EXE_SUFFIX.is_empty() {
+            // Nothing to prove on this platform - see doc comment above.
+            return;
+        }
+        let body = format!(
+            r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "../../target/debug/g-mesh-plugin-python"
+
+[plugin.languages]
+extensions = [".py"]
+"#,
+            version = CURRENT_PROTOCOL_VERSION,
+        );
+        let (root, dir) = plugin_dir("python", &body);
+        let target_debug = root.path().join("target").join("debug");
+        fs::create_dir_all(&target_debug).unwrap();
+        fs::write(target_debug.join(format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX)), b"")
+            .unwrap();
+
+        let manifest = read_manifest(&dir).unwrap();
+        assert_eq!(
+            manifest.command,
+            target_debug.join(format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX)),
+        );
     }
 
     /// The bundled JS/TS plugin's own `plugin.toml` (`plugins/typescript/plugin.toml`,

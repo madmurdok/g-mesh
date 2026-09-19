@@ -704,7 +704,32 @@ pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option
 /// own doc comment), so a checkout missing even one workspace-built plugin's
 /// binary needs the whole-workspace build to get unstuck, not just the one
 /// crate the failure happened to name.
+///
+/// # Which spelling the message names
+///
+/// `command` reaching this function already went through
+/// `manifest::resolve_exe_suffix` once, at manifest-read time - so on a
+/// platform with a non-empty [`std::env::consts::EXE_SUFFIX`] (Windows),
+/// `command` is extensionless *here* only when neither the unsuffixed nor
+/// the suffixed spelling exists (if the suffixed one did, resolution would
+/// already have switched to it). Reporting `command` as written in that case
+/// would name a spelling cargo never produces on that platform at all -
+/// wrong in a different way than the bare `No such file or directory` this
+/// function exists to replace, not an improvement over it. So this
+/// re-derives the suffixed spelling via [`manifest::exe_suffixed`] (the same
+/// pure decision `resolve_exe_suffix` itself uses) purely for the message,
+/// independent of whether that file exists - it's the name a real
+/// `cargo build --workspace` on this platform would actually produce, and
+/// therefore the one a spawn attempt is actually missing.
 pub(crate) fn missing_workspace_binary_hint(command: &Path) -> Option<String> {
+    missing_workspace_binary_hint_with_suffix(command, std::env::consts::EXE_SUFFIX)
+}
+
+/// [`missing_workspace_binary_hint`]'s logic with the platform suffix taken
+/// as a parameter rather than read from [`std::env::consts::EXE_SUFFIX`]
+/// internally, so a test can exercise the Windows arm (`".exe"`) from any
+/// host.
+fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Option<String> {
     if command.is_file() {
         return None;
     }
@@ -718,16 +743,20 @@ pub(crate) fn missing_workspace_binary_hint(command: &Path) -> Option<String> {
         return None;
     }
     let workspace_root = target_dir.parent().filter(|root| root.join("Cargo.toml").is_file());
+
+    let named =
+        crate::daemon::manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
+
     Some(match workspace_root {
         Some(root) => format!(
             "the plugin binary {} does not exist - it has not been built yet. Run `cargo build --workspace` in {}",
-            command.display(),
+            named.display(),
             root.display()
         ),
         None => format!(
             "the plugin binary {} does not exist - it has not been built yet (run `cargo build --workspace` in \
              the repository root)",
-            command.display()
+            named.display()
         ),
     })
 }
@@ -1603,6 +1632,52 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let binary = workspace.path().join("bin").join("g-mesh-plugin-go");
         assert_eq!(missing_workspace_binary_hint(&binary), None);
+    }
+
+    /// GM-335: on Windows, `manifest::resolve_exe_suffix` only ever switches
+    /// `command` to the `.exe` spelling once that file is confirmed to
+    /// exist - so a genuinely-missing binary reaches this function still
+    /// spelled without a suffix, exactly as `plugins/python/plugin.toml`
+    /// writes it. The hint must still name the `.exe` spelling, since that's
+    /// what a real `cargo build --workspace` on Windows actually produces
+    /// and therefore what a spawn attempt is actually missing - reporting
+    /// the unsuffixed spelling (what `command` is literally holding here)
+    /// would misname the missing file, not just fail to help with it. This
+    /// is the test that catches the message regressing back to `command`
+    /// unmodified - see this test module's own
+    /// `missing_workspace_binary_hint_names_the_binary_and_the_build_command`
+    /// for the non-Windows-suffix baseline this builds on, and this function's
+    /// own "Which spelling the message names" doc comment for the reasoning.
+    #[test]
+    fn missing_workspace_binary_hint_names_the_exe_suffixed_spelling_on_windows() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        // Exactly what `manifest::resolve_path_entry` leaves `command` as
+        // when neither spelling exists: unsuffixed, per the manifest itself.
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-python");
+
+        let hint = missing_workspace_binary_hint_with_suffix(&binary, ".exe")
+            .expect("a missing target/debug binary must get a hint");
+
+        assert!(hint.contains("g-mesh-plugin-python.exe"), "{hint}");
+        assert!(!hint.contains("g-mesh-plugin-python does not exist"), "{hint}");
+    }
+
+    /// Once the `.exe` file actually exists, `command` itself would already
+    /// have been switched to it by `manifest::resolve_exe_suffix` before ever
+    /// reaching this function - so from this function's own point of view
+    /// (which only sees whatever `command` it was handed), an existing
+    /// suffixed binary reads as `command.is_file()` and produces no hint at
+    /// all, the same as the plain "binary exists" case.
+    #[test]
+    fn missing_workspace_binary_hint_is_none_when_the_command_already_carries_the_suffix() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path().join("target").join("debug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("g-mesh-plugin-python.exe");
+        std::fs::write(&binary, b"").unwrap();
+
+        assert_eq!(missing_workspace_binary_hint_with_suffix(&binary, ".exe"), None);
     }
 
     /// [`missing_plugin_binary_hint`] tries the node-entry check first and
