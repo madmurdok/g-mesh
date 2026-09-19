@@ -21,6 +21,23 @@ on:
   # the state this file exists to end, and the only way to be sure it is the
   # *same* checks is to call the same workflow.
   workflow_call:
+  # GM-343. Until this existed there was no way to ask CI anything without
+  # pushing a commit, and no way to ask it of one platform - so every Windows
+  # question through the 3.6.0 and 3.7.0 batches cost a four-platform matrix,
+  # three rows of which were already known green and stayed green throughout.
+  # The default is still all four: this is an extra door, not a narrower one.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which platform to test. `all` is the default and is what push and PR still do.
+        type: choice
+        default: all
+        options:
+          - all
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
 
 permissions:
   contents: read
@@ -30,6 +47,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # GM-343. The matrix is computed rather than literal so that a dispatch can
+  # narrow it, and so that narrowing it *fails* on a name we do not recognise
+  # instead of quietly selecting nothing. A skipped matrix job renders almost
+  # exactly like a passed one, which is the single real hazard here: a partial
+  # run must never be mistaken later for a full one.
+  matrix:
+    name: Select the platforms to test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.select.outputs.include }}
+      partial: ${{ steps.select.outputs.partial }}
+    steps:
+      - id: select
+        shell: bash
+        env:
+          # Empty on push, pull_request and workflow_call - none of which take
+          # inputs - so those all land on `all`, unchanged.
+          TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          set -euo pipefail
+          # The same four rows release.yml builds. Kept in step with the
+          # comment that used to sit on the literal matrix below.
+          all='[
+            {"target":"x86_64-apple-darwin","runner":"macos-15-intel"},
+            {"target":"aarch64-apple-darwin","runner":"macos-15"},
+            {"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-22.04"},
+            {"target":"x86_64-pc-windows-msvc","runner":"windows-2022"}
+          ]'
+          if [ "$TARGET" = all ]; then
+            include="$(printf '%s' "$all" | jq -c .)"
+            partial=false
+          else
+            include="$(printf '%s' "$all" | jq -c --arg t "$TARGET" '[.[] | select(.target == $t)]')"
+            if [ "$(printf '%s' "$include" | jq 'length')" -ne 1 ]; then
+              echo "::error::unknown target '$TARGET' - it matches none of the four rows this workflow knows" >&2
+              exit 1
+            fi
+            partial=true
+            {
+              echo "## Partial run"
+              echo
+              echo "Only \`$TARGET\` was tested. **This run says nothing about the other three platforms.**"
+              echo
+              echo "It was started with \`workflow_dispatch\` and a \`target\` input; an ordinary push runs all four."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+          echo "partial=$partial" >> "$GITHUB_OUTPUT"
+          echo "testing: $include"
+
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-22.04
@@ -76,6 +144,7 @@ jobs:
 
   test:
     name: tests (${{ matrix.target }})
+    needs: matrix
     runs-on: ${{ matrix.runner }}
     env:
       RUST_VERSION: "1.97.1"
@@ -99,18 +168,72 @@ jobs:
         # ships is a target whose tests ran. Kept in step by hand rather than
         # shared, because the two matrices carry different extra fields and a
         # merged one would be harder to read than two honest copies.
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2022
+        #
+        # Computed by the `matrix` job above rather than written here, so a
+        # `workflow_dispatch` can narrow it (GM-343). The rows themselves are
+        # unchanged and live in that job's script.
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
 
     steps:
       - uses: actions/checkout@v7
+
+      # GM-342. `scripts/install.ps1` is 616 lines that, until this step, had
+      # never been executed OR parsed by anything: PowerShell is absent from
+      # the machine it was written on, and no job invoked it. GM-208 caught
+      # three real bugs in it by reading - `-match` on a multi-line array
+      # returning elements rather than a boolean, `$IsWindows` not existing on
+      # 5.1 and being fatal under StrictMode, and `Move-Item` refusing a
+      # cross-volume move - which is the argument for that review and equally
+      # the argument for this: they were found by attention, not by a process.
+      #
+      # First, because it is the cheapest possible failure and needs nothing
+      # installed - the Windows runner already has PowerShell.
+      #
+      # PARSING IS NOT EXECUTION, and a green tick here must not be read as
+      # "the installer works". It says nothing about Invoke-WebRequest,
+      # Expand-Archive, Get-FileHash's output shape, the cross-volume
+      # fallback, $LASTEXITCODE after a native binary, or the `throw`-under-
+      # `iex` behaviour `Die` depends on. StrictMode is a *runtime* setting
+      # and is not covered either. Running the thing end to end is GM-333.
+      - name: install.ps1 parses under PowerShell
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = (Resolve-Path 'scripts/install.ps1').Path
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            Write-Host "::error file=scripts/install.ps1::install.ps1 does not parse - $($errors.Count) error(s) follow"
+            foreach ($e in $errors) {
+              Write-Host ("  line {0}, col {1}: {2}" -f $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)
+            }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly under PowerShell $($PSVersionTable.PSVersion)"
+
+      # GM-342, the half that is informational ON PURPOSE for now. Every bug
+      # the manual review found is in PSScriptAnalyzer's range, so it is worth
+      # running - but nobody here has seen its output on this file, and
+      # turning an unseen lint into a required gate is how a gate starts
+      # failing for reasons unrelated to the change in front of it. The first
+      # real run decides: quiet, and `continue-on-error` comes off and this
+      # becomes a gate; noisy, and the triage belongs in its own diff.
+      - name: install.ps1 lint (informational until its output has been read)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber | Out-Null
+          }
+          $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' -Severity Error,Warning
+          if (-not $found) {
+            Write-Host 'PSScriptAnalyzer: nothing to report'
+            return
+          }
+          $found | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200 | Write-Host
+          Write-Host "PSScriptAnalyzer reported $($found.Count) finding(s) - informational, see this step's comment in ci.yml"
 
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate
