@@ -174,36 +174,97 @@ fn missing_toolchain() -> PluginCheck {
         .manifest_extra(semantic_section(Some(&nowhere)))
 }
 
+/// GM-341: the npm shim extension worth trying beyond a bare spelling, on the
+/// host this test actually runs on - empty everywhere but Windows, where
+/// `npm install pyright` writes `pyright-langserver.cmd`, not a `.exe`
+/// `std::process::Command` would find bare. Independently spelled from
+/// `plugins/python/src/semantic.rs`'s own `WINDOWS_SCRIPT_EXTENSIONS`/
+/// `HOST_SCRIPT_EXTENSIONS` rather than shared with it: this test exists to
+/// assert a real pyright resolves, and resolving it through the plugin's own
+/// candidate list would let a bug in that list pass the very test built to
+/// catch it.
+const WINDOWS_SCRIPT_EXTENSIONS: [&str; 1] = [".cmd"];
+#[cfg(windows)]
+const HOST_SCRIPT_EXTENSIONS: &[&str] = &WINDOWS_SCRIPT_EXTENSIONS;
+#[cfg(not(windows))]
+const HOST_SCRIPT_EXTENSIONS: &[&str] = &[];
+
+/// `path` with `extension` appended to its file name - `path` unchanged when
+/// `extension` is empty. `path` here is always one of the two bare names
+/// [`pyright_langserver`] tries, never a spelling that already carries an
+/// extension, so unlike `plugins/python/src/semantic.rs`'s `script_spellings`
+/// this does not need to guard against doubling one.
+fn spelled(path: &Path, extension: &str) -> PathBuf {
+    if extension.is_empty() {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_name().expect("a bin name, not a root or an empty path").to_os_string();
+    name.push(extension);
+    path.with_file_name(name)
+}
+
 /// The pyright-langserver these tests need.
 ///
 /// Resolved from this crate's own `node_modules` first (where the module doc
 /// says to install it, and the only place a checkout can be sure of), and from
-/// `PATH` otherwise, for a machine with a global install. Each is proved the
-/// way the plugin itself proves one: by running the *CLI twin*, because
-/// `pyright-langserver --version` exits 1 with "Connection input stream is not
-/// set" and would reject a perfectly good server.
+/// `PATH` otherwise, for a machine with a global install. Each is tried both
+/// bare and, per [`HOST_SCRIPT_EXTENSIONS`], with a platform script extension
+/// appended - GM-341: on Windows the npm install neither of those bare names
+/// resolves to is `pyright-langserver.cmd`, and `std::process::Command`'s
+/// `PATH` lookup does not try that spelling on its own (see
+/// `plugins/python/src/semantic.rs`'s module doc, Decision 1b, for the full
+/// argument; not re-made here to keep this one focused on what the test
+/// needs). Each spelling is proved the way the plugin itself proves one: by
+/// running the *CLI twin*, because `pyright-langserver --version` exits 1
+/// with "Connection input stream is not set" and would reject a perfectly
+/// good server.
 ///
 /// Deliberately not a `None` that turns into a skip: see this file's module
 /// doc.
 fn pyright_langserver() -> PathBuf {
     let local = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/node_modules/.bin"));
-    let candidates = [local.join("pyright-langserver"), PathBuf::from("pyright-langserver")];
-    for candidate in &candidates {
-        let twin = candidate.with_file_name("pyright");
-        let usable = std::process::Command::new(&twin)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success());
-        if usable {
-            return candidate.clone();
+    let bases = [local.join("pyright-langserver"), PathBuf::from("pyright-langserver")];
+    let extensions: Vec<&str> = std::iter::once("").chain(HOST_SCRIPT_EXTENSIONS.iter().copied()).collect();
+
+    let mut tried = Vec::new();
+    for base in &bases {
+        let cli_base = base.with_file_name("pyright");
+        for extension in &extensions {
+            let server = spelled(base, extension);
+            let cli = spelled(&cli_base, extension);
+            tried.push(server.clone());
+            let usable = std::process::Command::new(&cli)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if usable {
+                return server;
+            }
         }
     }
     panic!(
-        "these tests drive a real pyright and there is none that works: tried {candidates:?} through \
+        "these tests drive a real pyright and there is none that works: tried {tried:?} through \
          their `pyright --version` twin. Install it with `npm install pyright` run in \
          plugins/python (node_modules/ is gitignored there). Note that `pyright-langserver \
          --version` is NOT a way to check - it has no such flag and always exits 1."
     )
+}
+
+/// [`pyright_langserver`]'s extension-expansion, isolated from any real
+/// filesystem - the Windows arm exercised from this host, exactly as
+/// `plugins/python/src/semantic.rs`'s `script_spellings` is by its own tests.
+#[test]
+fn spelled_tries_the_bare_name_then_every_script_extension() {
+    let bare = PathBuf::from("pyright-langserver");
+    let tried: Vec<PathBuf> = std::iter::once("")
+        .chain(WINDOWS_SCRIPT_EXTENSIONS.iter().copied())
+        .map(|extension| spelled(&bare, extension))
+        .collect();
+    assert_eq!(
+        tried,
+        vec![PathBuf::from("pyright-langserver"), PathBuf::from("pyright-langserver.cmd")],
+        "the bare spelling first, then each Windows script extension appended"
+    );
 }
 
 /// Every `expectations.*` verdict the report carries, by check id.
