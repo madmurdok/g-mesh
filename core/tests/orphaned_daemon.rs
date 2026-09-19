@@ -283,18 +283,33 @@ fn a_daemon_whose_own_executable_is_deleted_stops_itself() {
 /// likeliest real-world way a daemon's binary leaves from under it, and it
 /// was not covered on any platform before.
 ///
-/// What it rests on, and what a failure here would mean: `orphan_check` asks
-/// `std::env::current_exe()`, and this test is only meaningful if that keeps
-/// answering the path the process was started from after the rename. On Unix
-/// it does - `/proc/self/exe` and its equivalents resolve the inode, and a
-/// renamed file reports its old path as `NotFound`. On Windows
-/// `GetModuleFileNameW` reads the loader's record of the image path, captured
-/// at load and not rewritten by a later rename, so it should answer the same
-/// way. "Should" is doing real work in that sentence: it was not verified on
-/// a Windows machine, only reasoned about, and this test is what decides it.
-/// If it fails there with the daemon still running, the finding is not about
-/// the test - it is that `orphan_check` cannot see this kind of orphaning on
-/// Windows, and `lifecycle.rs` is what has to change.
+/// What it rests on is `std::env::current_exe()` continuing to answer the path
+/// the process was started from after the rename - and whether it does splits
+/// the platforms in two, which CI measured rather than anyone predicting:
+///
+/// * macOS and Windows freeze the path at exec. `_NSGetExecutablePath` returns
+///   what was passed to exec, and `GetModuleFileNameW` reads the loader's
+///   record of the image path; neither is rewritten by a later rename. The old
+///   path stops resolving, `orphan_check` sees `NotFound`, the daemon stops.
+///   Run 35450145624: PASS on Windows in 1.740s, PASS on both macOS arches.
+/// * Linux does not. `/proc/self/exe` is a magic symlink to the *inode*, and
+///   the kernel resolves it to whatever path that inode currently has - so
+///   after a rename `current_exe()` answers the NEW path, which exists, and
+///   nothing is orphaned. Same run: FAIL, 61s, the daemon still running.
+///   Confirmed directly, outside this suite, with a five-line program in a
+///   `rust:1-slim` container renamed while running: `at start: Ok("/w/probe")`
+///   then `after rename: Ok("/w/probe.superseded")`, `path exists = true`.
+///
+/// That is not a gap in `orphan_check`, which is why nothing in `lifecycle.rs`
+/// changed: on Linux the executable genuinely is still there and still
+/// reachable, and `is_definitely_gone`'s whole contract is reachability. The
+/// Linux arm below asserts that behaviour rather than skipping it.
+///
+/// Nor does it leave the upgrade path uncovered there. `scripts/install.sh`
+/// renames the old install directory aside and then `rm -rf`s it, so on Linux
+/// an upgrade ends in a real unlink - which is
+/// [`a_daemon_whose_own_executable_is_deleted_stops_itself`], directly above.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn a_daemon_whose_own_executable_is_renamed_away_stops_itself() {
     let project = Project::new();
@@ -315,6 +330,42 @@ fn a_daemon_whose_own_executable_is_renamed_away_stops_itself() {
 
     common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
     assert_released_everything(&project, &mut daemon_process, plugin_pid);
+}
+
+/// The Linux half of the rename case, stated as behaviour rather than left as
+/// a hole in the platform matrix: there, moving the executable aside does NOT
+/// orphan the daemon, and must not.
+///
+/// `/proc/self/exe` is a symlink to the inode, so `current_exe()` follows the
+/// file to its new name and answers a path that exists. `is_definitely_gone`
+/// asks whether a file is still reachable, and it is - so the honest answer on
+/// this platform is "not orphaned", and a daemon that stopped here would be
+/// stopping on a file that never went anywhere.
+///
+/// Watches for [`CONTROL_WATCH`] for the same reason the control below does:
+/// so "it had not got round to it yet" is not an available explanation.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_whose_own_executable_is_renamed_away_is_left_alone_because_linux_follows_the_inode() {
+    let project = Project::new();
+    let (bin_dir, copied_bin) = daemon_from_a_copy_of_the_binary();
+
+    let mut daemon_process = Daemon::spawn(&copied_bin, project.root());
+    let _plugin_pid = wait_until_fully_up(&project);
+
+    let moved_aside = bin_dir.path().join("g-mesh.superseded");
+    std::fs::rename(&copied_bin, &moved_aside).expect("failed to move the daemon's own executable aside");
+    assert!(moved_aside.exists(), "the executable must still exist under its new name");
+    assert!(!copied_bin.exists(), "nothing may remain at the path the daemon was started from");
+
+    std::thread::sleep(CONTROL_WATCH);
+
+    assert!(
+        daemon_process.is_running(),
+        "on Linux current_exe() follows the inode to the new name, so a renamed-away executable is \
+         still reachable and the daemon must keep running - an upgrade's actual unlink is covered by \
+         a_daemon_whose_own_executable_is_deleted_stops_itself"
+    );
 }
 
 /// The control. Same fixture, same timeouts, same wait - and nothing deleted.
