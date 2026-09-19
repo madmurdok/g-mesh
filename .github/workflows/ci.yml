@@ -332,25 +332,30 @@ jobs:
       # written to sleep forever comes back as `TIMEOUT [8.066s]
       # g-mesh::zz_hang_probe a_test_that_never_finishes`.
       #
-      # Left at 15 rather than raised, though this step's first-ever Windows
-      # run (run 35434554867) hit it: that run's 21 failures were 20 copies of
-      # one cause (GM-335 - `plugins/python` and `plugins/rust`'s binaries
-      # were unspawnable on Windows because cargo always emits `.exe` there
-      # and the manifests named the suffix-less path), each then burning its
-      # full 60-90s per-test budget on a cold-start index that could never
-      # finish, which is what left 140 of 1298 tests never reached at all -
-      # not the suite being too large for 15 minutes on a healthy run. With
-      # that fixed, a full `cargo test --workspace` locally (macOS, all four
-      # bundled plugins built and their semantic tiers exercised, load average
-      # 8.7/19.4/19.7 - a loaded dev machine, not a quiet runner) finished in
-      # 343s real (207s user, 74s sys), comfortably inside this budget even
-      # before nextest's cross-binary parallelism. That is evidence this
-      # number now fits, not a measurement of Windows itself - this sandbox
-      # has no Windows runner, so the honest thing is to leave the number
-      # alone and let this fix's own first green Windows run be the real
-      # measurement, rather than guess a new one from a macOS number.
+      # 25, not 15, and the number is a measurement rather than a margin.
+      # This budget covers the *build* as well as the run, which is most of
+      # it. On run 35443197107 the x86_64 macOS job was killed at 15:00 with
+      # every one of its 1327 tests passing:
+      #
+      #   step start  12:36:47
+      #   build done  12:46:00   (`Finished test profile ... in 9m 03s`)
+      #   tests start 12:46:05
+      #   Summary     12:51:50   (345s, 1327 passed, 0 failed)
+      #   killed      12:51:51
+      #
+      # 9m03s + 5m45s = 14m53s against 15m - it lost by seconds, on a green
+      # suite, because `macos-15-intel` is the slowest image in the matrix and
+      # a cold debug build of this workspace is nine minutes there. Windows on
+      # the same run: 8m21s total, of which 165s was the tests.
+      #
+      # That job had been passing until GM-335 touched `core/build.rs`, which
+      # invalidates every downstream crate - so the margin had been thin for a
+      # while and nothing had made it visible. 25 leaves roughly 10 minutes of
+      # headroom over the worst observed total while still bounding a genuine
+      # hang, and nextest reports a stuck test as `SLOW`/`TIMEOUT` long before
+      # this fires (see the paragraph above).
       - name: cargo nextest run
-        timeout-minutes: 15
+        timeout-minutes: 25
         shell: bash
         env:
           G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
