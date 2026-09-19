@@ -499,7 +499,40 @@ jobs:
         # round-trip tests *and* the plugin SDK's - including the SDK's toy
         # plugin going through the real `g-mesh plugins check`, which is the
         # only place the SDK's own conformance is proved.
-        run: cargo nextest run --workspace
+        # `--profile ci` only adds the JUnit file (GM-344); nothing about how
+        # the tests run changes - see `.config/nextest.toml`.
+        run: cargo nextest run --workspace --profile ci
+
+      # GM-344. So a platform's state is readable on the run page instead of
+      # by downloading the log and writing a regex - which produced a wrong
+      # count twice in one session, in the same direction both times.
+      #
+      # `always()` because the interesting case is the failing one, and the
+      # step above has already failed the job by the time this runs.
+      - name: Test results, by binary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          junit=target/nextest/ci/junit.xml
+          if [ ! -f "$junit" ]; then
+            echo "No JUnit at \`$junit\` - nextest did not get far enough to write one." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # `python3` on the Unix images, `python` on windows-2022.
+          py="$(command -v python3 || command -v python)"
+          "$py" scripts/ci-junit-summary.py "$junit" "${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Kept for every run, not only failing ones: GM-345's run-to-run diff
+      # needs both sides, and the green side is the one nobody thinks to keep.
+      - name: Keep the JUnit results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.target }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 30
 
       # GM-277's conformance kit, per bundled plugin that has one -
       # `plugins/*/conformance/{project,expect.toml}` - on the same four
