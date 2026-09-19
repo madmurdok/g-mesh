@@ -97,9 +97,21 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 ///
 /// A bare `command` (the manifest's default, `rust-analyzer`) is looked up on
 /// `PATH` by the operating system - `Command::new` does that for us, on every
-/// platform, including Windows' `PATHEXT` rules that a hand-rolled `PATH`
-/// walk gets wrong - and, if that candidate does not behave like a server,
-/// `rustup which` is asked for the toolchain's own copy.
+/// platform - and, if that candidate does not behave like a server, `rustup
+/// which` is asked for the toolchain's own copy.
+///
+/// **Correction, GM-341:** an earlier version of this comment said
+/// `Command::new`'s `PATH` lookup honours Windows' `PATHEXT` rules. It does
+/// not - measured false for `plugins/python`'s pyright, whose npm install is
+/// a `.cmd` shim `Command::new` cannot find bare, and documented
+/// `CreateProcess` behaviour rather than a `PATHEXT` walk explains why: given
+/// an extensionless name, Windows' own process-creation API tries only that
+/// name and `<name>.exe`, nothing else - `PATHEXT` is `cmd.exe`'s rule, not
+/// `CreateProcess`'s. This plugin has no *consequence* from the same mistake,
+/// and that is luck rather than design: `rustup` ships `rust-analyzer` as a
+/// native `rust-analyzer.exe`, so the one extension `Command::new` does try
+/// is already the right one. See `plugins/python/src/semantic.rs`'s module
+/// doc, Decision 1b, for the fix that plugin needed and this one did not.
 ///
 /// A `command` that is a *path* is not searched for: someone who wrote a path
 /// into the manifest meant that file, and quietly running a different binary
