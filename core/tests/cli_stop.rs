@@ -164,7 +164,17 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
 
     let output = project.stop();
 
-    assert!(output.contains(&format!("daemon core: pid {core}")), "{output}");
+    // Which *rung* stopped the core, not merely that it was named. GM-320: the
+    // escalation to `SIGKILL` means this command goes on succeeding if the
+    // polite rung quietly stops working, so without this assertion a daemon
+    // that ignored every `SIGTERM` would pass this whole file - the verdict is
+    // the only place that difference is visible. `core/tests/daemon_sigterm.rs`
+    // makes the same claim directly against a raw signal; this one makes it
+    // about what a user is told.
+    assert!(
+        output.contains(&format!("daemon core: pid {core} (terminated)")),
+        "the core must stop when it is asked, not have to be killed:\n{output}"
+    );
     assert!(output.contains(&format!("plugin (typescript): pid {plugin}")), "{output}");
     assert!(!daemon::is_process_alive(core), "the daemon core (pid {core}) is still running after stop");
     assert!(!daemon::is_process_alive(plugin), "the plugin (pid {plugin}) was orphaned by stop");

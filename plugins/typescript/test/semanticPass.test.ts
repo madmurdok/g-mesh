@@ -42,6 +42,47 @@ async function makeProject(files: Record<string, string>): Promise<string> {
 /** For fixtures that put their sources under `src/`. */
 const TSCONFIG = JSON.stringify({ compilerOptions: { strict: true }, include: ["src"] }) + "\n";
 
+/**
+ * GM-322: does `ProjectIndex.indexedPathOf` (this file's private class - not
+ * exported, so this drives the primitive it is actually built from rather
+ * than the private method itself) need a fix too, or was the bug confined to
+ * semantic.test.ts/security.test.ts's own string comparisons?
+ *
+ * `indexedPathOf` matches a `DefinitionLocation.file` from tsserver -
+ * forward-slash-spelled on Windows, confirmed on real Windows CI run
+ * 35363320719 - against `this.roots`, which are native-separator (backslash
+ * on Windows). It does that with `path.relative(root, absolute)`, then
+ * `toPosixPath` on the result. This is macOS, so `path` here is `path.posix`
+ * and can't reproduce Windows behavior - but `path.win32` is a pure-JS
+ * module with no OS calls, so it runs the exact win32 algorithm on any
+ * platform. That is what this test drives, standing in for
+ * `path.relative`/`path.sep` inside `indexedPathOf` when the process is
+ * actually on Windows.
+ *
+ * It would fail if `path.win32.relative` required matching separator styles
+ * in its two arguments - which is the shape the bug would take here, and
+ * exactly the assumption worth checking rather than taking on faith.
+ */
+test("path.win32.relative tolerates a tsserver-style forward-slash answer against a native-separator project root", () => {
+  const win32 = path.win32;
+  const root = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\gmesh-semantic-uqbMIM";
+  const tsserverAnswer = "C:/Users/RUNNER~1/AppData/Local/Temp/gmesh-semantic-uqbMIM/src/util.ts";
+
+  const relative = win32.relative(root, tsserverAnswer);
+  assert.equal(relative, "src\\util.ts", "path.win32.relative must resolve the split correctly either way");
+
+  // The second step indexedPathOf takes: toPosixPath (ignorePolicy.ts) splits
+  // on the *platform's* path.sep and joins with "/". On an actual Windows
+  // process that separator is "\\", which is what win32.sep is here too.
+  const posix = relative.split(win32.sep).join("/");
+  assert.equal(posix, "src/util.ts", "the project-relative path indexedPathOf produces must be forward-slash");
+
+  // Sanity: a genuinely different file must still come out different -
+  // win32-leniency about separators must not make this comparison vacuous.
+  const otherAnswer = "C:/Users/RUNNER~1/AppData/Local/Temp/gmesh-semantic-uqbMIM/src/other.ts";
+  assert.notEqual(win32.relative(root, otherAnswer), relative);
+});
+
 /** For the barrel fixtures, whose files sit at the project root. */
 const ROOT_TSCONFIG = JSON.stringify({ compilerOptions: { strict: true } }) + "\n";
 

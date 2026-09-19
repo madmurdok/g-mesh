@@ -34,6 +34,20 @@ the plugin is a separate Node entry point the daemon launches with `node`.
 curl -fsSL https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.sh | sh
 ```
 
+**What it runs on.** Intel and Apple Silicon macOS; x86_64 Linux with
+**glibc 2.34 or newer** — Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 35+;
+Windows x86_64 through `install.ps1`. There is no aarch64 Linux build and no
+musl build. The glibc floor is not a guess: GM-332 measured it by starting
+the published artifact in containers, and below 2.34 it does not start at all
+(`libc.so.6: version 'GLIBC_2.34' not found`), which rules out **Ubuntu
+20.04, Debian 11, RHEL 8, Amazon Linux 2 and CentOS 7**. Two things put it
+there — glibc 2.34 itself, which moved `pthread_create` and `dlopen` into
+libc so that *every* Rust binary built against it requires 2.34, and ONNX
+Runtime's C++, which needs GLIBCXX_3.4.29 (GCC 11). They land on the same
+distros, so dropping the embedding runtime would not widen this by one
+release. `install.sh` checks the version before downloading and refuses with
+that explanation rather than letting you install 50MB that cannot exec.
+
 `scripts/install.sh` detects the platform, downloads the matching release
 archive, **verifies its SHA-256 before unpacking anything** (a mismatch aborts
 with both hashes printed and installs nothing), runs the downloaded binary once
@@ -75,10 +89,33 @@ embedding model live elsewhere under `~/.g-mesh` and survive it.
 
 **Windows is not supported by this script.** That target ships a `.zip`, which
 a POSIX shell has no portable way to unpack, so the script refuses instead of
-pretending. Install it by hand: download
-`g-mesh-v<version>-x86_64-pc-windows-msvc.zip` from the releases page, unpack
-it somewhere permanent — keeping `g-mesh.exe` and `plugins\` beside each other,
-for the reason above — and add that directory to `PATH`.
+pretending — and points at `scripts/install.ps1`, its PowerShell counterpart:
+
+```powershell
+irm https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.ps1 | iex
+```
+
+It is the same design, not a different one: download, **verify the SHA-256
+before unpacking anything**, run the downloaded binary once to prove it
+executes and discovers its plugin, then install — same default location
+(`$env:USERPROFILE\.g-mesh\bin`), same reason the binary and `plugins\` are
+never separated (`current_exe()`-relative plugin discovery breaks the same
+way behind a Windows shortcut or `doskey` alias that it does behind a macOS
+symlink), and the same refusal to skip the checksum. Flags and environment
+variables mirror install.sh's:
+
+```powershell
+irm .../install.ps1 | iex; Install-GMesh -Version 2.7.0     # pin a release
+irm .../install.ps1 | iex; Install-GMesh -InstallDir C:\opt\g-mesh
+$env:G_MESH_VERSION = '2.7.0'; pwsh scripts/install.ps1
+```
+
+Uninstalling is `Remove-Item -Recurse -Force $env:USERPROFILE\.g-mesh\bin`.
+
+This installs the artifact; it does not by itself prove that artifact works
+end to end on Windows — that is GM-333 (a release-workflow step that runs
+each published artifact on its own runner), a separate, narrower claim than
+"the installer downloads, verifies and unpacks it correctly."
 
 **Until a release is published, this installs nothing.** Releases are built as
 drafts and are invisible — and their download URLs 404 — until a human presses

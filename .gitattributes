@@ -1,0 +1,64 @@
+# Line endings, pinned per extension and on purpose.
+#
+# Git for Windows installs with `core.autocrlf=true`, so `actions/checkout`
+# rewrites the working tree to CRLF there. That is not cosmetic: `gofmt`
+# treats a CRLF file as unformatted, and CI's "Go plugin tests" step failed
+# on all 37 files under plugins/go the first time a Windows job got far
+# enough to reach it (GM-334). Pinning the sources to LF fixes every clone,
+# not only CI - a Windows contributor running `gofmt` locally hit the same
+# wall with nothing to explain it.
+#
+# Deliberately NOT `* text=auto eol=lf`. `core/tests/fixtures/*.rpc` are
+# stored WITH CRLF on purpose - they are JSON-RPC control-plane captures and
+# Content-Length framing is \r\n-delimited - and that directory's own
+# .gitattributes marks them `-text`. Those four are the only tracked files in
+# the repository that contain a CR byte at all; that was checked rather than
+# assumed, which is what makes every rule below a no-op on content. The sole
+# behaviour change is what a Windows checkout writes. Keep it that way: a
+# blanket root rule is one edit away from fighting the fixtures.
+#
+# `*.ps1` is absent on purpose. scripts/install.ps1 reaches its users through
+# `irm ... | iex`, which fetches the blob (LF) rather than a checkout, so the
+# attribute would not touch the path that matters - and nothing lints or runs
+# it from a checkout on any runner. A Windows contributor reading it locally
+# gets CRLF, which is what PowerShell tooling expects.
+
+# --- sources ---------------------------------------------------------------
+# gofmt is the one that actually breaks today. The rest are pinned before
+# they do: every formatter and every byte offset in the index is computed
+# from these files.
+*.rs            text eol=lf
+*.go            text eol=lf
+*.ts            text eol=lf
+*.js            text eol=lf
+*.cjs           text eol=lf
+*.py            text eol=lf
+*.pyi           text eol=lf
+
+# --- shell -----------------------------------------------------------------
+# A CRLF .sh is a latent bug, not a style question: Git Bash executes
+# scripts/*.sh on the Windows runner, and a trailing \r turns a heredoc
+# terminator or a `case` pattern into something that no longer matches.
+*.sh            text eol=lf
+
+# --- manifests, lockfiles, workflows ---------------------------------------
+*.toml          text eol=lf
+*.lock          text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.mod           text eol=lf
+*.sum           text eol=lf
+*.work          text eol=lf
+
+# --- test fixtures ---------------------------------------------------------
+# NOT *.rpc - see the header. These three are read as text and their line
+# endings are part of what the extractors and the bulk plane parse.
+*.ndjson        text eol=lf
+*.toy           text eol=lf
+*.fk            text eol=lf
+
+# --- docs and repository metadata ------------------------------------------
+*.md            text eol=lf
+*.html          text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf

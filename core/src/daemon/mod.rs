@@ -735,12 +735,19 @@ pub fn run(root: &Path) -> Result<()> {
         });
     }
 
-    // Startup is over; what is left is the two idle timers and the accept
-    // loop's outcome, whichever arrives first. `supervise` returning `Ok` is
-    // this daemon deciding it has been unused long enough to go - `main`
-    // returns and the OS reclaims the socket, the watchers and the SQLite
-    // handle.
-    let outcome = lifecycle::supervise(&dir, &registry, &core_activity, timeouts, accept_loop);
+    // Startup is over; what is left is the two idle timers, the orphan check
+    // riding the same tick (GM-320), and the accept loop's outcome, whichever
+    // arrives first. `supervise` returning `Ok` is this daemon deciding it has
+    // been unused long enough - or has nothing left to serve at all - and
+    // going: `main` returns and the OS reclaims the socket, the watchers and
+    // the SQLite handle.
+    //
+    // `canonical_root`, not `root`: the orphan check stats this path once a
+    // tick, and it has to be the same spelling everything else here resolved
+    // against rather than whatever relative form the caller's argv happened to
+    // carry.
+    let outcome =
+        lifecycle::supervise(&canonical_root, &dir, &registry, &core_activity, timeouts, accept_loop);
 
     // Released here, explicitly, rather than whenever this frame happens to
     // unwind. `supervise` has already removed the socket and the pid file on

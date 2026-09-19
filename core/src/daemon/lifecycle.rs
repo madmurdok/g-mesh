@@ -72,9 +72,74 @@
 //! synchronous round trip - and, counter-intuitively, that blocking is what
 //! makes the breaker fire *promptly* on a language's first cold pass rather
 //! than what stops it. See the architecture doc's GM-304 notes.
+//!
+//! # A fourth thing on that same tick: is there still anything to serve (GM-320)
+//!
+//! Both timers above measure *silence*, and silence is the wrong question for
+//! a daemon whose project has been deleted out from under it. The core's
+//! timeout does eventually collect one - nothing resets a clock nobody is
+//! connecting to - but "eventually" is [`DEFAULT_CORE_IDLE`], a full day, and
+//! the thing being held for that day is not small: a Rust plugin's process
+//! tree is 563-580MB (GM-291) and the core itself measured 1.4GB RSS on this
+//! machine, so a handful of them is gigabytes. Four were found running at once
+//! on one developer machine - two from throwaway `/tmp` builds, two from a
+//! worktree whose `target/` had been deleted - and all four were cleared by
+//! hand.
+//!
+//! [`orphan_check`] is the answer, and it is deliberately the narrowest one
+//! that covers those cases: two `stat`s per tick, and an exit only on an
+//! absence the filesystem positively reports. A daemon whose **project root**
+//! is gone can never answer another useful question - every path it would
+//! resolve, watch or reparse is underneath it. A daemon whose **own
+//! executable** is gone cannot even be compared against a newer build
+//! (`daemon::build_stamp` reads that file's mtime), so a shim can neither
+//! reuse it honestly nor retire it; it is orphaned in the strongest sense the
+//! word has here. Neither is a "nobody has asked lately" judgement, which is
+//! why neither waits out an idle timeout and why the check runs *first* in the
+//! tick, ahead of the sleep and memory-limit passes a doomed daemon has no
+//! reason to pay for.
+//!
+//! Three things were weighed against it and are not here. Making the core
+//! timeout **unconditional** was the first: the timer is not in fact being
+//! reset by anything improper - `CoreActivity::request` fires on a connection
+//! and on a tool call, and nothing connects to a daemon whose project is
+//! gone - so shortening or un-gating it would punish healthy long-lived
+//! daemons to reach a case this check reaches in one tick. A **supervisor or
+//! reaper** that sweeps the machine for orphans was the second, and it is the
+//! most machinery for the least specific benefit: a second long-lived process
+//! to install, keep current and stop, in order to notice from outside what
+//! each daemon can answer about itself from two `stat`s. And **exiting only
+//! once nothing is attached**, the rule [`CoreActivity::idle_beyond`] applies
+//! to the idle timeout, was the third - rejected because the reason that rule
+//! exists (a client's tool surface must not vanish under it) has already
+//! failed when the project root has: every tool call is now about files that
+//! do not exist, and preserving that session costs a gigabyte to serve
+//! nothing. The bound this buys is therefore unconditional - **at most one
+//! tick**, 30s with the production defaults - rather than "one tick, unless
+//! someone is holding the door".
+//!
+//! # Why there is no signal handling here, measured rather than assumed
+//!
+//! `crate::process`'s header states that this daemon installs no signal
+//! handler and that `SIGTERM` kills it outright. GM-320 set out to find the
+//! gap behind that claim - a request treated as a completed termination, the
+//! shape GM-321 had just found one layer down in the TS plugin - and found
+//! none: against a real daemon on macOS, `SIGTERM` ended the core in
+//! 0.19-0.30s in every configuration tried (started by hand, bootstrapped
+//! detached through the shim, project root deleted, own executable deleted,
+//! and holding a live `rust-analyzer` tree), and each time the whole plugin
+//! tree went with it. What forced `kill -9` was not a swallowed signal but an
+//! *unreachable* one: `cli::stop` takes its project root from the current
+//! directory, and for an orphan that directory is exactly what no longer
+//! exists - `g-mesh stop` there fails with "failed to resolve the current
+//! directory". So the polite stop works and could not be asked for, which is
+//! why this module's answer is for the daemon to stop *itself*.
+//! `core/tests/daemon_sigterm.rs` is what keeps the first half of that true.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -939,6 +1004,85 @@ impl CoreActivity {
     }
 }
 
+/// A reason this daemon can never serve anyone again, as opposed to merely
+/// having nobody asking right now - see this module's own "A fourth thing on
+/// that same tick" section for why those are different questions and why only
+/// these two absences count as this one.
+///
+/// Carries the path it judged so the log line names it: an operator reading
+/// "the project root no longer exists" wants to know *which* root, and this is
+/// the only place that fact is still held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Orphaned {
+    /// The canonicalized project root [`supervise`] was given is gone. Every
+    /// path this daemon would resolve, watch or reparse lives under it.
+    ProjectRootGone(PathBuf),
+    /// The executable this process was started from is gone - a `cargo clean`,
+    /// a deleted worktree, a `/tmp` build swept away. Nothing can compare this
+    /// daemon's build against a newer one any more (`daemon::build_stamp`
+    /// reads that file's mtime), so no shim can honestly reuse or retire it.
+    ExecutableGone(PathBuf),
+}
+
+impl fmt::Display for Orphaned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectRootGone(path) => {
+                write!(f, "the project root {} no longer exists", path.display())
+            }
+            Self::ExecutableGone(path) => {
+                write!(f, "the executable this daemon was started from ({}) no longer exists", path.display())
+            }
+        }
+    }
+}
+
+/// Whether this daemon has outlived the thing it exists to serve.
+///
+/// `exe` is passed in rather than read here - always
+/// `std::env::current_exe()` in production, and a scripted value in the tests
+/// below, which is the only way to exercise the "cannot tell" branch without a
+/// platform where `current_exe` actually fails.
+///
+/// The root is judged before the executable because it is the stronger and the
+/// commoner fact: a deleted checkout takes its `target/` with it, so both arms
+/// are true at once and the one worth putting in the log is the project.
+///
+/// A `current_exe()` that *failed* is not evidence of anything and never ends
+/// the process - the same reading `shim::incumbent` gives a build stamp it
+/// cannot compute: degrade to the behaviour from before the check existed
+/// rather than act on a guess.
+pub fn orphan_check(project_root: &Path, exe: io::Result<PathBuf>) -> Option<Orphaned> {
+    if is_definitely_gone(project_root) {
+        return Some(Orphaned::ProjectRootGone(project_root.to_path_buf()));
+    }
+    let exe = exe.ok()?;
+    if is_definitely_gone(&exe) {
+        return Some(Orphaned::ExecutableGone(exe));
+    }
+    None
+}
+
+/// `true` only for a path the filesystem positively reports as absent.
+///
+/// Deliberately not `Path::exists()`, which answers `false` for *every* way a
+/// stat can fail - a parent directory this user may not traverse, an I/O
+/// error, a network mount that timed out - and the decision on the other end
+/// of this one ends a process. `NotFound` is the only answer that means what
+/// the caller is asking; everything else means "could not tell", and this
+/// returns `false` for all of it, which lands the daemon back on the behaviour
+/// it had before this check existed.
+///
+/// `fs::metadata` rather than `symlink_metadata` on purpose: the question is
+/// whether a file is still *reachable* at this path, and an installed
+/// `g-mesh` whose symlink now dangles is as gone as a deleted one.
+fn is_definitely_gone(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(_) => false,
+        Err(err) => err.kind() == io::ErrorKind::NotFound,
+    }
+}
+
 /// Keeps the core alive for one connection's lifetime, and restarts the idle
 /// clock when that connection ends - a client that just disconnected is the
 /// most recent thing the core did, not the beginning of a day of silence.
@@ -951,8 +1095,9 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// The daemon's main thread once startup is over: runs both idle timers until
-/// the accept loop stops or the core's own timeout says it is time to go.
+/// The daemon's main thread once startup is over: runs both idle timers, and
+/// [`orphan_check`] beside them, until the accept loop stops, the core's own
+/// timeout says it is time to go, or there is nothing left to serve.
 ///
 /// Structured as a poll of the accept loop's result channel rather than a
 /// `join` on its thread (which is what `daemon::run` used to end with) purely
@@ -983,6 +1128,7 @@ impl Drop for ConnectionGuard {
 /// out ([`PluginRegistry::sleep_all_now`](crate::daemon::registry::PluginRegistry::sleep_all_now)) -
 /// a language that was never touched simply has nothing to do either time.
 pub fn supervise(
+    project_root: &Path,
     state_dir: &Path,
     registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
@@ -997,6 +1143,27 @@ pub fn supervise(
             Ok(result) => return result,
             Err(RecvTimeoutError::Disconnected) => bail!("the daemon's MCP accept loop panicked"),
             Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        // First in the tick, ahead of both timers (GM-320): an orphaned daemon
+        // has nothing left to time, and no reason to pay for a whole-system
+        // `sysinfo` scan on its way out. Two `stat`s, and an exit only on an
+        // absence the filesystem positively reported - see [`orphan_check`]
+        // and this module's "A fourth thing on that same tick" section. This
+        // is what bounds an orphan's life at one tick rather than at
+        // `coreIdleTimeoutHours`.
+        if let Some(orphan) = orphan_check(project_root, std::env::current_exe()) {
+            eprintln!(
+                "g-mesh daemon: {orphan} - shutting down; nothing can ask this daemon for \
+                 anything again, and a fresh one will be started if the project comes back"
+            );
+            // The same teardown the idle exit below performs, and for the same
+            // reason it is a `return` rather than a `std::process::exit`: the
+            // watcher thread may be mid-commit, and `sleep_all_now` cannot
+            // come back until that transaction is durable.
+            registry.sleep_all_now("the core has been orphaned and is shutting down");
+            release_state_files(state_dir);
+            return Ok(());
         }
 
         registry.sleep_if_idle_all();
@@ -1372,6 +1539,93 @@ mod tests {
         // two consecutive sleeps would be replayed only in the first.
         queue.push("src/a.ts".to_string());
         assert_eq!(queue.drain(), vec!["src/a.ts".to_string()]);
+    }
+
+    /// The healthy case, which is every tick of every daemon that is not
+    /// orphaned: both paths resolve, and nothing is reported.
+    #[test]
+    fn a_project_root_and_executable_that_both_exist_are_not_an_orphan() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+
+        assert_eq!(orphan_check(project.path(), Ok(exe.path().to_path_buf())), None);
+    }
+
+    /// GM-320's first arm, and the one the four hand-cleared daemons were in:
+    /// the checkout the daemon was serving is gone.
+    #[test]
+    fn a_deleted_project_root_is_an_orphan() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let root = project.path().to_path_buf();
+        let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+        project.close().expect("failed to delete the project root");
+
+        assert_eq!(
+            orphan_check(&root, Ok(exe.path().to_path_buf())),
+            Some(Orphaned::ProjectRootGone(root.clone()))
+        );
+        // The log line has to name the root, or an operator with several
+        // daemons cannot tell which one just went.
+        assert!(
+            Orphaned::ProjectRootGone(root.clone()).to_string().contains(&root.display().to_string()),
+            "the reason must name the root it judged"
+        );
+    }
+
+    /// The second arm: a `cargo clean`, a deleted worktree, a `/tmp` build
+    /// swept away. The root is deliberately left intact here, so the only
+    /// thing that can produce a verdict is the executable.
+    #[test]
+    fn a_deleted_executable_is_an_orphan_even_with_the_project_root_intact() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let exe_dir = tempfile::tempdir().expect("failed to create an executable directory");
+        let exe = exe_dir.path().join("g-mesh");
+        fs::write(&exe, b"not really a binary").expect("failed to create a stand-in executable");
+
+        assert_eq!(orphan_check(project.path(), Ok(exe.clone())), None, "nothing is missing yet");
+
+        fs::remove_file(&exe).expect("failed to delete the stand-in executable");
+        assert_eq!(orphan_check(project.path(), Ok(exe.clone())), Some(Orphaned::ExecutableGone(exe)));
+    }
+
+    /// A `current_exe()` that failed is not evidence that anything is missing,
+    /// and this decision ends a process - so "cannot tell" must read exactly
+    /// like "nothing is wrong". The intact project root is what makes this
+    /// test about the executable branch alone.
+    #[test]
+    fn an_unresolvable_executable_is_never_treated_as_a_missing_one() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+
+        let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot read /proc/self/exe"));
+        assert_eq!(orphan_check(project.path(), unresolvable), None);
+    }
+
+    /// A deleted checkout takes its `target/` with it, so both arms are true
+    /// at once - and the one worth logging is the project, not the binary that
+    /// was inside it.
+    #[test]
+    fn a_root_that_is_gone_is_reported_ahead_of_an_executable_that_is_also_gone() {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let root = project.path().to_path_buf();
+        let exe = root.join("target/debug/g-mesh");
+        project.close().expect("failed to delete the project root");
+
+        assert_eq!(orphan_check(&root, Ok(exe)), Some(Orphaned::ProjectRootGone(root)));
+    }
+
+    /// The discriminating half of [`is_definitely_gone`]: a path whose *parent*
+    /// does not exist is itself absent, while a path that is merely empty, or
+    /// a directory, is present. Only `NotFound` may ever end a daemon.
+    #[test]
+    fn only_a_positively_absent_path_reads_as_gone() {
+        let dir = tempfile::tempdir().expect("failed to create a directory");
+        assert!(!is_definitely_gone(dir.path()), "a directory that exists is not gone");
+
+        let empty = dir.path().join("empty");
+        fs::write(&empty, b"").expect("failed to create an empty file");
+        assert!(!is_definitely_gone(&empty), "an empty file is still a file");
+
+        assert!(is_definitely_gone(&dir.path().join("no/such/path")));
     }
 
     #[test]

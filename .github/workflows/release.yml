@@ -210,7 +210,36 @@ jobs:
           # Pinned to the oldest supported Ubuntu on purpose: the glibc the
           # binary links against is the runner's (2.35 here), and a binary
           # built on a newer image simply will not start on an older distro.
-          # `ubuntu-latest` would silently narrow who can run the artifact.
+          # `ubuntu-latest` would move the floor up; it does not follow that
+          # this pin keeps the floor low. GM-332 measured where it actually
+          # sits, and the answer is **glibc 2.34 / GLIBCXX_3.4.29 (GCC 11)**:
+          #
+          #   ubuntu:22.04  glibc 2.35   starts, indexes
+          #   ubuntu:24.04  glibc 2.39   starts, indexes
+          #   ubuntu:20.04  glibc 2.31   does not start:
+          #     libstdc++.so.6: version `GLIBCXX_3.4.29' not found
+          #     libc.so.6: version `GLIBC_2.34' not found
+          #
+          # So Ubuntu 20.04, Debian 11, RHEL 8, Amazon Linux 2 and CentOS 7
+          # cannot run the artifact at all. Two separate causes, neither of
+          # them a dependency we could drop:
+          #
+          #   * GLIBC_2.34 comes from glibc itself. 2.34 absorbed libpthread,
+          #     libdl and librt into libc, so `pthread_create`, `dlopen` and
+          #     `__libc_start_main` are only offered at that version here. A
+          #     five-line Rust program with no dependencies, built on this
+          #     runner, needs the same 12 symbols at GLIBC_2.34. The builder's
+          #     glibc is the floor; the crate graph has nothing to do with it.
+          #   * GLIBCXX_3.4.29 comes from ONNX Runtime (`ort`), the only C++
+          #     in the tree - the same probe links no libstdc++ at all.
+          #
+          # Which kills the obvious idea: making the embedding runtime
+          # optional would drop 36MB but NOT one version of floor, because
+          # GCC 11 and glibc 2.34 ship on the same distros. Lowering the floor
+          # means building against an older glibc - a manylinux/older-Ubuntu
+          # *container* on this runner, since GitHub retired the 20.04 image -
+          # or a musl target. Both are real work and neither is scheduled; see
+          # GM-332 for the decision and the numbers behind it.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: x86_64-pc-windows-msvc

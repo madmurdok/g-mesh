@@ -89,8 +89,9 @@
 #
 # The Windows target ships a `.zip`, and a POSIX shell has no portable
 # unzipper. Running this under Git Bash / MSYS would mean pretending; instead
-# it refuses with the three manual steps that actually work. Native Windows
-# support would be a separate `install.ps1`, not a branch of this file.
+# it refuses and points at `scripts/install.ps1` (GM-208), which does the same
+# download-verify-unpack-advise sequence in PowerShell, the interpreter
+# actually present on every target machine this script cannot serve.
 #
 # ---------------------------------------------------------------------------
 # TESTING IT WITHOUT A RELEASE
@@ -153,10 +154,11 @@ usage: install.sh [--version X.Y.Z] [--install-dir DIR] [--target TRIPLE] [--for
                      like an existing g-mesh install
   -h, --help         this message
 
-Installs macOS (Intel/Apple Silicon) and x86_64 Linux (glibc) builds.
-Windows is not supported by this script: that target ships a .zip - download
-it from the releases page and unpack it, keeping g-mesh.exe and plugins/
-together in one directory.
+Installs macOS (Intel/Apple Silicon) and x86_64 Linux (glibc 2.34+) builds.
+Windows is not supported by this script: that target ships a .zip, which a
+POSIX shell has no portable way to unpack. Use scripts/install.ps1 instead:
+
+  irm https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.ps1 | iex
 EOF
 }
 
@@ -213,8 +215,13 @@ windows_not_supported() {
 install: this script cannot install g-mesh on Windows.
 
 The Windows build ships as a .zip, which a POSIX shell has no portable way to
-unpack, so rather than half-installing it this script stops here. Install it
-by hand instead - it is three steps:
+unpack, so rather than half-installing it this script stops here. Use
+scripts/install.ps1 instead - it is the same download/verify/unpack sequence,
+in PowerShell:
+
+  irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex
+
+Or by hand, if you would rather not run a script - it is three steps:
 
   1. Download g-mesh-v<version>-x86_64-pc-windows-msvc.zip from
      https://github.com/$REPO/releases
@@ -267,6 +274,27 @@ detect_target() {
 		if [ -f /etc/alpine-release ] || { ldd --version 2>&1 || true; } | grep -qi musl; then
 			die "this looks like a musl system (Alpine); only a glibc (*-unknown-linux-gnu) Linux build is published. Build from source: https://github.com/$REPO#build"
 		fi
+		# Same failure one step finer, and the same reason to refuse early.
+		# The artifact needs glibc >= 2.34 (and GLIBCXX_3.4.29, which ships on
+		# the same distros): GM-332 measured that by running it, not by
+		# reading the linker. Below the floor it downloads, verifies, unpacks
+		# and then dies at exec with `libc.so.6: version 'GLIBC_2.34' not
+		# found` - a message that names no remedy and no cause.
+		_libc=$({ getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>/dev/null | head -n 1 || true; } |
+			tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | head -n 1 | sed 's/[^0-9.].*$//')
+		case "$_libc" in
+		# Anything we cannot parse is left alone on purpose: a wrong refusal
+		# on an exotic-but-fine system is worse than the honest exec error.
+		[0-9]*.[0-9]*)
+			_libc_major=${_libc%%.*}
+			_libc_minor=${_libc#*.}
+			_libc_minor=${_libc_minor%%.*}
+			if [ "$_libc_major" -lt 2 ] ||
+				{ [ "$_libc_major" -eq 2 ] && [ "$_libc_minor" -lt 34 ]; }; then
+				die "this system has glibc $_libc; the published Linux build needs glibc 2.34 or newer (it would install and then fail to start). Distros below the floor include Ubuntu 20.04, Debian 11, RHEL 8, Amazon Linux 2 and CentOS 7. Build from source: https://github.com/$REPO#build"
+			fi
+			;;
+		esac
 		echo 'x86_64-unknown-linux-gnu'
 		;;
 	MINGW* | MSYS* | CYGWIN* | Windows_NT)
