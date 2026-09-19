@@ -611,6 +611,74 @@ pub(crate) fn exe_suffixed(path: &Path, suffix: &str) -> Option<PathBuf> {
     Some(path.with_file_name(name))
 }
 
+/// Windows' extended-length prefix on a canonicalized path, written back the
+/// ordinary way when that is possible: `\\?\C:\x` as `C:\x` and
+/// `\\?\UNC\srv\share` as `\\srv\share`. `None` when no rewrite applies (any
+/// path that is not extended-length, and an extended-length one naming
+/// something with no ordinary spelling at all - `\\?\pipe\...`,
+/// `\\?\Volume{...}`) or when the ordinary spelling would be too long to be
+/// legal (see below). [`plain_spelling`] is the `Path` wrapper callers use.
+///
+/// This exists because of what the prefix *means*. `fs::canonicalize` returns
+/// it on Windows, and under it Windows stops parsing the string: `/` is no
+/// longer a separator and `.`/`..` are no longer resolved, so the path is
+/// handed to the filesystem exactly as spelled. Everything this module
+/// resolves is then joined onto that directory
+/// ([`resolve_path_entry`]/[`resolve_arg`]), and every manifest in this tree
+/// spells its own entry point with forward slashes and a leading `./` or
+/// `../` - so `args = ["dist/src/index.js"]` under a canonicalized directory
+/// becomes `\\?\D:\...\typescript\dist/src/index.js`, which is no longer a
+/// path the OS will resolve but a string whatever runs it has to make sense
+/// of. `node` does not: on CI run 35451298477 every conformance-kit test
+/// whose plugin is spawned through node failed with the plugin exiting 1
+/// before writing a byte, while the Go plugin - a native binary reached from
+/// the same canonicalized directory - passed, and the *same* node plugin
+/// spawned by the daemon from an un-canonicalized directory passed too
+/// (`plugin_bridge`).
+///
+/// 259, not 260: `MAX_PATH` counts the terminating NUL, so that is the
+/// longest ordinary path Windows accepts, and the prefix is the only way to
+/// write a longer one. Measured in UTF-16 code units, which is what Windows
+/// counts, rather than in bytes or `char`s.
+///
+/// A `&str`, not a `Path`, and no `#[cfg(windows)]`: `Path`'s prefix parsing
+/// is the host's, so a `cfg`-gated version could only ever be tested on the
+/// platform it is for. `fs::canonicalize` on Unix returns a path beginning
+/// with `/`, so no Unix path reaches the branches below - which makes running
+/// this unconditionally both harmless and the reason its Windows arm is
+/// testable from any host, exactly as [`exe_suffixed`] takes its suffix as an
+/// argument for that reason.
+pub(crate) fn plain_win32_path(path: &str) -> Option<String> {
+    const VERBATIM: &str = r"\\?\";
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+    const MAX_PATH_WITHOUT_NUL: usize = 259;
+
+    let plain = if let Some(share) = path.strip_prefix(VERBATIM_UNC) {
+        format!(r"\\{share}")
+    } else {
+        let disk = path.strip_prefix(VERBATIM)?;
+        let mut chars = disk.chars();
+        let is_disk = matches!(chars.next(), Some(letter) if letter.is_ascii_alphabetic())
+            && chars.next() == Some(':')
+            && matches!(chars.next(), None | Some('\\'));
+        if !is_disk {
+            return None;
+        }
+        disk.to_string()
+    };
+    (plain.encode_utf16().count() <= MAX_PATH_WITHOUT_NUL).then_some(plain)
+}
+
+/// [`plain_win32_path`] over an owned path, left exactly as it came when no
+/// rewrite applies - including any path that is not valid UTF-8, which cannot
+/// be one of the spellings this rewrites.
+pub(crate) fn plain_spelling(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(plain_win32_path) {
+        Some(plain) => PathBuf::from(plain),
+        None => path,
+    }
+}
+
 /// Resolves one `args` entry the same way as [`resolve_path_entry`], but
 /// back into a `String` - `args` crosses into `Command::args` as strings,
 /// and an entry with no path separator (a flag, a bare word) is not a path
@@ -1446,6 +1514,90 @@ watch_files = ["[unclosed"]
         // (what `std::env::consts::EXE_SUFFIX` actually is on macOS/Linux)
         // must never switch to it.
         assert_eq!(resolve_exe_suffix(unsuffixed.clone(), ""), unsuffixed);
+    }
+
+    // -----------------------------------------------------------------
+    // GM-337: Windows' extended-length (`\\?\`) spelling
+    // -----------------------------------------------------------------
+    //
+    // `plain_win32_path` takes a `&str` and is not `cfg`-gated, for the same
+    // reason `exe_suffixed` takes its suffix as an argument: the Windows arm
+    // is the only arm that does anything, and it has to be exercisable from
+    // a host that cannot produce such a path in the first place. The inputs
+    // below are the two real ones from CI run 35451298477 - the fake
+    // plugin's temp directory and the bundled TS plugin's checkout
+    // directory, both as `fs::canonicalize` spelled them there.
+
+    #[test]
+    fn plain_win32_path_rewrites_a_canonicalized_disk_path() {
+        assert_eq!(
+            plain_win32_path(r"\\?\D:\a\g-mesh\g-mesh\plugins\typescript").as_deref(),
+            Some(r"D:\a\g-mesh\g-mesh\plugins\typescript"),
+        );
+        assert_eq!(
+            plain_win32_path(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\.tmpPBFGol\fake").as_deref(),
+            Some(r"C:\Users\runneradmin\AppData\Local\Temp\.tmpPBFGol\fake"),
+        );
+    }
+
+    #[test]
+    fn plain_win32_path_rewrites_a_canonicalized_unc_path() {
+        assert_eq!(
+            plain_win32_path(r"\\?\UNC\build\share\plugins\go").as_deref(),
+            Some(r"\\build\share\plugins\go")
+        );
+    }
+
+    #[test]
+    fn plain_win32_path_leaves_a_path_with_no_ordinary_spelling_alone() {
+        // A device namespace name is not a drive and not a UNC share, so
+        // there is nothing to rewrite it *to* - dropping the prefix would
+        // name something else entirely.
+        assert_eq!(plain_win32_path(r"\\?\pipe\g-mesh"), None);
+        assert_eq!(plain_win32_path(r"\\?\Volume{9f3a}\plugins\go"), None);
+    }
+
+    #[test]
+    fn plain_win32_path_leaves_an_ordinary_path_alone() {
+        // Including every path any non-Windows host can produce: this
+        // function runs unconditionally, so a Unix canonicalization has to
+        // fall straight through it.
+        assert_eq!(plain_win32_path(r"D:\a\g-mesh\plugins\go"), None);
+        assert_eq!(plain_win32_path("/private/var/folders/t7/plugins/go"), None);
+    }
+
+    #[test]
+    fn plain_win32_path_keeps_the_prefix_on_a_path_too_long_to_spell_without_it() {
+        // The prefix is the *only* way to write a path this long, so
+        // rewriting it would turn a working path into an unopenable one.
+        let long = format!(r"\\?\C:\{}", "d".repeat(300));
+        assert_eq!(plain_win32_path(&long), None);
+
+        // ...and the boundary is real: 259 characters is the longest
+        // ordinary path Windows accepts (`MAX_PATH` counts the NUL).
+        let at_limit = format!(r"\\?\C:\{}", "d".repeat(259 - 3));
+        assert_eq!(plain_win32_path(&at_limit).map(|p| p.chars().count()), Some(259));
+        let over_limit = format!(r"\\?\C:\{}", "d".repeat(259 - 2));
+        assert_eq!(plain_win32_path(&over_limit), None);
+    }
+
+    /// The fix under test, at the granularity the kit uses it:
+    /// `plugin_check::check` hands `plain_spelling` the result of
+    /// `fs::canonicalize`, and everything a plugin is invoked with is joined
+    /// onto whatever comes back. Fails if `plain_win32_path` is reverted to
+    /// returning `None` unconditionally (verified by doing exactly that).
+    #[test]
+    fn plain_spelling_is_what_a_manifest_directory_is_joined_onto() {
+        assert_eq!(
+            plain_spelling(PathBuf::from(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\.tmpPBFGol\fake")),
+            PathBuf::from(r"C:\Users\runneradmin\AppData\Local\Temp\.tmpPBFGol\fake"),
+        );
+    }
+
+    #[test]
+    fn plain_spelling_leaves_a_path_it_cannot_rewrite_exactly_as_it_was() {
+        let unix = PathBuf::from("/private/var/folders/t7/plugin_check/fake");
+        assert_eq!(plain_spelling(unix.clone()), unix);
     }
 
     /// End-to-end through `read_manifest`: a `plugin.toml` shaped exactly
