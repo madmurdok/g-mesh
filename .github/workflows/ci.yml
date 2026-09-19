@@ -331,6 +331,24 @@ jobs:
       # cancelled and prints nothing. Demonstrated rather than assumed: a test
       # written to sleep forever comes back as `TIMEOUT [8.066s]
       # g-mesh::zz_hang_probe a_test_that_never_finishes`.
+      #
+      # Left at 15 rather than raised, though this step's first-ever Windows
+      # run (run 35434554867) hit it: that run's 21 failures were 20 copies of
+      # one cause (GM-335 - `plugins/python` and `plugins/rust`'s binaries
+      # were unspawnable on Windows because cargo always emits `.exe` there
+      # and the manifests named the suffix-less path), each then burning its
+      # full 60-90s per-test budget on a cold-start index that could never
+      # finish, which is what left 140 of 1298 tests never reached at all -
+      # not the suite being too large for 15 minutes on a healthy run. With
+      # that fixed, a full `cargo test --workspace` locally (macOS, all four
+      # bundled plugins built and their semantic tiers exercised, load average
+      # 8.7/19.4/19.7 - a loaded dev machine, not a quiet runner) finished in
+      # 343s real (207s user, 74s sys), comfortably inside this budget even
+      # before nextest's cross-binary parallelism. That is evidence this
+      # number now fits, not a measurement of Windows itself - this sandbox
+      # has no Windows runner, so the honest thing is to leave the number
+      # alone and let this fix's own first green Windows run be the real
+      # measurement, rather than guess a new one from a macOS number.
       - name: cargo nextest run
         timeout-minutes: 15
         shell: bash

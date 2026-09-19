@@ -51,15 +51,22 @@ const NPM: &str = "npm";
 /// `"./g-mesh-plugin-go"` - no `.exe` on any platform, since that manifest
 /// (unlike this build step) has no `#[cfg(windows)]` of its own to give it
 /// one. Building under that exact name here is what keeps a checkout's
-/// manifest spawnable without editing it per platform - Windows support for
-/// this plugin is left to GM-283 (distribution), which already owns
-/// per-target binary naming for the release matrix; this build step's own
-/// job is only "keep a checkout building `plugins check`/`plugins list`",
-/// which today it does correctly on macOS/Linux and, on Windows, produces a
-/// binary `plugin.toml` cannot spawn (a `cargo build`/`cargo test` there
-/// still succeeds - only the plugin-spawning tests would fail, the same
-/// "diagnosis enough" contract this file already accepts for a missing Go
-/// toolchain).
+/// manifest spawnable without editing it per platform, and this works on
+/// Windows too, not just macOS/Linux: `go build -o g-mesh-plugin-go .`
+/// writes exactly that literal name, with no suffix, on every platform -
+/// unlike `cargo build`, `go build -o` does not force a `.exe` extension
+/// onto an explicitly named output - and Windows's `CreateProcess` (what
+/// `std::process::Command` calls) runs a PE binary by its actual file
+/// contents, not by its extension, so a suffix-less executable spawns fine
+/// there too. GM-335's own Windows CI run confirmed this directly: the Go
+/// plugin spawned and completed a bulk index
+/// (`[g-mesh-go] bulk index complete: 0 file(s), 0 node(s), 0 edge(s)`)
+/// while the two cargo-workspace plugins failed to spawn at all, because
+/// *their* binaries are cargo build outputs and cargo does force `.exe` on
+/// Windows regardless of what a platform-neutral manifest names (see
+/// `daemon::manifest`'s "Command/args resolution" doc comment for the fix).
+/// So Go is the one bundled language that has never needed Windows-specific
+/// handling here or in its manifest.
 const GO_PLUGIN_BINARY: &str = "g-mesh-plugin-go";
 
 fn main() {
