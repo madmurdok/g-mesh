@@ -142,12 +142,59 @@ fn encode(path: &str) -> String {
     encoded
 }
 
+/// Whether `text` begins with a Windows drive letter and its colon.
+///
+/// A plain `&str` test rather than `Path::components`, because every caller
+/// here holds a path that came off the wire: on a non-Windows host `Path`
+/// has no notion of a prefix at all, so asking it would answer "no" on the
+/// very platform the question is being asked *about*.
+fn starts_with_drive(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(letter), Some(':')) if letter.is_ascii_alphabetic())
+}
+
+/// A Windows extended-length (`\\?\`) path in its ordinary spelling, or
+/// `path` unchanged when it is not one.
+///
+/// `std::fs::canonicalize` returns that spelling on Windows and only there,
+/// and it is not interchangeable with the ordinary one anywhere it matters
+/// to this module: `Path::strip_prefix` compares a `Prefix::VerbatimDisk`
+/// against a `Prefix::Disk` and finds them different, so a root kept in the
+/// verbatim form matches nothing a language server ever reports - every
+/// server on Windows says `file:///C:/…`. A URI built from one is worse
+/// still: `file:////?/C:/…` names no file on any host.
+///
+/// A pure function over the text rather than a `#[cfg(windows)]` branch, so
+/// that its Windows arm is exercisable from a Unix host - the same reason
+/// `daemon::manifest::exe_suffixed` takes its suffix as an argument instead
+/// of reading `EXE_SUFFIX` itself. On Unix nothing produces such a path, so
+/// this is the identity there in practice as well as in principle.
+pub(crate) fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    // A path this side cannot read as UTF-8 cannot carry the ASCII prefix
+    // either, so leaving it alone is the whole of the right answer.
+    let Some(text) = path.to_str() else { return path.to_path_buf() };
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{share}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // A drive is the only verbatim path with an ordinary spelling to fall
+        // back to. `\\?\Volume{…}` and the rest of the device namespace have
+        // none, and are left exactly as they are rather than mangled into
+        // something that looks like a path and is not.
+        Some(rest) if starts_with_drive(rest) => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// The `file:` URI naming `path`, which must be absolute.
 ///
 /// Windows paths are spelled with forward slashes and keep their drive
 /// letter's colon, which is why `:` is in the unreserved set above: a server
-/// handed `file:///C%3A/x` would look for a drive named `C%3A`.
+/// handed `file:///C%3A/x` would look for a drive named `C%3A`. An
+/// extended-length path loses its `\\?\` first - see
+/// [`without_verbatim_prefix`].
 pub(crate) fn file_uri(path: &Path) -> String {
+    let path = without_verbatim_prefix(path);
     let text = path.to_string_lossy().replace('\\', "/");
     let text = encode(&text);
     if text.starts_with('/') {
@@ -171,11 +218,11 @@ pub(crate) fn path_from_uri(uri: &str) -> Option<PathBuf> {
     // `/home/x` came back as `home/x` when the leading slash was stripped;
     // `C:/x` is already whole. A drive letter is the only case where the
     // stripped slash was structural rather than part of the path.
-    let looks_like_a_drive = {
-        let mut chars = decoded.chars();
-        matches!((chars.next(), chars.next()), (Some(letter), Some(':')) if letter.is_ascii_alphabetic())
-    };
-    Some(if looks_like_a_drive { PathBuf::from(decoded) } else { PathBuf::from(format!("/{decoded}")) })
+    Some(if starts_with_drive(&decoded) {
+        PathBuf::from(decoded)
+    } else {
+        PathBuf::from(format!("/{decoded}"))
+    })
 }
 
 /// Percent-decoding, or `None` for an escape that is not one.
@@ -283,6 +330,42 @@ mod tests {
     #[test]
     fn a_windows_path_keeps_its_drive_letter() {
         let uri = file_uri(Path::new("C:\\projects\\thing\\src\\lib.rs"));
+        assert_eq!(uri, "file:///C:/projects/thing/src/lib.rs");
+        assert_eq!(path_from_uri(&uri).as_deref(), Some(Path::new("C:/projects/thing/src/lib.rs")));
+    }
+
+    /// The spelling `std::fs::canonicalize` hands back on Windows, and the
+    /// only one no other layer here accepts - see
+    /// [`without_verbatim_prefix`]. Written as literals so that the Windows
+    /// arm of this decision is checked on every host, not only the one that
+    /// can produce such a path.
+    #[test]
+    fn an_extended_length_windows_path_is_spelled_the_ordinary_way() {
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\C:\projects\thing")),
+            PathBuf::from(r"C:\projects\thing")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\UNC\server\share\x.rs")),
+            PathBuf::from(r"\\server\share\x.rs"),
+            "a verbatim UNC path's ordinary spelling is the share, not a drive"
+        );
+        // Nothing to fall back to: the device namespace has no ordinary
+        // spelling, and half-stripping it would invent one.
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\Volume{9f3b}\x.rs")),
+            PathBuf::from(r"\\?\Volume{9f3b}\x.rs")
+        );
+        // The two spellings this function must never touch.
+        assert_eq!(without_verbatim_prefix(Path::new(r"C:\a\b")), PathBuf::from(r"C:\a\b"));
+        assert_eq!(without_verbatim_prefix(Path::new("/private/var/a")), PathBuf::from("/private/var/a"));
+    }
+
+    /// A URI built from a canonicalized Windows root is the one every server
+    /// speaks - `file:///C:/…`, never `file:////?/C:/…`.
+    #[test]
+    fn an_extended_length_windows_path_gets_an_ordinary_file_uri() {
+        let uri = file_uri(Path::new(r"\\?\C:\projects\thing\src\lib.rs"));
         assert_eq!(uri, "file:///C:/projects/thing/src/lib.rs");
         assert_eq!(path_from_uri(&uri).as_deref(), Some(Path::new("C:/projects/thing/src/lib.rs")));
     }
