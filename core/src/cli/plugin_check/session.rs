@@ -13,7 +13,7 @@
 //! `storage::write::apply_diff`, container maintenance, and `link_diff`.
 //! GM-277's expectations will query exactly the linked state this builds.
 //!
-//! Three things differ from `daemon::plugin::PluginProcess` /
+//! Four things differ from `daemon::plugin::PluginProcess` /
 //! `daemon::bulk_index::walk_one_language`, each on purpose:
 //!
 //! - **The pipes are tee'd.** [`TeeReader`]/[`TeeWriter`] copy every byte
@@ -35,6 +35,13 @@
 //!   whole-project budget the daemon defines, sized off the same file count -
 //!   and the handshake borrows `file_changed`, the smallest one, since
 //!   announcing a handshake is less work than any reparse.
+//! - **The plugin's stderr is kept, not only forwarded.** The daemon's
+//!   `Stdio::inherit` is right for it - plugin logs are diagnostic, and the
+//!   daemon has a log of its own to interleave them into. A kit whose whole
+//!   product is a report must be able to *quote* them: "the bulk index
+//!   exited with exit code: 1" and nothing else is not a finding a plugin
+//!   author can act on, and it is what 25 Windows failures got. See
+//!   [`StderrCapture`], which still forwards every byte on the way past.
 //!
 //! # Isolation
 //!
@@ -215,6 +222,102 @@ pub(crate) fn count_claimed_files(manifest: &PluginManifest, dir: &Path) -> usiz
 
 // --- bulk -------------------------------------------------------------------
 
+/// How many lines of a plugin's own stderr a failure quotes - enough for a
+/// runtime's uncaught-exception banner and the top of its stack, capped so a
+/// plugin that logs steadily cannot bury the finding it is attached to.
+const STDERR_LINES_QUOTED: usize = 20;
+
+/// A spawned plugin's stderr, drained on a thread and kept for whatever
+/// failure message the kit ends up writing about that process.
+///
+/// This is the whole of what a plugin gets to say about its own death, and
+/// until GM-337 the kit threw it away: `stderr` was `Stdio::inherit`, so the
+/// plugin's account went to wherever the kit's own stderr went - under `cargo
+/// nextest`, into a buffer the failing assertion never printed - and the
+/// report said `the bulk index exited with exit code: 1` and nothing else.
+/// Twenty-five Windows failures were diagnosable only by reasoning about
+/// paths, because the one process that knew the answer had been told to say
+/// it somewhere nobody was listening.
+struct StderrCapture(Arc<Mutex<Vec<u8>>>);
+
+impl StderrCapture {
+    /// Takes `child`'s piped stderr and starts draining it. Every byte is
+    /// also written straight through to this process's own stderr, which is
+    /// what `Stdio::inherit` did and all it did - a plugin's live log still
+    /// reaches whoever is watching a run.
+    ///
+    /// Drained on a thread rather than read at the end because a pipe is
+    /// finite: a plugin that fills it while nobody reads would block in its
+    /// own `write` and hang the run, which is a deadlock `inherit` could not
+    /// have had and this must not introduce.
+    fn attach(child: &mut Child) -> Self {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let Some(mut stderr) = child.stderr.take() else {
+            return Self(captured);
+        };
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8 * 1024];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = io::stderr().write_all(&chunk[..n]);
+                        sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self(captured)
+    }
+
+    /// `failure` with what the plugin wrote to stderr quoted under it, or
+    /// unchanged when there was nothing to quote. Read wherever the failure
+    /// is finally assembled, which for a process still running is a
+    /// best-effort snapshot - the drain thread may be mid-chunk.
+    fn explain(&self, failure: String) -> String {
+        quote_stderr(&self.0.lock().unwrap(), failure, false)
+    }
+
+    /// As [`Self::explain`], for a failure that *is* the child's own fate -
+    /// a spawn that failed, a walk that was killed, a non-zero exit. There,
+    /// having said nothing on the way out is itself part of the answer and
+    /// is said out loud, because a report that goes quiet about stderr reads
+    /// exactly like one that never looked, which is the report this kit used
+    /// to print.
+    fn explain_end(&self, failure: String) -> String {
+        quote_stderr(&self.0.lock().unwrap(), failure, true)
+    }
+}
+
+/// `failure`, with the last [`STDERR_LINES_QUOTED`] non-blank lines of
+/// `stderr` quoted under it - and, when `note_silence`, an explicit note
+/// when there were none.
+///
+/// The quoted lines are indented past the column `report` renders a verdict
+/// in and prefixed with `|`, so nothing a plugin prints can be read back as a
+/// check result by that line format or by the tests that parse it.
+///
+/// The *last* lines rather than the first: a runtime that dies on an uncaught
+/// exception prints its banner last, after whatever the plugin had already
+/// logged.
+fn quote_stderr(stderr: &[u8], failure: String, note_silence: bool) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return if note_silence { format!("{failure}, having written nothing to stderr") } else { failure };
+    }
+    let shown = lines.len().min(STDERR_LINES_QUOTED);
+    let mut out = failure;
+    out.push_str(&format!("\n            its stderr, last {shown} of {} line(s):", lines.len()));
+    for line in &lines[lines.len() - shown..] {
+        out.push_str(&format!("\n            | {line}"));
+    }
+    out
+}
+
 /// One non-blank line of a bulk stream, with its 1-based line number in the
 /// raw output (blank lines still count, so the number matches what a plugin
 /// author sees running `--bulk-index` by hand).
@@ -255,7 +358,9 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Piped rather than inherited, and echoed on by `StderrCapture` - see
+        // its own doc comment for what inheriting it cost.
+        .stderr(Stdio::piped());
     scratch.isolate(&mut command);
 
     let mut child = match command.spawn() {
@@ -268,6 +373,7 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
             };
         }
     };
+    let stderr = StderrCapture::attach(&mut child);
     let mut stdout = child.stdout.take().expect("stdout was piped");
 
     // Read on a thread into a shared buffer, so a timeout can kill the child
@@ -319,6 +425,9 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         }
     }
 
+    // Only now, with the child reaped: whatever it wrote to stderr is the
+    // only account of a walk that produced nothing and exited non-zero.
+    let failure = failure.map(|failure| stderr.explain_end(failure));
     let bytes = std::mem::take(&mut *captured.lock().unwrap());
     BulkRun { lines: parse_bulk_lines(&bytes), bytes, failure }
 }
@@ -760,6 +869,9 @@ struct Driver<'a> {
     child: Child,
     reader: TeeReader<BufReader<ChildStdout>>,
     writer: TeeWriter<ChildStdin>,
+    /// The plugin's own stderr, quoted into `session.failure` by
+    /// [`Driver::finish`] - see [`StderrCapture`].
+    stderr: StderrCapture,
     conn: &'a Mutex<Connection>,
     timeouts: RoundTripTimeouts,
     next_id: i64,
@@ -800,7 +912,8 @@ pub(crate) fn run_session(
         .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // As in `run_bulk` above - see [`StderrCapture`].
+        .stderr(Stdio::piped());
     scratch.isolate(&mut command);
 
     let mut child = match command.spawn() {
@@ -812,6 +925,7 @@ pub(crate) fn run_session(
             };
         }
     };
+    let stderr = StderrCapture::attach(&mut child);
     let reader =
         TeeReader { inner: BufReader::new(child.stdout.take().expect("stdout was piped")), log: Vec::new() };
     let writer = TeeWriter {
@@ -822,7 +936,7 @@ pub(crate) fn run_session(
         marker_at_first_semantic_pass: None,
     };
     let mut driver =
-        Driver { child, reader, writer, conn, timeouts, next_id: 1, session: Session::default() };
+        Driver { child, reader, writer, stderr, conn, timeouts, next_id: 1, session: Session::default() };
 
     if let Err(err) = driver.handshake(manifest) {
         driver.session.failure = Some(format!("handshake: {err:#}"));
@@ -1043,7 +1157,7 @@ impl Driver<'_> {
     /// Closes the plugin's stdin - the daemon's own shutdown signal - waits
     /// [`SHUTDOWN_GRACE`], then kills whatever is left.
     fn finish(self) -> Session {
-        let Driver { mut child, reader, writer, mut session, .. } = self;
+        let Driver { mut child, reader, writer, stderr, mut session, .. } = self;
         session.marker_at_first_semantic_pass = writer.marker_at_first_semantic_pass;
         drop(writer);
         drop(reader);
@@ -1051,6 +1165,9 @@ impl Driver<'_> {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // After the child is gone, so a plugin that explained itself on the
+        // way out is quoted having said all of it.
+        session.failure = session.failure.take().map(|failure| stderr.explain(failure));
         session
     }
 }
@@ -1157,5 +1274,83 @@ mod tests {
         assert_eq!(tee.log, b"Content-Length: 2\r\n\r\n{}");
         assert_eq!(read_frame(&mut tee).unwrap().unwrap(), b"null");
         assert_eq!(tee.log, frame);
+    }
+
+    // -----------------------------------------------------------------
+    // GM-337: quoting a plugin's own stderr into the failure about it
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn quoted_stderr_shows_the_last_lines_indented_past_the_verdict_column() {
+        let stderr = b"node:internal/modules/cjs/loader:1228\n  throw err;\n\nError: Cannot find module\n";
+        let quoted =
+            quote_stderr(stderr, "bulk run 1: the bulk index exited with exit code: 1".to_string(), true);
+
+        assert_eq!(
+            quoted.lines().collect::<Vec<_>>(),
+            vec![
+                "bulk run 1: the bulk index exited with exit code: 1",
+                "            its stderr, last 3 of 3 line(s):",
+                "            | node:internal/modules/cjs/loader:1228",
+                "            |   throw err;",
+                "            | Error: Cannot find module",
+            ],
+        );
+        // Nothing a plugin prints can be read back as a check verdict by
+        // `report`'s line format, whatever it prints.
+        for line in quoted.lines().skip(1) {
+            assert!(
+                !line.starts_with("  PASS") && !line.starts_with("  FAIL") && !line.starts_with("  SKIP"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_stderr_keeps_the_tail_of_a_plugin_that_logs_steadily() {
+        let stderr: Vec<u8> = (0..STDERR_LINES_QUOTED + 5)
+            .fold(String::new(), |mut acc, i| {
+                acc.push_str(&format!("line {i}\n"));
+                acc
+            })
+            .into_bytes();
+        let quoted = quote_stderr(&stderr, "failed".to_string(), true);
+
+        assert!(
+            quoted.contains(&format!(
+                "its stderr, last {STDERR_LINES_QUOTED} of {} line(s):",
+                STDERR_LINES_QUOTED + 5
+            )),
+            "{quoted}"
+        );
+        // The banner a runtime prints on the way out is the last thing it
+        // writes, so the tail is the half worth keeping.
+        assert!(quoted.contains(&format!("| line {}", STDERR_LINES_QUOTED + 4)), "{quoted}");
+        assert!(!quoted.contains("| line 0\n") && !quoted.ends_with("| line 0"), "{quoted}");
+        assert_eq!(quoted.matches("\n            | ").count(), STDERR_LINES_QUOTED, "{quoted}");
+    }
+
+    #[test]
+    fn a_silent_plugins_own_fate_says_so_and_anything_else_stays_as_it_was() {
+        assert_eq!(
+            quote_stderr(b"", "the bulk index exited with exit code: 1".to_string(), true),
+            "the bulk index exited with exit code: 1, having written nothing to stderr",
+        );
+        // A failure that is the kit's own (reading ids back out of the
+        // index, say) gains nothing from a note about the plugin's silence.
+        assert_eq!(
+            quote_stderr(
+                b"   \n\n",
+                "reading a.fk's node ids back from the index: locked".to_string(),
+                false
+            ),
+            "reading a.fk's node ids back from the index: locked",
+        );
+    }
+
+    #[test]
+    fn quoted_stderr_survives_bytes_that_are_not_utf8() {
+        let quoted = quote_stderr(&[0xff, 0xfe, b'\n', b'o', b'k'], "failed".to_string(), true);
+        assert!(quoted.contains("| ok"), "{quoted}");
     }
 }

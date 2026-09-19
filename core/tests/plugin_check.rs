@@ -267,6 +267,13 @@ if (process.argv[2] === "--bulk-index") {
     setInterval(() => {}, 1000);
     return;
   }
+  if (DEFECT === "bulk-dies" || DEFECT === "bulk-dies-silently") {
+    // A plugin that fails the way a real one does when its runtime cannot
+    // even load it: a non-zero exit with nothing on stdout - with a word on
+    // stderr, or (the second spelling) without one.
+    if (DEFECT === "bulk-dies") console.error("fk-extractor: cannot open the toy grammar");
+    process.exit(3);
+  }
   const out = (value) => process.stdout.write(JSON.stringify(value) + "\n");
   for (const filePath of walk(root, root, [])) {
     const { nodes, edges } = extract(filePath, read(root, filePath), "bulk");
@@ -452,8 +459,19 @@ impl Run {
         self.outcomes.iter().filter(|(_, v)| *v == "FAIL").map(|(k, _)| k.as_str()).collect()
     }
 
+    /// Panicking with the report attached, rather than `BTreeMap`'s own
+    /// `no entry found for key` - which is what
+    /// `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` printed
+    /// on Windows (CI run 35451298477), and it names neither the missing id
+    /// nor the run that was missing it.
     fn outcome(&self, id: &str) -> &str {
-        &self.outcomes[id]
+        self.outcomes.get(id).map(String::as_str).unwrap_or_else(|| {
+            panic!(
+                "the report carries no {id:?}; it has {:?}:\n{}",
+                self.outcomes.keys().collect::<Vec<_>>(),
+                self.stdout
+            )
+        })
     }
 }
 
@@ -722,6 +740,53 @@ fn a_bulk_index_that_never_finishes_fails_session_instead_of_hanging() {
         "{}",
         run.stdout
     );
+}
+
+/// GM-337. A plugin that dies before writing a byte is the shape every
+/// Windows conformance failure on CI run 35451298477 had, and the report
+/// said only "the bulk index exited with exit code: 1" - because the kit
+/// spawned it with `stderr` inherited, so the plugin's own account of why
+/// went to the kit's stderr, which the failing assertion never printed.
+/// Twenty-five failures, and the one process that knew the answer had been
+/// told to say it where nobody was listening.
+///
+/// So: the `session` finding must quote what the plugin actually wrote. This
+/// is the control for that - it fails (on the quoted line, not on the
+/// verdict) if `run_bulk` goes back to `Stdio::inherit`.
+#[test]
+fn a_bulk_index_that_dies_quotes_what_the_plugin_said_about_it() {
+    let run = assert_only_failure("bulk-dies", false, "session", &[]);
+    // `ExitStatus`'s own wording differs by platform ("exit status: 3",
+    // "exit code: 3"), so the assertion is that the status is still named at
+    // all - the quoted stderr below is the part this test is about.
+    assert!(
+        run.stdout.contains("bulk run 1: the bulk index exited with exit") && run.stdout.contains(": 3"),
+        "the exit status is still named:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("| fk-extractor: cannot open the toy grammar"),
+        "the plugin's own stderr must be in the report:\n{}",
+        run.stdout
+    );
+    // Both runs, not just the first: a reader comparing them needs each
+    // one's own account rather than one line and a repetition.
+    assert_eq!(
+        run.stdout.matches("| fk-extractor: cannot open the toy grammar").count(),
+        2,
+        "both bulk runs quote their own stderr:\n{}",
+        run.stdout
+    );
+}
+
+/// The other half of the same contract: "it exited 1 and said nothing" is a
+/// finding of its own, and must not read the same as "it exited 1 and I did
+/// not look" - which is exactly what the report used to say either way.
+#[test]
+fn a_bulk_index_that_dies_silently_says_that_it_said_nothing() {
+    let run = assert_only_failure("bulk-dies-silently", false, "session", &[]);
+    assert!(run.stdout.contains(", having written nothing to stderr"), "{}", run.stdout);
+    assert!(!run.stdout.contains("its stderr, last"), "nothing to quote, so nothing quoted:\n{}", run.stdout);
 }
 
 #[test]
