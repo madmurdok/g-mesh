@@ -768,10 +768,23 @@ mod tests {
     /// that it failed.
     #[test]
     fn nothing_usable_names_the_remedy() {
-        let err = resolve(Path::new("/nonexistent/pyright-langserver"), Path::new("/projects/thing"))
-            .expect_err("must not resolve");
+        let command = Path::new("/nonexistent/pyright-langserver");
+        let err = resolve(command, Path::new("/projects/thing")).expect_err("must not resolve");
         let message = format!("{err:#}");
         assert!(message.contains("npm install pyright"), "{message}");
-        assert!(message.contains("/nonexistent/pyright"), "the candidate it tried: {message}");
+        // The candidate is rendered by `Path::display()` from what `cli_twin`
+        // built with `Path::join`, so on Windows it reads `/nonexistent\pyright`
+        // and this assertion used to spell `/nonexistent/pyright` by hand and
+        // fail there (GM-336). Asking `cli_twin` for the expectation keeps the
+        // two on the same platform, rather than normalising separators in a
+        // message a human reads in a Windows terminal - where the backslash is
+        // the right spelling.
+        //
+        // Pinned together with the origin, not alone: `…/pyright-langserver`
+        // *contains* `…/pyright`, so an assertion on the twin's path by itself
+        // would pass just as happily if the twin were never applied and the
+        // server spelling were probed instead.
+        let expected = format!("{} (the path the manifest names)", cli_twin(command).display());
+        assert!(message.contains(&expected), "expected to find `{expected}` in: {message}");
     }
 }
