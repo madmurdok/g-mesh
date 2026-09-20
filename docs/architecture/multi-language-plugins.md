@@ -831,6 +831,17 @@ Two things the sketch above did not say, found while building it:
   resolves a keyword. The bridge aims at the first occurrence of the node's own
   name inside its range - a heuristic, but a language-agnostic one, with the
   range's start as the fallback.
+- **An answer's *node* has to be a `Type`, and finding a node is not the same
+  as finding the declaration written there (GM-361).** `implementation`
+  answers with a position inside the `impl` header, and `SdkIndex::node_at`
+  returns the smallest node *containing* it. At a file's top level that is the
+  `File` node, which was already refused, and the second hop above recovers
+  the declaration. Inside an inline module it is the **module**, which is a
+  node, is addressable, and implements nothing - so the sweep recorded it as
+  an implementor: `find_implementations("Sink")` on ripgrep carried a row
+  `sink::sinks @ crates/searcher/src/sink.rs:516`, a `pub mod`. Refusing a
+  non-`Type` sends that answer down the same second hop, which finds the
+  types declared in the module.
 
 The fixture is a real process: `plugins/sdk/fake-lsp/` is a language server
 whose whole behaviour is a JSON script the test writes (readiness mode,
