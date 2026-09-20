@@ -794,7 +794,20 @@ func (e *semanticEngine) answerImplements(
 			continue
 		}
 		for _, ifaceObj := range interfaces {
-			if ifaceObj == subtype.obj {
+			// Pointer identity is not enough: `Tests: true` type-checks a
+			// package's test variant (`render [render.test]`) separately
+			// from its production variant, so the same `type Render
+			// interface { ... }` declaration surfaces as two distinct
+			// *types.TypeName objects - one reached via namedTypes, the
+			// other via interfaces. Both trivially satisfy
+			// types.Implements against each other (same method set), and
+			// the placeholder edge target resolves by package path + name
+			// back to the one real node, so a pointer-only guard here lets
+			// a self edge through. Package path + name is what a Go
+			// declaration actually is; two TypeName objects that agree on
+			// both name the same declaration no matter which type-checking
+			// pass produced them.
+			if ifaceObj.Pkg().Path() == subtype.obj.Pkg().Path() && ifaceObj.Name() == subtype.obj.Name() {
 				continue
 			}
 			iface, _ := resolved.interfaces[ifaceObj].Underlying().(*types.Interface)

@@ -294,6 +294,91 @@ func TestSemanticPassIsDeterministic(t *testing.T) {
 	}
 }
 
+// selfImplementsFiles is a separate fixture from probeFiles, on purpose: an
+// internal `_test.go` file in the same package as the interface it declares
+// is exactly what makes `packages.Load(..., Tests: true)` type-check that
+// package twice - once as `talks` and again as `talks [talks.test]` - so
+// `Talker` surfaces as two distinct *types.TypeName objects for the one
+// declaration. Folding probeFiles into the shared fixture would pull that
+// duplication into every other test's exact edge comparison; this fixture
+// exists so only this test pays for it.
+var selfImplementsFiles = map[string]string{
+	"go.mod": "module example.com/subprobe\n\ngo 1.22\n",
+
+	"talk.go": `package subprobe
+
+type Talker interface {
+	Talk() string
+}
+
+type Loud struct{}
+
+func (Loud) Talk() string { return "LOUD" }
+`,
+
+	// Nothing here even needs to mention Talker: an internal test file's
+	// mere presence in the package is what forces the second, separately
+	// type-checked package variant.
+	"talk_test.go": `package subprobe
+
+import "testing"
+
+func TestLoudTalks(t *testing.T) {
+	if (Loud{}).Talk() != "LOUD" {
+		t.Fatal("Loud should talk LOUD")
+	}
+}
+`,
+}
+
+func writeSelfImplementsProject(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for name, contents := range selfImplementsFiles {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	return root
+}
+
+// GM-362: an interface must never come back as its own implementor. Before
+// the fix, `answerImplements`'s guard against a self edge compared
+// `*types.TypeName` pointer identity, which only holds within one
+// type-checking pass - it does not hold between a package's production
+// variant and its `[pkg.test]` variant, which `Tests: true` type-checks
+// separately. `Talker` (declared once, in talk.go) surfaces as two distinct
+// TypeName objects because talk_test.go exists in the same package, both
+// trivially satisfying `types.Implements` against each other, and both
+// resolving back to the one real `Talker` node - producing
+// "talk.go:Talker SUPERTYPE_OF example.com/subprobe#Talker" alongside
+// the real "talk.go:Loud SUPERTYPE_OF ...". Disable the fix (revert the
+// guard to `ifaceObj == subtype.obj`) and this test fails on exactly that
+// extra row; the TypeScript equivalent (no test-variant duplication in that
+// plugin) is covered by the control in GM-362's task description, not here.
+func TestSemanticPassExcludesAnInterfaceFromItsOwnImplementors(t *testing.T) {
+	requireGoToolchain(t)
+	root := writeSelfImplementsProject(t)
+
+	state := newPluginState(root)
+	got := renderEdges(t, root, state.handleSemanticPass(nil))
+	want := []string{
+		"talk.go:Loud SUPERTYPE_OF example.com/subprobe#Talker",
+		// The test file's own call through a composite literal receiver -
+		// present because talk_test.go is real, compiling Go, not a stub
+		// that exists only to trigger the `[pkg.test]` variant.
+		"talk_test.go:TestLoudTalks CALLS example.com/subprobe#Loud.Talk",
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("semantic pass over a package with an internal _test.go file produced\n  %s\nwant\n  %s",
+			strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
 // A per-file pass re-checks that file's package and nothing else - the
 // design doc's "re-check that file's package, reusing loaded dependencies".
 func TestSemanticPassPerFileAnswersOnlyThatFile(t *testing.T) {

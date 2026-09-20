@@ -134,6 +134,16 @@ expect = ["server/conn.go:CloseAll"]
 # mentions Closer anywhere - Server (pointer receiver), Conn (pointer
 # receiver), and Logged, which declares no Close at all: it embeds *Server,
 # and the method-set promotion is what satisfies the interface.
+#
+# This is also GM-362's regression check: `Closer` must never appear in its
+# own expect list. server/server_test.go gives the `server` package an
+# internal test file for exactly this reason - it is what makes
+# `packages.Load(..., Tests: true)` type-check a `[server.test]` variant of
+# the package separately from its production build, so `Closer` surfaces as
+# two distinct `*types.TypeName` objects for the one declaration. Before the
+# fix, both trivially satisfy `types.Implements` against each other and
+# `Closer` lands as its own fourth row here; this exact `expect` set is what
+# catches that extra row.
 [[implementations]]
 symbol = "Closer"
 tier = "semantic"
