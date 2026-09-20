@@ -470,13 +470,42 @@ pub fn apply(conn: &Connection) -> Result<()> {
 /// old enough to fail the first check has no `indexer_version` column to
 /// select at all - `schema_version` is the one column every generation of
 /// this schema has had, so it is the only one safe to ask about first.
+///
+/// For the same reason, `apply` itself is not safe to run first either
+/// (GM-357). `apply`'s DDL is written for `CURRENT_SCHEMA_VERSION`'s shape:
+/// `CREATE TABLE IF NOT EXISTS` is harmless against an older table (it is
+/// simply skipped), but `CREATE INDEX ... nodes(language, container)` is
+/// not, because a pre-schema-8 `nodes` has no `container` column, so SQLite
+/// errors and execution never reaches the `schema_version` read below, let
+/// alone the `reset` that mismatch should have triggered. So `apply` now
+/// runs only after `schema_version` itself has confirmed the tables already
+/// match `CURRENT_SCHEMA_VERSION`, at which point its DDL is a genuine
+/// no-op, or, in the `Err` branch below, as a probe for whether the
+/// database is empty enough for that DDL to succeed as a first-time create.
 pub fn ensure_current(conn: &Connection, indexer_version: &str) -> Result<bool> {
-    apply(conn)?;
-
-    let schema: Option<String> = conn
-        .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0))
-        .optional()
-        .context("failed to read schema_version")?;
+    let schema: Option<String> =
+        match conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).optional()
+        {
+            Ok(schema) => schema,
+            Err(_) => {
+                // Reading `schema_version` itself failed - either an entirely
+                // fresh database (no `meta` table yet: the ordinary first-run
+                // case, where `apply` below creates it with no row) or something
+                // this tool cannot read or repair as one of its own indexes at
+                // all. `apply` is what tells the two apart: it is a harmless
+                // no-op against nothing, and it fails the same way this function
+                // used to fail unconditionally against the latter - so a failure
+                // here is reported as one sentence naming the remedy, not
+                // forwarded as SQLite's DDL dump.
+                apply(conn).map_err(|_| {
+                    anyhow::anyhow!(
+                        "this index predates what this build can read or repair in place - \
+                     run `g-mesh clean` to remove it, then reindex"
+                    )
+                })?;
+                None
+            }
+        };
 
     let Some(schema) = schema else {
         record_version(conn, indexer_version)?;
@@ -485,6 +514,11 @@ pub fn ensure_current(conn: &Connection, indexer_version: &str) -> Result<bool> 
     if schema != CURRENT_SCHEMA_VERSION {
         return reset(conn, indexer_version).map(|()| true);
     }
+
+    // Only reached once `schema_version` has confirmed the tables on disk
+    // already match `CURRENT_SCHEMA_VERSION` - so this DDL is a no-op, never
+    // the DDL that broke GM-357.
+    apply(conn)?;
 
     let indexer: String = conn
         .query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get(0))
@@ -1209,6 +1243,128 @@ mod tests {
             !semantic_pass_completed(&conn).unwrap(),
             "data wiped by a version mismatch has to have its semantic pass redone too"
         );
+    }
+
+    /// The exact pre-GM-264 DDL (`git show 88394e5~1:core/src/storage/schema.rs`),
+    /// current as `CURRENT_SCHEMA_VERSION` "7" - i.e. what 2.12.0 (and every
+    /// earlier 2.x build) actually wrote to disk. `nodes` here has no
+    /// `container` column; `containers`, `placeholder_targets` and
+    /// `language_state` do not exist at all.
+    const SCHEMA_7_DDL: &str = r#"
+        CREATE TABLE nodes (
+            id              TEXT PRIMARY KEY,
+            kind            TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            qualifiedName   TEXT NOT NULL,
+            filePath        TEXT NOT NULL,
+            startLine       INTEGER NOT NULL,
+            startCol        INTEGER NOT NULL,
+            endLine         INTEGER NOT NULL,
+            endCol          INTEGER NOT NULL,
+            signature       TEXT,
+            exported        INTEGER NOT NULL DEFAULT 0,
+            docComment      TEXT,
+            language        TEXT NOT NULL,
+            nativeKind      TEXT,
+            hasSyntaxErrors INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_nodes_filePath ON nodes(filePath);
+        CREATE INDEX idx_nodes_qualifiedName ON nodes(qualifiedName);
+
+        CREATE TABLE declarations (
+            nodeId    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            ordinal   INTEGER NOT NULL,
+            startLine INTEGER NOT NULL,
+            startCol  INTEGER NOT NULL,
+            endLine   INTEGER NOT NULL,
+            endCol    INTEGER NOT NULL,
+            signature TEXT,
+            hasBody   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (nodeId, ordinal)
+        );
+
+        CREATE TABLE edges (
+            id            TEXT PRIMARY KEY,
+            fromId        TEXT NOT NULL REFERENCES nodes(id),
+            toId          TEXT NOT NULL REFERENCES nodes(id),
+            kind          TEXT NOT NULL,
+            source        TEXT NOT NULL CHECK (source IN ('tree-sitter', 'ts-compiler')),
+            resolved      INTEGER NOT NULL DEFAULT 0,
+            toDeclaration INTEGER
+        );
+        CREATE INDEX idx_edges_fromId ON edges(fromId);
+        CREATE INDEX idx_edges_toId ON edges(toId);
+
+        CREATE TABLE meta (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            schema_version  TEXT NOT NULL,
+            indexer_version TEXT NOT NULL,
+            embedding_model TEXT,
+            lastUsed        TEXT NOT NULL,
+            bulkIndexedAt   TEXT,
+            semanticPassAt  TEXT
+        );
+
+        CREATE TABLE indexed_files (
+            filePath    TEXT PRIMARY KEY,
+            mtimeMillis INTEGER NOT NULL,
+            contentHash TEXT NOT NULL
+        );
+
+        CREATE TABLE vectors (
+            nodeId          TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+            embedding       BLOB NOT NULL,
+            embeddingVersion TEXT NOT NULL
+        );
+    "#;
+
+    /// GM-357: a real pre-schema-8 index (last written by 2.12.0, schema "7")
+    /// must be recovered - wiped and reindexed through `reset`, exactly like
+    /// any other version mismatch - not crash before it ever reads
+    /// `schema_version`.
+    ///
+    /// This is the fixture the existing `wipes_and_reindexes_on_version_mismatch`
+    /// test above does *not* provide: that test's `setup()` calls today's
+    /// `apply` first, so its `nodes` table already has `container` - it seeds
+    /// only `meta.schema_version`, never an actually-old table shape, which is
+    /// exactly why it did not catch GM-357. This one builds the tables schema
+    /// "7" really had, with no `container` column and none of GM-264's new
+    /// tables, so it fails on unfixed code and passes only once `apply`'s DDL
+    /// runs after the version check, not before it.
+    #[test]
+    fn recovers_a_genuinely_pre_schema_8_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_7_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES ('n1', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '7', '1', CURRENT_TIMESTAMP)",
+            [],
+        )
+        .unwrap();
+
+        let reindex_needed = ensure_current(&conn, GENERATION).expect(
+            "a pre-schema-8 index must be recovered via reset, not fail before schema_version is even read",
+        );
+        assert!(reindex_needed);
+
+        let version: String =
+            conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+        assert_eq!(node_count, 0, "old data must not survive the wipe");
+
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language, visibility, container)
+             VALUES ('n2', 'Function', 'foo', 'mod::foo', 'src/lib.rs', 1, 0, 3, 1, 'rust', 'container', 'pkg')",
+            [],
+        )
+        .unwrap_or_else(|err| panic!("nodes.container must exist on a freshly reset index: {err}"));
     }
 
     #[test]
