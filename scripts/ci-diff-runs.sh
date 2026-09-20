@@ -21,6 +21,14 @@
 # in the older run and fails in the newer one is reported as "was passing",
 # which is a regression until history says otherwise.
 #
+# The same care applies in the other direction. A test that stops failing is
+# FIXED only when history does not contradict that - if the history runs show
+# it both passing and failing, it is reported as INTERMITTENT instead, with
+# how many of those runs went each way, because "3 of 5 green" and "19 of 20
+# green" are different statements. With no history runs supplied, fail->pass
+# is genuinely indistinguishable from fixed, and the output says so rather
+# than defaulting to FIXED as if it had checked.
+#
 # Only runs that carry JUnit artifacts can be read, which means runs from
 # GM-344 onwards. Earlier runs have logs and nothing else.
 set -euo pipefail
@@ -86,16 +94,22 @@ def read(root_dir):
 old_runs, new_runs = read(sys.argv[1]), read(sys.argv[2])
 history = [read(d) for d in sys.argv[3:]]
 
-def flaky(target, ident):
-    """Has this test been seen BOTH passing and failing in the history runs?"""
-    seen_pass = seen_fail = False
+def history_counts(target, ident):
+    """(passed, failed) counts for this ident across history runs that tested it."""
+    p = f = 0
     for run in history:
         state = run.get(target)
         if not state:
             continue
-        seen_pass |= ident in state["passed"]
-        seen_fail |= ident in state["failed"]
-    return seen_pass and seen_fail
+        p += ident in state["passed"]
+        f += ident in state["failed"]
+    return p, f
+
+
+def flaky(target, ident):
+    """Has this test been seen BOTH passing and failing in the history runs?"""
+    p, f = history_counts(target, ident)
+    return bool(p and f)
 
 exit_code = 0
 for target in sorted(set(old_runs) | set(new_runs)):
@@ -130,9 +144,35 @@ for target in sorted(set(old_runs) | set(new_runs)):
         continue
 
     if fixed:
-        print(f"  FIXED ({len(fixed)})")
+        # fail -> pass gets the same care as pass -> fail: a test seen in
+        # BOTH states is a flake candidate whichever direction it moved. The
+        # older run's own failure is already known - it is exactly why the
+        # ident is in `fixed` - so it only takes history independently
+        # showing this SAME ident passing too to establish "seen both
+        # states"; that is the non-tautological half history has to supply,
+        # the same role it plays on the newly-failing side.
+        confirmed = []
+        intermittent = []
         for ident in fixed:
-            print(f"    {ident}")
+            p, f = history_counts(target, ident)
+            if history and p:
+                intermittent.append((ident, p, f))
+            else:
+                confirmed.append(ident)
+
+        if confirmed:
+            print(f"  FIXED ({len(confirmed)})")
+            for ident in confirmed:
+                print(f"    {ident}")
+            if not history:
+                print("  (no history runs supplied - fail->pass and a flake that "
+                      "happened to pass on the newer run look identical from two "
+                      "runs alone, so this is not confirmed as a real fix)")
+        if intermittent:
+            print(f"  INTERMITTENT, not fixed ({len(intermittent)})")
+            for ident, p, f in intermittent:
+                total = 1 + p + f  # the older run's failure, plus history
+                print(f"    {ident}  [failed in the older run; {p} of {total} known runs passed]")
     if broke:
         exit_code = 1
         print(f"  NEWLY FAILING ({len(broke)})")
