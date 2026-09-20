@@ -320,6 +320,16 @@ file = "pkg/sub/deep.py"
 # `from .. import helpers` reads a member out of, and `container:pkg.base` is
 # the module `from ..base import …` names.
 #
+# `container:pkg.helpers` is the GM-358 entry: `helpers` is not a symbol
+# `pkg/__init__.py` declares, it is `pkg/helpers.py` - a real submodule, the
+# same shape `src/requests/__init__.py`'s `from . import packages, utils` and
+# `tests/test_utils.py`'s `from requests import compat` measured against
+# psf/requests. Before the fix this row was silently missing (`truncated:
+# false`, no flag - indistinguishable from a complete answer) and only
+# `container:pkg`/`container:pkg.base` came back; `find_references` on
+# `pkg::helpers` already worked, since it never depended on the missing
+# `IMPORTS` edge.
+#
 # It is anchored on *this* file rather than on `pkg/mod.py`, whose imports are
 # more varied, because the kit's session empties and restores the file with
 # the most nodes - `pkg/mod.py` - and core GCs a container whose last member
@@ -328,7 +338,7 @@ file = "pkg/sub/deep.py"
 # reindex", which within one session never happens). An expectation over
 # `pkg/__init__.py`'s imports would be asserting that deliberate core
 # behaviour, not this plugin's.
-expect = ["container:pkg", "container:pkg.base"]
+expect = ["container:pkg", "container:pkg.base", "container:pkg.helpers"]
 
 # --- definition: the module self-announcement node ---------------------------
 
