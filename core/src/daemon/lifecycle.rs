@@ -455,6 +455,23 @@ impl PluginSupervisor {
         self.inner.lock().unwrap().process.as_ref().map(PluginProcess::pid)
     }
 
+    /// Hands the running plugin process a new round-trip budget - see
+    /// [`PluginProcess::set_round_trip_timeouts`], which carries the whole
+    /// argument for why this exists and why it is test-only.
+    ///
+    /// A no-op while the plugin is asleep: there is no process to re-budget,
+    /// and the next wake spawns one that reads the env override afresh.
+    #[cfg(test)]
+    pub(crate) fn set_round_trip_timeouts(
+        &self,
+        timeouts: crate::daemon::plugin::RoundTripTimeouts,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(process) = inner.process.as_mut() {
+            process.set_round_trip_timeouts(timeouts);
+        }
+    }
+
     /// Whether anything is queued for the next wake. Cheap enough to ask on
     /// every tool call.
     pub fn has_pending(&self) -> bool {
@@ -1317,6 +1334,17 @@ mod tests {
             Arc::new(EmbeddingPipeline::disabled()),
         )
         .expect("the stalling fixture plugin must still shake hands and start normally");
+        // Removed *between* the two spawns, not after both (GM-355). The
+        // override is read once, inside `PluginProcess::spawn`, and the
+        // budget it produces then belongs to that supervisor for life - so
+        // setting it across both spawns handed the short stall budget to the
+        // responsive plugin as well, whose round trip below has to *succeed*.
+        // Only the stalling plugin has any business timing out here.
+        //
+        // It also has to come off promptly for the older reason: another test
+        // racing on `ENV_LOCK` right after this one must not see it.
+        std::env::remove_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV);
+
         let responsive = PluginSupervisor::start(
             project.path(),
             responsive_manifest,
@@ -1327,26 +1355,35 @@ mod tests {
         )
         .expect("the responsive fixture plugin must start");
 
-        // The override only has to be visible while `PluginProcess::spawn`
-        // resolves it, above - both supervisors have already captured their
-        // own `RoundTripTimeouts` by value, so removing it now cannot affect
-        // either, and leaving it set any longer than necessary would risk
-        // another test (racing on `ENV_LOCK` right after this one) seeing it.
-        std::env::remove_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV);
-
         let conn = test_plugin::empty_index();
         let first_pid = stalling.pid().expect("a freshly started plugin is awake");
 
         // The discriminating assertion: this call must return once its
         // timeout elapses, not hang forever waiting for an answer that is
-        // never coming. 10s is a generous multiple of the 150ms override -
-        // this is a hang guard, not a timing assertion (see this repo's
-        // house rule on timing measurements).
+        // never coming. A hang guard, not a timing assertion - and GM-355
+        // moved it from 10s to 60s because 10s was not actually one.
+        //
+        // What this call spends is 150ms of timeout plus a whole plugin
+        // relaunch, and the relaunch is the part that grows with the machine:
+        // measured 242ms in total on an idle laptop, 2.26s under a 20x CPU
+        // oversubscription, and 7.06s under 50x (load average 585) - already
+        // 71% of a 10s budget, on a machine nobody would call wedged. A
+        // Windows runner carrying 1300 other tests is exactly that shape,
+        // which is the most likely reading of the one failure in five this
+        // test produced there.
+        //
+        // 60s matches `core/tests/common`'s `DEFAULT_STARTUP_TIMEOUT_SECS`,
+        // GM-301's one number for every "wait for a process to do a
+        // process-shaped thing" in this repo, and for its stated reason: a
+        // budget picked on a quiet laptop is not a promise the code ever
+        // made. This is the one wait here the clock must still decide, since
+        // the alternative to a guard is a test that hangs CI instead of
+        // failing it - named as such rather than left to be rediscovered.
         let start = Instant::now();
         stalling.file_changed(&conn, "app.go-src".to_string());
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(10),
+            elapsed < Duration::from_secs(60),
             "file_changed must return once its timeout elapses, not block on a plugin that never \
              answers - took {elapsed:?}"
         );
@@ -1390,6 +1427,21 @@ mod tests {
             1,
             "the second language's plugin was never touched by the first one's timeout"
         );
+
+        // Everything above is what the short budget was for, and it is spent
+        // (GM-355). The relaunched process keeps the budget its
+        // `PluginProcess` captured at construction, so without this the
+        // replay below - a healthy round trip that has to *succeed* - would
+        // go on racing the 150ms the stall was given. Measured, it takes
+        // 2.0ms idle and 2.2ms under a 20x CPU oversubscription, then crosses
+        // 150ms at 50x, times out, relaunches again and returns 0 replayed:
+        // the test failing because the machine was busy, with an assertion
+        // about a dirty file's fate.
+        //
+        // The production default rather than "something bigger": there is
+        // nothing special about this round trip, so it should be judged on
+        // the budget a real one gets.
+        stalling.set_round_trip_timeouts(crate::daemon::plugin::RoundTripTimeouts::default());
 
         // The dirty file is actually replayed - against the relaunched
         // process, which (per `install_stalling`'s one-stall-ever contract)

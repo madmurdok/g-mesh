@@ -44,21 +44,44 @@
 
 #![cfg(unix)]
 
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use g_mesh::cli::status::{self, CoreState};
 use g_mesh::daemon::{self, DaemonLock};
+use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
+use serde_json::{json, Value};
 
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
+const PROTOCOL_VERSION: &str = "2025-06-18";
 
 struct Project {
     dir: tempfile::TempDir,
+    /// Where every daemon this project's shims spawn sends its stderr
+    /// (`shim::DAEMON_LOG_ENV`), instead of the `/dev/null` it defaults to.
+    ///
+    /// GM-355, and it is about what a failure here is allowed to claim. A
+    /// daemon can end for reasons that have nothing to do with the shim under
+    /// test - a cold-start walk that could not spawn a plugin ends it inside
+    /// the first second, which is squarely inside the window these tests look
+    /// at. With its stderr discarded, all that reaches the assertion is "the
+    /// process is gone", and the message beside it names the only suspect the
+    /// test knows about. That is how
+    /// `a_serving_daemon_is_reused_by_a_second_shim_and_never_evicted` was
+    /// seen blaming a second shim that had, demonstrably, printed nothing and
+    /// done nothing. One line of captured stderr is the difference between a
+    /// verdict and an accusation.
+    ///
+    /// Its own directory, not the project root (a file there is something the
+    /// daemon would walk and watch) and not the state directory (which the
+    /// shim creates, so it does not exist yet when the first shim is spawned).
+    logs: tempfile::TempDir,
 }
 
 impl Project {
@@ -66,11 +89,26 @@ impl Project {
         let dir = tempfile::tempdir().expect("failed to create a temp project root");
         std::fs::write(dir.path().join("a.ts"), b"export const a = 1;\n")
             .expect("failed to seed the project with a source file");
-        Self { dir }
+        let logs = tempfile::tempdir().expect("failed to create a temp daemon log directory");
+        Self { dir, logs }
     }
 
     fn root(&self) -> &Path {
         self.dir.path()
+    }
+
+    fn daemon_log(&self) -> PathBuf {
+        self.logs.path().join("daemon.log")
+    }
+
+    /// What the daemons behind this project have said, for a failure message
+    /// to quote - see [`Project::logs`]. Empty (rather than a panic) when no
+    /// daemon has written anything, which is the ordinary case.
+    fn daemon_said(&self) -> String {
+        match std::fs::read_to_string(self.daemon_log()) {
+            Ok(log) if !log.trim().is_empty() => log,
+            _ => "(the daemon logged nothing)\n".to_string(),
+        }
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -116,6 +154,7 @@ impl Project {
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            .env(g_mesh::shim::DAEMON_LOG_ENV, self.daemon_log())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -195,6 +234,79 @@ fn wait_for(what: &str, ready: impl FnMut() -> bool) {
     common::wait_for(what, common::startup_timeout(), ready);
 }
 
+/// Drives one real MCP `initialize` through a shim's stdio and returns what
+/// it said, so a test can wait for **the shim having arrived and decided**
+/// rather than for a guess at how long that takes.
+///
+/// GM-355. `a_serving_daemon_is_reused_by_a_second_shim_and_never_evicted`
+/// used to wait `thread::sleep(500ms)` here, which is the same 500ms
+/// `shim::WEDGE_CONFIRMATION` gives a suspected wedge before acting on it -
+/// so the test was racing the exact decision it exists to judge, and losing
+/// that race looked identical to passing. An answered `initialize` is
+/// positive evidence instead: the shim connected to a serving daemon and
+/// proxied a request to it. *Which* daemon that was is then the assertions'
+/// business, and they are what catch a shim that evicted and replaced one.
+///
+/// The conversation runs on a helper thread against
+/// [`common::startup_timeout`] so a shim that never answers fails the test
+/// instead of hanging it - the same shape, and the same budget, as
+/// `shim_bootstrap.rs`'s `mcp_tool_names`.
+fn initialize_through_shim(shim: &mut Child) -> Value {
+    let writer = shim.stdin.take().expect("shim stdin was not piped");
+    let reader = shim.stdout.take().expect("shim stdout was not piped");
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(initialize(writer, reader));
+    });
+
+    let timeout = common::startup_timeout();
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(err)) => panic!("the shim's MCP session failed: {err}"),
+        Err(err) => panic!("the shim did not answer initialize within {timeout:?}: {err}"),
+    }
+}
+
+fn initialize<W: Write, R: Read>(mut writer: W, reader: R) -> Result<Value, String> {
+    let mut reader = BufReader::new(reader);
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "g-mesh-wedged-daemon-tests", "version": "0" },
+        },
+    }))
+    .expect("the request is always serializable");
+    write_ndjson_frame(&mut writer, &body).map_err(|e| format!("cannot send initialize: {e:#}"))?;
+
+    let frame = read_ndjson_frame(&mut reader)
+        .map_err(|e| format!("cannot read the answer: {e:#}"))?
+        .ok_or("the shim closed the connection instead of answering")?;
+    let answer: Value = serde_json::from_slice(&frame)
+        .map_err(|e| format!("the answer is not valid JSON ({e}): {}", String::from_utf8_lossy(&frame)))?;
+    if answer["result"]["serverInfo"]["name"] != "g-mesh" {
+        return Err(format!("unexpected initialize response: {answer}"));
+    }
+    Ok(answer)
+}
+
+/// Whatever a finished shim wrote to its stderr, for a failure message to
+/// quote - see [`Project::logs`] for why a failure here has to say what the
+/// other processes involved actually did rather than assert a culprit.
+fn shim_said(shim: &mut Child) -> String {
+    let Some(mut stderr) = shim.stderr.take() else { return "(stderr already taken)".to_string() };
+    let mut said = String::new();
+    match stderr.read_to_string(&mut said) {
+        Ok(_) if !said.trim().is_empty() => said,
+        Ok(_) => "(the shim logged nothing)\n".to_string(),
+        Err(err) => format!("(could not read the shim's stderr: {err})\n"),
+    }
+}
+
 /// `status` used to answer "not running" here, because it reads `daemon.pid`
 /// and the wedged daemon deleted its own. The lock is the fact that survives
 /// that, and the one the next bootstrap acts on, so this is what `status` has
@@ -264,18 +376,51 @@ fn a_shim_bootstrap_recovers_a_wedged_project_rather_than_timing_out() {
 /// daemon that is *answering* is never a candidate for eviction, however many
 /// shims arrive. A second shim reuses it; nothing is signalled, nothing is
 /// replaced, and there is still exactly one daemon at the end.
+///
+/// # GM-355: what this waits on, and what it is allowed to conclude
+///
+/// It used to sleep 500ms and then assert. Both halves of that were wrong in
+/// the same direction - they turned a busy machine into a verdict about the
+/// daemon.
+///
+/// The wait is now [`initialize_through_shim`]: the second shim has provably
+/// arrived, judged the incumbent and proxied a request to whatever it
+/// decided to serve from. 500ms was a guess at that, and a bad one, because
+/// `shim::WEDGE_CONFIRMATION` is *also* 500ms - a shim that had wrongly
+/// judged this daemon wedged would have been killed by this test mid-decision
+/// and the test would have reported success. Slow machine, green test, no
+/// coverage. Waiting for the answer removes the race in both directions.
+///
+/// The conclusion is now allowed to be narrower than the assertion's own
+/// wording. "A serving daemon must survive another shim's arrival" names the
+/// shim, but the observation underneath it is only "the process is gone", and
+/// a daemon ends for reasons that have nothing to do with any shim - a
+/// cold-start walk that cannot spawn a plugin ends it inside the first
+/// second, which is inside exactly this window. So the failure quotes what
+/// the shim and the daemon each actually said (see [`Project::logs`]), and a
+/// reader gets to see whether anything evicted anything at all.
 #[test]
 fn a_serving_daemon_is_reused_by_a_second_shim_and_never_evicted() {
     let project = Project::new();
     let incumbent = project.bootstrap_core();
 
     let mut second = project.spawn_shim();
-    thread::sleep(Duration::from_millis(500));
+    initialize_through_shim(&mut second);
     let _ = second.kill();
     let _ = second.wait();
+    let second_said = shim_said(&mut second);
 
-    assert!(daemon::is_process_alive(incumbent), "a serving daemon must survive another shim's arrival");
-    assert_eq!(read_pid(&project.pid_file()), incumbent, "no replacement may have taken over");
+    assert!(
+        daemon::is_process_alive(incumbent),
+        "a serving daemon must survive another shim's arrival - pid {incumbent} is gone.\n\
+         the second shim said:\n{second_said}\nthe daemon(s) said:\n{}",
+        project.daemon_said()
+    );
+    assert_eq!(
+        read_pid(&project.pid_file()),
+        incumbent,
+        "no replacement may have taken over.\nthe second shim said:\n{second_said}"
+    );
     assert_eq!(daemon::inspect_daemon_lock(project.root()).unwrap(), DaemonLock::Serving);
 }
 
