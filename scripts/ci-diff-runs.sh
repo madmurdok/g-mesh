@@ -99,8 +99,26 @@ def flaky(target, ident):
 
 exit_code = 0
 for target in sorted(set(old_runs) | set(new_runs)):
-    before = old_runs.get(target, {"failed": set(), "passed": set()})
-    after = new_runs.get(target, {"failed": set(), "passed": set()})
+    # A platform one run never tested is NOT a platform with no failures.
+    # A Windows-only dispatch carries one artifact; diffed against a full
+    # run it would otherwise print three serene "0 failing -> 0" lines about
+    # platforms it never touched - the same "absent renders like passed"
+    # trap the partial-run notice in ci.yml exists to close, reproduced
+    # inside the tool built to close it. Caught by running this against a
+    # real dispatch rather than by reading it.
+    if target not in old_runs or target not in new_runs:
+        missing = "the older" if target not in old_runs else "the newer"
+        present = new_runs.get(target) or old_runs.get(target)
+        print(f"=== {target}: NOT COMPARABLE ===")
+        print(f"  {missing} run has no artifact for this platform - it was not tested there,")
+        print(f"  which is not the same as having had no failures. The other run has "
+              f"{len(present['failed'])} failing of "
+              f"{len(present['failed']) + len(present['passed'])}.")
+        print()
+        continue
+
+    before = old_runs[target]
+    after = new_runs[target]
     fixed = sorted(before["failed"] - after["failed"])
     broke = sorted(after["failed"] - before["failed"])
     still = sorted(after["failed"] & before["failed"])
