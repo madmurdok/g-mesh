@@ -182,6 +182,9 @@ pub const CONTAINER_NATIVE_KIND: &str = "container";
 
 const MODULE_KIND: &str = "Module";
 const DEFINES_KIND: &str = "DEFINES";
+/// Only [`defining_containers`] needs this, to find the file node whose span
+/// says which of a file's own declarations *is* the file.
+const FILE_KIND: &str = "File";
 
 /// `edges.engine` on the `DEFINES` edges written here. A diagnostic label only
 /// (`storage::schema`'s DDL comment on `edges`): it says "core wrote this, no
@@ -594,6 +597,112 @@ pub fn parent_chain(conn: &Connection, language: &str, key: &str) -> Result<Vec<
         current = parent;
     }
     Ok(chain)
+}
+
+/// The container a file defines, as [`defining_containers`] reports it.
+pub struct DefiningContainer {
+    /// The container's key - `requests.adapters`, `grep_searcher::sink`,
+    /// `github.com/gin-gonic/gin/render`. The anchor a caller would pass to
+    /// reach this container directly.
+    pub key: String,
+    /// The container's own node id, i.e. what a walk anchors on.
+    pub node_id: String,
+    pub language: String,
+}
+
+/// The container(s) `file_path` *is* - the module a Go, Rust or Python file
+/// defines, as opposed to the modules it merely imports.
+///
+/// WHY THIS EXISTS (GM-356)
+///
+/// Outside TypeScript the import graph's nodes are containers, not files: an
+/// `IMPORTS` edge leaves a `File` node and arrives at a container. So an
+/// `Incoming` walk anchored on a file completes having found nothing, and
+/// reports the well-formed zero that means "nothing imports this" about a
+/// file that is imported four times over. `mcp::get_dependencies::from_file`
+/// uses this to walk from the container instead, and says so.
+///
+/// HOW A FILE'S OWN CONTAINER IS TOLD FROM THE ONES IT ONLY MENTIONS
+///
+/// The index records membership one way only - `DEFINES` edges from a
+/// container to the declarations in it (see this module's head comment) - so
+/// "the container this file defines" has to be read back off the file's
+/// declarations. Two shapes make that more than a `DISTINCT`:
+///
+///  1. **A file's own module node is a member of its *parent*.** The Python
+///     plugin emits one `Module` declaration per file (`adapters` in
+///     `requests/adapters.py`), and its `container` is `requests`, not
+///     `requests.adapters` - because that is where the module is *declared*.
+///     Counting it would offer the parent package as a candidate for every
+///     file in it. It is excluded by the one thing that distinguishes it from
+///     an ordinary member: it spans the whole file. A `mod sinks { .. }`
+///     nested inside `sink.rs` spans lines 516-662 of 663 and is kept, which
+///     is right - it is declared *in* `grep_searcher::sink` and so evidences
+///     it.
+///  2. **A file can also declare containers below its own.** That same nested
+///     `mod sinks` gives its own container members in this file, so
+///     `grep_searcher::sink::sinks` is a candidate too. Any candidate with
+///     another candidate in its [`parent_chain`] is dropped: a module
+///     declared inside a file is not the module that file *is*.
+///
+/// What is left is normally exactly one container, and the caller is expected
+/// to treat anything else as unanswerable rather than pick. Measured over
+/// three indexed repositories - gin, ripgrep and requests - every one of the
+/// 234 files with any candidate at all resolved to exactly one, and it was
+/// the right one: all 97 Go files matched the import path derived
+/// independently from `go.mod` plus the file's directory, and all 18 Python
+/// files inside the package matched the module path derived from theirs (the
+/// other 16 are outside any package and correctly get the plugin's own
+/// `orphan:<path>` container).
+///
+/// An empty result is the honest answer for a file that declares nothing the
+/// index carries a container for - a `doc.go`, a `setup.py`, a Rust
+/// integration-test binary. There is no module to name, so the caller has
+/// nothing to substitute and nothing to suggest.
+///
+/// Keyed throughout: the file's nodes by `idx_nodes_filePath`, their
+/// containers by `idx_edges_toId` and `containers`' primary key.
+pub fn defining_containers(conn: &Connection, file_path: &str) -> Result<Vec<DefiningContainer>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT DISTINCT ct.key, ct.nodeId, ct.language \
+             FROM nodes m \
+             JOIN edges e ON e.toId = m.id AND e.kind = ?2 \
+             JOIN containers ct ON ct.nodeId = e.fromId \
+             JOIN nodes f ON f.kind = ?3 AND f.filePath = ?1 \
+             WHERE m.filePath = ?1 \
+               AND NOT (m.kind = ?4 AND m.startLine <= f.startLine AND m.endLine >= f.endLine) \
+             ORDER BY ct.key",
+        )
+        .context("failed to prepare the defining-container lookup")?;
+    let rows = stmt
+        .query_map(params![file_path, DEFINES_KIND, FILE_KIND, MODULE_KIND], |row| {
+            Ok(DefiningContainer { key: row.get(0)?, node_id: row.get(1)?, language: row.get(2)? })
+        })
+        .context("failed to look up a file's containers")?;
+    let candidates: Vec<DefiningContainer> =
+        rows.collect::<rusqlite::Result<_>>().context("failed to read a file's containers")?;
+
+    // One candidate cannot be below another, so the parent walk is skipped
+    // entirely for the overwhelmingly common case.
+    if candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    // `(language, key)` throughout, never `key` alone: a key is only unique
+    // within a language (`containers`' own `UNIQUE (language, key)`), and
+    // nothing here needs to assume one file produced candidates in only one.
+    let keys: Vec<(String, String)> =
+        candidates.iter().map(|c| (c.language.clone(), c.key.clone())).collect();
+    let mut outermost = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let chain = parent_chain(conn, &candidate.language, &candidate.key)?;
+        let below_another =
+            keys.iter().any(|(language, key)| *language == candidate.language && chain.contains(key));
+        if !below_another {
+            outermost.push(candidate);
+        }
+    }
+    Ok(outermost)
 }
 
 #[cfg(test)]

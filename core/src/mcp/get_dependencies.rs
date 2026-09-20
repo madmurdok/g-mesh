@@ -14,6 +14,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::graph::containers::{self, DefiningContainer};
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
@@ -127,10 +128,11 @@ struct DependencyWalk {
     truncated_by: Option<&'static str>,
     frontier_nodes: Vec<String>,
     resume_token: Option<String>,
-    /// The file this walk actually started from, when that is not the one the
-    /// caller named - see [`entry_point_for`]. Absent (not `null`) whenever
-    /// the anchor was taken literally, which is the overwhelming majority of
-    /// calls and must not pay bytes to say nothing happened.
+    /// The node this walk actually started from, when that is not the one the
+    /// caller named - see [`entry_point_for`] and [`incoming_from_file`].
+    /// Absent (not `null`) whenever the anchor was taken literally, which is
+    /// the overwhelming majority of calls and must not pay bytes to say
+    /// nothing happened.
     ///
     /// Always present when a substitution *did* happen, and deliberately so:
     /// the tool is answering a question adjacent to the one asked, and a
@@ -141,17 +143,55 @@ struct DependencyWalk {
 }
 
 /// What the caller named, and what it was taken to mean.
+///
+/// Exactly one of `file_path`/`qualified_name` is present, and which one says
+/// what kind of node the walk ran from: a file, for the entry-point
+/// substitution ([`entry_point_for`]), or a logical container, for the
+/// module-anchor one ([`incoming_from_file`]). Both are optional rather than
+/// one field of either meaning, so that a caller reading `filePath` keeps
+/// reading exactly what it read before this second case existed.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolvedFrom {
     requested: String,
-    file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     hint: &'static str,
+}
+
+impl ResolvedFrom {
+    /// A substitution that landed on a file.
+    fn file(requested: &str, file_path: String) -> Self {
+        Self {
+            requested: requested.to_string(),
+            file_path: Some(file_path),
+            qualified_name: None,
+            hint: RESOLVED_FROM_HINT,
+        }
+    }
+
+    /// A substitution that landed on the container a file defines.
+    fn module(requested: &str, key: String) -> Self {
+        Self {
+            requested: requested.to_string(),
+            file_path: None,
+            qualified_name: Some(key),
+            hint: MODULE_ANCHOR_HINT,
+        }
+    }
 }
 
 const RESOLVED_FROM_HINT: &str =
     "The path given is not an indexed file, so the walk started from the single entry point \
      found under it. Pass that file directly to avoid the substitution.";
+
+const MODULE_ANCHOR_HINT: &str =
+    "In this language the import graph's nodes are modules, not files: nothing points an import \
+     at a file, so an Incoming walk anchored on one is empty by construction rather than because \
+     the file is unimported. The walk ran from the module this file defines instead. Pass that \
+     `qualifiedName` as the anchor to avoid the substitution.";
 
 /// The wire spelling of each truncation cause, fixed by the contract in
 /// `docs/architecture/g-mesh-v1.md`, plus `bound_walk`'s own `"responseSize"` -
@@ -316,7 +356,9 @@ fn from_root_reporting(
 /// per-session token tax measured in this project, GM-188, and the
 /// `file_path` argument already disambiguates on its own):
 ///
-///  1. **Exact file.** Unchanged from before containers existed.
+///  1. **Exact file.** Unchanged from before containers existed, except for
+///     `Incoming` on a language whose import graph is made of modules - see
+///     [`incoming_from_file`], which is where GM-356's substitution lives.
 ///  2. **Exact container key** (`github.com/x/pkg`, `ripgrep::search`, ... -
 ///     Data Model > Logical containers), since GM-267. A key is only unique
 ///     *within* a language, so more than one match is a real ambiguity - a Go
@@ -343,7 +385,10 @@ fn from_file(
         queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
     if let Some(node) = anchor {
-        return from_root(conn, node.id, shape);
+        return match shape.direction {
+            Direction::Incoming => incoming_from_file(conn, &node.id, file_path, shape),
+            Direction::Outgoing => from_root(conn, node.id, shape),
+        };
     }
 
     let containers = queries::find_containers_by_key(conn, file_path)
@@ -361,14 +406,102 @@ fn from_file(
     // named has exactly one entry point behind it - `@excalidraw/math`
     // almost always does.
     if let Some(entry) = entry_point_for(conn, entry_points, file_path)? {
-        let resolved = ResolvedFrom {
-            requested: file_path.to_string(),
-            file_path: entry.file_path,
-            hint: RESOLVED_FROM_HINT,
-        };
+        let resolved = ResolvedFrom::file(file_path, entry.file_path);
         return from_root_reporting(conn, entry.id, shape, Some(resolved));
     }
     error(no_file_message(conn, entry_points, file_path)?)
+}
+
+/// `Incoming` from an indexed file, which is the one arm of [`from_file`] a
+/// literal anchor can answer *wrongly* rather than merely unhelpfully
+/// (GM-356).
+///
+/// THE DEFECT
+///
+/// Outside TypeScript an `IMPORTS` edge runs from a `File` node to a
+/// *container* - `requests.adapters`, `grep_searcher::sink`,
+/// `github.com/gin-gonic/gin/render` - because that is what the language's
+/// import statement names. Nothing ever points an import at a file, so a
+/// walk anchored on one finds no incoming edge, finishes inside its bounds,
+/// and returns `results: []` with `truncated: false`. That is the shape this
+/// tool uses to say *nothing imports this*, and it is false about
+/// `src/requests/adapters.py`, which `sessions.py`, `models.py` and two test
+/// files all import. In TypeScript a module *is* a file, so the two coincide
+/// and this never surfaced. GM-259's fallback does not reach it either: that
+/// one runs when the anchor *misses*, and here it resolves exactly.
+///
+/// WHY IT SUBSTITUTES RATHER THAN REFUSING
+///
+/// Both were open, and a refusal naming the container would also have been
+/// honest. It loses on the evidence this module already collected for the
+/// same choice one arm below: [`entry_point_for`]'s doc comment records that
+/// naming an anchor and then declining to use it cost a whole round trip and
+/// made two of five benchmark repetitions abandon the tool. The substitution
+/// is also on firmer ground here than there - `entry_point_for` infers from
+/// an adjacent fact (a directory that shares a package's name), while this
+/// reads the index's own membership edges, and
+/// [`containers::defining_containers`] records that it picked the right
+/// container on all 234 files of three indexed repositories with no ambiguity
+/// anywhere. Where it is *not* unambiguous it refuses and names what it
+/// found, which is the refusal branch exactly where a refusal is the only
+/// honest answer.
+///
+/// WHAT IT CANNOT CHANGE
+///
+/// Two guards, both structural, so that no call that answers today answers
+/// differently tomorrow:
+///
+///  - It is `Incoming` only. `Outgoing` from a file is already right - those
+///    edges *leave* the file node - and running it from the container would
+///    quietly answer about every file in the module instead of the one asked
+///    about.
+///  - The file must have no incoming `IMPORTS` edge of its own. That is what
+///    keeps TypeScript untouched (its imports arrive at files, so the literal
+///    anchor stands), and it holds for any future plugin that emits
+///    file-level import edges too, without this function knowing a list of
+///    languages. A file with no container to substitute keeps its literal
+///    answer as well: there is no module to name, so there is nothing to
+///    report and nothing to suggest.
+fn incoming_from_file(
+    conn: &Connection,
+    node_id: &str,
+    file_path: &str,
+    shape: &WalkShape,
+) -> Result<CallToolResult, ErrorData> {
+    let imported_directly = queries::has_incoming_edge(conn, node_id, IMPORT_EDGE)
+        .map_err(|e| internal_error("failed to probe a file's importers", e))?;
+    if imported_directly {
+        return from_root(conn, node_id.to_string(), shape);
+    }
+
+    let mut defined = containers::defining_containers(conn, file_path)
+        .map_err(|e| internal_error("failed to look up the containers a file defines", e))?;
+    match defined.len() {
+        0 => from_root(conn, node_id.to_string(), shape),
+        1 => {
+            let container = defined.pop().expect("len checked above");
+            let resolved = ResolvedFrom::module(file_path, container.key);
+            from_root_reporting(conn, container.node_id, shape, Some(resolved))
+        }
+        _ => error(ambiguous_defining_container_message(file_path, &defined)),
+    }
+}
+
+/// The refusal for a file that defines more than one module, neither of them
+/// inside the other - two sibling inline `mod`s and no items of the file's
+/// own, say. Guessing would answer about one of them and look exactly like
+/// answering about the file, so this names both and lets the caller pick.
+/// Not observed on any of the 234 indexed files
+/// [`containers::defining_containers`] was measured over; it exists because
+/// the alternative to naming a tie is breaking one silently.
+fn ambiguous_defining_container_message(file_path: &str, containers: &[DefiningContainer]) -> String {
+    let keys: Vec<&str> = containers.iter().map(|c| c.key.as_str()).collect();
+    format!(
+        "g-mesh: '{file_path}' defines more than one module ({}), and in this language imports \
+         name modules rather than files - so there is no single anchor an Incoming walk from this \
+         file could mean. Ask about one of them directly.",
+        keys.join(", "),
+    )
 }
 
 /// The message for an exact container key that names more than one
@@ -1636,5 +1769,309 @@ mod tests {
         assert_eq!(ids.len(), 2, "two distinct containers must not collapse into one row: {ids:?}");
         assert!(ids.contains(&a.as_str()), "{ids:?}");
         assert!(ids.contains(&b.as_str()), "{ids:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // GM-356: `Incoming` anchored on a file of a module-graph language.
+    //
+    // Every fixture below is the shape a real plugin emits, read off the
+    // three indexed repositories the diagnosis used: declarations carrying
+    // `container`, the `File -IMPORTS-> container` edge, and - for Python
+    // and Rust - the `Module` declarations that make "which container does
+    // this file define" a question with a wrong answer available.
+    // -----------------------------------------------------------------
+
+    /// A `File` node with a real extent. The default [`file`] helper leaves
+    /// every position at 0, which would make *every* member look like it
+    /// spans the whole file - exactly the distinction
+    /// `containers::defining_containers` turns on - so a fixture about that
+    /// distinction has to state the extent it means.
+    fn source_file(path: &str, language: &str, end_line: i64) -> NodeRecord {
+        let mut node = NodeRecord::new(path, "File", path, path, path, language);
+        node.end_line = end_line;
+        node
+    }
+
+    /// An ordinary declaration inside `file_path`, belonging to container
+    /// `key` - a Go func, a Rust item, a Python class. Spans a few lines
+    /// somewhere inside the file, never all of it.
+    fn member_in(id: &str, language: &str, key: &str, parent: Option<&str>, file_path: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Function", id, id, file_path, language);
+        node.container = Some(key.to_string());
+        node.container_parent = parent.map(str::to_string);
+        node.start_line = 5;
+        node.end_line = 7;
+        node
+    }
+
+    /// The `Module` declaration a Python file gets for *itself*: it spans the
+    /// whole file, and its container is the package the file sits in - the
+    /// parent, not the module the file defines. Counting it would offer
+    /// `requests` as a candidate for every file in `requests/`.
+    fn whole_file_module(
+        id: &str,
+        language: &str,
+        package: &str,
+        file_path: &str,
+        end_line: i64,
+    ) -> NodeRecord {
+        let mut node = NodeRecord::new(id, MODULE_KIND, id, id, file_path, language);
+        node.native_kind = Some("module".to_string());
+        node.container = Some(package.to_string());
+        node.end_line = end_line;
+        node
+    }
+
+    /// The `Module` declaration a Rust `mod sinks { .. }` gets: nested inside
+    /// the file, so it evidences the container it is declared in rather than
+    /// standing for the file.
+    fn nested_module(
+        id: &str,
+        language: &str,
+        declared_in: &str,
+        file_path: &str,
+        (start_line, end_line): (i64, i64),
+    ) -> NodeRecord {
+        let mut node = NodeRecord::new(id, MODULE_KIND, id, id, file_path, language);
+        node.native_kind = Some("module".to_string());
+        node.container = Some(declared_in.to_string());
+        node.start_line = start_line;
+        node.end_line = end_line;
+        node
+    }
+
+    fn incoming(max_depth: u32) -> WalkShape {
+        WalkShape { direction: Direction::Incoming, max_depth: Some(max_depth), max_fanout: Some(50) }
+    }
+
+    /// The defect itself, on the Python shape that was measured:
+    /// `get_dependencies("src/requests/adapters.py", Incoming)` returned
+    /// `results: []` with `truncated: false` while `sessions.py` held a
+    /// `from .adapters import HTTPAdapter`. The importers arrive at the
+    /// container, so the walk has to start there - and say that it did.
+    #[test]
+    fn incoming_from_a_python_file_walks_the_module_that_file_defines() {
+        let mut conn = setup();
+        upsert_node(&mut conn, source_file("src/requests/adapters.py", "python", 748)).unwrap();
+        upsert_node(&mut conn, source_file("src/requests/sessions.py", "python", 800)).unwrap();
+        upsert_node(
+            &mut conn,
+            member_in(
+                "HTTPAdapter",
+                "python",
+                "requests.adapters",
+                Some("requests"),
+                "src/requests/adapters.py",
+            ),
+        )
+        .unwrap();
+        // The file's own module node, a member of the *package*.
+        upsert_node(
+            &mut conn,
+            whole_file_module("adapters", "python", "requests", "src/requests/adapters.py", 748),
+        )
+        .unwrap();
+        upsert_node(&mut conn, member_in("Session", "python", "requests", None, "src/requests/sessions.py"))
+            .unwrap();
+        let adapters = crate::graph::containers::container_id("python", "requests.adapters");
+        imports_container(&mut conn, "src/requests/sessions.py", &adapters);
+
+        let body = json_body(&from_file(&conn, "src/requests/adapters.py", &incoming(1)).unwrap());
+
+        let importers: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(
+            importers,
+            vec!["src/requests/sessions.py"],
+            "the importer of requests.adapters is the answer to 'what imports adapters.py': {body}"
+        );
+        assert_eq!(body["resolvedFrom"]["requested"], "src/requests/adapters.py");
+        assert_eq!(
+            body["resolvedFrom"]["qualifiedName"], "requests.adapters",
+            "the substitution names the anchor that would have worked: {body}"
+        );
+        assert!(
+            body["resolvedFrom"]["filePath"].is_null(),
+            "a container substitution landed on a container, not a file: {body}"
+        );
+    }
+
+    /// Go's shape: one package per directory, no nesting, and the file that
+    /// GMB-163 measured returning zero - `render/render.go` against three
+    /// real importers.
+    #[test]
+    fn incoming_from_a_go_file_walks_the_package_that_file_defines() {
+        let mut conn = setup();
+        const PKG: &str = "github.com/gin-gonic/gin/render";
+        upsert_node(&mut conn, source_file("render/render.go", "go", 60)).unwrap();
+        upsert_node(&mut conn, source_file("context.go", "go", 900)).unwrap();
+        upsert_node(&mut conn, member_in("Render", "go", PKG, None, "render/render.go")).unwrap();
+        upsert_node(&mut conn, member_in("Context", "go", "github.com/gin-gonic/gin", None, "context.go"))
+            .unwrap();
+        let render = crate::graph::containers::container_id("go", PKG);
+        imports_container(&mut conn, "context.go", &render);
+
+        let body = json_body(&from_file(&conn, "render/render.go", &incoming(1)).unwrap());
+
+        let importers: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(importers, vec!["context.go"], "{body}");
+        assert_eq!(body["resolvedFrom"]["qualifiedName"], PKG, "{body}");
+    }
+
+    /// Rust's shape, and the half of the rule Go and Python never exercise: a
+    /// `mod sinks { .. }` written inside `sink.rs` puts members of
+    /// `grep_searcher::sink::sinks` in that file too. The file still defines
+    /// `grep_searcher::sink`; the nested module is something it *contains*.
+    /// Anchoring on the descendant would answer about a module nobody
+    /// imports.
+    #[test]
+    fn a_module_nested_inside_a_rust_file_is_not_the_module_that_file_defines() {
+        let mut conn = setup();
+        const SINK: &str = "grep_searcher::sink";
+        const SINKS: &str = "grep_searcher::sink::sinks";
+        upsert_node(&mut conn, source_file("crates/searcher/src/sink.rs", "rust", 663)).unwrap();
+        upsert_node(&mut conn, source_file("crates/printer/src/standard.rs", "rust", 400)).unwrap();
+        upsert_node(
+            &mut conn,
+            member_in("Sink", "rust", SINK, Some("grep_searcher"), "crates/searcher/src/sink.rs"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            nested_module("sinks", "rust", SINK, "crates/searcher/src/sink.rs", (516, 662)),
+        )
+        .unwrap();
+        upsert_node(&mut conn, member_in("UTF8", "rust", SINKS, Some(SINK), "crates/searcher/src/sink.rs"))
+            .unwrap();
+        upsert_node(
+            &mut conn,
+            member_in("Standard", "rust", "grep_printer", None, "crates/printer/src/standard.rs"),
+        )
+        .unwrap();
+        let sink = crate::graph::containers::container_id("rust", SINK);
+        imports_container(&mut conn, "crates/printer/src/standard.rs", &sink);
+
+        let body = json_body(&from_file(&conn, "crates/searcher/src/sink.rs", &incoming(1)).unwrap());
+
+        let importers: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(importers, vec!["crates/printer/src/standard.rs"], "{body}");
+        assert_eq!(
+            body["resolvedFrom"]["qualifiedName"], SINK,
+            "the outermost container the file declares, not the one declared inside it: {body}"
+        );
+    }
+
+    /// The TypeScript control, and the reason the guard is "this file has no
+    /// importers of its own" rather than a list of languages: a TS import
+    /// arrives at a file, so the literal anchor is already the right one and
+    /// nothing about this call may change.
+    #[test]
+    fn a_typescript_file_keeps_its_literal_incoming_anchor() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("packages/math/src/index.ts")).unwrap();
+        upsert_node(&mut conn, file("app/viewport.ts")).unwrap();
+        imports(&mut conn, "app/viewport.ts", "packages/math/src/index.ts");
+
+        let result = from_file(&conn, "packages/math/src/index.ts", &incoming(1)).unwrap();
+        let body = json_body(&result);
+
+        assert_eq!(body["results"][0]["filePath"], "app/viewport.ts");
+        assert_eq!(body["results"][0]["kind"], "File", "a file, not a container: {body}");
+        assert!(!body.to_string().contains("resolvedFrom"), "no substitution: {body}");
+    }
+
+    /// The other TypeScript control: an empty answer stays an empty answer.
+    /// A file nothing imports, in a language with no containers at all, has
+    /// nothing to substitute - and the zero it returns is the true one.
+    #[test]
+    fn a_typescript_file_nothing_imports_still_answers_a_plain_empty_walk() {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("app/main.ts")).unwrap();
+        upsert_node(&mut conn, file("app/util.ts")).unwrap();
+        imports(&mut conn, "app/main.ts", "app/util.ts");
+
+        let body = json_body(&from_file(&conn, "app/main.ts", &incoming(1)).unwrap());
+
+        assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+        assert_eq!(body["truncated"], false);
+        assert!(!body.to_string().contains("resolvedFrom"), "nothing was substituted: {body}");
+    }
+
+    /// `Outgoing` is deliberately outside the substitution: those edges leave
+    /// the file node, so the literal anchor answers the question actually
+    /// asked - "what does *this file* import" - and running the walk from the
+    /// container would silently widen it to every file in the module.
+    #[test]
+    fn outgoing_from_a_module_graph_file_is_left_alone() {
+        let mut conn = setup();
+        upsert_node(&mut conn, source_file("render/render.go", "go", 60)).unwrap();
+        upsert_node(
+            &mut conn,
+            member_in("Render", "go", "github.com/gin-gonic/gin/render", None, "render/render.go"),
+        )
+        .unwrap();
+        let http = materialize_container(&mut conn, "go", "net/http");
+        imports_container(&mut conn, "render/render.go", &http);
+
+        let body = json_body(
+            &from_file(
+                &conn,
+                "render/render.go",
+                &WalkShape { direction: Direction::Outgoing, max_depth: Some(1), max_fanout: Some(50) },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(body["results"][0]["qualifiedName"], "net/http", "{body}");
+        assert!(!body.to_string().contains("resolvedFrom"), "no substitution on Outgoing: {body}");
+    }
+
+    /// A file that declares nothing the index carries a container for - a
+    /// `doc.go`, a `setup.py`, a Rust integration-test binary. There is no
+    /// module to name, so the literal answer stands rather than being dressed
+    /// up as something better. The residual half of the defect, recorded
+    /// rather than papered over.
+    #[test]
+    fn a_file_that_defines_no_container_keeps_its_literal_answer() {
+        let mut conn = setup();
+        upsert_node(&mut conn, source_file("src/requests/certs.py", "python", 18)).unwrap();
+        // Only the file's own module node, which is a member of the package.
+        upsert_node(&mut conn, whole_file_module("certs", "python", "requests", "src/requests/certs.py", 18))
+            .unwrap();
+
+        let body = json_body(&from_file(&conn, "src/requests/certs.py", &incoming(1)).unwrap());
+
+        assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+        assert!(
+            !body.to_string().contains("resolvedFrom"),
+            "the package is not what this file defines, so it is not substituted: {body}"
+        );
+    }
+
+    /// Two sibling modules declared in one file, neither inside the other:
+    /// no single anchor means "this file", so both are named and the caller
+    /// picks. Guessing here would answer about one of them while looking
+    /// exactly like answering about the file.
+    #[test]
+    fn a_file_defining_two_sibling_modules_is_refused_with_both_named() {
+        let mut conn = setup();
+        upsert_node(&mut conn, source_file("crates/x/src/pair.rs", "rust", 200)).unwrap();
+        upsert_node(
+            &mut conn,
+            member_in("a_item", "rust", "x::pair::a", Some("x::pair"), "crates/x/src/pair.rs"),
+        )
+        .unwrap();
+        upsert_node(
+            &mut conn,
+            member_in("b_item", "rust", "x::pair::b", Some("x::pair"), "crates/x/src/pair.rs"),
+        )
+        .unwrap();
+
+        let message = error_text(&from_file(&conn, "crates/x/src/pair.rs", &incoming(1)).unwrap());
+
+        assert!(message.contains("x::pair::a"), "{message}");
+        assert!(message.contains("x::pair::b"), "{message}");
     }
 }
