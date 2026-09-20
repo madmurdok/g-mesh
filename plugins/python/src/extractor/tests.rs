@@ -537,6 +537,52 @@ fn a_relative_import_in_an_init_file_names_the_package_itself() {
         graph.placeholder_target("pkg.sub::deep"),
         ("container:pkg.sub".into(), "name:deep".into(), "pkg.sub".into())
     );
+    // GM-358: `deep` is a real submodule of `pkg.sub`, not a symbol declared
+    // inside it, so `from . import deep` also loads `pkg.sub.deep` as a side
+    // effect - the same shape `src/requests/__init__.py:158`'s
+    // `from . import packages, utils` has in psf/requests. The placeholder
+    // assertion above (`find_references`'s address) already worked before
+    // this fix; this `IMPORTS` edge is what `get_dependencies` needs and did
+    // not have.
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "pkg/sub/__init__.py"),
+        vec!["resolved_module pkg.sub.deep::*".to_string(), "resolved_module pkg.sub::*".to_string()],
+        "{:#?}",
+        graph.names()
+    );
+}
+
+/// The other measured GM-358 shape: an *absolute* `from pkg import name`
+/// where `name` may be either a submodule or an ordinary symbol, in the same
+/// statement family. `sub` must gain the extra `IMPORTS` edge; `assist`,
+/// resolved through `pkg.helper`'s own container edge exactly as before this
+/// fix, must not - it is the control that shows the fix discriminates rather
+/// than firing on every `from` import indiscriminately.
+#[test]
+fn a_from_import_of_a_submodule_gains_an_imports_edge_a_plain_symbol_import_does_not() {
+    let tree = tree(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/sub.py", ""),
+        ("pkg/helper.py", "def assist():\n    pass\n"),
+        ("pkg/mod.py", "from pkg import sub\nfrom pkg.helper import assist\n"),
+    ]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "pkg/mod.py"),
+        vec![
+            "resolved_module pkg.helper::*".to_string(),
+            "resolved_module pkg.sub::*".to_string(),
+            "resolved_module pkg::*".to_string(),
+        ],
+        "`sub` (a submodule) gains its own edge; `assist` (a plain symbol) \
+         does not gain a phantom one onto `pkg.helper.assist` - {:#?}",
+        graph.names()
+    );
+    // The symbol import's own address is untouched by the fix.
+    assert_eq!(
+        graph.placeholder_target("pkg.helper::assist"),
+        ("container:pkg.helper".into(), "name:assist".into(), "pkg.mod".into())
+    );
 }
 
 /// Python's own `ImportError: attempted relative import beyond top-level

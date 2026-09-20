@@ -417,6 +417,32 @@ fn a_nested_use_group_places_every_leaf_in_its_own_container() {
     assert_eq!(graph.target_of(graph.placeholder("pending_symbol", "g")).0, container("krate::a::deep"));
 }
 
+/// GM-358, the Rust shape of the same gap the Python plugin had:
+/// `use crate::a::b;`'s leaf, `b`, is a real (file-backed) submodule of `a`
+/// rather than a symbol declared inside it, so the `use` also loads `a::b`
+/// as a side effect. `f` (an ordinary symbol, resolved through `a`'s own
+/// container edge exactly as before this fix) is the control: it must not
+/// gain a phantom edge onto `krate::a::f`, which shows the fix discriminates
+/// rather than firing on every named `use` indiscriminately.
+#[test]
+fn a_use_of_a_submodule_gains_an_imports_edge_a_plain_symbol_use_does_not() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod c;\n"),
+        ("src/a.rs", "pub mod b;\npub fn f() {}\n"),
+        ("src/a/b.rs", "pub fn g() {}\n"),
+        ("src/c.rs", "use crate::a::b;\nuse crate::a::f;\npub fn run() { b::g(); f(); }\n"),
+    ]);
+    let graph = krate.extract("src/c.rs");
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "src/c.rs"),
+        vec!["resolved_module krate::a::*".to_string(), "resolved_module krate::a::b::*".to_string()],
+        "{:#?}",
+        graph.names()
+    );
+    assert_eq!(graph.target_of(graph.placeholder("pending_symbol", "b")).0, container("krate::a"));
+    assert_eq!(graph.target_of(graph.placeholder("pending_symbol", "f")).0, container("krate::a"));
+}
+
 // --- calls and references -------------------------------------------------------
 
 #[test]

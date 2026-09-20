@@ -450,6 +450,18 @@ impl Declarer<'_, '_> {
                     alias.unwrap_or(name),
                     Import::Item { container: container.clone(), name: name.to_string() },
                 );
+                // `use a::b::c;` where `c` is itself a submodule of `a::b`,
+                // not a symbol declared inside it, also loads that submodule
+                // as a side effect - Rust's own `use` semantics, the same as
+                // `use a::b::c::*;` would name directly. The REFERENCES edge
+                // above already addresses `c` as a name (GM-358); this is
+                // the additional IMPORTS edge `get_dependencies` is answered
+                // from, and it is the same gap the Python plugin had for
+                // `from a.b import c`.
+                let submodule = format!("{container}::{name}");
+                if self.project.has_container(&submodule) {
+                    self.import_edge(PathTarget::Container(submodule), name, range);
+                }
                 if republishes {
                     self.reexport(alias.unwrap_or(name), &container, name, module, range);
                 }
