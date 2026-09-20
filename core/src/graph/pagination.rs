@@ -585,18 +585,20 @@ pub fn paginate_edges(
         format!("n.filePath IN ({})", placeholders.join(", "))
     };
     // One row per far endpoint: keep only the edge no sibling edge onto the
-    // same endpoint outranks under this query's own ORDER BY. The scope
-    // filter is deliberately not repeated inside - it tests the far
-    // endpoint's file, which every sibling here shares by construction - and
-    // the kind filter is, since two kinds may join one pair of nodes.
+    // same endpoint outranks under this query's own ORDER BY. `d.kind =
+    // e.kind` rather than a repeat of `kind_filter`, so that a caller asking
+    // for several kinds at once (or for all of them, where `kind_filter` is
+    // vacuous) still gets one row per endpoint *per kind* - a `CALLS` edge
+    // and a `REFERENCES` edge between one pair are two different facts.
+    // `scope_filter` is deliberately not repeated: it tests the far
+    // endpoint's file, which every sibling here shares by construction.
     let distinct_filter = match distinct {
         Distinctness::Edges => "1 = 1".to_string(),
         Distinctness::OtherEndpoint => format!(
             "NOT EXISTS (SELECT 1 FROM edges d \
                WHERE d.{this_endpoint} = ?2 AND d.{other_endpoint} = e.{other_endpoint} \
-                 AND {} \
-                 AND (d.resolved > e.resolved OR (d.resolved = e.resolved AND d.id < e.id)))",
-            kind_filter.replace("e.kind", "d.kind")
+                 AND d.kind = e.kind \
+                 AND (d.resolved > e.resolved OR (d.resolved = e.resolved AND d.id < e.id)))"
         ),
     };
     let sql = format!(
