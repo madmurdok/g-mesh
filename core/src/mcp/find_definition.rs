@@ -1004,9 +1004,9 @@ mod tests {
     // --- GM-360: neither key is a unique one -------------------------------
 
     /// ripgrep's own `RegexMatcher` set, reduced to what the resolver reads:
-    /// four declarations of one name, three of them module-qualified and one
-    /// - the `pub(crate)` fixture under `tests/` - carrying the bare string
-    /// because it sits at its crate's root. The inbound-edge counts are the
+    /// four declarations of one name, three of them module-qualified and
+    /// one (the `pub(crate)` fixture under `tests/`) carrying the bare
+    /// string because it sits at its crate's root. The inbound-edge counts are the
     /// measured ones (`find_candidates_by_name`'s own doc), so the ranking
     /// these tests assert is ripgrep's ranking and not a convenient one.
     fn ripgrep_regex_matchers() -> Connection {
@@ -1025,7 +1025,7 @@ mod tests {
             upsert_node(&mut conn, node_with_span(id, "RegexMatcher", qualified_name, file, (5, 0))).unwrap();
             for n in 0..inbound {
                 let edge =
-                    EdgeRecord::new(&format!("{id}-{n}"), "user", id, "REFERENCES", "tree-sitter", true);
+                    EdgeRecord::new(format!("{id}-{n}"), "user", id, "REFERENCES", "tree-sitter", true);
                 upsert_edge(&mut conn, edge).unwrap();
             }
         }

@@ -801,7 +801,15 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 cargo test                       # every crate: core, wire, plugins/sdk
 cargo test -p g-mesh             # core alone
 cd plugins/typescript && npm run build && npm test
+scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
+
+`scripts/check.sh` is the one place those two gates are spelled out:
+`.github/workflows/ci.yml` calls it rather than repeating the commands, so a
+green run here is the same check the pipeline makes. Run it before pushing.
+It exists because the two had drifted — six tasks in one batch ran
+`cargo clippy -p g-mesh --lib`, which does not compile test targets, and four
+lints in a `#[cfg(test)]` module reached CI unseen (GM-368).
 
 The integration tests spawn real shims, real daemons and a real plugin against
 temp-directory fixtures, so they care about the environment they run in:
