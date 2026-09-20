@@ -462,10 +462,7 @@ impl PluginSupervisor {
     /// A no-op while the plugin is asleep: there is no process to re-budget,
     /// and the next wake spawns one that reads the env override afresh.
     #[cfg(test)]
-    pub(crate) fn set_round_trip_timeouts(
-        &self,
-        timeouts: crate::daemon::plugin::RoundTripTimeouts,
-    ) {
+    pub(crate) fn set_round_trip_timeouts(&self, timeouts: crate::daemon::plugin::RoundTripTimeouts) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(process) = inner.process.as_mut() {
             process.set_round_trip_timeouts(timeouts);
