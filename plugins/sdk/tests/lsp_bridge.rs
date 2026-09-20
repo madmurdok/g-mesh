@@ -969,6 +969,89 @@ fn an_implementation_answer_on_no_declaration_is_resolved_with_one_more_question
     assert_eq!(asked(&log, "textDocument/definition"), 1, "and exactly one follow-up, never a third");
 }
 
+/// GM-361: an `impl` header written *inside* an inline module is contained
+/// by that module's node, so `node_at` answers with the module - which
+/// implements nothing.
+///
+/// This is the sole difference from
+/// [`an_implementation_answer_on_no_declaration_is_resolved_with_one_more_question`]
+/// above: there the header sat at the file's top level and `node_at` found
+/// only the `File` node, which was already refused. Here a `Module` node
+/// covers lines 1-3, so the position the server answers with *does* land on
+/// a node - and taking it produced the row measured on ripgrep,
+/// `sink::sinks @ crates/searcher/src/sink.rs:516`, which is
+/// `pub mod sinks { … }`. Refusing it sends the answer to the same second
+/// hop the file-level case takes, which finds `Robot`.
+#[test]
+fn an_implementation_answer_landing_on_a_module_is_refused_and_asked_again() {
+    let scratch = Scratch::new("implementation-in-module");
+    const R_TOY: &str = "mod inner\n  type Robot\n  impl Greeter for Robot\n";
+    scratch.write("src/t.toy", "trait Greeter\n");
+    scratch.write("src/r.toy", R_TOY);
+
+    let mut index = SdkIndex::new();
+    let t = RelPath::new("src/t.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &t);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Type, "Greeter", "Greeter", range(0, 0, 0, 13))
+            .native_kind("trait")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(t, "trait Greeter\n".to_string(), builder.finish());
+
+    let r = RelPath::new("src/r.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &r);
+    builder.file_node(range(0, 0, 3, 0));
+    // The module covers the whole of the file's body, the `impl` header
+    // included - so it, not the `File` node, is what `node_at` reaches for.
+    builder.add_node(
+        NodeSpec::new(NodeKind::Module, "inner", "inner", range(0, 0, 2, 24))
+            .native_kind("module")
+            .in_container("pkg", None)
+            .public(),
+    );
+    let robot = builder.add_node(
+        NodeSpec::new(NodeKind::Type, "Robot", "inner::Robot", range(1, 2, 1, 12))
+            .native_kind("struct")
+            .in_container("pkg::inner", Some("pkg".to_string()))
+            .public(),
+    );
+    index.insert(r, R_TOY.to_string(), builder.finish());
+
+    let log = scratch.path().join("asked.log");
+    let mut config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "log": log.to_string_lossy(),
+        "answers": [
+            {
+                "uri": scratch.uri("src/t.toy"),
+                "line": 0,
+                "character": 6,
+                // `Robot` in `  impl Greeter for Robot`, inside `mod inner`.
+                "implementation": [{ "uri": scratch.real_uri("src/r.toy"), "line": 2, "character": 19 }],
+            },
+            {
+                "uri": scratch.uri("src/r.toy"),
+                "line": 2,
+                "character": 19,
+                "definition": { "uri": scratch.real_uri("src/r.toy"), "line": 1, "character": 7 },
+            },
+        ],
+    }));
+    config.implementation_kinds = vec!["trait".to_string()];
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "one implementor, not the module too: {:#?}", answer.diff);
+    assert_eq!(edges[0].kind, EdgeKind::SupertypeOf);
+    assert_eq!(edges[0].from_id, robot, "the edge starts at the type, never at the module around it");
+    assert_eq!(asked(&log, "textDocument/definition"), 1, "the refusal is what asks the second hop");
+}
+
 /// A question the server simply never answers costs its own budget and
 /// nothing more, and the pass says it did not cover everything.
 #[test]

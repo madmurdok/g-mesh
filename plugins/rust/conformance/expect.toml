@@ -35,6 +35,10 @@
 #     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
 #   - implementations (`shapes::Shape`, `impl Trait for T` found by
 #     `find_implementations` - GM-286's own acceptance case);
+#   - implementations, the three shapes whose edge does not start at a type
+#     declaration (`blanket::Sink`, GM-361): two blanket impls, which start
+#     theirs at the `impl` block, and one inside an inline module, whose
+#     module must not be reported as a fifth implementor;
 #   - imports (`nested/mod.rs`, a glob and a container-scoped named re-export
 #     - GM-286's own acceptance case);
 #   - definition, twice (`internals::crate_only` with a redundant-but-armless
@@ -50,12 +54,12 @@
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all fifteen entries run and
+#   1. with the manifest this plugin ships, where all sixteen entries run and
 #      pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other ten - every structural entry here,
-#      unchanged since 3.2.0 - keep passing;
+#      five report `Skip` and the other eleven - every structural entry
+#      here - keep passing;
 #   3. with 3.2.0's manifest and *without* the skip flag, where those five
 #      must FAIL.
 #
@@ -297,6 +301,38 @@ tier = "semantic"
 # either way - which is what makes this one entry both the cross-crate claim
 # and a guard against a sweep that drops the answers it used to get right.
 expect = ["crates/alpha/src/shapes.rs:shapes::Circle", "crates/beta/src/main.rs:Megaphone"]
+
+# --- implementations: blanket impls, and the module that is not one (GM-361) --
+
+[[implementations]]
+symbol = "blanket::Sink"
+# Structural, deliberately - and it is an assertion about the semantic tier
+# too, the same way `shapes::Shape`'s entry above is. Four implementors, and
+# the set staying exactly four is what three separate failures each break:
+#
+#   - `blanket::<&'a mut S as Sink>` and `blanket::<Box as Sink>` are the two
+#     blanket impls. Neither implements the trait for a declaration of this
+#     project - one self type is not a path at all, the other names `Box` -
+#     so neither has a type node to start its edge at, and both were simply
+#     absent from the measured 12-row page on ripgrep. The `impl` block
+#     itself carries the edge; its name is the prefix its own methods have.
+#   - `blanket::inner::Inner` is declared inside an inline module, whose node
+#     covers the `impl` header. `textDocument/implementation` answers with a
+#     position in that header, and the smallest node containing it is the
+#     module - so `blanket::inner` appearing here as a fifth implementor is
+#     precisely the ripgrep row `sink::sinks @ crates/searcher/src/sink.rs:516`,
+#     a `pub mod`, reported as implementing a trait.
+#   - Every one of these is found by both tiers, which the index holds as two
+#     edges with two `source` values. A page that listed edges rather than
+#     implementors would repeat each of them; the kit compares sets, so that
+#     duplication is invisible *here* and asserted in
+#     `find_implementations`'s own unit tests instead.
+expect = [
+    "crates/alpha/src/blanket.rs:blanket::Direct",
+    "crates/alpha/src/blanket.rs:blanket::<&'a mut S as Sink>",
+    "crates/alpha/src/blanket.rs:blanket::<Box as Sink>",
+    "crates/alpha/src/blanket.rs:blanket::inner::Inner",
+]
 
 # --- imports (get_dependencies, one hop, Outgoing): glob and container --------
 # (GM-286's own acceptance case, kept here rather than duplicated)

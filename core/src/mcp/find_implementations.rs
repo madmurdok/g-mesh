@@ -108,6 +108,10 @@ fn list_implementations(
         &["SUPERTYPE_OF"],
         file_paths,
         anchor_file_path,
+        // "Who implements this" has one answer per implementing type, and
+        // an implementor both tiers found holds two edges - see
+        // `Distinctness` (GM-361).
+        pagination::Distinctness::OtherEndpoint,
         page_size,
         cursor,
     )
@@ -850,6 +854,83 @@ mod tests {
             vec!["impl_a", "impl_b", "impl_c"],
             "all three implementors must come back, once each"
         );
+    }
+
+    /// GM-361: one implementor both tiers found is one row.
+    ///
+    /// An `edges` row's id is `(fromId, kind, toId)` *per tier*, so a
+    /// structural edge and the semantic one confirming it are two rows for
+    /// one fact - which is not an anomaly to be repaired in storage, it is
+    /// what the `source` column is for. Measured on ripgrep, that turned
+    /// `find_implementations("Sink")` into a 12-row page describing 7
+    /// implementors, with `StandardSink`, `JSONSink`, `SummarySink` and
+    /// `KitchenSink` each listed twice.
+    #[test]
+    fn an_implementor_both_tiers_found_is_one_row_not_two() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("impl_a", "Type", "A", "pkg::A", "a.rs", "rust")).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("impl_b", "Type", "B", "pkg::B", "b.rs", "rust")).unwrap();
+        for (id, from, tier) in [
+            ("e_a_syn", "impl_a", "tree-sitter"),
+            ("e_a_sem", "impl_a", "ts-compiler"),
+            ("e_b_syn", "impl_b", "tree-sitter"),
+            ("e_b_sem", "impl_b", "ts-compiler"),
+        ] {
+            upsert_edge(&mut conn, EdgeRecord::new(id, from, "target", "SUPERTYPE_OF", tier, true)).unwrap();
+        }
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let body = json_body(&result);
+        let mut ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["implementingSymbolId"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["impl_a", "impl_b"], "four edges, two implementors");
+        assert_eq!(body["hasMore"], false);
+    }
+
+    /// The de-duplication has to happen *in* the query, not to the rows it
+    /// returned: collapsing a page after the fact leaves the second edge
+    /// onto an endpoint free to reappear as the first row of the next page,
+    /// which is the same duplicate one call later.
+    #[test]
+    fn a_duplicated_implementor_does_not_reappear_on_the_next_page() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Type", "Iface", "pkg::Iface", "target.rs", "rust"))
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            let id = format!("impl_{name}");
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(&id, "Type", name, format!("pkg::{name}"), format!("{name}.rs"), "rust"),
+            )
+            .unwrap();
+            for tier in ["tree-sitter", "ts-compiler"] {
+                let edge = format!("e_{name}_{tier}");
+                upsert_edge(&mut conn, EdgeRecord::new(edge, &id, "target", "SUPERTYPE_OF", tier, true))
+                    .unwrap();
+            }
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref()).unwrap();
+            assert_eq!(page.results.len(), 1, "one row per page at page size 1");
+            seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["impl_a", "impl_b", "impl_c"], "six edges, three implementors, once each");
     }
 
     /// A caller-supplied `limit` above the default page size must actually

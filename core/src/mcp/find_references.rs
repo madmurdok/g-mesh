@@ -117,6 +117,9 @@ fn list_references(
         USAGE_EDGE_KINDS,
         file_paths,
         anchor_file_path,
+        // One row per usage: two calls to one function from one caller are
+        // two usages, which is this tool's contract.
+        pagination::Distinctness::Edges,
         page_size,
         cursor,
     )
@@ -223,6 +226,31 @@ mod tests {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    /// The control for GM-361's de-duplication: `find_implementations` asks
+    /// `paginate_edges` for one row per far endpoint, and this tool
+    /// deliberately does not. A usage is a usage - a `CALLS` edge and a
+    /// `REFERENCES` edge between one pair of symbols are two different
+    /// things to report, and so is one tier confirming what another found.
+    #[test]
+    fn two_usage_edges_between_one_pair_of_symbols_stay_two_rows() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("user", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e_calls", "user", "target", "CALLS", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("e_refs", "user", "target", "REFERENCES", "ts-compiler", true),
+        )
+        .unwrap();
+
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let body = json_body(&result);
+        assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
     }
 
     #[test]
