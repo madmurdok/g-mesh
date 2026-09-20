@@ -38,6 +38,13 @@ on:
           - x86_64-unknown-linux-gnu
           - x86_64-apple-darwin
           - aarch64-apple-darwin
+      # GM-346. Opt-in, default off, and reachable only through a dispatch -
+      # see the step at the end of the `test` job for the exposure this opens
+      # and the three specific questions it exists to answer.
+      debug:
+        description: "Hold the runner open with an interactive session if the tests fail. Off unless you say otherwise."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -633,6 +640,53 @@ jobs:
   # filtered out of PATH without taking unrelated tools with it - see the
   # "Delete every go binary" step below for the failed directory-filtering
   # approach and why deleting the file instead is what fixed it.
+      # GM-346. A shell on the platform, for the questions that reading could
+      # not settle. Three are waiting for it right now, each one closed by
+      # inference rather than by observation:
+      #
+      #   * GM-337 - which internal of node rejects a `\\?\` plugin path was
+      #     never established. `path.win32.resolve` normalises such a string
+      #     correctly on Node 20, so the mechanism sits past argv
+      #     normalisation, in module resolution or realpath. The fix works;
+      #     the reason is unknown.
+      #   * GM-339 - whether `current_exe()` follows a rename on Windows was
+      #     reasoned from `GetModuleFileNameW` reading the loader's record,
+      #     not observed. It happened to be right, and the identical reasoning
+      #     about Linux happened to be wrong, which is the argument.
+      #   * GM-341 - what npm actually writes into `node_modules/.bin` there
+      #     (`.cmd` only? plus an extensionless shim? a `.ps1`?) is taken from
+      #     documentation, and the whole fix rests on it.
+      #
+      # WHAT THIS OPENS, stated because a debug door deserves it: an
+      # interactive shell on a machine holding this repository's checkout and
+      # this job's `GITHUB_TOKEN`. It creates no permission the job did not
+      # already have - `permissions: contents: read` still applies - but it
+      # puts those behind a prompt somebody types at, which is a different
+      # exposure from a script that runs and exits. Hence every guard below:
+      #
+      #   * `github.event_name == 'workflow_dispatch'` as well as the input,
+      #     so no push or pull_request can reach it even if the input ever
+      #     acquires a truthy default by accident.
+      #   * `failure()`, so a green run never holds a runner.
+      #   * `limit-access-to-actor`, so the connection string in the log is
+      #     not an invitation - only the account that dispatched the run can
+      #     attach.
+      #   * `timeout-minutes`, so a session nobody attaches to cannot hold a
+      #     runner until the job's own 45-minute budget expires. A forgotten
+      #     dispatch costs 20 minutes, not the whole job.
+      #
+      # Pinned to a commit rather than a tag, unlike the `actions/*` above:
+      # those are GitHub's own and pinned to a major by this file's
+      # convention, while this is a third party and a moving tag is a
+      # third party that can change what runs here without a diff.
+      # 35b54af is v3.24 (2026-05-29).
+      - name: Interactive session (only on a dispatch that asked for one)
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug }}
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113
+        timeout-minutes: 20
+        with:
+          limit-access-to-actor: true
+
   go-plugin-without-toolchain:
     name: Go plugin conformance (no toolchain on PATH)
     runs-on: ubuntu-22.04
