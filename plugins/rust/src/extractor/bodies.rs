@@ -38,12 +38,14 @@
 //!    declared here nor imported (it came through a glob import, or the
 //!    prelude), an associated function on a generic parameter (`T::new()`),
 //!    `Self::` outside any impl.
-//!  - **`impl Trait for T` where `T` is not declared in this file.** The
+//!  - **`impl Trait for T` where `T` is declared in another file.** The
 //!    `SUPERTYPE_OF` edge has to start at `T`'s node, and an edge may not
 //!    leave its file - but a *semantic* answer may (the conformance kit
 //!    exempts `semanticPass` diffs from the per-file rules), so the question
 //!    is recorded at the type's position for rust-analyzer's
-//!    `textDocument/definition` to answer.
+//!    `textDocument/definition` to answer. `T` naming *no* declaration of
+//!    this project - `&'a mut S`, `Box<S>` - is a different case and not an
+//!    open site at all; see Decision 8 on [`Bodies::supertype_edge`].
 //!
 //! It is deliberately **not** recorded for an unresolved *type* reference.
 //! `Vec`, `String`, `Option`, `Result` and every other name from another
@@ -51,8 +53,8 @@
 //! site budget with questions whose answers are not in the index anyway. A
 //! type this project declares is reachable through a `use`, which resolves.
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey};
-use g_mesh_plugin_sdk::{OpenSite, OpenSiteKind, PlaceholderKind};
+use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey, Visibility};
+use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
 use crate::extractor::decls::{impl_block, member_tail, trait_block, BlockCtx, Family};
@@ -60,7 +62,9 @@ use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{qualified_in, resolve_module_path, visibility, ModuleCtx, PathTarget};
 use crate::extractor::model::{FileModel, Import};
 use crate::extractor::scope::Scopes;
-use crate::extractor::syntax::{flatten_path, item_name, looks_like_type, path_tail, text, Seg};
+use crate::extractor::syntax::{
+    flatten_path, item_name, looks_like_type, outer_doc_comment, path_tail, signature, text, Seg,
+};
 use crate::project::ProjectContext;
 
 /// What a use site turned out to name.
@@ -290,7 +294,7 @@ impl Bodies<'_, '_> {
             match trait_clause {
                 // `impl Tr for T` is the edge `find_implementations` walks,
                 // subtype -> supertype.
-                Some(clause) => self.supertype_edge(self_type, clause, module, Some(&block), from),
+                Some(clause) => self.supertype_edge(item, self_type, clause, module, Some(&block), from),
                 // An inherent `impl T` is a *use* of `T`, worth a reference
                 // so that `find_references` on a type shows where it is
                 // implemented.
@@ -850,39 +854,111 @@ impl Bodies<'_, '_> {
 
     /// `impl Tr for T` - `SUPERTYPE_OF` from `T` to `Tr`, the direction
     /// `find_implementations` walks.
+    ///
+    /// # Decision 8 (GM-361): a blanket impl starts its edge at the block
+    ///
+    /// The edge has to start at a node of *this* file, and for most impls
+    /// that is `T`'s own declaration. Two shapes have no such node and never
+    /// will, because they implement the trait for something that is not a
+    /// declaration of this project at all:
+    ///
+    /// - `impl<'a, S: Sink> Sink for &'a mut S` - the self type is not a
+    ///   path, so no name can be looked up;
+    /// - `impl<S: Sink + ?Sized> Sink for Box<S>` - the head is a path, but
+    ///   it is neither declared here nor imported, which is exactly what
+    ///   [`Bound::Nothing`] means (see `resolve_bare`: "a type nothing here
+    ///   declares or imports is almost always from another crate").
+    ///
+    /// Measured on ripgrep, those two were simply absent from
+    /// `find_implementations("Sink")`, while their methods were present
+    /// under `sink::<&'a mut S as Sink>::matched` - the block already has a
+    /// *name* in this plugin's scheme ([`BlockCtx::prefix`]), it just had no
+    /// node carrying it. So it gets one, and the edge starts there.
+    ///
+    /// The `Bound::There`/`Bound::Open` cases keep the old open site
+    /// untouched: those are `impl Tr for T` where `T` is a declaration this
+    /// project *does* make, in another file, and the answer a reader wants
+    /// there is `T` - which the semantic tier's trait sweep already
+    /// produces. Declaring a block node for them too would be a second row
+    /// describing the same impl.
     fn supertype_edge(
         &mut self,
+        item: Node,
         self_type: Node,
         trait_clause: Node,
         module: &ModuleCtx,
         block: Option<&BlockCtx>,
         from: &str,
     ) {
-        let subtype = flatten_path(self_type, self.source)
-            .filter(|segments| segments.len() == 1)
+        let segments = flatten_path(self_type, self.source);
+        let subtype = segments
             .as_deref()
+            .filter(|segments| segments.len() == 1)
             .and_then(path_tail)
             .and_then(|name| self.model.lookup_name(&module.key, name, Some(NodeKind::Type)))
             .map(|decl| decl.id.clone());
-        let Some(subtype) = subtype else {
-            // The implemented type is not declared in this file, so no edge
-            // of this file may start at it - see the module doc, Decision 7.
-            let name = flatten_path(self_type, self.source)
-                .as_deref()
-                .and_then(path_tail)
-                .unwrap_or_else(|| text(self_type, self.source))
-                .to_string();
-            self.open_site(
-                from,
-                self_type,
-                &name,
-                module,
-                OpenSiteKind::Implementation,
-                EdgeKind::SupertypeOf,
-            );
+        if let Some(subtype) = subtype {
+            self.supertype_to(&subtype, trait_clause, module, block);
             return;
+        }
+
+        // Nothing this project declares can be behind the self type, so the
+        // impl block itself is the only honest start for the edge.
+        let names_nothing = match segments.as_deref() {
+            None => true,
+            Some(segments) => {
+                matches!(self.resolve_path(segments, module, block, Some(NodeKind::Type)), Bound::Nothing)
+            }
         };
-        self.supertype_to(&subtype, trait_clause, module, block);
+        if names_nothing {
+            if let Some(subtype) = self.declare_impl_block(item, module, block) {
+                self.supertype_to(&subtype, trait_clause, module, block);
+                return;
+            }
+        }
+
+        // The implemented type is declared in another file, so no edge of
+        // this file may start at it - see the module doc, Decision 7.
+        let name = segments
+            .as_deref()
+            .and_then(path_tail)
+            .unwrap_or_else(|| text(self_type, self.source))
+            .to_string();
+        self.open_site(from, self_type, &name, module, OpenSiteKind::Implementation, EdgeKind::SupertypeOf);
+    }
+
+    /// The node for an `impl Tr for T` block whose `T` names no declaration -
+    /// see [`Self::supertype_edge`]'s Decision 8.
+    ///
+    /// Its name is the block's own prefix, `<&'a mut S as Sink>`, which is
+    /// already the prefix every method of the block carries, so the block
+    /// and its members read as one thing rather than two naming schemes. A
+    /// `Type`, because that is the kind `find_implementations` reports and
+    /// the kind the SDK bridge accepts as an implementor; `nativeKind` is
+    /// `impl`, which is what tells it apart from a `struct`.
+    ///
+    /// `public`, because a trait impl's reach is the trait's and the type's,
+    /// never narrower - the same reasoning [`impl_block`] already applies to
+    /// the block's members (Rust forbids a visibility modifier on either).
+    fn declare_impl_block(
+        &mut self,
+        item: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+    ) -> Option<String> {
+        let name = block.map(|block| block.prefix.clone())?;
+        let mut spec = NodeSpec::new(
+            NodeKind::Type,
+            name.clone(),
+            module.qualified(&name),
+            self.emitter.positions().range(item),
+        )
+        .native_kind("impl")
+        .visibility(Visibility::Public)
+        .in_container(module.key.clone(), module.parent.clone());
+        spec.signature = signature(item, self.source);
+        spec.doc_comment = outer_doc_comment(item, self.source);
+        Some(self.emitter.declare(spec, true))
     }
 
     fn supertype_to(&mut self, subtype: &str, supertype: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {

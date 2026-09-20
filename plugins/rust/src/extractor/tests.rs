@@ -626,6 +626,64 @@ fn an_impl_for_a_type_from_another_file_is_an_open_site_rather_than_an_edge() {
     assert_eq!(sites[0].edge_kind, EdgeKind::SupertypeOf);
 }
 
+/// Decision 8 (GM-361): a blanket impl implements the trait for something
+/// that is not a declaration of this project at all, so the `impl` block
+/// itself carries the edge.
+///
+/// Both shapes measured missing from `find_implementations("Sink")` on
+/// ripgrep are here: a self type that is not a path (`&'a mut S`), and one
+/// whose head is a path naming nothing this file declares or imports
+/// (`Box<S>`). The block's name is the prefix its own methods already carry,
+/// which is what makes `<&'a mut S as Sink>` and
+/// `<&'a mut S as Sink>::accept` read as one thing.
+#[test]
+fn a_blanket_impl_is_a_supertype_edge_from_the_impl_block_itself() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Sink { fn accept(&self) -> u8; }\n\
+         impl<'a, S: Sink> Sink for &'a mut S { fn accept(&self) -> u8 { (**self).accept() } }\n\
+         impl<S: Sink + ?Sized> Sink for Box<S> { fn accept(&self) -> u8 { (**self).accept() } }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+
+    for name in ["<&'a mut S as Sink>", "<Box as Sink>"] {
+        let block = graph.node(name);
+        assert_eq!(block.kind, NodeKind::Type, "{name} is what find_implementations reports");
+        assert_eq!(block.native_kind.as_deref(), Some("impl"), "and an `impl`, not a struct");
+        assert_eq!(graph.targets(EdgeKind::SupertypeOf, name), vec!["Sink"]);
+    }
+    assert!(
+        graph.edges(EdgeKind::SupertypeOf).iter().all(|edge| edge.resolved),
+        "both ends are declarations of this same file"
+    );
+    assert!(
+        graph.0.open_sites.iter().all(|site| site.kind != OpenSiteKind::Implementation),
+        "neither is a question for the semantic tier - see Decision 8: {:#?}",
+        graph.0.open_sites
+    );
+}
+
+/// The other half of Decision 8, and the reason it is not simply "declare a
+/// block whenever the self type does not resolve here": `P` below **is** a
+/// declaration this project makes, one file over, and the answer a reader
+/// wants for `impl Shape for P` is `P` - which the semantic tier's trait
+/// sweep produces from the open site's own file. A block node here would be
+/// a second row describing the one impl.
+#[test]
+fn an_impl_for_an_imported_type_keeps_its_open_site_and_gets_no_block_node() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod types;\npub trait Shape {}\nuse crate::types::P;\nimpl Shape for P {}\n"),
+        ("src/types.rs", "pub struct P;\n"),
+    ]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(graph.edges(EdgeKind::SupertypeOf).is_empty(), "{:#?}", graph.edges(EdgeKind::SupertypeOf));
+    assert_eq!(graph.find("<P as Shape>"), None, "no block node: {:#?}", graph.names());
+    let sites: Vec<_> =
+        graph.0.open_sites.iter().filter(|site| site.kind == OpenSiteKind::Implementation).collect();
+    assert_eq!(sites.len(), 1, "{sites:#?}");
+    assert_eq!(sites[0].name, "P");
+}
+
 // --- cfg, errors, purity ---------------------------------------------------------
 
 /// Decision 6: every alternative is indexed, and two alternatives that are

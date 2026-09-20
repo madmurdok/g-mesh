@@ -1278,6 +1278,25 @@ fn record_answer(
 ///
 /// `for_file` is the file whose question produced this, and it is the
 /// anchor's, never the implementor's: see [`Ask::Implementor`].
+///
+/// # Only a `Type` implements anything (GM-361)
+///
+/// [`SdkIndex::node_at`] answers with the **smallest node containing** the
+/// position, which is not the same as "the declaration written there". An
+/// `impl` header inside an inline module is contained by that module's own
+/// node and by nothing smaller, so the sweep recorded the *module* as an
+/// implementor: measured on ripgrep,
+/// `find_implementations("Sink")` carried a row
+/// `sink::sinks @ crates/searcher/src/sink.rs:516`, which is
+/// `pub mod sinks { … }`, alongside the three types declared inside it.
+///
+/// A module implements nothing, in any language this bridge serves, so a
+/// node that is not a [`NodeKind::Type`] is refused here. Refused, not
+/// dropped: `false` is exactly the signal that sends an
+/// [`Ask::Implementation`] answer to its second hop, which asks the server
+/// what is written at that position and gets the implementing declaration -
+/// the same path an `impl` header at a file's top level already took, where
+/// `node_at` found only the `File` node.
 fn record_implementor(
     answers: &mut Answers,
     index: &SdkIndex,
@@ -1295,6 +1314,11 @@ fn record_implementor(
         // implementations, which some do - and, for the second hop, the
         // `Trait` half of `impl Trait for T` if a server ever points there.
         return true;
+    }
+    if node.kind != NodeKind::Type {
+        // A container that merely encloses the position, not the declaration
+        // written at it - see this function's own doc.
+        return false;
     }
     let (from_id, at, container) = (node.id.clone(), node.range.start, node.container.clone());
     answers.record(

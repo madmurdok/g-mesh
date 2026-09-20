@@ -55,6 +55,7 @@ before believing it.
 | `impl T { fn m }` | `Function` | `method` | `T::m` |
 | `impl Tr for T { fn m }` | `Function` | `trait_impl_method` | `<T as Tr>::m` |
 | `trait Tr { fn m }` | `Function` | `trait_method` | `Tr::m` |
+| `impl Tr for &mut S` (no type of this project) | `Type` | `impl` | `<&mut S as Tr>` |
 
 A node's `qualifiedName` is its path from its crate root **without** the
 crate name (`parse::Lexer::next`), and its container is
@@ -67,6 +68,16 @@ depart from the design doc's sketch, both for the same reason - an id is
 - A trait impl's method carries the trait, in Rust's own disambiguation
   syntax, so `impl Display for P` and `impl Debug for P` can each have a
   `fmt`.
+
+The last row of the table is the only `impl` block that becomes a node of its
+own, and it exists so that the `SUPERTYPE_OF` edge has somewhere to start.
+`impl<'a, S: Sink> Sink for &'a mut S` and `impl<S: Sink> Sink for Box<S>`
+implement the trait for something no declaration of this project names - not a
+path at all in the first case, a foreign one in the second - so the ordinary
+edge, which runs from `T`'s declaration, has no `T`. `find_implementations`
+reported neither on ripgrep until the block got a node (GM-361). An
+`impl Tr for T` where `T` *is* a declaration, here or in another file, still
+starts its edge at `T` and the block stays nameless.
 
 Edges: `DEFINES`/`EXPORTS` from the file; `IMPORTS` from the file onto the
 container each `use` reads from; `CALLS` and `REFERENCES` onto a declaration

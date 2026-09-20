@@ -59,6 +59,8 @@ fn list_calls(
         &["CALLS"],
         file_paths,
         anchor_file_path,
+        // One row per call site, not per calling symbol - see `Distinctness`.
+        pagination::Distinctness::Edges,
         page_size,
         cursor,
     )
