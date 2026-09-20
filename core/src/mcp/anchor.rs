@@ -70,6 +70,13 @@ pub(super) struct AnchorInfo {
     pub(super) qualified_name: String,
     pub(super) kind: String,
     pub(super) file_path: String,
+    /// **Zero-based**, the index's own coordinate (tree-sitter's convention,
+    /// stored as the extractor reported it). A caller citing a line to a
+    /// human, or comparing against a grep, wants `start_line + 1` - which is
+    /// exactly what [`mcp::source::Snippet::first_line`] already carries
+    /// where a response includes source. The two are deliberately both
+    /// present and deliberately differ; renumbering this one would break
+    /// every caller doing arithmetic on it (GM-363).
     pub(super) start_line: i64,
     /// Which rung of the resolution ladder reached this anchor - see
     /// [`find_definition::ResolvedBy`]. Absent when built from a bare node
