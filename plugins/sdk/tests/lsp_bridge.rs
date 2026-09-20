@@ -83,18 +83,20 @@ impl Scratch {
         &self.0
     }
 
-    /// The `file:` URI of a project-relative path, spelled the way the bridge
-    /// spells it.
+    /// The `file:` URI of a project-relative path, as the scripted server
+    /// will be asked about it.
     fn uri(&self, relative: &str) -> String {
-        format!("file://{}", self.0.join(relative).to_string_lossy())
+        file_uri(&self.0.join(relative))
     }
 
     /// The same, through the *canonical* root - `/private/var/…` on macOS
-    /// where the scratch directory itself says `/var/…`. A server reports the
-    /// canonical spelling, so at least one test answers in it.
+    /// where the scratch directory itself says `/var/…`, and the long-name
+    /// `C:\Users\runneradmin\…` on Windows where `%TEMP%` is the 8.3
+    /// `C:\Users\RUNNER~1\…`. A server reports the canonical spelling, so at
+    /// least one test answers in it.
     fn real_uri(&self, relative: &str) -> String {
         let real = std::fs::canonicalize(&self.0).unwrap_or_else(|_| self.0.clone());
-        format!("file://{}", real.join(relative).to_string_lossy())
+        file_uri(&real.join(relative))
     }
 
     fn write(&self, relative: &str, contents: &str) {
@@ -117,6 +119,71 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// The `file:` URI naming an absolute path.
+///
+/// Spelled here rather than imported from the SDK, for the reason
+/// `fake-lsp`'s module doc gives about framing: the scripted server matches
+/// the request's URI as a *string*, so a fixture that built its expectation
+/// with the bridge's own function would agree with the bridge by
+/// construction and could never catch it spelling a URI no server accepts.
+/// That is not hypothetical - GM-338 is exactly that failure, in this
+/// direction: this helper used to be `format!("file://{path}")`, which is
+/// right for a POSIX path by luck (the leading `/` supplies the third slash)
+/// and wrong for every Windows one, which has no leading slash and uses the
+/// other separator. Nineteen of the twenty-five bridge tests in this file
+/// then asked about one URI, scripted an answer under another, and got the
+/// server's ordinary "nothing here" for every question.
+///
+/// Three decisions, and two of them are invisible on a Unix host: forward
+/// slashes, three of them before a drive letter, and percent-encoding for
+/// everything outside the unreserved set (`:` and `/` excepted - a drive
+/// spelled `C%3A` names no drive). The test below checks all three from any
+/// host.
+fn file_uri(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    // `std::fs::canonicalize` answers in Windows' extended-length spelling,
+    // which is not a URI path: `\\?\C:\p` is `C:\p`.
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('\\', "/");
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    // A POSIX path brings the third slash itself; a Windows one (`C:/p`) does
+    // not.
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+/// **The GM-338 control.** The one platform-dependent decision this fixture
+/// makes, stated as literals so that its Windows arm runs on every host -
+/// there is no Windows machine to reproduce the CI failure on, and a check
+/// that only runs where the bug cannot happen is not a check.
+///
+/// The first case is the exact shape of a GitHub Actions runner's `%TEMP%`,
+/// short name and all; the second is what `Scratch::real_uri` gets back from
+/// `canonicalize` there. Before the fix both produced `file://C:\…` - two
+/// slashes and the wrong separator - which is a URI the bridge never asks
+/// about and the scripted server therefore never matches.
+#[test]
+fn a_windows_scratch_path_is_asked_about_by_an_ordinary_file_uri() {
+    assert_eq!(
+        file_uri(Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\g-mesh-lsp-bridge-1-x\src\b.toy")),
+        "file:///C:/Users/RUNNER~1/AppData/Local/Temp/g-mesh-lsp-bridge-1-x/src/b.toy"
+    );
+    assert_eq!(file_uri(Path::new(r"\\?\C:\p\src\b.toy")), "file:///C:/p/src/b.toy");
+    // The POSIX arm, which is the only one CI was checking until now.
+    assert_eq!(file_uri(Path::new("/private/var/p/src/b.toy")), "file:///private/var/p/src/b.toy");
+    assert_eq!(file_uri(Path::new("/p/a b.toy")), "file:///p/a%20b.toy", "a URI carries no raw space");
 }
 
 /// Budgets small enough that a test finishes and large enough that a machine

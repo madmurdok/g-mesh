@@ -50,7 +50,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use rusqlite::Connection;
 
-use crate::daemon::manifest::{read_manifest, PluginManifest};
+use crate::daemon::manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::ndjson::BulkItem;
@@ -116,11 +116,24 @@ pub fn check(
 ) -> Result<Report> {
     // Canonicalized before `read_manifest`, which requires the directory's
     // own name to equal the manifest's language - `.` has no name to compare.
-    let plugin_dir = fs::canonicalize(plugin_dir)
-        .with_context(|| format!("plugin directory {} does not exist", plugin_dir.display()))?;
+    //
+    // ...and then spelled back the ordinary way, because on Windows
+    // `canonicalize` returns the extended-length (`\\?\`) form, and this is
+    // the directory every manifest-relative `command`/`args` entry is joined
+    // onto: under that prefix Windows resolves nothing, so the plugin's own
+    // entry point arrives at it spelled `...\typescript\dist/src/index.js`.
+    // `manifest::plain_win32_path` carries the evidence for what that costs.
+    // The report prints both paths too, and the extended-length spelling of a
+    // path is nobody's idea of where their plugin is.
+    let plugin_dir = plain_spelling(
+        fs::canonicalize(plugin_dir)
+            .with_context(|| format!("plugin directory {} does not exist", plugin_dir.display()))?,
+    );
     let manifest = read_manifest(&plugin_dir)?;
-    let fixture = fs::canonicalize(fixture)
-        .with_context(|| format!("fixture directory {} does not exist", fixture.display()))?;
+    let fixture = plain_spelling(
+        fs::canonicalize(fixture)
+            .with_context(|| format!("fixture directory {} does not exist", fixture.display()))?,
+    );
     if !fixture.is_dir() {
         bail!("fixture {} is not a directory", fixture.display());
     }

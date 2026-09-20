@@ -16,13 +16,18 @@
 #   scripts/build-targets.sh --version            # version the artifacts are named after
 #   scripts/build-targets.sh --asset-names [target...]
 #                                                 # names a full release publishes
+#   scripts/build-targets.sh --stage-dir <target>
+#                                                 # the staging dir build_one()
+#                                                 # left on disk for <target>
 #
-# The three query flags answer questions *without building*, so they need
+# The four query flags answer questions *without building*, so they need
 # neither cargo nor rustup and cost nothing to call. `--asset-names` exists for
 # the publishing job in .github/workflows/release.yml: it uploads exactly the
 # names this script says it emits, computed by the same code that emits them,
 # so renaming an artifact here cannot silently desync the Release from the
-# install script that fetches those names by URL.
+# install script that fetches those names by URL. `--stage-dir` exists for
+# scripts/release-smoke.sh (GM-333), for the same reason: the path it needs to
+# run the staged binary from is computed here, once, rather than retyped.
 #
 # Environment:
 #   G_MESH_VERSION  version string used in artifact names (default: the
@@ -329,8 +334,20 @@ main() {
 		done
 		return 0
 		;;
+	--stage-dir)
+		# GM-333: scripts/release-smoke.sh needs the exact same staging
+		# directory build_one() just wrote to, without a caller having to
+		# retype `artifact_stem_for`'s formula - the "generated, not typed"
+		# rule .github/workflows/release.yml's header already states for
+		# asset names applies here too.
+		shift
+		local sd_target="${1:-}"
+		[ -n "$sd_target" ] || die "--stage-dir requires a target argument"
+		printf '%s\n' "$DIST_DIR/$(artifact_stem_for "$sd_target" "$(resolve_version)")"
+		return 0
+		;;
 	-*)
-		die "unknown flag: $1 (try --list, --version, --asset-names)"
+		die "unknown flag: $1 (try --list, --version, --asset-names, --stage-dir)"
 		;;
 	esac
 

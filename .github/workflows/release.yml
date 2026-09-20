@@ -149,7 +149,7 @@ on:
   # Building four targets is expensive, so PRs only trigger it when the
   # pipeline itself changes. This is the intended way to prove the workflow
   # works before relying on it for a real release: open a PR touching these
-  # two files and watch all four jobs.
+  # files and watch all four jobs.
   pull_request:
     paths:
       - ".github/workflows/release.yml"
@@ -159,6 +159,13 @@ on:
       - "scripts/bundle-rust-plugin.sh"
       - "scripts/bundle-python-plugin.sh"
       - "scripts/prepare-release-assets.sh"
+      # GM-333: a change to any of these three should get the same "watch all
+      # four jobs" PR run as a change to the build/package scripts above -
+      # they are what the new smoke-test steps in the `build` job actually
+      # run.
+      - "scripts/release-smoke.sh"
+      - "scripts/release-smoke-fixture/**"
+      - "scripts/install.ps1"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
 # write`, and only for itself - the jobs that compile third-party C, C++ and
@@ -322,6 +329,138 @@ jobs:
             echo "rustc=$(rustc --version)"
           } > "dist/meta/${{ matrix.target }}.txt"
           cat "dist/meta/${{ matrix.target }}.txt"
+
+      # GM-333. `build_one()` above already proves the staged binary starts
+      # and sees the plugins staged beside it (`--version`/`plugins list`,
+      # gated on `target == host` inside build-targets.sh - which, in this
+      # matrix, is every leg, since each target builds natively on its own
+      # runner). It never spawns a plugin process, indexes anything, or
+      # touches the network - exactly what GM-206 went and checked by hand,
+      # once, on one platform, and exactly what a build cannot reveal on its
+      # own ("CI produced it" is not "it works"). This runs `<staged binary>
+      # reindex` against an in-tree multi-language fixture
+      # (scripts/release-smoke-fixture) on this target's own runner, so every
+      # release gets that on all four - see scripts/release-smoke.sh's own
+      # header for exactly what it checks and why, including the fixture
+      # choice and why `g-mesh model fetch` is deliberately not part of this.
+      #
+      # Runs unconditionally - on a manual dispatch, a PR touching the
+      # pipeline, and a tag alike - not only on a tag: `tests:` above already
+      # makes this argument once for gating this whole job on nothing, and a
+      # check that only runs at release time is a check that tells you after
+      # it shipped.
+      - name: Smoke test the staged artifact (GM-333)
+        shell: bash
+        run: |
+          stage_dir="$(bash scripts/build-targets.sh --stage-dir ${{ matrix.target }})"
+          bash scripts/release-smoke.sh "$stage_dir" ${{ matrix.target }}
+
+      # GM-333. `scripts/install.ps1` is 616 lines that, until this step, had
+      # never been *executed* anywhere - ci.yml's "install.ps1 parses under
+      # PowerShell" (GM-342) proves only that it parses, and its own comment
+      # says so: "Running the thing end to end is GM-333." This is that run,
+      # against the archive this job just staged rather than a published
+      # release - there is no published release to install from during a
+      # build. A tiny local file server hands out the staged `.zip` and
+      # `.sha256` at the same `<base>/v<version>/<asset>` shape install.ps1
+      # expects from GitHub Releases; `G_MESH_DOWNLOAD_BASE` is documented and
+      # injectable for exactly this (see install.ps1's own "TESTING IT
+      # WITHOUT A RELEASE" section - this step automates precisely what that
+      # section says to run by hand). Everything this step creates - the
+      # server's files and the install itself - lives under
+      # `$env:RUNNER_TEMP`, which the runner discards on its own, and the
+      # `finally` block below tears the server and the install down besides,
+      # so nothing here can affect a later step.
+      #
+      # Unverified: this has never run on a real Windows runner (this change
+      # could not be exercised by pushing - see the PR/commit that introduced
+      # it). It assumes `python` is on PATH, which GitHub's `windows-2022`
+      # image documents; if that stops being true this fails loudly ("python"
+      # not found) rather than silently skipping.
+      - name: Install from the staged archive with install.ps1 (GM-333)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            throw "python not found on PATH - needed to serve the staged archive locally for install.ps1's end-to-end smoke test (GM-333)"
+          }
+
+          $version = ((& bash scripts/build-targets.sh --version) | Out-String).Trim()
+          $names = @(& bash scripts/build-targets.sh --asset-names x86_64-pc-windows-msvc)
+          $archive = $names[0]
+          $checksum = $names[1]
+
+          $serveRoot = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-serve'
+          $versionDir = Join-Path $serveRoot "v$version"
+          New-Item -ItemType Directory -Path $versionDir -Force | Out-Null
+          Copy-Item "dist/$archive" (Join-Path $versionDir $archive)
+          Copy-Item "dist/$checksum" (Join-Path $versionDir $checksum)
+
+          $port = 8933
+          Write-Host "==> starting a local file server on 127.0.0.1:$port ($serveRoot)"
+          $serverOutLog = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-server.out.log'
+          $serverErrLog = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-server.err.log'
+          $server = Start-Process -FilePath 'python' `
+            -ArgumentList @('-m', 'http.server', '--bind', '127.0.0.1', '--directory', $serveRoot, "$port") `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $serverOutLog -RedirectStandardError $serverErrLog
+
+          $installDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-installed'
+
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              try {
+                Invoke-WebRequest -Uri "http://127.0.0.1:$port/v$version/$archive" -Method Head -UseBasicParsing -ErrorAction Stop | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $ready) {
+              throw "local file server on 127.0.0.1:$port never came up - see $serverOutLog / $serverErrLog"
+            }
+
+            $env:G_MESH_DOWNLOAD_BASE = "http://127.0.0.1:$port"
+            # A `throw` inside install.ps1 (its `Die`) unwinds up through this
+            # call and into the `finally` below, same as it would for anyone
+            # running it - `&` invokes it in a child scope of this same
+            # session, not a separate process, so nothing extra is needed to
+            # propagate that failure into this step failing.
+            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $installDir
+
+            $exe = Join-Path $installDir 'g-mesh.exe'
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+              throw "install.ps1 reported success but $exe does not exist"
+            }
+
+            Write-Host "==> verifying the installed binary runs from its final location"
+            $reported = ((& $exe --version) -join "`n")
+            if ($LASTEXITCODE -ne 0 -or $reported -notmatch [regex]::Escape($version)) {
+              throw "installed g-mesh.exe --version did not report $version (exit $LASTEXITCODE, output: $reported)"
+            }
+            $pluginsOutput = ((& $exe plugins list) -join "`n")
+            if ($LASTEXITCODE -ne 0) {
+              throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
+            }
+            foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+              if ($pluginsOutput -notmatch $lang) {
+                throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$pluginsOutput"
+              }
+            }
+
+            Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
+          } finally {
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $serveRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:G_MESH_DOWNLOAD_BASE -ErrorAction SilentlyContinue
+          }
 
       # `meta/` rides along inside the same artifact rather than as a second
       # one: upload-artifact roots the upload at the common ancestor of these

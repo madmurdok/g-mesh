@@ -1742,7 +1742,29 @@ mod tests {
 
         assert!(!supervisor.is_semantic_suspended(), "not suspended before the first sample");
 
-        supervisor.check_memory_limit();
+        // Through the seam, not `check_memory_limit()`'s real sampler (GM-340).
+        //
+        // This test's subject is the *aftermath* of a suspension: that the
+        // next fileChanged still wakes the plugin for structural work, and
+        // that no semanticPass rides along with it. Reaching that state
+        // through the real sampler made it depend on the operating system
+        // reporting the fixture's 200MB buffer as over 100MB on **two
+        // consecutive scans**, on a runner already carrying 1300 other tests.
+        // That is not a property this test is judged on, and it is what made
+        // it flaky - three failures in five days, twice on Windows and once
+        // on macOS, every one of them with the plugin still alive when the
+        // assertion ran.
+        //
+        // The decision keeps its own coverage, and keeps it deterministically:
+        // `a_confirmed_over_limit_sample_suspends_the_language` proves that two
+        // over-limit readings suspend, and
+        // `an_unconfirmed_over_limit_sample_leaves_the_plugin_running` proves
+        // the other arm. That the *real* sampler can see a real process's
+        // memory belongs to `core/tests/plugin_memory_limit.rs`, against a
+        // real rust-analyzer, where a live measurement is the subject rather
+        // than an obstacle.
+        let (sampler, _calls) = scripted_sampler(vec![Some(500), Some(480)]);
+        supervisor.check_memory_limit_sampled_by(sampler);
 
         assert_eq!(supervisor.pid(), None, "a plugin over its memory limit must be put to sleep");
         assert!(supervisor.is_semantic_suspended(), "its language's semantic passes must be suspended");

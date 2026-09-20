@@ -36,10 +36,10 @@
 //! The three places, in order, and what each one is for:
 //!
 //! 1. **`PATH`.** The manifest's bare `pyright-langserver`, looked up by the
-//!    operating system - `Command::new` does that on every platform,
-//!    including Windows' `PATHEXT` rules a hand-rolled walk gets wrong. This
-//!    is a global `npm i -g pyright`, a `pipx install pyright`, or a distro
-//!    package.
+//!    operating system - `Command::new` does that on every platform. This is
+//!    a global `npm i -g pyright`, a `pipx install pyright`, or a distro
+//!    package. On Windows this candidate needs more than a plain lookup - see
+//!    Decision 1b, right after this list.
 //! 2. **The indexed project's own `node_modules/.bin`.** Resolved against the
 //!    *project root*, not against the manifest, and this is the reason the
 //!    factory takes a root at all: a project that pins its own pyright is
@@ -81,6 +81,52 @@
 //! still probed, through the CLI twin beside it when its name ends in
 //! `-langserver`, so a path that is wrong fails with one log line rather than
 //! as a server that dies at handshake.
+//!
+//! # Decision 1b: `Command::new` does not walk `PATHEXT`, so this module does
+//!
+//! GM-341: none of the three candidates above start on Windows when pyright
+//! is installed the ordinary way, `npm install pyright`. npm's Windows shim
+//! for a bin is not a `.exe` - `bin-links` writes `<name>.cmd` (a `cmd.exe`
+//! batch file usable from `cmd.exe`, PowerShell, and this process) alongside
+//! an extensionless POSIX shebang script and a `<name>.ps1`, neither of which
+//! `CreateProcessW` can execute directly. `std::process::Command` on Windows
+//! is a thin wrapper over `CreateProcessW`, and that API's own extension
+//! completion is narrower than a shell's: given a bare name it tries the name
+//! as given and then `<name>.exe`, nothing else. `PATHEXT` is `cmd.exe`'s own
+//! rule, consulted by the shell that parses a typed command line - not by
+//! `CreateProcess`, and not by anything standing between it and `Command`.
+//! Concretely: candidate 1 looks for `pyright-langserver.exe`; candidate 2
+//! names `node_modules/.bin/pyright-langserver`, a path with a separator, so
+//! *no* extension is tried at all; and even candidate 3 fails the same way,
+//! because `npx` itself ships as `npx.cmd` beside `node.exe` on a machine
+//! whose Node came from the official Windows installer. Not measured on a
+//! Windows host - there is none here - but is documented `CreateProcess`
+//! behaviour plus the CI evidence this task was cut from: CI's own step had
+//! already run `npm install pyright` successfully, and the conformance test -
+//! which carried the same naive candidate list this module did - still
+//! reported no usable pyright.
+//!
+//! The fix is [`script_spellings`]: every final candidate path from all three
+//! branches above, and a path the manifest names explicitly, is tried both as
+//! written and, when it has no extension of its own, with `.cmd` appended.
+//! Only `.cmd` - not `.bat`, which current npm does not write (listing a
+//! spelling nothing installs would only make a failure message name a
+//! candidate that can never exist), and not `.ps1`, which `CreateProcessW`
+//! cannot execute directly either: running one needs an explicit
+//! `powershell -File` wrapper this module does not add, so trying the bare
+//! `.ps1` path would add a candidate that can never succeed rather than a
+//! real fallback. `npx` is not special-cased - it goes through the same
+//! expansion as the manifest path and the two npm-install candidates, which
+//! is what makes this a fix rather than a list of two spellings with a third
+//! exception waiting to be discovered the same way this one was. The
+//! extension list is a parameter, not a fact [`script_spellings`] reads for
+//! itself - [`candidates`] is the one place that picks
+//! [`WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
+//! `daemon::manifest::resolve_exe_suffix` uses around
+//! `daemon::manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
+//! is exercised by this module's own tests from this macOS host, rather than
+//! sitting behind a `#[cfg(windows)]` nobody here can run. GM-335 is what a
+//! test that never runs costs.
 //!
 //! # Decision 2: the probe is bounded, because this one can reach the network
 //!
@@ -196,6 +242,31 @@ const NPM_PACKAGE: &str = "pyright";
 /// Where a project keeps a locally installed pyright.
 const NODE_BIN_DIR: &str = "node_modules/.bin";
 
+/// The npm shim extension worth trying beyond a candidate's bare spelling -
+/// see this module's doc, Decision 1b, for why `.cmd` and not `.bat`/`.ps1`.
+///
+/// Only read by [`HOST_SCRIPT_EXTENSIONS`]'s `#[cfg(windows)]` arm and by this
+/// module's own tests (which exercise it from every host, windows included) -
+/// so a build for any other host sees it as unread, which is what the `allow`
+/// says and nothing more.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_SCRIPT_EXTENSIONS: [&str; 1] = [".cmd"];
+
+/// The script extensions worth trying on the host this process actually runs
+/// on - empty everywhere but Windows, where npm writes a bin as a `.cmd`
+/// shim rather than a `.exe`.
+///
+/// The only `#[cfg(windows)]` in this module, and it does nothing but pick
+/// which list [`candidates`] hands to [`script_spellings`] - a pure function
+/// that takes the list as a parameter rather than reading this constant
+/// itself, so its Windows arm is exercised by this module's own tests from
+/// any host. Same shape as `daemon::manifest::resolve_exe_suffix` picking
+/// `std::env::consts::EXE_SUFFIX` for `daemon::manifest::exe_suffixed`.
+#[cfg(windows)]
+const HOST_SCRIPT_EXTENSIONS: &[&str] = &WINDOWS_SCRIPT_EXTENSIONS;
+#[cfg(not(windows))]
+const HOST_SCRIPT_EXTENSIONS: &[&str] = &[];
+
 /// How long one candidate's `--version` may take before it is killed and
 /// counted as a failure - see this module's doc, Decision 2. Generous against
 /// the 0.89s a local probe measured and the 4.94s an `npx` one did, and still
@@ -226,7 +297,7 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             )
         })?;
 
-    let resolved = resolve(&config.command, root)?;
+    let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
     eprintln!(
@@ -275,9 +346,13 @@ struct Resolved {
 
 /// The server to run, the args it needs, and the version its CLI twin
 /// answered with.
-fn resolve(command: &Path, root: &Path) -> Result<Resolved> {
+///
+/// `script_extensions` is [`HOST_SCRIPT_EXTENSIONS`] in production - see this
+/// module's doc, Decision 1b, for why it is a parameter here rather than a
+/// constant this function reads for itself.
+fn resolve(command: &Path, root: &Path, script_extensions: &[&str]) -> Result<Resolved> {
     let mut failures: Vec<String> = Vec::new();
-    for candidate in candidates(command, root) {
+    for candidate in candidates(command, root, script_extensions) {
         let (probe_command, probe_args) = &candidate.probe;
         match probe(probe_command, probe_args, PROBE_BUDGET) {
             Ok(version) => {
@@ -299,44 +374,82 @@ fn resolve(command: &Path, root: &Path) -> Result<Resolved> {
     )
 }
 
-/// The spellings worth probing, in order - see this module's doc, Decision 1.
+/// The spellings worth probing, in order - see this module's doc, Decisions 1
+/// and 1b.
 ///
 /// A `command` that is a path names one file and is never searched around; a
 /// bare one is a `PATH` lookup, then the indexed project's own
-/// `node_modules/.bin`, then `npx`.
-fn candidates(command: &Path, root: &Path) -> Vec<Candidate> {
+/// `node_modules/.bin`, then `npx`. Within each of those, every extension
+/// [`script_spellings`] builds for `script_extensions` is tried, in order,
+/// before moving to the next origin - the origin priority (a global install
+/// over a project-local one over the network) matters more than which
+/// spelling of one origin answers first.
+fn candidates(command: &Path, root: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
     let bare = command.components().count() == 1 && !command.is_absolute();
     if !bare {
-        return vec![Candidate {
-            command: command.to_path_buf(),
-            prefix_args: Vec::new(),
-            probe: (cli_twin(command), Vec::new()),
-            origin: "the path the manifest names",
-        }];
+        return script_spellings(command, script_extensions)
+            .into_iter()
+            .map(|command| Candidate {
+                probe: (cli_twin(&command), Vec::new()),
+                command,
+                prefix_args: Vec::new(),
+                origin: "the path the manifest names",
+            })
+            .collect();
     }
 
     let name = command.to_string_lossy().into_owned();
     let local = root.join(NODE_BIN_DIR).join(&name);
-    vec![
-        Candidate {
-            command: command.to_path_buf(),
+    let mut candidates = Vec::new();
+    for command in script_spellings(command, script_extensions) {
+        candidates.push(Candidate {
+            probe: (cli_twin(&command), Vec::new()),
+            command,
             prefix_args: Vec::new(),
-            probe: (cli_twin(command), Vec::new()),
             origin: "PATH",
-        },
-        Candidate {
-            probe: (cli_twin(&local), Vec::new()),
-            command: local,
+        });
+    }
+    for command in script_spellings(&local, script_extensions) {
+        candidates.push(Candidate {
+            probe: (cli_twin(&command), Vec::new()),
+            command,
             prefix_args: Vec::new(),
             origin: "the project's node_modules/.bin",
-        },
-        Candidate {
-            command: PathBuf::from("npx"),
+        });
+    }
+    for command in script_spellings(Path::new("npx"), script_extensions) {
+        candidates.push(Candidate {
             prefix_args: npx_args(&name),
-            probe: (PathBuf::from("npx"), npx_args(CLI_BIN)),
+            probe: (command.clone(), npx_args(CLI_BIN)),
+            command,
             origin: "npx",
-        },
-    ]
+        });
+    }
+    candidates
+}
+
+/// `path`, and - when it has no extension of its own - `path` with each of
+/// `extensions` appended to its file name, in the order given.
+///
+/// Mirrors `daemon::manifest::exe_suffixed`'s rule for `.exe` (never touch an
+/// explicit spelling) generalised to a list, because a Windows npm install
+/// needs more than one alternate spelling tried - see this module's doc,
+/// Decision 1b. Pure and filesystem-independent, like its precedent: nothing
+/// here checks whether a spelling exists, which is what makes it exercisable
+/// from any host by a plain unit test rather than only against a real
+/// install.
+fn script_spellings(path: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let mut spellings = vec![path.to_path_buf()];
+    if path.extension().is_some() {
+        return spellings;
+    }
+    let Some(stem) = path.file_name() else { return spellings };
+    for extension in extensions {
+        let mut name = stem.to_os_string();
+        name.push(extension);
+        spellings.push(path.with_file_name(name));
+    }
+    spellings
 }
 
 /// `npx`'s own argv for running `bin` out of the pyright package.
@@ -477,12 +590,14 @@ mod tests {
     use g_mesh_plugin_sdk::lsp::ServerReadiness;
 
     /// A path names one binary and is never searched around - see
-    /// [`candidates`]' doc and GM-290's own rule.
+    /// [`candidates`]' doc and GM-290's own rule. No extensions on this host
+    /// (`&[]`, matching `HOST_SCRIPT_EXTENSIONS` on every non-Windows host) is
+    /// the ordinary case; the Windows arm gets its own test below.
     #[test]
     fn a_command_that_is_a_path_is_the_only_candidate() {
         let root = Path::new("/projects/thing");
-        assert_eq!(candidates(Path::new("/opt/py/pyright-langserver"), root).len(), 1);
-        assert_eq!(candidates(Path::new("servers/pyright-langserver"), root).len(), 1);
+        assert_eq!(candidates(Path::new("/opt/py/pyright-langserver"), root, &[]).len(), 1);
+        assert_eq!(candidates(Path::new("servers/pyright-langserver"), root, &[]).len(), 1);
     }
 
     /// A bare name is three places in one fixed order, and the middle one is
@@ -490,7 +605,7 @@ mod tests {
     #[test]
     fn a_bare_name_is_path_then_the_projects_node_modules_then_npx() {
         let root = Path::new("/projects/thing");
-        let candidates = candidates(Path::new(SERVER_BIN), root);
+        let candidates = candidates(Path::new(SERVER_BIN), root, &[]);
         assert_eq!(candidates.len(), 3, "{candidates:#?}");
 
         assert_eq!(candidates[0].command, PathBuf::from(SERVER_BIN), "the bare name stays a PATH lookup");
@@ -510,13 +625,64 @@ mod tests {
         );
     }
 
+    /// GM-341: on Windows every one of the three origins is tried both bare
+    /// and with `.cmd` appended, in that order, before the next origin - see
+    /// this module's doc, Decision 1b. Built from `WINDOWS_SCRIPT_EXTENSIONS`
+    /// rather than a literal `".cmd"`, so a second extension ever added there
+    /// is covered here without editing this test. Run from this macOS host,
+    /// which is the point: [`script_spellings`] takes the extension list as a
+    /// parameter instead of reading [`HOST_SCRIPT_EXTENSIONS`] itself, so its
+    /// Windows arm needs no Windows host to execute.
+    #[test]
+    fn on_windows_every_origin_is_tried_bare_then_with_each_script_extension() {
+        let root = Path::new("/projects/thing");
+        let candidates = candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS);
+        let spellings_per_origin = 1 + WINDOWS_SCRIPT_EXTENSIONS.len();
+        assert_eq!(candidates.len(), 3 * spellings_per_origin, "{candidates:#?}");
+
+        let path = |origin: &str, path: &Path| {
+            candidates.iter().find(|c| c.origin == origin && c.command == path).unwrap_or_else(|| {
+                panic!("expected a {origin} candidate spelled {}: {candidates:#?}", path.display())
+            })
+        };
+        path("PATH", Path::new(SERVER_BIN));
+        path("PATH", Path::new("pyright-langserver.cmd"));
+        path(
+            "the project's node_modules/.bin",
+            &root.join("node_modules/.bin").join("pyright-langserver.cmd"),
+        );
+        let npx_cmd = path("npx", Path::new("npx.cmd"));
+        assert_eq!(
+            npx_cmd.prefix_args,
+            vec!["--yes", "--package", NPM_PACKAGE, SERVER_BIN],
+            "the .cmd spelling of npx runs the same argv as the bare one: {npx_cmd:#?}"
+        );
+
+        // Bare-before-.cmd within one origin, and PATH-before-local-before-npx
+        // across origins - see this module's doc, Decision 1b, on why origin
+        // order outranks extension order.
+        let origins: Vec<&str> = candidates.iter().map(|c| c.origin).collect();
+        assert_eq!(
+            origins,
+            vec![
+                "PATH",
+                "PATH",
+                "the project's node_modules/.bin",
+                "the project's node_modules/.bin",
+                "npx",
+                "npx"
+            ],
+            "{candidates:#?}"
+        );
+    }
+
     /// The npx probe and the npx server invocation must differ in exactly one
     /// token, the bin name. Anything else and the probe is proving a
     /// different command than the one that will run - which is precisely how
     /// the 404 above got past a green probe.
     #[test]
     fn the_npx_probe_differs_from_the_npx_server_only_in_the_bin_name() {
-        let npx = candidates(Path::new(SERVER_BIN), Path::new("/projects/thing")).remove(2);
+        let npx = candidates(Path::new(SERVER_BIN), Path::new("/projects/thing"), &[]).remove(2);
         let (_, probe_args) = &npx.probe;
         assert_eq!(npx.prefix_args.len(), probe_args.len(), "{npx:#?}");
         let differing: Vec<_> =
@@ -529,18 +695,56 @@ mod tests {
     #[test]
     fn every_candidate_is_probed_through_the_cli_twin_and_never_the_server() {
         let root = Path::new("/projects/thing");
-        for candidate in candidates(Path::new(SERVER_BIN), root) {
+        for candidate in candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS) {
             let (probe, args) = &candidate.probe;
             assert!(
                 !probe.to_string_lossy().contains("langserver"),
                 "the language server has no --version: {candidate:#?}"
             );
             assert!(
-                probe.file_name().is_some_and(|name| name == CLI_BIN)
+                probe
+                    .file_name()
+                    .is_some_and(|name| name == CLI_BIN || name == format!("{CLI_BIN}.cmd").as_str())
                     || args.iter().any(|arg| arg == CLI_BIN),
-                "and the twin is pyright's own CLI: {candidate:#?}"
+                "and the twin is pyright's own CLI, extension included: {candidate:#?}"
             );
         }
+    }
+
+    /// [`script_spellings`] is the pure building block [`candidates`] uses for
+    /// every origin - see this module's doc, Decision 1b.
+    #[test]
+    fn script_spellings_keeps_the_bare_path_and_appends_every_extension() {
+        assert_eq!(
+            script_spellings(Path::new("pyright-langserver"), &[]),
+            vec![PathBuf::from("pyright-langserver")],
+            "no extensions on this host is a no-op"
+        );
+        assert_eq!(
+            script_spellings(Path::new("pyright-langserver"), &[".cmd"]),
+            vec![PathBuf::from("pyright-langserver"), PathBuf::from("pyright-langserver.cmd")]
+        );
+        assert_eq!(
+            script_spellings(Path::new("/p/node_modules/.bin/pyright-langserver"), &[".cmd", ".ps1"]),
+            vec![
+                PathBuf::from("/p/node_modules/.bin/pyright-langserver"),
+                PathBuf::from("/p/node_modules/.bin/pyright-langserver.cmd"),
+                PathBuf::from("/p/node_modules/.bin/pyright-langserver.ps1"),
+            ],
+            "a directory is kept, and both extensions are offered in the order given"
+        );
+    }
+
+    /// A spelling that already carries an extension is left alone - the same
+    /// rule `daemon::manifest::exe_suffixed` applies to `.exe`: someone who
+    /// wrote `pyright-langserver.cmd` into the manifest by hand meant exactly
+    /// that file, not `pyright-langserver.cmd.cmd`.
+    #[test]
+    fn script_spellings_does_not_touch_an_explicit_extension() {
+        assert_eq!(
+            script_spellings(Path::new("pyright-langserver.cmd"), &[".cmd"]),
+            vec![PathBuf::from("pyright-langserver.cmd")]
+        );
     }
 
     /// The twin keeps the directory and the extension, and leaves a name that
@@ -628,7 +832,8 @@ mod tests {
             .expect("the project-local CLI twin answers --version");
         assert!(version.starts_with("pyright "), "the probe reports pyright's own version: {version}");
 
-        let resolved = resolve(Path::new(SERVER_BIN), &root).expect("a local install resolves");
+        let resolved =
+            resolve(Path::new(SERVER_BIN), &root, HOST_SCRIPT_EXTENSIONS).expect("a local install resolves");
         assert_ne!(resolved.origin, "npx", "a local install must be found without the network");
         if probe(Path::new(CLI_BIN), &[], PROBE_BUDGET).is_err() {
             assert_eq!(resolved.origin, "the project's node_modules/.bin");
@@ -769,7 +974,8 @@ mod tests {
     #[test]
     fn nothing_usable_names_the_remedy() {
         let command = Path::new("/nonexistent/pyright-langserver");
-        let err = resolve(command, Path::new("/projects/thing")).expect_err("must not resolve");
+        let err = resolve(command, Path::new("/projects/thing"), HOST_SCRIPT_EXTENSIONS)
+            .expect_err("must not resolve");
         let message = format!("{err:#}");
         assert!(message.contains("npm install pyright"), "{message}");
         // The candidate is rendered by `Path::display()` from what `cli_twin`

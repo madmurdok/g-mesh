@@ -64,3 +64,27 @@ test-group = 'daemon-spawning'
 [[profile.default.overrides]]
 filter = 'test(two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 test-group = 'daemon-spawning'
+
+# GM-344. A CI-only profile, so that a run leaves behind something a machine
+# can read. Everything about how tests are *run* is inherited unchanged -
+# this adds an output file and nothing else.
+#
+# CI-only on purpose: `cargo nextest run` locally must not start writing XML
+# into anyone's tree. The runners ask for it with `--profile ci`.
+#
+# What it is for: until this existed, "what is failing on Windows" was
+# answered by downloading a six-thousand-line log and writing a regex. That
+# produced a wrong count twice in one session - 47 when it was 48, because
+# the regex wanted `(` followed by a digit while nextest pads its counter
+# (`( 246/1308)`), so every test numbered under 1000 silently vanished. A
+# systematic parse error in the same direction both times, which is what
+# hand-grepping cannot protect against and this replaces.
+[profile.ci]
+inherits = "default"
+
+[profile.ci.junit]
+# Written to `target/nextest/ci/junit.xml`. One `<testsuite>` per test
+# binary, which is the grouping that matters: 25 failures in one binary is
+# one cause, 25 across twelve is a different situation entirely, and that
+# distinction is what made GM-337 diagnosable at all.
+path = "junit.xml"

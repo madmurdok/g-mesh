@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::client::{LspClient, Poll};
 use super::config::SemanticConfig;
-use super::position::{file_uri, line_text, path_from_uri, PositionEncoding};
+use super::position::{file_uri, line_text, path_from_uri, without_verbatim_prefix, PositionEncoding};
 use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
 use crate::index::SdkIndex;
 use crate::path::RelPath;
@@ -352,6 +352,16 @@ pub struct LspBridge {
     /// `/private/var/folders/…`, which is the spelling everything downstream
     /// of the server uses. Both are kept and both are tried, the same way
     /// `plugins/go/semantic.go` keeps both for `go list`'s output.
+    ///
+    /// Windows has the same divergence for a different reason - a root given
+    /// in 8.3 short form (`C:\Users\RUNNER~1\…`, which is what `%TEMP%` is on
+    /// a GitHub Actions runner), a junction, a `subst` drive - and there
+    /// `canonicalize` answers in the extended-length spelling, which
+    /// [`without_verbatim_prefix`] removes before the path is stored. Kept
+    /// verbatim it would match nothing: `strip_prefix` reads
+    /// `Prefix::VerbatimDisk` and `Prefix::Disk` as different prefixes, so
+    /// this second root - the whole point of which is to catch what the first
+    /// one misses - would be dead weight on that platform.
     real_root: PathBuf,
     config: SemanticConfig,
     budgets: Budgets,
@@ -393,7 +403,9 @@ impl LspBridge {
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
-        let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let real_root = std::fs::canonicalize(root)
+            .map(|resolved| without_verbatim_prefix(&resolved))
+            .unwrap_or_else(|_| root.to_path_buf());
         Self {
             language: language.to_string(),
             root: root.to_path_buf(),

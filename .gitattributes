@@ -17,11 +17,18 @@
 # behaviour change is what a Windows checkout writes. Keep it that way: a
 # blanket root rule is one edit away from fighting the fixtures.
 #
-# `*.ps1` is absent on purpose. scripts/install.ps1 reaches its users through
-# `irm ... | iex`, which fetches the blob (LF) rather than a checkout, so the
-# attribute would not touch the path that matters - and nothing lints or runs
-# it from a checkout on any runner. A Windows contributor reading it locally
-# gets CRLF, which is what PowerShell tooling expects.
+# `*.ps1` is absent on purpose, and the reason is narrower than it first
+# was. scripts/install.ps1 reaches its users through `irm ... | iex`, which
+# fetches the blob (LF) rather than a checkout, so the attribute would not
+# touch the path that matters. A Windows contributor reading it locally gets
+# CRLF, which is what PowerShell tooling expects.
+#
+# What this comment used to add - "and nothing lints or runs it from a
+# checkout on any runner" - is no longer true and was deleted rather than
+# left standing: GM-342 parses and lints it on the Windows runner, and GM-333
+# installs from the staged archive with it. Both read it from a checkout.
+# Neither is sensitive to its line endings, which is why the conclusion holds
+# and only its supporting clause went.
 
 # --- sources ---------------------------------------------------------------
 # gofmt is the one that actually breaks today. The rest are pinned before
