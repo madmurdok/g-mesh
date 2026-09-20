@@ -68,7 +68,8 @@ Six rungs, tried in order, each labelled by what it establishes:
 | # | rung | establishes | `resolvedBy` |
 |---|---|---|---|
 | 1 | exact node id | resolution | `id` |
-| 2 | exact `qualifiedName` | resolution | `qualifiedName` |
+| 2 | exact `qualifiedName`, one match, and the query is not also a declaration's own name | resolution | `qualifiedName` |
+| 2′ | exact `qualifiedName`, several matches | **suggestion** | `nameAmbiguous` |
 | 3 | bare name, single match | resolution | `name` |
 | 3′ | bare name, several matches | **suggestion** — today's ranked candidate page | `nameAmbiguous` |
 | 4 | the name is a path, or a file's stem | resolution *of the file*, suggestion about the symbol | `fileName` |
@@ -77,6 +78,21 @@ Six rungs, tried in order, each labelled by what it establishes:
 
 Rungs 1–3 are what exists. Rung 4 is what 0b95d41c and 0299043a each built locally, lifted into the
 shared path. Rung 5 is new and runs only when `embed_query` returns `Some`.
+
+**Rung 2 is narrower than it first looks, and 2′ is why (GM-360).** A `qualifiedName` is a spelling,
+not a key, and the ladder was written as if it were one: "exactly one match" fell through to rung 3
+when it matched *two* (ripgrep declares `matcher::RegexMatcher` in both `crates/regex` and
+`crates/pcre2`, because a Rust qualifiedName is a module path within its crate), and a bare query
+took rung 2 whenever a single declaration's qualifiedName happened to *be* that bare string — which
+in ripgrep is a `pub(crate)` fixture under `tests/`, and in gin is `ginS/gins.go`'s package-level
+`Any` rather than `RouterGroup.Any`. Neither is evidence about which declaration was meant; both are
+facts about module depth. So rung 2 now requires that the query is not also some declaration's own
+`name` (the language-agnostic way to say "genuinely qualified" — no separator to know), and several
+exact matches is rung 2′, an ambiguity, rather than a miss that falls all the way to rung 5.
+
+Rung 2′ is skipped for a specifier-shaped query (`is_module_specifier`), which keeps its refusal:
+gin's `net/http` is carried by 63 `external_module` import placeholders, one per importing file, and
+a page of those is noise, not candidates.
 
 The distinction that carries the design: **rungs 3′, 4 and 5 return the same shape** — a page of
 candidates the caller re-queries by id — and differ only in `resolvedBy`. That reuses a contract the

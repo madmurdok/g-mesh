@@ -142,3 +142,32 @@ pub fn describe<S: Shape>(shape: &S) -> &'static str {
 pub fn total_dyn(shape: &dyn Shape) -> u8 {
     shape.area()
 }
+
+/// GM-360, face A1: a type whose namesake sits at the *other* crate's root.
+///
+/// `crates/beta/src/main.rs` declares a `Ruler` too, and because a Rust
+/// qualifiedName is a module path within its crate, beta's carries the bare
+/// string `Ruler` while this one carries `shapes::Ruler`. Until GM-360 that
+/// made the bare query `RegexMatcher`-shaped: exactly one declaration's
+/// qualifiedName *was* the query, so `find_definition` resolved to it with
+/// `resolvedBy: qualifiedName` and no ambiguity flag - an answer decided by
+/// where a declaration happens to sit. `conformance/expect.toml`'s
+/// `[[definition]] symbol = "Ruler"` is that case as a check.
+pub struct Ruler;
+
+/// GM-360, face A5: a type whose *qualifiedName* is not unique either.
+///
+/// `crates/beta/src/shapes.rs` is a `shapes` module too, and declares its own
+/// `Gauge`, so `shapes::Gauge` names two declarations in this workspace -
+/// exactly ripgrep's `matcher::RegexMatcher`, which `crates/regex` and
+/// `crates/pcre2` both carry. Until GM-360 an exact qualifiedName match that
+/// hit two rows was treated as no match at all and fell through to a bare-name
+/// lookup no qualified spelling can ever match.
+pub struct Gauge;
+
+/// The one reference to *this* crate's `Gauge`, so the expectation over it is
+/// an exact set that a resolution landing on beta's `Gauge` fails.
+pub fn calibrate(gauge: &Gauge) -> u8 {
+    let _ = gauge;
+    1
+}
