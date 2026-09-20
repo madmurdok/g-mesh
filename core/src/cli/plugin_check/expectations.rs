@@ -122,6 +122,19 @@
 //!    around), so its own disambiguated re-call uses the candidate's exact
 //!    `qualifiedName`, which takes `resolve_symbol_name`'s fast
 //!    exact-match rung.
+//!
+//!    That rung is narrower since GM-360, and it bounds what a
+//!    `[[definition]]` entry can say. A candidate whose `qualifiedName` is
+//!    the bare name several declarations carry - a crate-root Rust type
+//!    against a module-qualified namesake, or a package-level Go func
+//!    against a method - is ambiguous *as a query*, so the re-call returns a
+//!    candidate page a second time and [`resolve_definition`] fails the
+//!    entry saying exactly that. Nor does a `qualifiedName` that two
+//!    declarations share (`shapes::Gauge`, in two crates of
+//!    `plugins/rust/conformance/project`) narrow to one. Both shapes are
+//!    still expressible as `[[references]]`/`[[callers]]`/
+//!    `[[implementations]]`, whose re-call is by `id` - which is why that
+//!    fixture asserts its two-crate case through `[[references]]`.
 //! 3. **No `file`, or `file` narrows to zero or more than one candidate**:
 //!    the expectation fails, with every candidate's `id`/`qualifiedName`/
 //!    `filePath`/`kind` printed - never a silent pick, per the task's own

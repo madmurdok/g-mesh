@@ -176,7 +176,7 @@ Five of its entries are tagged `tier = "semantic"` (GM-290) and are run three
 ways by `tests/conformance.rs`, which is what makes any of the runs mean
 something:
 
-- with the manifest this plugin ships, where all fifteen entries pass;
+- with the manifest this plugin ships, where all seventeen entries pass;
 - with 3.2.0's own manifest (`semantic_pass = false`) and
   `--skip-semantic-expectations`, where those five report `Skip` and every
   structural entry keeps passing - this plugin binary answering the release

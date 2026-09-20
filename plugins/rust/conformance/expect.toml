@@ -37,8 +37,10 @@
 #     `find_implementations` - GM-286's own acceptance case);
 #   - imports (`nested/mod.rs`, a glob and a container-scoped named re-export
 #     - GM-286's own acceptance case);
-#   - definition, twice (`internals::crate_only` with a redundant-but-armless
-#     `file`, `shapes::Square::perimeter` without one).
+#   - definition, three times (`internals::crate_only` with a
+#     redundant-but-armless `file`, `shapes::Square::perimeter` without one,
+#     and GM-360's `Ruler`, where `file` is load-bearing);
+#   - references, a qualifiedName two crates carry (GM-360's `shapes::Gauge`).
 #
 # Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
 # matters, and an entry missing from the set is as much of a failure as an
@@ -50,12 +52,13 @@
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all fifteen entries run and
+#   1. with the manifest this plugin ships, where all seventeen entries run and
 #      pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other ten - every structural entry here,
-#      unchanged since 3.2.0 - keep passing;
+#      five report `Skip` and the other twelve - every structural entry
+#      here, ten of them unchanged since 3.2.0 and two added by GM-360 -
+#      keep passing;
 #   3. with 3.2.0's manifest and *without* the skip flag, where those five
 #      must FAIL.
 #
@@ -335,3 +338,50 @@ expect = ["crates/alpha/src/internals.rs:internals::crate_only"]
 symbol = "shapes::Square::perimeter"
 # Unambiguous - no `file` needed to disambiguate.
 expect = ["crates/alpha/src/shapes.rs:shapes::Square::perimeter"]
+
+# --- definition: a bare name whose namesakes are spread across module depths
+#     (GM-360, face A1) -------------------------------------------------------
+
+[[definition]]
+symbol = "Ruler"
+file = "crates/alpha/src/shapes.rs"
+# `Ruler` is declared twice: `alpha::shapes::Ruler`, whose qualifiedName is
+# `shapes::Ruler`, and beta's crate-root `Ruler`, whose qualifiedName is the
+# bare string. Before GM-360 the exact-qualifiedName rung matched beta's and
+# only beta's, so this entry resolved - unflagged, `resolvedBy:
+# qualifiedName` - to `crates/beta/src/main.rs:Ruler`, and `file` was never
+# consulted because nothing looked ambiguous. That is ripgrep's
+# `RegexMatcher` in two files: the declaration that wins is the one that
+# happens to sit at a crate root, which is a fact about module depth and not
+# about which type was meant.
+#
+# Now the bare name is an ambiguity over both, `file` picks this one, and the
+# re-call by its `qualifiedName` (`shapes::Ruler`, which nothing else
+# carries) takes the fast rung - so the entry fails against the pre-GM-360
+# resolver on the wrong file and passes against this one.
+expect = ["crates/alpha/src/shapes.rs:shapes::Ruler"]
+
+# --- references: a *qualified* spelling two crates carry (GM-360, face A5) ---
+
+[[references]]
+symbol = "shapes::Gauge"
+file = "crates/alpha/src/shapes.rs"
+# A Rust qualifiedName is a module path within its crate, so `alpha::shapes`
+# and `beta_crate::shapes` both spell their members `shapes::<name>` and
+# `shapes::Gauge` names two declarations - ripgrep's `matcher::RegexMatcher`,
+# which `crates/regex` and `crates/pcre2` both declare, in one workspace.
+#
+# Before GM-360 "the exact rung matched two rows" was treated as no match at
+# all: resolution fell through to a bare-name lookup, which no qualified
+# spelling can ever match, then to file names, then to semantic neighbours -
+# so this entry failed with `no symbol named 'shapes::Gauge' found` rather
+# than with a wrong set. It is `[[references]]` rather than `[[definition]]`
+# deliberately: the disambiguated re-call for the four edge-walking tools is
+# by the candidate's `id`, while `find_definition` has only `qualifiedName`
+# to re-call with (expectations.rs, decision 3) - which for *this* face is the
+# very string that is ambiguous, so the kit could not express it that way.
+#
+# The set is exact, and both crates' `Gauge` have a reference of their own, so
+# a resolution landing on `crates/beta/src/shapes.rs:shapes::Gauge` fails
+# twice over: one missing entry and one extra.
+expect = ["crates/alpha/src/shapes.rs:shapes::calibrate"]
