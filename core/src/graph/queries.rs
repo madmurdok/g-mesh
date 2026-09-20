@@ -423,6 +423,26 @@ pub fn find_file_node(conn: &Connection, file_path: &str) -> Result<Option<NodeR
     .context("failed to look up file node")
 }
 
+/// Whether any edge of `edge_kind` arrives at `node_id` - one keyed probe
+/// (`idx_edges_toId`), not a count and not a walk.
+///
+/// `get_dependencies::from_file` asks this of a `File` node before deciding
+/// that an `Incoming` walk from it could only ever be empty (GM-356). The
+/// question is deliberately about the *graph*, not about a walk's result: a
+/// file that is genuinely an import target keeps its literal anchor, and a
+/// substitution can therefore never replace an answer that had rows in it.
+pub fn has_incoming_edge(conn: &Connection, node_id: &str, edge_kind: &str) -> Result<bool> {
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM edges WHERE toId = ?1 AND kind = ?2 LIMIT 1",
+            params![node_id, edge_kind],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to probe a node's incoming edges")?;
+    Ok(hit.is_some())
+}
+
 /// Finds the container node(s) whose own key is exactly `key`, across every
 /// language a container of that key exists in - the counterpart of
 /// [`find_file_node`] for a logical container (a Go import path, a Rust
