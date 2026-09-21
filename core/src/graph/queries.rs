@@ -2,28 +2,109 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::graph::containers::CONTAINER_NATIVE_KIND;
+use crate::graph::imports::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 
-// Every "which symbol is this?" lookup below excludes both of
-// `graph::symbol_links`' placeholder `nativeKind`s. A pending symbol
-// placeholder carries an imported symbol's *name*, and a re-export
-// placeholder the name a barrel republishes, while both stand for a
-// definition that lives in another file entirely - so answering a name,
-// qualifiedName or position query with one would point the caller at a
-// pass-through instead of at the definition it asked for. `IS NOT` rather
-// than `<>` or `NOT IN`, so an ordinary node's NULL `nativeKind` still
-// passes.
+// Every "which symbol is this?" lookup below - by name, by qualifiedName, by
+// position - answers with a *declaration* and nothing else.
+// [`NON_DECLARATION_NATIVE_KINDS`] is the one list of what that excludes, and
+// [`declaration_only`] the one SQL condition built from it, so the three
+// lookups and `mcp::find_definition`'s candidate page cannot drift apart the
+// way they had.
 //
-// The name, qualifiedName and position lookups exclude core's container
-// nodes (`graph::containers::CONTAINER_NATIVE_KIND`) as well, for a
-// different reason with the same effect: a container is a real node, but it
-// has no source - `filePath` is `''` and its range is zero - so an answer
-// built on one (a source snippet, a staleness check on its file, an anchor
-// echo telling the caller where it lives) points at nothing. Its name is also
-// its whole key (`github.com/x/app/server`), which no caller asking "where is
-// `server` defined" writes. `find_in_file_named` and the file lookups below
-// need no such filter: they already refuse `Module` or require `File`.
+// Four of the five excluded kinds are addresses rather than declarations. A
+// *pending symbol* placeholder carries an imported symbol's own name; a
+// *re-export* one the name a barrel republishes; a *resolved module* one the
+// specifier of an import some file of this project satisfies; an *external
+// module* one the specifier of an import nothing here satisfies at all. Every
+// one of them is the graph's record that a file reached for something. None
+// has a body, a signature worth reading, or a definition site: their
+// `filePath` and range point at the `import`/`use` line that produced them,
+// so an answer built on one sends the caller to an import statement and calls
+// it a definition.
+//
+// The fifth, core's own container node
+// (`graph::containers::CONTAINER_NATIVE_KIND`), is excluded for a different
+// reason with the same effect: it is a real node, but it has no source -
+// `filePath` is `''` and its range is zero - so an answer built on one (a
+// source snippet, a staleness check on its file, an anchor echo telling the
+// caller where it lives) points at nothing. Its name is also its whole key
+// (`github.com/x/app/server`), which no caller asking "where is `server`
+// defined" writes.
+//
+// `find_in_file_named` and the file lookups below need no such filter: they
+// already refuse `Module` or require `File`.
+//
+// ## Excluded, not marked (GM-367)
+//
+// `resolved_module` and `external_module` were the two missing from this
+// list, and the cost was measured rather than argued. On a gin index
+// (schema 8, indexer 2), `find_definition("context")` answered with the
+// import placeholder in `context_test.go` - unflagged, and labelled
+// `resolvedBy: "qualifiedName"`, the strongest confidence marker this tool
+// surface has - and `find_definition("http")` offered 63 of them, one per
+// importing file, as a ranked candidate page.
+//
+// The alternative weighed was to keep them and *mark* them, the shape
+// `resolvedFrom` and `excludedReferences` use elsewhere here: narrow the
+// answer and say that you did. It lost on three counts.
+//
+//  - **A marker has nowhere to live.** Four of the five tools reading these
+//    lookups anchor on a single node rather than listing rows, so there is no
+//    per-row field to carry it; `mcp::anchor::AnchorInfo` would have to grow
+//    one, on every response, for a value no tool can act on.
+//  - **It would single out two of five kinds** for visibility while the other
+//    three stayed silently excluded - a distinction with no principle behind
+//    it, in the one place a caller is entitled to assume the list is
+//    coherent.
+//  - **A labelled placeholder is still not an answer.** It has no definition
+//    site in this project, so the only move it leaves the caller is to
+//    re-query - the round trip the label was supposed to save.
+//
+// What the caller genuinely wants said is said where it is actionable rather
+// than on a row that should not be there: see
+// `mcp::find_definition::import_only_refusal`, which turns the refusal these
+// exclusions produce into a sentence naming the specifier and the tool that
+// does answer for it.
+//
+// `graph::symbol_links::is_declaration` asks a related but different question
+// - which nodes may be *linked onto*, at index time - and deliberately keeps
+// its own four-kind list. Adding `external_module` there would repoint edges
+// during linking rather than narrow an answer at query time, which is a
+// change with its own evidence to collect and is not this one. The two lists
+// are pinned against each other by a test in that module, so the difference
+// stays deliberate.
+
+/// The `nativeKind`s that never answer a name, qualifiedName or position
+/// lookup - see this module's header for what each one is and why it is here.
+/// One list, because [`find_by_name`], [`find_by_qualified_name`],
+/// [`find_by_position`] and `mcp::find_definition`'s candidate page all have
+/// to agree about it.
+pub(crate) const NON_DECLARATION_NATIVE_KINDS: [&str; 5] = [
+    PENDING_SYMBOL_NATIVE_KIND,
+    REEXPORT_NATIVE_KIND,
+    RESOLVED_MODULE_NATIVE_KIND,
+    EXTERNAL_MODULE_NATIVE_KIND,
+    CONTAINER_NATIVE_KIND,
+];
+
+/// [`NON_DECLARATION_NATIVE_KINDS`] as a SQL condition on a `nodes` row.
+/// `prefix` is the table alias and its dot (`"n."`), or `""` for an
+/// unaliased `nodes`.
+///
+/// `nativeKind IS NULL OR ... NOT IN (...)` rather than the chain of `IS NOT`
+/// this replaces: an ordinary declaration's `nativeKind` *is* NULL, and
+/// `NULL NOT IN (...)` evaluates to NULL rather than true, so without the
+/// explicit null arm the filter would exclude every real declaration. The
+/// values interpolated are this crate's own `&'static str` constants and
+/// never caller input, which is why they are written into the SQL rather than
+/// bound - binding five of them at four call sites is what let the lists
+/// drift in the first place.
+pub(crate) fn declaration_only(prefix: &str) -> String {
+    let kinds = NON_DECLARATION_NATIVE_KINDS.map(|kind| format!("'{kind}'")).join(", ");
+    format!("({prefix}nativeKind IS NULL OR {prefix}nativeKind NOT IN ({kinds}))")
+}
 
 pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
     Ok(NodeRecord {
@@ -113,23 +194,16 @@ pub fn delete_node(conn: &mut Connection, id: &str) -> Result<()> {
 }
 
 pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("");
     let mut stmt = match file_path {
-        Some(_) => conn.prepare(
-            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4 AND filePath = ?5",
-        )?,
-        None => conn.prepare(
-            "SELECT * FROM nodes WHERE name = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4",
-        )?,
+        Some(_) => {
+            conn.prepare(&format!("SELECT * FROM nodes WHERE name = ?1 AND {declaration} AND filePath = ?2"))?
+        }
+        None => conn.prepare(&format!("SELECT * FROM nodes WHERE name = ?1 AND {declaration}"))?,
     };
     let rows = match file_path {
-        Some(fp) => stmt.query_map(
-            params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND, fp],
-            map_node_row,
-        )?,
-        None => stmt.query_map(
-            params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND],
-            map_node_row,
-        )?,
+        Some(fp) => stmt.query_map(params![name, fp], map_node_row)?,
+        None => stmt.query_map(params![name], map_node_row)?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by name")
 }
@@ -382,31 +456,47 @@ pub fn find_by_qualified_name(
     qualified_name: &str,
     file_path: Option<&str>,
 ) -> Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("");
     let mut stmt = match file_path {
-        Some(_) => conn.prepare(
-            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4 AND filePath = ?5",
-        )?,
-        None => conn.prepare(
-            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 AND nativeKind IS NOT ?4",
-        )?,
+        Some(_) => conn.prepare(&format!(
+            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND {declaration} AND filePath = ?2"
+        ))?,
+        None => conn.prepare(&format!("SELECT * FROM nodes WHERE qualifiedName = ?1 AND {declaration}"))?,
     };
     let rows = match file_path {
-        Some(fp) => stmt.query_map(
-            params![
-                qualified_name,
-                PENDING_SYMBOL_NATIVE_KIND,
-                REEXPORT_NATIVE_KIND,
-                CONTAINER_NATIVE_KIND,
-                fp
-            ],
-            map_node_row,
-        )?,
-        None => stmt.query_map(
-            params![qualified_name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, CONTAINER_NATIVE_KIND],
-            map_node_row,
-        )?,
+        Some(fp) => stmt.query_map(params![qualified_name, fp], map_node_row)?,
+        None => stmt.query_map(params![qualified_name], map_node_row)?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by qualifiedName")
+}
+
+/// The distinct specifiers of the *import placeholders* a spelling matches,
+/// each with how many of them carry it - most first.
+///
+/// The mirror image of [`find_by_name`]: it answers over exactly the module
+/// placeholder rows that one excludes (`resolved_module` and
+/// `external_module`; the two symbol placeholders carry a symbol's name, not
+/// a specifier, and belong to `graph::symbol_links`' own lookups). Its only
+/// caller is `mcp::find_definition::import_only_refusal`, which is why it
+/// returns counts rather than rows: `net/http` on gin is 63 identical
+/// placeholders, and the useful fact about them is that there are 63, not
+/// where each one sits.
+///
+/// Matches either column, because a caller types either half of the same
+/// import - Go's `http` and `net/http`, Python's `path` and `os.path` - and
+/// both are equally not a definition.
+pub fn import_specifiers_named(conn: &Connection, name: &str) -> Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT qualifiedName AS specifier, COUNT(*) AS carriers FROM nodes \
+         WHERE (name = ?1 OR qualifiedName = ?1) \
+           AND nativeKind IN ('{RESOLVED_MODULE_NATIVE_KIND}', '{EXTERNAL_MODULE_NATIVE_KIND}') \
+         GROUP BY qualifiedName \
+         ORDER BY carriers DESC, specifier ASC"
+    ))?;
+    let rows = stmt.query_map(params![name], |row| {
+        Ok((row.get::<_, String>("specifier")?, row.get::<_, i64>("carriers")? as usize))
+    })?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up import placeholders by name")
 }
 
 /// Finds the `File` node for a project-relative path, e.g. resolving
@@ -479,23 +569,17 @@ pub fn find_by_position(
 ) -> Result<Option<NodeRecord>> {
     let (line, col) = (line as i64, col as i64);
     conn.query_row(
-        "SELECT * FROM nodes \
-         WHERE filePath = ?1 \
-           AND nativeKind IS NOT ?4 \
-           AND nativeKind IS NOT ?5 \
-           AND nativeKind IS NOT ?6 \
-           AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
-           AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
-         ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
-         LIMIT 1",
-        params![
-            file_path,
-            line,
-            col,
-            PENDING_SYMBOL_NATIVE_KIND,
-            REEXPORT_NATIVE_KIND,
-            CONTAINER_NATIVE_KIND
-        ],
+        &format!(
+            "SELECT * FROM nodes \
+             WHERE filePath = ?1 \
+               AND {} \
+               AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
+               AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
+             ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
+             LIMIT 1",
+            declaration_only("")
+        ),
+        params![file_path, line, col],
         map_node_row,
     )
     .optional()
@@ -689,6 +773,89 @@ mod tests {
         assert!(find_by_qualified_name(&conn, "app", Some("")).unwrap().is_empty());
         assert!(find_by_position(&conn, "", 0, 0).unwrap().is_none());
         assert_eq!(find_by_name(&conn, "run", None).unwrap().len(), 1, "its member is still found");
+    }
+
+    /// An import placeholder is the graph's record that a file imported
+    /// something - it has no body and no definition site here - so no name,
+    /// qualifiedName or position lookup may answer with one, however exactly
+    /// its spelling matches (GM-367).
+    ///
+    /// Modelled on the measured gin case: `context_test.go` imports
+    /// `context`, whose placeholder is named and qualified `context` and sits
+    /// on the import line, while the declaration a caller means is elsewhere.
+    /// Both module placeholder kinds are asserted - `external_module` for an
+    /// import this project does not satisfy, `resolved_module` for one it
+    /// does - because they were both missing from the filter and the two
+    /// arrive by different routes.
+    ///
+    /// The last assertion is the control inside the test: a real declaration
+    /// in the same file, under a name the placeholders do not carry, is still
+    /// found by all three lookups. Without it this test would also pass on a
+    /// filter that excluded everything.
+    #[test]
+    fn import_placeholders_are_not_answers_to_name_qualified_name_or_position_lookups() {
+        let mut conn = setup();
+        for (id, native_kind) in [("ext", EXTERNAL_MODULE_NATIVE_KIND), ("res", RESOLVED_MODULE_NATIVE_KIND)]
+        {
+            let mut placeholder =
+                NodeRecord::new(id, "Module", "context", "context", "app/context_test.go", "go");
+            placeholder.native_kind = Some(native_kind.to_string());
+            placeholder.start_line = 8;
+            placeholder.end_line = 8;
+            placeholder.end_col = 10;
+            upsert_node(&mut conn, placeholder).unwrap();
+        }
+        let mut declaration =
+            NodeRecord::new("decl", "Type", "Context", "Context", "app/context_test.go", "go");
+        declaration.start_line = 20;
+        declaration.end_line = 30;
+        upsert_node(&mut conn, declaration).unwrap();
+
+        assert!(find_by_name(&conn, "context", None).unwrap().is_empty(), "by name");
+        assert!(find_by_qualified_name(&conn, "context", None).unwrap().is_empty(), "by qualifiedName");
+        assert!(
+            find_by_position(&conn, "app/context_test.go", 8, 4).unwrap().is_none(),
+            "by position, on the import line the placeholder covers"
+        );
+
+        assert_eq!(find_by_name(&conn, "Context", None).unwrap().len(), 1, "the declaration is still found");
+        assert_eq!(find_by_qualified_name(&conn, "Context", None).unwrap().len(), 1);
+        assert_eq!(
+            find_by_position(&conn, "app/context_test.go", 25, 0).unwrap().map(|n| n.id),
+            Some("decl".to_string())
+        );
+    }
+
+    /// The counts are the point: `net/http` on gin is 63 placeholders of one
+    /// specifier, and a refusal that says "63" is saying something a caller
+    /// can act on, where a list of 63 identical rows was not. Either column
+    /// matches, because a caller types either half of the same import.
+    #[test]
+    fn import_specifiers_named_groups_by_specifier_and_counts_its_carriers() {
+        let mut conn = setup();
+        for (id, file) in [("h1", "a.go"), ("h2", "b.go"), ("h3", "c.go")] {
+            let mut placeholder = NodeRecord::new(id, "Module", "http", "net/http", file, "go");
+            placeholder.native_kind = Some(EXTERNAL_MODULE_NATIVE_KIND.to_string());
+            upsert_node(&mut conn, placeholder).unwrap();
+        }
+        let mut other = NodeRecord::new("h4", "Module", "http", "github.com/x/http", "d.go", "go");
+        other.native_kind = Some(EXTERNAL_MODULE_NATIVE_KIND.to_string());
+        upsert_node(&mut conn, other).unwrap();
+        // A declaration of the same name is not an import record and must not
+        // be counted as one.
+        upsert_node(&mut conn, NodeRecord::new("d", "Function", "http", "http", "e.go", "go")).unwrap();
+
+        assert_eq!(
+            import_specifiers_named(&conn, "http").unwrap(),
+            vec![("net/http".to_string(), 3), ("github.com/x/http".to_string(), 1)],
+            "grouped by specifier, most-carried first"
+        );
+        assert_eq!(
+            import_specifiers_named(&conn, "net/http").unwrap(),
+            vec![("net/http".to_string(), 3)],
+            "the qualifiedName half of the same import finds it too"
+        );
+        assert!(import_specifiers_named(&conn, "nothing").unwrap().is_empty());
     }
 
     #[test]

@@ -11,10 +11,8 @@ use rusqlite::{Connection, Row};
 use serde::Serialize;
 
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::pagination;
 use crate::graph::queries;
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::NodeRecord;
 
 use super::source;
@@ -236,20 +234,18 @@ fn find_candidates_by_name(
     name: &str,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
-    // The `nativeKind` filter matches `graph::queries`': a pending-symbol
-    // placeholder is named after the symbol it is waiting for and a re-export
-    // one after the symbol it passes through, so without it every file
-    // importing or republishing `foo` would offer itself as a candidate `foo`.
-    // Core's container nodes are excluded too, as in `graph::queries`' own
-    // lookups (see the comment at the top of that module): a candidate with
-    // no file to show is not one a caller can re-query into an answer.
+    // The `nativeKind` filter is `graph::queries`' own, shared rather than
+    // restated (GM-367): the lookups that decide whether a candidate page is
+    // needed and the page itself have to agree about what counts as a
+    // declaration, and while they were two copies of one list they did not -
+    // the copy here was three kinds where that one is five.
     let base_sql = format!(
         "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
          n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
          CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-         FROM nodes n WHERE {} = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3 \
-         AND n.nativeKind IS NOT ?4",
-        column.sql()
+         FROM nodes n WHERE {} = ?1 AND {}",
+        column.sql(),
+        queries::declaration_only("n.")
     );
 
     fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
@@ -267,14 +263,7 @@ fn find_candidates_by_name(
         Ok((candidate, score, id))
     }
 
-    pagination::paginate_by_score(
-        conn,
-        &base_sql,
-        &[&name, &PENDING_SYMBOL_NATIVE_KIND, &REEXPORT_NATIVE_KIND, &CONTAINER_NATIVE_KIND],
-        CANDIDATE_PAGE_SIZE,
-        cursor,
-        map_row,
-    )
+    pagination::paginate_by_score(conn, &base_sql, &[&name], CANDIDATE_PAGE_SIZE, cursor, map_row)
 }
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
@@ -370,6 +359,34 @@ pub(super) struct Resolved {
 /// on both counts and is reached by the same first arm of the match below,
 /// unchanged.
 ///
+/// # The specifier guard on the second arm is gone, because it is now dead (GM-367)
+///
+/// GM-360 added `if !is_module_specifier(name)` to the `qualifiedName` arm
+/// for one reason: gin's `net/http` was the qualifiedName of 63
+/// `external_module` import placeholders, so without it a package name was
+/// answered with a page of 20 rows that are not declarations. GM-367 removed
+/// those rows from `graph::queries`' lookups instead, one layer down, which
+/// is where the problem always was - and with them gone, nothing this guard
+/// could catch reaches it.
+///
+/// Measured on the three probe indexes (gin, ripgrep, requests - schema 8,
+/// indexer 2) and on a fourth, older excalidraw one: after the exclusion, no
+/// specifier-shaped spelling is the `qualifiedName` of two or more
+/// declarations, in any of them. The reason is structural rather than a
+/// property of these four codebases - every declaration whose qualifiedName
+/// contains `/` or starts with `@` is a `File` node, and a file path is
+/// unique within a project by construction, so `exact.len() >= 2` cannot
+/// arise for a specifier-shaped query at all. The guard's arm is never
+/// entered, so its condition is never evaluated.
+///
+/// It is removed rather than left as a belt-and-braces second defence,
+/// because a guard that cannot fire still reads as the place the problem is
+/// handled, and the next person to work here would have to re-derive that it
+/// is not. `is_module_specifier` itself stays: its *other* caller,
+/// [`by_semantic_neighbours`], is where shape genuinely decides something
+/// a score cannot (`@excalidraw/element` scores 0.699 against an index it has
+/// nothing to do with).
+///
 /// `Ok(Ok(node))` is that node. `Ok(Err(result))` is a finished response the
 /// caller must return unchanged - the ranked candidate page when the name is
 /// ambiguous, or the not-found tool error - which is what lets the four
@@ -407,16 +424,7 @@ pub(super) fn resolve_symbol_name(
     // spelling is qualified.
     let ambiguous_over = match (matches.len(), exact.len()) {
         (2.., _) => Some(NameColumn::Name),
-        // Specifier-shaped queries keep the answer they have today, which is
-        // the refusal at the bottom of the ladder. Measured on gin: the
-        // qualifiedName `net/http` is carried by 63 `external_module` import
-        // placeholders, one per importing file, so without this guard the
-        // rung above would answer a package name with a page of 20 rows that
-        // are not declarations and that no caller can re-query into one.
-        // `is_module_specifier`'s own doc has the rest of the argument -
-        // specifiers have a rung of their own, `get_dependencies`' path
-        // matching, and this is the second place that has to know it.
-        (_, 2..) if !is_module_specifier(name) => Some(NameColumn::QualifiedName),
+        (_, 2..) => Some(NameColumn::QualifiedName),
         _ => None,
     };
     if let Some(column) = ambiguous_over {
@@ -543,6 +551,78 @@ fn by_semantic_neighbours(
     }))
 }
 
+/// How many specifiers a refusal names before it stops. Three, because the
+/// list is prose in an error message rather than a page: gin's `json` is one
+/// specifier and ripgrep's `regex` is two, and a spelling that is four
+/// different imports is a fact about the query, not a list worth reading.
+const MAX_NAMED_SPECIFIERS: usize = 3;
+
+/// The rung GM-367 owes the caller: nothing *declares* this name, but the
+/// index knows exactly what it is - something this project imports.
+///
+/// # Why a rung and not just a better string
+///
+/// Excluding import placeholders from `graph::queries`' lookups is what stops
+/// `find_definition("context")` answering with an `import` line and calling
+/// it a declaration. It is not by itself what makes the answer useful: what
+/// is left over is "g-mesh: no symbol named 'http' found", which is true, and
+/// which hides that the index has 63 records of `net/http` being imported and
+/// could have said so.
+///
+/// So the exclusion says that it happened, at the one place a caller sees it.
+/// That is the `resolvedFrom` / `excludedReferences` shape this tool surface
+/// already uses - narrow the answer, and say that you did - without adding a
+/// field to a row that should not be in the answer at all, or to four tools
+/// that have nowhere to put one (`graph::queries`' header has that argument
+/// in full).
+///
+/// # Where it sits, and why there
+///
+/// After the file-name rung and before the semantic one.
+///
+/// *After* file names, because a file that declares things is a better answer
+/// than a note about an import: gin's `context` *is* `context.go`, and that
+/// file's declarations are what the caller was reaching for. That rung keeps
+/// the query.
+///
+/// *Before* semantics, because the two are not the same kind of claim. The
+/// semantic rung offers "the closest declarations by meaning ... they may be
+/// what you meant, or may merely be nearby"; this one states what the index
+/// records. A resemblance does not improve on a fact, and this codebase's
+/// standing rule - a missing edge beats a wrong one - is the same preference
+/// one layer up.
+///
+/// # An error, not a page
+///
+/// There is genuinely no symbol to return, so this stays `is_error: true` and
+/// carries prose, exactly as the refusal it replaces did. That also keeps the
+/// blast radius of GM-367 on `find_references`/`find_callers`/`find_callees`/
+/// `find_implementations`, which share this resolution, to the *text* of a
+/// refusal rather than the shape of a response.
+fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolResult>, ErrorData> {
+    let specifiers = queries::import_specifiers_named(conn, name)
+        .map_err(|e| internal_error("failed to look up import placeholders by name", e))?;
+    if specifiers.is_empty() {
+        return Ok(None);
+    }
+
+    let carriers: usize = specifiers.iter().map(|(_, count)| count).sum();
+    let named: Vec<String> = specifiers
+        .iter()
+        .take(MAX_NAMED_SPECIFIERS)
+        .map(|(specifier, count)| format!("'{specifier}' ({count})"))
+        .collect();
+    let rest = specifiers.len().saturating_sub(named.len());
+    let and_more = if rest > 0 { format!(", and {rest} more") } else { String::new() };
+    let message = format!(
+        "g-mesh: nothing named '{name}' is declared in this project. It names something this \
+         project imports: {}{and_more} - {carriers} import record(s), which have no definition \
+         site here. For what a file imports, or what imports it, use get_dependencies.",
+        named.join(", ")
+    );
+    error(message).map(Some)
+}
+
 /// The last rung before a refusal: no declaration carries the name, but a file
 /// does.
 ///
@@ -565,6 +645,11 @@ fn by_file_name(
     let in_file = queries::find_in_file_named(conn, name, MAX_SUGGESTIONS)
         .map_err(|e| internal_error("failed to look up nodes by file name", e))?;
     if in_file.is_empty() {
+        // Before the semantic rung, because this is a fact the index holds
+        // and that one offers a resemblance - see [`import_only_refusal`].
+        if let Some(refusal) = import_only_refusal(conn, name)? {
+            return Ok(Err(refusal));
+        }
         // The last rung before giving up. It returns `None` for every way of
         // having nothing useful to say - no model, a specifier-shaped query,
         // nothing scoring high enough - so the terse refusal below stays the
@@ -695,6 +780,130 @@ mod tests {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    /// An import placeholder, as the Go plugin emits one for `import
+    /// "context"`: a `Module` row named and qualified after the specifier,
+    /// sitting on the import line of the file that wrote it.
+    fn import_placeholder(id: &str, name: &str, specifier: &str, file: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Module", name, specifier, file, "go");
+        node.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+        node.start_line = 8;
+        node.end_line = 8;
+        node.end_col = 20;
+        node
+    }
+
+    fn resolved_by_name(conn: &Connection, name: &str) -> Result<CallToolResult, ErrorData> {
+        by_name(conn, None, None, name, None)
+    }
+
+    /// GM-367's measured gin case, in miniature: `context` is an import
+    /// placeholder and nothing else, and 3.8.0 answered it as a declaration -
+    /// `resolvedBy: "qualifiedName"`, unflagged, pointing at the import line.
+    ///
+    /// **Evidence.** With the exclusion reverted in `graph::queries` this
+    /// fails on the first assertion, resolving to `ph` instead of refusing.
+    #[test]
+    fn a_name_carried_only_by_import_placeholders_is_refused_and_says_what_it_is() {
+        let mut conn = setup();
+        upsert_node(&mut conn, import_placeholder("ph", "context", "context", "app/context_test.go"))
+            .unwrap();
+
+        let text = error_text(&resolved_by_name(&conn, "context").unwrap());
+
+        assert!(text.contains("nothing named 'context' is declared"), "{text}");
+        assert!(text.contains("'context' (1)"), "the specifier and how many import it: {text}");
+        assert!(text.contains("get_dependencies"), "the tool that does answer for it: {text}");
+    }
+
+    /// The other half of the gin case: `net/http` is the qualifiedName of 63
+    /// placeholders, which 3.8.0 offered as a ranked page of 20 candidates
+    /// that no caller can re-query into a definition. Three stands in for 63.
+    ///
+    /// **Evidence.** With the exclusion reverted this fails: the answer is a
+    /// candidate page (`ambiguous: true`), not an error.
+    #[test]
+    fn a_specifier_carried_by_many_import_placeholders_is_not_a_candidate_page() {
+        let mut conn = setup();
+        for (i, file) in ["a.go", "b.go", "c.go"].iter().enumerate() {
+            upsert_node(&mut conn, import_placeholder(&format!("ph{i}"), "http", "net/http", file)).unwrap();
+        }
+
+        for query in ["http", "net/http"] {
+            let text = error_text(&resolved_by_name(&conn, query).unwrap());
+            assert!(text.contains("'net/http' (3)"), "{query}: {text}");
+            assert!(text.contains("3 import record(s)"), "{query}: {text}");
+        }
+    }
+
+    /// The case that moves an *answer* rather than a refusal, and the one
+    /// with the widest reach: a real declaration whose name an import also
+    /// carries used to be one of two candidates, so `find_references` and the
+    /// other three anchored tools answered with a candidate page instead of
+    /// their result. ripgrep's `test` and requests' `ssl` are the measured
+    /// instances.
+    ///
+    /// **Evidence.** With the exclusion reverted this fails: the answer is a
+    /// two-row candidate page rather than the declaration.
+    #[test]
+    fn a_declaration_whose_name_an_import_shares_resolves_to_the_declaration() {
+        let mut conn = setup();
+        upsert_node(&mut conn, import_placeholder("ph", "test", "test", "a.rs")).unwrap();
+        upsert_node(&mut conn, node_with_span("decl", "test", "tests::test", "b.rs", (9, 0))).unwrap();
+
+        let body = json_body(&resolved_by_name(&conn, "test").unwrap());
+
+        assert_eq!(body["id"], "decl", "the declaration, not the import: {body}");
+        assert_eq!(body["resolvedBy"], "name");
+    }
+
+    /// **Control.** A declaration with no import anywhere near it resolves
+    /// exactly as it did, by the same rung, with the same id - this passes in
+    /// both arms, and is what says the tests above are about placeholders
+    /// rather than about the filter having swallowed everything.
+    #[test]
+    fn a_declaration_with_no_import_in_sight_resolves_exactly_as_before() {
+        let mut conn = setup();
+        upsert_node(&mut conn, node_with_span("decl", "Marshal", "codec::Marshal", "b.rs", (9, 0))).unwrap();
+
+        let body = json_body(&resolved_by_name(&conn, "codec::Marshal").unwrap());
+
+        assert_eq!(body["id"], "decl");
+        assert_eq!(body["resolvedBy"], "qualifiedName", "the fast path is untouched");
+    }
+
+    /// **Control.** A name several *declarations* carry is still an
+    /// ambiguity, and still a ranked candidate page - the exclusion narrows
+    /// which rows are declarations, never what happens once two of them
+    /// compete. Passes in both arms.
+    #[test]
+    fn two_declarations_sharing_a_name_are_still_a_candidate_page() {
+        let mut conn = setup();
+        upsert_node(&mut conn, node_with_span("a", "run", "pkg_a::run", "a.rs", (5, 0))).unwrap();
+        upsert_node(&mut conn, node_with_span("b", "run", "pkg_b::run", "b.rs", (5, 0))).unwrap();
+
+        let body = json_body(&resolved_by_name(&conn, "run").unwrap());
+
+        assert_eq!(body["ambiguous"], true);
+        assert_eq!(body["resolvedBy"], "nameAmbiguous");
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    }
+
+    /// The rung order, asserted rather than assumed: gin's `context` is both
+    /// an import placeholder *and* the stem of `context.go`, and the file
+    /// wins - its declarations are a better answer than a note about an
+    /// import. [`import_only_refusal`]'s own doc has the argument.
+    #[test]
+    fn a_file_named_like_the_import_answers_before_the_import_note_does() {
+        let mut conn = setup();
+        upsert_node(&mut conn, import_placeholder("ph", "context", "context", "app/main.go")).unwrap();
+        upsert_node(&mut conn, node_with_span("decl", "Context", "Context", "context.go", (30, 0))).unwrap();
+
+        let body = json_body(&resolved_by_name(&conn, "context").unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        assert_eq!(body["results"][0]["id"], "decl");
     }
 
     #[test]
