@@ -964,6 +964,11 @@ fn the_typescript_plugin_satisfies_its_own_expectations_file() {
         "{}",
         run.stdout
     );
+    // GM-371's category: what a name is NOT. Asserted present for the same
+    // reason as the two above - a fixture that quietly dropped it would still
+    // look complete, and this is the one category whose whole history is that
+    // nothing exercised it.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.refusal[")), "{}", run.stdout);
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
@@ -1012,6 +1017,11 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
         "{}",
         run.stdout
     );
+    // GM-371's category: what a name is NOT. Asserted present for the same
+    // reason as the two above - a fixture that quietly dropped it would still
+    // look complete, and this is the one category whose whole history is that
+    // nothing exercised it.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.refusal[")), "{}", run.stdout);
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
@@ -1076,6 +1086,13 @@ fn the_go_plugin_without_a_toolchain_skips_only_the_semantic_tier_expectations()
         "expectations.importers[0]",
         "expectations.definition[0]",
         "expectations.definition[1]",
+        // GM-371, and structural for exactly the reason `[[importers]]` is:
+        // the import placeholder both of these refusals are about is emitted
+        // by the tree-sitter pass, so a missing `go` toolchain changes
+        // nothing about them and they belong in this list rather than among
+        // the entries the flag skips.
+        "expectations.refusal[0]",
+        "expectations.refusal[1]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
@@ -1217,6 +1234,85 @@ fn an_ambiguous_symbol_fails_with_its_candidates() {
     assert_eq!(run_callers.outcome("expectations.callers[0]"), "PASS", "{}", run_callers.stdout);
 }
 
+/// Decision 9 (GM-371), both ways round in one run: `[[refusal]]` passes when
+/// the tool genuinely declines to resolve a name, and fails on every other
+/// shape a call can come back in.
+///
+/// This is the branch that had no fixture at all - `expectations.rs`'s
+/// decision 2 has claimed since GM-277 landed - the 3.5.0, 3.6.0, 3.7.0 and
+/// 3.8.0 batches - that a refusal rendered as a zero-element
+/// `[[definition]]` set, and it never could: `tool_json` turned
+/// `is_error: true` into the same `Err` a dead index produces, so every
+/// refusal was a failure and nothing exercised the claim either way.
+///
+/// The five entries are one per outcome, deliberately in one file so the
+/// passing arm and the failing ones are measured against the same index:
+///
+/// 0. `find_definition` refuses `ghost` (no declaration, no file of that
+///    name, and the kit runs with embeddings disabled so the semantic rung
+///    cannot offer neighbours) - PASS, the arm that could not exist before.
+/// 1. the same tool against `helper`, which *does* resolve - FAIL, naming
+///    what it resolved to. This is the half that makes the entry an
+///    assertion rather than a wish: a `[[refusal]]` on a name the tool
+///    happily answers must not pass.
+/// 2. `find_callers` refuses `ghost` too, but the entry demands a phrase no
+///    refusal carries - FAIL. Without this, "it errored" would be the whole
+///    test, and a dead daemon or a malformed anchor would satisfy it.
+/// 3. `find_definition` on `shared`, declared in two files - a candidate
+///    page, which is ambiguity rather than absence - FAIL with the
+///    candidates listed (decision 3's "never a silent pick").
+/// 4. `find_references` refuses `ghost` - PASS, so the category is shown
+///    working on more than the one tool, which is the point: GM-367's whole
+///    effect on four of five tools was "a name that used to resolve now
+///    refuses".
+#[test]
+fn a_refusal_expectation_passes_only_on_a_real_refusal() {
+    let fixture =
+        write_fk_fixture(&[("a.fk", "fn helper\n"), ("b.fk", "fn shared\n"), ("c.fk", "fn shared\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[refusal]]\ntool = \"definition\"\nsymbol = \"ghost\"\n\
+         contains = [\"no symbol named 'ghost' found\"]\n\n\
+         [[refusal]]\ntool = \"definition\"\nsymbol = \"helper\"\n\
+         contains = [\"no symbol named\"]\n\n\
+         [[refusal]]\ntool = \"callers\"\nsymbol = \"ghost\"\n\
+         contains = [\"a phrase no refusal of this tool ever carries\"]\n\n\
+         [[refusal]]\ntool = \"definition\"\nsymbol = \"shared\"\n\
+         contains = [\"no symbol named\"]\n\n\
+         [[refusal]]\ntool = \"references\"\nsymbol = \"ghost\"\n\
+         contains = [\"no symbol named 'ghost' found\"]\n",
+    );
+    let fake = install_fake("none", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+
+    assert_eq!(run.outcome("expectations.refusal[0]"), "PASS", "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.refusal[4]"), "PASS", "{}", run.stdout);
+
+    assert_eq!(run.outcome("expectations.refusal[1]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("find_definition resolved the symbol and answered rather than refusing"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("it resolved to: a.fk:helper"), "{}", run.stdout);
+
+    assert_eq!(run.outcome("expectations.refusal[2]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("missing 1 required phrase(s): \"a phrase no refusal of this tool ever carries\""),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("the tool refused with: g-mesh: no symbol named"), "{}", run.stdout);
+
+    assert_eq!(run.outcome("expectations.refusal[3]"), "FAIL", "{}", run.stdout);
+    assert!(run.stdout.contains("returned a candidate page rather than refusing"), "{}", run.stdout);
+    assert!(run.stdout.contains("filePath=b.fk"), "{}", run.stdout);
+    assert!(run.stdout.contains("filePath=c.fk"), "{}", run.stdout);
+
+    assert!(!run.success, "three failing expectations must exit non-zero:\n{}", run.stdout);
+}
+
 /// A typo'd key in `expect.toml` is a hard parse error - `expectations.file`
 /// fails with the unknown field named, and no per-expectation check runs at
 /// all (decision 5: typos must not pass silently).
@@ -1304,6 +1400,9 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         "expectations.importers[0]",
         "expectations.definition[0]",
         "expectations.definition[1]",
+        // GM-371: a name the index does not carry is refused whether or not
+        // tsserver ran, so this one is structural too.
+        "expectations.refusal[0]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }

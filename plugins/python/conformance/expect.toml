@@ -411,3 +411,29 @@ expect = [
     "pkg/plugins/loader.py",
     "pkg/sub/deep.py",
 ]
+
+# --- refusal: a name this project does not declare --------------------------
+#     (GM-371, and `expectations.rs`'s decision 9)
+
+[[refusal]]
+tool = "definition"
+symbol = "os.path"
+contains = [
+  "nothing named 'os.path' is declared in this project",
+  "It names something this project imports: 'os.path' (1)",
+  "use get_dependencies",
+]
+# Python is the second of the two fixtures whose imports leave the project,
+# so it is one of the two that can state GM-367's refusal in the form that
+# change is actually about - see `plugins/go/conformance/expect.toml`'s pair
+# for the full argument, which is not repeated here.
+#
+# What this entry adds over Go's is the *shape of the name*. `plugins/
+# loader.py` writes `import os.path`, and the placeholder that leaves behind
+# answers to the dotted specifier itself - `os.path` - and not to its last
+# segment: `find_definition("path")` refuses this project with the terse
+# "no symbol named 'path' found", having found no import record by that
+# name at all. That is worth a fixture entry rather than a comment in core,
+# because it is the plugin's choice of specifier that makes it true, and a
+# plugin that one day indexed `import os.path` under `path` would still pass
+# every other expectation in this file.

@@ -251,3 +251,55 @@ via_module = "github.com/example/app/server"
 # hazard the other fixtures have to avoid by hand. `server.go` avoids it
 # here too, deliberately, so that all four fixtures state the same rule.
 expect = ["cmd/main.go"]
+
+# --- refusal: a name this project does not declare --------------------------
+#     (GM-371, and `expectations.rs`'s decision 9)
+
+[[refusal]]
+tool = "definition"
+symbol = "strings"
+contains = [
+  "nothing named 'strings' is declared in this project",
+  "It names something this project imports: 'strings' (1)",
+  "use get_dependencies",
+]
+# The category that asserts what a name is NOT, and Go is one of the two
+# fixtures that can state it in the form GM-367 is about.
+#
+# `helper.go` imports "strings" and nothing in this project declares
+# anything by that name, so the only thing the index carries is an import
+# placeholder - a record with no definition site. GM-367 made
+# `find_definition` refuse that case in so many words instead of answering
+# the placeholder as though it were a declaration, and until GM-371 added
+# this category no fixture in this kit could pin that: a refusal was a
+# failure in every category there was, so the one positive shape GM-367's
+# whole change produces - "this name resolves to nothing here" - was
+# unassertable.
+#
+# All three phrases carry weight, which is why they are listed separately
+# rather than as one long string: the first is the refusal's claim, the
+# third is the redirection that makes it useful (`get_dependencies` is where
+# an import question belongs), and the middle one pins the *count*. `(1)` is
+# the number of import records carrying that specifier, which is the fact
+# that distinguishes "the index looked and found placeholders" from "the
+# index found nothing at all" - and a second `import "strings"` anywhere in
+# this fixture will fail this entry, deliberately: the count is part of the
+# answer, not decoration.
+
+[[refusal]]
+tool = "references"
+symbol = "strings"
+contains = ["nothing named 'strings' is declared in this project", "use get_dependencies"]
+# The same refusal, from a different tool, and that is the entry's whole
+# point. GM-367's effect on `find_references`/`find_callers`/`find_callees`/
+# `find_implementations` is *only* the text of a refusal, because all four
+# resolve a `symbol_name` through `find_definition::resolve_symbol_name` and
+# hand its answer straight back (`mcp::anchor`'s own module doc). One
+# fixture entry per tool would be four copies of one fact; two entries -
+# `find_definition` above, one of the four sharing its ladder here - is what
+# shows the ladder really is shared, on a real plugin, rather than asserted
+# in a unit test that builds the response itself.
+#
+# The count is left out here on purpose. The entry above owns that claim;
+# repeating it would mean two entries to edit the day the fixture gains
+# another `import "strings"`, for one fact.

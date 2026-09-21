@@ -583,7 +583,19 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   file = "server/server.go"
   via_module = "github.com/x/app/server"   # which module the walk ran from;
   expect = ["cmd/main.go"]                 # omitted = assert no substitution
+  [[refusal]]                              # what a name is NOT (GM-371)
+  tool = "definition"                      # or callers/references/implementations
+  symbol = "strings"                       # imported, declared nowhere here
+  contains = ["use get_dependencies"]      # phrases the refusal must carry
   ```
+
+  `[[refusal]]` is the only category that asserts the *absence* of an answer,
+  and it is deliberately not spelled `expect = []`: an empty answer and a
+  refused one are different facts, and everywhere but `[[definition]]` an
+  empty `expect` already means "resolved, and the answer is empty". It passes
+  on a tool-level refusal carrying every phrase in `contains`, and on nothing
+  else - not on a protocol-level failure, not on a candidate page, not on an
+  answer. `expectations.rs`'s decision 9 has the full argument.
 
 The same fixtures run in core's CI for every bundled plugin. They are the
 per-language acceptance test, replacing "the TS integration tests happen to cover
