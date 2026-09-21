@@ -109,8 +109,67 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 /// How many entries `conformance/expect.toml` carries, and how many of them
 /// are tagged `tier = "semantic"`. Asserted rather than assumed, so an entry
 /// added without a decision about its tier fails here first.
-const EXPECTATIONS: usize = 11;
+const EXPECTATIONS: usize = 12;
 const SEMANTIC_EXPECTATIONS: usize = 3;
+
+/// GM-380: the tripwire above only works if tripping it says what to do.
+///
+/// [`EXPECTATIONS`] is deliberately hand-written - the doc above says why: an
+/// entry added without a decision about its tier has to fail somewhere, and
+/// this is where. What it did not do is *explain itself*. GM-371 added the
+/// `[[refusal]]` entry to `expect.toml` without bumping it, and the three
+/// tests that read it failed with `left: 13`, `right: 12`: a number
+/// naming neither the file, nor the constant, nor the decision its author was
+/// supposed to make. The suite then sat red on `release-3.9.0` for
+/// a day, and the reason is worth naming exactly, because the obvious version
+/// of it is wrong: CI *does* cover this crate - `.github/workflows/ci.yml`
+/// runs `cargo nextest run --workspace` - but the batch was never pushed, so
+/// CI never saw it. What ran instead was the local routine
+/// (`scripts/check.sh`, `cargo test -p g-mesh --lib`, `--test plugin_check`,
+/// `g-mesh plugins check`), and every one of those is scoped to core or to
+/// the kit. The missing local command is `cargo nextest run --workspace`, or
+/// `cargo test --workspace` without nextest installed.
+///
+/// So this test makes the same comparison first and states the whole of it.
+/// Both constants stay hand-written; only the diagnosis is derived.
+#[test]
+fn the_expectation_constants_describe_the_file_they_count() {
+    let (entries, semantic) = count_expectations();
+    assert_eq!(
+        entries, EXPECTATIONS,
+        "conformance/expect.toml carries {entries} entries but EXPECTATIONS says \
+         {EXPECTATIONS}. Adding an entry is meant to land here: decide whether it needs the \
+         semantic tier (`tier = \"semantic\"`), then set EXPECTATIONS = {entries} and \
+         SEMANTIC_EXPECTATIONS to match. Until they agree, the run tests below compare \
+         `judged.len()` against EXPECTATIONS + 1 and fail with a bare pair of numbers."
+    );
+    assert_eq!(
+        semantic, SEMANTIC_EXPECTATIONS,
+        "conformance/expect.toml tags {semantic} entries `tier = \"semantic\"` but \
+         SEMANTIC_EXPECTATIONS says {SEMANTIC_EXPECTATIONS} - set it to {semantic}."
+    );
+}
+
+/// `(entries, entries tagged `tier = "semantic"`)` in [`EXPECT`], by parsing
+/// rather than by grepping. The distinction is not pedantry: `tier =
+/// "semantic"` appears in that file's *comments* too, so counting lines
+/// answers 4 where the file declares 3.
+fn count_expectations() -> (usize, usize) {
+    let text = std::fs::read_to_string(EXPECT).expect("conformance/expect.toml is readable");
+    let parsed: toml::Value = toml::from_str(&text).expect("conformance/expect.toml parses");
+    let mut total = 0;
+    let mut semantic = 0;
+    for value in parsed.as_table().expect("expect.toml is a table").values() {
+        let Some(entries) = value.as_array() else { continue };
+        for entry in entries {
+            total += 1;
+            if entry.get("tier").and_then(toml::Value::as_str) == Some("semantic") {
+                semantic += 1;
+            }
+        }
+    }
+    (total, semantic)
+}
 
 /// The `[plugin.semantic]` section of the manifest this plugin ships, as TOML.
 ///
