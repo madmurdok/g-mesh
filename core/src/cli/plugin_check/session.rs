@@ -363,6 +363,33 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         .stderr(Stdio::piped());
     scratch.isolate(&mut command);
 
+    // The same missing-binary check `daemon::bulk_index::walk_one_language`
+    // makes before spawning this same plugin, for the same reason - see
+    // `daemon::plugin::missing_workspace_binary_hint`'s doc comment. Without
+    // it, a fresh worktree's unbuilt `target/debug/g-mesh-plugin-{python,rust}`
+    // fails `Command::spawn` below with a bare `No such file or directory
+    // (os error 2)`, which blames the plugin for a build step nothing in
+    // this kit's own path runs (GM-375): `core/build.rs` builds the
+    // typescript and go plugins as a side effect of `cargo build`, but the
+    // two cargo-workspace plugins are ordinary workspace members with no
+    // such step, so `cargo build --workspace` is the one command that
+    // produces them and this kit deliberately does not run it - see this
+    // module's doc comment on why a crash/missing binary is a finding, not
+    // something to work around.
+    //
+    // Deliberately `missing_workspace_binary_hint` alone, not the combined
+    // `missing_plugin_binary_hint` the daemon's own spawn sites use: the
+    // latter also matches a missing node entry point, and the typescript
+    // plugin's `Command::spawn` here always succeeds (`node` exists) and
+    // fails informatively on its own - `StderrCapture` already quotes
+    // node's "Cannot find module .../dist/src/index.js" for that case, which
+    // names its own cause and is not this task's gap. Matching that case
+    // here too would replace an unrelated, already-honest failure text
+    // with a different one for no reason this task asked for.
+    if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
+        return BulkRun { bytes: Vec::new(), lines: Vec::new(), failure: Some(hint) };
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -916,6 +943,15 @@ pub(crate) fn run_session(
         .stderr(Stdio::piped());
     scratch.isolate(&mut command);
 
+    // As in `run_bulk` above - see `daemon::plugin::missing_workspace_binary_hint`'s
+    // doc comment and GM-375. `missing_workspace_binary_hint` alone, not the
+    // combined `missing_plugin_binary_hint`, for the same reason given there:
+    // the typescript plugin's own spawn failure here is already honest and
+    // must stay untouched.
+    if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
+        return Session { failure: Some(hint), ..Session::default() };
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -1175,6 +1211,95 @@ impl Driver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
+
+    // -----------------------------------------------------------------
+    // GM-375: a fresh worktree's unbuilt cargo-workspace plugin binary
+    // names the missing artifact and the build command, instead of a bare
+    // "No such file or directory" that blames the plugin.
+    // -----------------------------------------------------------------
+
+    /// A manifest whose `command` is `<workspace>/target/debug/g-mesh-plugin-fake`,
+    /// the exact shape `plugins/python/plugin.toml` and
+    /// `plugins/rust/plugin.toml` declare (a dev-time path into the
+    /// workspace's own `target/`, resolved relative to the manifest's own
+    /// directory). The binary is deliberately never created.
+    fn fake_workspace_plugin_manifest(command: PathBuf) -> PluginManifest {
+        PluginManifest {
+            language: "fake".to_string(),
+            protocol_version: 2,
+            plugin_version: "0.0.0".to_string(),
+            command,
+            args: Vec::new(),
+            extensions: vec![".fake".to_string()],
+            fingerprint_ignore: Vec::new(),
+            manifest_dir: PathBuf::from("/dev/null"),
+            capabilities: Capabilities::default(),
+            workspace: WorkspaceConfig::default(),
+        }
+    }
+
+    /// `run_bulk` against a manifest whose cargo-workspace binary was never
+    /// built must report the same friendly hint
+    /// `daemon::plugin::missing_workspace_binary_hint` gives the daemon's own
+    /// spawn sites - not the bare `Command::spawn` OS error this test would
+    /// see if the GM-375 check above `command.spawn()` in `run_bulk` were
+    /// removed (confirmed by temporarily reverting it: the assertion below
+    /// fails on the unpatched function, quoting "No such file or directory"
+    /// instead).
+    #[test]
+    fn run_bulk_names_a_missing_workspace_binary_instead_of_the_bare_os_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-fake");
+        let manifest = fake_workspace_plugin_manifest(binary.clone());
+        let scratch = Scratch::create().unwrap();
+
+        let run = run_bulk(&manifest, &scratch, Duration::from_secs(5));
+
+        let failure = run.failure.expect("a missing binary must fail the bulk run");
+        assert!(failure.contains(&binary.display().to_string()), "{failure}");
+        assert!(failure.contains("has not been built yet"), "{failure}");
+        assert!(failure.contains("cargo build --workspace"), "{failure}");
+        assert!(!failure.contains("No such file or directory"), "{failure}");
+        assert!(!failure.contains("failed to spawn"), "{failure}");
+    }
+
+    /// Same claim as above, for `run_session`'s control-plane spawn - the
+    /// other site `Command::new(&manifest.command).spawn()` was called
+    /// unconditionally before GM-375.
+    #[test]
+    fn run_session_names_a_missing_workspace_binary_instead_of_the_bare_os_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-fake");
+        let manifest = fake_workspace_plugin_manifest(binary.clone());
+        let scratch = Scratch::create().unwrap();
+        let conn = open_index().unwrap();
+        let target = EditTarget {
+            file_path: "a.fake".to_string(),
+            line: 1,
+            original: b"fn a\n".to_vec(),
+            edited: b"fn a \n".to_vec(),
+            declaration: None,
+        };
+
+        let session = run_session(
+            &manifest,
+            &scratch,
+            &conn,
+            &target,
+            RoundTripTimeouts::default(),
+            Duration::from_secs(5),
+        );
+
+        let failure = session.failure.expect("a missing binary must fail the session");
+        assert!(failure.contains(&binary.display().to_string()), "{failure}");
+        assert!(failure.contains("has not been built yet"), "{failure}");
+        assert!(failure.contains("cargo build --workspace"), "{failure}");
+        assert!(!failure.contains("No such file or directory"), "{failure}");
+        assert!(!failure.contains("failed to spawn"), "{failure}");
+    }
 
     #[test]
     fn the_whitespace_edit_goes_before_the_last_newline() {
