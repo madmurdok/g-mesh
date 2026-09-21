@@ -134,6 +134,14 @@ expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
 [[callers]]
 symbol = "Base.describe"
 tier = "semantic"
+# GM-382, and this plugin is one of the two where the other arm is real:
+# `pyright` is resolved at runtime (PATH, then `node_modules/.bin`, then
+# `npx`), so a checkout without `npm install pyright` in `plugins/python`
+# genuinely has no semantic tier. `"silent"` asserts the arm this run is in -
+# pyright resolved, whole-project pass completed, nothing to disclose - and
+# is therefore a live assertion rather than a formality: it fails the moment
+# a response claims a tier it did not have, or disclaims one it did.
+provenance = "silent"
 # Through 3.4.0 this entry was the receiver gap's airtight *proof of absence*:
 # `describe` was called two ways in `pkg/mod.py` and only `call_through_a_class`'s
 # class-qualified `Base.describe(obj)` produced an edge, so the set was one

@@ -6,6 +6,7 @@
 //! anchor calls). Both are single-hop by design; the transitive walk lives in
 //! `get_dependencies`, not here.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -14,13 +15,14 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{internal_error, success};
-use super::{anchor, SymbolQueryParams};
+use super::{anchor, provenance, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
 /// `resolved`. Direction-agnostic on purpose: `list_calls` doesn't know
@@ -195,6 +197,13 @@ struct CallerPage {
     /// nothing behind.
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
+    /// See `super::provenance` - present only when the anchor's language
+    /// declares a semantic tier that has not completed for this project, so
+    /// this answer came from its structural tier alone. Absent (not `null`,
+    /// not an "everything is fine" object) on every healthy response, which
+    /// is nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
 }
 
 /// What a `CALLS` walk left behind, disclosed at the response level.
@@ -313,11 +322,19 @@ struct CalleePage {
     /// nothing behind.
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
+    /// See `super::provenance` - present only when the anchor's language
+    /// declares a semantic tier that has not completed for this project, so
+    /// this answer came from its structural tier alone. Absent (not `null`,
+    /// not an "everything is fine" object) on every healthy response, which
+    /// is nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
 }
 
 pub(crate) fn handle_callers(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -372,12 +389,14 @@ pub(crate) fn handle_callers(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
+        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
     })
 }
 
 pub(crate) fn handle_callees(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -426,6 +445,7 @@ pub(crate) fn handle_callees(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
+        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
     })
 }
 
@@ -435,6 +455,16 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::EdgeRecord;
+
+    /// The capability map every test in this module passes: empty, so
+    /// `provenance::resolve` reads "no plugin here declares a semantic
+    /// tier" and these responses stay byte-for-byte what they were before
+    /// GM-382 added the field. The tests that are *about* the field build
+    /// their own map; see `mcp::provenance`'s own tests for the predicate
+    /// itself.
+    fn no_capabilities() -> HashMap<String, Capabilities> {
+        HashMap::new()
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -470,12 +500,120 @@ mod tests {
         conn
     }
 
+    /// GM-382, the arm this whole task exists for, at the wire level rather
+    /// than at `provenance::resolve`'s: a language that declares a semantic
+    /// tier, an index in which that tier has not run, and the real
+    /// `find_callers` handler - the response must say so.
+    ///
+    /// The index here is deliberately a *healthy-looking* one: one resolved
+    /// `CALLS` edge, `hasMore: false`, `allUnresolved: false`. That is the
+    /// exact shape the shipped guidance tells a caller to trust without
+    /// re-checking, and before this field existed it was also the exact
+    /// shape a Rust page produced with no `rust-analyzer` installed. The
+    /// only thing distinguishing the two is the block asserted below.
+    #[test]
+    fn a_declared_semantic_tier_that_never_ran_is_disclosed_on_the_wire() {
+        let conn = setup_chain();
+        let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
+
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &rust_with_a_semantic_tier(),
+            params,
+        )
+        .unwrap();
+
+        let body = json_body(&result);
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "the page still answers: {body}");
+        assert_eq!(body["hasMore"], false, "and still looks complete: {body}");
+        assert_eq!(
+            body["provenance"],
+            serde_json::json!({ "language": "rust", "semanticTier": "absent" }),
+            "the page must disclose which plugin answered and that its semantic tier did not: {body}"
+        );
+    }
+
+    /// The control for the test above, and the only difference between them
+    /// is the one variable: the same fixture, the same query, the same
+    /// capability map, with `rust`'s whole-project semantic pass recorded.
+    /// The disclosure has to disappear.
+    ///
+    /// Without this pair the test above proves only that a field can be
+    /// emitted, not that it *discriminates* - a block hard-coded onto every
+    /// Rust response would pass it and would be worthless.
+    #[test]
+    fn a_completed_semantic_pass_leaves_the_wire_shape_untouched() {
+        let conn = setup_chain();
+        schema::record_language_semantic_pass(&conn, "rust").unwrap();
+        let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
+
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &rust_with_a_semantic_tier(),
+            params,
+        )
+        .unwrap();
+
+        let body = json_body(&result);
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "the same answer: {body}");
+        assert!(
+            body.get("provenance").is_none(),
+            "a healthy page must carry no provenance key at all - not `null`, not an \
+             everything-is-fine object: {body}"
+        );
+    }
+
+    /// `find_callees` is the same response envelope and must not have been
+    /// wired up differently by hand - the four edge-walking tools are
+    /// exactly the set that carries this, and a tool missing it would be a
+    /// silent hole in precisely the direction GM-382 is about.
+    #[test]
+    fn find_callees_discloses_the_absent_tier_too() {
+        let conn = setup_chain();
+        let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
+
+        let result = handle_callees(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &rust_with_a_semantic_tier(),
+            params,
+        )
+        .unwrap();
+
+        assert_eq!(
+            json_body(&result)["provenance"],
+            serde_json::json!({ "language": "rust", "semanticTier": "absent" })
+        );
+    }
+
+    /// A capability map declaring rust's real shipped shape: it has a
+    /// semantic tier, and that tier is what resolves receiver calls. The
+    /// fixture's nodes are all `"rust"` (see `setup_chain`), so this is the
+    /// language every anchor in this module resolves to.
+    fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
+        HashMap::from([(
+            "rust".to_string(),
+            Capabilities {
+                semantic_pass: true,
+                receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
+                receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
+            },
+        )])
+    }
+
     #[test]
     fn find_callers_of_b_returns_exactly_a_not_c_not_itself() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result =
-            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "B has exactly one caller, not the transitive chain");
@@ -486,8 +624,13 @@ mod tests {
     fn find_callees_of_b_returns_exactly_c_not_a() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result =
-            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callees(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "B has exactly one callee, not the transitive chain");
@@ -526,6 +669,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -567,8 +711,13 @@ mod tests {
     fn callers_of_a_root_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("a".to_string()), ..Default::default() };
-        let result =
-            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -596,7 +745,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+            &handle_callers(
+                &Arc::new(Mutex::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every caller unresolved must set the response-level marker");
@@ -623,7 +778,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+            &handle_callers(
+                &Arc::new(Mutex::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
 
         assert_eq!(
@@ -672,7 +833,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+            &handle_callers(
+                &Arc::new(Mutex::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
 
         assert_eq!(body["excludedReferences"]["count"], over, "the count stays whole");
@@ -703,7 +870,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+            &handle_callees(
+                &Arc::new(Mutex::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
 
         assert_eq!(body["excludedReferences"]["count"], 1);
@@ -723,8 +896,13 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result =
-            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let raw = json_body(&result).to_string();
         let body = json_body(&result);
 
@@ -756,7 +934,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap(),
+            &handle_callers(
+                &Arc::new(Mutex::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(
@@ -769,8 +953,13 @@ mod tests {
     fn callees_of_a_leaf_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("c".to_string()), ..Default::default() };
-        let result =
-            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callees(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -787,6 +976,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -800,6 +990,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -818,6 +1009,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -829,6 +1021,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -864,6 +1057,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -889,7 +1083,9 @@ mod tests {
             symbol_id: Some(picked["id"].as_str().expect("a candidate carries its id").to_string()),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+        );
         assert!(body.get("ambiguous").is_none(), "an id is never ambiguous");
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "only the chosen candidate's callers, never a union across candidates");
@@ -914,14 +1110,18 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
-        let ambiguous = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), by_name).unwrap());
+        let ambiguous = json_body(
+            &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), by_name).unwrap(),
+        );
         assert_eq!(ambiguous["ambiguous"], true);
 
         // Re-asking by qualifiedName here is the loop: it is the same query.
         let requalified = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
         assert_eq!(
-            json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), requalified).unwrap())
-                ["ambiguous"],
+            json_body(
+                &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), requalified)
+                    .unwrap()
+            )["ambiguous"],
             true
         );
 
@@ -935,7 +1135,9 @@ mod tests {
         );
 
         let params = SymbolQueryParams { symbol_id: Some("run_b".to_string()), ..Default::default() };
-        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap()[0]["callerSymbolId"], "caller_b");
     }
 
@@ -944,8 +1146,13 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result =
-            handle_callers(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callers(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -954,8 +1161,13 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result =
-            handle_callees(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result = handle_callees(
+            &Arc::new(Mutex::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1048,7 +1260,9 @@ mod tests {
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+        );
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
@@ -1071,6 +1285,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1079,6 +1294,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams {
                     symbol_id: Some("b".to_string()),
                     file_paths: Some(Vec::new()),
@@ -1122,7 +1338,9 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle_callers(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle_callers(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -1158,6 +1376,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1173,6 +1392,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1195,6 +1415,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1205,6 +1426,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1239,7 +1461,8 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle_callees(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
+            let result =
+                handle_callees(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["calleeSymbolId"].as_str().unwrap().to_string()));

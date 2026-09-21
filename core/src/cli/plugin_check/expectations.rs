@@ -374,8 +374,57 @@
 //! not a claim about the language. The four that resolve a `symbol_name`
 //! through `find_definition::resolve_symbol_name` are the ones where
 //! refusing is an answer about the code.
+//!
+//! # Decision 10: asserting which tier answered (GM-382)
+//!
+//! Every category above asserts *what* a tool answered. None could assert
+//! which tier produced the answer - and until GM-382 no response said,
+//! which is the root under GM-356/358/360/361/362: the same query against a
+//! Rust project with `rust-analyzer` installed and without it returns the
+//! same shape, the same `resolved: true` rows, and means different things.
+//!
+//! `provenance` is that assertion, on the three `symbol`-anchored
+//! edge-walking categories plus `[[definition]]`:
+//!
+//! ```toml
+//! [[callers]]
+//! symbol = "shapes::Square::perimeter"
+//! tier = "semantic"
+//! expect = ["..."]
+//! provenance = "silent"
+//! ```
+//!
+//! **Two values, and omission is the third spelling of the first.**
+//! `"silent"` requires the response to carry no `provenance` key at all -
+//! the plugin's semantic tier ran, so there is nothing to disclose. Any
+//! other value is a language id and requires
+//! `provenance = {language = "<id>", semanticTier = "absent"}`. Omitting
+//! the key means `"silent"` too, the same way `ImportersExpectation::
+//! via_module`'s absence is an assertion rather than a skip (decision 7) -
+//! so every entry already written in every bundled fixture gained this
+//! assertion without being edited, which is the point: a plugin that
+//! started disclaiming its own semantic tier would fail its whole file, not
+//! one opted-in entry.
+//!
+//! **`[[definition]]` accepts the key but can only ever satisfy
+//! `"silent"`.** `find_definition` resolves a declaration, which is
+//! structural work no semantic tier changes, so it carries no block by
+//! design (`mcp::provenance`'s module doc, "scoped to four tools"). The key
+//! is still evaluated there rather than ignored: a fixture that asked a
+//! definition entry for a language id would otherwise get silence from a
+//! typo, and silence is what this whole decision exists to remove.
+//!
+//! **Why the fixtures only ever say `"silent"`.** A conformance session
+//! drives its plugin's whole-project semantic pass and only continues if it
+//! completed (`session::run_session`), so a *passing* check run is by
+//! construction one whose semantic tier was present. The other arm - engine
+//! declared, engine unreachable - ends the session before expectations are
+//! evaluated, so it is pinned in `mcp::find_callers_callees`' own tests
+//! against a hand-built index instead. Giving the kit an arm that survives
+//! a missing engine would let a fixture assert both halves here, and is
+//! left as its own task rather than folded into this one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -387,6 +436,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
+use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::mcp::{
@@ -448,6 +498,18 @@ struct SymbolExpectation {
     /// Decision 6. Absent means `Structural`.
     #[serde(default)]
     tier: Tier,
+    /// Decision 10 (GM-382): what the response's `provenance` block must
+    /// say. **Absence is itself an assertion** - the same rule
+    /// `ImportersExpectation::via_module` documents - so an entry that does
+    /// not mention this field still requires the response to carry no
+    /// `provenance` at all, which is what every already-written entry in
+    /// every bundled fixture means and why adding the field needed no edit
+    /// to any of them. `"silent"` spells that same requirement out loud, for
+    /// the one entry per fixture that exists to say so; any other value is a
+    /// language id, and requires a block naming that language with
+    /// `semanticTier: "absent"`.
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 /// One `[[imports]]` entry: `get_dependencies` from `file`, one hop
@@ -542,6 +604,13 @@ pub(crate) struct EvalContext<'a> {
     pub(crate) embedding: &'a EmbeddingPipeline,
     pub(crate) project_root: &'a Path,
     pub(crate) entry_points: &'a [String],
+    /// The manifest's own `[plugin.capabilities]`, keyed by language -
+    /// what the four edge-walking handlers need to decide whether this
+    /// plugin declares a semantic tier at all (`mcp::provenance::resolve`).
+    /// A one-entry map, because a check run is always about exactly one
+    /// plugin; built from `manifest.capabilities` rather than from a
+    /// registry, since the kit discovers no registry.
+    pub(crate) capabilities: &'a HashMap<String, Capabilities>,
 }
 
 /// Runs every expectation in `expect`, in file order, and returns one
@@ -645,13 +714,18 @@ impl SymbolTool {
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
-            SymbolTool::Callers => find_callers_callees::handle_callers(ctx.conn, ctx.embedding, params),
-            SymbolTool::References => find_references::handle(ctx.conn, ctx.embedding, params),
+            SymbolTool::Callers => {
+                find_callers_callees::handle_callers(ctx.conn, ctx.embedding, ctx.capabilities, params)
+            }
+            SymbolTool::References => {
+                find_references::handle(ctx.conn, ctx.embedding, ctx.capabilities, params)
+            }
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths } = params;
                 find_implementations::dispatch(
                     ctx.conn,
                     ctx.embedding,
+                    ctx.capabilities,
                     FindImplementationsParams {
                         symbol_id,
                         symbol_name,
@@ -701,10 +775,14 @@ fn eval_symbol_expectation(
             // Decision 8, and only for the one tool of the three whose
             // contract is one row per answer. `Callers`/`References` walk
             // `Distinctness::Edges`, where a repeat is a second usage.
-            let findings = match tool {
+            let mut findings: Vec<String> = match tool {
                 SymbolTool::Implementations => duplicate_row_finding(&rows).into_iter().collect(),
                 SymbolTool::Callers | SymbolTool::References => Vec::new(),
             };
+            // Decision 10, on all three tools rather than only one: unlike a
+            // duplicate row, a provenance claim means the same thing
+            // whichever of them made it.
+            findings.extend(provenance_finding(&value, item.provenance.as_deref()));
             let actual: BTreeSet<String> = rows.into_iter().collect();
             let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
             let outcome = outcome_with(findings, &expected, &actual);
@@ -858,6 +936,47 @@ fn resolved_from_finding(value: &Value, via_module: Option<&str>) -> Option<Stri
     }
 }
 
+/// Decision 10's `provenance`, both ways round - deliberately the same
+/// four-arm shape as [`resolved_from_finding`], because it is the same kind
+/// of claim: a response field that is present exactly when the answer is
+/// narrower than the question, asserted in both its present and its absent
+/// state so that neither can drift unnoticed.
+///
+/// The `"silent"` sentinel and an omitted key mean the same thing (see
+/// [`SymbolExpectation::provenance`]); both land in the `None` arms below.
+fn provenance_finding(value: &Value, expected: Option<&str>) -> Option<String> {
+    let expected = expected.filter(|e| *e != SILENT_PROVENANCE);
+    let actual = value.get("provenance");
+    match (expected, actual) {
+        (None, None) => None,
+        (Some(language), Some(block))
+            if block.get("language").and_then(Value::as_str) == Some(language)
+                && block.get("semanticTier").and_then(Value::as_str) == Some("absent") =>
+        {
+            None
+        }
+        (None, Some(block)) => Some(format!(
+            "expected no provenance block - this plugin's semantic tier ran, so the response has \
+             nothing to disclose - but the response carries provenance = {block} (decision 10)"
+        )),
+        (Some(language), None) => Some(format!(
+            "provenance = \"{language}\", but the response carries no provenance block at all: it \
+             claims its semantic tier contributed, which is the exact silence GM-382 exists to \
+             remove (decision 10)"
+        )),
+        (Some(language), Some(block)) => Some(format!(
+            "provenance = \"{language}\" with semanticTier = \"absent\", but the response says \
+             provenance = {block}"
+        )),
+    }
+}
+
+/// The value [`SymbolExpectation::provenance`] accepts for "this response
+/// must carry no provenance block" - the same requirement omitting the key
+/// already has, written out so a fixture can say it on purpose rather than
+/// only by saying nothing.
+const SILENT_PROVENANCE: &str = "silent";
+
 /// Decision 2's `[[imports]]`/`[[importers]]` row mapping, as a list - the
 /// set is built from it, and decision 8's duplicate check needs the rows
 /// before that collapse.
@@ -892,8 +1011,18 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
                 }
                 _ => BTreeSet::new(),
             };
+            // Decision 10. `find_definition` never carries a block, so this
+            // can only ever pass for `"silent"`/omitted - which is exactly
+            // why it runs here rather than being skipped: an entry that
+            // asked for a language id would otherwise be ignored silently.
+            let findings: Vec<String> =
+                provenance_finding(&value, item.provenance.as_deref()).into_iter().collect();
             let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
-            CheckResult { id: id.into(), outcome: set_diff_outcome(&expected, &actual), warnings: Vec::new() }
+            CheckResult {
+                id: id.into(),
+                outcome: outcome_with(findings, &expected, &actual),
+                warnings: Vec::new(),
+            }
         }
     }
 }

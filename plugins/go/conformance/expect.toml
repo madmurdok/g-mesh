@@ -113,6 +113,14 @@ expect = ["container:fmt", "container:github.com/example/app/server"]
 [[callers]]
 symbol = "Server.Addr"
 tier = "semantic"
+# GM-382. Go's semantic tier is `go/types`, which needs the `go` toolchain -
+# absent on a machine without it, which CI checks for real in its own
+# `go-plugin-without-toolchain` job. `"silent"` asserts the arm *this* run is
+# in: `go` present, whole-project pass completed, nothing to disclose. It is
+# a live assertion rather than a formality, because both rows below come from
+# `types.Info.Selections` and are exactly what disappears without the tier -
+# so this entry pins that the response claims the tier it actually had.
+provenance = "silent"
 expect = ["cmd/main.go:main", "server/logged.go:UseLogged"]
 
 # A method call through a struct field, resolved to the sibling file that

@@ -3,6 +3,7 @@
 //! `graph::pagination::paginate_edges`; this module is just the "anchor
 //! lookup -> incoming usage edges -> usage-site JSON" wiring around it.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -11,12 +12,13 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 
 use super::tool_result::{internal_error, success};
-use super::{anchor, SymbolQueryParams};
+use super::{anchor, provenance, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
 /// source". The extractor files each usage under exactly one of these and
@@ -96,6 +98,13 @@ struct ReferencePage {
     /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// See `super::provenance` - present only when the anchor's language
+    /// declares a semantic tier that has not completed for this project, so
+    /// this answer came from its structural tier alone. Absent (not `null`,
+    /// not an "everything is fine" object) on every healthy response, which
+    /// is nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
@@ -154,6 +163,7 @@ fn list_references(
 pub(crate) fn handle(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -195,6 +205,7 @@ pub(crate) fn handle(
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
+        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
     })
 }
 
@@ -204,6 +215,16 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::{EdgeRecord, NodeRecord};
+
+    /// The capability map every test in this module passes: empty, so
+    /// `provenance::resolve` reads "no plugin here declares a semantic
+    /// tier" and these responses stay byte-for-byte what they were before
+    /// GM-382 added the field. The tests that are *about* the field build
+    /// their own map; see `mcp::provenance`'s own tests for the predicate
+    /// itself.
+    fn no_capabilities() -> HashMap<String, Capabilities> {
+        HashMap::new()
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -248,7 +269,9 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
     }
@@ -361,6 +384,7 @@ mod tests {
             &super::super::find_callers_callees::handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -382,6 +406,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -427,6 +452,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     limit: Some(1),
@@ -475,6 +501,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -513,6 +540,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -551,6 +579,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(vec!["a.ts".to_string()]),
@@ -627,6 +656,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -774,7 +804,8 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -843,7 +874,8 @@ mod tests {
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
@@ -883,7 +915,8 @@ mod tests {
             file_paths: Some(vec!["a.rs".to_string()]),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
         assert_eq!(results[0]["referencingSymbolId"], "in_scope");
@@ -917,6 +950,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -925,6 +959,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(Vec::new()),
@@ -947,7 +982,9 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -980,8 +1017,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every row unresolved must set the response-level marker");
     }
@@ -1017,8 +1056,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(
             body["allUnresolved"], false,
@@ -1044,8 +1085,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["anchor"]["id"], "target");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::run");
         assert_eq!(body["anchor"]["kind"], "Function");
@@ -1074,6 +1117,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1082,6 +1126,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1109,7 +1154,9 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1118,7 +1165,9 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1148,7 +1197,8 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -1171,8 +1221,10 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert!(
             body.get("hint").is_none(),
             "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
@@ -1215,7 +1267,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
+            let result = handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["referencingSymbolId"].as_str().unwrap().to_string()));

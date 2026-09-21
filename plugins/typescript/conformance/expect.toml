@@ -25,6 +25,15 @@
 [[callers]]
 symbol = "add"
 file = "src/math.ts"
+# GM-382. This plugin's semantic tier is the TypeScript compiler itself,
+# resolved from the plugin's own `node_modules` rather than from the user's
+# machine, so it is the least likely of the four to be missing - but the
+# assertion is not "it cannot happen", it is "it did not happen here":
+# `"silent"` requires the response to carry no `provenance` block, and fails
+# if this plugin ever answers while claiming its semantic tier was absent.
+# Every other entry in this file requires the same thing by saying nothing,
+# which is the same assertion (decision 10).
+provenance = "silent"
 # double() calls add() within math.ts itself (same-file); main.ts's run()
 # imports { add } and calls it directly (cross-file named import); main.ts's
 # useBarrelStar() imports add under a different local name through index.ts's

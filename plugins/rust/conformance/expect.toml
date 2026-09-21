@@ -174,6 +174,18 @@ expect = ["crates/alpha/src/lib.rs:run"]
 [[callers]]
 symbol = "shapes::Square::perimeter"
 tier = "semantic"
+# GM-382. This is the entry the semantic tier exists for, so it is the entry
+# where a response that quietly lost that tier would do the most damage: the
+# third caller below is exactly the row a missing `rust-analyzer` removes,
+# and nothing in the response used to say so. `"silent"` asserts the healthy
+# arm - a real rust-analyzer resolved the receiver call, the whole-project
+# pass completed, and there is no disclosure to make. Run this fixture
+# against `missing_toolchain()` instead and the same call would carry
+# `provenance = {language = "rust", semanticTier = "absent"}`; that arm is
+# pinned in `core/tests/plugin_check.rs`, because a session whose engine
+# never starts ends before expectations are evaluated (see
+# `tests/conformance.rs`).
+provenance = "silent"
 # This entry used to be the receiver-call gap's airtight *proof of absence*:
 # `perimeter` is called three ways in this file, `Square::scale`'s
 # `self.perimeter()` and `total_perimeter_via_path`'s

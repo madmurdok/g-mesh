@@ -594,17 +594,43 @@ fn present_languages(conn: &Connection) -> Result<Vec<String>> {
 pub fn present_languages_with_semantic_state(conn: &Connection) -> Result<Vec<(String, bool)>> {
     let mut result = Vec::new();
     for language in present_languages(conn)? {
-        let passed: Option<Option<String>> = conn
-            .query_row(
-                "SELECT semanticPassAt FROM language_state WHERE language = ?1",
-                params![language],
-                |row| row.get(0),
-            )
-            .optional()
-            .with_context(|| format!("failed to read language_state.semanticPassAt for {language}"))?;
-        result.push((language, matches!(passed, Some(Some(_)))));
+        let passed = language_semantic_pass_done(conn, &language)?;
+        result.push((language, passed));
     }
     Ok(result)
+}
+
+/// Whether `language`'s whole-project semantic pass has completed at least
+/// once - the single-language read
+/// [`present_languages_with_semantic_state`] does for every present language
+/// at session start, and [`mcp::provenance`](crate::mcp) does for one
+/// language per tool call.
+///
+/// Split out rather than left inline because the two callers want different
+/// shapes of the same fact and neither wants the other's: the instructions
+/// path needs every present language paired up, a tool call needs exactly the
+/// one language its anchor is written in and has no reason to pay a
+/// `SELECT DISTINCT` over `nodes` to get there.
+///
+/// **A `false` here says the pass has not completed, and deliberately does
+/// not say why.** The three reasons - never scheduled yet, scheduled and
+/// still running, attempted and answered `incomplete` because the language's
+/// engine could not be started - are indistinguishable in this table by
+/// design (`language_state`'s own DDL comment, and
+/// `docs/architecture/multi-language-plugins.md`'s "Semantic engine missing"
+/// paragraph). Anything reported to a caller from this value must therefore
+/// be true of all three, which is what `mcp::provenance` is careful to say
+/// and no more.
+pub fn language_semantic_pass_done(conn: &Connection, language: &str) -> Result<bool> {
+    let passed: Option<Option<String>> = conn
+        .query_row(
+            "SELECT semanticPassAt FROM language_state WHERE language = ?1",
+            params![language],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read language_state.semanticPassAt for {language}"))?;
+    Ok(matches!(passed, Some(Some(_))))
 }
 
 /// Whether every language [`present_languages`] names has a non-NULL
