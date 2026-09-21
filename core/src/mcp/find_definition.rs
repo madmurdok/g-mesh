@@ -175,11 +175,64 @@ struct FileNamePage {
     results: Vec<DefinitionCandidate>,
 }
 
+/// Which column an ambiguous query matched on, and so which set of
+/// declarations the candidate page ranks. See [`resolve_symbol_name`] for
+/// when each is reached.
+#[derive(Clone, Copy)]
+enum NameColumn {
+    Name,
+    QualifiedName,
+}
+
+impl NameColumn {
+    /// Interpolated into the SQL below rather than bound: a column name
+    /// cannot be a parameter, and these two literals are the only values
+    /// this type has.
+    fn sql(self) -> &'static str {
+        match self {
+            NameColumn::Name => "n.name",
+            NameColumn::QualifiedName => "n.qualifiedName",
+        }
+    }
+}
+
 /// Ranks candidates by inbound `REFERENCES`+`CALLS` edge count, descending -
 /// a rough proxy for "how central is this symbol", since nothing else in the
 /// graph orders same-named definitions across files.
+///
+/// # Test-only declarations are ranked, not excluded (GM-360)
+///
+/// The case that raised the question: bare `RegexMatcher` names four ripgrep
+/// declarations, two `pub` production matchers wired into `core/search.rs`
+/// and two `pub(crate)` test helpers, one of which lives under `tests/`. It
+/// is tempting to drop a non-public declaration in a test directory from a
+/// bare-name page when public ones compete, and this deliberately does not:
+///
+/// - A declaration that is in the index and carries the name is an answer to
+///   "where is this defined", and someone reading `crates/matcher/tests/util.rs`
+///   asking about the type in front of them would get a list that omits it.
+///   The standing rule is that a missing edge beats a wrong one - but a
+///   dropped candidate is not a missing edge, it is a wrong answer to a
+///   question the index can answer.
+/// - "Test-only" is not a fact this module has. `visibility` is normalized
+///   (`public`/`container`/`file`), but what `container` *means* is the
+///   plugin's business, and "under `tests/`" is a per-language convention -
+///   Rust's integration tests, Go's `_test.go` siblings, Python's `tests/`
+///   package - that core would have to encode a list of. A resolution ladder
+///   that silently applies language conventions is how the tool got here.
+/// - Ranking already separates them, measured rather than assumed. On
+///   ripgrep the inbound counts are: `crates/regex`'s production matcher 11,
+///   `crates/searcher`'s `pub(crate)` helper 7, `crates/pcre2`'s production
+///   matcher 5, and the `tests/` fixture 2 - so the fixture that used to be
+///   returned as *the* answer now ranks last of four, and the caller can
+///   still reach it.
+///
+/// The ranking rule is therefore load-bearing, and it is this sentence and
+/// the `ORDER BY` in [`pagination::paginate_by_score`] - nothing else in the
+/// graph orders same-named declarations.
 fn find_candidates_by_name(
     conn: &Connection,
+    column: NameColumn,
     name: &str,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
@@ -190,11 +243,14 @@ fn find_candidates_by_name(
     // Core's container nodes are excluded too, as in `graph::queries`' own
     // lookups (see the comment at the top of that module): a candidate with
     // no file to show is not one a caller can re-query into an answer.
-    let base_sql = "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
-                    n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
-                    CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-                    FROM nodes n WHERE n.name = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3 \
-                    AND n.nativeKind IS NOT ?4";
+    let base_sql = format!(
+        "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
+         n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
+         CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
+         FROM nodes n WHERE {} = ?1 AND n.nativeKind IS NOT ?2 AND n.nativeKind IS NOT ?3 \
+         AND n.nativeKind IS NOT ?4",
+        column.sql()
+    );
 
     fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
         let id: String = row.get("id")?;
@@ -213,7 +269,7 @@ fn find_candidates_by_name(
 
     pagination::paginate_by_score(
         conn,
-        base_sql,
+        &base_sql,
         &[&name, &PENDING_SYMBOL_NATIVE_KIND, &REEXPORT_NATIVE_KIND, &CONTAINER_NATIVE_KIND],
         CANDIDATE_PAGE_SIZE,
         cursor,
@@ -257,7 +313,12 @@ pub(super) enum ResolvedBy {
     QualifiedName,
     /// A bare name matching exactly one declaration.
     Name,
-    /// A bare name matching several: the page is ranked candidates, not an answer.
+    /// A name matching several declarations - bare (`RegexMatcher`, four
+    /// times in ripgrep) or qualified (`matcher::RegexMatcher`, twice: a Rust
+    /// qualifiedName is a module path *within* a crate, and two crates can
+    /// hold the same one). Either way the page is ranked candidates, not an
+    /// answer, and either way the caller re-queries by a candidate's `id` -
+    /// which is why both wear this one label rather than two.
     NameAmbiguous,
     /// No declaration carries the name, but a file does - so these are that
     /// file's declarations, offered because a default import binds an export
@@ -280,6 +341,35 @@ pub(super) struct Resolved {
 /// re-queries a candidate it picked off a previous ambiguous page), then
 /// falls back to a bare-name lookup.
 ///
+/// # Neither key is unique, and the fast path has to say so (GM-360)
+///
+/// A qualifiedName is a *spelling*, not a primary key, and a bare one is not
+/// evidence of anything. Both halves were measured on ripgrep, which declares
+/// `RegexMatcher` four times:
+///
+/// | spelling | declarations | 3.7.0's answer |
+/// |---|---|---|
+/// | `RegexMatcher` | 4 (2 `pub`, 2 `pub(crate)`) | the one `pub(crate)` fixture under `tests/`, `resolvedBy: qualifiedName`, unflagged |
+/// | `matcher::RegexMatcher` | 2 (`crates/regex`, `crates/pcre2`) | `resolvedBy: semanticNeighbours` - nothing structural matched at all |
+///
+/// The fixture won the first because a Rust qualifiedName is a module path
+/// *within its crate*, so a crate-root declaration carries the bare string
+/// and the other three do not - the fast path then matched exactly one row
+/// and stopped. That is an accident of where a declaration sits, not a
+/// reason to prefer it, so a query that is also some declaration's own name
+/// goes through the bare-name rung with all of its namesakes.
+///
+/// The second failed for the mirror reason: two crates each have a `matcher`
+/// module, the fast path matched *two* rows, and "not exactly one" fell
+/// through to a bare-name lookup that no qualified spelling can ever match,
+/// and from there to the semantic rung. Several exact matches is an
+/// ambiguity, not a miss.
+///
+/// Go's `Binding` in gin - two `interface` declarations behind build tags,
+/// both with bare qualifiedNames - is the control: it was already ambiguous
+/// on both counts and is reached by the same first arm of the match below,
+/// unchanged.
+///
 /// `Ok(Ok(node))` is that node. `Ok(Err(result))` is a finished response the
 /// caller must return unchanged - the ranked candidate page when the name is
 /// ambiguous, or the not-found tool error - which is what lets the four
@@ -295,31 +385,63 @@ pub(super) fn resolve_symbol_name(
 ) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
     let mut exact = queries::find_by_qualified_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
-    if exact.len() == 1 {
+
+    // The fast path, and the only single-query one: a genuinely qualified
+    // spelling that exactly one declaration carries. `name != its own name`
+    // is what "genuinely qualified" means here without this module having to
+    // know any language's path separator - and it is the whole cost of the
+    // change on the happy path, one string comparison on a row already read.
+    if exact.len() == 1 && exact[0].name != name {
         return Ok(Ok(Resolved { node: exact.remove(0), by: ResolvedBy::QualifiedName }));
     }
 
     let matches = queries::find_by_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by name", e))?;
 
-    match matches.len() {
-        0 => by_file_name(conn, embedding, name),
-        1 => Ok(Ok(Resolved {
-            node: matches.into_iter().next().expect("len checked above"),
-            by: ResolvedBy::Name,
-        })),
-        _ => {
-            let page = find_candidates_by_name(conn, name, cursor)
-                .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage {
-                ambiguous: true,
-                resolved_by: ResolvedBy::NameAmbiguous,
-                results: page.results,
-                has_more: page.has_more,
-                next_cursor: page.next_cursor,
-            })
-            .map(Err)
+    // The name set is consulted first, and subsumes the other whenever the
+    // query is bare: a declaration whose qualifiedName *is* the bare string
+    // is named that too, so `matches` is then a superset of `exact` and
+    // ranking the smaller set would drop real candidates - excalidraw's two
+    // bare `getNonDeletedElements` would hide any module-qualified third.
+    // `exact` decides only when nothing is *named* the query, i.e. when the
+    // spelling is qualified.
+    let ambiguous_over = match (matches.len(), exact.len()) {
+        (2.., _) => Some(NameColumn::Name),
+        // Specifier-shaped queries keep the answer they have today, which is
+        // the refusal at the bottom of the ladder. Measured on gin: the
+        // qualifiedName `net/http` is carried by 63 `external_module` import
+        // placeholders, one per importing file, so without this guard the
+        // rung above would answer a package name with a page of 20 rows that
+        // are not declarations and that no caller can re-query into one.
+        // `is_module_specifier`'s own doc has the rest of the argument -
+        // specifiers have a rung of their own, `get_dependencies`' path
+        // matching, and this is the second place that has to know it.
+        (_, 2..) if !is_module_specifier(name) => Some(NameColumn::QualifiedName),
+        _ => None,
+    };
+    if let Some(column) = ambiguous_over {
+        let page = find_candidates_by_name(conn, column, name, cursor)
+            .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
+        return success(&CandidatePage {
+            ambiguous: true,
+            resolved_by: ResolvedBy::NameAmbiguous,
+            results: page.results,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor,
+        })
+        .map(Err);
+    }
+
+    match matches.into_iter().next() {
+        // With one match and one exact row they are the same node - the query
+        // is both its name and its whole qualifiedName - so the stronger rung
+        // is reported, which is what keeps every language whose qualifiedNames
+        // are bare by construction (TypeScript) answering exactly as it did.
+        Some(node) => {
+            let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
+            Ok(Ok(Resolved { node, by }))
         }
+        None => by_file_name(conn, embedding, name),
     }
 }
 
@@ -655,7 +777,7 @@ mod tests {
         let mut member = node_with_span("n1", "app", "app::app", "src/app.rs", (5, 0));
         member.container = Some("app".to_string());
         upsert_node(&mut conn, member).unwrap();
-        let candidates = find_candidates_by_name(&conn, "app", None).unwrap();
+        let candidates = find_candidates_by_name(&conn, NameColumn::Name, "app", None).unwrap();
         assert_eq!(candidates.results.len(), 1, "the container node must not be ranked");
 
         let params = FindDefinitionParams {
@@ -877,6 +999,128 @@ mod tests {
 
         assert_eq!(body["ambiguous"], true);
         assert_eq!(body["resolvedBy"], "nameAmbiguous");
+    }
+
+    // --- GM-360: neither key is a unique one -------------------------------
+
+    /// ripgrep's own `RegexMatcher` set, reduced to what the resolver reads:
+    /// four declarations of one name, three of them module-qualified and
+    /// one (the `pub(crate)` fixture under `tests/`) carrying the bare
+    /// string because it sits at its crate's root. The inbound-edge counts are the
+    /// measured ones (`find_candidates_by_name`'s own doc), so the ranking
+    /// these tests assert is ripgrep's ranking and not a convenient one.
+    fn ripgrep_regex_matchers() -> Connection {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("user", "Function", "user", "user", "crates/core/search.rs", "rust"),
+        )
+        .unwrap();
+        for (id, qualified_name, file, inbound) in [
+            ("regex", "matcher::RegexMatcher", "crates/regex/src/matcher.rs", 11),
+            ("searcher", "testutil::RegexMatcher", "crates/searcher/src/testutil.rs", 7),
+            ("pcre2", "matcher::RegexMatcher", "crates/pcre2/src/matcher.rs", 5),
+            ("fixture", "RegexMatcher", "crates/matcher/tests/util.rs", 2),
+        ] {
+            upsert_node(&mut conn, node_with_span(id, "RegexMatcher", qualified_name, file, (5, 0))).unwrap();
+            for n in 0..inbound {
+                let edge =
+                    EdgeRecord::new(format!("{id}-{n}"), "user", id, "REFERENCES", "tree-sitter", true);
+                upsert_edge(&mut conn, edge).unwrap();
+            }
+        }
+        conn
+    }
+
+    /// Face A1. The bare query used to resolve - exactly, unflagged,
+    /// `resolvedBy: qualifiedName` - to the one declaration whose
+    /// qualifiedName *is* the bare string, which in ripgrep is a `pub(crate)`
+    /// test fixture. Carrying the bare string is a fact about module depth,
+    /// so it competes with its namesakes instead of short-circuiting past
+    /// them.
+    #[test]
+    fn a_bare_name_does_not_resolve_to_whichever_declaration_sits_at_a_root() {
+        let conn = ripgrep_regex_matchers();
+
+        let body = json_body(&by_name(&conn, None, None, "RegexMatcher", None).unwrap());
+
+        assert_eq!(body["ambiguous"], true, "four declarations carry this name: {body}");
+        assert_eq!(body["resolvedBy"], "nameAmbiguous");
+        let results = body["results"].as_array().expect("a candidate page");
+        assert_eq!(results.len(), 4, "every declaration of the name is offered");
+        assert_eq!(
+            results[0]["filePath"], "crates/regex/src/matcher.rs",
+            "ranked by inbound edges, so the production matcher leads"
+        );
+        assert_eq!(
+            results[3]["filePath"], "crates/matcher/tests/util.rs",
+            "the test fixture is ranked last, not excluded - find_candidates_by_name's own doc"
+        );
+    }
+
+    /// Face A5, the mirror image: two crates each have a `matcher` module, so
+    /// the exact rung matches two rows. "Not exactly one" used to mean "no
+    /// match", which dropped the query into a bare-name lookup no qualified
+    /// spelling can match, and on from there to the semantic rung.
+    #[test]
+    fn a_qualified_name_two_declarations_carry_is_an_ambiguity_not_a_miss() {
+        let conn = ripgrep_regex_matchers();
+
+        let body = json_body(&by_name(&conn, None, None, "matcher::RegexMatcher", None).unwrap());
+
+        assert_eq!(body["ambiguous"], true, "two declarations carry this qualifiedName: {body}");
+        assert_eq!(body["resolvedBy"], "nameAmbiguous");
+        let results = body["results"].as_array().expect("a candidate page");
+        assert_eq!(results.len(), 2, "only the two declarations that carry it, not all four namesakes");
+        assert_eq!(results[0]["filePath"], "crates/regex/src/matcher.rs");
+        assert_eq!(results[1]["filePath"], "crates/pcre2/src/matcher.rs");
+    }
+
+    /// The control this fix is measured against: gin's `Binding`, two
+    /// `interface` declarations behind build tags, both with bare
+    /// qualifiedNames. It was already ambiguous before GM-360 and has to
+    /// answer identically after - it is the case that proves ambiguity
+    /// detection works and that Rust's naming scheme, not the detector, was
+    /// what slipped past it.
+    #[test]
+    fn two_declarations_sharing_one_bare_qualified_name_are_ambiguous_exactly_as_before() {
+        let mut conn = setup();
+        for (id, file) in [("binding", "binding/binding.go"), ("nomsgpack", "binding/binding_nomsgpack.go")] {
+            upsert_node(&mut conn, node_with_span(id, "Binding", "Binding", file, (40, 0))).unwrap();
+        }
+
+        let body = json_body(&by_name(&conn, None, None, "Binding", None).unwrap());
+
+        assert_eq!(body["ambiguous"], true);
+        assert_eq!(body["resolvedBy"], "nameAmbiguous");
+        assert_eq!(body["results"].as_array().expect("a candidate page").len(), 2);
+    }
+
+    /// The other control, and the reason the fix is a comparison against a
+    /// declaration's own `name` rather than a search for `::`: a language
+    /// whose qualifiedNames are bare by construction (TypeScript) must keep
+    /// resolving a lone declaration on the strongest rung, not lose it to a
+    /// bare-name lookup with a weaker label.
+    #[test]
+    fn a_lone_declaration_whose_qualified_name_is_bare_still_resolves_on_the_exact_rung() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            node_with_span(
+                "n1",
+                "getNonDeletedElements",
+                "getNonDeletedElements",
+                "packages/element/src/index.ts",
+                (5, 0),
+            ),
+        )
+        .unwrap();
+
+        let body = json_body(&by_name(&conn, None, None, "getNonDeletedElements", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "qualifiedName");
+        assert_eq!(body["id"], "n1");
+        assert!(body.get("results").is_none(), "one declaration is not a candidate page");
     }
 
     // --- the declaration's source ------------------------------------------

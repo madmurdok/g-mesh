@@ -109,7 +109,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 /// How many entries `conformance/expect.toml` carries, and how many of them
 /// are tagged `tier = "semantic"`. Asserted rather than assumed, so an entry
 /// added without a decision about its tier fails here first.
-const EXPECTATIONS: usize = 10;
+const EXPECTATIONS: usize = 11;
 const SEMANTIC_EXPECTATIONS: usize = 3;
 
 /// The `[plugin.semantic]` section of the manifest this plugin ships, as TOML.

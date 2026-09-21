@@ -926,6 +926,34 @@ impl PluginProcess {
         })
     }
 
+    /// Replaces this process's round-trip budget after construction - the
+    /// seam GM-355 needed and [`FILE_CHANGED_TIMEOUT_ENV`] could not give.
+    ///
+    /// That env override is read once, in `spawn` above, and the resulting
+    /// budget then belongs to this `PluginProcess` for the rest of its life,
+    /// across every relaunch. That is right for production, where one budget
+    /// describes one plugin. It is wrong for a test whose *subject* is a
+    /// timeout, because such a test needs two different budgets in sequence:
+    /// a short one for the round trip that must time out, and an ordinary one
+    /// for the round trips that must succeed afterwards. Sharing the short
+    /// one between them is what made
+    /// `a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_without_blocking_another_language`
+    /// a statement about the machine: its replay, a perfectly healthy round
+    /// trip against the relaunched process, was racing the 150ms the *stall*
+    /// had been given. Measured, that replay takes 2.0ms on an idle machine
+    /// and still 2.2ms under a 20x CPU oversubscription - and crosses 150ms,
+    /// times out and fails the test, at 50x.
+    ///
+    /// Test-only, because there is no production reason to change a budget
+    /// mid-life and a setter nobody calls would be dead code. What stays real
+    /// in the test that uses it is everything that matters: the timeout it is
+    /// judged on still elapses for real, against a plugin that genuinely
+    /// never answers.
+    #[cfg(test)]
+    pub(crate) fn set_round_trip_timeouts(&mut self, timeouts: RoundTripTimeouts) {
+        self.timeouts = timeouts;
+    }
+
     /// The plugin process's pid, so the daemon can record it for tooling that
     /// has to reason about the plugin from outside this process. Reflects
     /// whichever process is current, so it changes across a crash relaunch -

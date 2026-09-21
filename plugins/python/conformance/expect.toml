@@ -15,10 +15,10 @@
 # `tests/conformance.rs` runs this file three ways, and the three together are
 # the whole point:
 #
-#   1. with the manifest this plugin ships, where all ten entries run and pass;
+#   1. with the manifest this plugin ships, where all eleven entries run and pass;
 #   2. with 3.4.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      three report `Skip` and the other seven - every structural entry here -
+#      three report `Skip` and the other eight - every structural entry here -
 #      keep passing;
 #   3. with 3.4.0's manifest and *without* the skip flag, where those three
 #      must FAIL.
@@ -58,6 +58,10 @@
 #     `find_implementations`) - deliberately still structural after GM-299,
 #     because pyright implements no `textDocument/implementation` at all;
 #   - imports (`pkg/sub/deep.py`, both of them relative);
+#   - importers, the *incoming* direction (`pkg/helpers.py`, GM-365's new
+#     category - see that entry, and `expectations.rs`'s decision 7: it is
+#     where GM-356's file-to-module substitution is asserted, and where
+#     GM-358's missing edge is asserted from the other end);
 #   - definition, anchored on the module self-announcement node
 #     (`pkg.sub.deep`) - the node `crate::project`'s Decision 1 obliges this
 #     plugin to emit, asserted here to be a real, addressable declaration
@@ -320,6 +324,16 @@ file = "pkg/sub/deep.py"
 # `from .. import helpers` reads a member out of, and `container:pkg.base` is
 # the module `from ..base import …` names.
 #
+# `container:pkg.helpers` is the GM-358 entry: `helpers` is not a symbol
+# `pkg/__init__.py` declares, it is `pkg/helpers.py` - a real submodule, the
+# same shape `src/requests/__init__.py`'s `from . import packages, utils` and
+# `tests/test_utils.py`'s `from requests import compat` measured against
+# psf/requests. Before the fix this row was silently missing (`truncated:
+# false`, no flag - indistinguishable from a complete answer) and only
+# `container:pkg`/`container:pkg.base` came back; `find_references` on
+# `pkg::helpers` already worked, since it never depended on the missing
+# `IMPORTS` edge.
+#
 # It is anchored on *this* file rather than on `pkg/mod.py`, whose imports are
 # more varied, because the kit's session empties and restores the file with
 # the most nodes - `pkg/mod.py` - and core GCs a container whose last member
@@ -328,7 +342,7 @@ file = "pkg/sub/deep.py"
 # reindex", which within one session never happens). An expectation over
 # `pkg/__init__.py`'s imports would be asserting that deliberate core
 # behaviour, not this plugin's.
-expect = ["container:pkg", "container:pkg.base"]
+expect = ["container:pkg", "container:pkg.base", "container:pkg.helpers"]
 
 # --- definition: the module self-announcement node ---------------------------
 
@@ -340,3 +354,60 @@ symbol = "pkg.sub.deep"
 # real declaration a lookup can land on - not an internal artefact - and that
 # it lives in the file it describes.
 expect = ["pkg/sub/deep.py:pkg.sub.deep"]
+
+# --- importers (get_dependencies, one hop, Incoming): the other direction ----
+#     (GM-356 and GM-358, and `expectations.rs`'s decision 7)
+
+[[importers]]
+file = "pkg/helpers.py"
+via_module = "pkg.helpers"
+# Until GM-365 every entry in this kit asked an *outgoing* question, and two
+# of this batch's six defects were in this direction. This entry is where
+# both of them would have been caught.
+#
+# `via_module` is half the assertion, and it is GM-356's: in Python an
+# `IMPORTS` edge arrives at the *module* `pkg.helpers`, never at
+# `pkg/helpers.py`, so a walk literally anchored on the file finds no
+# incoming edge and returns `results: []` with `truncated: false` - a
+# well-formed zero saying "nothing imports this" about a file five statements
+# in four files import. The fix substitutes the module the file defines and
+# names it in `resolvedFrom.qualifiedName`; this entry requires that key
+# exactly, so against the pre-fix binary it fails twice - no substitution,
+# and an empty set.
+#
+# The five statements behind the five rows, read out of the fixture rather
+# than off the tool's own answer:
+#
+#   - `pkg/mod.py` imports it three ways at once (`import pkg.helpers`,
+#     `from . import helpers`, `from .helpers import assist`), which collapse
+#     onto one row: this is a walk over nodes, not a list of statements.
+#   - `pkg/__init__.py`: `from .helpers import assist as helper`.
+#   - `pkg/plugins/loader.py`: `from pkg.helpers import *` - a star import is
+#     still an import of the module.
+#   - `pkg/gaps.py`: `from .helpers import SEPARATOR as JOINER`, inside a
+#     `try:`. An import in a conditional body is an import.
+#   - `pkg/sub/deep.py`: `from .. import helpers` - and this row is GM-358's,
+#     from the other end. `helpers` there is a *submodule* reached through a
+#     relative import two levels up, exactly the `from <pkg> import
+#     <submodule>` form that built no `IMPORTS` edge before 3.8.0. The
+#     `[[imports]]` entry above asserts that same edge from deep.py's side as
+#     `container:pkg.helpers`; this asserts it from the module's, which is
+#     the side a caller asking "what would break if I changed this file"
+#     actually reads. Against a pre-GM-358 binary (with GM-356 in place) this
+#     entry fails on that one missing row while the other four stay - a
+#     missing member rather than an empty answer, which is the discrimination
+#     the two halves of the fix have to be told apart by.
+#
+# Anchored on `pkg/helpers.py` and not on `pkg/mod.py` for the reason the
+# `[[imports]]` entry above gives at length: the session empties and restores
+# the file with the most nodes, which is `pkg/mod.py`, and a container whose
+# last member went with it is GC'd along with every `IMPORTS` edge pointing
+# at it. `pkg.helpers`' members are all in `helpers.py`, which the session
+# never touches.
+expect = [
+    "pkg/__init__.py",
+    "pkg/gaps.py",
+    "pkg/mod.py",
+    "pkg/plugins/loader.py",
+    "pkg/sub/deep.py",
+]

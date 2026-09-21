@@ -84,6 +84,19 @@
 //! `external_module` node instead - see `crate::project`'s Decision 8 for how
 //! that is decided, and why a relative import never needs deciding.
 //!
+//! ## A named import whose name is itself a submodule (GM-358)
+//!
+//! `from a.b import C` draws its `IMPORTS` edge onto `a.b`, the container
+//! being read from - but when `C` is not a symbol declared in `a.b`, rather
+//! a submodule (`from . import packages`, `from requests import compat`),
+//! Python's own import semantics also load `a.b.C` as a side effect, the
+//! same as writing `import a.b.C` directly. [`Declarer::imported_name`]
+//! draws a second `IMPORTS` edge onto `a.b.C` for exactly this case,
+//! guarded by [`ProjectContext::has_container`] so it never fires for an
+//! ordinary symbol import. The `pending_symbol`/`REFERENCES` placeholder for
+//! `C` itself is unaffected either way - that address was never the bug,
+//! only `get_dependencies`'s answer was.
+//!
 //! # `__all__`
 //!
 //! `__all__ = ["Greeter", "greet"]` in `pkg/__init__.py` is how a package
@@ -473,6 +486,22 @@ impl Declarer<'_, '_> {
         let file = self.emitter.file_id().to_string();
         self.emitter.placeholder_edge(EdgeKind::References, &file, &placeholder);
         self.model.import(local, Import::Item { container: container.to_string(), name: name.to_string() });
+
+        // `from a.b import c` where `c` is itself a submodule of `a.b`
+        // rather than a symbol declared inside it also loads that submodule
+        // as a side effect - Python's own import semantics, the same thing
+        // `import a.b.c` would address directly. The REFERENCES edge above
+        // already addresses `c` as a name (`find_references` on it is
+        // correct); what was missing (GM-358) is the IMPORTS edge
+        // `get_dependencies` is answered from. `has_container` is exactly
+        // the self-announcement registry `crate::project`'s Decision 8
+        // builds for this: a real submodule's dotted key is in it, an
+        // ordinary symbol's never is, so this never fires for the common
+        // `from a.b import SomeFunction` case.
+        let submodule = format!("{container}.{name}");
+        if self.project.has_container(&submodule) {
+            self.import_edge(&submodule, range, false);
+        }
     }
 
     /// The `IMPORTS` edge from this file onto whatever a dotted name

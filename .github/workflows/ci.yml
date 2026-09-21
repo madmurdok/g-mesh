@@ -891,9 +891,15 @@ jobs:
       # rustfmt.toml, recovered by measurement rather than picked - see that
       # file. A formatter written down but not checked drifts straight back,
       # which is the state this repository was in until GM-241.
+      # Both steps call scripts/check.sh rather than spelling the command
+      # here, so a contributor running it locally runs exactly this (GM-368).
+      # They differed before: six tasks ran `clippy -p g-mesh --lib`, which
+      # does not compile test targets, and four lints in a `#[cfg(test)]`
+      # module reached this job unseen. The steps stay separate so `fmt` -
+      # the cheaper failure, with the obvious remedy - is reported first.
       - name: cargo fmt --check
         # `--all`: every workspace member, not core alone (GM-284).
-        run: cargo fmt --all --check
+        run: scripts/check.sh fmt
 
       # `-D warnings`, because a lint that reports and passes is a lint nobody
       # reads. The tree was brought to zero findings before this was turned on
@@ -901,4 +907,4 @@ jobs:
       # annotations, a seven-field tuple type, and one assertion that was
       # constant-true and therefore checking nothing).
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: scripts/check.sh clippy

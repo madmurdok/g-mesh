@@ -942,15 +942,28 @@ fn the_typescript_plugin_satisfies_its_own_expectations_file() {
         .collect();
     // Every kind in expect.toml is exercised, and none of them silently
     // vanished from the report.
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.references")), "{}", run.stdout);
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers[")), "{}", run.stdout);
     assert!(
-        expectation_results.iter().any(|id| id.starts_with("expectations.implementations")),
+        expectation_results.iter().any(|id| id.starts_with("expectations.references[")),
         "{}",
         run.stdout
     );
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.definition")), "{}", run.stdout);
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.implementations[")),
+        "{}",
+        run.stdout
+    );
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports[")), "{}", run.stdout);
+    // GM-365's incoming direction. The `[` above and here is load-bearing:
+    // `expectations.importers[0]` starts with `expectations.imports` too, so
+    // without it one category could stand in for the other and a fixture that
+    // lost its outgoing entry would still look covered.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.importers[")), "{}", run.stdout);
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.definition[")),
+        "{}",
+        run.stdout
+    );
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
@@ -975,17 +988,30 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
         .keys()
         .filter(|id| id.starts_with("expectations.") && *id != "expectations.file")
         .collect();
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers")), "{}", run.stdout);
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.references")), "{}", run.stdout);
-    // GM-281: implicit interface satisfaction is in the file now, and it is
-    // the one kind no structural tier could ever have produced.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.callers[")), "{}", run.stdout);
     assert!(
-        expectation_results.iter().any(|id| id.starts_with("expectations.implementations")),
+        expectation_results.iter().any(|id| id.starts_with("expectations.references[")),
         "{}",
         run.stdout
     );
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports")), "{}", run.stdout);
-    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.definition")), "{}", run.stdout);
+    // GM-281: implicit interface satisfaction is in the file now, and it is
+    // the one kind no structural tier could ever have produced.
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.implementations[")),
+        "{}",
+        run.stdout
+    );
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.imports[")), "{}", run.stdout);
+    // GM-365's incoming direction. The `[` above and here is load-bearing:
+    // `expectations.importers[0]` starts with `expectations.imports` too, so
+    // without it one category could stand in for the other and a fixture that
+    // lost its outgoing entry would still look covered.
+    assert!(expectation_results.iter().any(|id| id.starts_with("expectations.importers[")), "{}", run.stdout);
+    assert!(
+        expectation_results.iter().any(|id| id.starts_with("expectations.definition[")),
+        "{}",
+        run.stdout
+    );
     for id in expectation_results {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
@@ -1044,6 +1070,10 @@ fn the_go_plugin_without_a_toolchain_skips_only_the_semantic_tier_expectations()
         "expectations.callers[3]",
         "expectations.references[0]",
         "expectations.imports[0]",
+        // GM-365: the incoming direction is structural too, in every
+        // language - an `IMPORTS` edge needs no toolchain - so it belongs in
+        // this list rather than among the entries the flag skips.
+        "expectations.importers[0]",
         "expectations.definition[0]",
         "expectations.definition[1]",
     ] {
@@ -1204,7 +1234,7 @@ fn an_unknown_expectation_key_is_a_hard_parse_error() {
     assert!(run.stdout.contains("bogus_field"), "{}", run.stdout);
     assert!(run.stdout.contains("unknown field"), "{}", run.stdout);
     assert!(
-        !run.outcomes.keys().any(|id| id.starts_with("expectations.callers")),
+        !run.outcomes.keys().any(|id| id.starts_with("expectations.callers[")),
         "an unparsed file must run no per-expectation check:\n{}",
         run.stdout
     );
@@ -1268,6 +1298,10 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         "expectations.references[0]",
         "expectations.implementations[0]",
         "expectations.imports[0]",
+        // GM-365: the incoming direction is structural too - an `IMPORTS`
+        // edge needs no toolchain in any of these languages - so it belongs
+        // among the entries a missing semantic tier must not disturb.
+        "expectations.importers[0]",
         "expectations.definition[0]",
         "expectations.definition[1]",
     ] {

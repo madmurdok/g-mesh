@@ -485,6 +485,39 @@ pub struct ScoredEdge {
     pub locality: i64,
 }
 
+/// Whether a page's rows are edges or the *other endpoints* those edges
+/// reach - [`paginate_edges`]' one behavioural switch.
+///
+/// # Why one anchor can hold two edges saying the same thing (GM-361)
+///
+/// A plugin's structural tier and its semantic tier both describe the same
+/// file, and an `edges` row's id is `(fromId, kind, toId)` *per tier* -
+/// `source` tells a `tree-sitter` edge from a `rust-analyzer` one, which is
+/// the point of the column. So when rust-analyzer's implementation sweep
+/// re-derives an `impl Trait for T` the structural pass had already found,
+/// the index honestly holds two rows for one fact.
+///
+/// For [`Edges`](Distinctness::Edges) that is what a caller wants: two
+/// `f(); f();` in one function genuinely are two calls, and
+/// `find_references` reporting one row per usage is its whole contract.
+/// For `find_implementations` it is not: "who implements this trait" has one
+/// answer per implementing type, and the measured result on ripgrep was a
+/// 12-row page describing 7 implementors, with `StandardSink`, `JSONSink`,
+/// `SummarySink` and `KitchenSink` each appearing twice.
+///
+/// [`OtherEndpoint`](Distinctness::OtherEndpoint) keeps exactly one edge per
+/// other endpoint, chosen in the page's own order (`resolved` first, then
+/// the smallest id) so the keyset cursor stays correct across pages - a
+/// de-duplication done *after* paging would let one endpoint reappear on the
+/// next page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distinctness {
+    /// One row per edge.
+    Edges,
+    /// One row per distinct node at the edge's far end.
+    OtherEndpoint,
+}
+
 /// Paginates the anchor node's incident edges, ordered per the structural
 /// ordering rule: `resolved: true` before `resolved: false`, then locality
 /// (an edge whose other endpoint shares `anchor_file_path` sorts first),
@@ -510,7 +543,9 @@ pub struct ScoredEdge {
 /// scope, search the whole project" for existing callers to see no behavior
 /// change, and an empty slice is the only spelling of "no scope" that doesn't
 /// need a separate sentinel.
-// Eight independently-meaningful parameters, each already documented above;
+/// `distinct` is [`Distinctness`]' own doc: whether a second edge onto an
+/// endpoint already on the page is a second row or the same answer twice.
+// Nine independently-meaningful parameters, each already documented above;
 // grouping them into a struct would only move the same list one level of
 // indirection away from its three call sites without shortening it.
 #[allow(clippy::too_many_arguments)]
@@ -521,6 +556,7 @@ pub fn paginate_edges(
     edge_kinds: &[&str],
     file_paths: &[&str],
     anchor_file_path: &str,
+    distinct: Distinctness,
     page_size: usize,
     cursor: Option<&str>,
 ) -> Result<Page<ScoredEdge>> {
@@ -548,6 +584,23 @@ pub fn paginate_edges(
         let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
         format!("n.filePath IN ({})", placeholders.join(", "))
     };
+    // One row per far endpoint: keep only the edge no sibling edge onto the
+    // same endpoint outranks under this query's own ORDER BY. `d.kind =
+    // e.kind` rather than a repeat of `kind_filter`, so that a caller asking
+    // for several kinds at once (or for all of them, where `kind_filter` is
+    // vacuous) still gets one row per endpoint *per kind* - a `CALLS` edge
+    // and a `REFERENCES` edge between one pair are two different facts.
+    // `scope_filter` is deliberately not repeated: it tests the far
+    // endpoint's file, which every sibling here shares by construction.
+    let distinct_filter = match distinct {
+        Distinctness::Edges => "1 = 1".to_string(),
+        Distinctness::OtherEndpoint => format!(
+            "NOT EXISTS (SELECT 1 FROM edges d \
+               WHERE d.{this_endpoint} = ?2 AND d.{other_endpoint} = e.{other_endpoint} \
+                 AND d.kind = e.kind \
+                 AND (d.resolved > e.resolved OR (d.resolved = e.resolved AND d.id < e.id)))"
+        ),
+    };
     let sql = format!(
         "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.engine AS engine, e.resolved AS resolved, \
          e.toDeclaration AS toDeclaration, \
@@ -556,6 +609,7 @@ pub fn paginate_edges(
          WHERE e.{this_endpoint} = ?2 \
            AND {kind_filter} \
            AND {scope_filter} \
+           AND {distinct_filter} \
            AND ( \
              ?3 = 0 \
              OR e.resolved < ?4 \
@@ -816,7 +870,18 @@ mod tests {
         make_edge(&conn, "e_unresolved", "root", "n1", false);
         make_edge(&conn, "e_resolved", "root", "n2", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         assert_eq!(page.results.len(), 2);
         assert!(page.results[0].edge.resolved, "resolved edge must sort first at equal locality");
         assert!(!page.results[1].edge.resolved);
@@ -832,7 +897,18 @@ mod tests {
         make_edge(&conn, "e_far", "root", "far", true);
         make_edge(&conn, "e_near", "root", "near", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         assert_eq!(page.results[0].edge.id, "e_near", "same-file target must sort before a distant one");
         assert_eq!(page.results[1].edge.id, "e_far");
     }
@@ -846,7 +922,18 @@ mod tests {
         make_edge(&conn, "e1", "caller1", "root", true);
         make_edge(&conn, "e2", "caller2", "root", true);
 
-        let page = paginate_edges(&conn, "root", Direction::Incoming, &[], &[], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(
+            &conn,
+            "root",
+            Direction::Incoming,
+            &[],
+            &[],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         let ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2"], "same-file caller must sort before the distant one");
     }
@@ -864,9 +951,18 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page =
-                paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 2, cursor.as_deref())
-                    .unwrap();
+            let page = paginate_edges(
+                &conn,
+                "root",
+                Direction::Outgoing,
+                &[],
+                &[],
+                "a.rs",
+                Distinctness::Edges,
+                2,
+                cursor.as_deref(),
+            )
+            .unwrap();
             seen.extend(page.results.iter().map(|e| e.edge.id.clone()));
 
             // Simulate a background reindex inserting a new low-priority edge
@@ -904,8 +1000,18 @@ mod tests {
         make_edge(&conn, "e_in", "root", "in_scope", true);
         make_edge(&conn, "e_out", "root", "out_of_scope", true);
 
-        let page =
-            paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs"], "a.rs", 10, None).unwrap();
+        let page = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &["b.rs"],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         let ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -925,9 +1031,18 @@ mod tests {
         make_edge(&conn, "e_two", "root", "in_two", true);
         make_edge(&conn, "e_out", "root", "out", true);
 
-        let page =
-            paginate_edges(&conn, "root", Direction::Outgoing, &[], &["b.rs", "c.rs"], "a.rs", 10, None)
-                .unwrap();
+        let page = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &["b.rs", "c.rs"],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         let mut ids: Vec<&str> = page.results.iter().map(|e| e.edge.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["e_one", "e_two"], "every file in the scope set must contribute its rows");
@@ -942,9 +1057,30 @@ mod tests {
         make_edge(&conn, "e_far", "root", "far", true);
         make_edge(&conn, "e_near", "root", "near", true);
 
-        let scoped = paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
-        let unscoped =
-            paginate_edges(&conn, "root", Direction::Outgoing, &[], &[], "a.rs", 10, None).unwrap();
+        let scoped = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
+        let unscoped = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            "a.rs",
+            Distinctness::Edges,
+            10,
+            None,
+        )
+        .unwrap();
         let scoped_ids: Vec<&str> = scoped.results.iter().map(|e| e.edge.id.as_str()).collect();
         let unscoped_ids: Vec<&str> = unscoped.results.iter().map(|e| e.edge.id.as_str()).collect();
         assert_eq!(
@@ -983,6 +1119,7 @@ mod tests {
                 &[],
                 &["scoped.rs"],
                 "a.rs",
+                Distinctness::Edges,
                 1,
                 cursor.as_deref(),
             )

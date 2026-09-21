@@ -149,6 +149,11 @@ pub enum ContainerInfo {
 pub struct ProjectContext {
     crates: Vec<Crate>,
     files: module_tree::FileContainers,
+    /// Every container key `files` (and each crate root) actually contains -
+    /// the reverse of `files`, kept as its own set rather than recomputed on
+    /// every query. This is what [`ProjectContext::has_container`] answers
+    /// from; see that method's own doc for why the extractor needs it (GM-358).
+    container_keys: BTreeSet<String>,
     /// Everything this load could not honestly resolve - a manifest that
     /// would not parse, a crate-key collision, a `mod` naming nothing on
     /// disk, two `mod` items claiming one file. Never fatal (see `load`'s own
@@ -232,7 +237,9 @@ impl ProjectContext {
             }
         }
 
-        Ok(Self { crates, files, notes })
+        let container_keys = files.values().map(|(key, _)| key.clone()).collect();
+
+        Ok(Self { crates, files, container_keys, notes })
     }
 
     /// Every crate this project model found, in the order their `Cargo.toml`
@@ -250,6 +257,30 @@ impl ProjectContext {
             Some((key, parent)) => ContainerInfo::Member { key: key.clone(), parent: parent.clone() },
             None => ContainerInfo::Orphan { key: orphan_key(path) },
         }
+    }
+
+    /// Whether `key` names a module this project's own module tree actually
+    /// contains - `plugins/python`'s analogous `has_container` (GM-358) is
+    /// the sibling of this method, and the reason both exist is the same
+    /// shape of gap: `use crate::a::b;`'s leaf, `b`, may itself be a
+    /// submodule of `a` rather than a symbol declared inside it, and only a
+    /// whole-crate registry - not the resolving file's own `FileModel`,
+    /// which knows only what *that file* declares - can tell the two apart.
+    /// `resolve_module_path` cannot answer this either: past the first
+    /// segment it appends every further one blindly (its own doc says why),
+    /// so `a::b` being syntactically well-formed says nothing about whether
+    /// `b` is real.
+    ///
+    /// Answered from `files`, the same source [`container_for`](Self::container_for)
+    /// reads - so it inherits that source's one gap: an **inline** `mod b {
+    /// … }` has no file of its own and is not in `files` (see
+    /// `module_tree`'s own doc and its
+    /// `a_file_mod_and_an_inline_mod_both_get_the_right_key` test), so this
+    /// answers `false` for an inline submodule that is genuinely there. That
+    /// is a missing edge, never a wrong one - the same trade-off
+    /// `FileModel::lookup_name` documents for an ambiguous name.
+    pub fn has_container(&self, key: &str) -> bool {
+        self.container_keys.contains(key)
     }
 
     /// Everything this load could not honestly resolve - see this struct's

@@ -10,7 +10,7 @@
 //!
 //! - [`semantic`] - the manifest this plugin ships, read from
 //!   `plugins/rust/plugin.toml` rather than copied, so a run checks the
-//!   configuration a user actually gets. All fifteen expectations run and
+//!   configuration a user actually gets. All seventeen expectations run and
 //!   pass.
 //! - [`structural_3_2_0`] - the manifest as 3.2.0 declared it:
 //!   `semantic_pass = false`, no `[plugin.semantic]` at all. Core never sends
@@ -101,7 +101,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 /// How many entries `conformance/expect.toml` carries, and how many of them
 /// are tagged `tier = "semantic"`. Asserted rather than assumed, so an entry
 /// added without a decision about its tier fails here first.
-const EXPECTATIONS: usize = 15;
+const EXPECTATIONS: usize = 20;
 const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// The `[plugin.semantic]` section of the manifest this plugin ships, as

@@ -35,10 +35,22 @@
 #     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
 #   - implementations (`shapes::Shape`, `impl Trait for T` found by
 #     `find_implementations` - GM-286's own acceptance case);
+#   - implementations, the three shapes whose edge does not start at a type
+#     declaration (`blanket::Sink`, GM-361): two blanket impls, which start
+#     theirs at the `impl` block, and one inside an inline module, whose
+#     module must not be reported as a fifth implementor;
 #   - imports (`nested/mod.rs`, a glob and a container-scoped named re-export
 #     - GM-286's own acceptance case);
-#   - definition, twice (`internals::crate_only` with a redundant-but-armless
-#     `file`, `shapes::Square::perimeter` without one).
+#   - imports, a `use` whose leaf is a submodule rather than a symbol
+#     (`gaps.rs`, GM-358 - the Rust half of the shape that fixture had no
+#     ready-made case for when that task landed);
+#   - importers, the *incoming* direction (`internals.rs`, GM-356 - see that
+#     entry and `expectations.rs`'s decision 7; the whole category is new in
+#     GM-365 and this is Rust's entry in it);
+#   - definition, three times (`internals::crate_only` with a
+#     redundant-but-armless `file`, `shapes::Square::perimeter` without one,
+#     and GM-360's `Ruler`, where `file` is load-bearing);
+#   - references, a qualifiedName two crates carry (GM-360's `shapes::Gauge`).
 #
 # Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
 # matters, and an entry missing from the set is as much of a failure as an
@@ -50,12 +62,14 @@
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all fifteen entries run and
+#   1. with the manifest this plugin ships, where all twenty entries run and
 #      pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other ten - every structural entry here,
-#      unchanged since 3.2.0 - keep passing;
+#      five report `Skip` and the other fifteen - every structural entry
+#      here, ten of them unchanged since 3.2.0, two added by GM-360, one by
+#      GM-361 and two by GM-365 -
+#      keep passing;
 #   3. with 3.2.0's manifest and *without* the skip flag, where those five
 #      must FAIL.
 #
@@ -298,6 +312,49 @@ tier = "semantic"
 # and a guard against a sweep that drops the answers it used to get right.
 expect = ["crates/alpha/src/shapes.rs:shapes::Circle", "crates/beta/src/main.rs:Megaphone"]
 
+# --- implementations: blanket impls, and the module that is not one (GM-361) --
+
+[[implementations]]
+symbol = "blanket::Sink"
+# Structural, deliberately - and it is an assertion about the semantic tier
+# too, the same way `shapes::Shape`'s entry above is. Four implementors, and
+# the set staying exactly four is what three separate failures each break:
+#
+#   - `blanket::<&'a mut S as Sink>` and `blanket::<Box as Sink>` are the two
+#     blanket impls. Neither implements the trait for a declaration of this
+#     project - one self type is not a path at all, the other names `Box` -
+#     so neither has a type node to start its edge at, and both were simply
+#     absent from the measured 12-row page on ripgrep. The `impl` block
+#     itself carries the edge; its name is the prefix its own methods have.
+#   - `blanket::inner::Inner` is declared inside an inline module, whose node
+#     covers the `impl` header. `textDocument/implementation` answers with a
+#     position in that header, and the smallest node containing it is the
+#     module - so `blanket::inner` appearing here as a fifth implementor is
+#     precisely the ripgrep row `sink::sinks @ crates/searcher/src/sink.rs:516`,
+#     a `pub mod`, reported as implementing a trait.
+#   - Every one of these is found by both tiers, which the index holds as two
+#     edges with two `source` values. A page that listed edges rather than
+#     implementors would repeat each of them.
+#
+#     That duplication used to be invisible here - GM-361 checked rather than
+#     assumed, and recorded that with its de-duplication disabled this whole
+#     suite still passed, because the kit compared `BTreeSet`s. GM-365 closed
+#     it (`expectations.rs`, decision 8): for `[[implementations]]`, whose
+#     tool promises one row per implementing type, a repeated row now fails
+#     the entry even when the set matches, naming what repeated and how
+#     often. Measured on this entry: with `Distinctness::Edges` restored in
+#     `find_implementations`, all four rows come back twice and this entry
+#     fails on them while its set is still exactly right. `[[callers]]` and
+#     `[[references]]` are exempt on purpose - they run on
+#     `Distinctness::Edges`, where a repeat is a second usage - so that limit
+#     is now stated rather than merely true.
+expect = [
+    "crates/alpha/src/blanket.rs:blanket::Direct",
+    "crates/alpha/src/blanket.rs:blanket::<&'a mut S as Sink>",
+    "crates/alpha/src/blanket.rs:blanket::<Box as Sink>",
+    "crates/alpha/src/blanket.rs:blanket::inner::Inner",
+]
+
 # --- imports (get_dependencies, one hop, Outgoing): glob and container --------
 # (GM-286's own acceptance case, kept here rather than duplicated)
 
@@ -335,3 +392,128 @@ expect = ["crates/alpha/src/internals.rs:internals::crate_only"]
 symbol = "shapes::Square::perimeter"
 # Unambiguous - no `file` needed to disambiguate.
 expect = ["crates/alpha/src/shapes.rs:shapes::Square::perimeter"]
+
+# --- definition: a bare name whose namesakes are spread across module depths
+#     (GM-360, face A1) -------------------------------------------------------
+
+[[definition]]
+symbol = "Ruler"
+file = "crates/alpha/src/shapes.rs"
+# `Ruler` is declared twice: `alpha::shapes::Ruler`, whose qualifiedName is
+# `shapes::Ruler`, and beta's crate-root `Ruler`, whose qualifiedName is the
+# bare string. Before GM-360 the exact-qualifiedName rung matched beta's and
+# only beta's, so this entry resolved - unflagged, `resolvedBy:
+# qualifiedName` - to `crates/beta/src/main.rs:Ruler`, and `file` was never
+# consulted because nothing looked ambiguous. That is ripgrep's
+# `RegexMatcher` in two files: the declaration that wins is the one that
+# happens to sit at a crate root, which is a fact about module depth and not
+# about which type was meant.
+#
+# Now the bare name is an ambiguity over both, `file` picks this one, and the
+# re-call by its `qualifiedName` (`shapes::Ruler`, which nothing else
+# carries) takes the fast rung - so the entry fails against the pre-GM-360
+# resolver on the wrong file and passes against this one.
+expect = ["crates/alpha/src/shapes.rs:shapes::Ruler"]
+
+# --- references: a *qualified* spelling two crates carry (GM-360, face A5) ---
+
+[[references]]
+symbol = "shapes::Gauge"
+file = "crates/alpha/src/shapes.rs"
+# A Rust qualifiedName is a module path within its crate, so `alpha::shapes`
+# and `beta_crate::shapes` both spell their members `shapes::<name>` and
+# `shapes::Gauge` names two declarations - ripgrep's `matcher::RegexMatcher`,
+# which `crates/regex` and `crates/pcre2` both declare, in one workspace.
+#
+# Before GM-360 "the exact rung matched two rows" was treated as no match at
+# all: resolution fell through to a bare-name lookup, which no qualified
+# spelling can ever match, then to file names, then to semantic neighbours -
+# so this entry failed with `no symbol named 'shapes::Gauge' found` rather
+# than with a wrong set. It is `[[references]]` rather than `[[definition]]`
+# deliberately: the disambiguated re-call for the four edge-walking tools is
+# by the candidate's `id`, while `find_definition` has only `qualifiedName`
+# to re-call with (expectations.rs, decision 3) - which for *this* face is the
+# very string that is ambiguous, so the kit could not express it that way.
+#
+# The set is exact, and both crates' `Gauge` have a reference of their own, so
+# a resolution landing on `crates/beta/src/shapes.rs:shapes::Gauge` fails
+# twice over: one missing entry and one extra.
+expect = ["crates/alpha/src/shapes.rs:shapes::calibrate"]
+
+# --- imports: a `use` whose LEAF is a submodule, not a symbol (GM-358) -------
+
+[[imports]]
+file = "crates/alpha/src/gaps.rs"
+# `gaps.rs` holds one `use`: `use crate::nested;`. Two rows come out of it,
+# and the second is the one GM-358 added.
+#
+#   - `container:alpha` is the *prefix*, `crate`, which is this crate's root
+#     container. It was there before the fix and is here in both arms - the
+#     control half of this entry, since it is what makes the failure below a
+#     missing member rather than an empty answer.
+#   - `container:alpha::nested` is the leaf. `nested` is a submodule of the
+#     crate root, not a symbol declared in it, and until 3.8.0 a leaf was
+#     only ever addressed as a *name* inside the prefix's container (the
+#     `REFERENCES` placeholder, which always worked) - no `IMPORTS` edge was
+#     built for it, so `get_dependencies` on this file answered
+#     `container:alpha` and nothing else, indistinguishable from a file that
+#     really does read only the crate root. `ProjectContext::has_container`
+#     is what tells the two apart, and disabling that guard is what this
+#     entry fails against: measured, `container:alpha::nested` disappears and
+#     `container:alpha` stays, exactly as the two bullets above claim.
+#
+# The `use` is deliberately never used in that file - see its own comment:
+# every way of using `nested` from there goes through `nested::deep::work`,
+# whose caller set is pinned by `[[callers]]` above to exactly `lib.rs:run`,
+# so a call here would break that entry to prove this one.
+#
+# Anchored here rather than on `crates/beta/src/main.rs`, whose `use` items
+# are more varied, for the same reason the `nested/mod.rs` entry above gives:
+# the kit's session empties and restores `crates/alpha/src/shapes.rs`, and a
+# container whose last member went with it is GC'd, taking every `IMPORTS`
+# edge pointing at it along. Neither `alpha` nor `alpha::nested` has a member
+# in that file.
+expect = ["container:alpha", "container:alpha::nested"]
+
+# --- importers: the incoming direction (GM-356, expectations.rs decision 7) --
+
+[[importers]]
+file = "crates/alpha/src/internals.rs"
+via_module = "alpha::internals"
+# The direction no entry in any of this kit's four fixtures could assert
+# before GM-365, and the one three of the 3.8.0 batch's six wrong answers
+# were in.
+#
+# `via_module` is half the assertion. In Rust an `IMPORTS` edge arrives at a
+# *container* - `use crate::internals::…` names `alpha::internals`, never
+# `crates/alpha/src/internals.rs` - so a walk literally anchored on the file
+# finds no incoming edge and returns `results: []`, `truncated: false`: a
+# well-formed zero that says "nothing imports this" about a file five other
+# files read. GM-356 substitutes the module the file defines and reports it
+# as `resolvedFrom.qualifiedName`; this entry requires that key exactly, so
+# against the pre-fix binary it fails twice over - no substitution, and an
+# empty set where five files are expected.
+#
+# The five, each read out of the source rather than off the tool's own
+# answer: `shapes.rs` and `nested/deep.rs` (`use crate::internals::crate_only`),
+# `nested/mod.rs` (`use crate::internals::*`, a glob - still an import),
+# `prelude.rs` (`pub use crate::internals::published as exported_helper`, a
+# re-export - also still an import, which is the row a hand-derivation misses
+# first) and `crates/beta/src/main.rs` (`use alpha::internals::crate_only`,
+# from the other crate). beta's is the interesting one: the *symbol*
+# placeholder that `use` also emits is the one core's visibility check
+# refuses (`[[callers]] internals::crate_only` above asserts its absence),
+# and the file-level `IMPORTS` edge is unaffected by that refusal - the file
+# does read the module, whatever it is then allowed to name inside it.
+#
+# `internals.rs` is not the file the session edits (`shapes.rs` is), which is
+# what keeps this entry answerable at all: emptying a file GCs the containers
+# whose only members were in it, and an importer's placeholder onto a GC'd
+# container does not come back within one session.
+expect = [
+  "crates/alpha/src/shapes.rs",
+  "crates/alpha/src/nested/mod.rs",
+  "crates/alpha/src/nested/deep.rs",
+  "crates/alpha/src/prelude.rs",
+  "crates/beta/src/main.rs",
+]
