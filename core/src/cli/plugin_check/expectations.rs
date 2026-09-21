@@ -76,8 +76,15 @@
 //!   `split_once(':')` without a case for whether a qualifiedName is
 //!   present.
 //! - **`[[definition]]`**: the single resolved node, the same
-//!   `"{filePath}:{qualifiedName}"` rule, as a one-element (or zero-element,
-//!   on a refusal) set.
+//!   `"{filePath}:{qualifiedName}"` rule, as a one-element set. A *refusal*
+//!   is not a zero-element set here, and this said for a while that it was
+//!   (GM-371): a tool declining to answer is a different fact from a tool
+//!   answering nothing, and conflating them is the mistake the whole 3.8.0
+//!   batch was about. `[[refusal]]` is where a refusal is asserted -
+//!   decision 9, which also has why `expect = []` was not made to mean it.
+//! - **`[[refusal]]`**: no set at all. The entry names a tool and a symbol
+//!   that tool must *decline* to resolve, plus the phrases its refusal has
+//!   to carry - decision 9.
 //! - **`[[imports]]`**: `get_dependencies`'s rows. A row with a `filePath`
 //!   (an indexed file) renders as the bare file path, no prefix - the
 //!   answer already *is* a file. A row with no `filePath` (a `Module`-kind
@@ -286,6 +293,87 @@
 //! an id, not dropping this check. No bundled fixture has one (all four
 //! suites pass), and a failure names the row, so the day one appears it is
 //! visible rather than silent.
+//!
+//! # Decision 9: asserting that a tool refuses (GM-371)
+//!
+//! Every category above asserts what a name *is*. None could assert what it
+//! is *not*, and GM-367 is precisely a change whose whole effect on four of
+//! the five tools this kit drives is "a name that used to resolve now
+//! refuses" - nothing in any fixture could have pinned it. `[[refusal]]` is
+//! that assertion: a `tool`, a `symbol` that tool must decline to resolve,
+//! and the phrases the refusal has to carry.
+//!
+//! ```toml
+//! [[refusal]]
+//! tool = "definition"
+//! symbol = "strings"
+//! contains = ["is declared in this project", "get_dependencies"]
+//! ```
+//!
+//! **Why not `expect = []`**, which is what decision 2 promised until this
+//! task and what the natural reading of "this name is not a definition here"
+//! would be. Three reasons, in the order they decided it:
+//!
+//! - **An empty answer and a refused one are different facts, and this kit
+//!   exists to keep them apart.** GM-356 was a walk that returned a
+//!   *well-formed zero* where the truth was "you anchored on the wrong
+//!   node", and decision 7 added `[[importers]]` so that an empty answer and
+//!   an absent one stop reading alike. Spelling a refusal `[]` puts that
+//!   same conflation back, in the one category that did not have it.
+//! - **`[]` is unambiguous for `[[definition]]` only by accident of arity.**
+//!   `find_definition` returns at most one node, so `[]` has no second
+//!   reading there *today*. Everywhere else `expect = []` already means
+//!   "resolved, and the answer is empty" - a shape bundled fixtures use
+//!   (`plugins/python`'s `[[importers]]`, the `tier` parse tests). So the
+//!   `[]`-means-refusal rule could never extend to `[[callers]]` /
+//!   `[[references]]` / `[[implementations]]` without *weakening* the
+//!   entries already written: one of those that began refusing would start
+//!   to pass. A shape that can only ever cover one of the four tools
+//!   GM-367 changed is the wrong shape for the defect that motivated it.
+//! - **`[]` has nowhere to put the refusal's text**, and the text is the
+//!   only thing that separates "refused because this is not a declaration"
+//!   from "the call broke". An expectation that passes on a dead daemon is
+//!   worse than no expectation.
+//!
+//! **What a `[[refusal]]` must not accept**, which is the whole of its
+//! value. It passes on exactly one shape - a *tool-level* refusal
+//! (`CallToolResult` with `is_error: true`) whose text carries every phrase
+//! in `contains` - and fails on all four of the others:
+//!
+//! - **A protocol-level failure** - `ErrorData`, i.e. the outer `Err` that
+//!   `mcp::anchor`'s own doc reserves for "genuine protocol-level failures":
+//!   a poisoned mutex, a SQLite error, an index that is not there. Never a
+//!   refusal, whatever it says, and the finding says which kind it was.
+//!   [`tool_json`] used to flatten this distinction into one `Err(String)`,
+//!   which is why the branch decision 2 described could not be reached;
+//!   [`ToolOutcome`] is that distinction restored.
+//! - **An answer.** The tool resolved the name, which is the opposite of
+//!   what the entry claims; the resolved row is printed.
+//! - **A candidate page.** Ambiguity is not refusal - the tool had answers
+//!   and asked which one - so this fails with the candidates listed,
+//!   consistent with decision 3's "never a silent pick".
+//! - **A refusal missing a phrase.** Named individually, with the refusal
+//!   quoted, so the fixture can be fixed against what was actually said.
+//!
+//! `contains` is required and must be non-empty, for the third reason
+//! above: without it the entry would accept *any* refusal, including the
+//! parameter-validation ones (`find_definition`'s "give either `symbol_name`,
+//! or both `file_path` and `position`"). Those are unreachable from here -
+//! this module builds every parameter struct itself and always sends
+//! `symbol_name` alone - but "unreachable by construction" is a property of
+//! today's call sites, not something a fixture should have to rely on.
+//!
+//! **No `file` key**, unlike the four `symbol`-anchored categories. `file`
+//! exists to pick one of several candidates (decision 3); an entry claiming
+//! the name resolves to nothing has nothing to disambiguate, and a candidate
+//! page is a failure here rather than something to narrow.
+//!
+//! **Four tools, not five.** `[[imports]]`/`[[importers]]` anchor on a file
+//! path rather than a name, so the only refusal they can produce is about
+//! the fixture naming a path that is not in the project - a broken fixture,
+//! not a claim about the language. The four that resolve a `symbol_name`
+//! through `find_definition::resolve_symbol_name` are the ones where
+//! refusing is an answer about the code.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -324,6 +412,8 @@ pub(crate) struct ExpectFile {
     importers: Vec<ImportersExpectation>,
     #[serde(default)]
     definition: Vec<SymbolExpectation>,
+    #[serde(default)]
+    refusal: Vec<RefusalExpectation>,
 }
 
 /// Which of a plugin's tiers an expectation needs answered before it can
@@ -397,6 +487,39 @@ struct ImportersExpectation {
     tier: Tier,
 }
 
+/// One `[[refusal]]` entry - decision 9. Its own struct rather than a key on
+/// [`SymbolExpectation`], for the reason decision 7 gave `[[importers]]` one:
+/// `deny_unknown_fields` then keeps `contains` off a `[[callers]]` entry,
+/// where it would mean nothing, by construction rather than by review.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusalExpectation {
+    /// Which of the four `symbol_name`-resolving tools must refuse.
+    tool: RefusedTool,
+    /// The name it must decline to resolve. No `file` companion: decision 9
+    /// has why there is nothing here to disambiguate.
+    symbol: String,
+    /// Every phrase the refusal's own text has to carry. Required and
+    /// checked non-empty (decision 9): an entry that asserted only "it
+    /// refused" would be satisfied by a refusal about something else.
+    contains: Vec<String>,
+    /// Decision 6. Absent means `Structural`.
+    #[serde(default)]
+    tier: Tier,
+}
+
+/// Decision 9's `tool` key: which handler a `[[refusal]]` entry drives.
+/// Deliberately the four that resolve a `symbol_name` - see decision 9 on why
+/// `imports`/`importers` are not among them.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum RefusedTool {
+    Definition,
+    Callers,
+    References,
+    Implementations,
+}
+
 /// Reads and parses `path`. The one hard-error path in this module - see
 /// decision 5: a missing file, invalid TOML, or an unknown key is not a
 /// check finding, it is why no check ran at all.
@@ -460,6 +583,13 @@ pub(crate) fn evaluate(ctx: &EvalContext, expect: &ExpectFile, skip_semantic: bo
             eval_definition_expectation(ctx, index, item)
         }));
     }
+    // Decision 9, last so that adding the category left every already-written
+    // fixture's `expectations.{kind}[{index}]` ids exactly where they were.
+    for (index, item) in expect.refusal.iter().enumerate() {
+        results.push(skip_or_eval(skip_semantic, "refusal", index, item.tier, || {
+            eval_refusal_expectation(ctx, index, item)
+        }));
+    }
     results
 }
 
@@ -513,7 +643,7 @@ impl SymbolTool {
     /// `transitive: Some(false)`, which that function's own doc comment
     /// says defers *entirely* to the unmodified single-hop `handle`, so this
     /// is not a second, weaker path into that module.
-    fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<Value, String> {
+    fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
             SymbolTool::Callers => find_callers_callees::handle_callers(ctx.conn, ctx.embedding, params),
             SymbolTool::References => find_references::handle(ctx.conn, ctx.embedding, params),
@@ -535,8 +665,22 @@ impl SymbolTool {
                 )
             }
         };
-        tool_json(result)
+        tool_outcome(result)
     }
+}
+
+/// `find_definition`'s own one-line call, shared by [`resolve_definition`]
+/// and decision 9's [`eval_refusal_expectation`] so both reach the handler
+/// through the same parameters.
+fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
+    let params = FindDefinitionParams {
+        symbol_name: Some(symbol_name),
+        file_path: None,
+        position: None,
+        cursor: None,
+        include_source: Some(false),
+    };
+    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, params))
 }
 
 fn eval_symbol_expectation(
@@ -589,7 +733,7 @@ fn resolve_and_call(
         limit,
         file_paths: None,
     };
-    let value = tool.call(ctx, first).map_err(|e| vec![e])?;
+    let value = tool_json(tool.call(ctx, first)).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
         return Ok(value);
     }
@@ -606,7 +750,7 @@ fn resolve_and_call(
         limit,
         file_paths: None,
     };
-    let retried = tool.call(ctx, retry).map_err(|e| vec![e])?;
+    let retried = tool_json(tool.call(ctx, retry)).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
         return Err(vec![
             "re-querying by the disambiguated candidate's own id still returned a candidate page - this \
@@ -673,7 +817,7 @@ fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Resul
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    tool_json(get_dependencies::handle(ctx.conn, ctx.entry_points, params))
+    tool_json(tool_outcome(get_dependencies::handle(ctx.conn, ctx.entry_points, params)))
 }
 
 /// The set comparison both walk categories share, with decision 8's
@@ -759,16 +903,7 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
 /// by `symbol_id`: `find_definition` has no such parameter, unlike the other
 /// four tools.
 fn resolve_definition(ctx: &EvalContext, symbol: &str, file: Option<&str>) -> Result<Value, Vec<String>> {
-    let call = |symbol_name: String| {
-        let params = FindDefinitionParams {
-            symbol_name: Some(symbol_name),
-            file_path: None,
-            position: None,
-            cursor: None,
-            include_source: Some(false),
-        };
-        tool_json(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, params))
-    };
+    let call = |symbol_name: String| tool_json(call_definition(ctx, symbol_name));
 
     let value = call(symbol.to_string()).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
@@ -789,6 +924,139 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, file: Option<&str>) -> Re
         )]);
     }
     Ok(retried)
+}
+
+// --- [[refusal]] (decision 9) ---------------------------------------------------
+
+impl RefusedTool {
+    /// The real tool's own name, so a finding reads as something a reader can
+    /// go and call rather than as this file's category label.
+    fn label(self) -> &'static str {
+        match self {
+            RefusedTool::Definition => "find_definition",
+            RefusedTool::Callers => "find_callers",
+            RefusedTool::References => "find_references",
+            RefusedTool::Implementations => "find_implementations",
+        }
+    }
+
+    /// Calls the real handler with `symbol_name` alone - decision 3's first
+    /// rung, and the only one that can refuse. There is deliberately no
+    /// candidate-narrowing re-call here (decision 9: nothing to disambiguate).
+    fn call(self, ctx: &EvalContext, symbol: &str) -> Result<ToolOutcome, String> {
+        let tool = match self {
+            RefusedTool::Definition => return call_definition(ctx, symbol.to_string()),
+            RefusedTool::Callers => SymbolTool::Callers,
+            RefusedTool::References => SymbolTool::References,
+            RefusedTool::Implementations => SymbolTool::Implementations,
+        };
+        tool.call(
+            ctx,
+            SymbolQueryParams {
+                symbol_id: None,
+                symbol_name: Some(symbol.to_string()),
+                cursor: None,
+                limit: Some(pagination::MAX_PAGE_SIZE as u32),
+                file_paths: None,
+            },
+        )
+    }
+}
+
+/// Decision 9. Passes on exactly one shape - a tool-level refusal carrying
+/// every phrase the entry named - and says which of the other four it got
+/// instead.
+fn eval_refusal_expectation(ctx: &EvalContext, index: usize, item: &RefusalExpectation) -> CheckResult {
+    let id = format!("expectations.refusal[{index}]");
+    let label = item.tool.label();
+    let findings = match item.tool.call(ctx, &item.symbol) {
+        // Never a refusal, whatever it says: this is the arm a dead daemon or
+        // an unreadable index lands in, and an entry that accepted it would
+        // pass for reasons that have nothing to do with the code under test.
+        Err(err) => Some(vec![format!(
+            "{label} failed at the protocol level rather than refusing, which decision 9 never \
+             accepts as a refusal: {err}"
+        )]),
+        Ok(ToolOutcome::Answer(value)) if is_candidate_page(&value) => {
+            let mut findings = vec![format!(
+                "{label} returned a candidate page rather than refusing - the name resolves to \
+                 several declarations, which is ambiguity, not absence (decision 9)"
+            )];
+            findings.extend(candidate_lines(&value));
+            Some(findings)
+        }
+        Ok(ToolOutcome::Answer(value)) => Some(vec![
+            format!("{label} resolved the symbol and answered rather than refusing (decision 9)"),
+            format!("it resolved to: {}", resolved_anchor_line(&value)),
+        ]),
+        Ok(ToolOutcome::Refusal(text)) => refusal_text_findings(&text, &item.contains),
+    };
+    match findings {
+        None => CheckResult { id: id.into(), outcome: Outcome::Pass, warnings: Vec::new() },
+        Some(findings) => {
+            let mut lines = vec![format!("tool = \"{}\", symbol = \"{}\"", tool_key(item.tool), item.symbol)];
+            lines.extend(findings);
+            fail(id, lines)
+        }
+    }
+}
+
+/// The `tool` key as the fixture spells it - `label` names the handler, this
+/// names the TOML value, and a failure wants both so the line can be found in
+/// the file it came from.
+fn tool_key(tool: RefusedTool) -> &'static str {
+    match tool {
+        RefusedTool::Definition => "definition",
+        RefusedTool::Callers => "callers",
+        RefusedTool::References => "references",
+        RefusedTool::Implementations => "implementations",
+    }
+}
+
+/// Decision 9's text assertion, as its own function so what it will and will
+/// not accept is testable without a live index: `None` when `text` carries
+/// every required phrase, `Some(findings)` naming each one it does not - and
+/// quoting the refusal, since a fixture can only be fixed against what was
+/// actually said.
+///
+/// An empty `contains` fails rather than passing vacuously. It is the one
+/// degenerate shape `deny_unknown_fields` cannot catch (the key is present
+/// and well-typed), and accepting it would turn the entry into "any refusal
+/// will do" - which decision 9 exists to rule out.
+fn refusal_text_findings(text: &str, contains: &[String]) -> Option<Vec<String>> {
+    if contains.is_empty() {
+        return Some(vec![
+            "`contains` is empty, so this entry would accept any refusal at all - decision 9 \
+             requires at least one phrase the refusal has to carry"
+                .to_string(),
+            format!("the tool refused with: {text}"),
+        ]);
+    }
+    let missing: Vec<&str> = contains.iter().map(String::as_str).filter(|p| !text.contains(p)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(vec![
+        format!(
+            "the tool refused, but its refusal is missing {} required phrase(s): {}",
+            missing.len(),
+            missing.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", ")
+        ),
+        format!("the tool refused with: {text}"),
+    ])
+}
+
+/// What an answer says it anchored on, for a `[[refusal]]` entry that got one:
+/// the `anchor` wrapper the four edge-walking tools carry, or
+/// `find_definition`'s own top-level node, which has no wrapper at all
+/// (decision 3 case 1).
+fn resolved_anchor_line(value: &Value) -> String {
+    let node = value.get("anchor").unwrap_or(value);
+    format!(
+        "{}:{}",
+        node.get("filePath").and_then(Value::as_str).unwrap_or("?"),
+        node.get("qualifiedName").and_then(Value::as_str).unwrap_or("?")
+    )
 }
 
 // --- shared: candidate pages, JSON extraction, set diffs ----------------------
@@ -866,33 +1134,75 @@ fn candidate_failure(symbol: &str, value: &Value, reason: &str) -> Vec<String> {
     let resolved_by = value.get("resolvedBy").and_then(Value::as_str).unwrap_or("unknown");
     let mut findings =
         vec![format!("'{symbol}' did not resolve to one symbol (resolvedBy = {resolved_by}): {reason}")];
-    for candidate in value.get("results").and_then(Value::as_array).into_iter().flatten() {
-        findings.push(format!(
-            "candidate: id={} qualifiedName={} filePath={} kind={}",
-            candidate.get("id").and_then(Value::as_str).unwrap_or("?"),
-            candidate.get("qualifiedName").and_then(Value::as_str).unwrap_or("?"),
-            candidate.get("filePath").and_then(Value::as_str).unwrap_or("?"),
-            candidate.get("kind").and_then(Value::as_str).unwrap_or("?"),
-        ));
-    }
+    findings.extend(candidate_lines(value));
     findings
 }
 
-/// Extracts an MCP tool's answer as parsed JSON, or the message to report
-/// instead: `ErrorData` (a protocol-level failure), or `is_error: true` (a
-/// tool-level refusal - "no symbol named X found", a bad parameter
-/// combination) both become a plain string, since neither carries JSON on
-/// the wire for this module to parse.
-fn tool_json(result: Result<CallToolResult, ErrorData>) -> Result<Value, String> {
+/// Every candidate a page offered, one identifying line each - shared by
+/// [`candidate_failure`] and decision 9's own candidate-page arm, which
+/// report the same list under different headlines.
+fn candidate_lines(value: &Value) -> Vec<String> {
+    value
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            format!(
+                "candidate: id={} qualifiedName={} filePath={} kind={}",
+                candidate.get("id").and_then(Value::as_str).unwrap_or("?"),
+                candidate.get("qualifiedName").and_then(Value::as_str).unwrap_or("?"),
+                candidate.get("filePath").and_then(Value::as_str).unwrap_or("?"),
+                candidate.get("kind").and_then(Value::as_str).unwrap_or("?"),
+            )
+        })
+        .collect()
+}
+
+/// What a handler said, with the one distinction the categories that compare
+/// sets do not need and decision 9 lives on: a tool that *declined* to answer
+/// is not the same event as a tool that could not be reached.
+///
+/// The outer `Err` of the `Result` this is carried in keeps its old meaning
+/// and `mcp::anchor`'s - "genuine protocol-level failures", plus this
+/// module's own two ways of getting an unusable body (no text content, text
+/// that is not JSON). Those are never a refusal, whatever they say.
+#[derive(Debug)]
+enum ToolOutcome {
+    /// `is_error` unset or false: the parsed wire JSON. May still be a
+    /// candidate page - [`is_candidate_page`] is a separate question.
+    Answer(Value),
+    /// `is_error: true`: a tool-level refusal, carrying prose rather than
+    /// JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
+    /// message, a bad parameter combination).
+    Refusal(String),
+}
+
+/// Extracts an MCP tool's answer, keeping [`ToolOutcome`]'s distinction:
+/// `ErrorData` and an unusable body stay `Err`, `is_error: true` becomes
+/// `Refusal` with the prose it carried, and anything else is parsed as JSON.
+fn tool_outcome(result: Result<CallToolResult, ErrorData>) -> Result<ToolOutcome, String> {
     let result = result.map_err(|e| e.to_string())?;
     let text = match result.content.first() {
         Some(ContentBlock::Text(text)) => text.text.clone(),
         other => return Err(format!("tool returned no text content: {other:?}")),
     };
     if result.is_error == Some(true) {
-        return Err(text);
+        return Ok(ToolOutcome::Refusal(text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("tool returned content that is not JSON: {e}"))
+    serde_json::from_str(&text)
+        .map(ToolOutcome::Answer)
+        .map_err(|e| format!("tool returned content that is not JSON: {e}"))
+}
+
+/// The view every category except `[[refusal]]` wants: a refusal is simply a
+/// failure with the tool's own words in it, exactly as it was before
+/// [`ToolOutcome`] existed. Only decision 9 needs the two apart.
+fn tool_json(outcome: Result<ToolOutcome, String>) -> Result<Value, String> {
+    match outcome? {
+        ToolOutcome::Answer(value) => Ok(value),
+        ToolOutcome::Refusal(text) => Err(text),
+    }
 }
 
 /// Decision 2's `[[callers]]`/`[[references]]`/`[[implementations]]` row
@@ -1283,6 +1593,122 @@ mod tests {
             warnings: Vec::new(),
         });
         assert_eq!(ran_without_the_flag.outcome, Outcome::Pass);
+    }
+
+    /// Decision 9's root cause, pinned at the exact place it was lost:
+    /// `tool_json` collapsed a tool-level refusal and a protocol-level failure
+    /// into one `Err(String)`, so nothing downstream could tell "this name is
+    /// not a declaration" from "the call broke" - which is why decision 2's
+    /// zero-element branch was unreachable. [`tool_outcome`] keeps them apart.
+    #[test]
+    fn a_tool_level_refusal_is_a_refusal_and_a_protocol_error_is_not() {
+        let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: no symbol named 'x' found")]);
+        let Ok(ToolOutcome::Refusal(text)) = tool_outcome(Ok(refusal)) else {
+            panic!("is_error: true must be a Refusal, not an Err");
+        };
+        assert_eq!(text, "g-mesh: no symbol named 'x' found");
+
+        let answer = CallToolResult::success(vec![ContentBlock::text("{\"results\":[]}")]);
+        let Ok(ToolOutcome::Answer(value)) = tool_outcome(Ok(answer)) else {
+            panic!("a successful result must parse as an Answer");
+        };
+        assert!(value.get("results").is_some(), "{value}");
+
+        // The arm an entry must never accept: the handler never produced a
+        // result at all.
+        let protocol: Result<CallToolResult, ErrorData> =
+            Err(ErrorData::internal_error("g-mesh: the index is gone".to_string(), None));
+        assert!(tool_outcome(protocol).is_err(), "a protocol-level failure must stay an Err");
+    }
+
+    /// The four categories that compare sets must be unaffected by the split:
+    /// a refusal is still exactly the `Err(text)` they have always reported.
+    #[test]
+    fn tool_json_still_reports_a_refusal_as_a_plain_error_string() {
+        let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: nope")]);
+        assert_eq!(tool_json(tool_outcome(Ok(refusal))), Err("g-mesh: nope".to_string()));
+    }
+
+    /// Decision 9's text assertion: every phrase must be present, each missing
+    /// one is named, and the refusal itself is quoted so a fixture can be
+    /// fixed against what was said rather than against a guess.
+    #[test]
+    fn a_refusal_must_carry_every_phrase_the_entry_named() {
+        let text = "g-mesh: nothing named 'strings' is declared in this project. It names something \
+                    this project imports: 'strings' (1) - 1 import record(s), which have no definition \
+                    site here. For what a file imports, or what imports it, use get_dependencies.";
+        let phrases = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert!(refusal_text_findings(text, &phrases(&["is declared in this project", "get_dependencies"]))
+            .is_none());
+
+        let findings = refusal_text_findings(text, &phrases(&["is declared in this project", "ghost"]))
+            .expect("a missing phrase must fail the entry");
+        let joined = findings.join("\n");
+        assert!(joined.contains("missing 1 required phrase(s): \"ghost\""), "{joined}");
+        assert!(joined.contains("use get_dependencies"), "the refusal itself must be quoted: {joined}");
+    }
+
+    /// The degenerate shape `deny_unknown_fields` cannot catch: `contains` is
+    /// present and well-typed but empty, which would make the entry accept any
+    /// refusal at all - including one about a parameter mistake. Decision 9
+    /// fails it instead.
+    #[test]
+    fn an_empty_contains_never_passes_vacuously() {
+        let findings = refusal_text_findings("g-mesh: anything at all", &[])
+            .expect("an empty `contains` must fail rather than accept everything");
+        assert!(findings.join("\n").contains("`contains` is empty"), "{findings:?}");
+    }
+
+    /// Decision 9's `[[refusal]]` parses with its three required keys, rejects
+    /// a `file` companion (there is nothing to disambiguate), and its
+    /// `contains` cannot appear on a `[[callers]]` entry - the property that
+    /// made a separate struct worth having, exactly as decision 7 argued for
+    /// `via_module`.
+    #[test]
+    fn refusal_entries_parse_and_their_keys_stay_out_of_the_other_categories() {
+        let file: ExpectFile = toml::from_str(
+            "[[refusal]]\ntool = \"definition\"\nsymbol = \"strings\"\ncontains = [\"imports\"]\n\n\
+             [[refusal]]\ntool = \"references\"\nsymbol = \"ghost\"\ncontains = [\"no symbol named\"]\n\
+             tier = \"semantic\"\n",
+        )
+        .unwrap();
+        assert_eq!(file.refusal.len(), 2);
+        assert_eq!(file.refusal[0].tool, RefusedTool::Definition);
+        assert_eq!(file.refusal[0].tier, Tier::Structural);
+        assert_eq!(file.refusal[1].tool, RefusedTool::References);
+        assert_eq!(file.refusal[1].tier, Tier::Semantic);
+
+        for (source, needle) in [
+            ("[[refusal]]\ntool = \"definition\"\nsymbol = \"x\"\ncontains = []\nfile = \"a.rs\"\n", "file"),
+            ("[[callers]]\nsymbol = \"x\"\nexpect = []\ncontains = [\"y\"]\n", "contains"),
+            ("[[refusal]]\ntool = \"imports\"\nsymbol = \"x\"\ncontains = [\"y\"]\n", "imports"),
+        ] {
+            let err = toml::from_str::<ExpectFile>(source).unwrap_err().to_string();
+            assert!(err.contains(needle), "expected {needle:?} to be rejected, got: {err}");
+        }
+
+        // `contains` is required, not defaulted - an entry that forgot it is a
+        // parse error rather than an entry that accepts any refusal.
+        let err = toml::from_str::<ExpectFile>("[[refusal]]\ntool = \"callers\"\nsymbol = \"x\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contains"), "{err}");
+    }
+
+    /// The line a `[[refusal]]` prints when it was answered instead, on both
+    /// shapes of answer decision 3 case 1 describes: the four edge-walking
+    /// tools wrap the node in `anchor`, `find_definition` returns it bare.
+    #[test]
+    fn an_answered_refusal_names_what_it_resolved_to_on_either_shape() {
+        let walk = serde_json::json!({
+            "anchor": {"id": "n1", "qualifiedName": "helper", "filePath": "a.fk", "kind": "Function"},
+            "results": [],
+        });
+        assert_eq!(resolved_anchor_line(&walk), "a.fk:helper");
+
+        let definition = serde_json::json!({"qualifiedName": "helper", "filePath": "a.fk"});
+        assert_eq!(resolved_anchor_line(&definition), "a.fk:helper");
     }
 
     #[test]
