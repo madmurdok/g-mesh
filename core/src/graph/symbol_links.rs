@@ -225,8 +225,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
-use crate::graph::containers::{self, CONTAINER_NATIVE_KIND};
-use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
+use crate::graph::containers;
+use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a pending cross-file symbol with. Mirrors
@@ -288,25 +288,75 @@ fn required_target_kind(edge_kind: &str) -> Option<Option<&'static str>> {
 /// Whether a node of this `nativeKind` declares something, i.e. may be a
 /// candidate at all (contract step 1). Placeholders are addresses, and a
 /// container node is core's bookkeeping with no source of its own.
+///
+/// The list is `graph::queries`' [`NON_DECLARATION_NATIVE_KINDS`] and not one
+/// of this module's own - see that module's header for what each of the five
+/// kinds is. Its SQL twin here is [`declaration_only`], the same builder the
+/// name lookups use.
+///
+/// ## `external_module` joined the list (GM-372)
+///
+/// It was the one kind this filter admitted while the lookups refused it.
+/// GM-367 excluded it from the *read* path - a `find_definition("context")`
+/// on gin was answering with `context_test.go`'s import line - and left this
+/// side alone on purpose, because excluding a kind here repoints edges while
+/// the index is being written, which is evidence of a different kind to
+/// collect. GM-372 collected it and excluded the kind:
+///
+///  - **A link is a claim, and this one would be false.** A pending symbol
+///    says "the declaration of `name` in scope `S`". An `external_module`
+///    row in `S` is `S`'s own record that it imported `name` from somewhere
+///    outside this project - the same node the lookups refuse - so repointing
+///    onto it answers a different question and marks the edge `resolved = 1`
+///    while doing so. There is no reading under which an import record is the
+///    declaration a usage meant, which is why "link it and mark it" was never
+///    an option here the way it was weighed and rejected for the read path.
+///  - **Nothing wanted the edge.** A `CALLS` or `SUPERTYPE_OF` edge cannot
+///    land on one anyway (contract step 3: kind `Module` is neither a
+///    `Function` nor a `Type`), so the only edge at stake is `REFERENCES`,
+///    and a `REFERENCES` edge onto one import record of one file is precisely
+///    the per-file fragmentation GM-367 measured as useless (63 rows for
+///    `net/http` on gin). What a caller genuinely wants said about an
+///    external specifier is said by the `IMPORTS` edge `graph::imports`
+///    deliberately leaves on the node, and by
+///    `mcp::find_definition::import_only_refusal`.
+///  - **The one list is the point.** Two lists answering "is this a
+///    declaration" is what GM-367 removed from three lookups; leaving a
+///    fourth copy here with one kind's worth of difference would keep the
+///    drift alive in the one place it writes to the graph rather than reads
+///    from it.
+///
+/// **What it changed on real corpora: nothing.** Re-indexing go-gin,
+/// rs-ripgrep and py-requests from scratch with and without this exclusion
+/// produced identical edge sets - 14,205, 18,343 and 4,760 edges, zero
+/// differing rows on each - and no edge on any of the three had landed on an
+/// `external_module` node before it either, nor on one in any of the 366
+/// indexes on the machine this was measured on, which hold 68,079 import
+/// records between them and carry only the `IMPORTS` edges that belong on
+/// them.
+///
+/// The gap was latent, then, and what kept it latent is *not* this filter:
+/// every shipped plugin emits its import records `file`-visible and with no
+/// container, and a `file`-visible node is never a candidate in a file scope
+/// (module doc, "Visibility"), so the check one step later was refusing them.
+/// All 68,079 are `file`-visible and containerless, so the convention is
+/// real - but it is a convention, not something core states or enforces: the
+/// wire lets a plugin send a `Module` node with any `nativeKind` and any
+/// visibility it likes. The failure it is one edit away from is concrete
+/// rather than imagined: `file` visibility *is* accepted in a container
+/// scope for the requester's own file, so a plugin that gave its import
+/// records the container they sit in - the obvious thing to do to make them
+/// show up as members of a Go package or a Rust module - would hand every
+/// same-file container-scoped placeholder a rival candidate spelled exactly
+/// like what it was looking for. The kind filter is where that line belongs,
+/// because the kind is what core knows about the node.
+///
+/// The tests below pin it at both ends:
+/// `no_kind_the_lookups_refuse_can_be_linked_onto` for the refusal,
+/// `an_import_record_no_longer_makes_a_name_ambiguous` for the edge that
+/// lands instead.
 fn is_declaration(native_kind: Option<&str>) -> bool {
-    !matches!(
-        native_kind,
-        Some(
-            PENDING_SYMBOL_NATIVE_KIND
-                | REEXPORT_NATIVE_KIND
-                | RESOLVED_MODULE_NATIVE_KIND
-                | CONTAINER_NATIVE_KIND
-        )
-    )
-}
-
-/// [`is_declaration`] as a SQL condition on `nodes`. `IS NULL OR`, because
-/// `NOT IN` on an ordinary node's NULL `nativeKind` is NULL, not true.
-fn declaration_filter() -> String {
-    format!(
-        "(nativeKind IS NULL OR nativeKind NOT IN ('{PENDING_SYMBOL_NATIVE_KIND}', '{REEXPORT_NATIVE_KIND}', \
-         '{RESOLVED_MODULE_NATIVE_KIND}', '{CONTAINER_NATIVE_KIND}'))"
-    )
+    !native_kind.is_some_and(|kind| NON_DECLARATION_NATIVE_KINDS.contains(&kind))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -820,7 +870,14 @@ fn republished_addresses(conn: &Connection, seeds: Vec<Address>) -> Result<Vec<A
 /// `idx_nodes_container`, a file's placeholders by `idx_nodes_filePath`.
 fn requesters_below_new_containers(conn: &Connection, diff: &Diff) -> Result<Vec<String>> {
     // Each id's last record decides its membership, as it does in
-    // `graph::containers`.
+    // `graph::containers`. The count below is compared against the
+    // `containers.memberCount` that module maintains, so the two have to
+    // exclude the same kinds - `graph::containers::membership` is the other
+    // half of this filter, and it still spells its own four-kind list (it
+    // does not exclude `external_module`, which GM-372 excluded here). The
+    // two agree on everything any plugin actually sends, because an import
+    // record carries no container at all and so is filtered out one line
+    // above by the `is_empty` check, whichever list is consulted.
     let mut last: HashMap<&str, Option<(&str, &str)>> = HashMap::new();
     for node in &diff.upsert_nodes {
         let key = node
@@ -1040,7 +1097,8 @@ impl<'c> Resolver<'c> {
             "SELECT id, kind, filePath, language, visibility, visibilityContainer FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key \
              FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
-        let declarations = declaration_filter();
+        // Unaliased: `CANDIDATE` selects from `nodes` directly.
+        let declarations = declaration_only("");
         let prepare = |sql: String| conn.prepare(&sql).context("failed to prepare a symbol-linking lookup");
         Ok(Resolver {
             conn,
@@ -1272,30 +1330,110 @@ mod tests {
         conn
     }
 
-    /// [`is_declaration`] here and `graph::queries`'
-    /// `NON_DECLARATION_NATIVE_KINDS` there answer two different questions -
-    /// "may this node be *linked onto*, at index time" and "may it be the
-    /// *answer* to a symbol lookup" - and are allowed to differ. They are
-    /// allowed to differ *deliberately*, which is what this pins: GM-367
-    /// added `external_module` to the lookup side, having found that an
-    /// import placeholder was being answered as a declaration, and left this
-    /// side alone, because excluding one here would repoint edges during
-    /// linking rather than narrow an answer at query time - a change with its
-    /// own evidence to collect.
+    /// The replacement for GM-367's pinning test, which asserted that this
+    /// filter and the lookups' differed by exactly `external_module`. GM-372
+    /// removed the difference (see [`is_declaration`]), so what is worth
+    /// pinning is no longer the size of a gap between two lists - there is
+    /// one list now - but that the linker actually refuses every kind on it,
+    /// through the SQL the candidate lookup really runs.
     ///
-    /// So the difference is exactly one kind. If it ever becomes zero or two,
-    /// that is a decision, and it fails here until someone records it.
+    /// Each kind gets a `public` node in the target file under the name the
+    /// placeholder is waiting for, which is the strongest form of the trap: a
+    /// visible, exactly-named, kind-compatible row that a `REFERENCES` edge
+    /// would land on if the `nativeKind` filter did not stop it. No shipped
+    /// plugin emits an import record `public` - they are all `file`-visible
+    /// and containerless, which is why nothing has ever landed on one - but
+    /// that is the plugins' convention and this is core's rule, so the test
+    /// states core's.
+    ///
+    /// `external_module` is the arm that fails without GM-372's change; the
+    /// other four fail without the filter at all. The control is the test
+    /// below.
     #[test]
-    fn the_link_filter_and_the_lookup_filter_differ_by_exactly_external_module() {
-        let linkable_but_not_an_answer: Vec<&str> = crate::graph::queries::NON_DECLARATION_NATIVE_KINDS
-            .into_iter()
-            .filter(|kind| is_declaration(Some(kind)))
-            .collect();
+    fn no_kind_the_lookups_refuse_can_be_linked_onto() {
+        for kind in NON_DECLARATION_NATIVE_KINDS {
+            let mut conn = setup();
+            let mut trap = symbol("target.ts", "mutate", MODULE_KIND, true);
+            trap.id = format!("trap:{kind}");
+            trap.native_kind = Some(kind.to_string());
+            apply_diff(
+                &mut conn,
+                &Diff {
+                    upsert_nodes: vec![symbol("caller.ts", "run", "Function", true), trap],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let edge = seed_usage(&mut conn, "Function:caller.ts:run", "REFERENCES", "target.ts", "mutate");
 
+            let summary = link_all(&mut conn).unwrap();
+
+            assert_eq!(summary, LinkSummary::default(), "a {kind} row is not a declaration to link onto");
+            assert_eq!(
+                edge_target(&conn, &edge),
+                ("pending:caller.ts:target.ts#mutate".to_string(), false),
+                "the {kind} row must leave the usage edge on its placeholder, unresolved"
+            );
+        }
+    }
+
+    /// The control for the test above: the same fixture with the `nativeKind`
+    /// taken off. A `Module` node is a perfectly good target for a
+    /// `REFERENCES` edge - a TS namespace is one - so this links in both
+    /// arms, which is what shows the refusals above come from the kind list
+    /// and not from the node's kind, its visibility, or the fixture being
+    /// unlinkable in the first place.
+    #[test]
+    fn a_module_that_is_not_an_address_is_still_linked_onto() {
+        let mut conn = setup();
+        let mut declaration = symbol("target.ts", "mutate", MODULE_KIND, true);
+        declaration.id = "Module:target.ts:mutate".to_string();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![symbol("caller.ts", "run", "Function", true), declaration],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let edge = seed_usage(&mut conn, "Function:caller.ts:run", "REFERENCES", "target.ts", "mutate");
+
+        assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+        assert_eq!(edge_target(&conn, &edge), ("Module:target.ts:mutate".to_string(), true));
+    }
+
+    /// The other half of GM-372, and the direction that is easy to miss:
+    /// excluding a kind from the candidate set does not only withhold edges,
+    /// it lets one *land*. A file that both declares `mutate` and imports a
+    /// package spelled `mutate` offered two candidates to a `REFERENCES`
+    /// edge, and "several candidates" is a refusal (contract step 4) - so
+    /// before this change the import record cost the real declaration its
+    /// edge. Now there is one candidate and it is the right one.
+    #[test]
+    fn an_import_record_no_longer_makes_a_name_ambiguous() {
+        let mut conn = setup();
+        let mut import_record = symbol("target.ts", "mutate", MODULE_KIND, true);
+        import_record.id = "external:target.ts:mutate".to_string();
+        import_record.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    symbol("caller.ts", "run", "Function", true),
+                    symbol("target.ts", "mutate", "Function", true),
+                    import_record,
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let edge = seed_usage(&mut conn, "Function:caller.ts:run", "REFERENCES", "target.ts", "mutate");
+
+        assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
         assert_eq!(
-            linkable_but_not_an_answer,
-            vec![crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND],
-            "the two filters may differ, but only by the one kind GM-367 argued about"
+            edge_target(&conn, &edge),
+            ("Function:target.ts:mutate".to_string(), true),
+            "the declaration answers; the import record of the same name is not a rival candidate"
         );
     }
 
