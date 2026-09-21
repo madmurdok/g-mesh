@@ -20,6 +20,7 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::storage::vectors::pack;
 
+use super::similarity;
 use super::tool_result::{error, internal_error, success};
 use super::SearchCodeParams;
 
@@ -38,6 +39,37 @@ pub(super) struct SearchResult {
     /// this is exactly `1 - cosine_distance`). Higher is more similar; this
     /// is also the column `paginate_by_score` orders and pages by.
     pub(super) score: f64,
+    /// The declaration's own `nodes.language`, read for
+    /// [`super::similarity::floor`] and never serialized: the floor a row is
+    /// judged against is a property of the language its text was written in,
+    /// and the caller is handed the verdict rather than the inputs to it -
+    /// see `super::similarity`'s doc comment on why the constant stays off
+    /// the wire. Twenty copies of `"language":"typescript"` on a page whose
+    /// rows are nearly always one language would also be the per-row
+    /// repetition of a per-call fact that `super::provenance` argues against.
+    #[serde(skip)]
+    pub(super) language: String,
+}
+
+#[cfg(test)]
+impl SearchResult {
+    /// The two fields `super::similarity`'s tests vary, with the rest filled
+    /// in. A constructor rather than `..Default::default()` because the two
+    /// that matter are then impossible to omit by accident - a row with a
+    /// default score of `0.0` would make every one of those tests pass for
+    /// the wrong reason.
+    pub(super) fn for_test(score: f64, language: &str) -> Self {
+        Self {
+            symbol_id: "n".to_string(),
+            qualified_name: "pkg::n".to_string(),
+            kind: "Function".to_string(),
+            file_path: "a.rs".to_string(),
+            start_line: 1,
+            start_col: 0,
+            score,
+            language: language.to_string(),
+        }
+    }
 }
 
 /// The standard cursor-pagination envelope, serialized: `Page<T>` itself
@@ -52,6 +84,13 @@ struct SearchPage {
     results: Vec<SearchResult>,
     has_more: bool,
     next_cursor: Option<String>,
+    /// The verdict [`super::similarity::verdict`] reached about this page, and
+    /// the only shape this tool has ever had that means *no* - see that
+    /// module's doc comment. Absent on a page that matched, and absent on a
+    /// continuation page, where the scores this verdict is computed from are
+    /// not in hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_match: Option<similarity::NoMatch>,
 }
 
 /// Ranks every embedded node against `query` and paginates the result.
@@ -73,6 +112,7 @@ pub(super) fn search(
     // or signature - see `embedding::pipeline::text_to_embed`) out of the
     // results without a separate filter.
     let base_sql = "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, \
+                     n.language, \
                      (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
                      FROM vectors v JOIN nodes n ON n.id = v.nodeId";
     let packed = pack(query);
@@ -90,6 +130,7 @@ pub(super) fn search(
                 start_line: row.get("startLine")?,
                 start_col: row.get("startCol")?,
                 score,
+                language: row.get("language")?,
             },
             score,
             id,
@@ -115,7 +156,14 @@ pub(super) fn handle(
     let page = search(&conn, &query_vector, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to search code", e))?;
 
-    success(&SearchPage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
+    let no_match = similarity::verdict(&params.query, params.cursor.as_deref(), &page.results);
+
+    success(&SearchPage {
+        results: page.results,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        no_match,
+    })
 }
 
 #[cfg(test)]
@@ -279,6 +327,95 @@ mod tests {
         let page = search(&conn, &[1.0, 0.0, 0.0], 25, None).unwrap();
         assert_eq!(page.results.len(), 25, "all 25 must come back in one page");
         assert!(!page.has_more);
+    }
+
+    /// Inserts a node whose language is `language`, so a test can drive
+    /// `similarity::floor`'s per-language table through the real handler.
+    fn insert_node_in(conn: &Connection, id: &str, language: &str) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, 'Function', ?1, ?1, 'a.ts', 1, 0, 3, 1, ?2)",
+            rusqlite::params![id, language],
+        )
+        .unwrap();
+    }
+
+    /// GM-381's wire contract, and its control: the same index and the same
+    /// page shape, one query that clears TypeScript's floor and one that does
+    /// not. The healthy page must carry no `noMatch` key at all - not `null`,
+    /// not an empty object - or the field is a footnote rather than a signal.
+    #[test]
+    fn a_page_below_the_floor_says_no_and_a_page_above_it_says_nothing() {
+        let conn = setup();
+        insert_node_in(&conn, "ts", "typescript");
+        // Cosine 1.0 against [1,0] and 0.0 against [0,1]: comfortably either
+        // side of typescript's floor, whatever the table says it is.
+        insert(&conn, "ts", &[1.0, 0.0], "v1").unwrap();
+
+        let matched = search(&conn, &[1.0, 0.0], 10, None).unwrap();
+        let missed = search(&conn, &[0.0, 1.0], 10, None).unwrap();
+
+        assert_eq!(super::super::similarity::verdict("reads a file", None, &matched.results), None);
+        let verdict = super::super::similarity::verdict("reads a file", None, &missed.results)
+            .expect("a page scoring 0.0 cannot be a match");
+        let body: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&SearchPage {
+                results: missed.results,
+                has_more: false,
+                next_cursor: None,
+                no_match: Some(verdict),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["noMatch"]["reason"], "belowSimilarityFloor");
+        let healthy: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&SearchPage {
+                results: matched.results,
+                has_more: false,
+                next_cursor: None,
+                no_match: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(healthy.get("noMatch").is_none(), "a matching page must carry no key at all: {healthy}");
+    }
+
+    /// The other half of that contract, against a real paginated index: the
+    /// second page of a search holds rows that are all below the floor - it is
+    /// the tail of a ranking, so of course it does - and must still carry no
+    /// verdict. The first page of the same search is the control, and it does
+    /// carry one, so the two arms differ only in the cursor.
+    #[test]
+    fn a_continuation_page_carries_no_verdict_although_its_rows_are_all_below_the_floor() {
+        let conn = setup();
+        for i in 0..4 {
+            let id = format!("n{i}");
+            insert_node_in(&conn, &id, "typescript");
+            // Nearly orthogonal to the query below, so every row on both
+            // pages scores far under typescript's floor.
+            insert(&conn, &id, &[0.01 * (i as f32) + 0.01, 1.0, 0.0], "v1").unwrap();
+        }
+        let first = search(&conn, &[1.0, 0.0, 0.0], 2, None).unwrap();
+        assert!(first.has_more, "the fixture must produce a second page");
+        let cursor = first.next_cursor.clone().unwrap();
+        let second = search(&conn, &[1.0, 0.0, 0.0], 2, Some(&cursor)).unwrap();
+        assert!(
+            second.results.iter().all(|r| r.score < super::super::similarity::floor("typescript")),
+            "the fixture must put the whole continuation under the floor: {:?}",
+            second.results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        assert!(
+            super::super::similarity::verdict("reads a file", None, &first.results).is_some(),
+            "the control: the first page of this same search is a no"
+        );
+        assert_eq!(
+            super::super::similarity::verdict("reads a file", Some(&cursor), &second.results),
+            None,
+            "a continuation is never judged"
+        );
     }
 
     /// Task #50's acceptance criterion, end to end: a free-text query
