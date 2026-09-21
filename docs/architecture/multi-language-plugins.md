@@ -579,6 +579,10 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   [[imports]]
   file = "cmd/main.go"
   expect = ["container:github.com/x/app/server"]
+  [[importers]]                            # the incoming direction (GM-365)
+  file = "server/server.go"
+  via_module = "github.com/x/app/server"   # which module the walk ran from;
+  expect = ["cmd/main.go"]                 # omitted = assert no substitution
   ```
 
 The same fixtures run in core's CI for every bundled plugin. They are the

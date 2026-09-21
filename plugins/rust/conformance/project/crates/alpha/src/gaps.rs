@@ -2,6 +2,23 @@
 //! so a reader can check each claim against a real declaration rather than
 //! against prose. `plugins/rust/README.md` states them; this is where they
 //! are exercised.
+//!
+//! The `use` below is the one thing here that is *not* a gap any more, and
+//! it is here because this is the file whose own imports nothing else
+//! asserts - see `conformance/expect.toml`'s `[[imports]]` entry for it.
+
+// GM-358, the Rust half: `use a::b;` where the leaf `b` is a *submodule* of
+// `a` rather than a symbol declared inside it. Until 3.8.0 the `IMPORTS`
+// edge was drawn onto the prefix (`alpha`) and never onto the leaf, so
+// `get_dependencies` could not see that this file reads `alpha::nested` at
+// all - the same shape `from . import helpers` has in Python.
+//
+// Deliberately unused: every way of *using* `nested` from here goes through
+// `nested::deep::work`, whose caller set `expect.toml` pins to exactly
+// `lib.rs:run`, so a call here would break that entry to prove this one.
+// The `use` alone is what the edge is built from.
+#[allow(unused_imports)]
+use crate::nested;
 
 /// A `macro_rules!` **is** a node (`Function`, `nativeKind = "macro"`), so
 /// `make_helper!(…)` below is a `CALLS` edge onto it.
