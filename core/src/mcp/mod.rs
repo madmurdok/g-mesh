@@ -75,6 +75,7 @@ mod get_file_outline;
 mod instructions;
 mod provenance;
 mod search_code;
+mod similarity;
 mod source;
 mod tool_result;
 
