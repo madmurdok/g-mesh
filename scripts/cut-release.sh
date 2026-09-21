@@ -144,6 +144,31 @@
 # one, or one a future dependency introduces that this narrow check does not
 # anticipate - has to fail a real test to reach a release.
 #
+# GM-374: this script has tagged `main` after every merge since it was
+# written - the premise "add tagging so this can't recur" was already true.
+# What actually happened is nobody RAN it: main carried twelve consecutive
+# `merge: release-X into main` commits, 2.11.0 through 3.8.0, with no tag
+# anywhere near them, because the ritual depended on a human remembering to
+# invoke a script that produces no visible harm when skipped - CI never
+# reacts to a missing tag, it only reacts to one being pushed. A tool that
+# is only correct when run is not a fix for "nobody ran it".
+#
+# check_no_untagged_prior_releases below is what makes a second lapse
+# structural instead of just possible-to-avoid: before tagging the release
+# this invocation is cutting, it walks main's first-parent history BEHIND
+# that commit and refuses if an earlier `merge: release-X into main` commit
+# has no `vX` tag anywhere in the repo. Next time a release ships without
+# running this script, the release after THAT one cannot be cut until the
+# gap is back-filled - the omission becomes a blocked release instead of a
+# silent one. The walk stops at the first version that already has a tag
+# (by name, not by which commit it points at), so it costs nothing once a
+# gap is closed and never re-opens the four pre-2.11.0 tags that anchor to
+# their release branch's tip rather than to the main-merge commit - that
+# inconsistency is documented, not something this check is meant to police.
+# Cost: a release can now be blocked by a PRIOR release's missed tag, not
+# just its own state - which is the point, but it means back-filling is now
+# sometimes mandatory before a release can ship at all, not merely tidy.
+#
 # ---------------------------------------------------------------------------
 # WHAT IT REFUSES ON
 #
@@ -154,6 +179,8 @@
 #   - `main` out of sync with its upstream (a commit only local, or only
 #     remote, cannot be the commit CI tags when the push happens)
 #   - the tag already exists, locally or on the remote
+#   - an earlier `merge: release-X into main` commit has no tag at all
+#     (GM-374 - see the comment above this section)
 #   - a version string that is not `X.Y.Z`
 #   - `core/Cargo.toml`'s version disagreeing with the argument
 #   - any other workspace member's version disagreeing with core's (GM-288)
@@ -378,6 +405,50 @@ check_core_feature_isolation() {
 	fi
 }
 
+# GM-374: refuses if main's first-parent history carries an earlier
+# `merge: release-X into main` commit with no `vX` tag anywhere in the repo.
+# See this script's GM-374 header comment for why this exists and what it
+# costs. Walks backward from `main^` (the commit BEFORE the one this
+# invocation is about to tag) and stops at the first version that already
+# has a tag by name - it does not check that the tag points at that exact
+# commit, because the pre-2.11.0 tags deliberately don't (v2.8.0, v2.8.1 and
+# v2.9.0 anchor to their release branch's tip; only v2.10.0 onward anchors
+# to the main-merge commit) and re-litigating that is not this check's job.
+# A merge commit whose subject doesn't match the `merge: release-X into
+# main` convention exactly is invisible to this walk, same as it would be to
+# a person reading `git log --first-parent` for the same pattern - this is a
+# safety net for the established convention, not a guarantee independent of
+# it.
+check_no_untagged_prior_releases() {
+	local head_parent
+	head_parent="$(git -C "$REPO_ROOT" rev-parse main^ 2>/dev/null)" || return 0
+
+	local missing=()
+	local line sha subject ver
+	while IFS= read -r line; do
+		sha="${line%% *}"
+		subject="${line#* }"
+		if [[ "$subject" =~ ^merge:\ release-([0-9]+\.[0-9]+\.[0-9]+)\ into\ main$ ]]; then
+			ver="${BASH_REMATCH[1]}"
+			if [ -z "$(git -C "$REPO_ROOT" tag -l "v$ver")" ]; then
+				missing+=("v$ver ($sha)")
+			else
+				break
+			fi
+		fi
+	done < <(git -C "$REPO_ROOT" log --first-parent --format="%H %s" "$head_parent")
+
+	if [ ${#missing[@]} -gt 0 ]; then
+		local line2
+		echo "cut-release: earlier release(s) on main were never tagged:" >&2
+		for line2 in "${missing[@]}"; do
+			echo "  - $line2" >&2
+		done
+		die "back-fill the tag(s) above first (git tag -a v<version> <sha> -m 'g-mesh v<version>') - this is exactly how the tag history went missing from v2.10.0 to v3.8.0 (GM-374)"
+	fi
+	log "no untagged prior releases behind $(git -C "$REPO_ROOT" rev-parse --short main^) on main's first-parent history"
+}
+
 # owner/repo parsed from the `origin` remote, for printing real URLs at the
 # end rather than a placeholder someone has to mentally substitute.
 origin_slug() {
@@ -457,6 +528,10 @@ main() {
 
 	[ -z "$(git -C "$REPO_ROOT" ls-remote --tags origin "refs/tags/$tag")" ] ||
 		die "tag $tag already exists on origin - a release for $version has already been cut"
+
+	# GM-374: refuses if an earlier release shipped without this script
+	# tagging it - see the GM-374 header comment and the function itself.
+	check_no_untagged_prior_releases
 
 	# The exact check .github/workflows/release.yml's "Check the tag matches
 	# the crate version" step runs, so a mismatch is caught here instead of
@@ -555,4 +630,11 @@ main() {
 	fi
 }
 
-main "$@"
+# GM-374: guarded so this file can be sourced (e.g. to call
+# check_no_untagged_prior_releases directly, as this script's own tests do)
+# without also running the full release ritual. A normal invocation
+# (`scripts/cut-release.sh <version>`) is unaffected - BASH_SOURCE[0] equals
+# $0 exactly when the file is executed rather than sourced.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+	main "$@"
+fi
