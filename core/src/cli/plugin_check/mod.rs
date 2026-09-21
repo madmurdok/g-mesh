@@ -42,6 +42,7 @@ mod expectations;
 pub mod report;
 pub(crate) mod session;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -351,11 +352,16 @@ fn expectations_section(
     let embedding = EmbeddingPipeline::disabled();
     let entry_points = manifest.workspace.entry_points.clone();
     let project_root = scratch.workspace();
+    // One entry, keyed by this plugin's own language: a check run is about
+    // exactly one plugin, and `mcp::provenance::resolve` looks its anchor's
+    // language up in exactly this shape (GM-382).
+    let capabilities = HashMap::from([(manifest.language.clone(), manifest.capabilities)]);
     let ctx = expectations::EvalContext {
         conn,
         embedding: &embedding,
         project_root: &project_root,
         entry_points: &entry_points,
+        capabilities: &capabilities,
     };
 
     let mut results =
