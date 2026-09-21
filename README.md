@@ -1,11 +1,14 @@
 # g-mesh
 
 Local structural code-graph indexer for AI agents, exposed as an MCP server.
-MVP scope: JavaScript/TypeScript only. Resolution is structural (tree-sitter)
-first, with a semantic pass over it that drives the project's own `tsserver`
-for the questions a name-matching layer cannot answer — today, the members of
-an `import * as ns` namespace import. See `REQUIREMENTS.md` and
-`docs/architecture/g-mesh-v1.md` for the full design.
+Ships four bundled language plugins — Go, Python, Rust, TypeScript/JavaScript
+(`g-mesh plugins list`). Resolution is structural (tree-sitter) first, with a
+semantic pass over it that drives each project's own language server —
+`go/types` for Go, `pyright` for Python, `rust-analyzer` for Rust, `tsserver`
+for TypeScript/JavaScript — for the questions a name-matching layer cannot
+answer (for TypeScript/JavaScript, e.g. the members of an `import * as ns`
+namespace import). See `REQUIREMENTS.md` and `docs/architecture/g-mesh-v1.md`
+for the full design.
 
 ## Layout
 
@@ -21,9 +24,18 @@ output lands in `target/`.
 - `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
   bulk indexing, incremental reparse. Spawned by the daemon as a child
   process, one instance per project.
+- `plugins/go/` — Go language plugin: tree-sitter parsing plus a `go/types`
+  semantic tier. Its own Go module (`go.mod`), not a cargo workspace member,
+  built as a prebuilt binary the same way `plugins/typescript/` is.
 - `plugins/sdk/` — everything a Rust language plugin needs that is not its
   language: protocol loop, walk, incremental diff, ids. See "Writing a
   language plugin".
+- `plugins/rust/` — Rust language plugin, built on `plugins/sdk` with a
+  `rust-analyzer` semantic tier. A cargo workspace member, so `cargo
+  build`/`cargo test` from the repository root cover it.
+- `plugins/python/` — Python language plugin, built on `plugins/sdk` with a
+  `pyright` semantic tier. A cargo workspace member, so `cargo build`/`cargo
+  test` from the repository root cover it.
 
 The daemon and shim are one binary (`target/{debug,release}/g-mesh`);
 the plugin is a separate Node entry point the daemon launches with `node`.
@@ -341,8 +353,10 @@ in the client's server log rather than as an empty answer.
 
 The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
-project's SQLite index, spawns the JS/TS plugin, builds the initial index if
-the project has never been indexed (see below), starts the file watcher, and
+project's SQLite index, spawns every bundled language plugin it discovers —
+unconditionally, regardless of which languages the project actually contains
+(`daemon::bulk_index::run`) — builds the initial index if the project has
+never been indexed (see below), starts the file watcher, and
 serves the MCP tool surface over a per-project endpoint (an `AF_UNIX` socket on
 Linux and macOS, a named pipe on Windows). The daemon outlives the shim and is
 reused by later connections for the same project.
@@ -498,8 +512,10 @@ claude mcp add g-mesh -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 ## First run: the initial index
 
 The first time a daemon starts for a project it walks the whole tree once
-(gitignore-aware, skipping `.git`, `node_modules`, `dist`, and `.claude`), parses every
-`.ts`/`.tsx`/`.js`/`.jsx` file, and commits the result **before** it accepts
+(gitignore-aware, skipping `.git`, `node_modules`, `dist`, and `.claude`), parses
+every file each bundled plugin claims by extension — `.ts`/`.tsx`/`.mts`/`.cts`/
+`.js`/`.jsx`/`.mjs`/`.cjs` for TypeScript/JavaScript, `.go` for Go, `.py`/`.pyi`
+for Python, `.rs` for Rust — and commits the result **before** it accepts
 any MCP connection — so a client's first tool call already sees a complete
 graph, with nothing to touch or warm up first. Expect that first start to
 take proportionally longer on a large project; every later start is
@@ -594,8 +610,9 @@ with a connection timeout ten seconds later. The default `~/.g-mesh` is
 nowhere near it; only a deliberately relocated root can reach it.
 
 Upgrading g-mesh does not need that, though: an index records which build of
-the indexing pipeline filled it — core's own generation *and* a digest of the
-JS/TS plugin's compiled output — and an index that no longer matches is wiped
+the indexing pipeline filled it — core's own generation *and* one digest over
+every discovered plugin's compiled output, `(language, fingerprint)` for each
+(`daemon::registry::indexer_version`) — and an index that no longer matches is wiped
 and re-walked on the next daemon start. A daemon already running when the
 upgrade lands is retired first, whether it is the core binary or only the
 plugin that was rebuilt, so the next MCP call is answered by what is on disk
@@ -812,7 +829,7 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 ## Run tests
 
 ```bash
-cargo test                       # every crate: core, wire, plugins/sdk
+cargo test                       # every crate: core, wire, plugins/sdk, plugins/rust, plugins/python
 cargo test -p g-mesh             # core alone
 cd plugins/typescript && npm run build && npm test
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
