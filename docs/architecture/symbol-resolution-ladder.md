@@ -100,6 +100,19 @@ such rows out of 63. The exclusion lives in the shared lookups, so it reaches al
 once; `graph::queries`' own header records the decision (exclude outright, rather than keep them
 and mark them) and why the alternative lost.
 
+**Rung 4 ranks, it does not just page (GM-373).** Its page is cut at five, so the order decides
+what the caller sees at all, and `exported DESC, startLine ASC` decided it by source position —
+which is a proxy for importance only by accident. Measured on gin, `find_definition("context")`
+came back with `context.go`'s first five exported constants (`MIMEJSON`, `MIMEHTML`, `MIMEXML`, …)
+and never reached `Context`, the type the file exists for, 90-odd declarations further down. The
+primary key is now the inbound `REFERENCES`+`CALLS` count — the same ranking rung 3′ already uses,
+so the two candidate-returning rungs order by one rule rather than two — with the old expression
+kept as the tie-break, so a file whose declarations are all unreferenced comes back exactly as
+before. This rung is reached by 107 distinct queries across gin, ripgrep and requests (a file stem,
+or a case variant of one, that no declaration is named), not by the one in the ticket:
+`graph::queries::find_in_file_named`'s own doc has that sweep, and why preferring a declaration
+named like the file lost to it.
+
 A spelling that only import placeholders carry therefore falls through to a rung of its own,
 between 4 and 5: `import_only_refusal`, which refuses and says what the name *is* —
 `"nothing named 'http' is declared in this project. It names something this project imports:

@@ -229,6 +229,84 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
 /// wildcard is acceptable here and would not be on a hot one. Case-insensitive
 /// by SQLite's default ASCII `LIKE`, deliberately: `import Foo from "./foo"` is
 /// the same situation.
+///
+/// # Ranked by inbound edges, not by source order (GM-373)
+///
+/// A file's declarations arrive here as a *page*, and `limit` cuts it, so the
+/// order decides what the caller sees at all. It used to be `exported DESC,
+/// startLine ASC`, which is not so much wrong as uninformed: source order is a
+/// proxy for importance only by accident, and `exported` does not separate a
+/// constant from the type the file is named after. On a gin index,
+/// `find_definition("context")` reached this rung and answered with
+/// `MIMEJSON`, `MIMEHTML`, `MIMEXML`, `MIMEXML2`, `MIMEPlain` - `context.go`'s
+/// first five exported constants - while `Context`, the type the file exists
+/// for, sat 90-odd declarations further down and never made the page.
+///
+/// So the primary key is now the inbound `REFERENCES`+`CALLS` count, the same
+/// "how central is this symbol" proxy `mcp::find_definition`'s
+/// `find_candidates_by_name` ranks its own candidate page by (GM-360) - the
+/// two rungs that answer with candidates now order them by one rule rather
+/// than two. It separates this case by a wide margin, measured on the three
+/// probe indexes: in `context.go`, `Context` has 335 inbound edges against
+/// `MIMEJSON`'s 15 and `MIMEXML`'s 17.
+///
+/// `exported DESC, startLine ASC` stays as the tie-break, which is what makes
+/// the change a refinement rather than a replacement: where the graph has
+/// nothing to say - every candidate at zero, as in ripgrep's `disabled.rs` -
+/// the page is byte for byte the one this function returned before.
+///
+/// # How many queries this is actually about
+///
+/// 107, swept rather than guessed, because a rung tuned on one query is a rung
+/// measured on one query. The set that can reach here is exactly "a file stem,
+/// or a case variant of one, that no declaration carries as its `name` or
+/// `qualifiedName`"; enumerated over the three probe indexes it is 84 queries
+/// on gin, 12 on requests and 11 on ripgrep. Of those 107 pages, 27 come back
+/// identical, 13 are reordered behind an unchanged first row, and 67 have a
+/// new first row. No query changes *rung*: the row set is untouched and only
+/// its order moves, so nothing that resolved starts refusing or the reverse.
+///
+/// # What lost, and why it is written down
+///
+/// Preferring a declaration whose own name *is* the file's stem (`Context` in
+/// `context.go`) is the other obvious rule. It is not a bad rule, which is why
+/// the reason it lost has to be the measured one rather than a slogan: over
+/// the 107 it disagrees with the edge count about the first row 11 times, and
+/// it is better in 7 of them - `Binding` over `BindingBody`, `RouterGroup`
+/// over `RouterGroup.GET`, requests' `Server` over `consume_socket_content`.
+///
+/// It lost on the other 4, and on what the 7 are worth given the ranking:
+///
+/// - **A stem match cannot tell a subject from a member or a fixture**, and
+///   the graph has no language-agnostic way to say which it has - `name` vs
+///   `qualifiedName` separates the two in Go and not in Rust, where every
+///   top-level declaration is module-qualified too. So the rule puts
+///   `errorMsgs.Errors` above the `errorMsgs` type, and - the case that
+///   decides it - ripgrep's `literal::tests::literal`, a test function with
+///   **0** inbound edges, above `literal::TSeq` with 20. Handing back a
+///   test fixture as *the* answer is the exact failure GM-360 removed from
+///   the bare-name rung; re-creating it here, one rung down, for a spelling
+///   coincidence, is not a trade worth making.
+/// - **The ranking already carries those 7 onto the page**, which is the
+///   number that shrinks the win. Among them the stem-named declaration ranks
+///   in the top 5 in 5 cases after this change (`Binding` 15th -> 2nd,
+///   `RouterGroup` 22nd -> 3rd) against 2 before it, and in no case does one
+///   that was on the page fall off. The tie-break would move a row the caller
+///   can already see to the top; the cost is the bullet above.
+///
+/// The residue is worth naming rather than hiding: the two the ranking does
+/// push off the page, gin's `Logger` (29th) and `Mode` (16th), are *public
+/// API a project barely uses itself*. Inbound edges measure internal use, so
+/// an exported entry point with one caller in-tree will always rank below a
+/// well-used helper. That is the known blind spot of this proxy, here and in
+/// `find_candidates_by_name`, and the honest bound on what it claims.
+///
+/// The `limit` its caller passes was also re-examined and deliberately left at
+/// five. An order that means something makes the *marginal* row worth less,
+/// not more: under source order row 6 was as good a guess as row 1, so the cap
+/// was where the arbitrariness showed, whereas now row 6 is by construction
+/// the sixth most-referenced. Widening it would add payload to a page that is
+/// a "did you mean", not an answer.
 pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result<Vec<NodeRecord>> {
     // A name carrying a separator or an extension is not a module stem, and
     // would turn the patterns below into something that matches far too much.
@@ -240,7 +318,9 @@ pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result
          WHERE (filePath LIKE '%/' || ?1 || '.%' OR filePath LIKE ?1 || '.%') \
            AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 \
            AND kind IS NOT 'File' AND kind IS NOT 'Module' \
-         ORDER BY exported DESC, startLine ASC \
+         ORDER BY (SELECT COUNT(*) FROM edges e \
+                   WHERE e.toId = nodes.id AND e.kind IN ('REFERENCES', 'CALLS')) DESC, \
+                  exported DESC, startLine ASC \
          LIMIT ?4",
     )?;
     let rows = stmt.query_map(
