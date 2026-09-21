@@ -68,13 +68,18 @@ use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 // exclusions produce into a sentence naming the specifier and the tool that
 // does answer for it.
 //
-// `graph::symbol_links::is_declaration` asks a related but different question
-// - which nodes may be *linked onto*, at index time - and deliberately keeps
-// its own four-kind list. Adding `external_module` there would repoint edges
-// during linking rather than narrow an answer at query time, which is a
-// change with its own evidence to collect and is not this one. The two lists
-// are pinned against each other by a test in that module, so the difference
-// stays deliberate.
+// `graph::symbol_links::is_declaration` asks the same question one step
+// earlier - which nodes may be *linked onto*, while the index is being
+// written - and since GM-372 it reads this same list rather than a fourth
+// copy of it. GM-367 left it a four-kind copy on purpose: it was missing
+// `external_module`, and adding a kind there repoints edges during linking
+// rather than narrowing an answer at query time, which is evidence of a
+// different kind (a re-index and a before/after edge diff on real corpora,
+// not a query sweep). GM-372 collected it - no edge moved on go-gin,
+// rs-ripgrep or py-requests, because a plugin's import records are
+// `file`-visible and the linker's visibility check was already refusing them
+// one step later - and excluded the kind anyway, on the contract rather than
+// on observed damage. That module's `is_declaration` carries the argument.
 
 /// The `nativeKind`s that never answer a name, qualifiedName or position
 /// lookup - see this module's header for what each one is and why it is here.
