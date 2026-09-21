@@ -86,7 +86,10 @@ pub mod testing;
 mod walk;
 
 pub use diff::{diff_file, is_empty_diff};
-pub use graph::{EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
+pub use graph::{
+    placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
+    PlaceholderKind,
+};
 pub use index::{FileEntry, SdkIndex};
 pub use manifest::{PluginSpec, ResolvedSpec, MANIFEST_PATH_ENV};
 pub use path::RelPath;
