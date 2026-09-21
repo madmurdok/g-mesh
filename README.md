@@ -197,6 +197,17 @@ g-mesh model fetch
 g-mesh model status   # where the weights are expected, and whether they're there
 ```
 
+**If you are comparing two indexes, point `G_MESH_MODEL_DIR` at an empty
+directory in both arms.** Embedding generation, not indexing, dominates a
+re-index: measured on go-gin (GM-372), 142.9s with the weights present against
+10.4s without, for node and edge dumps that are byte-identical. So an A/B about
+*index shape* spends its time generating vectors the comparison never reads —
+and spends long enough that the machine's own load becomes a variable in it.
+That is not hypothetical: the first attempt at that measurement had to be
+abandoned mid-ripgrep after the vector count moved 3,514 → 3,539 over several
+minutes at load average ~200, which is a moving index, not a stable arm.
+
+
 That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
 `516f4baf13dec4ddddda8631e019b5737c8bc250`, and `model.onnx` alone is ~612 MiB
 — which is why it is neither vendored nor downloaded behind your back. Each
