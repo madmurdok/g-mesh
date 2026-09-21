@@ -643,6 +643,17 @@ fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolR
 /// in the response, because an order the caller cannot see is an order the
 /// caller cannot use: "these are the first five" and "these are the five the
 /// rest of the project leans on" are different claims about the same page.
+///
+/// `find_in_file_named`'s stem match is directory-agnostic (GM-377), so more
+/// than one file can share a stem - gin's `fs.go` and `internal/fs/fs.go`
+/// both answer for `fs`. Measured across every stem gin, ripgrep and requests
+/// can reach this rung with (GM-373's enumeration, reused rather than
+/// rebuilt): 12 of 107 pages mix rows from more than one file. That is real
+/// but modest, and every row already carries its own `filePath` - so the
+/// fix is the sentence, not a ranking rule to crown one file or a new field
+/// to carry the rest: when the rows span more than one file the explanation
+/// names all of them instead of asserting the first row's path as if it were
+/// the only one.
 fn by_file_name(
     conn: &Connection,
     embedding: Option<&EmbeddingPipeline>,
@@ -667,12 +678,26 @@ fn by_file_name(
         };
     }
 
-    let file_path = in_file[0].file_path.clone();
+    // Distinct files, in the order their rows first appear on the page - not
+    // sorted, so this reads as "the files behind the rows above" rather than
+    // implying a ranking between files that the query never computed.
+    let mut file_paths: Vec<&str> = Vec::new();
+    for n in &in_file {
+        if !file_paths.contains(&n.file_path.as_str()) {
+            file_paths.push(&n.file_path);
+        }
+    }
+    // The singular case keeps the exact sentence this rung has always used -
+    // this branch changes only what a *multi-file* page says about itself.
+    let (source_sentence, pronoun) = match file_paths.as_slice() {
+        [only] => (format!("The file {only} is, and declares these"), "its"),
+        many => (format!("These files are, and between them declare these: {}", many.join(", ")), "their"),
+    };
     success(&FileNamePage {
         resolved_by: ResolvedBy::FileName,
         ambiguous: false,
         explanation: format!(
-            "No declaration is named '{name}'. The file {file_path} is, and declares these - its \
+            "No declaration is named '{name}'. {source_sentence} - {pronoun} \
              most-referenced declarations first. A default import binds a file's export under \
              whatever local name the importing file chose, and that local name is not indexed - \
              so a name read at a use site can be absent here while the declaration it refers to \
@@ -1300,6 +1325,65 @@ mod tests {
             .map(|r| r["qualifiedName"].as_str().unwrap())
             .collect();
         assert_eq!(listed, vec!["write", "read"], "source order, as before: {body}");
+    }
+
+    /// **Discrimination.** `find_in_file_named`'s stem match is
+    /// directory-agnostic, so gin's real `fs.go` and `internal/fs/fs.go` both
+    /// answer for the stem `fs` and the page mixes rows from both. Before
+    /// GM-377 the explanation named only the first row's file as if it were
+    /// the page's sole source - false of a page that also carries a row from
+    /// the other file.
+    ///
+    /// **Evidence.** Reverting the `by_file_name` fix (naming
+    /// `in_file[0].file_path` as "the file") makes this fail: the
+    /// explanation claims `fs.go` alone while `results` still carries a row
+    /// from `internal/fs/fs.go`.
+    #[test]
+    fn a_page_mixing_two_files_names_both_instead_of_the_first_rows_alone() {
+        let mut conn = setup();
+        referenced_decl(&mut conn, "Stat", "Function", "Stat", "fs.go", 10, 3);
+        referenced_decl(&mut conn, "Open", "Function", "Open", "internal/fs/fs.go", 12, 1);
+
+        let body = json_body(&by_name(&conn, None, None, "fs", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        let paths: Vec<&str> =
+            body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["fs.go", "internal/fs/fs.go"], "{body}");
+
+        let explanation = body["explanation"].as_str().expect("an explanation").to_string();
+        assert!(
+            explanation.contains("fs.go") && explanation.contains("internal/fs/fs.go"),
+            "the explanation must name every file the rows came from, not just the first: \
+             {explanation}"
+        );
+        assert!(
+            !explanation.contains("The file fs.go is"),
+            "must not claim fs.go alone as the page's source when internal/fs/fs.go also \
+             contributed a row: {explanation}"
+        );
+    }
+
+    /// **Control.** A single-file page reads exactly as it always has - this
+    /// is what says the sentence above is a fix for mixed pages, not a
+    /// rewording of every page's explanation.
+    #[test]
+    fn a_single_file_page_keeps_the_unqualified_sentence() {
+        let mut conn = setup();
+        referenced_decl(&mut conn, "Stat", "Function", "Stat", "fs.go", 10, 3);
+        referenced_decl(&mut conn, "Open", "Function", "Open", "fs.go", 12, 1);
+
+        let body = json_body(&by_name(&conn, None, None, "fs", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        let explanation = body["explanation"].as_str().expect("an explanation").to_string();
+        assert!(
+            explanation.starts_with(
+                "No declaration is named 'fs'. The file fs.go is, and \
+                                      declares these - its most-referenced declarations first."
+            ),
+            "{explanation}"
+        );
     }
 
     /// A name that is nowhere keeps the short refusal. A page of candidates
