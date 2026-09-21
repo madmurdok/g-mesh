@@ -7,11 +7,15 @@ use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIN
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 
 // Every "which symbol is this?" lookup below - by name, by qualifiedName, by
-// position - answers with a *declaration* and nothing else.
+// position, or by the stem of the file it sits in ([`find_in_file_named`]) -
+// answers with a *declaration* and nothing else, and so does
+// `mcp::find_definition`'s candidate page built on top of them.
 // [`NON_DECLARATION_NATIVE_KINDS`] is the one list of what that excludes, and
-// [`declaration_only`] the one SQL condition built from it, so the three
-// lookups and `mcp::find_definition`'s candidate page cannot drift apart the
-// way they had.
+// [`declaration_only`] the one SQL condition built from it, so the four
+// lookups cannot drift apart the way they had. `find_in_file_named` is the
+// one GM-376 folded in last: until then it spelled two of the five kinds
+// itself, as bound parameters rather than this module's interpolated
+// constants - see that function's own doc for what else it excludes and why.
 //
 // Four of the five excluded kinds are addresses rather than declarations. A
 // *pending symbol* placeholder carries an imported symbol's own name; a
@@ -33,8 +37,10 @@ use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 // (`github.com/x/app/server`), which no caller asking "where is `server`
 // defined" writes.
 //
-// `find_in_file_named` and the file lookups below need no such filter: they
-// already refuse `Module` or require `File`.
+// The file lookups below - [`find_file_node`], [`find_files_under`],
+// [`find_files_ending_in_dir`] - need no such filter: they require `kind =
+// 'File'` rather than refuse anything, so none of the five excluded native
+// kinds (none of which is ever stored as `kind = 'File'`) can reach them.
 //
 // ## Excluded, not marked (GM-367)
 //
@@ -307,26 +313,55 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
 /// was where the arbitrariness showed, whereas now row 6 is by construction
 /// the sixth most-referenced. Widening it would add payload to a page that is
 /// a "did you mean", not an answer.
+///
+/// # What is excluded, and why `kind = 'Module'` is not part of it (GM-376)
+///
+/// This lookup's `WHERE` matches on `filePath` alone, so unlike
+/// [`find_by_name`]/[`find_by_qualified_name`]/[`find_by_position`] it can
+/// return *anything* declared in the file - which is exactly why it needs
+/// [`declaration_only`] too: an import placeholder or a container row sitting
+/// in the same file is not a declaration this rung may offer, any more than
+/// it is one those three may. Before GM-376 this spelled two of the five
+/// excluded native kinds itself (`pending_symbol`, `reexport`, bound as
+/// `?2`/`?3`) and missed the other three (`resolved_module`,
+/// `external_module`, `container`) - not a wrong answer for any of these
+/// today, but for a reason this function did not itself hold: see the module
+/// header's "What is excluded" for why a fifth kind of row, `kind = 'File'`,
+/// still needs its own clause.
+///
+/// `kind = 'Module'` is *not* folded into that clause, and its removal is a
+/// correctness fix, not a no-op: every one of the five excluded native kinds
+/// happens to be stored under `kind = 'Module'` today (a plugin's placeholder
+/// rows and `graph::containers`' own container rows both are), so
+/// `declaration_only` already refuses all of them without any help from
+/// `kind`. But `kind = 'Module'` refused more than those five - a TypeScript
+/// `namespace` is a real declaration, with a `DEFINES` edge from its file and
+/// members of its own, stored as `kind: "Module", nativeKind: "namespace"`
+/// (plugins/typescript/src/extract.ts). Before this change, asking this rung
+/// for a name that only a namespace in some file carried came back empty;
+/// `tests::a_namespace_stored_as_kind_module_is_still_offered` and
+/// `tests::an_import_record_stored_as_a_non_module_kind_is_still_excluded`
+/// below pin the two directions of this: dropping `kind = 'Module'` lets the
+/// namespace through, and `declaration_only` alone still refuses an import
+/// record that happens not to be stored as `kind = 'Module'`.
 pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result<Vec<NodeRecord>> {
     // A name carrying a separator or an extension is not a module stem, and
     // would turn the patterns below into something that matches far too much.
     if name.is_empty() || name.contains(['/', '\\', '.']) {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let declaration = declaration_only("");
+    let mut stmt = conn.prepare(&format!(
         "SELECT * FROM nodes \
          WHERE (filePath LIKE '%/' || ?1 || '.%' OR filePath LIKE ?1 || '.%') \
-           AND nativeKind IS NOT ?2 AND nativeKind IS NOT ?3 \
-           AND kind IS NOT 'File' AND kind IS NOT 'Module' \
+           AND {declaration} \
+           AND kind IS NOT 'File' \
          ORDER BY (SELECT COUNT(*) FROM edges e \
                    WHERE e.toId = nodes.id AND e.kind IN ('REFERENCES', 'CALLS')) DESC, \
                   exported DESC, startLine ASC \
-         LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(
-        params![name, PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, limit as i64],
-        map_node_row,
-    )?;
+         LIMIT ?2",
+    ))?;
+    let rows = stmt.query_map(params![name, limit as i64], map_node_row)?;
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by file name")
 }
 
@@ -941,6 +976,49 @@ mod tests {
             "the qualifiedName half of the same import finds it too"
         );
         assert!(import_specifiers_named(&conn, "nothing").unwrap().is_empty());
+    }
+
+    /// The case GM-376's fold exists for: before it, `find_in_file_named`
+    /// refused only `pending_symbol`/`reexport` by `nativeKind`, catching the
+    /// other three excluded kinds (`resolved_module`, `external_module`,
+    /// `container`) only because every one of them happens to be stored under
+    /// `kind = 'Module'` and the old SQL refused that outright. A row that is
+    /// one of the three *without* being `kind = 'Module'` is not a shape any
+    /// shipped plugin sends - constructed here the same way GM-372's own
+    /// tests construct their traps, by building the `NodeRecord` directly -
+    /// but it is exactly what the old SQL had no defence against: this test
+    /// fails against that SQL (the row is offered as a candidate) and passes
+    /// once `find_in_file_named` consults `declaration_only`/
+    /// `NON_DECLARATION_NATIVE_KINDS` instead of its own two-kind copy.
+    #[test]
+    fn an_import_record_stored_as_a_non_module_kind_is_still_excluded() {
+        let mut conn = setup();
+        let mut leak = NodeRecord::new("leak", "Type", "widget", "widget", "src/widget.rs", "rust");
+        leak.native_kind = Some(EXTERNAL_MODULE_NATIVE_KIND.to_string());
+        upsert_node(&mut conn, leak).unwrap();
+
+        assert!(
+            find_in_file_named(&conn, "widget", 5).unwrap().is_empty(),
+            "an import record is not a declaration to offer as a candidate, whatever `kind` it is stored under"
+        );
+    }
+
+    /// The control for the test above, and GM-376's other discrimination
+    /// case: a real declaration stored as `kind: "Module"` - a TypeScript
+    /// `namespace` is the shape (`plugins/typescript/src/extract.ts`) - used
+    /// to be refused here too, by the `kind IS NOT 'Module'` clause this task
+    /// removed. It must still be offered once that clause is gone, or the
+    /// fold traded one leak for a new exclusion.
+    #[test]
+    fn a_namespace_stored_as_kind_module_is_still_offered() {
+        let mut conn = setup();
+        let mut namespace = NodeRecord::new("ns", "Module", "Config", "Config", "src/config.rs", "rust");
+        namespace.native_kind = Some("namespace".to_string());
+        upsert_node(&mut conn, namespace).unwrap();
+
+        let found = find_in_file_named(&conn, "config", 5).unwrap();
+        assert_eq!(found.len(), 1, "the namespace declaration must be offered as a candidate");
+        assert_eq!(found[0].id, "ns");
     }
 
     #[test]

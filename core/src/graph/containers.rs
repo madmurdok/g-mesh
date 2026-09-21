@@ -101,16 +101,33 @@
 //!
 //! # Who counts as a member
 //!
-//! Any node with a non-empty `container`, except the placeholder kinds
-//! (`pending_symbol`, `reexport`, `resolved_module`) and a container node
-//! itself. A placeholder is an *address*, not a declaration, and two things
-//! break if it is counted: `graph::imports` deletes a linked-away
-//! `resolved_module` placeholder with plain SQL (outside `apply_diff`, so this
-//! module would never see it leave), and it only does so once no edge touches
-//! the placeholder - which a `DEFINES` edge from its container would prevent
-//! forever. An empty key is treated as no container rather than as a container
-//! whose key is the empty string, which no language in the design doc's table
-//! has.
+//! Any node with a non-empty `container`, except a container node itself and
+//! the four kinds that are an *address* rather than a declaration
+//! (`pending_symbol`, `reexport`, `resolved_module`, `external_module`). Two
+//! things break if a placeholder is counted: `graph::imports` deletes a
+//! linked-away `resolved_module` placeholder with plain SQL (outside
+//! `apply_diff`, so this module would never see it leave), and it only does
+//! so once no edge touches the placeholder - which a `DEFINES` edge from its
+//! container would prevent forever. An empty key is treated as no container
+//! rather than as a container whose key is the empty string, which no
+//! language in the design doc's table has.
+//!
+//! [`membership`] reads this exclusion off `graph::queries::
+//! NON_DECLARATION_NATIVE_KINDS` (GM-376) - the same list `find_by_name`,
+//! `find_by_qualified_name`, `find_by_position` and `mcp::find_definition`'s
+//! candidate page consult, and the one `graph::symbol_links::is_declaration`
+//! has read since GM-372 - rather than spelling its own copy. It had been a
+//! four-kind copy missing `external_module` until now, which
+//! `graph::symbol_links::requesters_below_new_containers`' own comment names
+//! as the coupling to watch: that function compares its upserted-member count
+//! against the `containers.memberCount` this module maintains, so the two
+//! must exclude the same kinds. They agreed on everything any plugin actually
+//! sends only because an import record carries no container at all, so it is
+//! filtered out one line above by the `is_empty` check regardless of which
+//! list is consulted - see `graph::containers::tests::
+//! placeholders_and_empty_keys_are_never_members` for the case that only a
+//! hand-built node (not a shipped plugin) can reach, where the two lists used
+//! to disagree.
 //!
 //! # `parentKey`: last writer wins, and a disagreement is logged
 //!
@@ -172,8 +189,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
+use crate::graph::queries::NON_DECLARATION_NATIVE_KINDS;
 use crate::storage::write::{Diff, NodeRecord};
 
 /// The `nativeKind` of a core-materialized container node. Never plugin-emitted
@@ -237,15 +253,7 @@ fn defines_edge_id(container_node_id: &str, member_id: &str) -> String {
 /// of which container. See the module doc's "Who counts as a member".
 fn membership(language: &str, container: Option<&str>, native_kind: Option<&str>) -> Option<Key> {
     let key = container.filter(|key| !key.is_empty())?;
-    let excluded = matches!(
-        native_kind,
-        Some(
-            PENDING_SYMBOL_NATIVE_KIND
-                | REEXPORT_NATIVE_KIND
-                | RESOLVED_MODULE_NATIVE_KIND
-                | CONTAINER_NATIVE_KIND
-        )
-    );
+    let excluded = native_kind.is_some_and(|kind| NON_DECLARATION_NATIVE_KINDS.contains(&kind));
     (!excluded).then(|| (language.to_string(), key.to_string()))
 }
 
@@ -710,6 +718,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::graph::imports::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
+    use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
     use crate::storage::schema;
     use crate::storage::write::{apply_diff, EdgeRecord};
 
@@ -1079,11 +1089,29 @@ mod tests {
     /// A placeholder is an address, not a declaration: counting one would
     /// keep a linked-away `resolved_module` alive forever (its `DEFINES`
     /// edge is an incident edge `graph::imports` waits to see gone).
+    ///
+    /// `external_module` is in this list too (GM-376) even though no shipped
+    /// plugin ever sends one with a non-empty `container` - the case is only
+    /// reachable the way this test reaches it, by constructing the
+    /// `NodeRecord` directly rather than through a plugin's wire output. It
+    /// is the arm that fails without GM-376's change to [`membership`]: on
+    /// the four-kind copy `membership` used to spell, an `external_module`
+    /// row here was still counted, so `containers.memberCount` would disagree
+    /// with `graph::symbol_links::requesters_below_new_containers`'s own
+    /// count for it - the coupling that function's own comment names. The
+    /// other four kinds fail without any filter at all, so they are not the
+    /// control for this change; see
+    /// `a_module_that_is_not_an_address_is_still_a_member` for that.
     #[test]
     fn placeholders_and_empty_keys_are_never_members() {
         let mut conn = setup(true);
         let mut nodes = Vec::new();
-        for native_kind in [PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND] {
+        for native_kind in [
+            PENDING_SYMBOL_NATIVE_KIND,
+            REEXPORT_NATIVE_KIND,
+            RESOLVED_MODULE_NATIVE_KIND,
+            EXTERNAL_MODULE_NATIVE_KIND,
+        ] {
             let mut placeholder = member(native_kind, "go", Some("pkg"), None);
             placeholder.kind = MODULE_KIND.to_string();
             placeholder.native_kind = Some(native_kind.to_string());
@@ -1094,6 +1122,23 @@ mod tests {
 
         assert_eq!(rows(&conn), vec![]);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM edges"), 0);
+        check_invariants(&conn).unwrap();
+    }
+
+    /// The control for the test above: a `Module`-kind node that is not one
+    /// of the excluded native kinds - a TypeScript namespace is the real
+    /// example (`plugins/typescript/src/extract.ts` emits `kind: "Module",
+    /// nativeKind: "namespace"`) - is still a member, so the exclusion above
+    /// is about `nativeKind`, not about `kind == "Module"`.
+    #[test]
+    fn a_module_that_is_not_an_address_is_still_a_member() {
+        let mut conn = setup(true);
+        let mut namespace = member("ns", "typescript", Some("pkg"), None);
+        namespace.kind = MODULE_KIND.to_string();
+        namespace.native_kind = Some("namespace".to_string());
+        apply_diff(&mut conn, &upsert(vec![namespace])).unwrap();
+
+        assert_eq!(row(&conn, "typescript", "pkg").unwrap().member_count, 1);
         check_invariants(&conn).unwrap();
     }
 
