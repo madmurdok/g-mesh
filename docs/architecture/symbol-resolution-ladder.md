@@ -113,6 +113,22 @@ or a case variant of one, that no declaration is named), not by the one in the t
 `graph::queries::find_in_file_named`'s own doc has that sweep, and why preferring a declaration
 named like the file lost to it.
 
+**How that 107 was counted, because the obvious way gets 14 (GM-373).** GM-367 established the
+probe this project now reaches for whenever a rung has to be measured: take every distinct `name`
+and `qualifiedName` in an index — 12,774 spellings across gin, requests and ripgrep — and run each
+through the handler. It is a good instrument and it is the wrong one here. Rung 4 is reached by a
+*file stem*, or a case variant of one, that **no declaration carries as its name or
+qualifiedName** — and most file stems are not themselves indexed spellings, so the sweep never
+types them. It finds 14 of the 107. The danger is not that it is incomplete; it is that it returns
+a confident, quantified answer over thousands of inputs, so 13% coverage reads exactly like a
+complete sweep. Anything re-measuring this rung must enumerate stems instead. GM-373's enumeration
+is a SQL reproduction of the rung's own query and agrees with the real handler row-for-row on all
+14 × 2 arms where the two can be compared, which is what licenses using it in place of the
+handler. It has since been reused unchanged, by GM-377, to measure a different property of the
+same 107 pages — that 12 of them draw rows from more than one file — so it is an instrument rather
+than one task's scaffolding.
+
+
 A spelling that only import placeholders carry therefore falls through to a rung of its own,
 between 4 and 5: `import_only_refusal`, which refuses and says what the name *is* —
 `"nothing named 'http' is declared in this project. It names something this project imports:
