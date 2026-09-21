@@ -72,7 +72,10 @@ What lands on disk is a *directory*, not one file — by default `~/.g-mesh/bin`
 ```
 ~/.g-mesh/bin/
   g-mesh                 the core binary
-  plugins/typescript/    the plugin core discovers beside it
+  plugins/typescript/    the JS/TS plugin core discovers beside it
+  plugins/go/            the Go plugin, discovered the same way
+  plugins/rust/          the Rust plugin, discovered the same way
+  plugins/python/        the Python plugin, discovered the same way
   LICENSE*, README.md
 ```
 
@@ -137,9 +140,17 @@ build-from-source path below is the only one that works.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`, stable) — build the core.
-- Node.js >= 20 and `node` on `PATH` — build the plugin, and required at
-  *runtime* because the daemon spawns the plugin via `node <entry.js>`.
+- Rust toolchain (`cargo`, stable) — build the core, the Rust plugin and the
+  Python plugin (both are cargo workspace members).
+- Node.js >= 20 and `node` on `PATH` — build the JS/TS plugin, and required
+  at *runtime* because the daemon spawns it via `node <entry.js>`.
+- Go toolchain (`go` on `PATH`) — `core/build.rs` builds the bundled Go
+  plugin automatically whenever core is built. It is best-effort like the
+  JS/TS build step next to it: a missing toolchain only prints a
+  `cargo:warning`, it does not fail `cargo build`. Without it, the checkout
+  simply has no working Go plugin — `g-mesh plugins list` won't show `go`,
+  and a dev-checkout daemon (which discovers every bundled plugin
+  unconditionally) won't start until it is built some other way.
 
 ## Build
 
@@ -147,18 +158,30 @@ build-from-source path below is the only one that works.
 # 1. Core (Rust binary: g-mesh, with the mcp-shim/daemon subcommands)
 cargo build --release -p g-mesh
 # -> target/release/g-mesh
+# core/build.rs also builds the Go plugin here, best-effort, as long as a
+# Go toolchain is on PATH (see Prerequisites) -> plugins/go/g-mesh-plugin-go
 
 # 2. JS/TS plugin
 cd plugins/typescript
 npm install
 npm run build
+cd ../..
 # -> plugins/typescript/dist/src/index.js
+
+# 3. Rust plugin
+cargo build -p g-mesh-plugin-rust
+# -> target/debug/g-mesh-plugin-rust
+
+# 4. Python plugin
+cargo build -p g-mesh-plugin-python
+# -> target/debug/g-mesh-plugin-python
 ```
 
-Build order doesn't matter, but both are required — the daemon refuses to
-start (hard failure) if it can't spawn the plugin.
+Build order doesn't matter, but all four are required — a dev checkout's
+daemon discovers every bundled plugin unconditionally and refuses to start
+(hard failure) if it can't spawn one of them.
 
-### 3. Embedding model (optional — only `search_code` needs it)
+### 5. Embedding model (optional — only `search_code` needs it)
 
 The seven structural tools work with nothing else installed. `search_code`,
 the semantic one, needs a model directory that **you fetch explicitly** —
@@ -269,6 +292,11 @@ g-mesh-v<version>-<triple>/
     node_modules/                         its native tree-sitter grammars
     plugin.toml                           how core discovers and spawns it
     LICENSE-nodejs                        the embedded runtime's notice
+  plugins/go/
+    g-mesh-plugin-go[.exe]                the Go plugin - one static,
+                                           CGO-free binary cross-compiled for
+                                           this target, no runtime to embed
+    plugin.toml                           how core discovers and spawns it
   plugins/rust/
     g-mesh-plugin-rust                    the Rust plugin - a plain cargo
                                            binary, no runtime to embed
@@ -279,6 +307,11 @@ g-mesh-v<version>-<triple>/
     plugin.toml                           how core discovers and spawns it
   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 ```
+
+The Go plugin (GM-283) needs no native runner at all, unlike the other
+three — `scripts/bundle-go-plugin.sh` cross-compiles it
+(`CGO_ENABLED=0 GOOS=... GOARCH=...`) into one static binary for any target
+from any host, and writes an installed `plugin.toml` naming that binary.
 
 The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
 SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
