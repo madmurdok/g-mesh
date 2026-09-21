@@ -193,11 +193,12 @@ func nodesEqual(a, b wireNode) bool {
 // writes the kit's marker, and that call can only be reached from here.
 //
 // With no Go toolchain on PATH, or a `packages.Load` that fails outright,
-// the engine logs once and returns an empty diff, exactly as this function
-// did before there was an engine at all - the structural graph stays, Go's
-// `language_state.semanticPassAt` is never set, and the receiver-call gap
-// stays listed in the MCP instructions.
-func (s *pluginState) handleSemanticPass(filePaths []string) fileChangeDiff {
+// the engine logs once and returns an empty diff with the second return
+// value `true` - GM-384's `incomplete`, without which the structural graph
+// stayed put but Go's `language_state.semanticPassAt` got set anyway, and
+// the receiver-call gap dropped out of the MCP instructions despite no
+// semantic tier having actually run.
+func (s *pluginState) handleSemanticPass(filePaths []string) (fileChangeDiff, bool) {
 	return s.semantic.run(s.workspace, filePaths)
 }
 
@@ -229,7 +230,10 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		logf("file changed: %s", params.FilePath)
 		diff := state.handleFileChanged(params.FilePath)
 		if hasID {
-			writeResult(out, env.ID, diff)
+			// A structural reparse has nothing to be incomplete about
+			// (core/src/watcher/apply.rs's own comment on this same
+			// distinction) - always `false`.
+			writeResult(out, env.ID, diff, false)
 		}
 		return
 
@@ -244,9 +248,9 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		} else {
 			logf("semantic pass requested for %d file(s)", len(params.FilePaths))
 		}
-		diff := state.handleSemanticPass(params.FilePaths)
+		diff, incomplete := state.handleSemanticPass(params.FilePaths)
 		if hasID {
-			writeResult(out, env.ID, diff)
+			writeResult(out, env.ID, diff, incomplete)
 		}
 		return
 
@@ -299,8 +303,8 @@ func workspaceChangedFilePath(params json.RawMessage) string {
 	return p.FilePath
 }
 
-func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff) {
-	body, err := json.Marshal(fileChangeResponse{JSONRPC: jsonrpcVersion, ID: id, Result: diff})
+func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incomplete bool) {
+	body, err := json.Marshal(fileChangeResponse{JSONRPC: jsonrpcVersion, ID: id, Result: diff, Incomplete: incomplete})
 	if err != nil {
 		logf("failed to encode response: %v", err)
 		return

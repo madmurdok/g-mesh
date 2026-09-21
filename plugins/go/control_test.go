@@ -225,13 +225,69 @@ func TestOpenSitesAreCachedPerFileAndReplacedWholesale(t *testing.T) {
 
 func TestHandleSemanticPassAlwaysAnswersEmpty(t *testing.T) {
 	state := newPluginState(t.TempDir())
-	diff := state.handleSemanticPass(nil)
+	diff, incomplete := state.handleSemanticPass(nil)
 	if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 {
 		t.Fatalf("handleSemanticPass(nil) = %+v, want an empty diff", diff)
 	}
-	diff = state.handleSemanticPass([]string{"a.go"})
+	if incomplete {
+		t.Fatalf("handleSemanticPass(nil) on an empty project answered incomplete=true, want false - " +
+			"there was nothing to resolve, which is a trivially complete pass")
+	}
+	diff, incomplete = state.handleSemanticPass([]string{"a.go"})
 	if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 {
 		t.Fatalf("handleSemanticPass([a.go]) = %+v, want an empty diff", diff)
+	}
+	if incomplete {
+		t.Fatalf("handleSemanticPass([a.go]) for a file this project doesn't have answered incomplete=true, want false")
+	}
+}
+
+// GM-384: the discriminating case. `semantic.go`'s doc comment used to claim
+// that with no `go` on PATH, "language_state.semanticPassAt is never set for
+// Go" - false, because nothing here ever told core the pass was incomplete:
+// an empty diff and a *complete* diff are the same wire shape unless
+// `incomplete` says otherwise (wire/src/lib.rs's `FileChangeResponse::
+// incomplete`), and core's `apply_semantic_pass`
+// (core/src/watcher/apply.rs) only withholds the timestamp when that field
+// is `true`. So a Go-only index with no toolchain looked exactly like one
+// whose semantic pass had just finished - `semanticPassAt` got set, and
+// both `mcp::provenance` and the receiver-call gap in `mcp::instructions`
+// believed it.
+//
+// Driven through `handleEnvelope` end to end, because the thing core's
+// `apply_semantic_pass` actually reads is the marshaled JSON response, not
+// this process's internal return value - a passing check on the Go value
+// alone would not prove the wire contract is honored.
+func TestSemanticPassWithoutAToolchainReportsIncompleteOnTheWire(t *testing.T) {
+	root := writeProbeProject(t)
+
+	// Emptied rather than narrowed, matching
+	// TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff: exec.LookPath
+	// consults PATH only, so this is exactly "no toolchain installed."
+	t.Setenv("PATH", "")
+
+	state := newPluginState(root)
+
+	var out bytes.Buffer
+	handleEnvelope(state, controlEnvelope{
+		JSONRPC: jsonrpcVersion,
+		ID:      json.RawMessage("1"),
+		Method:  "semanticPass",
+		Params:  json.RawMessage(`{"filePaths":[]}`),
+	}, &out)
+
+	frames := readFrames(t, bufio.NewReader(&out))
+	if len(frames) != 1 {
+		t.Fatalf("got %d response frame(s), want 1: %+v", len(frames), frames)
+	}
+	incomplete, _ := frames[0]["incomplete"].(bool)
+	if !incomplete {
+		t.Fatalf(
+			"whole-project semanticPass without a toolchain answered %+v, want \"incomplete\":true on the wire - "+
+				"without it, core's apply_semantic_pass records the pass as done and both mcp::provenance and "+
+				"the receiver-call gap in mcp::instructions believe a semantic tier ran that never did",
+			frames[0],
+		)
 	}
 }
 

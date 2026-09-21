@@ -47,11 +47,17 @@ package main
 // # Degradation
 //
 // No `go` on PATH, or a `packages.Load` that fails outright: log once and
-// answer with an empty diff. The structural graph stays exactly as it was,
-// `language_state.semanticPassAt` is never set for Go, and the MCP
-// instructions keep listing the receiver-call gap - the design doc's
-// "Semantic engine missing" failure mode, which is a *partial* index rather
-// than a broken one.
+// answer with an empty diff and `incomplete: true` (wire/src/lib.rs's
+// `FileChangeResponse::incomplete`). That field is what makes the rest of
+// the sentence true rather than aspirational: core's
+// `watcher::apply::apply_semantic_pass` withholds
+// `language_state.semanticPassAt` only when a whole-project pass reports
+// itself incomplete, so the structural graph stays exactly as it was,
+// `semanticPassAt` is never set for Go, and the MCP instructions keep
+// listing the receiver-call gap - the design doc's "Semantic engine
+// missing" failure mode, which is a *partial* index rather than a broken
+// one. A pass that resolved nothing but never says so is, on the wire, a
+// pass that finished - see GM-384.
 //
 // # What this pass does not answer
 //
@@ -447,15 +453,23 @@ func (e *semanticEngine) isProjectContainer(path string) bool {
 // run answers one `semanticPass` request. `filePaths` empty means the whole
 // project, core's own convention (protocol::types::ControlMessage::
 // SemanticPass).
-func (e *semanticEngine) run(ws *workspace, filePaths []string) fileChangeDiff {
+//
+// The second return is wire.go's `fileChangeResponse.Incomplete`: `true`
+// when this pass could not even try to resolve what it was asked about (no
+// toolchain, or every module's `go list` failed), `false` when it ran to
+// completion - including the trivial completion of "there was nothing in
+// scope to resolve." That distinction is why an empty `scope` and a failed
+// `loadFor` are not the same return: both answer an empty diff, but only
+// the second one is a pass that owed an answer and did not give one.
+func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff, bool) {
 	started := time.Now()
 	e.ws = ws
 	defer func() { e.ws = nil }()
 
 	if _, err := exec.LookPath("go"); err != nil {
 		e.degrade("semantic pass degraded: no `go` binary on PATH (%v) - answering every "+
-			"semanticPass with an empty diff; the structural graph is unaffected", err)
-		return emptyDiff()
+			"semanticPass with an empty diff, incomplete=true; the structural graph is unaffected", err)
+		return emptyDiff(), true
 	}
 
 	wholeProject := len(filePaths) == 0
@@ -466,13 +480,13 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) fileChangeDiff {
 		scope = e.claimedFiles(filePaths)
 	}
 	if len(scope) == 0 {
-		return emptyDiff()
+		return emptyDiff(), false
 	}
 
 	structural := e.extractStructural(ws, scope)
 	resolved := newResolutions()
 	if !e.loadFor(ws, resolved, wholeProject, scope) {
-		return emptyDiff()
+		return emptyDiff(), true
 	}
 
 	builder := newSemanticDiff()
@@ -487,7 +501,7 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) fileChangeDiff {
 		"%d node(s)/%d edge(s) upserted, %d edge(s) retracted, in %s",
 		len(scope), sites, implementsEdges, len(diff.UpsertNodes), len(diff.UpsertEdges),
 		len(diff.DeleteEdgeIds), time.Since(started).Round(time.Millisecond))
-	return diff
+	return diff, false
 }
 
 // claimedFiles narrows a per-file request to the `.go` files this plugin

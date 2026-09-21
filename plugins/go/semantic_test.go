@@ -194,7 +194,10 @@ func TestSemanticPassResolvesEveryOpenShape(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	diff := state.handleSemanticPass(nil)
+	diff, incomplete := state.handleSemanticPass(nil)
+	if incomplete {
+		t.Fatalf("a whole-project pass with a toolchain present answered incomplete=true")
+	}
 
 	want := []string{
 		// Implicit interface satisfaction - nothing in either type's syntax
@@ -259,7 +262,7 @@ func TestSemanticPassRetractsCallsOntoAType(t *testing.T) {
 	}
 
 	state := newPluginState(root)
-	diff := state.handleSemanticPass(nil)
+	diff, _ := state.handleSemanticPass(nil)
 
 	retracted := map[string]bool{}
 	for _, id := range diff.DeleteEdgeIds {
@@ -286,8 +289,10 @@ func TestSemanticPassIsDeterministic(t *testing.T) {
 	requireGoToolchain(t)
 	root := writeProbeProject(t)
 
-	first := renderEdges(t, root, newPluginState(root).handleSemanticPass(nil))
-	second := renderEdges(t, root, newPluginState(root).handleSemanticPass(nil))
+	firstDiff, _ := newPluginState(root).handleSemanticPass(nil)
+	secondDiff, _ := newPluginState(root).handleSemanticPass(nil)
+	first := renderEdges(t, root, firstDiff)
+	second := renderEdges(t, root, secondDiff)
 	if !equalStrings(first, second) {
 		t.Fatalf("two passes over one tree disagreed:\n  %s\nvs\n  %s",
 			strings.Join(first, "\n  "), strings.Join(second, "\n  "))
@@ -365,7 +370,8 @@ func TestSemanticPassExcludesAnInterfaceFromItsOwnImplementors(t *testing.T) {
 	root := writeSelfImplementsProject(t)
 
 	state := newPluginState(root)
-	got := renderEdges(t, root, state.handleSemanticPass(nil))
+	diff, _ := state.handleSemanticPass(nil)
+	got := renderEdges(t, root, diff)
 	want := []string{
 		"talk.go:Loud SUPERTYPE_OF example.com/subprobe#Talker",
 		// The test file's own call through a composite literal receiver -
@@ -386,7 +392,8 @@ func TestSemanticPassPerFileAnswersOnlyThatFile(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	got := renderEdges(t, root, state.handleSemanticPass([]string{"dotuse.go"}))
+	diff, _ := state.handleSemanticPass([]string{"dotuse.go"})
+	got := renderEdges(t, root, diff)
 	want := []string{"dotuse.go:dotImported CALLS example.com/probe/dotted#DotFunc"}
 	if !equalStrings(got, want) {
 		t.Fatalf("per-file pass produced\n  %s\nwant\n  %s",
@@ -404,7 +411,7 @@ func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	before := state.handleSemanticPass(nil)
+	before, _ := state.handleSemanticPass(nil)
 
 	var dotCall string
 	for _, edge := range before.UpsertEdges {
@@ -426,7 +433,7 @@ func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
 		t.Fatalf("rewrite dotuse.go: %v", err)
 	}
 
-	after := state.handleSemanticPass([]string{"dotuse.go"})
+	after, _ := state.handleSemanticPass([]string{"dotuse.go"})
 	retracted := false
 	for _, id := range after.DeleteEdgeIds {
 		if id == dotCall {
@@ -443,8 +450,8 @@ func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
 }
 
 // The design doc's "Semantic engine missing" failure mode: no `go` binary,
-// one log line, an empty diff, and a structural graph that is completely
-// untouched.
+// one log line, an empty diff answered `incomplete: true` (GM-384), and a
+// structural graph that is completely untouched.
 func TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff(t *testing.T) {
 	root := writeProbeProject(t)
 
@@ -463,10 +470,14 @@ func TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff(t *testing.T) {
 	}
 
 	for _, filePaths := range [][]string{nil, {"use.go"}} {
-		diff := state.handleSemanticPass(filePaths)
+		diff, incomplete := state.handleSemanticPass(filePaths)
 		if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 ||
 			len(diff.DeleteNodeIds) != 0 || len(diff.DeleteEdgeIds) != 0 {
 			t.Fatalf("semanticPass(%v) without a toolchain answered %+v, want an empty diff", filePaths, diff)
+		}
+		if !incomplete {
+			t.Fatalf("semanticPass(%v) without a toolchain answered incomplete=false, want true - "+
+				"otherwise core records the pass as done and never asks again", filePaths)
 		}
 	}
 }

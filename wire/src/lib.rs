@@ -426,11 +426,13 @@ pub struct FileChangeResponse {
     /// nothing.
     ///
     /// Absent means `false`, so a plugin that predates this field - the
-    /// bundled Go and JS/TS plugins, and any third-party one - keeps
-    /// answering exactly as it did: a pass that answers at all is a pass that
-    /// finished. That is also why this is not an enum: the only thing core
-    /// branches on is "was this pass complete", and the reason it was not is
-    /// the plugin's own to log, in words, where there is room for it.
+    /// bundled JS/TS plugin (GM-384 gave the bundled Go plugin its own
+    /// `incomplete: true`), and any third-party one that has not adopted it -
+    /// keeps answering exactly as it did: a pass that answers at all is a
+    /// pass that finished. That is also why this is not an enum: the only
+    /// thing core branches on is "was this pass complete", and the reason it
+    /// was not is the plugin's own to log, in words, where there is room for
+    /// it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub incomplete: bool,
 }

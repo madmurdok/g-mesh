@@ -98,10 +98,11 @@ These are gaps this plugin has and will report honestly rather than guess at.
   unresolved.
 - **No toolchain, no semantic tier.** With no `go` on `PATH` (or a
   `packages.Load` that fails outright) the plugin logs one line and answers
-  every `semanticPass` with an empty diff. The structural graph is complete
-  and unaffected, Go's `language_state.semanticPassAt` is never set, and
-  core's MCP instructions go on listing the receiver-call gap for Go — a
-  partial index that says so, rather than a broken one.
+  every `semanticPass` with an empty diff and `incomplete: true`. The
+  structural graph is complete and unaffected, Go's
+  `language_state.semanticPassAt` is never set, and core's MCP instructions
+  go on listing the receiver-call gap for Go — a partial index that says so,
+  rather than a broken one.
 
 ## Dependencies
 
