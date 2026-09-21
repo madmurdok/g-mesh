@@ -96,6 +96,25 @@ use crate::storage::write::Diff;
 /// the two are one wire contract and must be changed together.
 pub const RESOLVED_MODULE_NATIVE_KIND: &str = "resolved_module";
 
+/// The `nativeKind` a plugin marks an import it could *not* resolve to
+/// anything in this project with - a package, a language builtin, a crate
+/// nothing here walks. Mirrors `EXTERNAL_MODULE_NATIVE_KIND` in
+/// plugins/typescript/src/extract.ts and the same literal in the Python and
+/// Rust plugins' emitters; all of them are one wire contract.
+///
+/// Unlike [`RESOLVED_MODULE_NATIVE_KIND`] and the two placeholder kinds in
+/// `graph::symbol_links`, core never links one - there is nothing in the
+/// index for it to point at, which is what "external" means here - so it is
+/// stored as an ordinary `Module` row, and until GM-367 the symbol lookups
+/// answered with one as though it were a declaration. See `graph::queries`'
+/// own header for that, and `protocol::conformance` for why it is exempt
+/// from the "a placeholder nativeKind requires a target" rule.
+///
+/// Lives here rather than in the one module that used to spell it
+/// (`cli::plugin_check::checks`, privately) now that a second module needs
+/// it: two copies of a wire literal is how they come to disagree.
+pub const EXTERNAL_MODULE_NATIVE_KIND: &str = "external_module";
+
 const MODULE_KIND: &str = "Module";
 const FILE_KIND: &str = "File";
 

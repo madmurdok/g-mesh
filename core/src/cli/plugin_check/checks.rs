@@ -114,20 +114,17 @@ use crate::cli::plugin_check::session::{
     BulkLine, BulkRun, EditTarget, Exchange, Method, Session, StoredRange,
 };
 use crate::daemon::manifest::PluginManifest;
+use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::protocol::conformance::{
     placeholder_target_violation, plugin_emitted_container_violation, PLACEHOLDER_NATIVE_KINDS,
 };
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, WireEdge, WireNode};
 
-/// The TS plugin's `nativeKind` for an import it could not resolve to a file
-/// of the project (a package, a node builtin). Not one of core's placeholder
-/// kinds - core stores it as an ordinary `Module` row and never links it - but
-/// that is exactly why an edge onto it is a placeholder edge for the
-/// same-file rule: nothing will ever confirm it, so `resolved: true` would be
-/// a false claim.
-const EXTERNAL_MODULE_NATIVE_KIND: &str = "external_module";
-
+/// An `external_module` node is not one of core's placeholder kinds - core
+/// stores it as an ordinary `Module` row and never links it - but that is
+/// exactly why an edge onto it is a placeholder edge for the same-file rule:
+/// nothing will ever confirm it, so `resolved: true` would be a false claim.
 pub(crate) fn is_placeholder(native_kind: Option<&str>) -> bool {
     native_kind
         .is_some_and(|kind| PLACEHOLDER_NATIVE_KINDS.contains(&kind) || kind == EXTERNAL_MODULE_NATIVE_KIND)

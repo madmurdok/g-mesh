@@ -90,9 +90,29 @@ facts about module depth. So rung 2 now requires that the query is not also some
 `name` (the language-agnostic way to say "genuinely qualified" — no separator to know), and several
 exact matches is rung 2′, an ambiguity, rather than a miss that falls all the way to rung 5.
 
-Rung 2′ is skipped for a specifier-shaped query (`is_module_specifier`), which keeps its refusal:
-gin's `net/http` is carried by 63 `external_module` import placeholders, one per importing file, and
-a page of those is noise, not candidates.
+**Every rung answers with a declaration, and GM-367 is where that became true.** Rungs 2, 2′, 3 and
+3′ all read `graph::queries`' name/qualifiedName lookups, and those lookups excluded three
+non-declaration `nativeKind`s where there are five: an *import placeholder* — the graph's record
+that a file imported something, with no body and no definition site here — was a legitimate answer.
+Measured on gin: `find_definition("context")` took rung 2 to a placeholder in `context_test.go`,
+labelled `resolvedBy: "qualifiedName"`, and `find_definition("http")` took rung 2′ to a page of 20
+such rows out of 63. The exclusion lives in the shared lookups, so it reaches all five tools at
+once; `graph::queries`' own header records the decision (exclude outright, rather than keep them
+and mark them) and why the alternative lost.
+
+A spelling that only import placeholders carry therefore falls through to a rung of its own,
+between 4 and 5: `import_only_refusal`, which refuses and says what the name *is* —
+`"nothing named 'http' is declared in this project. It names something this project imports:
+'net/http' (63) … use get_dependencies"`. It sits before the semantic rung because it states what
+the index records and rung 5 offers a resemblance; it sits after rung 4 because gin's `context`
+really is `context.go`, and that file's declarations are the better answer.
+
+Rung 2′ used to be skipped for a specifier-shaped query (`is_module_specifier`), which was GM-360's
+guard against exactly those 63 `net/http` placeholders. With them excluded one layer down the guard
+is unreachable — across gin, ripgrep, requests and excalidraw, every remaining specifier-shaped
+`qualifiedName` belongs to a `File` node, and a file path is unique within a project by
+construction, so "two or more exact matches" cannot arise for one. GM-367 removed it from that arm.
+`is_module_specifier` itself stays, for rung 5, where shape decides something a score cannot.
 
 The distinction that carries the design: **rungs 3′, 4 and 5 return the same shape** — a page of
 candidates the caller re-queries by id — and differ only in `resolvedBy`. That reuses a contract the

@@ -1272,6 +1272,33 @@ mod tests {
         conn
     }
 
+    /// [`is_declaration`] here and `graph::queries`'
+    /// `NON_DECLARATION_NATIVE_KINDS` there answer two different questions -
+    /// "may this node be *linked onto*, at index time" and "may it be the
+    /// *answer* to a symbol lookup" - and are allowed to differ. They are
+    /// allowed to differ *deliberately*, which is what this pins: GM-367
+    /// added `external_module` to the lookup side, having found that an
+    /// import placeholder was being answered as a declaration, and left this
+    /// side alone, because excluding one here would repoint edges during
+    /// linking rather than narrow an answer at query time - a change with its
+    /// own evidence to collect.
+    ///
+    /// So the difference is exactly one kind. If it ever becomes zero or two,
+    /// that is a decision, and it fails here until someone records it.
+    #[test]
+    fn the_link_filter_and_the_lookup_filter_differ_by_exactly_external_module() {
+        let linkable_but_not_an_answer: Vec<&str> = crate::graph::queries::NON_DECLARATION_NATIVE_KINDS
+            .into_iter()
+            .filter(|kind| is_declaration(Some(kind)))
+            .collect();
+
+        assert_eq!(
+            linkable_but_not_an_answer,
+            vec![crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND],
+            "the two filters may differ, but only by the one kind GM-367 argued about"
+        );
+    }
+
     fn symbol(file: &str, name: &str, kind: &str, exported: bool) -> NodeRecord {
         let mut node = NodeRecord::new(format!("{kind}:{file}:{name}"), kind, name, name, file, "typescript");
         // Both fields, kept in lockstep by hand here the same way every
