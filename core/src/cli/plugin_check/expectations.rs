@@ -60,9 +60,11 @@
 //!
 //! # Decision 2: the answer format
 //!
-//! Every expectation's `expect` list is a *set* of strings - order and
-//! duplicates never matter (`BTreeSet` throughout, and the diff a failure
-//! prints is one too, so a re-ordered fixture is never a spurious failure):
+//! Every expectation's `expect` list is a *set* of strings - order never
+//! matters (`BTreeSet` throughout, and the diff a failure prints is one too,
+//! so a re-ordered fixture is never a spurious failure). Whether a *repeated*
+//! row matters is decision 8, which is a per-category question rather than a
+//! property of this format:
 //!
 //! - **`[[callers]]` / `[[references]]` / `[[implementations]]`**: each
 //!   result row renders as `"{filePath}:{qualifiedName}"` - except a
@@ -94,6 +96,12 @@
 //!   (`DependencyNode` carrying `nativeKind`) this task does not add, and no
 //!   caller of `get_dependencies` needs the distinction either: both answer
 //!   "this import didn't resolve to a file in the project".
+//! - **`[[importers]]`**: the same rows, from the same tool, walked
+//!   `Incoming` - see decision 7. In practice every row is a bare file path,
+//!   because an `IMPORTS` edge starts at the file where the `use`/`import`
+//!   line is written; the `container:` spelling is shared with `[[imports]]`
+//!   rather than forbidden here, so that a plugin which one day points an
+//!   import at a container renders the same way in both directions.
 //!
 //! # Decision 3: anchoring and ambiguity
 //!
@@ -188,10 +196,98 @@
 //! second one. `plugins/go/conformance/expect.toml`'s four `go/types`-only
 //! entries (three `[[callers]]`, one `[[implementations]]`) carry the tag;
 //! everything else - bare and package-qualified calls, references,
-//! `[[imports]]`, `[[definition]]` - answers from the structural tier alone
-//! and is untagged.
+//! `[[imports]]`, `[[importers]]`, `[[definition]]` - answers from the
+//! structural tier alone and is untagged.
+//!
+//! # Decision 7: the incoming direction (GM-365)
+//!
+//! Until this task every category here asked a question in the *outgoing*
+//! direction: who calls this, what does this file import, what implements
+//! this. Three of the 3.8.0 batch's six wrong answers were about the other
+//! one - GM-356 (an `Incoming` walk anchored on a file answered a
+//! well-formed zero outside TypeScript) and GM-358 (`from <pkg> import
+//! <submodule>` built no `IMPORTS` edge, so a 13-file answer silently
+//! missed a fourteenth) - and no expectation in any of the four fixtures
+//! could have caught either, because none of them ran a walk in that
+//! direction at all. `[[importers]]` is that direction:
+//! `get_dependencies(file, Incoming, max_depth = 1)`, the same handler
+//! `[[imports]]` already drives with `Outgoing`.
+//!
+//! **A separate list rather than a `direction` key on `[[imports]]`**, for
+//! two reasons that are both about what a failure says: the report id is
+//! `expectations.importers[2]`, which names the direction without anyone
+//! having to open the fixture, and `deny_unknown_fields` (decision 5) then
+//! keeps [`ImportersExpectation`]'s `via_module` - which is meaningless
+//! outgoing - out of an `[[imports]]` entry by construction.
+//!
+//! **`via_module` asserts GM-356's substitution, and its absence asserts
+//! the lack of one.** Outside TypeScript an `IMPORTS` edge arrives at a
+//! *container* (`pkg.helpers`, `alpha::internals`,
+//! `github.com/example/app/server`), never at a file, so an `Incoming` walk
+//! literally anchored on a file is empty by construction;
+//! `get_dependencies`'s `incoming_from_file` substitutes the module that
+//! file defines and reports it through `resolvedFrom.qualifiedName`. An
+//! entry that gives `via_module` requires exactly that key; an entry that
+//! omits it requires the response to carry no `resolvedFrom` at all - the
+//! walk ran from the file itself, which is TypeScript's shape, where a
+//! module *is* a file. Both directions are checked because only the pair
+//! discriminates: a fixture asserting the importer set alone would pass
+//! whether the answer came from the file or from a module chosen for it,
+//! which is precisely the distinction GM-356 turned out to be about.
+//!
+//! **A language this does not apply to says so in its own file.** Nothing
+//! here lets a fixture omit a category and still look complete, which is the
+//! defect class the whole 3.8.0 batch is about - so the four bundled
+//! `expect.toml`s each carry an `[[importers]]` entry and each say in prose
+//! which arm of the substitution they are (three substituting, TypeScript
+//! not). Two things this kit genuinely cannot assert are written down for
+//! the same reason rather than left to be re-derived: a duplicate row
+//! outside `[[implementations]]`/`[[imports]]`/`[[importers]]` (decision 8),
+//! and anything about a *position*. GM-363 documented that `startLine` is
+//! zero-based while `source.firstLine` beside it is one-based; no
+//! expectation can check that, and not by omission - decision 1 evaluates
+//! against an index whose chosen file has deliberately been left
+//! line-shifted by `session::declaration_edit`, and decision 2's
+//! `file:qualifiedName` answer format is what makes that safe. A category
+//! carrying coordinates would have to give that up, so GM-363's coverage is
+//! its unit tests and this paragraph.
+//!
+//! # Decision 8: a repeated row, where repeating is not an answer (GM-361)
+//!
+//! A `BTreeSet` cannot see a duplicate, and GM-361 found one that mattered:
+//! `find_implementations` listed *edges*, so an implementor both of a
+//! plugin's tiers had found appeared twice, and the measured ripgrep page
+//! was 12 rows describing 7 implementors. That defect is invisible to a set
+//! comparison - with GM-361's de-duplication disabled the whole rust
+//! conformance suite still passed, which that fixture's own comment records.
+//!
+//! So the set is no longer the only thing compared. For the categories whose
+//! tool promises one row per *answer* - `[[implementations]]`
+//! (`Distinctness::OtherEndpoint`, one row per implementing type) and
+//! `[[imports]]`/`[[importers]]` (a traversal visits a node once) - a
+//! repeated `"{filePath}:{qualifiedName}"` row fails the entry, naming what
+//! repeated and how often, even when the *set* matches exactly.
+//!
+//! `[[callers]]` and `[[references]]` are deliberately exempt, and that is
+//! why the check is per category rather than global: those two run on
+//! `Distinctness::Edges`, where two rows for one symbol are two usages, and
+//! that is the contract (`pagination::Distinctness`' own doc: "two `f();
+//! f();` in one function genuinely are two calls"). Failing them on a repeat
+//! would assert the opposite of what `find_references` guarantees. Their
+//! sets stay sets, and the limitation is stated here rather than silently
+//! tolerated.
+//!
+//! One shape this check would misread, written down because it is a cost of
+//! having it: two *distinct* declarations sharing a file and a
+//! `qualifiedName`, both implementing the anchor, render as one string twice
+//! and would be reported as a repeat. Decision 2's answer format already
+//! cannot tell those two apart - the expected set can only name the row once
+//! either way - so the fix if it ever happens is an answer format carrying
+//! an id, not dropping this check. No bundled fixture has one (all four
+//! suites pass), and a failure names the row, so the day one appears it is
+//! visible rather than silent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -224,6 +320,8 @@ pub(crate) struct ExpectFile {
     implementations: Vec<SymbolExpectation>,
     #[serde(default)]
     imports: Vec<ImportsExpectation>,
+    #[serde(default)]
+    importers: Vec<ImportersExpectation>,
     #[serde(default)]
     definition: Vec<SymbolExpectation>,
 }
@@ -273,6 +371,28 @@ struct ImportsExpectation {
     /// `[[imports]]` entry needs the semantic tier today, but the field
     /// exists here too so one that does never has to duplicate the file to
     /// say so.
+    #[serde(default)]
+    tier: Tier,
+}
+
+/// One `[[importers]]` entry: the same tool and the same hop, walked the
+/// other way - `get_dependencies` from `file`, one hop (`Incoming`) - which
+/// is decision 7's whole subject.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportersExpectation {
+    file: String,
+    /// The container key the walk is required to have run from, reported by
+    /// `get_dependencies` as `resolvedFrom.qualifiedName` (GM-356).
+    ///
+    /// **Absent is an assertion too**, not "don't check": it requires the
+    /// response to carry no `resolvedFrom` at all, i.e. that the anchor was
+    /// taken literally. Decision 7 has why the pair is what discriminates.
+    #[serde(default)]
+    via_module: Option<String>,
+    expect: Vec<String>,
+    /// Decision 6. Absent means `Structural` - an `IMPORTS` edge is
+    /// structural in every bundled plugin, so no entry needs the tag today.
     #[serde(default)]
     tier: Tier,
 }
@@ -328,6 +448,11 @@ pub(crate) fn evaluate(ctx: &EvalContext, expect: &ExpectFile, skip_semantic: bo
     for (index, item) in expect.imports.iter().enumerate() {
         results.push(skip_or_eval(skip_semantic, "imports", index, item.tier, || {
             eval_imports_expectation(ctx, index, item)
+        }));
+    }
+    for (index, item) in expect.importers.iter().enumerate() {
+        results.push(skip_or_eval(skip_semantic, "importers", index, item.tier, || {
+            eval_importers_expectation(ctx, index, item)
         }));
     }
     for (index, item) in expect.definition.iter().enumerate() {
@@ -428,9 +553,18 @@ fn eval_symbol_expectation(
             if let Some(finding) = page_truncation_finding(&value, tool.label()) {
                 return fail(id, vec![finding]);
             }
-            let actual = rows_to_set(&value);
+            let rows = rows_to_list(&value);
+            // Decision 8, and only for the one tool of the three whose
+            // contract is one row per answer. `Callers`/`References` walk
+            // `Distinctness::Edges`, where a repeat is a second usage.
+            let findings = match tool {
+                SymbolTool::Implementations => duplicate_row_finding(&rows).into_iter().collect(),
+                SymbolTool::Callers | SymbolTool::References => Vec::new(),
+            };
+            let actual: BTreeSet<String> = rows.into_iter().collect();
             let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
-            CheckResult { id: id.into(), outcome: set_diff_outcome(&expected, &actual), warnings: Vec::new() }
+            let outcome = outcome_with(findings, &expected, &actual);
+            CheckResult { id: id.into(), outcome, warnings: Vec::new() }
         }
     }
 }
@@ -487,10 +621,50 @@ fn resolve_and_call(
 
 fn eval_imports_expectation(ctx: &EvalContext, index: usize, item: &ImportsExpectation) -> CheckResult {
     let id = format!("expectations.imports[{index}]");
+    let value = match dependency_walk(ctx, &item.file, Direction::Outgoing) {
+        Ok(value) => value,
+        Err(err) => return fail(id, vec![format!("file = \"{}\"", item.file), err]),
+    };
+    if let Some(finding) = walk_truncation_finding(&value) {
+        return fail(id, vec![finding]);
+    }
+    compare_walk_rows(id, &value, &item.expect, Vec::new())
+}
+
+// --- [[importers]] ------------------------------------------------------------
+
+/// Decision 7. The same walk `[[imports]]` runs, in the other direction, plus
+/// the one thing only this direction has: whether the anchor was taken
+/// literally or substituted for the module the file defines
+/// (`resolvedFrom.qualifiedName`, GM-356).
+fn eval_importers_expectation(ctx: &EvalContext, index: usize, item: &ImportersExpectation) -> CheckResult {
+    let id = format!("expectations.importers[{index}]");
+    let value = match dependency_walk(ctx, &item.file, Direction::Incoming) {
+        Ok(value) => value,
+        Err(err) => return fail(id, vec![format!("file = \"{}\"", item.file), err]),
+    };
+    if let Some(finding) = walk_truncation_finding(&value) {
+        return fail(id, vec![finding]);
+    }
+    let findings = match resolved_from_finding(&value, item.via_module.as_deref()) {
+        None => Vec::new(),
+        Some(finding) => vec![format!("file = \"{}\"", item.file), finding],
+    };
+    // A wrong anchor and a wrong set are reported together rather than one
+    // hiding the other: when both are wrong the set is the more informative
+    // half (an empty one is GM-356's own signature), and it costs a line
+    // rather than a second run to have both.
+    compare_walk_rows(id, &value, &item.expect, findings)
+}
+
+/// `[[imports]]`/`[[importers]]`' shared call into the real
+/// `get_dependencies` handler - one hop, and everything else at this
+/// module's own defaults.
+fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Result<Value, String> {
     let params = GetDependenciesParams {
-        file_path: Some(item.file.clone()),
+        file_path: Some(file.to_string()),
         module_id: None,
-        direction: Direction::Outgoing,
+        direction,
         max_depth: Some(1),
         // Generous rather than exact: this is a conformance-kit fixture, not
         // a production repo, so nothing here relies on `get_dependencies`'
@@ -499,20 +673,51 @@ fn eval_imports_expectation(ctx: &EvalContext, index: usize, item: &ImportsExpec
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    let value = match tool_json(get_dependencies::handle(ctx.conn, ctx.entry_points, params)) {
-        Ok(value) => value,
-        Err(err) => return fail(id, vec![format!("file = \"{}\"", item.file), err]),
-    };
-    if let Some(finding) = walk_truncation_finding(&value) {
-        return fail(id, vec![finding]);
-    }
-    let actual = import_rows_to_set(&value);
-    let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
-    CheckResult { id: id.into(), outcome: set_diff_outcome(&expected, &actual), warnings: Vec::new() }
+    tool_json(get_dependencies::handle(ctx.conn, ctx.entry_points, params))
 }
 
-/// Decision 2's `[[imports]]` row mapping.
-fn import_rows_to_set(value: &Value) -> BTreeSet<String> {
+/// The set comparison both walk categories share, with decision 8's
+/// duplicate check in front of it and any findings the caller has already
+/// collected kept ahead of both.
+fn compare_walk_rows(id: String, value: &Value, expect: &[String], mut findings: Vec<String>) -> CheckResult {
+    let rows = import_rows(value);
+    findings.extend(duplicate_row_finding(&rows));
+    let actual: BTreeSet<String> = rows.into_iter().collect();
+    let expected: BTreeSet<String> = expect.iter().cloned().collect();
+    CheckResult { id: id.into(), outcome: outcome_with(findings, &expected, &actual), warnings: Vec::new() }
+}
+
+/// Decision 7's `via_module`, both ways round: `None` when the response says
+/// exactly what the entry claims, `Some(finding)` naming the disagreement
+/// otherwise.
+fn resolved_from_finding(value: &Value, via_module: Option<&str>) -> Option<String> {
+    let actual = value.get("resolvedFrom");
+    match (via_module, actual) {
+        (None, None) => None,
+        (Some(expected), Some(resolved))
+            if resolved.get("qualifiedName").and_then(Value::as_str) == Some(expected) =>
+        {
+            None
+        }
+        (None, Some(resolved)) => Some(format!(
+            "expected no substitution (no `via_module`), but the walk ran from another node: \
+             resolvedFrom = {resolved}"
+        )),
+        (Some(expected), None) => Some(format!(
+            "via_module = \"{expected}\", but the response carries no resolvedFrom - the walk ran \
+             from the file itself, which outside TypeScript is the empty-by-construction answer \
+             GM-356 is about (decision 7)"
+        )),
+        (Some(expected), Some(resolved)) => {
+            Some(format!("via_module = \"{expected}\", but the walk ran from resolvedFrom = {resolved}"))
+        }
+    }
+}
+
+/// Decision 2's `[[imports]]`/`[[importers]]` row mapping, as a list - the
+/// set is built from it, and decision 8's duplicate check needs the rows
+/// before that collapse.
+fn import_rows(value: &Value) -> Vec<String> {
     value
         .get("results")
         .and_then(Value::as_array)
@@ -691,8 +896,9 @@ fn tool_json(result: Result<CallToolResult, ErrorData>) -> Result<Value, String>
 }
 
 /// Decision 2's `[[callers]]`/`[[references]]`/`[[implementations]]` row
-/// mapping.
-fn rows_to_set(value: &Value) -> BTreeSet<String> {
+/// mapping, as a list - the set is built from it, and decision 8's duplicate
+/// check needs the rows before that collapse.
+fn rows_to_list(value: &Value) -> Vec<String> {
     value
         .get("results")
         .and_then(Value::as_array)
@@ -704,6 +910,52 @@ fn rows_to_set(value: &Value) -> BTreeSet<String> {
             format!("{file_path}:{qualified_name}")
         })
         .collect()
+}
+
+/// Decision 8: `None` when every row is its own answer, `Some(finding)`
+/// naming each repeated row and how many times it came back. Only called for
+/// the categories whose tool promises one row per answer - see decision 8 for
+/// why `[[callers]]`/`[[references]]` are exempt rather than overlooked.
+fn duplicate_row_finding(rows: &[String]) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows {
+        *counts.entry(row.as_str()).or_default() += 1;
+    }
+    let repeated: Vec<String> =
+        counts.iter().filter(|(_, n)| **n > 1).map(|(row, n)| format!("{row} (x{n})")).collect();
+    (!repeated.is_empty()).then(|| {
+        format!(
+            "{} row(s) came back more than once, and for this category a repeat is the same answer \
+             twice rather than a second fact (decision 8): {}",
+            repeated.len(),
+            repeated.join(", ")
+        )
+    })
+}
+
+/// Folds decision 7's and decision 8's findings into decision 2's set diff.
+/// A finding alongside a *matching* set still fails, and says so in as many
+/// words: otherwise the report reads as a set mismatch and sends a reader
+/// looking for one that isn't there.
+fn outcome_with(
+    mut findings: Vec<String>,
+    expected: &BTreeSet<String>,
+    actual: &BTreeSet<String>,
+) -> Outcome {
+    match set_diff_outcome(expected, actual) {
+        Outcome::Pass if findings.is_empty() => Outcome::Pass,
+        Outcome::Pass => {
+            findings.push(format!("the set itself matched: {{{}}}", format_set(actual)));
+            Outcome::Fail(findings)
+        }
+        Outcome::Fail(diff) => {
+            findings.extend(diff);
+            Outcome::Fail(findings)
+        }
+        // `set_diff_outcome` returns only `Pass`/`Fail`; kept total rather
+        // than `unreachable!` so a third outcome can never be lost here.
+        other => other,
+    }
 }
 
 fn format_set(set: &BTreeSet<String>) -> String {
@@ -864,7 +1116,7 @@ mod tests {
                 {"filePath": "b.ts"},
             ],
         });
-        let set = rows_to_set(&value);
+        let set: BTreeSet<String> = rows_to_list(&value).into_iter().collect();
         assert!(set.contains("a.ts:f"), "{set:?}");
         assert!(set.contains("b.ts:"), "{set:?}");
     }
@@ -877,9 +1129,91 @@ mod tests {
                 {"qualifiedName": "react", "kind": "Module"},
             ],
         });
-        let set = import_rows_to_set(&value);
+        let set: BTreeSet<String> = import_rows(&value).into_iter().collect();
         assert!(set.contains("a.ts"), "{set:?}");
         assert!(set.contains("container:react"), "{set:?}");
+    }
+
+    /// Decision 7's parsing half: `[[importers]]` is its own list, `via_module`
+    /// is optional, and `deny_unknown_fields` keeps it out of `[[imports]]` -
+    /// the property that made a separate list worth having over a `direction`
+    /// key.
+    #[test]
+    fn importers_parse_with_and_without_via_module_and_imports_reject_it() {
+        let file: ExpectFile = toml::from_str(
+            "[[importers]]\nfile = \"a.ts\"\nexpect = [\"b.ts\"]\n\n\
+             [[importers]]\nfile = \"pkg/helpers.py\"\nvia_module = \"pkg.helpers\"\nexpect = []\n",
+        )
+        .unwrap();
+        assert_eq!(file.importers.len(), 2);
+        assert_eq!(file.importers[0].via_module, None);
+        assert_eq!(file.importers[1].via_module.as_deref(), Some("pkg.helpers"));
+        assert_eq!(file.importers[0].tier, Tier::Structural);
+
+        let err =
+            toml::from_str::<ExpectFile>("[[imports]]\nfile = \"a.ts\"\nvia_module = \"a\"\nexpect = []\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("via_module") || err.contains("unknown field"), "{err}");
+    }
+
+    /// Decision 7: `via_module` is checked both ways round. The case that
+    /// matters is the third - a response with no `resolvedFrom` against an
+    /// entry that named a module is GM-356's own defect, and it must not read
+    /// as "not checked".
+    #[test]
+    fn via_module_is_an_assertion_in_both_of_its_states() {
+        let substituted = serde_json::json!({
+            "results": [],
+            "resolvedFrom": {"requested": "pkg/helpers.py", "qualifiedName": "pkg.helpers"},
+        });
+        let literal = serde_json::json!({"results": []});
+
+        assert!(resolved_from_finding(&substituted, Some("pkg.helpers")).is_none());
+        assert!(resolved_from_finding(&literal, None).is_none());
+
+        let missing = resolved_from_finding(&literal, Some("pkg.helpers")).expect("must flag it");
+        assert!(missing.contains("no resolvedFrom"), "{missing}");
+
+        let unexpected = resolved_from_finding(&substituted, None).expect("must flag it");
+        assert!(unexpected.contains("expected no substitution"), "{unexpected}");
+
+        let wrong = resolved_from_finding(&substituted, Some("pkg.other")).expect("must flag it");
+        assert!(wrong.contains("pkg.helpers"), "{wrong}");
+    }
+
+    /// Decision 8: the duplicate GM-361's de-duplication removed, which a
+    /// `BTreeSet` cannot see. Two rows of one implementor is one answer twice.
+    #[test]
+    fn a_repeated_row_is_named_with_its_count() {
+        let rows: Vec<String> = ["a.rs:A", "a.rs:A", "b.rs:B", "a.rs:C", "a.rs:C", "a.rs:C"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let finding = duplicate_row_finding(&rows).expect("must flag the repeats");
+        assert!(finding.contains("a.rs:A (x2)"), "{finding}");
+        assert!(finding.contains("a.rs:C (x3)"), "{finding}");
+        assert!(!finding.contains("b.rs:B"), "{finding}");
+
+        assert!(duplicate_row_finding(&["a.rs:A".to_string(), "b.rs:B".to_string()]).is_none());
+        assert!(duplicate_row_finding(&[]).is_none());
+    }
+
+    /// Decision 8's reporting rule: a duplicate fails the entry *even when the
+    /// set matches*, and says the set matched - otherwise the failure reads as
+    /// a set mismatch and sends a reader hunting for one that is not there.
+    #[test]
+    fn a_finding_against_a_matching_set_fails_and_says_the_set_matched() {
+        let expected: BTreeSet<String> = ["a.rs:A"].into_iter().map(String::from).collect();
+        let actual = expected.clone();
+        let Outcome::Fail(findings) = outcome_with(vec!["dup".to_string()], &expected, &actual) else {
+            panic!("a finding must fail the entry");
+        };
+        let text = findings.join("\n");
+        assert!(text.contains("dup"), "{text}");
+        assert!(text.contains("the set itself matched: {a.rs:A}"), "{text}");
+
+        assert_eq!(outcome_with(Vec::new(), &expected, &actual), Outcome::Pass);
     }
 
     /// Decision 4: a page reporting `hasMore: true` even at the maximum

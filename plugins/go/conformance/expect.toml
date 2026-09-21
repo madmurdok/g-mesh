@@ -23,6 +23,10 @@
 #   - implementations, implicit (semantic): `Closer`, satisfied by three
 #     types none of which mention it in their syntax;
 #   - imports, container-scoped (structural): `cmd/main.go`'s two imports;
+#   - importers, the *incoming* direction (structural): who imports the
+#     package `server/server.go` belongs to - GM-365's new category, and
+#     where GM-356's file-to-package substitution is asserted for Go
+#     (`expectations.rs`'s decision 7);
 #   - references (structural): `Server`, used but never called, which is
 #     what makes it a case `[[callers]]` cannot answer at all;
 #   - definition (structural): `Server.Addr`'s own declaration and
@@ -34,7 +38,7 @@
 # (the way CI's "no toolchain" job does, and the way `plugins/go/
 # semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
 # measured it at the unit level first): those four report `Skip` instead of
-# running, and the other eleven - every structural entry in this file - keep
+# running, and the other twelve - every structural entry in this file - keep
 # passing, which is the whole discrimination this file exists to make.
 #
 # Every `expect` list is an exact set, which is what makes the two `helper`
@@ -215,3 +219,35 @@ expect = ["server/server.go:Server.Addr"]
 [[definition]]
 symbol = "Placeholder"
 expect = ["main.go:Placeholder"]
+
+# --- importers (get_dependencies, one hop, Incoming) ------------------------
+#     (GM-356, and `expectations.rs`'s decision 7)
+
+[[importers]]
+file = "server/server.go"
+via_module = "github.com/example/app/server"
+# Go's import graph is made of packages, so an `IMPORTS` edge arrives at
+# `github.com/example/app/server` and never at `server/server.go`. A walk
+# literally anchored on the file therefore completed inside its bounds having
+# found nothing and answered `results: []`, `truncated: false` - the shape
+# this tool uses to say *nothing imports this*, about a package `cmd/main.go`
+# imports on its sixth line. GM-356 substitutes the package the file belongs
+# to and reports it as `resolvedFrom.qualifiedName`, which `via_module` above
+# pins: against the pre-fix binary this entry fails twice over, on the
+# missing substitution and on the empty set.
+#
+# One importer, and that is the whole package's honest answer rather than a
+# narrow fixture: `cmd/main.go` is the only file in this project that imports
+# `github.com/example/app/server`. `app_test.go` imports
+# `github.com/example/app` - the *root* package - and must not appear here;
+# its absence is what says the substitution landed on the package this file
+# is in rather than on the module tree above it.
+#
+# Note which file this is anchored on. Four files carry that package
+# (`server.go`, `conn.go`, `logged.go`, `server_test.go`), so unlike Python's
+# and Rust's one-file modules the container survives the session's emptied
+# file either way - but `conn.go` is the file this kit edits, and anchoring
+# an *Incoming* walk on the file whose members are temporarily gone is a
+# hazard the other fixtures have to avoid by hand. `server.go` avoids it
+# here too, deliberately, so that all four fixtures state the same rule.
+expect = ["cmd/main.go"]

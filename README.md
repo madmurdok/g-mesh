@@ -764,6 +764,11 @@ expect = ["shapes.go:Greeter"]
 file = "cmd/main.go"
 expect = ["container:github.com/x/app/server"]
 
+[[importers]]                   # the incoming direction
+file = "server/server.go"
+via_module = "github.com/x/app/server"   # omit it to assert no substitution
+expect = ["cmd/main.go"]
+
 [[definition]]
 symbol = "format"
 expect = ["overload.go:format"]
@@ -779,7 +784,16 @@ reimplemented query — and compared as a *set* against `expect`. A row
 becomes `"filePath:qualifiedName"` (a usage with no qualifiedName — outside
 any tracked symbol — becomes `"filePath:"`); an `[[imports]]` row with no
 file of its own (a container, or an import nothing in the project resolves)
-becomes `"container:<key>"`. `symbol` is resolved the tool's own way; an
+becomes `"container:<key>"`. `[[importers]]` is the same walk `[[imports]]`
+runs, in the other direction, and carries the one field only that direction
+has: `via_module` asserts which module the walk actually ran from
+(`resolvedFrom.qualifiedName` — outside TypeScript an import names a module,
+not a file, so a file anchor is substituted), and *omitting* it asserts that
+no substitution happened rather than that nothing was checked. For the
+categories whose tool answers one row per answer — `[[implementations]]`,
+`[[imports]]`, `[[importers]]` — a repeated row fails the entry even when the
+set matches; `[[callers]]`/`[[references]]` are exempt, since two rows there
+are two usages. `symbol` is resolved the tool's own way; an
 ambiguous name fails the expectation with the real candidate list rather
 than guessing, unless `file` narrows it to exactly one. A page that reports
 `hasMore`/`truncated` even at the maximum page size fails rather than being

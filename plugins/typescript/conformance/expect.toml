@@ -12,6 +12,13 @@
 # The project this runs against is ./project - six files, read alongside
 # this one so each case below can be checked by hand against the real
 # source rather than taken on faith.
+#
+# One entry here is a control rather than a claim about this plugin: the
+# `[[importers]]` one at the bottom, GM-365's new incoming category, which
+# passes identically against the pre- and post-GM-356 binary while the other
+# three languages' entries in that category fail against the first. Its own
+# comment says why, and it says so in this file rather than leaving the
+# category out of it.
 
 # --- same-file call, cross-file named import call, and both re-export forms -
 
@@ -88,3 +95,32 @@ expect = ["src/overload.ts:format"]
 symbol = "Greeter"
 # Unambiguous - no `file` needed to disambiguate.
 expect = ["src/shapes.ts:Greeter"]
+
+# --- importers (get_dependencies, one hop, Incoming) --------------------------
+#     (GM-365; `expectations.rs`'s decision 7 has the contract)
+
+[[importers]]
+file = "src/math.ts"
+# TypeScript's entry in the incoming category is also its CONTROL, and the
+# missing `via_module` is the assertion, not an omission - decision 7 makes
+# an absent `via_module` require that the response carry no `resolvedFrom` at
+# all.
+#
+# The category applies here like everywhere else - these two files really do
+# import math.ts - but the substitution GM-356 added does not, and this is
+# where that is written down rather than left to be inferred from a missing
+# key. In TypeScript a module *is* a file: an `IMPORTS` edge arrives at
+# `src/math.ts` itself, so the anchor the caller named is the anchor the walk
+# runs from, and `incoming_from_file`'s first guard (does this file have an
+# incoming IMPORTS edge of its own?) is what keeps it that way - by
+# construction, not by a list of languages. That is why this entry passes
+# unchanged against both the pre-GM-356 and the post-GM-356 binary while go,
+# rust and python's entries fail against the first: with all four in the same
+# category, the arms differ in exactly the intended place.
+#
+# The two rows: `src/main.ts` imports `add` and `* as m`, and `src/index.ts`
+# re-exports through both forms (`export * from "./math"` and `export {
+# double as twice } from "./math"`). A re-export is an import of the file it
+# reads. `src/overload.ts` and `src/util.js` import nothing from math.ts and
+# must not appear.
+expect = ["src/index.ts", "src/main.ts"]
