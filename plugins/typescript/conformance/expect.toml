@@ -124,3 +124,23 @@ file = "src/math.ts"
 # reads. `src/overload.ts` and `src/util.js` import nothing from math.ts and
 # must not appear.
 expect = ["src/index.ts", "src/main.ts"]
+
+# --- refusal: a name this project does not declare --------------------------
+#     (GM-371, and `expectations.rs`'s decision 9)
+
+[[refusal]]
+tool = "definition"
+symbol = "nosuchname"
+contains = ["no symbol named 'nosuchname' found"]
+# Like Rust's entry, this is the terse arm rather than GM-367's import-only
+# one, and for the same reason stated in its own file rather than left
+# implicit: every import in this project is relative and lands on a file the
+# fixture contains. The `[[imports]]` entry above is the direct evidence -
+# all four of its rows are bare file paths, and decision 2 records that a
+# `container:` row in TypeScript is precisely an import that resolved to
+# nothing. There are none, so there is no import-only name here to refuse.
+#
+# What this entry asserts is that an unknown name is refused rather than
+# answered: with five real declarations in scope and a semantic tier
+# running, "nosuchname" must still come back as nothing. See
+# `plugins/rust/conformance/expect.toml` for why that is deterministic here.

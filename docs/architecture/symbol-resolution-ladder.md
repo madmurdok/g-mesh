@@ -90,9 +90,58 @@ facts about module depth. So rung 2 now requires that the query is not also some
 `name` (the language-agnostic way to say "genuinely qualified" — no separator to know), and several
 exact matches is rung 2′, an ambiguity, rather than a miss that falls all the way to rung 5.
 
-Rung 2′ is skipped for a specifier-shaped query (`is_module_specifier`), which keeps its refusal:
-gin's `net/http` is carried by 63 `external_module` import placeholders, one per importing file, and
-a page of those is noise, not candidates.
+**Every rung answers with a declaration, and GM-367 is where that became true.** Rungs 2, 2′, 3 and
+3′ all read `graph::queries`' name/qualifiedName lookups, and those lookups excluded three
+non-declaration `nativeKind`s where there are five: an *import placeholder* — the graph's record
+that a file imported something, with no body and no definition site here — was a legitimate answer.
+Measured on gin: `find_definition("context")` took rung 2 to a placeholder in `context_test.go`,
+labelled `resolvedBy: "qualifiedName"`, and `find_definition("http")` took rung 2′ to a page of 20
+such rows out of 63. The exclusion lives in the shared lookups, so it reaches all five tools at
+once; `graph::queries`' own header records the decision (exclude outright, rather than keep them
+and mark them) and why the alternative lost.
+
+**Rung 4 ranks, it does not just page (GM-373).** Its page is cut at five, so the order decides
+what the caller sees at all, and `exported DESC, startLine ASC` decided it by source position —
+which is a proxy for importance only by accident. Measured on gin, `find_definition("context")`
+came back with `context.go`'s first five exported constants (`MIMEJSON`, `MIMEHTML`, `MIMEXML`, …)
+and never reached `Context`, the type the file exists for, 90-odd declarations further down. The
+primary key is now the inbound `REFERENCES`+`CALLS` count — the same ranking rung 3′ already uses,
+so the two candidate-returning rungs order by one rule rather than two — with the old expression
+kept as the tie-break, so a file whose declarations are all unreferenced comes back exactly as
+before. This rung is reached by 107 distinct queries across gin, ripgrep and requests (a file stem,
+or a case variant of one, that no declaration is named), not by the one in the ticket:
+`graph::queries::find_in_file_named`'s own doc has that sweep, and why preferring a declaration
+named like the file lost to it.
+
+**How that 107 was counted, because the obvious way gets 14 (GM-373).** GM-367 established the
+probe this project now reaches for whenever a rung has to be measured: take every distinct `name`
+and `qualifiedName` in an index — 12,774 spellings across gin, requests and ripgrep — and run each
+through the handler. It is a good instrument and it is the wrong one here. Rung 4 is reached by a
+*file stem*, or a case variant of one, that **no declaration carries as its name or
+qualifiedName** — and most file stems are not themselves indexed spellings, so the sweep never
+types them. It finds 14 of the 107. The danger is not that it is incomplete; it is that it returns
+a confident, quantified answer over thousands of inputs, so 13% coverage reads exactly like a
+complete sweep. Anything re-measuring this rung must enumerate stems instead. GM-373's enumeration
+is a SQL reproduction of the rung's own query and agrees with the real handler row-for-row on all
+14 × 2 arms where the two can be compared, which is what licenses using it in place of the
+handler. It has since been reused unchanged, by GM-377, to measure a different property of the
+same 107 pages — that 12 of them draw rows from more than one file — so it is an instrument rather
+than one task's scaffolding.
+
+
+A spelling that only import placeholders carry therefore falls through to a rung of its own,
+between 4 and 5: `import_only_refusal`, which refuses and says what the name *is* —
+`"nothing named 'http' is declared in this project. It names something this project imports:
+'net/http' (63) … use get_dependencies"`. It sits before the semantic rung because it states what
+the index records and rung 5 offers a resemblance; it sits after rung 4 because gin's `context`
+really is `context.go`, and that file's declarations are the better answer.
+
+Rung 2′ used to be skipped for a specifier-shaped query (`is_module_specifier`), which was GM-360's
+guard against exactly those 63 `net/http` placeholders. With them excluded one layer down the guard
+is unreachable — across gin, ripgrep, requests and excalidraw, every remaining specifier-shaped
+`qualifiedName` belongs to a `File` node, and a file path is unique within a project by
+construction, so "two or more exact matches" cannot arise for one. GM-367 removed it from that arm.
+`is_module_specifier` itself stays, for rung 5, where shape decides something a score cannot.
 
 The distinction that carries the design: **rungs 3′, 4 and 5 return the same shape** — a page of
 candidates the caller re-queries by id — and differ only in `resolvedBy`. That reuses a contract the

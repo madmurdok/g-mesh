@@ -34,6 +34,26 @@ struct OutlineSymbol {
     end_line: i64,
     end_col: i64,
     signature: Option<String>,
+    /// Reachable from outside the file this symbol is declared in - **not**
+    /// whether the symbol's own line carries a visibility keyword. Those
+    /// coincide for a top-level item but diverge for a member whose
+    /// reachability is inherited rather than stated: a method of a `pub`
+    /// trait, or of any `impl Trait for T` block, is exported even though
+    /// Rust forbids (and so never shows) a `pub` on that line - the trait or
+    /// the impl already carries the visibility, and the member is reachable
+    /// wherever the trait/type both are. Grepping the symbol's own line for
+    /// `pub` answers a different, narrower question and will disagree with
+    /// this field on exactly those rows - correctly, not as a bug in either
+    /// one (GM-369, measured against a real consumer that re-derived a
+    /// correct outline as wrong by making that substitution).
+    ///
+    /// An `impl` block itself can appear as its own row (kind `Type`, native
+    /// kind `impl`) when the implemented type has no declaration in this
+    /// project to attach its methods to instead - see `declare_impl_block` in
+    /// the Rust plugin's `extractor::bodies`. It is unconditionally `true`
+    /// there too, for the same reason: a trait impl's reach is the trait's
+    /// and the type's, never narrower, and there is no `pub` keyword on an
+    /// impl block for this field to instead mean.
     exported: bool,
 }
 

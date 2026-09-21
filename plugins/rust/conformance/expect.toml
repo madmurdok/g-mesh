@@ -517,3 +517,28 @@ expect = [
   "crates/alpha/src/prelude.rs",
   "crates/beta/src/main.rs",
 ]
+
+# --- refusal: a name this project does not declare --------------------------
+#     (GM-371, and `expectations.rs`'s decision 9)
+
+[[refusal]]
+tool = "definition"
+symbol = "nosuchname"
+contains = ["no symbol named 'nosuchname' found"]
+# The category applies here like everywhere else, but the *arm* differs, and
+# this comment is where that is written down rather than left to be inferred
+# from which phrase the entry happens to contain - the same rule
+# `[[importers]]` follows above.
+#
+# Rust's is the terse refusal, not GM-367's import-only one, because every
+# `use` in this project names a path inside the workspace: `crate::…`,
+# `super::…`, and `alpha::…` from beta, all of which resolve to files or to
+# containers this fixture declares. There is therefore no name here carried
+# only by an import record, and nothing to assert GM-367's message against -
+# `plugins/go` and `plugins/python` are where that arm is stated. What this
+# entry does pin is the other half of decision 9, which is not weaker: a
+# name the index does not carry AT ALL must be refused in so many words,
+# never answered with a nearby declaration. The kit runs with its embedding
+# pipeline disabled (`expectations.rs`'s `EvalContext`), so the semantic
+# rung cannot offer neighbours here and this refusal is deterministic rather
+# than model-dependent.
