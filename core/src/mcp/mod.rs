@@ -509,7 +509,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "get_file_outline",
-        description = "List the top-level symbols a file declares, in source order. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep."
+        description = "List the top-level symbols a file declares, in source order. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
     )]
     async fn get_file_outline(
         &self,
