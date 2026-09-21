@@ -49,7 +49,9 @@ use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{
     EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope,
 };
-use g_mesh_plugin_sdk::{FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath};
+use g_mesh_plugin_sdk::{
+    render_target, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath,
+};
 use tree_sitter::Node;
 
 /// Byte columns in, character columns out.
@@ -296,27 +298,6 @@ impl<'s> Emitter<'s> {
 
     pub(crate) fn finish(self) -> FileGraph {
         self.graph.finish()
-    }
-}
-
-/// The label a placeholder's `qualifiedName` carries, in the SDK's own
-/// rendering (`FileGraphBuilder::add_placeholder`: "`<container>::<key>` for
-/// a container scope").
-///
-/// Reproduced here rather than imported because the SDK keeps its renderer
-/// private, and only one node kind needs it - see [`Emitter::reexport`], the
-/// one placeholder this plugin has to build a `NodeSpec` for itself. It is a
-/// *label*, not an address: core reads the structured `target` row, and all
-/// this has to be is injective enough that two placeholders of one file
-/// waiting on different things get different ids.
-fn render_target(target: &PlaceholderTarget) -> String {
-    let key = match &target.key {
-        TargetKey::Name(name) => name,
-        TargetKey::QualifiedName(qualified_name) => qualified_name,
-    };
-    match &target.scope {
-        TargetScope::File(path) => format!("{path}#{key}"),
-        TargetScope::Container(container) => format!("{container}::{key}"),
     }
 }
 

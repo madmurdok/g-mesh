@@ -537,7 +537,11 @@ impl FileGraphBuilder {
 /// It is a label, not an address: core reads the structured `target` row, not
 /// this string. What it has to be is *injective enough* that two placeholders
 /// in one file waiting on different things get different ids.
-fn render_target(target: &PlaceholderTarget) -> String {
+///
+/// Public because a plugin that builds a placeholder's `NodeSpec` itself -
+/// `plugins/rust`'s re-export node - has to spell the label the same way, and
+/// a second copy of the rendering is a second thing to keep in step.
+pub fn render_target(target: &PlaceholderTarget) -> String {
     use g_mesh_wire::{TargetKey, TargetScope};
     let key = match &target.key {
         TargetKey::Name(name) => name,
@@ -547,6 +551,18 @@ fn render_target(target: &PlaceholderTarget) -> String {
         TargetScope::File(path) => format!("{path}#{key}"),
         TargetScope::Container(container) => format!("{container}::{key}"),
     }
+}
+
+/// The id [`FileGraphBuilder::add_placeholder`] will give a placeholder,
+/// derived from the only three things it depends on - and nothing else.
+///
+/// A placeholder's `name` and `range` describe one *use site*, and an address
+/// reached from several sites has several of those. A caller that has to
+/// choose between them - the LSP bridge, which sees them one server answer at
+/// a time - needs the id before it has finished choosing, so it gets it from
+/// here rather than by adding a node it would then have to revise.
+pub fn placeholder_id(file: &RelPath, kind: PlaceholderKind, target: &PlaceholderTarget) -> String {
+    node_id(file.as_str(), NodeKind::Module, &render_target(target), Some(kind.native_kind()))
 }
 
 #[cfg(test)]
@@ -635,6 +651,34 @@ mod tests {
             for two in ids.iter().skip(i + 1) {
                 assert_ne!(one, two, "two placeholders collided on one id");
             }
+        }
+    }
+
+    /// **GM-378.** And the id is that address and nothing else, so a caller
+    /// can know it before it has decided which use site the row describes -
+    /// which is what [`placeholder_id`] is for.
+    #[test]
+    fn a_placeholders_id_is_its_address_whatever_row_it_ends_up_carrying() {
+        let file = RelPath::new("src/a.toy");
+        let target = PlaceholderTarget {
+            scope: TargetScope::Container("pkg".into()),
+            key: TargetKey::Name("helper".into()),
+            from_container: None,
+        };
+        for kind in
+            [PlaceholderKind::PendingSymbol, PlaceholderKind::Reexport, PlaceholderKind::ResolvedModule]
+        {
+            let mut graph = builder();
+            let first = graph.add_placeholder(kind, "helper", target.clone(), range(1, 1));
+            let mut graph = builder();
+            // A different name, a different range - the same node.
+            let second = graph.add_placeholder(kind, "helper::inner", target.clone(), range(9, 9));
+            assert_eq!(first, second, "{kind:?}: the row moved the id");
+            assert_eq!(
+                first,
+                placeholder_id(&file, kind, &target),
+                "{kind:?}: `placeholder_id` must derive what `add_placeholder` assigns"
+            );
         }
     }
 

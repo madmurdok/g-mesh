@@ -768,15 +768,69 @@ struct Answers {
     language: String,
     engine: String,
     builders: BTreeMap<RelPath, FileGraphBuilder>,
-    /// Placeholders already emitted, by the address they wait on - so that two
-    /// sites resolving to one declaration produce one node rather than one id
-    /// written twice. The same rule `plugins/rust`'s emitter applies to its own
-    /// output, and for the same reason: `apply_diff` upserts by id either way,
-    /// but a stream that says one thing twice has stopped describing the file.
-    placeholders: BTreeMap<Address, String>,
+    /// Placeholders this pass will emit, by the address they wait on - so that
+    /// two sites resolving to one declaration produce one node rather than one
+    /// id written twice. The same rule `plugins/rust`'s emitter applies to its
+    /// own output, and for the same reason: `apply_diff` upserts by id either
+    /// way, but a stream that says one thing twice has stopped describing the
+    /// file.
+    ///
+    /// Collected here rather than added to a builder on the spot, because the
+    /// row a shared placeholder carries must not depend on which of its sites
+    /// was answered first - see [`Placeholder`].
+    placeholders: BTreeMap<Address, Placeholder>,
     edges: HashSet<String>,
     by_file: BTreeMap<RelPath, Vec<String>>,
     retract: BTreeSet<String>,
+}
+
+/// The node one address gets, and the use site whose `name` and `range` it
+/// shows.
+///
+/// # Why the site is chosen rather than taken
+///
+/// A placeholder's identity is the address it waits on: its id is derived from
+/// the file and the rendered target, and nothing else (`ids::node_id`). Its
+/// `name` and `range`, though, describe a *use site*, and an address reached
+/// from several sites has several of those - `SearchMode::Count` and
+/// `SearchMode::CountMatches` in ripgrep's `crates/core/flags/hiargs.rs` both
+/// address the enum `SearchMode`, so one node has to speak for both.
+///
+/// Recording whichever arrived first made that choice out of LSP answer
+/// arrival order, which is not a property of the file. Three indexings of one
+/// unchanged ripgrep checkout by one binary agreed on every node id and every
+/// edge, and disagreed on 50, 54 and 63 placeholder *rows* between the pairs -
+/// every one of them in `range`, six of them in `name` as well. Nothing
+/// downstream was wrong, since the linker reads the target and never the row,
+/// but the index had stopped being a function of the source: any node-level
+/// comparison over a Rust corpus was reading that noise as a difference.
+///
+/// So the row is made a function of the address instead. `name` is the
+/// resolved *declaration's* own name rather than the text at a use site -
+/// `SearchMode`, which every site addressing it is a use of, and which
+/// `qualifiedName` already says. `OpenSite::name` was never meant for this: it
+/// is documented as "an LSP bridge uses it only for diagnostics", and
+/// [`record_implementor`] already passes the declaration's name. The `range`
+/// is the *earliest* of the sites, which is the convention the structural tier
+/// arrives at by walking a file in source order.
+struct Placeholder {
+    id: String,
+    target: PlaceholderTarget,
+    name: String,
+    range: Range,
+}
+
+/// A witness's rank: earliest position wins, and the name settles the tie that
+/// two sites at one position would otherwise leave to arrival order again.
+fn witness_rank<'a>(name: &'a str, range: &Range) -> (u32, u32, u32, u32, &'a str) {
+    (range.start.line, range.start.col, range.end.line, range.end.col, name)
+}
+
+/// What a use site covers: the name written at it, starting where the site
+/// starts. `written` is the source text, which is not always the name the
+/// placeholder ends up carrying - see [`Placeholder`].
+fn site_range(at: Position, written: &str) -> Range {
+    Range { start: at, end: Position { line: at.line, col: at.col + written.chars().count() as u32 } }
 }
 
 /// Everything a placeholder's identity is derived from, in a form that can key
@@ -825,6 +879,12 @@ impl Answers {
     /// remembered against for retraction; the two differ only for an
     /// implementation answer, whose edge starts at a declaration in some other
     /// file entirely.
+    ///
+    /// `name` and `at` describe the use site this answer came from; which of
+    /// an address's sites the node ends up showing is [`Placeholder`]'s rule,
+    /// not this call's. The node itself is added in [`Answers::finish`], once
+    /// every site has had its say - so the id is derived here rather than
+    /// returned by the builder.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
@@ -832,25 +892,23 @@ impl Answers {
         in_file: &RelPath,
         from_id: &str,
         kind: EdgeKind,
-        display_name: &str,
-        at: Position,
+        name: &str,
+        at: Range,
         target: PlaceholderTarget,
     ) -> String {
         let key = address_key(in_file, &target);
-        let placeholder = match self.placeholders.get(&key) {
-            Some(id) => id.clone(),
+        let placeholder = match self.placeholders.get_mut(&key) {
+            Some(held) => {
+                if witness_rank(name, &at) < witness_rank(&held.name, &held.range) {
+                    held.name = name.to_string();
+                    held.range = at;
+                }
+                held.id.clone()
+            }
             None => {
-                let range = Range {
-                    start: at,
-                    end: Position { line: at.line, col: at.col + display_name.chars().count() as u32 },
-                };
-                let id = self.builder(in_file).add_placeholder(
-                    PlaceholderKind::PendingSymbol,
-                    display_name,
-                    target,
-                    range,
-                );
-                self.placeholders.insert(key, id.clone());
+                let id = crate::graph::placeholder_id(in_file, PlaceholderKind::PendingSymbol, &target);
+                self.placeholders
+                    .insert(key, Placeholder { id: id.clone(), target, name: name.to_string(), range: at });
                 id
             }
         };
@@ -878,6 +936,19 @@ impl Answers {
 
     fn finish(mut self) -> (FileChangeDiff, BTreeMap<RelPath, Vec<String>>) {
         let mut diff = FileChangeDiff::default();
+        // The nodes, now that every site addressing each one has been seen. In
+        // address order, which is the file's own order and not the order the
+        // server happened to answer in - the same reason the row itself is
+        // chosen rather than taken (see `Placeholder`).
+        for ((file, ..), held) in std::mem::take(&mut self.placeholders) {
+            let id = self.builder(&file).add_placeholder(
+                PlaceholderKind::PendingSymbol,
+                held.name,
+                held.target,
+                held.range,
+            );
+            debug_assert_eq!(id, held.id, "a placeholder's id must not depend on its row");
+        }
         for (_, builder) in std::mem::take(&mut self.builders) {
             let graph = builder.finish();
             diff.upsert_nodes.extend(graph.nodes);
@@ -1225,13 +1296,20 @@ fn record_answer(
                 }
             }
             let Some((_, node)) = target else { return Vec::new() };
+            // The placeholder is named after the declaration it waits on, not
+            // after the text at this site: `SearchMode::Count` and
+            // `SearchMode::CountMatches` are two spellings of one address, and
+            // a node that has to speak for both can only honestly carry the
+            // name they have in common. The site still supplies the *range* -
+            // as wide as what is written there - and which site that is comes
+            // from `Placeholder`, not from which answer arrived first.
             let edge = answers.record(
                 &question.file,
                 &question.file,
                 &site.from_id,
                 site.edge_kind,
-                &site.name,
-                site.position,
+                &node.name,
+                site_range(site.position, &site.name),
                 address_of(node, site.from_container.clone()),
             );
             // The contradiction rule: an answer that lands somewhere else
@@ -1330,7 +1408,7 @@ fn record_implementor(
         // answer and points at the anchor.
         EdgeKind::SupertypeOf,
         &anchor_node.name,
-        at,
+        site_range(at, &anchor_node.name),
         address_of(&anchor_node, container),
     );
     true
@@ -1651,6 +1729,136 @@ mod tests {
         node.container = None;
         let target = address_of(&node, None);
         assert_eq!(target.scope, TargetScope::File("src/greet.rs".to_string()));
+    }
+
+    /// **GM-378.** Two sites of one file addressing one declaration are one
+    /// placeholder, and the row it carries must be the same whichever of them
+    /// the server answered first.
+    ///
+    /// The instance is ripgrep's, reduced: `SearchMode::Count` at line 140 and
+    /// `SearchMode::CountMatches` at line 144 of `crates/core/flags/hiargs.rs`
+    /// both resolve to the enum `SearchMode`, so both land on node id
+    /// `69f3fc74…`. Recording whichever arrived first put a different `name`
+    /// and a different `range` on that one row from run to run, over an
+    /// unchanged checkout indexed by an unchanged binary.
+    ///
+    /// The two arms here are the same two answers in the two arrival orders,
+    /// which is exactly the difference between two such runs: with the witness
+    /// rule removed, the two arms produce the two rows the two indexings did,
+    /// and this test fails on them. Which *name* the surviving row carries is
+    /// the sibling test below.
+    #[test]
+    fn one_address_answered_from_two_sites_carries_the_same_row_in_either_order() {
+        let file = RelPath::new("crates/core/flags/hiargs.rs");
+        let mut declaration = node("SearchMode", (30, 9), (40, 1));
+        declaration.container = Some("rg::flags::lowargs".to_string());
+        declaration.qualified_name = "flags::lowargs::SearchMode".to_string();
+        declaration.file_path = "crates/core/flags/lowargs.rs".to_string();
+
+        // The two sites, in source order.
+        let sites = [
+            (Position { line: 140, col: 28 }, "SearchMode::Count"),
+            (Position { line: 144, col: 28 }, "SearchMode::CountMatches"),
+        ];
+        let mut rows = Vec::new();
+        for order in [[0usize, 1], [1, 0]] {
+            let mut answers = Answers::new("rust", "rust-analyzer");
+            for i in order {
+                let (at, written) = sites[i];
+                answers.record(
+                    &file,
+                    &file,
+                    "from",
+                    EdgeKind::References,
+                    &declaration.name,
+                    site_range(at, written),
+                    address_of(&declaration, Some("rg::flags::hiargs".to_string())),
+                );
+            }
+            let (diff, _) = answers.finish();
+            assert_eq!(diff.upsert_nodes.len(), 1, "two sites, one address, one node");
+            rows.push(diff.upsert_nodes.into_iter().next().unwrap());
+        }
+
+        assert_eq!(
+            rows[0].id, "69f3fc743f4eade2dc01f07e99f541f0",
+            "the reduction has to be the real instance, not something like it: this is the id \
+             the two rows collided on in an index of ripgrep"
+        );
+
+        assert_eq!(rows[0], rows[1], "the row a shared placeholder carries depends on answer order");
+        assert_eq!(
+            rows[0].name, "SearchMode",
+            "the node speaks for both sites, so it carries the name they have in common - not \
+             whichever spelling was answered first"
+        );
+        assert_eq!(
+            rows[0].range.start,
+            Position { line: 140, col: 28 },
+            "and the earliest of its sites, the way a source-order walk would have picked"
+        );
+    }
+
+    /// **GM-378.** And the name that one row carries is the declaration's,
+    /// not the text at the site that happened to reach it.
+    ///
+    /// The other half of the same instance, taken through `record_answer` so
+    /// that what is under test is the argument the caller chooses.
+    /// `OpenSite::name` is documented as something "an LSP bridge uses only
+    /// for diagnostics"; passing it here made the node claim to be
+    /// `SearchMode::Count` while its `qualifiedName` said `…::SearchMode`.
+    #[test]
+    fn a_placeholder_is_named_after_the_declaration_it_waits_on() {
+        let root = Path::new("/p");
+        let declared = RelPath::new("lowargs.rs");
+        let mut builder = FileGraphBuilder::new("rust", "tree-sitter", &declared);
+        let range = Range { start: Position { line: 30, col: 9 }, end: Position { line: 40, col: 1 } };
+        let mut spec = NodeSpec::new(NodeKind::Type, "SearchMode", "flags::lowargs::SearchMode", range)
+            .native_kind("enum")
+            .public();
+        spec.container = Some("rg::flags::lowargs".to_string());
+        builder.add_node(spec);
+        let mut index = SdkIndex::new();
+        index.insert(declared.clone(), "pub enum SearchMode {}\n".repeat(41), builder.finish());
+
+        let asking = RelPath::new("hiargs.rs");
+        let question = Question {
+            file: asking.clone(),
+            position: Position { line: 140, col: 28 },
+            ask: Ask::Definition(OpenSite {
+                from_id: "caller".to_string(),
+                position: Position { line: 140, col: 28 },
+                name: "SearchMode::Count".to_string(),
+                kind: OpenSiteKind::Reference,
+                edge_kind: EdgeKind::References,
+                from_container: Some("rg::flags::hiargs".to_string()),
+                replaces: None,
+            }),
+        };
+        let found = json!({
+            "uri": "file:///p/lowargs.rs",
+            "range": { "start": { "line": 30, "character": 9 } },
+        });
+
+        let mut answers = Answers::new("rust", "rust-analyzer");
+        let again =
+            record_answer(&mut answers, &index, [root, root], PositionEncoding::Utf16, &question, &found);
+        assert!(again.is_empty(), "a definition answer asks nothing further");
+        let (diff, _) = answers.finish();
+        assert_eq!(diff.upsert_nodes.len(), 1);
+        assert_eq!(
+            diff.upsert_nodes[0].name, "SearchMode",
+            "the placeholder waits on the enum, whatever the site that reached it was spelled"
+        );
+        assert_eq!(
+            diff.upsert_nodes[0].qualified_name, "rg::flags::lowargs::flags::lowargs::SearchMode",
+            "and its name agrees with the address its id is derived from"
+        );
+        assert_eq!(
+            diff.upsert_nodes[0].range,
+            site_range(Position { line: 140, col: 28 }, "SearchMode::Count"),
+            "the range is still the site's own extent, as wide as what is written there"
+        );
     }
 
     #[test]
