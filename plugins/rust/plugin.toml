@@ -37,7 +37,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.8.0"
+plugin_version = "3.9.0"
 
 [plugin.spawn]
 command = "../../target/debug/g-mesh-plugin-rust"
