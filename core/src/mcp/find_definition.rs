@@ -636,6 +636,13 @@ fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolR
 /// `ambiguous: false`, because these are not several readings of one name -
 /// they are what a differently-named thing declares. The rung label is what
 /// says so.
+///
+/// The five it offers are the file's five most-referenced declarations, not
+/// its first five - `graph::queries::find_in_file_named`'s own doc has the
+/// measurement and what the alternatives cost. The explanation below says so
+/// in the response, because an order the caller cannot see is an order the
+/// caller cannot use: "these are the first five" and "these are the five the
+/// rest of the project leans on" are different claims about the same page.
 fn by_file_name(
     conn: &Connection,
     embedding: Option<&EmbeddingPipeline>,
@@ -665,11 +672,11 @@ fn by_file_name(
         resolved_by: ResolvedBy::FileName,
         ambiguous: false,
         explanation: format!(
-            "No declaration is named '{name}'. The file {file_path} is, and declares these. A \
-             default import binds a file's export under whatever local name the importing file \
-             chose, and that local name is not indexed - so a name read at a use site can be \
-             absent here while the declaration it refers to is present under its own name. \
-             Re-query by one of these ids."
+            "No declaration is named '{name}'. The file {file_path} is, and declares these - its \
+             most-referenced declarations first. A default import binds a file's export under \
+             whatever local name the importing file chose, and that local name is not indexed - \
+             so a name read at a use site can be absent here while the declaration it refers to \
+             is present under its own name. Re-query by one of these ids."
         ),
         results: in_file
             .iter()
@@ -1180,6 +1187,119 @@ mod tests {
             body["explanation"].as_str().expect("an explanation").contains("default import"),
             "the page has to say why a name that is plainly in the source resolved to nothing: {body}"
         );
+    }
+
+    /// A declaration in `file`, at `line`, with `inbound` other declarations
+    /// referencing it - the three things the file-name rung's ordering reads.
+    /// Public, because the ordering it replaced put exported first and a
+    /// control has to hold that constant.
+    fn referenced_decl(
+        conn: &mut Connection,
+        id: &str,
+        kind: &str,
+        name: &str,
+        file: &str,
+        line: i64,
+        inbound: usize,
+    ) {
+        let mut node = NodeRecord::new(id, kind, name, name, file, "go");
+        node.start_line = line;
+        node.end_line = line;
+        node.visibility = "public".to_string();
+        node.exported = true;
+        upsert_node(conn, node).unwrap();
+        for i in 0..inbound {
+            let user = format!("{id}_user{i}");
+            upsert_node(conn, NodeRecord::new(&user, "Function", &user, &user, "uses.go", "go")).unwrap();
+            upsert_edge(
+                conn,
+                EdgeRecord::new(format!("{id}_e{i}"), &user, id, "REFERENCES", "tree-sitter", true),
+            )
+            .unwrap();
+        }
+    }
+
+    /// GM-373's measured gin case, in miniature: nothing is named `context`,
+    /// `context.go` is, and that file opens with a block of exported MIME
+    /// constants while the type the file exists for is declared ninety-odd
+    /// declarations later. Ordered by source position the page is the
+    /// constants and the caller never sees `Context`; ordered by how much of
+    /// the project leans on each declaration (`Context` 335 inbound edges
+    /// against `MIMEJSON`'s 15, measured on a real gin index) it is the first
+    /// row.
+    ///
+    /// **Evidence.** With `exported DESC, startLine ASC` restored as
+    /// `graph::queries::find_in_file_named`'s only ordering, this fails on the
+    /// first assertion: `MIMEJSON` is the first row.
+    #[test]
+    fn the_file_name_rung_offers_a_files_most_referenced_declaration_first() {
+        let mut conn = setup();
+        referenced_decl(&mut conn, "MIMEJSON", "Variable", "MIMEJSON", "context.go", 10, 2);
+        referenced_decl(&mut conn, "MIMEXML", "Variable", "MIMEXML", "context.go", 11, 2);
+        referenced_decl(&mut conn, "Context", "Type", "Context", "context.go", 100, 5);
+
+        let body = json_body(&by_name(&conn, None, None, "context", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        assert_eq!(body["results"][0]["qualifiedName"], "Context", "{body}");
+        // A reorder, not a filter: the constants are still on the page, which
+        // is what keeps this an answer to "which of these did you mean".
+        let listed: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["qualifiedName"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"MIMEJSON"), "{listed:?}");
+    }
+
+    /// **Control.** The same rung, on the case it already answered well:
+    /// gin's `render/toml.go`, where the type `TOML` both comes first in the
+    /// file and is the most referenced thing in it. It is the first row under
+    /// either ordering, so this passes in both arms - which is what says the
+    /// test above is about the ordering rule and not about a page tuned until
+    /// one query looked right.
+    #[test]
+    fn a_file_whose_subject_is_also_its_first_declaration_is_unchanged() {
+        let mut conn = setup();
+        referenced_decl(&mut conn, "TOML", "Type", "TOML", "render/toml.go", 20, 6);
+        referenced_decl(
+            &mut conn,
+            "tomlBinding.Name",
+            "Function",
+            "tomlBinding.Name",
+            "render/toml.go",
+            30,
+            0,
+        );
+
+        let body = json_body(&by_name(&conn, None, None, "toml", None).unwrap());
+
+        assert_eq!(body["resolvedBy"], "fileName");
+        assert_eq!(body["results"][0]["qualifiedName"], "TOML", "{body}");
+    }
+
+    /// **Control.** A file whose declarations are all unreferenced - ripgrep's
+    /// `crates/core/index/disabled.rs` is the real instance - has nothing for
+    /// the ranking to read, and falls back to exactly the order this rung
+    /// returned before: exported first, then source position. Passes in both
+    /// arms, and is what makes the change a refinement rather than a
+    /// replacement.
+    #[test]
+    fn a_file_with_no_inbound_edges_keeps_the_old_order() {
+        let mut conn = setup();
+        referenced_decl(&mut conn, "write", "Function", "write", "index/disabled.go", 10, 0);
+        referenced_decl(&mut conn, "read", "Function", "read", "index/disabled.go", 20, 0);
+
+        let body = json_body(&by_name(&conn, None, None, "disabled", None).unwrap());
+
+        let listed: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["qualifiedName"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, vec!["write", "read"], "source order, as before: {body}");
     }
 
     /// A name that is nowhere keeps the short refusal. A page of candidates
