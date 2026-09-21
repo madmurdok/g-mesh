@@ -475,6 +475,22 @@ re-checking rows) disappeared. What is left in the "after" runs is a single
 grep serving a question g-mesh does not answer at all — "which *other*
 symbols have similar names?" — not a re-check of what it did answer.
 
+The other half of trusting `resolved: true` is knowing what tier produced it.
+A same-file edge is confirmed by parsing alone, but a cross-file edge that
+needed a language's semantic tier — `rust-analyzer`, `pyright` — means one
+thing when that tier ran for this project and something narrower when it
+did not, and until GM-382 nothing in the response said which. Since GM-382,
+`find_references`/`find_callers`/`find_callees`/`find_implementations` carry
+a response-level `provenance: {language, semanticTier: "absent"}` block, but
+only when the anchor's language declares a semantic tier that has not
+completed here — a healthy response stays silent, the same way `resolved`
+staying `true` does. So a guarantee measured with a language's semantic tier
+present is a guarantee about that tier being present, not a universal one:
+a new language, or the same language on a machine without its tool
+installed, is a new measurement. `provenance` closes the one case that used
+to be silent about this everywhere; it does not make the guarantee itself
+universal.
+
 If you still want to trim that last step, put a short instruction in your
 project's `CLAUDE.md` (a task/project prompt reaches the model more reliably
 than a server capability description does):
