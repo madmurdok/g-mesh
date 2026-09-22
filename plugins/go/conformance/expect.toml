@@ -29,6 +29,10 @@
 #     (`expectations.rs`'s decision 7);
 #   - references (structural): `Server`, used but never called, which is
 #     what makes it a case `[[callers]]` cannot answer at all;
+#   - callers over that same `Server` (structural, GM-386): the empty answer
+#     the sentence above describes, asserted rather than left implied, plus
+#     the `excluded_references` disclosure that is the whole content of that
+#     page - see the entry's own comment;
 #   - definition (structural): `Server.Addr`'s own declaration and
 #     `Placeholder`'s.
 #
@@ -48,6 +52,16 @@
 # reaches it. An address that was file-scoped, or scoped to the project
 # rather than to a container, would put the other package's caller in the set
 # and fail here.
+#
+# GM-386 added three more things an entry can say, all of which read the same
+# way: `files` (decision 12) and `excluded_references` (decision 13) assert the
+# response's two per-page summaries, and an entry that does not mention them
+# requires the response to carry neither. An `unresolved:`-prefixed row
+# (decision 11) marks an edge the linker could not confirm; no row in this
+# file carries one, which is this fixture's assertion that every caller,
+# reference and implementor it names sits on a confirmed edge - including the
+# four container-scoped placeholder addresses above, whose whole point is that
+# core can resolve them.
 
 # A cross-file call inside one package, linked through core's container-
 # scoped lookup: main.go's `Placeholder` calls `helper`, which is declared in
@@ -199,6 +213,40 @@ expect = [
   "server/conn.go:newConn",
   "server/logged.go:Logged",
 ]
+# Decision 12, and Go's entry for it. Three of the six rows are in
+# server.go, so the tally says something the filePath column does not and the
+# response carries it. The counts are what is worth pinning here: this
+# plugin's claim that a method's *receiver* is a use of its type means
+# `server/server.go:3` is `New` plus the two method receivers, not one row
+# per file - drop the receiver rule and this count falls to 1 while the row
+# for `server/server.go:New` above stays exactly where it is.
+files = ["server/conn.go:2", "server/logged.go:1", "server/server.go:3"]
+
+# The other half of the sentence above - "`find_callers("Server")` would
+# answer nothing" - now says so in the file rather than in a comment, and
+# that empty page is where decision 13 does its work for Go.
+#
+# `expect = []` is a resolved answer that is empty (decision 9 has why that is
+# not the same as a refusal): `Server` is a type, so no `CALLS` edge can point
+# at it and the `results` array is genuinely blank. What makes the page useful
+# rather than a dead end is the disclosure beside it - the same six usages the
+# `[[references]]` entry above lists, counted as the non-CALLS edges this walk
+# left behind, which is the whole of GM-258's argument for carrying file names
+# instead of a bare count. A caller that reads it already has its file-level
+# answer and does not need the second `find_references` round-trip.
+#
+# So this entry fails in both directions: if the walk ever starts returning
+# callers for a type, and if the plugin ever stops emitting the `REFERENCES`
+# edges that make the emptiness explainable.
+[[callers]]
+symbol = "Server"
+file = "server/server.go"
+expect = []
+excluded_references = { count = 6, files = [
+  "server/server.go:3",
+  "server/conn.go:2",
+  "server/logged.go:1",
+] }
 
 # `Server.Addr`'s own declaration, found directly by its qualifiedName - no
 # semantic pass involved, unlike the `[[callers]]` entry higher up that asks

@@ -828,6 +828,10 @@ migration (GM-275) makes them a failure.
 symbol = "Server.Close"
 file = "server.go"            # optional: disambiguates an ambiguous symbol
 expect = ["cmd/main.go:run", "server_test.go:TestClose"]
+files = ["cmd/main.go:1", "server_test.go:1"]   # the response's own tally,
+                                                # omit it to assert none
+excluded_references = { count = 1, files = ["doc.go:1"] }  # the non-CALLS
+                                                # usages this walk left behind
 
 [[references]]
 symbol = "Greetable"
@@ -866,7 +870,15 @@ runs, in the other direction, and carries the one field only that direction
 has: `via_module` asserts which module the walk actually ran from
 (`resolvedFrom.qualifiedName` — outside TypeScript an import names a module,
 not a file, so a file anchor is substituted), and *omitting* it asserts that
-no substitution happened rather than that nothing was checked. For the
+no substitution happened rather than that nothing was checked. A row the
+linker could not confirm carries a leading `unresolved:` marker, so an entry
+that does not spell one asserts that every row it names sits on a confirmed
+edge; a page that reports `allUnresolved: true` fails outright, the same way a
+truncated one does. `files` and `excluded_references` assert the response's
+two per-page summaries as sets of `"path:count"`, and *omitting* either
+asserts that the response carries none — which is what makes a plugin that
+starts emitting one usage twice, or stops emitting a `REFERENCES` edge it used
+to, fail an entry whose row set has not moved at all. For the
 categories whose tool answers one row per answer — `[[implementations]]`,
 `[[imports]]`, `[[importers]]` — a repeated row fails the entry even when the
 set matches; `[[callers]]`/`[[references]]` are exempt, since two rows there
