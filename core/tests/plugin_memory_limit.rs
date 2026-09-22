@@ -593,11 +593,26 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
     assert!(!text.is_empty(), "get_info must carry non-empty instructions once a language is present");
 
     if semantic_pass_done {
+        // GM-385: a completed pass NARROWS this gap, it does not close it.
+        // rust-analyzer resolves `x.area()` against the receiver's declared
+        // or inferred type - `&dyn Shape`, `<S: Shape>` - so the call lands
+        // on `Shape::area` and the *override's* own caller page still
+        // under-reports. This arm used to assert "One real gap", i.e. the
+        // gap rendered as closed, which was the belief GM-385 measured and
+        // disproved across all four plugins. What a resolved tier changes is
+        // the wording, not the existence of the gap, so the assertion is
+        // still two-sided: the static-receiver form must be there and the
+        // open form must not.
         assert!(
-            text.contains("One real gap"),
+            text.contains("binds to the receiver's declared or inferred type"),
             "rust's semantic pass completed and recorded before suspension caught it (the \
              common-case race - see this file's module doc), so the real MCP `initialize` \
-             response must render its receiver-call gap as CLOSED:\n{text}"
+             response must render its receiver-call gap in the STATIC-RECEIVER form:\n{text}"
+        );
+        assert!(
+            !text.contains("produces no edge by design"),
+            "rust's semantic pass completed, so the gap must not still be rendered in its \
+             OPEN form - that wording is for a tier that never ran:\n{text}"
         );
     } else {
         assert!(
