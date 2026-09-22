@@ -109,7 +109,11 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 /// How many entries `conformance/expect.toml` carries, and how many of them
 /// are tagged `tier = "semantic"`. Asserted rather than assumed, so an entry
 /// added without a decision about its tier fails here first.
-const EXPECTATIONS: usize = 12;
+// 13 since GM-385, which added `[[callers]] Greeter.describe` - the empty
+// page an agent gets when it asks who calls an override whose one call site
+// was attributed to the base's annotation. Deliberately NOT semantic: the page
+// is empty with pyright and without it, which is the hazard it records.
+const EXPECTATIONS: usize = 13;
 const SEMANTIC_EXPECTATIONS: usize = 3;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.

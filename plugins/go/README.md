@@ -7,6 +7,11 @@ A single static Go binary that indexes Go for g-mesh, in two tiers:
 | structural | `go/parser` (`extract.go`, `uses.go`, `scope.go`) | no | declarations, containers (import paths), visibility, `DEFINES`/`EXPORTS`/`IMPORTS`, bare and package-qualified calls and references |
 | semantic | `go/types` via `golang.org/x/tools/go/packages` (`semantic.go`) | **yes** — `go` on `PATH` | receiver calls (`x.M()`), method promotion through embedding, interface dispatch, dot-imported names, implicit interface satisfaction (`SUPERTYPE_OF`) |
 
+"Interface dispatch" in that last cell means the call is attributed to the
+**interface method's** declaration, not to the concrete method that runs —
+see [What a resolved receiver call resolves *to*](#what-a-resolved-receiver-call-resolves-to)
+before trusting a caller list for a method.
+
 The design, and every decision either tier had to settle, is in
 [`docs/architecture/multi-language-plugins.md`](../../docs/architecture/multi-language-plugins.md)
 ("Go plugin", plus the GM-279/GM-280/GM-281 implementation notes).
@@ -59,6 +64,56 @@ Every answer is a `qualifiedName`-keyed placeholder addressed at the
 it. `Close` as a bare name is worthless — it exists on dozens of types — so
 the address is `Server.Close` inside `github.com/you/app/server`, which names
 one declaration and nothing else.
+
+## What a resolved receiver call resolves *to*
+
+`plugin.toml` says `receiver_calls = "resolved"`, and that is a statement
+about the *tier*, not a promise about which code runs. `go/types` resolves
+`x.M()` against the **static type of `x`** — the only type it has — so a call
+through an interface value lands on the interface method's own declaration,
+never on the concrete method that executes:
+
+```go
+func CloseAll(closers []Closer) error {
+    for _, c := range closers {
+        if err := c.Close(); err != nil { ... }   // -> Closer.Close
+    }
+}
+```
+
+Measured on `conformance/project`, with `go` on `PATH` and the whole-project
+pass complete:
+
+| query | answer |
+| --- | --- |
+| `find_callers("Closer.Close")` | `{server/conn.go:CloseAll}` |
+| `find_callers("Server.Close")` | `{server/conn.go:Conn.Close}` — no `CloseAll` |
+| `find_callers("Conn.Close")` | `{}` — empty |
+| `find_implementations("Closer")` | `{Server, Conn, Logged}` |
+
+The third row is the one to read twice. `Conn` implements `Closer`, so
+`CloseAll` runs `Conn.Close` whenever its slice holds a `Conn` — and the page
+that asks who calls `Conn.Close` comes back empty, with `hasMore: false`,
+`allUnresolved: false` and no `provenance` block, because nothing was absent:
+the tier ran and filed that call under the interface. Every signal says
+complete, and it is complete for "who *names* this declaration", which is a
+different question from "what runs this code".
+
+**Where the missing calls went, and why this plugin will not count them.**
+They are on the interface method's page, exactly — so
+`find_implementations` is the crossing, and `conformance/expect.toml` asserts
+all four rows above as exact sets. What this plugin never reports is a
+*number*: it knows `Closer` has three implementors, it does not know how many
+of `CloseAll`'s iterations reach any one of them, and that is unknowable by
+construction. A count an agent acts on is worse than silence, which is the
+rule `core/src/mcp/provenance.rs` already states for an absent tier.
+
+This is not Go-specific. `plugins/rust` and `plugins/python` have the same
+section, saying the same thing in their own syntax, because it is what static
+resolution means rather than what one engine does. `plugins/typescript` is
+the odd one out and says so: it declares `receiver_calls = "unresolved"` for
+both tiers and emits no edge for `x.m()` at all. A session is told the
+consequence once, by `core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER`.
 
 ## Out of scope, deliberately
 

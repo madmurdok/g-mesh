@@ -50,6 +50,19 @@ class Greeter(Base):
     def __init__(self, name: str) -> None:
         self.name = name
 
+    def describe(self) -> str:
+        """Override the base's method, and never be called by name.
+
+        ``pkg/callers.py``'s ``through_a_base_annotation`` writes
+        ``obj.describe()`` for ``obj: Base``, and a ``Greeter`` passed to it
+        runs *this* body - but pyright attributes the call to the annotation,
+        so that call site lands on ``Base.describe`` and this declaration's
+        own caller page comes back empty. ``conformance/expect.toml`` asserts
+        both halves; see its ``Greeter.describe`` entry for why an empty page
+        is the shape worth pinning.
+        """
+        return "greeter " + self.name
+
     def shout(self) -> str:
         """Call a sibling method through this method's own instance."""
         return self.render().upper()

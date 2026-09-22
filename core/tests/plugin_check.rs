@@ -1441,6 +1441,14 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         // GM-371: a name the index does not carry is refused whether or not
         // tsserver ran, so this one is structural too.
         "expectations.refusal[0]",
+        // GM-385: `[[callers]] Greetable#greet` - the receiver call
+        // `viaGreetable` makes on `g: Greetable`. This plugin declares
+        // `receiver_calls = "unresolved"` for BOTH tiers, so the page is
+        // empty here and empty in the shipped-manifest run above, and its
+        // presence in this list is the assertion: an entry that moved
+        // between the two arms would mean tsserver had started answering
+        // receiver calls.
+        "expectations.callers[3]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }

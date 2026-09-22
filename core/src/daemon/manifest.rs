@@ -246,9 +246,28 @@ pub struct Capabilities {
     pub semantic_pass: bool,
     /// Whether receiver calls resolve to edges once this plugin's best
     /// available tier has run (its semantic tier, if it has one and it has
-    /// run - otherwise the structural tier alone). `Resolved` means the MCP
-    /// instructions do not need to list the receiver-call gap for this
-    /// language; `Unresolved` (the default) means they do.
+    /// run - otherwise the structural tier alone).
+    ///
+    /// **`Resolved` means resolved against the receiver's declared or
+    /// inferred type, never the type it holds at run time**, and GM-385
+    /// measured that this is not one plugin's limitation but what the word
+    /// can mean at all: a static analysis has no other type to resolve
+    /// against. All three bundled plugins that declare `Resolved` behave
+    /// identically - `go/types` attributes a call through a `Closer` value
+    /// to `Closer.Close`, rust-analyzer attributes `&dyn Shape`/`<S: Shape>`
+    /// to `Shape::area`, pyright attributes `obj.describe()` for `obj: Base`
+    /// to `Base.describe` - so the override's own caller page loses those
+    /// call sites and looks complete without them.
+    ///
+    /// That consequence is disclosed once per session rather than per
+    /// answer: `mcp::instructions`' `P4_STATIC_RECEIVER` renders it, and that
+    /// constant's doc comment has the measurements, the rejected per-row and
+    /// per-response shapes, and why a count of what was missed must never be
+    /// offered in place of a pointer to where it went.
+    ///
+    /// For the tool-surface consequence: `Resolved` means the MCP
+    /// instructions do not list the receiver-call gap in its *open* form for
+    /// this language; `Unresolved` (the default) means they do.
     pub receiver_calls: ReceiverCallResolution,
     /// Whether the *structural* tier alone - before any semantic pass runs,
     /// or for a plugin with no semantic tier at all - resolves receiver

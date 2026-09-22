@@ -84,6 +84,56 @@ container each `use` reads from; `CALLS` and `REFERENCES` onto a declaration
 of the same file or onto a placeholder core links; `SUPERTYPE_OF` from a type
 to each trait it implements and from a trait to each of its supertraits.
 
+## What a resolved receiver call resolves *to*
+
+`plugin.toml` says `receiver_calls = "resolved"`, and that is a statement
+about the *tier*, not a promise about which code runs. rust-analyzer resolves
+`x.m()` against the **static type of `x`** — the only type it has — so a call
+through a trait object or a generic lands on the trait's own declaration,
+never on the `impl` that executes:
+
+```rust
+pub fn total(square: &Square) -> u8 { square.area() }        // -> <Square as Shape>::area
+pub fn total_dyn(shape: &dyn Shape) -> u8 { shape.area() }   // -> Shape::area
+pub fn measure<S: Shape>(shape: &S) -> u8 { shape.area() }   // -> Shape::area
+```
+
+Measured on `conformance/project`, with rust-analyzer resolved and the
+whole-project pass complete:
+
+| query | answer |
+| --- | --- |
+| `find_callers("shapes::Shape::area")` | `{shapes::total_dyn, gaps::measure}` |
+| `find_callers("shapes::<Square as Shape>::area")` | `{shapes::total}` — no `total_dyn`, no `measure` |
+| `find_callers("shapes::<Circle as Shape>::area")` | `{}` — empty |
+| `find_implementations("shapes::Shape")` | `{shapes::Square, shapes::Circle}` |
+
+The third row is the one to read twice. `Circle` implements `Shape`, so
+either of the two dispatching call sites runs `<Circle as Shape>::area` for a
+`Circle` — and the page that asks who calls it comes back empty, with
+`hasMore: false`, `allUnresolved: false` and no `provenance` block, because
+nothing was absent: the tier ran and filed those calls under the trait. Every
+signal says complete, and it is complete for "who *names* this declaration",
+which is a different question from "what runs this code".
+
+**Where the missing calls went, and why this plugin will not count them.**
+They are on the trait's page, exactly — so `find_implementations` is the
+crossing, and `conformance/expect.toml` asserts all four rows above as exact
+sets. What this plugin never reports is a *number*: it knows `Shape` has two
+implementors, it does not know which one any given `&dyn Shape` holds, and
+that is unknowable by construction. A count an agent acts on is worse than
+silence, which is the rule `core/src/mcp/provenance.rs` already states for an
+absent tier.
+
+This is not Rust-specific. `plugins/go` and `plugins/python` have the same
+section, saying the same thing in their own syntax, because it is what static
+resolution means rather than what one engine does. `plugins/typescript` is
+the odd one out and says so: it declares `receiver_calls = "unresolved"` for
+both tiers and emits no edge for `x.m()` at all — which is also what gap 3
+below describes for *this* plugin's structural tier, before rust-analyzer has
+run. A session is told the consequence once, by
+`core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER`.
+
 ## What it does not see
 
 These are what the *structural* tier does not see. Each is a question only
@@ -107,6 +157,11 @@ code that has them.
 3. **Trait dispatch through generics.** `fn f<S: Shape>(s: &S) { s.area() }`
    reaches whichever `Shape::area` the type argument selects at each call
    site. That is a receiver call, so it produces no edge at all - see below.
+   Once rust-analyzer has run it produces one, onto `Shape::area` itself:
+   the bound is the only type there is to resolve against. That is not this
+   gap closing, it is this gap narrowing, and
+   [What a resolved receiver call resolves *to*](#what-a-resolved-receiver-call-resolves-to)
+   above has what the narrowed answer does and does not cover.
 
 Two smaller ones, for completeness:
 
