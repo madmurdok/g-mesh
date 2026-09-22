@@ -15,6 +15,7 @@ use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
 
+use super::similarity;
 use super::source;
 use super::tool_result::{error, internal_error, success};
 use super::FindDefinitionParams;
@@ -453,22 +454,6 @@ pub(super) fn resolve_symbol_name(
     }
 }
 
-/// The similarity cutoff, from `g-mesh-bench`'s
-/// `docs/results/v0.21.0-semantic-threshold-calibration.md`.
-///
-/// Measured over both corpora, with the right-answer set read from the
-/// benchmark's own task oracles so it could not be tuned to flatter the
-/// result: right answers score a median 0.684 (p10 0.615), queries with no
-/// right answer a median 0.423 (p90 0.535). At 0.60 that keeps 20 of the 21
-/// findable answers and admits 1 of 54 negatives.
-///
-/// 0.55 has *identical* recall and twice the false positives; 0.65 costs 23
-/// points of recall and gains nothing. The choice is flat across 0.56-0.64,
-/// which is the part worth knowing: this does not need re-tuning as the index
-/// shifts, and a change here should be justified by a re-run of that script
-/// rather than by taste.
-const SEMANTIC_THRESHOLD: f64 = 0.60;
-
 /// How many neighbours to offer. The calibration found the correct hit ranked
 /// first in 19 of 21 cases, so a long list would be payload without value.
 const SEMANTIC_CANDIDATES: usize = 3;
@@ -516,9 +501,38 @@ fn is_module_specifier(name: &str) -> bool {
 /// # When it stays silent
 ///
 /// No model (`embed_query` is `None` on a machine that never downloaded the
-/// 612 MiB weights), a specifier-shaped query, or nothing scoring above
-/// [`SEMANTIC_THRESHOLD`]: all three fall through to the terse refusal this
-/// rung was added in front of, never to an error.
+/// 612 MiB weights), a specifier-shaped query, or nothing scoring above its
+/// language's [`similarity::floor`]: all three fall through to the terse
+/// refusal this rung was added in front of, never to an error.
+///
+/// # The floor moved, and it moved *down* here - on purpose
+///
+/// GM-381 needed the same judgement for `search_code`, measured it over four
+/// languages, and found one constant could not serve them; the table now
+/// lives in `mcp::similarity::floor` and this rung reads it per hit rather
+/// than holding a constant of its own. That is not a free refactor, because
+/// the two call sites do not see the same kind of query: this rung is only
+/// ever reached with a *symbol name*, while `search_code` takes free text,
+/// and the safe floor for free text sits lower. So the shared table changes
+/// what this rung does, and the change is worth stating rather than
+/// discovering.
+///
+/// Calibrated on name queries alone (149 go, 145 python, 143 rust, 291
+/// typescript positives against 150-300 absent-name negatives each), the
+/// floor that keeps this rung's false refusals at or under 3% is 0.648 for
+/// go, 0.628 for python, 0.555 for rust and 0.538 for typescript. The shared
+/// table ships 0.59 / 0.57 / 0.55 / 0.50 - at or below every one of those.
+/// **Every deviation is in the direction of offering candidates rather than
+/// refusing**, which is the direction this rung's own argument asks for: a
+/// labelled "did you mean" is cheap and a refusal is what GM-234 existed to
+/// stop. Concretely, on TypeScript name queries the old 0.60 wrongly refused
+/// 6.9% of pages that held the right answer; at 0.50 that is 0.0%, paid for
+/// by offering candidates on 35% of hopeless queries instead of 10%.
+///
+/// Tightening this rung with a *name-query* table of its own is a real
+/// improvement left undone here, because it is a different calibration with
+/// a different cost matrix and it would have ridden in unmeasured on a task
+/// about `search_code`.
 fn by_semantic_neighbours(
     conn: &Connection,
     embedding: Option<&EmbeddingPipeline>,
@@ -532,7 +546,7 @@ fn by_semantic_neighbours(
     let results: Vec<DefinitionCandidate> = page
         .results
         .into_iter()
-        .filter(|hit| hit.score >= SEMANTIC_THRESHOLD)
+        .filter(|hit| hit.score >= similarity::floor(&hit.language))
         .map(DefinitionCandidate::from)
         .collect();
     if results.is_empty() {
@@ -1698,11 +1712,11 @@ mod tests {
         let conn = setup_with_vectors();
         insert_vector(&conn, "near", &[1.0, 0.0]);
 
-        // Cosine 1.0 - comfortably above SEMANTIC_THRESHOLD.
+        // Cosine 1.0 - comfortably above the fixture language's floor.
         let accepted =
             super::super::search_code::search(&conn, &[1.0, 0.0], SEMANTIC_CANDIDATES, None).unwrap();
         assert!(
-            accepted.results[0].score >= SEMANTIC_THRESHOLD,
+            accepted.results[0].score >= similarity::floor("rust"),
             "the fixture must place this above the threshold: {}",
             accepted.results[0].score
         );
@@ -1711,7 +1725,7 @@ mod tests {
         let rejected =
             super::super::search_code::search(&conn, &[0.0, 1.0], SEMANTIC_CANDIDATES, None).unwrap();
         assert!(
-            rejected.results[0].score < SEMANTIC_THRESHOLD,
+            rejected.results[0].score < similarity::floor("rust"),
             "the fixture must place this below the threshold: {}",
             rejected.results[0].score
         );

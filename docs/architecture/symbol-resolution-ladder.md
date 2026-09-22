@@ -233,6 +233,14 @@ On the wire, both response shapes gain one field:
 - **Threshold calibration is a measurement task, not a constant.** It needs right-answer and
   junk-answer scores across both corpora before a number is chosen. Until then rung 5 should be off
   by default.
+
+  *Settled twice, and the second time changed the shape of the answer.* GM-234 measured 0.60 over
+  the two TypeScript corpora. GM-381 re-measured over four languages and both query shapes, and
+  found that one constant cannot serve them: the floor is now per language and lives in
+  `mcp::similarity::floor` (go 0.59, python 0.57, rust 0.55, typescript 0.50), which this rung reads
+  per hit rather than holding a constant of its own. TypeScript needs the *lowest* floor, not the
+  0.60 that was measured on it, because 0.60 was measured on symbol-name queries alone — see that
+  module's doc comment for the sample and the held-out check.
 - **Does `resolvedBy` change agent behaviour?** Unknown. It is information the caller did not have;
   whether it improves decisions or just adds tokens is measurable on the bench, and should be
   measured rather than assumed — the same mistake as assuming the doc could be cut.

@@ -29,6 +29,10 @@
 #     (`expectations.rs`'s decision 7);
 #   - references (structural): `Server`, used but never called, which is
 #     what makes it a case `[[callers]]` cannot answer at all;
+#   - callers over that same `Server` (structural, GM-386): the empty answer
+#     the sentence above describes, asserted rather than left implied, plus
+#     the `excluded_references` disclosure that is the whole content of that
+#     page - see the entry's own comment;
 #   - definition (structural): `Server.Addr`'s own declaration and
 #     `Placeholder`'s.
 #
@@ -48,6 +52,16 @@
 # reaches it. An address that was file-scoped, or scoped to the project
 # rather than to a container, would put the other package's caller in the set
 # and fail here.
+#
+# GM-386 added three more things an entry can say, all of which read the same
+# way: `files` (decision 12) and `excluded_references` (decision 13) assert the
+# response's two per-page summaries, and an entry that does not mention them
+# requires the response to carry neither. An `unresolved:`-prefixed row
+# (decision 11) marks an edge the linker could not confirm; no row in this
+# file carries one, which is this fixture's assertion that every caller,
+# reference and implementor it names sits on a confirmed edge - including the
+# four container-scoped placeholder addresses above, whose whole point is that
+# core can resolve them.
 
 # A cross-file call inside one package, linked through core's container-
 # scoped lookup: main.go's `Placeholder` calls `helper`, which is declared in
@@ -113,6 +127,14 @@ expect = ["container:fmt", "container:github.com/example/app/server"]
 [[callers]]
 symbol = "Server.Addr"
 tier = "semantic"
+# GM-382. Go's semantic tier is `go/types`, which needs the `go` toolchain -
+# absent on a machine without it, which CI checks for real in its own
+# `go-plugin-without-toolchain` job. `"silent"` asserts the arm *this* run is
+# in: `go` present, whole-project pass completed, nothing to disclose. It is
+# a live assertion rather than a formality, because both rows below come from
+# `types.Info.Selections` and are exactly what disappears without the tier -
+# so this entry pins that the response claims the tier it actually had.
+provenance = "silent"
 expect = ["cmd/main.go:main", "server/logged.go:UseLogged"]
 
 # A method call through a struct field, resolved to the sibling file that
@@ -132,6 +154,50 @@ expect = ["server/conn.go:Conn.Close"]
 symbol = "Closer.Close"
 tier = "semantic"
 expect = ["server/conn.go:CloseAll"]
+
+# --- GM-385: the same fact, read from the end an agent actually asks --------
+#
+# The entry above is written from the call site: `c.Close()` on a `Closer`
+# lands on the interface method. This one is that sentence's other half, and
+# it is the half a caller meets.
+#
+# `Conn` implements `Closer` - `[[implementations]]` below asserts exactly
+# that - so `CloseAll` runs `Conn.Close` whenever the slice it walks holds a
+# `Conn`. Asking who calls `Conn.Close` nonetheless returns **nothing**, and
+# returns it in the shape that reads as settled. Measured against this
+# fixture with `go` on PATH and the whole-project pass complete, the MCP
+# response is 240 bytes:
+#
+#   {"anchor":{...},"results":[],"hasMore":false,"allUnresolved":false}
+#
+# No `provenance` block either, correctly: the semantic tier did run, so
+# there is nothing absent to disclose. Every signal a caller has says the
+# answer is complete, and it is complete only for the question the index can
+# answer - "who names this declaration", not "what runs this code".
+#
+# `expect = []` is a resolved-and-blank answer rather than a refusal
+# (decision 9). Asserting it is what makes the absence a measurement: nothing
+# else in this file fails if this page ever stops being empty, and nothing
+# else fails if it *starts* carrying `CloseAll` - which it would, the day a
+# semantic tier decided to guess at run-time dispatch. That guess is the one
+# this fixture must catch, because a wrong caller is worse than a missing one.
+#
+# **No `tier` key, deliberately**, unlike the three semantic entries above.
+# The page is empty with `go/types` and empty without it - structurally
+# because a receiver call emits no edge at all, semantically because the one
+# that exists went to `Closer.Close`. So this entry passes in the CI job that
+# runs with no Go toolchain as well as in the one that has it, and the reason
+# it can is the point: the response is byte-identical in both arms, so no
+# field on it could tell a reader which arm produced it. That is why GM-385
+# discloses this once per session (`core/src/mcp/instructions.rs`'s
+# `P4_STATIC_RECEIVER`) instead of marking the page - and why neither that
+# sentence nor this file may ever state a *count* of the calls missing here.
+# The index knows `Closer` has three implementors; it does not know how many
+# of `CloseAll`'s iterations reach this one, and a number a caller acts on is
+# worse than silence.
+[[callers]]
+symbol = "Conn.Close"
+expect = []
 
 # Implicit implementation: the thing Go's structural interfaces make
 # invisible to any amount of parsing. Three implementers, none of which
@@ -191,6 +257,40 @@ expect = [
   "server/conn.go:newConn",
   "server/logged.go:Logged",
 ]
+# Decision 12, and Go's entry for it. Three of the six rows are in
+# server.go, so the tally says something the filePath column does not and the
+# response carries it. The counts are what is worth pinning here: this
+# plugin's claim that a method's *receiver* is a use of its type means
+# `server/server.go:3` is `New` plus the two method receivers, not one row
+# per file - drop the receiver rule and this count falls to 1 while the row
+# for `server/server.go:New` above stays exactly where it is.
+files = ["server/conn.go:2", "server/logged.go:1", "server/server.go:3"]
+
+# The other half of the sentence above - "`find_callers("Server")` would
+# answer nothing" - now says so in the file rather than in a comment, and
+# that empty page is where decision 13 does its work for Go.
+#
+# `expect = []` is a resolved answer that is empty (decision 9 has why that is
+# not the same as a refusal): `Server` is a type, so no `CALLS` edge can point
+# at it and the `results` array is genuinely blank. What makes the page useful
+# rather than a dead end is the disclosure beside it - the same six usages the
+# `[[references]]` entry above lists, counted as the non-CALLS edges this walk
+# left behind, which is the whole of GM-258's argument for carrying file names
+# instead of a bare count. A caller that reads it already has its file-level
+# answer and does not need the second `find_references` round-trip.
+#
+# So this entry fails in both directions: if the walk ever starts returning
+# callers for a type, and if the plugin ever stops emitting the `REFERENCES`
+# edges that make the emptiness explainable.
+[[callers]]
+symbol = "Server"
+file = "server/server.go"
+expect = []
+excluded_references = { count = 6, files = [
+  "server/server.go:3",
+  "server/conn.go:2",
+  "server/logged.go:1",
+] }
 
 # `Server.Addr`'s own declaration, found directly by its qualifiedName - no
 # semantic pass involved, unlike the `[[callers]]` entry higher up that asks

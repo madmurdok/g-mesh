@@ -101,8 +101,17 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 /// How many entries `conformance/expect.toml` carries, and how many of them
 /// are tagged `tier = "semantic"`. Asserted rather than assumed, so an entry
 /// added without a decision about its tier fails here first.
-const EXPECTATIONS: usize = 21;
-const SEMANTIC_EXPECTATIONS: usize = 5;
+// 22 since GM-385, which added `[[callers]] shapes::<Circle as Shape>::area` -
+// the empty page an agent gets when it asks who calls an override whose call
+// sites were all attributed to the trait. It is deliberately NOT semantic: the
+// page is empty in both arms, which is the hazard that entry exists to record.
+const EXPECTATIONS: usize = 22;
+// 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
+// implementation entries, not because its rows need rust-analyzer - they do
+// not - but because the `files` tally it now asserts counts edges, and two of
+// the usages in shapes.rs are the semantic tier's. That fixture entry's own
+// comment has the measurement and what arm 2 gives up for it.
+const SEMANTIC_EXPECTATIONS: usize = 6;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///

@@ -17,7 +17,7 @@
 //! `SUPERTYPE_OF` edges transitively via `graph::traversal` - see
 //! [`dispatch`] and [`from_root`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -26,6 +26,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
@@ -34,7 +35,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
-use super::{anchor, find_definition, FindImplementationsParams, SymbolQueryParams};
+use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
 
 /// The one edge kind both the single-hop and transitive walks follow -
 /// pulled out for the transitive path's own `TraversalOptions`/`ResumeState`
@@ -87,6 +88,13 @@ struct ImplementationPage {
     /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// See `super::provenance` - present only when the anchor's language
+    /// declares a semantic tier that has not completed for this project, so
+    /// this answer came from its structural tier alone. Absent (not `null`,
+    /// not an "everything is fine" object) on every healthy response, which
+    /// is nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
 }
 
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
@@ -145,6 +153,7 @@ fn list_implementations(
 pub(super) fn handle(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = conn.lock().unwrap();
@@ -179,6 +188,7 @@ pub(super) fn handle(
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
+        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
     })
 }
 
@@ -253,6 +263,15 @@ struct TransitiveImplementationWalk {
     resume_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// See `super::provenance`. Present on a fresh walk under exactly the
+    /// same condition the single-hop page carries it, and absent on a
+    /// *resumed* one for the same reason `anchor` above is - a resumed call
+    /// resolves no anchor, so it has no language to name, and the response
+    /// that handed out the token already carried the disclosure for this
+    /// walk. Recomputing it would mean re-reading a node purely to repeat
+    /// something already delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
 }
 
 /// The wire spelling of each truncation cause - identical mapping to
@@ -282,15 +301,30 @@ fn wire_name(cause: TruncatedBy) -> &'static str {
 /// `edge_kind` - it is always `Incoming` over `SUPERTYPE_OF` - so, unlike
 /// that function, this one does not need either as a parameter; they are
 /// baked into the `ResumeState` built at the bottom instead.
+/// Everything a transitive page says about *itself* rather than about its
+/// rows, in one argument.
+///
+/// The three travel together and are set together: a fresh walk
+/// ([`from_root`]) has all three to give, a resumed one ([`continued`]) has
+/// none of them, and no caller has ever wanted a different combination -
+/// which is exactly the shape a struct exists to make unspellable. Grouping
+/// them is also what keeps [`bound_walk`] under `clippy::too_many_arguments`
+/// without an `allow`, now that GM-382 added the third.
+struct WalkFraming {
+    anchor: Option<anchor::AnchorInfo>,
+    hint: Option<&'static str>,
+    provenance: Option<provenance::Provenance>,
+}
+
 fn bound_walk(
     result: TraversalResult,
     max_depth: u32,
     max_fanout: u32,
-    anchor: Option<anchor::AnchorInfo>,
-    hint: Option<&'static str>,
+    framing: WalkFraming,
     prior_visited: Vec<VisitedNode>,
     prior_walked: Vec<String>,
 ) -> TransitiveImplementationWalk {
+    let WalkFraming { anchor, hint, provenance } = framing;
     // Present only on a fresh walk: a resumed call's `nodes` excludes
     // already-visited nodes (the anchor included), so `prior_visited` already
     // carries it forward instead.
@@ -312,6 +346,7 @@ fn bound_walk(
             frontier_nodes: result.frontier_nodes,
             resume_token: result.resume_token,
             hint,
+            provenance,
         };
     };
 
@@ -349,6 +384,7 @@ fn bound_walk(
         frontier_nodes: Vec::new(),
         resume_token: Some(token),
         hint,
+        provenance,
     }
 }
 
@@ -370,6 +406,7 @@ fn from_root(
     resolved_by: find_definition::ResolvedBy,
     hint: Option<&'static str>,
     max_depth: Option<u32>,
+    capabilities: &HashMap<String, Capabilities>,
 ) -> Result<CallToolResult, ErrorData> {
     // Carries the rung for the same reason the single-hop path does: a caller
     // must be able to tell an exact resolution from one the ladder suggested,
@@ -386,7 +423,9 @@ fn from_root(
 
     let result = traversal::traverse(conn, options)
         .map_err(|e| internal_error("failed to walk the implementation hierarchy", e))?;
-    success(&bound_walk(result, max_depth, max_fanout, Some(anchor_info), hint, Vec::new(), Vec::new()))
+    let provenance = provenance::resolve(conn, capabilities, &anchor_node.language);
+    let framing = WalkFraming { anchor: Some(anchor_info), hint, provenance };
+    success(&bound_walk(result, max_depth, max_fanout, framing, Vec::new(), Vec::new()))
 }
 
 /// Continues a transitive walk the exploration budget or a prior
@@ -406,7 +445,8 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the implementation walk", e))?;
-    success(&bound_walk(result, max_depth, max_fanout, None, None, prior_visited, prior_walked))
+    let framing = WalkFraming { anchor: None, hint: None, provenance: None };
+    success(&bound_walk(result, max_depth, max_fanout, framing, prior_visited, prior_walked))
 }
 
 /// The entry point `mod.rs` calls. Dispatches on `transitive`/`resume_token`
@@ -419,6 +459,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 pub(crate) fn dispatch(
     conn: &Arc<Mutex<Connection>>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
     let FindImplementationsParams {
@@ -449,7 +490,7 @@ pub(crate) fn dispatch(
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
 
     if !transitive.unwrap_or(false) {
-        return handle(conn, embedding, symbol_params);
+        return handle(conn, embedding, capabilities, symbol_params);
     }
 
     let conn = conn.lock().unwrap();
@@ -460,7 +501,7 @@ pub(crate) fn dispatch(
     let resolved_by = resolved.by;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, resolved_by, hint, max_depth)
+    from_root(&conn, &anchor, resolved_by, hint, max_depth, capabilities)
 }
 
 #[cfg(test)]
@@ -469,6 +510,16 @@ mod tests {
     use crate::graph::queries::{upsert_edge, upsert_node};
     use crate::storage::schema;
     use crate::storage::write::{EdgeRecord, NodeRecord};
+
+    /// The capability map every test in this module passes: empty, so
+    /// `provenance::resolve` reads "no plugin here declares a semantic
+    /// tier" and these responses stay byte-for-byte what they were before
+    /// GM-382 added the field. The tests that are *about* the field build
+    /// their own map; see `mcp::provenance`'s own tests for the predicate
+    /// itself.
+    fn no_capabilities() -> HashMap<String, Capabilities> {
+        HashMap::new()
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -524,7 +575,9 @@ mod tests {
     fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(
@@ -599,7 +652,9 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -622,8 +677,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 1);
         assert_eq!(
             body["allUnresolved"], true,
@@ -653,8 +710,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
     }
@@ -664,8 +723,10 @@ mod tests {
     fn the_single_hop_response_echoes_the_resolved_anchor() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
         assert_eq!(body["anchor"]["kind"], "Type");
@@ -684,7 +745,8 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
         // The rung travels with the anchor, and this path is where it was
@@ -707,7 +769,8 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         assert_eq!(body["anchor"]["id"], "interface");
         assert_eq!(body["anchor"]["resolvedBy"], "qualifiedName", "resolved by qualifiedName, not by id");
     }
@@ -751,8 +814,14 @@ mod tests {
         options.max_fanout = 10_000;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let first =
-            bound_walk(result, max_depth, max_fanout, Some(anchor_info), None, Vec::new(), Vec::new());
+        let first = bound_walk(
+            result,
+            max_depth,
+            max_fanout,
+            WalkFraming { anchor: Some(anchor_info), hint: None, provenance: None },
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(first.anchor.is_some(), "the first page of a fresh walk still carries the anchor");
         let token = first.resume_token.expect("this wide a fanout must truncate and hand back a token");
 
@@ -773,6 +842,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -781,6 +851,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -808,7 +879,9 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -882,7 +955,9 @@ mod tests {
         }
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap();
+        let result =
+            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         let mut ids: Vec<&str> = body["results"]
             .as_array()
@@ -957,7 +1032,8 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -984,7 +1060,8 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -1009,8 +1086,10 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), params).unwrap());
+        let body = json_body(
+            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+                .unwrap(),
+        );
         assert!(
             body.get("hint").is_none(),
             "hint must be entirely absent, not null, on a normal symbol anchor: {body}"
@@ -1050,7 +1129,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, &EmbeddingPipeline::disabled(), params).unwrap();
+            let result = handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
@@ -1081,6 +1160,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1089,6 +1169,7 @@ mod tests {
             &dispatch(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1116,6 +1197,7 @@ mod tests {
             &dispatch(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1127,6 +1209,7 @@ mod tests {
             &dispatch(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(false),
@@ -1141,6 +1224,7 @@ mod tests {
             &dispatch(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
                 FindImplementationsParams {
                     symbol_id: Some("interface".to_string()),
                     transitive: Some(true),
@@ -1205,7 +1289,8 @@ mod tests {
             max_depth: Some(2),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
 
         let reached: Vec<(String, u64)> = body["results"]
             .as_array()
@@ -1250,7 +1335,14 @@ mod tests {
         options.max_fanout = 1;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let walk = bound_walk(result, max_depth, max_fanout, None, None, Vec::new(), Vec::new());
+        let walk = bound_walk(
+            result,
+            max_depth,
+            max_fanout,
+            WalkFraming { anchor: None, hint: None, provenance: None },
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert_eq!(walk.results.len(), 1, "one of the three implementors, and a warning");
         assert!(walk.truncated);
@@ -1295,7 +1387,14 @@ mod tests {
         options.max_fanout = 10_000;
         let (max_depth, max_fanout) = (options.max_depth, options.max_fanout);
         let result = traversal::traverse(&conn, options).unwrap();
-        let first = bound_walk(result, max_depth, max_fanout, None, None, Vec::new(), Vec::new());
+        let first = bound_walk(
+            result,
+            max_depth,
+            max_fanout,
+            WalkFraming { anchor: None, hint: None, provenance: None },
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert!(!first.results.is_empty(), "at least one row must come back");
         assert!(
@@ -1350,6 +1449,7 @@ mod tests {
         let with_symbol_id = dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
             FindImplementationsParams {
                 symbol_id: Some("interface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -1362,6 +1462,7 @@ mod tests {
         let with_symbol_name = dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
             FindImplementationsParams {
                 symbol_name: Some("Iface".to_string()),
                 resume_token: Some("whatever".to_string()),
@@ -1374,6 +1475,7 @@ mod tests {
         let with_transitive_only = dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
             FindImplementationsParams {
                 transitive: Some(true),
                 resume_token: Some("whatever".to_string()),
@@ -1411,7 +1513,8 @@ mod tests {
             transitive: Some(true),
             ..Default::default()
         };
-        let body = json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), params).unwrap());
+        let body =
+            json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
 
         let hint = body["hint"].as_str().expect("a File-anchored transitive call must still carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");

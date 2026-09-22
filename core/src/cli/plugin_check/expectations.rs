@@ -74,7 +74,11 @@
 //!   `"{filePath}:"`, the trailing colon rather than the bare path chosen so
 //!   the format is always exactly one colon and a reader can
 //!   `split_once(':')` without a case for whether a qualifiedName is
-//!   present.
+//!   present. A row the linker could not confirm takes a leading
+//!   `unresolved:` marker - decision 11, which has why the row's own
+//!   `resolved` bit is spelled inside the row rather than in a key beside
+//!   it; the `split_once(':')` reading then applies to what follows the
+//!   marker, exactly as it already does after `[[imports]]`' `container:`.
 //! - **`[[definition]]`**: the single resolved node, the same
 //!   `"{filePath}:{qualifiedName}"` rule, as a one-element set. A *refusal*
 //!   is not a zero-element set here, and this said for a while that it was
@@ -374,8 +378,221 @@
 //! not a claim about the language. The four that resolve a `symbol_name`
 //! through `find_definition::resolve_symbol_name` are the ones where
 //! refusing is an answer about the code.
+//!
+//! # Decision 10: asserting which tier answered (GM-382)
+//!
+//! Every category above asserts *what* a tool answered. None could assert
+//! which tier produced the answer - and until GM-382 no response said,
+//! which is the root under GM-356/358/360/361/362: the same query against a
+//! Rust project with `rust-analyzer` installed and without it returns the
+//! same shape, the same `resolved: true` rows, and means different things.
+//!
+//! `provenance` is that assertion, on the three `symbol`-anchored
+//! edge-walking categories plus `[[definition]]`:
+//!
+//! ```toml
+//! [[callers]]
+//! symbol = "shapes::Square::perimeter"
+//! tier = "semantic"
+//! expect = ["..."]
+//! provenance = "silent"
+//! ```
+//!
+//! **Two values, and omission is the third spelling of the first.**
+//! `"silent"` requires the response to carry no `provenance` key at all -
+//! the plugin's semantic tier ran, so there is nothing to disclose. Any
+//! other value is a language id and requires
+//! `provenance = {language = "<id>", semanticTier = "absent"}`. Omitting
+//! the key means `"silent"` too, the same way `ImportersExpectation::
+//! via_module`'s absence is an assertion rather than a skip (decision 7) -
+//! so every entry already written in every bundled fixture gained this
+//! assertion without being edited, which is the point: a plugin that
+//! started disclaiming its own semantic tier would fail its whole file, not
+//! one opted-in entry.
+//!
+//! **`[[definition]]` accepts the key but can only ever satisfy
+//! `"silent"`.** `find_definition` resolves a declaration, which is
+//! structural work no semantic tier changes, so it carries no block by
+//! design (`mcp::provenance`'s module doc, "scoped to four tools"). The key
+//! is still evaluated there rather than ignored: a fixture that asked a
+//! definition entry for a language id would otherwise get silence from a
+//! typo, and silence is what this whole decision exists to remove.
+//!
+//! **Why the fixtures only ever say `"silent"`.** A conformance session
+//! drives its plugin's whole-project semantic pass and only continues if it
+//! completed (`session::run_session`), so a *passing* check run is by
+//! construction one whose semantic tier was present. The other arm - engine
+//! declared, engine unreachable - ends the session before expectations are
+//! evaluated, so it is pinned in `mcp::find_callers_callees`' own tests
+//! against a hand-built index instead. Giving the kit an arm that survives
+//! a missing engine would let a fixture assert both halves here, and is
+//! left as its own task rather than folded into this one.
+//!
+//! # Decision 11: a row's own `resolved` bit, and `allUnresolved` (GM-386)
+//!
+//! Decisions 4 and 10 made two of the six promises the shipped agent
+//! guidance (`cli::agent_instructions`) actually tells a caller to rely on
+//! into executable expectations: `hasMore: false`/`truncated: false`, and
+//! which tier answered. The other four - a row's own `resolved` flag, the
+//! response-level `allUnresolved` marker, the `files` tally (decision 12)
+//! and `excludedReferences` (decision 13) - were checked nowhere but core's
+//! own unit tests against hand-built indexes. That is GM-380's shape one
+//! layer out: a plugin that started leaving a same-file edge
+//! `resolved: false` would break the promise in all four languages and still
+//! pass every conformance suite, because decision 2's answer format reads
+//! `filePath` and `qualifiedName` and no other field of a row.
+//!
+//! **A row's `resolved` flag is spelled inside the row, not in a key beside
+//! it.** A row the linker could not confirm renders as
+//! `"unresolved:{filePath}:{qualifiedName}"`. Two properties follow, and
+//! they are why this beat a second list (`unresolved = [...]`) alongside
+//! `expect`:
+//!
+//! - **Every entry already written asserts the healthy case, unedited** -
+//!   exactly what decision 10's omitted `provenance` buys. No bundled
+//!   fixture spells the marker, so every one of them now requires every row
+//!   it names to be a confirmed edge.
+//! - **One list means the two facts cannot drift apart.** A separate
+//!   `unresolved` list would have to decide whether its entries *also*
+//!   belong in `expect`, and under either answer a fixture naming a row in
+//!   one but not the other means something a reader has to look up.
+//!
+//! The cost is that an unresolved row carries two colons rather than one.
+//! A row whose `resolved` field is missing altogether is treated as
+//! unresolved rather than assumed healthy: all three row types declare it
+//! non-optional, so its absence is itself a regression, and the reading that
+//! reports is better than the one that hides.
+//!
+//! **`allUnresolved: true` fails the entry outright, with no key to opt out
+//! of it** - decision 4's rule, for decision 4's reason. The marker means
+//! every row of a non-empty page came from an edge the linker could not
+//! confirm (`pagination::Page::all_unresolved`): the shape that reads as an
+//! ordinary complete page and is not. Comparing a set against it would pass
+//! on an answer nothing stands behind. A response carrying no
+//! `allUnresolved` field at all fails for the same reason its rows' missing
+//! `resolved` does.
+//!
+//! The marker is not made redundant by the row prefix. A page where every
+//! row is unresolved *and* whose fixture spells every row with the prefix
+//! matches as a set, and is caught here alone - which is the arm this
+//! decision's own control was built on.
+//!
+//! **How far a plugin can move a row's `resolved` bit, measured rather than
+//! assumed.** GM-386's controls were run by wrapping the bundled Go plugin
+//! in a shim that rewrote its own stdout, so the violating arm was genuinely
+//! a *plugin* rather than a patched core. Flipping the bit does reach the
+//! index (`storage::write::apply_diff` upserts `resolved =
+//! excluded.resolved`), but on the two shapes a conformant plugin can
+//! actually emit, something else gets there first:
+//!
+//! - **A same-file edge sent `resolved: false`** is what the built-in
+//!   `same-file-rule` check already reports, off the stream, before
+//!   expectations are evaluated at all (`checks::same_file_violation`). Run
+//!   against this kit's Go fixture it fails that check *and* two entries
+//!   here, whose diffs name `unresolved:helper.go:init` and the three
+//!   `unresolved:server/server.go:...` rows.
+//! - **A cross-file edge** cannot be sent pointing at the far file's
+//!   declaration at all - `stream-order` requires both endpoints to be nodes
+//!   of the edge's own file - so it travels as a placeholder, and a
+//!   placeholder edge the linker repoints is set `resolved = 1` by
+//!   `graph::symbol_links` whatever the plugin said. Measured: flipping all
+//!   ten edges the Go plugin's `go/types` tier answers with changes nothing
+//!   in the index, because every one of them lands on a placeholder core
+//!   then resolves.
+//!
+//! So an `unresolved:` row is today a *second* fence rather than the first,
+//! and that is worth saying out loud rather than leaving a reader to assume
+//! this check is the only thing standing between a plugin and a wrong
+//! answer. It is still the fence in the right place: the two checks above
+//! read the stream, this one reads what the MCP tool finally *answers*,
+//! which is the promise `cli::agent_instructions` actually makes to a
+//! caller; and a shape neither stream rule covers - a semantic tier allowed
+//! to name a cross-file declaration directly, which no bundled plugin emits
+//! today - would land here and nowhere else.
+//!
+//! # Decision 12: the `files` tally, present and absent (GM-386)
+//!
+//! `find_callers`/`find_references` attach `files` exactly when it says
+//! something `results` does not: the page is incomplete, or its rows repeat
+//! a file (`pagination::tally_is_worth_sending`). Decision 4 has already
+//! ruled the first half out here, so within this kit the field is present
+//! precisely when the rows repeat a file - which makes both of its states
+//! worth pinning:
+//!
+//! - **Absent is an assertion**, the rule decisions 7 and 10 already run on.
+//!   An entry that does not mention `files` requires the response to carry
+//!   none, so an entry whose rows sit one per file today fails the day a
+//!   plugin emits one usage twice and the response grows a tally.
+//! - **Present is the only check that sees that duplicate at all** on
+//!   `[[callers]]`/`[[references]]`. Decision 8 deliberately exempts those
+//!   two from the duplicate-row check, because two rows for one symbol are
+//!   two usages there - so a plugin emitting the *same* usage twice is
+//!   invisible to the set, invisible to decision 8, and visible only in this
+//!   tally's per-file count.
+//!
+//! The value is a set of `"{path}:{refs}"` - `pagination::FileTally`'s two
+//! fields in decision 2's own one-colon spelling, compared as a set so the
+//! tally's highest-count-first ordering is never a spurious failure.
+//!
+//! `[[implementations]]` and `[[definition]]` carry no tally by design, so
+//! the key is accepted on them and can only ever fail - the treatment
+//! decision 10 gives `provenance` on `[[definition]]`, for its reason: a
+//! fixture that asked for one by typo should hear about it rather than be
+//! quietly ignored.
+//!
+//! **Where the `provenance` analogy breaks, and what it costs.** Decision
+//! 10's healthy state is the same for every entry in every arm - the block is
+//! absent - so making its omission an assertion couples an entry to nothing.
+//! A tally is a count of *edges*, so its healthy state depends both on the
+//! anchor and on which tiers ran: an anchor whose edge set grows with the
+//! semantic tier has a tally that moves with it, and for some anchors the
+//! tally is not sent at all in the structural arm. Once `files` is asserted
+//! there is then no single spelling of that entry that is true in both arms,
+//! and the entry has to carry `tier = "semantic"` for the tally even when its
+//! rows are structural. Two of the bundled fixtures' entries are in exactly
+//! that position and say so in their own comments -
+//! `plugins/typescript`'s overloaded `format` (two call sites only once
+//! tsserver binds them) and `plugins/rust`'s `[[references]] shapes::Shape`
+//! (six usages in `shapes.rs` with rust-analyzer, four without) - and the
+//! second of them is why that suite's `SEMANTIC_EXPECTATIONS` went from five
+//! to six. The price is paid in the structural-only arm, which now skips
+//! those entries rather than passing them; the design keeps the absent arm
+//! anyway, because the absent arm is the half that catches a plugin emitting
+//! one usage twice, and that is the regression this decision exists for.
+//!
+//! # Decision 13: `excludedReferences`, how a CALLS-only page says so (GM-386)
+//!
+//! `find_callers` walks `CALLS` edges alone and discloses what that left
+//! behind - a count and a per-file tally of the `REFERENCES`-kind usages it
+//! did not list (`find_callers_callees::ExcludedReferences`). The shipped
+//! guidance tells an agent to read that instead of re-asking the same anchor
+//! through `find_references`, so a fixture has to be able to pin it:
+//!
+//! ```toml
+//! [[callers]]
+//! symbol = "Placeholder"
+//! expect = ["app_test.go:TestPlaceholder"]
+//! excluded_references = { count = 1, files = ["main.go:1"] }
+//! ```
+//!
+//! Both keys are required once the block is given, and its absence is an
+//! assertion too: an entry that does not mention it requires the response to
+//! carry no `excludedReferences` at all. That absent arm is what catches a
+//! plugin that *stops* emitting a `REFERENCES` edge for a usage shape it
+//! used to see - a change which leaves `[[callers]]`' own set untouched and
+//! is therefore invisible to every other category in this file.
+//!
+//! `count` is asserted beside `files` rather than derived from it because
+//! the wire keeps them apart for a reason: the count is exact and uncapped,
+//! the tally is cut at `pagination::MAX_EXCLUDED_FILE_TALLY`, and
+//! understating the gap is the one thing this disclosure must never do. A
+//! response that sets `filesTruncated` fails the entry rather than being
+//! compared against a capped list - decision 4's rule once more, and no
+//! conformance fixture is within two orders of magnitude of that cap.
+//! `hint` is a core constant carrying no plugin behaviour, and is not
+//! asserted.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -387,6 +604,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
+use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::mcp::{
@@ -448,6 +666,42 @@ struct SymbolExpectation {
     /// Decision 6. Absent means `Structural`.
     #[serde(default)]
     tier: Tier,
+    /// Decision 10 (GM-382): what the response's `provenance` block must
+    /// say. **Absence is itself an assertion** - the same rule
+    /// `ImportersExpectation::via_module` documents - so an entry that does
+    /// not mention this field still requires the response to carry no
+    /// `provenance` at all, which is what every already-written entry in
+    /// every bundled fixture means and why adding the field needed no edit
+    /// to any of them. `"silent"` spells that same requirement out loud, for
+    /// the one entry per fixture that exists to say so; any other value is a
+    /// language id, and requires a block naming that language with
+    /// `semanticTier: "absent"`.
+    #[serde(default)]
+    provenance: Option<String>,
+    /// Decision 12 (GM-386): the response's `files` tally, as a set of
+    /// `"{path}:{refs}"`. **Absence is itself an assertion** - the response
+    /// must then carry no `files` at all, which is what every entry whose
+    /// rows already sit one per file means.
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    /// Decision 13 (GM-386): the `excludedReferences` block `find_callers`
+    /// attaches when its `CALLS` walk left `REFERENCES`-kind usages behind.
+    /// **Absence is itself an assertion**, same as [`Self::files`]: the
+    /// response must carry no block at all.
+    #[serde(default)]
+    excluded_references: Option<ExcludedExpectation>,
+}
+
+/// Decision 13's `excluded_references` block. Both fields are required once
+/// the key is given - see that decision on why the exact, uncapped `count`
+/// is asserted beside the capped tally rather than derived from it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExcludedExpectation {
+    count: u64,
+    /// The same `"{path}:{refs}"` spelling [`SymbolExpectation::files`] uses,
+    /// compared as a set.
+    files: Vec<String>,
 }
 
 /// One `[[imports]]` entry: `get_dependencies` from `file`, one hop
@@ -542,6 +796,13 @@ pub(crate) struct EvalContext<'a> {
     pub(crate) embedding: &'a EmbeddingPipeline,
     pub(crate) project_root: &'a Path,
     pub(crate) entry_points: &'a [String],
+    /// The manifest's own `[plugin.capabilities]`, keyed by language -
+    /// what the four edge-walking handlers need to decide whether this
+    /// plugin declares a semantic tier at all (`mcp::provenance::resolve`).
+    /// A one-entry map, because a check run is always about exactly one
+    /// plugin; built from `manifest.capabilities` rather than from a
+    /// registry, since the kit discovers no registry.
+    pub(crate) capabilities: &'a HashMap<String, Capabilities>,
 }
 
 /// Runs every expectation in `expect`, in file order, and returns one
@@ -645,13 +906,18 @@ impl SymbolTool {
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
-            SymbolTool::Callers => find_callers_callees::handle_callers(ctx.conn, ctx.embedding, params),
-            SymbolTool::References => find_references::handle(ctx.conn, ctx.embedding, params),
+            SymbolTool::Callers => {
+                find_callers_callees::handle_callers(ctx.conn, ctx.embedding, ctx.capabilities, params)
+            }
+            SymbolTool::References => {
+                find_references::handle(ctx.conn, ctx.embedding, ctx.capabilities, params)
+            }
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths } = params;
                 find_implementations::dispatch(
                     ctx.conn,
                     ctx.embedding,
+                    ctx.capabilities,
                     FindImplementationsParams {
                         symbol_id,
                         symbol_name,
@@ -701,10 +967,22 @@ fn eval_symbol_expectation(
             // Decision 8, and only for the one tool of the three whose
             // contract is one row per answer. `Callers`/`References` walk
             // `Distinctness::Edges`, where a repeat is a second usage.
-            let findings = match tool {
+            let mut findings: Vec<String> = match tool {
                 SymbolTool::Implementations => duplicate_row_finding(&rows).into_iter().collect(),
                 SymbolTool::Callers | SymbolTool::References => Vec::new(),
             };
+            // Decision 10, on all three tools rather than only one: unlike a
+            // duplicate row, a provenance claim means the same thing
+            // whichever of them made it.
+            findings.extend(provenance_finding(&value, item.provenance.as_deref()));
+            // Decisions 11-13, in the order a reader of the response meets
+            // them: the whole page's own marker first, then the two
+            // summaries beside `results`. The rows' `resolved` bits are not
+            // here at all - decision 11 spells them into `rows` above, so
+            // they reach the reader through the set diff.
+            findings.extend(all_unresolved_finding(&value));
+            findings.extend(files_finding(&value, item.files.as_deref()));
+            findings.extend(excluded_references_finding(&value, item.excluded_references.as_ref()));
             let actual: BTreeSet<String> = rows.into_iter().collect();
             let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
             let outcome = outcome_with(findings, &expected, &actual);
@@ -858,6 +1136,172 @@ fn resolved_from_finding(value: &Value, via_module: Option<&str>) -> Option<Stri
     }
 }
 
+/// Decision 10's `provenance`, both ways round - deliberately the same
+/// four-arm shape as [`resolved_from_finding`], because it is the same kind
+/// of claim: a response field that is present exactly when the answer is
+/// narrower than the question, asserted in both its present and its absent
+/// state so that neither can drift unnoticed.
+///
+/// The `"silent"` sentinel and an omitted key mean the same thing (see
+/// [`SymbolExpectation::provenance`]); both land in the `None` arms below.
+fn provenance_finding(value: &Value, expected: Option<&str>) -> Option<String> {
+    let expected = expected.filter(|e| *e != SILENT_PROVENANCE);
+    let actual = value.get("provenance");
+    match (expected, actual) {
+        (None, None) => None,
+        (Some(language), Some(block))
+            if block.get("language").and_then(Value::as_str) == Some(language)
+                && block.get("semanticTier").and_then(Value::as_str) == Some("absent") =>
+        {
+            None
+        }
+        (None, Some(block)) => Some(format!(
+            "expected no provenance block - this plugin's semantic tier ran, so the response has \
+             nothing to disclose - but the response carries provenance = {block} (decision 10)"
+        )),
+        (Some(language), None) => Some(format!(
+            "provenance = \"{language}\", but the response carries no provenance block at all: it \
+             claims its semantic tier contributed, which is the exact silence GM-382 exists to \
+             remove (decision 10)"
+        )),
+        (Some(language), Some(block)) => Some(format!(
+            "provenance = \"{language}\" with semanticTier = \"absent\", but the response says \
+             provenance = {block}"
+        )),
+    }
+}
+
+/// The value [`SymbolExpectation::provenance`] accepts for "this response
+/// must carry no provenance block" - the same requirement omitting the key
+/// already has, written out so a fixture can say it on purpose rather than
+/// only by saying nothing.
+const SILENT_PROVENANCE: &str = "silent";
+
+/// Decision 11's row marker: what a `resolved: false` row is prefixed with,
+/// so the bit travels inside decision 2's one string per row instead of in a
+/// second list beside `expect`.
+const UNRESOLVED_PREFIX: &str = "unresolved:";
+
+/// Decision 11's response-level half. `None` when the page says every row it
+/// carries stands on a confirmed edge; `Some(finding)` when it says the
+/// opposite, or does not say at all.
+fn all_unresolved_finding(value: &Value) -> Option<String> {
+    match value.get("allUnresolved").and_then(Value::as_bool) {
+        Some(false) => None,
+        Some(true) => Some(
+            "the response set allUnresolved: true - every row on this page came from an edge the \
+             linker could not confirm, so the page reads as an ordinary complete answer and is \
+             not one; decision 11 never compares a set against it"
+                .to_string(),
+        ),
+        None => Some(
+            "the response carries no allUnresolved field at all, which every result page declares \
+             non-optional - decision 11 reports that rather than reading its absence as \"nothing \
+             to worry about\""
+                .to_string(),
+        ),
+    }
+}
+
+/// Decision 12's `files` tally, both ways round - the same four-arm shape as
+/// [`resolved_from_finding`] and [`provenance_finding`], because it is the
+/// same kind of claim: a field present exactly when it says something the
+/// rows do not, asserted in both its states so neither can drift unnoticed.
+fn files_finding(value: &Value, expected: Option<&[String]>) -> Option<String> {
+    match (expected, value.get("files")) {
+        (None, None) => None,
+        (None, Some(tally)) => Some(format!(
+            "expected no files tally - this entry's rows are meant to sit one per file, so the \
+             tally would restate the filePath column - but the response carries files = {{{}}} \
+             (decision 12)",
+            format_set(&tally_set(tally))
+        )),
+        (Some(expected), None) => Some(format!(
+            "files = {{{}}}, but the response carries no files tally at all: it is claiming its \
+             rows already sit one per file (pagination::tally_is_worth_sending), which is the \
+             opposite of what this entry says (decision 12)",
+            format_set(&expected.iter().cloned().collect())
+        )),
+        (Some(expected), Some(tally)) => {
+            let actual = tally_set(tally);
+            let expected: BTreeSet<String> = expected.iter().cloned().collect();
+            (actual != expected).then(|| {
+                format!(
+                    "files tally mismatch (decision 12): expected {{{}}}, actual {{{}}}",
+                    format_set(&expected),
+                    format_set(&actual)
+                )
+            })
+        }
+    }
+}
+
+/// Decision 13's `excludedReferences` block, both ways round. The count and
+/// the tally are compared separately because the wire keeps them separate -
+/// the count is exact and uncapped, the tally is not.
+fn excluded_references_finding(value: &Value, expected: Option<&ExcludedExpectation>) -> Option<String> {
+    match (expected, value.get("excludedReferences")) {
+        (None, None) => None,
+        (None, Some(block)) => Some(format!(
+            "expected no excludedReferences block - this CALLS walk is meant to have left nothing \
+             behind - but the response discloses count = {}, files = {{{}}} (decision 13)",
+            block.get("count").and_then(Value::as_u64).unwrap_or_default(),
+            format_set(&tally_set(block.get("files").unwrap_or(&Value::Null)))
+        )),
+        (Some(expected), None) => Some(format!(
+            "excluded_references = {{ count = {} }}, but the response carries no \
+             excludedReferences block: the walk found no REFERENCES-kind usage of this anchor to \
+             disclose, which is the usage shape disappearing rather than the answer changing \
+             (decision 13)",
+            expected.count
+        )),
+        (Some(expected), Some(block)) => {
+            if block.get("filesTruncated").and_then(Value::as_bool) == Some(true) {
+                return Some(
+                    "the response set excludedReferences.filesTruncated - its tally was cut at \
+                     pagination::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
+                     against a fixture's whole list; narrow the fixture"
+                        .to_string(),
+                );
+            }
+            let actual_count = block.get("count").and_then(Value::as_u64);
+            let actual_files = tally_set(block.get("files").unwrap_or(&Value::Null));
+            let expected_files: BTreeSet<String> = expected.files.iter().cloned().collect();
+            if actual_count == Some(expected.count) && actual_files == expected_files {
+                return None;
+            }
+            Some(format!(
+                "excludedReferences mismatch (decision 13): expected count = {}, files = {{{}}}; \
+                 actual count = {}, files = {{{}}}",
+                expected.count,
+                format_set(&expected_files),
+                actual_count.map(|c| c.to_string()).unwrap_or_else(|| "(absent)".to_string()),
+                format_set(&actual_files)
+            ))
+        }
+    }
+}
+
+/// A `pagination::FileTally` array as decision 12's `"{path}:{refs}"` set.
+/// Anything that is not an array reads as the empty set, which is what the
+/// callers above want: a block without the field they asked for fails with
+/// `{(none)}` beside what was expected, rather than silently comparing
+/// nothing against nothing.
+fn tally_set(tally: &Value) -> BTreeSet<String> {
+    tally
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                entry.get("path").and_then(Value::as_str).unwrap_or("?"),
+                entry.get("refs").and_then(Value::as_i64).map(|n| n.to_string()).unwrap_or("?".to_string())
+            )
+        })
+        .collect()
+}
+
 /// Decision 2's `[[imports]]`/`[[importers]]` row mapping, as a list - the
 /// set is built from it, and decision 8's duplicate check needs the rows
 /// before that collapse.
@@ -892,8 +1336,28 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
                 }
                 _ => BTreeSet::new(),
             };
+            // Decision 10. `find_definition` never carries a block, so this
+            // can only ever pass for `"silent"`/omitted - which is exactly
+            // why it runs here rather than being skipped: an entry that
+            // asked for a language id would otherwise be ignored silently.
+            //
+            // Decisions 12 and 13 run here for that same reason and can only
+            // ever pass omitted: a definition is one node, so there is
+            // nothing to tally and no `CALLS` walk to have left anything
+            // behind. `allUnresolved` is deliberately *not* checked - this
+            // response is not a result page and declares no such field, so
+            // decision 11's "a missing marker is a regression" rule would be
+            // false here.
+            let mut findings: Vec<String> =
+                provenance_finding(&value, item.provenance.as_deref()).into_iter().collect();
+            findings.extend(files_finding(&value, item.files.as_deref()));
+            findings.extend(excluded_references_finding(&value, item.excluded_references.as_ref()));
             let expected: BTreeSet<String> = item.expect.iter().cloned().collect();
-            CheckResult { id: id.into(), outcome: set_diff_outcome(&expected, &actual), warnings: Vec::new() }
+            CheckResult {
+                id: id.into(),
+                outcome: outcome_with(findings, &expected, &actual),
+                warnings: Vec::new(),
+            }
         }
     }
 }
@@ -1208,6 +1672,12 @@ fn tool_json(outcome: Result<ToolOutcome, String>) -> Result<Value, String> {
 /// Decision 2's `[[callers]]`/`[[references]]`/`[[implementations]]` row
 /// mapping, as a list - the set is built from it, and decision 8's duplicate
 /// check needs the rows before that collapse.
+///
+/// Decision 11's `unresolved:` marker is applied here, which is the whole of
+/// how a row's own `resolved` bit becomes assertable: a row that does not say
+/// it is resolved - `false`, or the field missing entirely - carries the
+/// prefix, so an entry that does not spell it is already asserting the row
+/// stands on a confirmed edge.
 fn rows_to_list(value: &Value) -> Vec<String> {
     value
         .get("results")
@@ -1217,7 +1687,11 @@ fn rows_to_list(value: &Value) -> Vec<String> {
         .map(|row| {
             let file_path = row.get("filePath").and_then(Value::as_str).unwrap_or_default();
             let qualified_name = row.get("qualifiedName").and_then(Value::as_str).unwrap_or_default();
-            format!("{file_path}:{qualified_name}")
+            let marker = match row.get("resolved").and_then(Value::as_bool) {
+                Some(true) => "",
+                Some(false) | None => UNRESOLVED_PREFIX,
+            };
+            format!("{marker}{file_path}:{qualified_name}")
         })
         .collect()
 }
@@ -1422,13 +1896,158 @@ mod tests {
     fn rows_to_set_blanks_the_qualified_name_of_a_file_level_row() {
         let value = serde_json::json!({
             "results": [
-                {"filePath": "a.ts", "qualifiedName": "f"},
-                {"filePath": "b.ts"},
+                {"filePath": "a.ts", "qualifiedName": "f", "resolved": true},
+                {"filePath": "b.ts", "resolved": true},
             ],
         });
         let set: BTreeSet<String> = rows_to_list(&value).into_iter().collect();
         assert!(set.contains("a.ts:f"), "{set:?}");
         assert!(set.contains("b.ts:"), "{set:?}");
+    }
+
+    /// Decision 11's row half, which is the whole of how a row's `resolved`
+    /// bit becomes assertable: a confirmed row is spelled exactly as it was
+    /// before GM-386, so every already-written fixture entry keeps passing
+    /// and thereby asserts the healthy case; an unconfirmed one takes the
+    /// marker and no longer matches the row a fixture already names. A row
+    /// with no `resolved` field at all is read as unconfirmed rather than
+    /// assumed healthy.
+    #[test]
+    fn an_unconfirmed_row_is_marked_and_a_confirmed_one_is_spelled_as_before() {
+        let value = serde_json::json!({
+            "results": [
+                {"filePath": "a.rs", "qualifiedName": "f", "resolved": true},
+                {"filePath": "b.rs", "qualifiedName": "g", "resolved": false},
+                {"filePath": "c.rs", "qualifiedName": "h"},
+            ],
+        });
+        let rows = rows_to_list(&value);
+        assert_eq!(rows, vec!["a.rs:f", "unresolved:b.rs:g", "unresolved:c.rs:h"], "{rows:?}");
+    }
+
+    /// Decision 11's response half. `false` is the only shape that passes:
+    /// `true` is the page built entirely from edges the linker could not
+    /// confirm, and a missing field is a result page that stopped declaring
+    /// a marker every one of them declares non-optional.
+    #[test]
+    fn all_unresolved_is_asserted_in_every_one_of_its_three_states() {
+        assert!(all_unresolved_finding(&serde_json::json!({"allUnresolved": false})).is_none());
+
+        let flagged = all_unresolved_finding(&serde_json::json!({"allUnresolved": true}))
+            .expect("a wholly unconfirmed page must fail the entry");
+        assert!(flagged.contains("allUnresolved: true"), "{flagged}");
+
+        let missing = all_unresolved_finding(&serde_json::json!({"results": []}))
+            .expect("a page with no marker at all must fail the entry");
+        assert!(missing.contains("no allUnresolved field"), "{missing}");
+    }
+
+    /// Decision 12, both ways round - the property that makes every
+    /// already-written entry assert something without being edited is the
+    /// second arm: an entry that says nothing requires the response to carry
+    /// no tally.
+    #[test]
+    fn the_files_tally_is_an_assertion_in_both_of_its_states() {
+        let with_tally = serde_json::json!({
+            "results": [],
+            "files": [{"path": "src/main.ts", "refs": 2}, {"path": "src/math.ts", "refs": 1}],
+        });
+        let without = serde_json::json!({"results": []});
+        let expected = ["src/main.ts:2".to_string(), "src/math.ts:1".to_string()];
+
+        assert!(files_finding(&with_tally, Some(&expected)).is_none());
+        assert!(files_finding(&without, None).is_none());
+
+        let unexpected = files_finding(&with_tally, None).expect("an unasserted tally must fail the entry");
+        assert!(unexpected.contains("expected no files tally"), "{unexpected}");
+        assert!(unexpected.contains("src/main.ts:2"), "{unexpected}");
+
+        let absent = files_finding(&without, Some(&expected)).expect("a missing tally must fail the entry");
+        assert!(absent.contains("no files tally at all"), "{absent}");
+
+        // The count is the part the set of rows cannot say - GM-386's whole
+        // reason for asserting the tally rather than only its presence.
+        let wrong_count = files_finding(&with_tally, Some(&["src/main.ts:3".to_string()]))
+            .expect("a count that moved must fail the entry");
+        assert!(wrong_count.contains("files tally mismatch"), "{wrong_count}");
+    }
+
+    /// Decision 13, both ways round, plus the two shapes that must never be
+    /// compared as if whole: a count that moved while the tally did not, and
+    /// a tally the response itself says was cut.
+    #[test]
+    fn excluded_references_is_an_assertion_in_both_of_its_states() {
+        let disclosed = serde_json::json!({
+            "results": [],
+            "excludedReferences": {
+                "count": 2,
+                "files": [{"path": "a.rs", "refs": 1}, {"path": "b.rs", "refs": 1}],
+                "hint": "...",
+            },
+        });
+        let silent = serde_json::json!({"results": []});
+        let expected =
+            ExcludedExpectation { count: 2, files: vec!["a.rs:1".to_string(), "b.rs:1".to_string()] };
+
+        assert!(excluded_references_finding(&disclosed, Some(&expected)).is_none());
+        assert!(excluded_references_finding(&silent, None).is_none());
+
+        let unexpected = excluded_references_finding(&disclosed, None)
+            .expect("an unasserted disclosure must fail the entry");
+        assert!(unexpected.contains("expected no excludedReferences block"), "{unexpected}");
+
+        // The arm that catches a plugin dropping a usage shape it used to
+        // emit a REFERENCES edge for: the caller set does not move, so
+        // nothing else in this file would notice.
+        let vanished = excluded_references_finding(&silent, Some(&expected))
+            .expect("a disclosure that stopped being made must fail the entry");
+        assert!(vanished.contains("carries no excludedReferences block"), "{vanished}");
+
+        let undercount = ExcludedExpectation { count: 3, files: expected.files.clone() };
+        let wrong = excluded_references_finding(&disclosed, Some(&undercount))
+            .expect("a count that disagrees must fail the entry");
+        assert!(wrong.contains("expected count = 3"), "{wrong}");
+        assert!(wrong.contains("actual count = 2"), "{wrong}");
+
+        let mut truncated = disclosed.clone();
+        truncated["excludedReferences"]["filesTruncated"] = serde_json::json!(true);
+        let cut = excluded_references_finding(&truncated, Some(&expected))
+            .expect("a cut tally must never be compared as if whole");
+        assert!(cut.contains("filesTruncated"), "{cut}");
+    }
+
+    /// Decisions 12 and 13, the parsing half: both keys are optional, and
+    /// `deny_unknown_fields` reaches inside the inline table too - so a
+    /// misspelled sub-key is a parse error rather than an assertion that
+    /// silently checks less than it looks like it does.
+    #[test]
+    fn the_new_keys_parse_and_a_typo_inside_them_is_a_hard_error() {
+        let file: ExpectFile = toml::from_str(
+            "[[callers]]\nsymbol = \"f\"\nexpect = []\n\n\
+             [[callers]]\nsymbol = \"g\"\nexpect = []\nfiles = [\"a.rs:2\"]\n\
+             excluded_references = { count = 1, files = [\"b.rs:1\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(file.callers[0].files, None);
+        assert!(file.callers[0].excluded_references.is_none());
+        assert_eq!(file.callers[1].files.as_deref(), Some(["a.rs:2".to_string()].as_slice()));
+        let block = file.callers[1].excluded_references.as_ref().expect("the block parses");
+        assert_eq!(block.count, 1);
+        assert_eq!(block.files, vec!["b.rs:1".to_string()]);
+
+        for (source, needle) in [
+            (
+                "[[callers]]\nsymbol = \"f\"\nexpect = []\nexcluded_references = { count = 1, \
+                 file = [\"b.rs:1\"] }\n",
+                "file",
+            ),
+            // `count` is required: a block that only listed files would
+            // assert the capped half and not the exact one.
+            ("[[callers]]\nsymbol = \"f\"\nexpect = []\nexcluded_references = { files = [] }\n", "count"),
+        ] {
+            let err = toml::from_str::<ExpectFile>(source).unwrap_err().to_string();
+            assert!(err.contains(needle), "expected {needle:?} to be rejected, got: {err}");
+        }
     }
 
     #[test]

@@ -475,6 +475,22 @@ re-checking rows) disappeared. What is left in the "after" runs is a single
 grep serving a question g-mesh does not answer at all — "which *other*
 symbols have similar names?" — not a re-check of what it did answer.
 
+The other half of trusting `resolved: true` is knowing what tier produced it.
+A same-file edge is confirmed by parsing alone, but a cross-file edge that
+needed a language's semantic tier — `rust-analyzer`, `pyright` — means one
+thing when that tier ran for this project and something narrower when it
+did not, and until GM-382 nothing in the response said which. Since GM-382,
+`find_references`/`find_callers`/`find_callees`/`find_implementations` carry
+a response-level `provenance: {language, semanticTier: "absent"}` block, but
+only when the anchor's language declares a semantic tier that has not
+completed here — a healthy response stays silent, the same way `resolved`
+staying `true` does. So a guarantee measured with a language's semantic tier
+present is a guarantee about that tier being present, not a universal one:
+a new language, or the same language on a machine without its tool
+installed, is a new measurement. `provenance` closes the one case that used
+to be silent about this everywhere; it does not make the guarantee itself
+universal.
+
 If you still want to trim that last step, put a short instruction in your
 project's `CLAUDE.md` (a task/project prompt reaches the model more reliably
 than a server capability description does):
@@ -501,7 +517,7 @@ than a server capability description does):
 - When the question is about which *files* are affected — a rename, a signature change, "list every file that calls X" — read the response's `files` array and answer from it. `find_references`/`find_callers` attach `files` exactly when the rows don't already answer at that granularity (the page is incomplete, or several rows share one file), and unlike `results` it is computed over the *whole* edge set rather than the page: on excalidraw's `pointFrom`, a `limit: 200` call returns 51 rows spanning 46 files and still says `hasMore: true`, while the same response's `files` lists all 81 referencing files with a per-file count in a quarter of the bytes. So it is both the cheaper answer and the *more complete* one — deduplicating the rows by hand produces a shorter file list than the tally already holds, and paging the cursor to repair that spends round-trips on something already in hand. Use `results` when you need the calling symbol or its line; use `files` for "what do I have to touch". When `files` is absent the page is complete and its rows already sit one per file, so there is nothing to deduplicate — the `filePath` column is the list.
 - A `get_dependencies` result's completeness is signaled by `truncated`/`truncatedBy`, not a per-row `resolved` flag — there isn't one; a multi-hop path can't be summarized by one boolean the way a single edge can. `truncated: false` means the walk reached everything within its depth/fanout bounds — trust it fully, don't re-verify with grep. `truncated: true` needs a follow-up keyed off `truncatedBy`, not a blanket re-query: on `maxDepth`, re-call anchored on the returned `frontierNodes` to go further; on `maxFanout`, that one node had more imports/importers than the fanout cap, so re-query just that node with the single-hop tools' own pagination; on `explorationBudget`/`responseSize`, call again with the returned `resumeToken`. The default `max_depth` is only 2 (shallower than a single-hop tool's own completeness bar), so check `truncated` before treating one result as the whole *transitive* tree — but a depth bound limits only how far the walk goes, never how completely it walked the levels it did reach: `truncated: false` with an empty `frontierNodes` is the entire answer for the depth you asked for, and at `max_depth: 1` that is exactly the complete set of direct importers (`Incoming`) or direct imports (`Outgoing`).
 - Which imports produce those rows is the other half of trusting one. A row is a *file*, not an import statement, and its edge comes from a parsed module specifier: `import ... from`, type-only `import type ...`, `export ... from`, and `import()`/`require()` whose specifier is a static string or folds to one. Type-only imports sit in the graph exactly like value imports, so an `Incoming` walk already answers "every file that imports this, both kinds" — measured on g-mesh-bench's `tt-deps-incoming-db-connection`, one `Incoming`, `max_depth: 1` call on `src/db/connection.ts` returned all 21 importing `src/` files (18 of them `import type`-only), exactly the task's ground-truth set, and the follow-up greps three separate runs ran to check it found nothing it had missed. So don't re-derive that list with a `from ["'].*<module path>` grep: it is the most expensive habit on this tool, a whole extra round-trip that reproduces an answer already in hand. What a row genuinely doesn't carry is which names the importing file binds, whether that particular import was type-only, and on what line — `IMPORTS` edges have no position in the schema. When the task needs that for some file, Read that one file; don't grep the tree for all of them. The only importer that can be missing is one whose specifier no static fold can compute (built from a runtime value, `process.env`, or another file's constant).
-- `search_code` is similarity-ranked, not a resolved graph query — its top hit isn't automatically "the answer" the way a `find_definition` hit is. But once a hit's `qualifiedName`/`kind`/`filePath` plausibly match what the prompt describes, one targeted confirming read (the exact lines, or `get_file_outline`) is enough — check the doc comment/signature there, then stop. Don't keep re-issuing `search_code` with reworded queries hunting for a "better" match, and don't follow a confirmed hit with a broad grep sweep across the repo "just in case" — that's the same wasted re-verification the bullet above warns against for the structural tools, just dressed up as more searching instead of more reading.
+- `search_code` is similarity-ranked, not a resolved graph query — its top hit isn't automatically "the answer" the way a `find_definition` hit is. A response carrying a `noMatch` block is the tool itself saying this page is not a match: don't do the confirming read and don't reword the query — go to grep or a structural tool. Its absence is the normal case, and means at least one hit cleared the floor for its language. But once a hit's `qualifiedName`/`kind`/`filePath` plausibly match what the prompt describes, one targeted confirming read (the exact lines, or `get_file_outline`) is enough — check the doc comment/signature there, then stop. Don't keep re-issuing `search_code` with reworded queries hunting for a "better" match, and don't follow a confirmed hit with a broad grep sweep across the repo "just in case" — that's the same wasted re-verification the bullet above warns against for the structural tools, just dressed up as more searching instead of more reading.
 - `find_implementations` only returns direct implementors/extenders by default — a class extending a class that implements the anchor interface won't show up in a `hasMore: false` page. For the whole hierarchy, re-call with `transitive: true` (walks the same edges transitively, up to a bounded depth, resumable via `resume_token`).
 ```
 
@@ -812,6 +828,10 @@ migration (GM-275) makes them a failure.
 symbol = "Server.Close"
 file = "server.go"            # optional: disambiguates an ambiguous symbol
 expect = ["cmd/main.go:run", "server_test.go:TestClose"]
+files = ["cmd/main.go:1", "server_test.go:1"]   # the response's own tally,
+                                                # omit it to assert none
+excluded_references = { count = 1, files = ["doc.go:1"] }  # the non-CALLS
+                                                # usages this walk left behind
 
 [[references]]
 symbol = "Greetable"
@@ -850,7 +870,15 @@ runs, in the other direction, and carries the one field only that direction
 has: `via_module` asserts which module the walk actually ran from
 (`resolvedFrom.qualifiedName` — outside TypeScript an import names a module,
 not a file, so a file anchor is substituted), and *omitting* it asserts that
-no substitution happened rather than that nothing was checked. For the
+no substitution happened rather than that nothing was checked. A row the
+linker could not confirm carries a leading `unresolved:` marker, so an entry
+that does not spell one asserts that every row it names sits on a confirmed
+edge; a page that reports `allUnresolved: true` fails outright, the same way a
+truncated one does. `files` and `excluded_references` assert the response's
+two per-page summaries as sets of `"path:count"`, and *omitting* either
+asserts that the response carries none — which is what makes a plugin that
+starts emitting one usage twice, or stops emitting a `REFERENCES` edge it used
+to, fail an entry whose row set has not moved at all. For the
 categories whose tool answers one row per answer — `[[implementations]]`,
 `[[imports]]`, `[[importers]]` — a repeated row fails the entry even when the
 set matches; `[[callers]]`/`[[references]]` are exempt, since two rows there

@@ -828,26 +828,66 @@ jobs:
           done
           echo "removed $count go binaries; none resolve on PATH any more"
 
-      # `--skip-semantic-expectations`: the four `tier = "semantic"` entries
-      # (three `[[callers]]`, one `[[implementations]]`) report `Skip`
-      # instead of running, and the rest of the same file - bare and
-      # package-qualified calls, references, imports, definition - must
-      # still pass. No PATH override on this step, unlike before GM-318: the
-      # step above deleted every `go` binary this job could find, from the
-      # job's real, unmodified PATH, so there is nothing left to override -
-      # and this step still checks that directly below rather than trusting
-      # the step above, in case a later change reintroduces one.
-      - name: g-mesh plugins check plugins/go (--skip-semantic-expectations, no Go on PATH)
+      # GM-384: this step now asserts a FAILING run, and that is deliberate,
+      # not a regression the flag below used to paper over.
+      #
+      # Before GM-384, the Go plugin's whole-project `semanticPass` answered
+      # an empty diff with no `incomplete` field (wire/src/lib.rs's
+      # `FileChangeResponse::incomplete`), so a Go-only index built with no
+      # toolchain on PATH looked exactly like one whose semantic tier had
+      # just finished: `language_state.semanticPassAt` got set,
+      # `mcp::provenance` had nothing to warn about, and `mcp::instructions`
+      # stopped listing Go's receiver-call gap - both readers misled by one
+      # missing field. `semantic.go`'s own doc comment said as much
+      # ("`language_state.semanticPassAt` is never set for Go"), and it was
+      # false.
+      #
+      # Now the plugin reports `incomplete: true`, and core's
+      # `watcher::apply::apply_semantic_pass` treats an *incomplete
+      # whole-project* pass as a failed round trip - correctly: nothing
+      # downstream should be able to certify a semantic pass that never ran.
+      # The conformance session (`core/src/cli/plugin_check/session.rs`)
+      # aborts at that step, before expectations are ever reached, so
+      # `--skip-semantic-expectations` (which only changes how `tier =
+      # "semantic"` entries are scored *once expectations run*) can no
+      # longer rescue this run into a clean `Pass` - it is passed below only
+      # for parity with how a real daemon run gates on the same capability,
+      # not because it changes this step's outcome any more. See
+      # `core/tests/plugin_check.rs`'s
+      # `the_go_plugin_without_a_toolchain_fails_the_session_check_with_an_incomplete_whole_project_pass`,
+      # which pins exactly this and proves the flag makes no difference here.
+      #
+      # So the assertion below is not "did the command succeed" (it must
+      # not) but "did it fail for *this* reason" - an unrelated regression
+      # (a crash, a hang, a shape violation) must not be able to hide behind
+      # an exit code this step already expects to be nonzero. No PATH
+      # override on this step, unlike before GM-318: the step above deleted
+      # every `go` binary this job could find, from the job's real,
+      # unmodified PATH, so there is nothing left to override - and this
+      # step still checks that directly below rather than trusting the step
+      # above, in case a later change reintroduces one.
+      - name: g-mesh plugins check plugins/go (no Go on PATH answers incomplete and fails the session check)
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if command -v go >/dev/null 2>&1; then
             echo "go must not be resolvable in this step - deleting it did not take" >&2
             exit 1
           fi
-          cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
+          report="$(cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
             plugins check plugins/go --fixture plugins/go/conformance/project \
-            --expect plugins/go/conformance/expect.toml --skip-semantic-expectations
+            --expect plugins/go/conformance/expect.toml --skip-semantic-expectations)"
+          status=$?
+          echo "$report"
+          if [ "$status" -eq 0 ]; then
+            echo "expected this run to fail - a whole-project semantic pass with no toolchain is not \
+                  certifiable - but it exited 0; the Go plugin may have stopped reporting incomplete=true" >&2
+            exit 1
+          fi
+          if ! grep -q "incomplete whole-project semantic pass" <<<"$report"; then
+            echo "the run failed, but not for the reason this job exists to prove - see the report above" >&2
+            exit 1
+          fi
 
   lint:
     name: cargo clippy

@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-python"
-version = "3.9.0"
+version = "3.10.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's Python language plugin: pyproject.toml/src-layout/namespace-package project model (GM-295), tree-sitter-python structural extraction (GM-296)"

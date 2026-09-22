@@ -254,10 +254,17 @@ type filePathsParams struct {
 // fileChangeResponse mirrors core's FileChangeResponse - the one response
 // shape both `fileChanged` and `semanticPass` answer with (see that type's
 // own doc comment for why there is only one).
+//
+// Incomplete mirrors that type's own `incomplete` field: `semanticPass`
+// only, `omitempty` so a `fileChanged` response (which always leaves it at
+// the zero value) says nothing on the wire rather than an explicit
+// `"incomplete":false` - core's serde side makes the same "absent means
+// false" choice (wire/src/lib.rs's `FileChangeResponse::incomplete`).
 type fileChangeResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  fileChangeDiff  `json:"result"`
+	JSONRPC    string          `json:"jsonrpc"`
+	ID         json.RawMessage `json:"id"`
+	Result     fileChangeDiff  `json:"result"`
+	Incomplete bool            `json:"incomplete,omitempty"`
 }
 
 // ackResponse is the `{ acknowledged: true }` shape this plugin answers a

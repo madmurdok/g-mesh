@@ -1055,6 +1055,25 @@ pub(crate) fn run_session(
         if !driver.step("semanticPass #1 (whole project)", file, &operation) {
             return driver.finish();
         }
+        // The half of a completed whole-project pass the kit used to leave
+        // out (GM-382). `daemon::semantic` records this the moment the same
+        // `apply_semantic_pass` call returns `Ok` - it is what makes
+        // `language_state.semanticPassAt` mean "this language's semantic
+        // tier has run", and the index the expectations are then evaluated
+        // against is supposed to be the index a daemon would have left
+        // behind. Without it every expectation ran against a linked index
+        // that still described itself as owing a semantic pass it had in
+        // fact just completed, which nothing noticed while nothing read that
+        // column - `mcp::provenance` reads it, so the gap became visible as
+        // a response claiming the semantic tier was absent in the one arm
+        // that had just driven it successfully.
+        if let Err(err) =
+            schema::record_language_semantic_pass(&driver.conn.lock().unwrap(), &manifest.language)
+        {
+            driver.session.failure =
+                Some(format!("recording {}'s completed semantic pass: {err:#}", manifest.language));
+            return driver.finish();
+        }
     }
 
     let gated = Operation::FileChanged { semantic_pass_capable: manifest.capabilities.semantic_pass };

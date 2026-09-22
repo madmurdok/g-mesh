@@ -36,6 +36,7 @@
 //! comment or this module doc instead, and keep guidance that spans tools in
 //! `get_info`'s `instructions` (sent once per session, not once per tool).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,6 +51,7 @@ use serde::Deserialize;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::CoreActivity;
+use crate::daemon::manifest::Capabilities;
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
@@ -71,7 +73,9 @@ pub(crate) mod find_references;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
 mod instructions;
+mod provenance;
 mod search_code;
+mod similarity;
 mod source;
 mod tool_result;
 
@@ -294,6 +298,21 @@ impl GMeshMcpServer {
         }
     }
 
+    /// Every discovered plugin's declared `[plugin.capabilities]`, which the
+    /// four edge-walking tools hand to `provenance::resolve` so it can tell a
+    /// plugin that declares a semantic tier from one that does not.
+    ///
+    /// Read fresh per call, and cloned, for exactly the reason
+    /// `get_dependencies`' own `entry_points` is: it is a map walk over data
+    /// that cannot change while this daemon runs
+    /// (`daemon::manifest::discover`'s contract), so a cache on `self` would
+    /// save nothing that holding the borrow does not already give away, and
+    /// four tools reaching through `self.registry` inline would say this
+    /// once each instead of once.
+    fn capabilities(&self) -> HashMap<String, Capabilities> {
+        self.registry.receiver_call_capabilities()
+    }
+
     /// Query-time staleness safety net (`watcher::staleness::ensure_fresh`,
     /// wired via `daemon::lifecycle::PluginSupervisor::ensure_fresh`) for the
     /// three tools that anchor their answer on one specific file:
@@ -474,7 +493,8 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_references::handle(&self.conn, &self.embedding, params.0)
+        let capabilities = self.capabilities();
+        find_references::handle(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -482,7 +502,8 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callers(&self.conn, &self.embedding, params.0)
+        let capabilities = self.capabilities();
+        find_callers_callees::handle_callers(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -490,7 +511,8 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_callers_callees::handle_callees(&self.conn, &self.embedding, params.0)
+        let capabilities = self.capabilities();
+        find_callers_callees::handle_callees(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(
@@ -504,7 +526,8 @@ impl GMeshMcpServer {
         if let Some(not_ready) = self.prepare().await {
             return not_ready;
         }
-        find_implementations::dispatch(&self.conn, &self.embedding, params.0)
+        let capabilities = self.capabilities();
+        find_implementations::dispatch(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(

@@ -587,6 +587,20 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   tool = "definition"                      # or callers/references/implementations
   symbol = "strings"                       # imported, declared nowhere here
   contains = ["use get_dependencies"]      # phrases the refusal must carry
+  [[callers]]
+  symbol = "Server.Addr"
+  expect = ["cmd/main.go:main"]
+  files = ["cmd/main.go:2"]                # the response's own file tally
+                                           # (GM-386); omit = assert none
+  excluded_references = { count = 1, files = ["doc.go:1"] }
+                                           # the non-CALLS usages this walk
+                                           # left behind; omit = assert none
+  provenance = "silent"                    # which tier answered (GM-382):
+                                           # "silent" = the response must carry
+                                           # no `provenance` block, because this
+                                           # plugin's semantic tier ran. A
+                                           # language id instead requires
+                                           # `{language, semanticTier="absent"}`.
   ```
 
   `[[refusal]]` is the only category that asserts the *absence* of an answer,
@@ -597,9 +611,65 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   else - not on a protocol-level failure, not on a candidate page, not on an
   answer. `expectations.rs`'s decision 9 has the full argument.
 
+  GM-386 gave `files` and `excluded_references` the same rule, and added one
+  more that needs no key at all: a result row the linker could not confirm is
+  spelled `unresolved:<filePath>:<qualifiedName>`, and a page that reports
+  `allUnresolved: true` fails outright. Those four fields are the whole of
+  what the shipped agent guidance tells a caller to trust, and until GM-386
+  none of them appeared in the kit's evaluation code at all - so a
+  plugin-specific regression in any of them was invisible in all four
+  languages. `expectations.rs`'s decisions 11-13 have the arguments, including
+  the measurement of how far a plugin can actually move the `resolved` bit
+  before `stream-order` or `same-file-rule` gets there first.
+
+  `provenance` (GM-382) was the first key whose *omission* is an assertion on
+  every entry that never mentions it: an entry without it requires the
+  response to carry no `provenance` block, so a plugin that started
+  disclaiming its own semantic tier fails its whole fixture rather than one
+  opted-in entry. `expectations.rs`'s decision 10 has the argument, including
+  why a passing conformance run can only ever be in the `"silent"` arm.
+
 The same fixtures run in core's CI for every bundled plugin. They are the
 per-language acceptance test, replacing "the TS integration tests happen to cover
 it".
+
+#### Per-response tier provenance (GM-382)
+
+The four plugins' semantic tiers are not equally available: TypeScript's type
+checker and Go's `go/types` ship with their plugins, while Rust's
+`rust-analyzer` and Python's `pyright` are resolved on the user's machine and
+may simply not be there. "Semantic engine missing" below says what happens
+then - the plugin logs once, answers `semanticPass` with an empty
+`incomplete` diff, `language_state.semanticPassAt` stays unset, and the
+structural graph is complete and honest.
+
+What was missing is that *the response never said so*. `find_callers`,
+`find_callees`, `find_references` and `find_implementations` returned the
+same field set, the same `resolved: true` rows and the same
+`hasMore: false` either way. Measured on ripgrep at 15.2.0, one query
+(`find_callers` on `searcher::Searcher::search_reader`, `limit: 200`), the
+same binary, two `PATH`s:
+
+| | semantic edges in the index | rows returned | `hasMore` | disclosure |
+|---|---|---|---|---|
+| `rust-analyzer` on `PATH` | 2757 | 45 | `true` | none |
+| `rust-analyzer` absent | 0 | 2 | `false` | `provenance` |
+
+The degraded page lost 43 of 45 callers and called itself complete. Since
+GM-382 it carries
+
+```json
+"provenance": { "language": "rust", "semanticTier": "absent" }
+```
+
+emitted only on those four tools, and only when the anchor's language
+declares a semantic tier (`capabilities.semantic_pass`) that has not
+completed for this project. It names no count of what the absent tier would
+have found - that number is not knowable, and a manufactured one is worse
+than silence. `core/src/mcp/provenance.rs`'s module doc has the full
+argument, including why the per-edge `source`/`engine` columns cannot answer
+this question and why the block is response-level rather than per-row (on
+excalidraw's `pointFrom` at `limit: 200`, 51 rows: 63 bytes against 2448).
 
 ### Plugin SDK (`plugins/sdk`, Rust crate)
 

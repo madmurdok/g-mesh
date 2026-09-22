@@ -33,6 +33,15 @@
 # - which is how this file is known to be measuring the pyright tier rather
 # than describing it.
 #
+# GM-386 added three more things an entry can say, all of which read the same
+# way: `files` (decision 12) and `excluded_references` (decision 13) assert the
+# response's two per-page summaries, and an entry that does not mention them
+# requires the response to carry neither. An `unresolved:`-prefixed row
+# (decision 11) marks an edge the linker could not confirm; no row in this
+# file carries one, which is this fixture's assertion that every usage it
+# names sits on a confirmed edge - in both arms, including the three entries
+# pyright answers.
+#
 # Every category `g-mesh plugins check --expect` can assert is exercised at
 # least once
 # (`core/src/cli/plugin_check/expectations.rs`'s module doc has the
@@ -106,6 +115,23 @@ expect = [
     "pkg/mod.py:call_through_imported_name",
     "pkg/sub/deep.py:Deep.describe",
 ]
+# Decision 12: two of the four rows are in mod.py, so the tally is carried.
+files = ["pkg/consumer.py:1", "pkg/mod.py:2", "pkg/sub/deep.py:1"]
+# Decision 13, and Python's entry for it. This walk lists four CALLS edges and
+# discloses three usages that are not calls, which in Python is one specific
+# shape each time: `pkg/__init__.py` is `from .helpers import assist`, the
+# re-export that makes the name importable as `pkg.assist`; `pkg/consumer.py`
+# and `pkg/mod.py` each bind the name with their own `import` before calling
+# it, and the binding is a REFERENCES edge in its own right. That is exactly
+# the gap GM-258 built this disclosure for - an agent asking "who calls
+# assist" gets four callers and is told, without a second round-trip, which
+# three files name it without calling it. Delete the re-export from
+# `__init__.py` and the count moves while the caller set does not.
+excluded_references = { count = 3, files = [
+    "pkg/__init__.py:1",
+    "pkg/consumer.py:1",
+    "pkg/mod.py:1",
+] }
 
 # --- callers: across a PEP 420 namespace package -----------------------------
 
@@ -127,6 +153,14 @@ file = "pkg/mod.py"
 # named `greet`; naming the file picks the declaration rather than the
 # pass-through.
 expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
+# Decision 13: `pkg/__init__.py` re-exports the name and `loader.py` binds it
+# before calling it - two usages that are not calls, disclosed rather than
+# silently dropped. No `files` key: the two rows already sit one per file, so
+# the response carries no tally and its absence is this entry's assertion.
+excluded_references = { count = 2, files = [
+    "pkg/__init__.py:1",
+    "pkg/plugins/loader.py:1",
+] }
 
 # --- callers: a class-qualified call, plus the receiver calls pyright answers
 #     and the one it does not (GM-299) --------------------------------------
@@ -134,6 +168,14 @@ expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
 [[callers]]
 symbol = "Base.describe"
 tier = "semantic"
+# GM-382, and this plugin is one of the two where the other arm is real:
+# `pyright` is resolved at runtime (PATH, then `node_modules/.bin`, then
+# `npx`), so a checkout without `npm install pyright` in `plugins/python`
+# genuinely has no semantic tier. `"silent"` asserts the arm this run is in -
+# pyright resolved, whole-project pass completed, nothing to disclose - and
+# is therefore a live assertion rather than a formality: it fails the moment
+# a response claims a tier it did not have, or disclaims one it did.
+provenance = "silent"
 # Through 3.4.0 this entry was the receiver gap's airtight *proof of absence*:
 # `describe` was called two ways in `pkg/mod.py` and only `call_through_a_class`'s
 # class-qualified `Base.describe(obj)` produced an edge, so the set was one
@@ -171,6 +213,13 @@ expect = [
     "pkg/mod.py:module_alias_is_bound",
     "pkg/callers.py:through_a_base_annotation",
 ]
+# Decision 12: two of the three rows are in mod.py.
+files = ["pkg/callers.py:1", "pkg/mod.py:2"]
+# Decision 13, and the counterpart of the note above about gap 2: the
+# monkey-patching line in `pkg/gaps.py` names `Base.describe` without calling
+# it, so it is neither in this caller set nor lost - it is the one usage this
+# CALLS walk discloses having left behind.
+excluded_references = { count = 1, files = ["pkg/gaps.py:1"] }
 
 # --- callers: the same call spelling, resolved to a SUBCLASS's override -----
 
@@ -186,7 +235,47 @@ tier = "semantic"
 # resolved every `describe()` to the base's declaration fails *here* on the
 # missing row, and a pass that resolved them all to the override fails
 # *above* on the missing rows. One of them passing alone would prove nothing.
+#
+# GM-385: note which row is *not* here. `pkg/callers.py:through_a_base_
+# annotation` calls `obj.describe()` on an `obj: Base`, and a `Deep` handed to
+# that function runs this very declaration - but the annotation is what
+# pyright reads, so the call site is filed on `Base.describe` above. This set
+# being exact is what asserts that; the entry below is the same fact with
+# nothing left to soften it.
 expect = ["pkg/callers.py:through_a_subclass"]
+
+# --- callers: an override nobody calls by name, which is the ordinary case --
+#
+# `Deep.describe` above at least has a call site of its own, which makes its
+# page look thin rather than wrong. `Greeter.describe` has none, and that is
+# the shape an agent actually meets: `pkg/mod.py`'s `Greeter` overrides
+# `describe`, `[[implementations]] Base` below names `Greeter`, and
+# `through_a_base_annotation` runs this body for every `Greeter` it is
+# handed - yet this page is **empty**, with `hasMore: false`,
+# `allUnresolved: false` and no `provenance` block, because pyright did run
+# and had nothing to disclaim.
+#
+# Every signal on that response says "complete". It is complete for the
+# question the index can answer - which call sites *name* this declaration -
+# and that is a different question from the one the caller asked. `core/src/
+# mcp/instructions.rs`'s `P4_STATIC_RECEIVER` is where a session is told the
+# difference, once, and its doc comment records why neither it nor this file
+# may ever offer a *count* of the calls missing here: the index knows `Base`
+# has two subclasses, it does not know how many of `through_a_base_
+# annotation`'s callers pass a `Greeter`, and a number an agent acts on is
+# worse than silence.
+#
+# **No `tier` key**, unlike the three entries above, and for the reason that
+# makes this worth asserting at all: the page is empty with pyright and empty
+# without it - structurally because a receiver call emits no edge, with
+# pyright because the one call went to `Base.describe`. So it passes on a
+# checkout with no `npm install pyright` too, and the response is
+# byte-identical in both arms. Nothing that could be attached to this page
+# would tell a reader which arm produced it, which is why GM-385 put the
+# disclosure in the session's instructions instead of on the response.
+[[callers]]
+symbol = "Greeter.describe"
+expect = []
 
 # --- callers: through a method's own instance parameter, and through a local
 #     whose type comes from its initializer -----------------------------------
@@ -259,6 +348,14 @@ expect = [
     "pkg/sub/deep.py:",
     "pkg/sub/deep.py:Deep",
 ]
+# Decision 12. Eight rows over four files, and the per-file counts are the
+# assertion: this is the category where a whole-file row and a symbol row from
+# the same file sit side by side (`pkg/mod.py:` is the import line, the other
+# two are the class base and the aliased call site), so `pkg/mod.py:3` is the
+# one number in this file that says how many *usages* Python's own
+# import-plus-use shape produces. The set above cannot say it - it names the
+# rows, and decision 8 exempts `[[references]]` from counting them.
+files = ["pkg/callers.py:2", "pkg/gaps.py:1", "pkg/mod.py:3", "pkg/sub/deep.py:2"]
 
 # --- references: a class reached through the `__all__` chain -----------------
 
@@ -288,6 +385,9 @@ expect = [
     "pkg/mod.py:call_through_a_class",
     "pkg/__init__.py:",
 ]
+# Decision 12: the import line and the use site in each of callers.py and
+# consumer.py are two rows apiece.
+files = ["pkg/__init__.py:1", "pkg/callers.py:2", "pkg/consumer.py:2", "pkg/mod.py:1"]
 
 # --- implementations: class Sub(Base), found by find_implementations ---------
 

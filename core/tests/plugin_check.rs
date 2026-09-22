@@ -1027,27 +1027,49 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
     }
 }
 
-/// GM-282's discrimination test for `--skip-semantic-expectations`, the Go
-/// counterpart to `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`
-/// above - except this drives the real toolchain dependency (`go` missing
-/// from `PATH`) rather than a manifest edit, the same way `plugins/go/
-/// semantic_test.go`'s `TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff`
-/// measured it at the unit level first, and the same way CI's "no toolchain"
-/// job runs it for real.
+/// GM-384 rewrote this from GM-282's original discrimination test for
+/// `--skip-semantic-expectations`, because that test pinned a bug: it
+/// asserted the run *succeeded* with `expectations.file` `Pass` and the four
+/// `tier = "semantic"` entries cleanly `Skip`. That could only happen
+/// because the Go plugin's whole-project `semanticPass` answered an empty
+/// diff with no `incomplete` field - wire/src/lib.rs's
+/// `FileChangeResponse::incomplete`, which core's `watcher::apply::
+/// apply_semantic_pass` reads to decide whether a whole-project pass gets to
+/// leave `language_state.semanticPassAt` set. Absent means "this pass
+/// finished," so a Go index built with no toolchain on `PATH` looked exactly
+/// like one whose semantic tier had just run to completion - `mcp::
+/// provenance` (GM-382) had nothing to warn about, and `mcp::instructions`
+/// (GM-262) stopped listing Go's receiver-call gap. Two consumers misled by
+/// one missing field.
 ///
-/// Every `tier = "semantic"` entry in the fixture's own `expect.toml` (three
-/// `[[callers]]`, one `[[implementations]]`) must report `Skip`, in place,
-/// under the exact id it would otherwise carry - never silently absent from
-/// the report, and never re-numbered around the gap. Every other entry -
-/// bare and package-qualified calls, references, imports, definition - is
-/// untouched and still passes, which is what proves the reduction is exactly
-/// the tagged four and nothing else.
+/// Now the plugin reports `incomplete: true` (`plugins/go/semantic.go`'s
+/// `run`), and that is load-bearing here in a way `--skip-semantic-
+/// expectations` cannot route around: `apply_semantic_pass` treats an
+/// incomplete *whole-project* pass as an error - the diff it carried is
+/// still committed, but the round trip that carried it fails - and the
+/// conformance session (`core/src/cli/plugin_check/session.rs`) stops at the
+/// first failing step, before `fileChanged #6` and before expectations are
+/// ever evaluated. `--skip-semantic-expectations` only changes how `[[
+/// callers]]`/`[[implementations]]` entries tagged `tier = "semantic"` are
+/// scored once expectations run; it has no say over whether the session
+/// reaches them. So passing it or not now produces the identical report:
+/// `expectations.file` is `Skip` ("session failed") either way, and the
+/// per-entry `Skip`/`Pass` split this test used to check no longer exists to
+/// check, because no expectation is evaluated at all.
+///
+/// That is the correct outcome, not a regression to route around: a
+/// conformance run has no basis to certify an index whose one semantic pass
+/// never completed, `--skip-semantic-expectations` or not. What this test
+/// now proves is narrower and more honest - the plugin says so on the wire,
+/// the kit refuses to certify past that point, and nothing *else* the kit
+/// checks (shape, stream order, id stability, ownership) is collateral
+/// damage from a `go`-free `PATH`.
 #[test]
-fn the_go_plugin_without_a_toolchain_skips_only_the_semantic_tier_expectations() {
+fn the_go_plugin_without_a_toolchain_fails_the_session_check_with_an_incomplete_whole_project_pass() {
     let path = path_without_go();
     // Sanity first (this repo's own rule: a comparison must be shown capable
     // of telling the arms apart before it is relied on) - `go` really is
-    // gone from this PATH, so a pass below is not an accident of the
+    // gone from this PATH, so a failure below is not an accident of the
     // toolchain still being reachable some other way (GOROOT, a cached
     // `go/packages` driver, ...).
     assert!(
@@ -1055,67 +1077,52 @@ fn the_go_plugin_without_a_toolchain_skips_only_the_semantic_tier_expectations()
         "the filtered PATH still resolves `go` - this test would not be discriminating anything: {path}"
     );
 
-    let run = run_check_with_expect_env(
-        &go_plugin_dir(),
-        &go_conformance_project(),
-        &go_conformance_expect(),
-        &["--skip-semantic-expectations"],
-        &[("PATH", &path)],
-    );
-    assert!(run.success, "{}", run.stdout);
-    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
-
-    for id in [
-        "expectations.callers[4]",
-        "expectations.callers[5]",
-        "expectations.callers[6]",
-        "expectations.implementations[0]",
-    ] {
-        assert_eq!(run.outcome(id), "SKIP", "{id}:\n{}", run.stdout);
-    }
-    for id in [
-        "expectations.callers[0]",
-        "expectations.callers[1]",
-        "expectations.callers[2]",
-        "expectations.callers[3]",
-        "expectations.references[0]",
-        "expectations.imports[0]",
-        // GM-365: the incoming direction is structural too, in every
-        // language - an `IMPORTS` edge needs no toolchain - so it belongs in
-        // this list rather than among the entries the flag skips.
-        "expectations.importers[0]",
-        "expectations.definition[0]",
-        "expectations.definition[1]",
-        // GM-371, and structural for exactly the reason `[[importers]]` is:
-        // the import placeholder both of these refusals are about is emitted
-        // by the tree-sitter pass, so a missing `go` toolchain changes
-        // nothing about them and they belong in this list rather than among
-        // the entries the flag skips.
-        "expectations.refusal[0]",
-        "expectations.refusal[1]",
-    ] {
-        assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
-    }
-
-    // The same run, minus the flag: the four semantic entries now FAIL
-    // outright (the plugin really answered nothing, not "skipped by us") -
-    // the fact `--skip-semantic-expectations` exists to turn into a clean
-    // `Skip` instead.
-    let run_without_flag = run_check_with_expect_env(
-        &go_plugin_dir(),
-        &go_conformance_project(),
-        &go_conformance_expect(),
-        &[],
-        &[("PATH", &path)],
-    );
-    assert!(!run_without_flag.success, "{}", run_without_flag.stdout);
-    for id in [
-        "expectations.callers[4]",
-        "expectations.callers[5]",
-        "expectations.callers[6]",
-        "expectations.implementations[0]",
-    ] {
-        assert_eq!(run_without_flag.outcome(id), "FAIL", "{id}:\n{}", run_without_flag.stdout);
+    for extra_args in [&["--skip-semantic-expectations"][..], &[][..]] {
+        let run = run_check_with_expect_env(
+            &go_plugin_dir(),
+            &go_conformance_project(),
+            &go_conformance_expect(),
+            extra_args,
+            &[("PATH", &path)],
+        );
+        assert!(
+            !run.success,
+            "a whole-project semantic pass that never ran must not be certifiable, \
+             extra_args={extra_args:?}:\n{}",
+            run.stdout
+        );
+        assert_eq!(run.outcome("session"), "FAIL", "extra_args={extra_args:?}:\n{}", run.stdout);
+        assert!(
+            run.stdout.contains("incomplete whole-project semantic pass"),
+            "the session must fail for the reason this test is about, not some other regression, \
+             extra_args={extra_args:?}:\n{}",
+            run.stdout
+        );
+        assert_eq!(
+            run.outcome("expectations.file"),
+            "SKIP",
+            "expectations need a session that reached the end, extra_args={extra_args:?}:\n{}",
+            run.stdout
+        );
+        // The rest of the contract is unaffected: an honest `incomplete`
+        // fails exactly the one check whose job is to notice it, not
+        // everything downstream of a `go`-free `PATH`.
+        for id in [
+            "shape",
+            "stream-order",
+            "same-file-rule",
+            "id-stability.bulk-repeat",
+            "id-stability.whitespace-edit",
+            "id-stability.deletes-known",
+            "id-stability.incremental-matches-bulk",
+            "id-stability.declaration-edit-applies",
+            "ownership.defines-exports-from-file",
+            "ownership.language",
+            "ownership.no-container",
+            "ownership.diff-stays-in-file",
+        ] {
+            assert_eq!(run.outcome(id), "PASS", "{id}, extra_args={extra_args:?}:\n{}", run.stdout);
+        }
     }
 }
 
@@ -1344,12 +1351,19 @@ fn an_unknown_expectation_key_is_a_hard_parse_error() {
 /// test proves that dependency is real, not assumed: it runs the identical
 /// fixture and `expect.toml` against a copy of the TS plugin whose manifest
 /// declares `semantic_pass = false`, so `session::run_session` never sends
-/// `semanticPass` at all, and shows that this one expectation - and only
-/// this one - now fails, missing exactly `useNamespaceImport`. Every other
-/// `[[callers]]` entry (the same-file call, the cross-file import, both
-/// barrel re-export forms - all structural) keeps passing, which is what
-/// proves the failure is specific to the semantic-only case and not a
-/// blanket breakage from disabling the capability.
+/// `semanticPass` at all, and shows that this expectation now fails, missing
+/// exactly `useNamespaceImport`. Every other `[[callers]]` entry (the
+/// same-file call, the cross-file import, both barrel re-export forms - all
+/// structural) keeps passing, which is what proves the failure is specific to
+/// the semantic-only case and not a blanket breakage from disabling the
+/// capability.
+///
+/// GM-386 added one more entry to the specific side of that line rather than
+/// to the unaffected side: the overloaded `format`, whose row set is
+/// structural but whose `files` tally is not. It is asserted below by name,
+/// with the finding that must accompany it, so "two entries fail here, for
+/// two stated reasons" stays a claim this test makes rather than a fact it
+/// tolerates.
 #[test]
 fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
     let plugin = ts_plugin_dir();
@@ -1387,10 +1401,34 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         run.stdout
     );
 
+    // GM-386 gave this arm a second, differently-shaped failure, and it is
+    // asserted by name rather than dropped from the list below - a list that
+    // quietly lost an entry would stop saying anything about it.
+    // `expectations.callers[2]` is the overloaded `format`, whose caller SET
+    // is structural (one row either way) but whose `files` tally is not: the
+    // two overload call sites are two CALLS edges only once tsserver has
+    // bound them, and with one edge the tally is not worth sending at all.
+    // So that entry asserts the tally, carries `tier = "semantic"` for it,
+    // and fails here on the tally alone - with its row set still matching,
+    // which is exactly what the finding has to say for this to be evidence
+    // rather than noise. See `plugins/typescript/conformance/expect.toml`'s
+    // own comment on why no single spelling of that entry is true in both
+    // arms.
+    assert_eq!(run.outcome("expectations.callers[2]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("the response carries no files tally at all"),
+        "callers[2] must fail on the tally, not on its rows:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("the set itself matched: {src/main.ts:useOverloads}"),
+        "callers[2]'s row set is structural and must still match:\n{}",
+        run.stdout
+    );
+
     // Every other expectation - the structural ones - is unaffected.
     for id in [
         "expectations.callers[0]",
-        "expectations.callers[2]",
         "expectations.references[0]",
         "expectations.implementations[0]",
         "expectations.imports[0]",
@@ -1403,6 +1441,14 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         // GM-371: a name the index does not carry is refused whether or not
         // tsserver ran, so this one is structural too.
         "expectations.refusal[0]",
+        // GM-385: `[[callers]] Greetable#greet` - the receiver call
+        // `viaGreetable` makes on `g: Greetable`. This plugin declares
+        // `receiver_calls = "unresolved"` for BOTH tiers, so the page is
+        // empty here and empty in the shipped-manifest run above, and its
+        // presence in this list is the assertion: an entry that moved
+        // between the two arms would mean tsserver had started answering
+        // receiver calls.
+        "expectations.callers[3]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }

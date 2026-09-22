@@ -13,6 +13,22 @@
 # this one so each case below can be checked by hand against the real
 # source rather than taken on faith.
 #
+# Three fields below are new in GM-386 and read the same way everywhere they
+# appear: `files` (decision 12) and `excluded_references` (decision 13) assert
+# the response's two per-page summaries, and an entry that does not mention
+# them requires the response to carry neither. An `unresolved:`-prefixed row
+# (decision 11) would mark an edge the linker could not confirm - no row in
+# this file carries one, which is this fixture's assertion that every usage it
+# names is a confirmed edge.
+#
+# No entry here gives `excluded_references`, and that is this language's
+# answer rather than a gap: none of the three `[[callers]]` anchors below has
+# a single `REFERENCES`-kind usage in this project. A TypeScript import is an
+# `IMPORTS` edge to a file, and every use of these three names at the far end
+# of one is a call - so the three entries assert the block's ABSENCE, which
+# decision 13 makes an assertion in its own right and which is the arm that
+# fails the day this plugin stops emitting a `REFERENCES` edge it used to.
+#
 # One entry here is a control rather than a claim about this plugin: the
 # `[[importers]]` one at the bottom, GM-365's new incoming category, which
 # passes identically against the pre- and post-GM-356 binary while the other
@@ -25,12 +41,32 @@
 [[callers]]
 symbol = "add"
 file = "src/math.ts"
+# GM-382. This plugin's semantic tier is the TypeScript compiler itself,
+# resolved from the plugin's own `node_modules` rather than from the user's
+# machine, so it is the least likely of the four to be missing - but the
+# assertion is not "it cannot happen", it is "it did not happen here":
+# `"silent"` requires the response to carry no `provenance` block, and fails
+# if this plugin ever answers while claiming its semantic tier was absent.
+# Every other entry in this file requires the same thing by saying nothing,
+# which is the same assertion (decision 10).
+provenance = "silent"
 # double() calls add() within math.ts itself (same-file); main.ts's run()
 # imports { add } and calls it directly (cross-file named import); main.ts's
 # useBarrelStar() imports add under a different local name through index.ts's
 # `export * from "./math"` and calls that - a second declaration re-exporting
 # the very same node, so it must not add a fourth, separate caller entry.
 expect = ["src/math.ts:double", "src/main.ts:run", "src/main.ts:useBarrelStar"]
+# Decision 12, and this is TypeScript's load-bearing entry for it - for the
+# very risk the comment above names. The set cannot see a third CALLS edge
+# that lands on the same node: `useBarrelStar` reaching `add` through
+# `export * from "./math"` produces one more row spelled exactly
+# `src/main.ts:useBarrelStar`, and a set collapses it. `find_callers` runs on
+# `Distinctness::Edges` and decision 8 deliberately exempts `[[callers]]` from
+# its duplicate-row check, so the per-file count here is the only thing in the
+# kit that would notice. `src/main.ts:2` is one call each from run() and
+# useBarrelStar(); a re-export walk that started answering twice makes it 3
+# while the SET above still matches exactly.
+files = ["src/main.ts:2", "src/math.ts:1"]
 
 [[callers]]
 symbol = "double"
@@ -46,6 +82,8 @@ file = "src/math.ts"
 # drops out of the actual set and this expectation fails - see
 # core/tests/plugin_check.rs's `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
 expect = ["src/main.ts:run", "src/main.ts:useNamespaceImport"]
+# Decision 12: both rows are in main.ts, one call each.
+files = ["src/main.ts:2"]
 
 [[callers]]
 symbol = "format"
@@ -54,6 +92,69 @@ file = "src/overload.ts"
 # (format("a") and format(1)) - both must resolve to the one merged
 # declaration, so the caller set has exactly one entry, not two.
 expect = ["src/main.ts:useOverloads"]
+# Decision 12, and the entry in this file where that field says the most -
+# which is also the entry that made GM-386 pay for it. The set above has ONE
+# member; the tally says `src/main.ts:2`, because the two overload call sites
+# are two CALLS edges distinguished by `WireEdge::toDeclaration`, and a set
+# collapses them onto the one merged declaration this entry exists to assert.
+# `find_callers` runs on `Distinctness::Edges` and decision 8 deliberately
+# exempts `[[callers]]` from its duplicate-row check, so this count is the
+# only thing in the whole kit that can see whether both bindings survived.
+files = ["src/main.ts:2"]
+# **`tier = "semantic"` is new in GM-386, and it is this file's first.** The
+# second binding is tsserver's work: without a semantic pass only one CALLS
+# edge exists, the tally is then not worth sending
+# (`pagination::tally_is_worth_sending`), and the response carries no `files`
+# at all. Since decision 12 makes an omitted `files` an assertion in its own
+# right, there is no way to write this entry so that it is true in both arms -
+# the healthy run needs the key and the structural-only run needs its absence.
+# So the entry is tagged for what it actually needs, and
+# `core/tests/plugin_check.rs`'s
+# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` was updated
+# to expect it among the failures of its structural arm, naming the tally as
+# the reason rather than dropping the entry from its list.
+#
+# Tagging costs nothing here today: nothing runs this fixture with
+# `--skip-semantic-expectations` (that flag's callers are the Go CI job and
+# the rust/python conformance suites), so the tag changes no run. What it does
+# is say, in the file, that this assertion depends on the compiler tier.
+tier = "semantic"
+
+# --- callers: the receiver call this language never resolves (GM-385) --------
+#
+# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. In the
+# other three bundled plugins that call produces an edge onto whatever
+# declaration the receiver's *static* type names - `go/types` files it under
+# the interface method, rust-analyzer under the trait's, pyright under the
+# annotation's class. This plugin files it nowhere: `plugin.toml` declares
+# `receiver_calls = "unresolved"` **and** `receiver_calls_structural =
+# "unresolved"`, so neither tier emits anything and this page is empty.
+#
+# That pair of manifest fields had no check behind it until this entry
+# existed. The fixture carried no receiver call at all, so a plugin that
+# quietly started resolving them - or a manifest edited to claim it did -
+# changed nothing any expectation could see.
+#
+# **No `tier` key, and this entry must pass in the structural arm too.** That
+# is the assertion rather than a concession: `core/tests/plugin_check.rs`'s
+# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` runs this
+# same file against a `semantic_pass = false` manifest and lists this entry
+# among the ones a missing tier must not disturb. An entry that differed
+# between those two arms would mean tsserver had started answering receiver
+# calls, which is exactly what the manifest says it does not.
+#
+# Read beside `plugins/go`'s `Conn.Close`, `plugins/rust`'s
+# `shapes::<Circle as Shape>::area` and `plugins/python`'s
+# `Greeter.describe`: all four fixtures now assert an empty `[[callers]]`
+# page for a method reached through a receiver, and the four comments are
+# where the two different reasons are kept apart. Here there is no edge to
+# narrow. There the edge exists and points at the base, which is what
+# `core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER` discloses once per
+# session for those three languages and never for this one.
+[[callers]]
+symbol = "Greetable#greet"
+file = "src/shapes.ts"
+expect = []
 
 # --- references (includes SUPERTYPE_OF, which callers/implementations don't share) -
 
@@ -63,7 +164,19 @@ file = "src/shapes.ts"
 # Greeter's `implements Greetable` clause is a SUPERTYPE_OF edge, which
 # find_references includes alongside CALLS/REFERENCES (its own
 # USAGE_EDGE_KINDS) but find_callers does not - proving that inclusion.
-expect = ["src/shapes.ts:Greeter"]
+#
+# `viaGreetable` joined this set in GM-385: its parameter annotation
+# `g: Greetable` is an ordinary same-file REFERENCES edge. Worth noticing
+# what that makes this entry say next to the `[[callers]] Greetable#greet`
+# entry above - the *type* is referenced by the very function whose call to
+# its *method* produces nothing. A reader who follows the type finds the
+# call site; a reader who follows the method does not.
+expect = ["src/shapes.ts:Greeter", "src/shapes.ts:viaGreetable"]
+# Decision 12: two rows, one file, so the response carries the tally and this
+# entry has to say so. It was absent - and asserted absent - until the second
+# row existed, which is that decision's own absent arm doing its job: adding
+# `viaGreetable` to the fixture failed this entry rather than slipping past it.
+files = ["src/shapes.ts:2"]
 
 # --- implementations ---------------------------------------------------------
 

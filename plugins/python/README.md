@@ -107,12 +107,63 @@ imports resolve against the environment the code actually runs in. `$VIRTUAL_ENV
 is deliberately **not** read: it describes whatever shell started the daemon,
 which is as likely to be another project's environment as this one's.
 
+### What a resolved receiver call resolves *to*
+
+`plugin.toml` says `receiver_calls = "resolved"`, and that is a statement
+about the *tier*, not a promise about which code runs. pyright resolves
+`x.m()` against the **static type of `x`** — the annotation, or what it can
+infer — so a call through a parameter annotated with a base class lands on
+the base's declaration, never on the override that executes:
+
+```python
+def through_a_base_annotation(obj: Base) -> str:
+    return obj.describe()          # -> Base.describe, whatever obj really is
+```
+
+Measured on `conformance/project`, with pyright resolved and the
+whole-project pass complete:
+
+| query | answer |
+| --- | --- |
+| `find_callers("Base.describe")` | `{call_through_a_class, module_alias_is_bound, through_a_base_annotation}` |
+| `find_callers("Deep.describe")` | `{through_a_subclass}` — no `through_a_base_annotation` |
+| `find_callers("Greeter.describe")` | `{}` — empty |
+| `find_implementations("Base")` | `{Greeter, Deep}` |
+
+The third row is the one to read twice. `Greeter` overrides `describe`, so
+`through_a_base_annotation` runs `Greeter.describe` for every `Greeter` it is
+handed — and the page that asks who calls it comes back empty, with
+`hasMore: false`, `allUnresolved: false` and no `provenance` block, because
+nothing was absent: the tier ran and filed that call under the annotation.
+Every signal says complete, and it is complete for "who *names* this
+declaration", which is a different question from "what runs this code".
+
+**Where the missing calls went, and why this plugin will not count them.**
+They are on the base's page, exactly — so `find_implementations` is the
+crossing, and `conformance/expect.toml` asserts all four rows above as exact
+sets. What this plugin never reports is a *number*: it knows `Base` has two
+subclasses, it does not know how many of `through_a_base_annotation`'s
+callers pass a `Greeter`, and that is unknowable by construction. A count an
+agent acts on is worse than silence, which is the rule
+`core/src/mcp/provenance.rs` already states for an absent tier.
+
+This is not Python-specific. `plugins/go` and `plugins/rust` have the same
+section, saying the same thing in their own syntax, because it is what static
+resolution means rather than what one engine does — Go's interface method and
+Rust's trait declaration are this base class, spelled differently.
+`plugins/typescript` is the odd one out and says so: it declares
+`receiver_calls = "unresolved"` for both tiers and emits no edge for `x.m()`
+at all. A session is told the consequence once, by
+`core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER`.
+
+What follows is the part that *is* Python-specific, and it is the larger one.
+
 ### What `resolved: true` covers for Python, and what it does not
 
 This is the part to read before trusting a Python caller list, and it is
-deliberately not written to sound like Go's. `plugin.toml` says
-`receiver_calls = "resolved"`, and that is a statement about the *tier*, not a
-promise about every call site. **Python is the language where `resolved: true`
+deliberately not written to sound like Go's. Everything in the section above
+applies here word for word; what does not carry over is how much pyright can
+infer in the first place. **Python is the language where `resolved: true`
 covers the least of any plugin here**, and the reason is not pyright's: it is
 that Python decides at run time what Go and Rust decide at compile time.
 
@@ -133,8 +184,10 @@ It answers *nothing at all* for every one of these, with pyright running:
    in `conformance/expect.toml` is asserted rather than merely described.
 2. **Dynamic dispatch in general.** Which `describe` runs is a fact about the
    object at run time; the best a checker can do is name the statically visible
-   declaration, and where the static type is a base class the edge points at the
-   base even though a subclass's override is what executes.
+   declaration. This one is not really a case of "answers nothing at all" —
+   it answers, and answers the base — so it is the section above rather than
+   an item in this list, and is kept here only so a reader working down the
+   list is not left thinking it was forgotten.
 3. **Monkey patching.** `Klass.method = something_else` after import. The index
    shows the declaration as written and every caller still appears to call it.
 4. **Attributes created at run time.** `setattr`, `__getattr__`,
