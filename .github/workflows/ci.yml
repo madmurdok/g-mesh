@@ -874,16 +874,27 @@ jobs:
             echo "go must not be resolvable in this step - deleting it did not take" >&2
             exit 1
           fi
-          report="$(cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
+          # The capture sits in an `if` CONDITION rather than standing alone,
+          # and that placement is the whole point. `shell: bash` expands to
+          # `bash --noprofile --norc -e -o pipefail {0}` - the `-e` is on the
+          # invocation line, where the script's own `set -uo pipefail` cannot
+          # reach it. A bare `report="$(...)"` therefore kills the step the
+          # instant the check exits non-zero, which is EVERY run of this job,
+          # taking `status=$?` and both assertions below with it. That is how
+          # GM-384's rewrite reached main having never once executed its own
+          # assertion (GM-388). A command in an `if` condition is exempt from
+          # errexit by the shell's own rules, so no `set +e` and no custom
+          # shell line is needed; the structure states the expectation instead
+          # of working around the flag.
+          if report="$(cargo run --manifest-path core/Cargo.toml --bin g-mesh -- \
             plugins check plugins/go --fixture plugins/go/conformance/project \
-            --expect plugins/go/conformance/expect.toml --skip-semantic-expectations)"
-          status=$?
-          echo "$report"
-          if [ "$status" -eq 0 ]; then
+            --expect plugins/go/conformance/expect.toml --skip-semantic-expectations)"; then
+            echo "$report"
             echo "expected this run to fail - a whole-project semantic pass with no toolchain is not \
                   certifiable - but it exited 0; the Go plugin may have stopped reporting incomplete=true" >&2
             exit 1
           fi
+          echo "$report"
           if ! grep -q "incomplete whole-project semantic pass" <<<"$report"; then
             echo "the run failed, but not for the reason this job exists to prove - see the report above" >&2
             exit 1
