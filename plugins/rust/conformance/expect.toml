@@ -286,6 +286,48 @@ expect = [
     "crates/alpha/src/gaps.rs:gaps::measure",
 ]
 
+# --- callers: the page the two entries above take their rows FROM (GM-385) ---
+#
+# The pair above is written from the call site's end: each `_.area()` lands on
+# the declaration its receiver's type names. This entry is the same fact read
+# from the other end, and it is the one an agent actually asks.
+#
+# `Circle` implements `Shape`. `total_dyn` calls `area` through `&dyn Shape`
+# and `gaps::measure` through `<S: Shape>`, so a `Circle` reaching either is
+# exactly what `<Circle as Shape>::area` runs for. This page is nonetheless
+# **empty**, and empty in the shape that reads as settled: `results: []` with
+# `hasMore: false`, `allUnresolved: false` and - since rust-analyzer answered -
+# no `provenance` block disclaiming anything either.
+#
+# `expect = []` is a resolved-and-genuinely-blank answer, not a refusal
+# (decision 9 has why those are different). It is asserted here rather than
+# left implied because nothing else in this file can fail when this page is
+# wrong: the two entries above pass whether or not this one is empty, and an
+# agent that asks "who calls Circle's area" is asking this one.
+#
+# What makes the emptiness honest rather than a defect is that the calls are
+# not lost, only filed elsewhere: they are on `shapes::Shape::area`'s page
+# directly above, and `[[implementations]] shapes::Shape` below is the edge
+# that gets a reader from this anchor to that one. `core/src/mcp/
+# instructions.rs`'s `P4_STATIC_RECEIVER` is where a session is told so, in
+# one sentence, once - and its doc comment records why this file must never
+# grow an entry asserting a *count* of the calls that are missing here.
+#
+# **No `tier` key, and that is the sharpest thing this entry says.** Every
+# other receiver-call entry in this file is `tier = "semantic"` because its
+# rows only exist once rust-analyzer has run. This page is empty in *both*
+# arms - structurally because a receiver call emits no edge at all, and
+# semantically because the two that exist went to the trait - so it passes
+# against the 3.2.0 structural manifest and against the shipped one alike.
+# That is not the entry being weak: it is the hazard, written down. The page
+# an agent sees is byte-identical whether the tier ran or not, so nothing in
+# the response can tell a reader which of the two reasons produced it, and no
+# per-answer field could - which is the measurement behind GM-385 choosing a
+# session-level sentence over a marker on this page.
+[[callers]]
+symbol = "shapes::<Circle as Shape>::area"
+expect = []
+
 [[callers]]
 symbol = "shapes::Shape::label"
 tier = "semantic"

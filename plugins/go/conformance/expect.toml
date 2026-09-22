@@ -155,6 +155,50 @@ symbol = "Closer.Close"
 tier = "semantic"
 expect = ["server/conn.go:CloseAll"]
 
+# --- GM-385: the same fact, read from the end an agent actually asks --------
+#
+# The entry above is written from the call site: `c.Close()` on a `Closer`
+# lands on the interface method. This one is that sentence's other half, and
+# it is the half a caller meets.
+#
+# `Conn` implements `Closer` - `[[implementations]]` below asserts exactly
+# that - so `CloseAll` runs `Conn.Close` whenever the slice it walks holds a
+# `Conn`. Asking who calls `Conn.Close` nonetheless returns **nothing**, and
+# returns it in the shape that reads as settled. Measured against this
+# fixture with `go` on PATH and the whole-project pass complete, the MCP
+# response is 240 bytes:
+#
+#   {"anchor":{...},"results":[],"hasMore":false,"allUnresolved":false}
+#
+# No `provenance` block either, correctly: the semantic tier did run, so
+# there is nothing absent to disclose. Every signal a caller has says the
+# answer is complete, and it is complete only for the question the index can
+# answer - "who names this declaration", not "what runs this code".
+#
+# `expect = []` is a resolved-and-blank answer rather than a refusal
+# (decision 9). Asserting it is what makes the absence a measurement: nothing
+# else in this file fails if this page ever stops being empty, and nothing
+# else fails if it *starts* carrying `CloseAll` - which it would, the day a
+# semantic tier decided to guess at run-time dispatch. That guess is the one
+# this fixture must catch, because a wrong caller is worse than a missing one.
+#
+# **No `tier` key, deliberately**, unlike the three semantic entries above.
+# The page is empty with `go/types` and empty without it - structurally
+# because a receiver call emits no edge at all, semantically because the one
+# that exists went to `Closer.Close`. So this entry passes in the CI job that
+# runs with no Go toolchain as well as in the one that has it, and the reason
+# it can is the point: the response is byte-identical in both arms, so no
+# field on it could tell a reader which arm produced it. That is why GM-385
+# discloses this once per session (`core/src/mcp/instructions.rs`'s
+# `P4_STATIC_RECEIVER`) instead of marking the page - and why neither that
+# sentence nor this file may ever state a *count* of the calls missing here.
+# The index knows `Closer` has three implementors; it does not know how many
+# of `CloseAll`'s iterations reach this one, and a number a caller acts on is
+# worse than silence.
+[[callers]]
+symbol = "Conn.Close"
+expect = []
+
 # Implicit implementation: the thing Go's structural interfaces make
 # invisible to any amount of parsing. Three implementers, none of which
 # mentions Closer anywhere - Server (pointer receiver), Conn (pointer

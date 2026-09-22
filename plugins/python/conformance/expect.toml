@@ -235,7 +235,47 @@ tier = "semantic"
 # resolved every `describe()` to the base's declaration fails *here* on the
 # missing row, and a pass that resolved them all to the override fails
 # *above* on the missing rows. One of them passing alone would prove nothing.
+#
+# GM-385: note which row is *not* here. `pkg/callers.py:through_a_base_
+# annotation` calls `obj.describe()` on an `obj: Base`, and a `Deep` handed to
+# that function runs this very declaration - but the annotation is what
+# pyright reads, so the call site is filed on `Base.describe` above. This set
+# being exact is what asserts that; the entry below is the same fact with
+# nothing left to soften it.
 expect = ["pkg/callers.py:through_a_subclass"]
+
+# --- callers: an override nobody calls by name, which is the ordinary case --
+#
+# `Deep.describe` above at least has a call site of its own, which makes its
+# page look thin rather than wrong. `Greeter.describe` has none, and that is
+# the shape an agent actually meets: `pkg/mod.py`'s `Greeter` overrides
+# `describe`, `[[implementations]] Base` below names `Greeter`, and
+# `through_a_base_annotation` runs this body for every `Greeter` it is
+# handed - yet this page is **empty**, with `hasMore: false`,
+# `allUnresolved: false` and no `provenance` block, because pyright did run
+# and had nothing to disclaim.
+#
+# Every signal on that response says "complete". It is complete for the
+# question the index can answer - which call sites *name* this declaration -
+# and that is a different question from the one the caller asked. `core/src/
+# mcp/instructions.rs`'s `P4_STATIC_RECEIVER` is where a session is told the
+# difference, once, and its doc comment records why neither it nor this file
+# may ever offer a *count* of the calls missing here: the index knows `Base`
+# has two subclasses, it does not know how many of `through_a_base_
+# annotation`'s callers pass a `Greeter`, and a number an agent acts on is
+# worse than silence.
+#
+# **No `tier` key**, unlike the three entries above, and for the reason that
+# makes this worth asserting at all: the page is empty with pyright and empty
+# without it - structurally because a receiver call emits no edge, with
+# pyright because the one call went to `Base.describe`. So it passes on a
+# checkout with no `npm install pyright` too, and the response is
+# byte-identical in both arms. Nothing that could be attached to this page
+# would tell a reader which arm produced it, which is why GM-385 put the
+# disclosure in the session's instructions instead of on the response.
+[[callers]]
+symbol = "Greeter.describe"
+expect = []
 
 # --- callers: through a method's own instance parameter, and through a local
 #     whose type comes from its initializer -----------------------------------

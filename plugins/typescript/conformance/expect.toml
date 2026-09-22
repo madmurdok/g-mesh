@@ -120,6 +120,42 @@ files = ["src/main.ts:2"]
 # is say, in the file, that this assertion depends on the compiler tier.
 tier = "semantic"
 
+# --- callers: the receiver call this language never resolves (GM-385) --------
+#
+# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. In the
+# other three bundled plugins that call produces an edge onto whatever
+# declaration the receiver's *static* type names - `go/types` files it under
+# the interface method, rust-analyzer under the trait's, pyright under the
+# annotation's class. This plugin files it nowhere: `plugin.toml` declares
+# `receiver_calls = "unresolved"` **and** `receiver_calls_structural =
+# "unresolved"`, so neither tier emits anything and this page is empty.
+#
+# That pair of manifest fields had no check behind it until this entry
+# existed. The fixture carried no receiver call at all, so a plugin that
+# quietly started resolving them - or a manifest edited to claim it did -
+# changed nothing any expectation could see.
+#
+# **No `tier` key, and this entry must pass in the structural arm too.** That
+# is the assertion rather than a concession: `core/tests/plugin_check.rs`'s
+# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` runs this
+# same file against a `semantic_pass = false` manifest and lists this entry
+# among the ones a missing tier must not disturb. An entry that differed
+# between those two arms would mean tsserver had started answering receiver
+# calls, which is exactly what the manifest says it does not.
+#
+# Read beside `plugins/go`'s `Conn.Close`, `plugins/rust`'s
+# `shapes::<Circle as Shape>::area` and `plugins/python`'s
+# `Greeter.describe`: all four fixtures now assert an empty `[[callers]]`
+# page for a method reached through a receiver, and the four comments are
+# where the two different reasons are kept apart. Here there is no edge to
+# narrow. There the edge exists and points at the base, which is what
+# `core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER` discloses once per
+# session for those three languages and never for this one.
+[[callers]]
+symbol = "Greetable#greet"
+file = "src/shapes.ts"
+expect = []
+
 # --- references (includes SUPERTYPE_OF, which callers/implementations don't share) -
 
 [[references]]
@@ -128,7 +164,19 @@ file = "src/shapes.ts"
 # Greeter's `implements Greetable` clause is a SUPERTYPE_OF edge, which
 # find_references includes alongside CALLS/REFERENCES (its own
 # USAGE_EDGE_KINDS) but find_callers does not - proving that inclusion.
-expect = ["src/shapes.ts:Greeter"]
+#
+# `viaGreetable` joined this set in GM-385: its parameter annotation
+# `g: Greetable` is an ordinary same-file REFERENCES edge. Worth noticing
+# what that makes this entry say next to the `[[callers]] Greetable#greet`
+# entry above - the *type* is referenced by the very function whose call to
+# its *method* produces nothing. A reader who follows the type finds the
+# call site; a reader who follows the method does not.
+expect = ["src/shapes.ts:Greeter", "src/shapes.ts:viaGreetable"]
+# Decision 12: two rows, one file, so the response carries the tally and this
+# entry has to say so. It was absent - and asserted absent - until the second
+# row existed, which is that decision's own absent arm doing its job: adding
+# `viaGreetable` to the fixture failed this entry rather than slipping past it.
+files = ["src/shapes.ts:2"]
 
 # --- implementations ---------------------------------------------------------
 

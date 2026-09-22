@@ -29,8 +29,11 @@
 //! [`INSTRUCTIONS_BYTE_CEILING`] leaves working margin under that hard cut.
 //! Four shapes exist, in increasing cost:
 //!
-//! 1. **No language has an open gap** ([`P4_NO_GAP`]) - shortest: the
-//!    whole receiver-call paragraph drops to one sentence.
+//! 1. **Every present language resolves receiver calls**
+//!    ([`P4_STATIC_RECEIVER`]) - clause (1) narrows to what that resolution
+//!    actually binds to (the receiver's declared type, never its run-time
+//!    one) instead of dropping out. GM-385 measured why it must not drop
+//!    out; that constant's own doc has the arms.
 //! 2. **Nothing is known yet, or exactly one language has the gap**
 //!    ([`P4_GENERIC`]) - the original, un-generated sentence, unchanged byte
 //!    for byte. A single present language is never ambiguous about which
@@ -189,23 +192,23 @@ fn format_language_list(names: &[String]) -> String {
 const P1: &str = "Structural code-graph queries over this project's index. Prefer these over \
      grepping when you need definitions, references, call edges or imports.";
 
-/// Paired with [`P2_ONE_GAP`]: both describe the paragraph right after this
-/// one ("Two real gaps" / "One real gap"), so the count here has to agree
-/// with whichever `P4_*` rendering [`build`] pairs it with.
+/// The only P2 there is, and "two" is not a number [`build`] varies: every
+/// `P4_*` rendering below states exactly two gaps, because the receiver-call
+/// gap narrows but never closes (see [`P4_STATIC_RECEIVER`]).
+///
+/// Until GM-385 there was a second spelling, `P2_ONE_GAP`, paired with a
+/// `P4_NO_GAP` that dropped the receiver-call gap entirely once every
+/// present language's semantic tier had resolved it. Both are gone: the
+/// state they described - a project where a method's caller page is
+/// exhaustive - is not a state any of these plugins can reach, so a
+/// rendering that announced it was announcing something untrue. Keeping the
+/// constant as a parameter [`assemble`] threads through would leave a knob
+/// whose only honest setting is this one.
 const P2_TWO_GAPS: &str = "A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
      (excludes other same-named declarations' call sites, same guarantee either \
      way), is already resolved per call site to that exact declaration - do not \
      re-check it with grep as a routine habit. Only fall back to grep for one of \
      the two specific gaps below, never as a general double-check.";
-
-/// [`P2_TWO_GAPS`], worded for exactly one remaining gap - paired only with
-/// [`P4_NO_GAP`], where the receiver-call gap has closed for
-/// every present language and only the "still building" gap is left below.
-const P2_ONE_GAP: &str = "A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
-     (excludes other same-named declarations' call sites, same guarantee either \
-     way), is already resolved per call site to that exact declaration - do not \
-     re-check it with grep as a routine habit. Only fall back to grep for the \
-     one specific gap below, never as a general double-check.";
 
 const P3: &str = "`resolved: false` marks the one thing the indexer could not settle alone: an \
      edge whose target is in *another* file, where whether that file exports the \
@@ -233,14 +236,123 @@ const P4_GENERIC: &str = "Two real gaps - the only legitimate reasons to grep af
      is temporary, retry after a few seconds rather than concluding the symbol \
      does not exist.";
 
-/// Every present language has resolved its receiver-call gap: the whole
-/// clause (1) drops out, "Two real gaps" becomes "One", and what is left is
-/// only the still-building gap, renumbered out of its `(2)` since there is no
-/// longer a `(1)` beside it.
-const P4_NO_GAP: &str = "One real gap - the only legitimate reason to grep afterward: on a \
-     project's first index, or a re-index after an upgrade, every tool errors \
-     with a \"still building\" message - that is temporary, retry after a few \
-     seconds rather than concluding the symbol does not exist.";
+/// Every present language *resolves* receiver calls - so clause (1) states
+/// what "resolved" actually bought, instead of dropping out.
+///
+/// # What GM-385 measured, and why the gap narrows rather than closes
+///
+/// A semantic tier resolves `x.foo()` against the receiver's **declared or
+/// inferred** type, because that is the only type a static analysis has. It
+/// is therefore answering a narrower question than the caller asked, and
+/// until GM-385 nothing said so anywhere a caller reads. Measured through
+/// the real MCP handlers on each bundled fixture, the three tiers that
+/// resolve receiver calls at all agree exactly:
+///
+/// - **go** (`go/types`) - `find_callers("Closer.Close")` is
+///   `{server/conn.go:CloseAll}`; a dispatch through an interface value
+///   lands on the *interface method's* declaration.
+/// - **rust** (`rust-analyzer`) - `find_callers("shapes::Shape::area")` is
+///   `{shapes::total_dyn, gaps::measure}`; `&dyn Shape` and `<S: Shape>`
+///   both land on the *trait's* declaration.
+/// - **python** (`pyright`) - `find_callers("Base.describe")` contains
+///   `pkg/callers.py:through_a_base_annotation`, which is `obj.describe()`
+///   for `obj: Base`; the annotation decides, so it lands on the *base's*
+///   declaration.
+///
+/// `typescript` is the fourth and behaves differently: it declares
+/// `receiver_calls = "unresolved"` in both tiers, emits no receiver-call
+/// edge at all, and therefore keeps clause (1) in its original
+/// [`P4_GENERIC`] wording for ever. Nothing here applies to it.
+///
+/// The half that makes this worth a paragraph is the *other* end of the
+/// same edge. Because the call site was attributed to the base, the
+/// override's own page loses it - and loses it silently, since a page that
+/// never received a row looks exactly like a symbol nobody calls. Measured
+/// on the Go fixture, with `go/types` having completed a whole-project
+/// pass, `find_callers` on `Conn.Close` answers in 240 bytes with
+/// `results: []`, `hasMore: false` and `allUnresolved: false`. `CloseAll`
+/// closes a `Conn` whenever the slice it walks holds one, and
+/// `find_implementations("Closer")` names `Conn` as an implementor in that
+/// same index. Before GM-385 the session that returned that empty page also
+/// said "One real gap" and "do not re-check it with grep", which is the
+/// exact claim this constant exists to withdraw.
+///
+/// # Why a pointer and never a number (GM-382's rule, one layer out)
+///
+/// `mcp::provenance`'s module doc refuses to estimate what an absent tier
+/// would have found, because a manufactured number a caller acts on is
+/// worse than silence. The same refusal applies here, and the temptation is
+/// sharper because a count looks computable: the index really does know how
+/// many implementors a type has, so a response *could* say "3 other types
+/// implement this". It must not. That number counts implementors, not the
+/// call sites this page is missing - a caller who reads it on
+/// `find_callers(Conn.Close)` acts on "3 more callers", a quantity nothing
+/// computed - and the true count is unknowable by construction, since which
+/// override runs is a run-time fact.
+///
+/// So this sentence says only what is knowable, and spends the bytes a
+/// count would have taken on something strictly better: *where the missing
+/// calls are*. They are on the base's page, exactly, and
+/// `find_implementations` is the edge that gets there. A caller who follows
+/// it reads real rows instead of acting on an estimate.
+///
+/// # Why one sentence here rather than a field on the response
+///
+/// Both per-answer shapes were measured, and both lost.
+///
+/// **Per-row** cannot carry it at all. The disclosure is about call sites
+/// *absent* from the page, and no property of a row that is present can
+/// state one. The 240-byte answer above has zero rows, so a per-row marker
+/// would be missing from precisely the page that needs it most. Bytes agree
+/// independently: on excalidraw's `pointFrom` at `limit: 200` - 51 rows,
+/// the established worst case - a 30-byte per-row marker costs 1,530 bytes
+/// against a 44-byte response-level block, 34.8x for one fact about the
+/// call. That is `mcp::provenance`'s own argument against `edges.source`,
+/// reaching the same answer from a second direction.
+///
+/// **Per-response** is affordable but fires on *every* answer in go, rust
+/// and python once their pass lands, which is `mcp::provenance`'s first
+/// rule ("a disclosure that fires everywhere is noise") straight through.
+/// Firing it only on the narrow interesting case - an anchor that overrides
+/// a supertype's member - is the thing the index cannot do: `nodes.
+/// container` holds a package/module key, `SUPERTYPE_OF` joins *types* and
+/// never members, `DEFINES` runs file-to-member and container-to-member but
+/// never type-to-member, and no `OVERRIDES` edge exists. Core would have to
+/// recover a member's owning type by parsing its `qualifiedName` in four
+/// different grammars (`Server.Close`, `Base.describe`,
+/// `shapes::<Square as Shape>::area`, `Greeter#greet`) - a per-language
+/// name table in core, which this module's own doc ("Language names")
+/// already rules out for a far smaller thing.
+///
+/// What is left is a property of the *tier*: constant for a language and a
+/// session, which is exactly what this module renders.
+///
+/// # Why the other renderings are left alone
+///
+/// [`P4_GENERIC`] and [`p4_named`] both keep clause (1), and both already
+/// warn that a method's caller/reference lists can under-report. They are
+/// less specific about *why* for a language whose tier has landed, but
+/// neither tells a caller a method page is exhaustive, so neither is false.
+/// This branch is the only one that withdrew the warning, and the only one
+/// fixed.
+///
+/// That scope is also what the byte budget can afford, measured rather than
+/// assumed: [`p4_named`]'s eight-language worst case renders at 1,856 bytes
+/// against [`INSTRUCTIONS_BYTE_CEILING`]'s 1,900, and the shortest wording
+/// that adds this fact to it costs 43 more - one byte under a ceiling a
+/// ninth language breaks, after which [`p4_fallback`] replaces the named
+/// list with a vaguer sentence. Trading a specific language list for a
+/// vaguer one in order to gain specificity is a net loss, so it is not
+/// made.
+const P4_STATIC_RECEIVER: &str =
+    "Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
+     call through a variable receiver (`x.foo()`) binds to the receiver's declared \
+     or inferred type, not the one it holds at run time, so an override's caller \
+     page under-reports - calls reaching it through a base or interface sit on that \
+     base's page, and find_implementations is the way across. (2) On a project's \
+     first index, or a re-index after an upgrade, every tool errors with a \
+     \"still building\" message - that is temporary, retry after a few seconds \
+     rather than concluding the symbol does not exist.";
 
 /// [`P4_GENERIC`] with `"by design"` replaced by `"in {list}"` - the only
 /// difference, so that everything this clause says about bare/this/super/
@@ -314,8 +426,8 @@ const P5: &str = "Efficient usage: pass `symbol_name` directly to the four tools
 /// always did: blank-line separated, nothing trimmed or reflowed - so a
 /// caller only ever varies `p2`/`p4`, never how they meet the fixed
 /// paragraphs around them.
-fn assemble(p2: &str, p4: &str) -> String {
-    [P1, p2, P3, p4, P5].join("\n\n")
+fn assemble(p4: &str) -> String {
+    [P1, P2_TWO_GAPS, P3, p4, P5].join("\n\n")
 }
 
 /// Builds `get_info`'s `with_instructions` string for this session, from
@@ -335,9 +447,11 @@ fn assemble(p2: &str, p4: &str) -> String {
 ///    default: render exactly what `get_info` always said, so a project
 ///    mid-cold-start reads no differently than it read before this module
 ///    existed.
-/// 2. **No present language has an open gap** - [`P4_NO_GAP`]: the
-///    shortest rendering, and the only one whose paragraph count actually
-///    drops from two to one.
+/// 2. **No present language has an *open* gap** - [`P4_STATIC_RECEIVER`]:
+///    every language here resolves receiver calls, so clause (1) says what
+///    that resolution binds to rather than disappearing. Until GM-385 this
+///    case dropped the clause and announced "One real gap", which measured
+///    false in all three of the languages that can reach it.
 /// 3. **Exactly one language is present** (and it has the gap, since case 2
 ///    already handled "it doesn't") - the original wording, unchanged. A
 ///    single present language is never ambiguous about which language "no
@@ -364,23 +478,23 @@ fn assemble(p2: &str, p4: &str) -> String {
 /// module's fallback exists to bound.
 pub fn build(present: &[PresentLanguage]) -> String {
     if present.is_empty() {
-        return assemble(P2_TWO_GAPS, P4_GENERIC);
+        return assemble(P4_GENERIC);
     }
 
     let gapped = languages_with_open_receiver_gap(present);
     if gapped.is_empty() {
-        return assemble(P2_ONE_GAP, P4_NO_GAP);
+        return assemble(P4_STATIC_RECEIVER);
     }
     if present.len() == 1 {
-        return assemble(P2_TWO_GAPS, P4_GENERIC);
+        return assemble(P4_GENERIC);
     }
 
     let list = format_language_list(&gapped);
-    let named = assemble(P2_TWO_GAPS, &p4_named(&list));
+    let named = assemble(&p4_named(&list));
     if named.len() <= INSTRUCTIONS_BYTE_CEILING {
         named
     } else {
-        assemble(P2_TWO_GAPS, &p4_fallback())
+        assemble(&p4_fallback())
     }
 }
 
@@ -601,26 +715,62 @@ results instead of paging.";
         assert!(rendered.contains("produces no edge by design"), "one present language is never named");
     }
 
+    /// The four assertions every "its semantic tier has landed" arm makes,
+    /// so that the three languages that reach this rendering are checked
+    /// against one statement of it rather than three transcriptions.
+    ///
+    /// The two negative assertions are the discrimination, not decoration.
+    /// `"One real gap"` is what this rendering said until GM-385, and it was
+    /// measured false in all three languages (see [`P4_STATIC_RECEIVER`]'s
+    /// own doc for the queries). `"produces no edge"` is the *pre-pass*
+    /// wording, so its absence is what separates this arm from the
+    /// `*_before_its_semantic_pass_*` test beside it - without it both arms
+    /// would pass on a `build` that ignored `semantic_pass_done` entirely.
+    fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
+        assert!(rendered.contains("Two real gaps"), "{language}: the gap narrows, it never closes");
+        assert!(!rendered.contains("One real gap"), "{language}: the withdrawn claim must not return");
+        assert!(
+            rendered.contains("binds to the receiver's declared or inferred type"),
+            "{language}: the rendering has to say what the resolution actually binds to:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("find_implementations is the way across"),
+            "{language}: a pointer to the missing calls, never a count of them:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("produces no edge"),
+            "{language}: that is the pre-pass wording, and this arm is past it:\n{rendered}"
+        );
+        assert!(rendered.contains("still building"), "{language}: the second gap survives");
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "{language}: {} bytes exceeds the {INSTRUCTIONS_BYTE_CEILING}-byte ceiling",
+            rendered.len()
+        );
+        println!("{language}-only (pass done) bytes: {}", rendered.len());
+    }
+
     /// And what the same index reads once rust-analyzer has answered
-    /// (GM-290): the receiver-call gap drops out of the text entirely,
-    /// leaving only the still-building one, renumbered out of its `(2)`.
+    /// (GM-290): the receiver-call gap *narrows* rather than closing.
     ///
     /// This is the assertion behind "how long does the gap stay listed" - the
     /// answer being "until this flips", which core sets from
     /// `language_state.semanticPassAt` the moment a *complete* whole-project
-    /// pass lands.
+    /// pass lands. GM-385 changed what happens when it flips, not when.
+    ///
+    /// Measured on this plugin's own fixture:
+    /// `find_callers("shapes::Shape::area")` is
+    /// `{shapes::total_dyn, gaps::measure}` - `&dyn Shape` and `<S: Shape>`
+    /// both land on the trait's declaration - while
+    /// `find_callers("shapes::<Circle as Shape>::area")` is **empty**,
+    /// though either of those two call sites reaches it at run time.
+    /// `conformance/expect.toml` asserts both as exact sets.
     #[test]
-    fn rust_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+    fn rust_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
         let mut rust = rust_pre_semantic();
         rust.semantic_pass_done = true;
         let rendered = build(&[rust]);
-        assert!(
-            rendered.contains("One real gap"),
-            "rust-analyzer resolves every receiver call once its whole-project pass has completed"
-        );
-        assert!(!rendered.contains("Two real gaps"));
-        assert!(!rendered.contains("variable receiver"));
-        assert!(rendered.contains("still building"), "the second gap must survive renumbering");
+        assert_narrowed_receiver_clause(&rendered, "rust");
     }
 
     /// GM-297's own acceptance criterion 2, and the half GM-299 did not
@@ -652,26 +802,33 @@ results instead of paging.";
     }
 
     /// And what the same index reads once pyright has answered (GM-299): the
-    /// receiver-call gap drops out of the generated text entirely.
+    /// receiver-call gap narrows rather than dropping out.
     ///
     /// Worth reading beside `plugins/python/README.md`, which says at length
     /// that pyright resolves a receiver call only when it can infer the
     /// receiver's type - an unannotated parameter stays unresolved for ever.
-    /// These instructions are generated from one manifest field and cannot
-    /// express that, which is exactly why the honest statement of what
-    /// `resolved: true` covers for Python lives in the plugin's README and
-    /// not here: this is a switch, and Python's answer is a paragraph.
+    /// That list is still the README's, and still cannot fit here.
+    ///
+    /// What GM-385 moved *into* this rendering is the one part of it that is
+    /// not Python-specific at all. GM-299 read the whole thing as "a switch,
+    /// and Python's answer is a paragraph", and the paragraph is only
+    /// Python's because it enumerates what pyright cannot infer. The
+    /// narrowing - that what pyright *does* infer is the receiver's
+    /// annotation, so `obj.describe()` for `obj: Base` is attributed to
+    /// `Base.describe` however the object was built - is one sentence and is
+    /// true of `go/types` and rust-analyzer in exactly the same words.
+    /// Measured: `find_callers("Base.describe")` carries
+    /// `pkg/callers.py:through_a_base_annotation`, and
+    /// `find_callers("Deep.describe")` does not, though `Deep` overrides
+    /// `describe` and `find_implementations("Base")` names it.
     #[test]
-    fn python_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+    fn python_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
         let rendered = build(&[PresentLanguage {
             language: "python".to_string(),
             capabilities: bundled_python_capabilities(),
             semantic_pass_done: true,
         }]);
-        assert!(rendered.contains("One real gap"), "pyright answered, so the gap is no longer listed");
-        assert!(!rendered.contains("Two real gaps"));
-        assert!(!rendered.contains("variable receiver"));
-        assert!(rendered.contains("still building"), "the second gap must survive renumbering");
+        assert_narrowed_receiver_clause(&rendered, "python");
     }
 
     /// What a Go-only index reads once Go's whole-project `semanticPass` has
@@ -679,20 +836,81 @@ results instead of paging.";
     /// criterion, asserted against the shipped manifest rather than a
     /// hand-written capability literal.
     ///
-    /// The receiver-call gap drops out of the text entirely: the `go/types`
-    /// pass resolved every `x.M()` in the index, so the only thing left to
-    /// warn about is the still-building one, renumbered out of its `(2)`.
+    /// The `go/types` pass resolved every `x.M()` in the index, and GM-385's
+    /// point is what it resolved them *to*. This is the rendering measured
+    /// against a real index: on `plugins/go/conformance/project`, with the
+    /// pass complete, `find_callers("Conn.Close")` answers `results: []`,
+    /// `hasMore: false` in 240 bytes, while `server/conn.go:CloseAll` closes
+    /// a `Conn` through a `Closer` value and `find_implementations("Closer")`
+    /// names `Conn`. The session that returns that empty page used to also
+    /// say "One real gap" and "do not re-check it with grep".
     #[test]
-    fn go_only_after_its_semantic_pass_omits_the_receiver_gap_entirely() {
+    fn go_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
         let rendered = build(&[go_present(true)]);
-        assert!(
-            rendered.contains("One real gap"),
-            "go/types resolves every receiver call once its whole-project pass has completed"
+        assert_narrowed_receiver_clause(&rendered, "go");
+    }
+
+    /// The silence half of the control: TypeScript declares
+    /// `receiver_calls = "unresolved"` in *both* tiers, so no amount of
+    /// semantic-pass progress can reach the narrowed rendering, and the
+    /// sentence about binding to a declared type must never appear for it.
+    ///
+    /// Asserted with `semantic_pass_done: true` deliberately - the flag that
+    /// moves the other three languages into the narrowed arm is set here and
+    /// changes nothing, which is what makes this a control rather than a
+    /// restatement of `ts_only_is_byte_identical_to_the_original_string`.
+    /// Measured on a probe fixture carrying three real receiver calls
+    /// (`g.greet()` on a parameter typed by the interface, by the base
+    /// class, and on a local of a subclass): every one of the three `greet`
+    /// declarations answers `find_callers` with an empty set, because this
+    /// plugin emits no receiver-call edge for either tier to narrow.
+    #[test]
+    fn typescript_never_reaches_the_narrowed_rendering_however_its_pass_goes() {
+        let mut ts = typescript_present();
+        ts.semantic_pass_done = true;
+
+        let rendered = build(&[ts]);
+
+        assert_eq!(
+            rendered, ORIGINAL_INSTRUCTIONS,
+            "typescript's gap never narrows, because it never resolves"
         );
-        assert!(!rendered.contains("Two real gaps"));
-        assert!(!rendered.contains("variable receiver"));
-        assert!(rendered.contains("still building"), "the second gap must survive renumbering");
-        println!("go-only (pass done) bytes: {}", rendered.len());
+        assert!(
+            rendered.contains("produces no edge by design"),
+            "the open-gap wording is the right one here"
+        );
+        assert!(
+            !rendered.contains("binds to the receiver's declared"),
+            "the narrowed clause must not fire for a language with no receiver-call edges:\n{rendered}"
+        );
+    }
+
+    /// The scope decision [`P4_STATIC_RECEIVER`]'s doc argues for, pinned so
+    /// that it is a decision rather than an omission: a mixed project renders
+    /// [`p4_named`], which keeps the open-gap clause for the languages that
+    /// have it and does *not* carry the narrowing for the ones that do not.
+    ///
+    /// That rendering is unspecific rather than false - it still warns that a
+    /// method's caller/reference lists can under-report, and never claims a
+    /// method page is exhaustive. The reason it is left alone is the byte
+    /// budget measured in that constant's doc: this rendering's worst case is
+    /// already 1,856 of 1,900 bytes.
+    #[test]
+    fn a_mixed_project_keeps_the_named_open_gap_and_does_not_carry_the_narrowing() {
+        let mut go_done = go_present(true);
+        go_done.semantic_pass_done = true;
+
+        let rendered = build(&[typescript_present(), go_done]);
+
+        assert!(rendered.contains("produces no edge in typescript"), "{rendered}");
+        assert!(
+            !rendered.contains("binds to the receiver's declared"),
+            "scoped out by budget, deliberately - see P4_STATIC_RECEIVER:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("caller/reference lists for methods can under-report"),
+            "the warning this rendering does keep is why leaving it alone is not a falsehood:\n{rendered}"
+        );
     }
 
     /// And before that pass - the cold-start window, and the *permanent*
@@ -784,7 +1002,7 @@ results instead of paging.";
     /// fallback that itself blew the budget would defeat the point.
     #[test]
     fn fallback_wording_fits_under_the_ceiling() {
-        let rendered = assemble(P2_TWO_GAPS, &p4_fallback());
+        let rendered = assemble(&p4_fallback());
         println!("fallback bytes: {}", rendered.len());
         assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
         assert!(rendered.contains("semantic layer finishes"));
@@ -826,10 +1044,8 @@ results instead of paging.";
         // would overflow the ceiling, or this test would silently exercise
         // the same branch as the worst-case test above instead of the one
         // it means to.
-        let would_be_named = assemble(
-            P2_TWO_GAPS,
-            &p4_named(&format_language_list(&languages_with_open_receiver_gap(&present))),
-        );
+        let would_be_named =
+            assemble(&p4_named(&format_language_list(&languages_with_open_receiver_gap(&present))));
         assert!(
             would_be_named.len() > INSTRUCTIONS_BYTE_CEILING,
             "test fixture must actually overflow the ceiling to exercise the fallback branch: {} bytes",
@@ -837,11 +1053,7 @@ results instead of paging.";
         );
 
         let rendered = build(&present);
-        assert_eq!(
-            rendered,
-            assemble(P2_TWO_GAPS, &p4_fallback()),
-            "must render the fallback, not a truncated name list"
-        );
+        assert_eq!(rendered, assemble(&p4_fallback()), "must render the fallback, not a truncated name list");
         assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
     }
 }
