@@ -1351,12 +1351,19 @@ fn an_unknown_expectation_key_is_a_hard_parse_error() {
 /// test proves that dependency is real, not assumed: it runs the identical
 /// fixture and `expect.toml` against a copy of the TS plugin whose manifest
 /// declares `semantic_pass = false`, so `session::run_session` never sends
-/// `semanticPass` at all, and shows that this one expectation - and only
-/// this one - now fails, missing exactly `useNamespaceImport`. Every other
-/// `[[callers]]` entry (the same-file call, the cross-file import, both
-/// barrel re-export forms - all structural) keeps passing, which is what
-/// proves the failure is specific to the semantic-only case and not a
-/// blanket breakage from disabling the capability.
+/// `semanticPass` at all, and shows that this expectation now fails, missing
+/// exactly `useNamespaceImport`. Every other `[[callers]]` entry (the
+/// same-file call, the cross-file import, both barrel re-export forms - all
+/// structural) keeps passing, which is what proves the failure is specific to
+/// the semantic-only case and not a blanket breakage from disabling the
+/// capability.
+///
+/// GM-386 added one more entry to the specific side of that line rather than
+/// to the unaffected side: the overloaded `format`, whose row set is
+/// structural but whose `files` tally is not. It is asserted below by name,
+/// with the finding that must accompany it, so "two entries fail here, for
+/// two stated reasons" stays a claim this test makes rather than a fact it
+/// tolerates.
 #[test]
 fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
     let plugin = ts_plugin_dir();
@@ -1394,10 +1401,34 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         run.stdout
     );
 
+    // GM-386 gave this arm a second, differently-shaped failure, and it is
+    // asserted by name rather than dropped from the list below - a list that
+    // quietly lost an entry would stop saying anything about it.
+    // `expectations.callers[2]` is the overloaded `format`, whose caller SET
+    // is structural (one row either way) but whose `files` tally is not: the
+    // two overload call sites are two CALLS edges only once tsserver has
+    // bound them, and with one edge the tally is not worth sending at all.
+    // So that entry asserts the tally, carries `tier = "semantic"` for it,
+    // and fails here on the tally alone - with its row set still matching,
+    // which is exactly what the finding has to say for this to be evidence
+    // rather than noise. See `plugins/typescript/conformance/expect.toml`'s
+    // own comment on why no single spelling of that entry is true in both
+    // arms.
+    assert_eq!(run.outcome("expectations.callers[2]"), "FAIL", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("the response carries no files tally at all"),
+        "callers[2] must fail on the tally, not on its rows:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("the set itself matched: {src/main.ts:useOverloads}"),
+        "callers[2]'s row set is structural and must still match:\n{}",
+        run.stdout
+    );
+
     // Every other expectation - the structural ones - is unaffected.
     for id in [
         "expectations.callers[0]",
-        "expectations.callers[2]",
         "expectations.references[0]",
         "expectations.implementations[0]",
         "expectations.imports[0]",

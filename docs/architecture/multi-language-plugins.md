@@ -590,6 +590,11 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   [[callers]]
   symbol = "Server.Addr"
   expect = ["cmd/main.go:main"]
+  files = ["cmd/main.go:2"]                # the response's own file tally
+                                           # (GM-386); omit = assert none
+  excluded_references = { count = 1, files = ["doc.go:1"] }
+                                           # the non-CALLS usages this walk
+                                           # left behind; omit = assert none
   provenance = "silent"                    # which tier answered (GM-382):
                                            # "silent" = the response must carry
                                            # no `provenance` block, because this
@@ -606,7 +611,18 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
   else - not on a protocol-level failure, not on a candidate page, not on an
   answer. `expectations.rs`'s decision 9 has the full argument.
 
-  `provenance` (GM-382) is the only key whose *omission* is an assertion on
+  GM-386 gave `files` and `excluded_references` the same rule, and added one
+  more that needs no key at all: a result row the linker could not confirm is
+  spelled `unresolved:<filePath>:<qualifiedName>`, and a page that reports
+  `allUnresolved: true` fails outright. Those four fields are the whole of
+  what the shipped agent guidance tells a caller to trust, and until GM-386
+  none of them appeared in the kit's evaluation code at all - so a
+  plugin-specific regression in any of them was invisible in all four
+  languages. `expectations.rs`'s decisions 11-13 have the arguments, including
+  the measurement of how far a plugin can actually move the `resolved` bit
+  before `stream-order` or `same-file-rule` gets there first.
+
+  `provenance` (GM-382) was the first key whose *omission* is an assertion on
   every entry that never mentions it: an entry without it requires the
   response to carry no `provenance` block, so a plugin that started
   disclaiming its own semantic tier fails its whole fixture rather than one

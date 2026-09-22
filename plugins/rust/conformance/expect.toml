@@ -56,26 +56,32 @@
 # matters, and an entry missing from the set is as much of a failure as an
 # extra one.
 #
-# **`tier = "semantic"`** marks the five entries that need a real
+# GM-386 added three more things an entry can say, all of which read the same
+# way: `files` (decision 12) and `excluded_references` (decision 13) assert the
+# response's two per-page summaries, and an entry that does not mention them
+# requires the response to carry neither. An `unresolved:`-prefixed row
+# (decision 11) marks an edge the linker could not confirm; no row in this
+# file carries one, which is this fixture's assertion that every caller,
+# reference and implementor it names sits on a confirmed edge - in the
+# structural arm as well as the rust-analyzer one.
+#
+# **`tier = "semantic"`** marks the six entries that need a real
 # rust-analyzer behind the SDK's `LspBridge` (GM-290) - decision 6 of
 # `core/src/cli/plugin_check/expectations.rs`'s own module doc, the same way
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all twenty entries run and
-#      pass;
+#   1. with the manifest this plugin ships, where all 21 entries run and pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other fifteen - every structural entry
-#      here, ten of them unchanged since 3.2.0, two added by GM-360, one by
-#      GM-361 and two by GM-365 -
+#      six report `Skip` and the other 15 - every structural entry here -
 #      keep passing;
-#   3. with 3.2.0's manifest and *without* the skip flag, where those five
+#   3. with 3.2.0's manifest and *without* the skip flag, where those six
 #      must FAIL.
 #
 # Arm 2 is what "without rust-analyzer, the structural results are the 3.2.0
 # results" means as something a machine checks. Arm 3 is the discrimination,
-# and it is not decoration: measured, it fails exactly five entries, each for
+# and it is not decoration: measured, it fails exactly six entries, each for
 # the reason it was written -
 #
 #   callers[5]  missing shapes::total_perimeter            (receiver call on a variable)
@@ -83,9 +89,12 @@
 #   callers[7]  empty, wanted total_dyn and gaps::measure  (trait object / generic -> the trait's)
 #   callers[8]  empty, wanted shapes::describe             (a default trait method)
 #   implementations[1]  missing beta's Megaphone           (an impl in another crate)
+#   references[0]       the right six rows, tally 4 not 6  (GM-386; see that entry)
 #
 # - which is how this file is known to be measuring the rust-analyzer tier
-# rather than describing it.
+# rather than describing it. The last line is the odd one and says so in its
+# own entry: its rows are structural and match in both arms, and only the
+# `files` tally GM-386 added moves.
 #
 # 3.2.0's manifest rather than "the shipped one with a broken command" for
 # arm 2 and 3, and the reason is the kit's own rule: a plugin that declares
@@ -121,6 +130,15 @@ expect = [
     "crates/alpha/src/internals.rs:internals::published",
     "crates/alpha/src/nested/deep.rs:nested::deep::deep_work",
 ]
+# Decision 13: the two `use` paths that name this function without calling it
+# - one in shapes.rs, one in nested/deep.rs - are REFERENCES edges, so this
+# CALLS walk discloses them rather than dropping them silently. No `files`
+# key: the three rows already sit one per file, so the response carries no
+# tally and its absence is this entry's assertion.
+excluded_references = { count = 2, files = [
+    "crates/alpha/src/nested/deep.rs:1",
+    "crates/alpha/src/shapes.rs:1",
+] }
 
 # --- callers: a pub use re-export chain, cross-crate --------------------------
 
@@ -132,6 +150,21 @@ symbol = "internals::published"
 # - including the rename, which is why the placeholder's key is `published`
 # and its node's name is `exported_helper`.
 expect = ["crates/beta/src/main.rs:main"]
+# Decision 13, and Rust's entry for it. One caller, two usages that are not
+# calls: the `pub use` in prelude.rs that re-exports the name, and the `use`
+# line in main.rs that imports it before calling it. That pair is the
+# Rust-specific shape the shipped guidance warns about in as many words -
+# `find_callers` answers a narrower question than "every place this name
+# appears", and in a language where a re-export chain is how a name travels
+# between crates the gap is not an edge case; here it is two thirds of the
+# usages, and the whole re-export walk this entry exists to prove is written
+# in those two lines. Were this plugin to stop emitting a REFERENCES edge for
+# a `use` path, the caller set above would not move at all and this block
+# would.
+excluded_references = { count = 2, files = [
+    "crates/alpha/src/prelude.rs:1",
+    "crates/beta/src/main.rs:1",
+] }
 
 # --- callers: a type-qualified path call across crates, and a `Self::` call
 #     against the same declaration from inside its own impl -------------------
@@ -157,6 +190,8 @@ symbol = "shapes::describe"
 # `bodies.rs`'s own table, exercised cross-crate rather than same-file the
 # way `internals::published`'s callers already are.
 expect = ["crates/beta/src/main.rs:main"]
+# Decision 13: the `use` line that imports the name sits beside the call.
+excluded_references = { count = 1, files = ["crates/beta/src/main.rs:1"] }
 
 # --- callers: a module-qualified path call, within one crate ------------------
 
@@ -168,6 +203,10 @@ symbol = "nested::deep::work"
 # names rather than by `qualifiedName`. `nested/mod.rs`'s own `pub use
 # deep::work;` re-export is not a call site and must not appear here.
 expect = ["crates/alpha/src/lib.rs:run"]
+# Decision 13: and this is where that re-export *does* appear - not as a
+# caller, but as the one non-CALLS usage this walk discloses leaving behind.
+# The sentence above and this block are the two halves of the same claim.
+excluded_references = { count = 1, files = ["crates/alpha/src/nested/mod.rs:1"] }
 
 # --- callers: the receiver-call gap, now closed (GM-290) -----------------------
 
@@ -211,6 +250,11 @@ expect = [
     "crates/alpha/src/shapes.rs:shapes::total_perimeter_via_path",
     "crates/alpha/src/shapes.rs:shapes::total_perimeter",
 ]
+# Decision 12: all three callers sit in shapes.rs, so the tally is carried,
+# and its count is how many call sites the rust-analyzer tier resolved - one
+# each. A fourth appearing here without a fourth row above would mean the
+# semantic tier had answered one site twice.
+files = ["crates/alpha/src/shapes.rs:3"]
 
 # --- callers: a receiver call through a variable, and through a trait object ---
 #
@@ -289,6 +333,37 @@ expect = [
     "crates/alpha/src/gaps.rs:gaps::measure",
     "crates/alpha/src/prelude.rs:",
 ]
+# Decision 12, and the tally says something the set above provably cannot:
+# six rows in shapes.rs against four members of the set. Two usages collapsed
+# onto rows already there - decision 8 exempts `[[references]]` from counting
+# repeats, because two rows for one symbol genuinely are two usages - so this
+# is the one assertion in this file that pins how many usages the plugin found
+# rather than which symbols they belong to.
+files = [
+    "crates/alpha/src/gaps.rs:1",
+    "crates/alpha/src/prelude.rs:1",
+    "crates/alpha/src/shapes.rs:6",
+]
+# **`tier = "semantic"` is on this entry for the tally alone, and the entry's
+# rows are still structural** - which is a cost GM-386 paid rather than hid.
+# Measured: without rust-analyzer the same six rows come back and the tally
+# reads `crates/alpha/src/shapes.rs:4`. Those two extra usages are the
+# semantic tier's, and since decision 12 makes an omitted `files` an assertion
+# of its own, no single spelling of this entry is true in both arms: the
+# healthy run needs `:6` and the structural-only run needs `:4`.
+#
+# What that costs: arm 2 (`without_a_semantic_tier_the_structural_
+# expectations_still_hold`) now *skips* this entry rather than passing it, so
+# `shapes::Shape`'s structural reference set is no longer asserted there.
+# `[[references]] shapes::Gauge` below is untagged and keeps that category
+# represented in arm 2. Arm 3 gains it as a sixth expected failure, which is
+# why `tests/conformance.rs`'s SEMANTIC_EXPECTATIONS went from 5 to 6.
+#
+# The general rule, worth knowing before adding the next `files`: a tally is a
+# count of *edges*, so any anchor whose edge set grows with the semantic tier
+# has a tier-dependent tally, and asserting it tags the entry. An entry whose
+# anchor is wholly structural - every `[[callers]]` entry above - does not.
+tier = "semantic"
 
 # --- implementations: impl Trait for T, found by find_implementations ---------
 # (GM-286's own acceptance case, kept here rather than duplicated)
