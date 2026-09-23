@@ -1,4 +1,5 @@
 use std::io::{BufReader, Cursor};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use g_mesh::embedding::EmbeddingPipeline;
@@ -130,11 +131,13 @@ fn seeded_index() -> Connection {
 
 /// `(source, engine, resolved)` - `source` is the GM-264 tier
 /// (`"syntactic"`/`"semantic"`), `engine` its own column.
-fn edge(conn: &Connection, id: &str) -> (String, String, bool) {
-    conn.query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })
-    .unwrap()
+fn edge(conn: &Mutex<Connection>, id: &str) -> (String, String, bool) {
+    conn.lock()
+        .unwrap()
+        .query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
 }
 
 /// The whole point of the `semanticPass` method, exercised against golden
@@ -149,7 +152,7 @@ fn edge(conn: &Connection, id: &str) -> (String, String, bool) {
 /// ordinary reparse runs.
 #[test]
 fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
-    let mut conn = seeded_index();
+    let conn = Mutex::new(seeded_index());
     assert_eq!(edge(&conn, "e1"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
     assert_eq!(edge(&conn, "e2"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
 
@@ -159,7 +162,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     apply_semantic_pass(
         &mut plugin_answer,
         &mut core_wrote,
-        &mut conn,
+        &conn,
         vec!["src/a.ts".to_string()],
         // Matches the id both fixtures carry; a mismatch is refused outright.
         RequestId::Number(7),
@@ -182,7 +185,8 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         ("syntactic".to_string(), "tree-sitter".to_string(), false),
         "an edge the pass said nothing about must be left exactly as it was"
     );
-    let edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
+    let edges: i64 =
+        conn.lock().unwrap().query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
     assert_eq!(edges, 2, "an upgrade updates the existing row - it never inserts a second one");
 
     // Core's own emitted request is conformant, and is the fixture's request.

@@ -1111,15 +1111,17 @@ impl Driver<'_> {
         let embedding = EmbeddingPipeline::disabled();
         let result = {
             let Driver { child, reader, writer, conn, timeouts, .. } = self;
-            let mut conn = conn.lock().unwrap();
             let mut kill = || {
                 let _ = child.kill();
             };
+            // `conn` (not a pre-locked guard): GM-396 has both functions
+            // below take the `Mutex` itself and lock it only for as long as
+            // each of their own steps needs it.
             match operation {
                 Operation::FileChanged { semantic_pass_capable } => apply_file_change(
                     reader,
                     writer,
-                    &mut conn,
+                    conn,
                     file,
                     id,
                     &embedding,
@@ -1128,16 +1130,9 @@ impl Driver<'_> {
                     *semantic_pass_capable,
                     &mut kill,
                 ),
-                Operation::WholeProjectSemanticPass { timeout } => apply_semantic_pass(
-                    reader,
-                    writer,
-                    &mut conn,
-                    Vec::new(),
-                    id,
-                    &embedding,
-                    *timeout,
-                    &mut kill,
-                ),
+                Operation::WholeProjectSemanticPass { timeout } => {
+                    apply_semantic_pass(reader, writer, conn, Vec::new(), id, &embedding, *timeout, &mut kill)
+                }
             }
         };
         self.record(label, result)
