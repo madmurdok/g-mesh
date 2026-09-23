@@ -13,8 +13,9 @@
 //!
 //! The default model is `jina-embeddings-v2-base-code` (the value
 //! [`crate::config::EmbeddingConfig`] already defaults to): 12 layers, hidden
-//! size 768, mean pooling, ALiBi positions so it accepts up to 8192 tokens.
-//! Nothing in this module is specific to it beyond the two shape checks -
+//! size 768, mean pooling, ALiBi positions so it accepts up to 8192 tokens
+//! (though [`EmbeddingModel::load`] truncates to far fewer - see
+//! [`DEFAULT_MAX_SEQUENCE_LENGTH`]). Nothing in this module is specific to it beyond the two shape checks -
 //! swapping in another BERT-style ONNX encoder with `input_ids` /
 //! `attention_mask` inputs and a `last_hidden_state` output means pointing
 //! [`EmbeddingModel::load`] at a different directory, not editing code. What
@@ -91,10 +92,46 @@ const LAST_HIDDEN_STATE: &str = "last_hidden_state";
 /// clear error instead of a corrupt index.
 pub const EMBEDDING_DIM: usize = 768;
 
-/// Longest input the default model accepts (ALiBi positions, 8192 tokens).
-/// Anything longer is truncated by the tokenizer rather than rejected: an
-/// over-long docstring should still produce a usable vector.
+/// Longest input the default model *can* accept (ALiBi positions, 8192
+/// tokens). This is the architecture's limit, not what [`EmbeddingModel::load`]
+/// truncates to - see [`DEFAULT_MAX_SEQUENCE_LENGTH`] for that, and for why
+/// the two differ.
 pub const MAX_SEQUENCE_LENGTH: usize = 8192;
+
+/// What [`EmbeddingModel::load`] truncates every input to. Anything longer is
+/// truncated by the tokenizer rather than rejected: an over-long docstring
+/// should still produce a usable vector.
+///
+/// # GM-393: why not [`MAX_SEQUENCE_LENGTH`]
+///
+/// Self-attention's working memory grows with the *square* of the input
+/// length, and ONNX Runtime's CPU arena keeps whatever the largest run
+/// needed for the rest of the session's life. Measured on the default model
+/// (macOS x86_64, one `embed` call per length, RSS after each; the loaded
+/// model alone is ~1.45 GB of RSS, much of it the mapped weights):
+///
+/// | input tokens | RSS after | time |
+/// |---:|---:|---:|
+/// | 1024 | 1.46 GB | 1.7 s |
+/// | 2048 | 2.09 GB | 4.5 s |
+/// | 4096 | 5.09 GB | 18 s |
+/// | 8192 | 14.9 GB | 65 s |
+///
+/// and it stayed at 14.9 GB for every short input after that. Doc comments
+/// long enough to hit 8192 are not hypothetical: g-mesh's own module docs
+/// reach 33k characters, and bulk-indexing this repository drove the daemon
+/// to 15.3 GB max RSS (GM-393). Disabling the arena returns the memory
+/// afterwards but not the peak (4.6 GB max RSS for one 4096-token run either
+/// way), and makes every inference slower, so the only thing that actually
+/// bounds the daemon is bounding the input.
+///
+/// 1024 is where that bound costs nothing measurable: a 1024-token run left
+/// RSS within 10 MB of a 128-token one, while 2048 already added ~600 MB. It
+/// is also twice the 512 tokens `jina-embeddings-v2` was pre-trained on, so
+/// what gets cut is the tail of a very long doc comment, not its summary.
+/// [`load_with_max_sequence_length`](EmbeddingModel::load_with_max_sequence_length)
+/// is still there for a caller that deliberately wants more.
+pub const DEFAULT_MAX_SEQUENCE_LENGTH: usize = 1024;
 
 /// Overrides where [`default_model_dir`] looks. Exists so tests and
 /// development checkouts can point at a model directory outside the user's
@@ -129,13 +166,18 @@ impl EmbeddingModel {
     /// model is the expected state of a fresh machine, not a bug, so the
     /// message names the file and points at the fetch script rather than
     /// surfacing a bare `NotFound`.
+    ///
+    /// Truncates to [`DEFAULT_MAX_SEQUENCE_LENGTH`], not to the model's full
+    /// [`MAX_SEQUENCE_LENGTH`] - see the former for the memory cost that
+    /// decides it.
     pub fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_max_sequence_length(model_dir, MAX_SEQUENCE_LENGTH)
+        Self::load_with_max_sequence_length(model_dir, DEFAULT_MAX_SEQUENCE_LENGTH)
     }
 
-    /// [`load`](Self::load) with a shorter truncation limit. Useful when the
-    /// caller knows its inputs are short (symbol signatures) and wants to cap
-    /// the worst case an accidentally huge input can cost.
+    /// [`load`](Self::load) with a different truncation limit. A shorter one
+    /// caps the worst case an accidentally huge input can cost even further;
+    /// a longer one buys more context per input at a cost that grows with its
+    /// square (see [`DEFAULT_MAX_SEQUENCE_LENGTH`]).
     ///
     /// Values above [`MAX_SEQUENCE_LENGTH`] are not rejected here - that
     /// constant describes the current default model, and this loader is
