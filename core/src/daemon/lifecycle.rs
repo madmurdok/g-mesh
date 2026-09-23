@@ -845,16 +845,20 @@ impl PluginSupervisor {
     }
 
     /// [`check_memory_limit`](Self::check_memory_limit)'s whole body, with the
-    /// sampler as a parameter so this module's own tests can drive the one
-    /// thing a real sampler cannot be asked to produce on demand: a specific
-    /// *sequence* of readings. The public method above is the only non-test
-    /// caller and always passes `daemon::memory::process_tree_rss_mb`.
+    /// sampler as a parameter so tests can drive the one thing a real sampler
+    /// cannot be asked to produce on demand: a specific *sequence* of
+    /// readings. The public method above is the only non-test caller and
+    /// always passes `daemon::memory::process_tree_rss_mb`.
     ///
     /// A seam rather than a mock of the whole check: everything that decides
     /// anything - the early-outs, the confirming sample, the suspension and
     /// its marker - is this function, exercised for real by every test below
     /// and by production alike. Only the number comes from elsewhere.
-    fn check_memory_limit_sampled_by(&self, sample: impl Fn(u32) -> Option<u64>) {
+    ///
+    /// `pub(crate)` rather than private since GM-390: `cli::status`'s own
+    /// suspended-language test needs the same seam, for the same reason this
+    /// module's tests already do - see that test's doc comment.
+    pub(crate) fn check_memory_limit_sampled_by(&self, sample: impl Fn(u32) -> Option<u64>) {
         let Some(limit_mb) = self.memory_limit_mb else { return };
         let mut inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else { return };

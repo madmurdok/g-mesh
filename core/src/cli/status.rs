@@ -1209,6 +1209,38 @@ mod tests {
     /// tempdir - the same one `collect` resolves for any project), and
     /// `status::collect`/`render` - a *separate* process's-worth of code from
     /// the daemon that wrote it, reading only off disk - reports it.
+    ///
+    /// # GM-390: reached through the injected sampler, not the real one
+    ///
+    /// This used to call `check_memory_limit()`, the real, OS-backed sampler
+    /// - and so, exactly like `daemon::lifecycle`'s own acceptance test
+    /// before GM-340 fixed it there, depended on `sysinfo` reporting this
+    /// fixture's 200MB buffer as over `memoryLimitMb` on *two* consecutive
+    /// whole-system scans. Seen failing on x86_64-apple-darwin: a first scan
+    /// read 230MB (over the 100MB limit), the confirming one 30MB - roughly a
+    /// bare Node process's idle RSS, i.e. the confirming scan did not see the
+    /// held buffer at all. `daemon::memory`'s own doc comment says why a
+    /// whole-tree snapshot can move like that between two calls milliseconds
+    /// apart with nothing about the fixture having changed: a shared runner
+    /// under other concurrent tests' process churn, or swap pressure, is
+    /// enough - `process_tree_sample`'s doc comment measured falls of
+    /// 170-200MB between two such snapshots taken a few milliseconds apart on
+    /// this repository's own `cargo test --workspace`, under real load.
+    ///
+    /// What this test is judged on is not "can two real samples confirm each
+    /// other" - that guard's own decision logic (an unconfirmed reading
+    /// leaves the plugin running; a confirmed one suspends it; an under-limit
+    /// reading costs one sample) already has deterministic, seam-driven
+    /// coverage in `daemon::lifecycle`'s
+    /// `an_unconfirmed_over_limit_sample_leaves_the_plugin_running` and
+    /// `a_confirmed_over_limit_sample_suspends_the_language`. This test's own
+    /// subject is narrower and different: that once a suspension *has*
+    /// happened, through the real production write path, a status read in a
+    /// separate process finds it on disk. So the two readings are scripted
+    /// (both comfortably over the limit, confirming each other every time)
+    /// rather than left to a real sampler that has already been shown to
+    /// disagree with itself between calls on a busy machine - deterministic
+    /// input to the same real write path, not a weaker test.
     #[test]
     fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
         use crate::daemon::lifecycle::PluginSupervisor;
@@ -1237,7 +1269,14 @@ mod tests {
         .expect("the fixture plugin must start");
 
         // The write path this task adds - not a hand-written marker file.
-        supervisor.check_memory_limit();
+        // GM-390: through the injected sampler (see this test's own doc
+        // comment on `check_memory_limit_sampled_by` vs `check_memory_limit`)
+        // - two scripted readings, both over the 100MB limit and confirming
+        // each other, so the real production write path below still runs off
+        // a genuine over-limit-then-confirmed decision, just not off two
+        // readings a real, shared-machine sampler can disagree with itself
+        // about.
+        supervisor.check_memory_limit_sampled_by(|_pid| Some(230));
         assert!(supervisor.is_semantic_suspended(), "the fixture must actually have suspended");
 
         let report = collect(project.path()).expect("status must still collect over a suspended project");
