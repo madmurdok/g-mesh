@@ -46,8 +46,8 @@
 
 use std::sync::OnceLock;
 
-use anyhow::Result;
-use rusqlite::Connection;
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::EmbeddingConfig;
 use crate::embedding::model::{default_model_dir, EmbeddingModel};
@@ -138,12 +138,20 @@ impl EmbeddingPipeline {
     ///
     /// A thin composition of [`compute`](Self::compute) and
     /// [`store`](Self::store) - see their doc comments for why GM-394 split
-    /// what used to be one method into two. `watcher::apply::round_trip` is
-    /// the caller this composed form still exists for: it is handed an
-    /// already-locked `conn` by `daemon::plugin::PluginProcess::
-    /// apply_file_change` and has no lock of its own to release between the
-    /// two halves, so splitting the call there would buy it nothing - one
-    /// file's worth of inference is nowhere near a bulk batch's.
+    /// what used to be one method into two.
+    ///
+    /// GM-396 retired this composed form's one production caller:
+    /// `watcher::apply::round_trip` used to call it because it was handed an
+    /// already-locked `conn` with no lock of its own to release between the
+    /// two halves - "one file's worth of inference is nowhere near a bulk
+    /// batch's" turned out to be the wrong call once GM-393 was in place
+    /// (many embeddable nodes in one file, each up to its own token cap, can
+    /// still add up to real seconds), so `round_trip` now calls `compute`
+    /// and `store` itself, with the connection lock released in between, the
+    /// same way `daemon::bulk_index::commit` already did. `apply` is kept as
+    /// a convenience for a caller with no lock to release at all - a disabled
+    /// pipeline, or a test - not because any production path still needs the
+    /// undivided form.
     pub fn apply(&self, conn: &Connection, diff: &Diff) -> Result<()> {
         let computed = self.compute(diff);
         self.store(conn, &computed);
@@ -151,8 +159,8 @@ impl EmbeddingPipeline {
     }
 
     /// The database-free half of [`apply`](Self::apply): runs every upserted
-    /// node in `diff` with embeddable text through the model and returns
-    /// `(node_id, embedding)` for each one that succeeded. Empty, quickly, if
+    /// node in `diff` with embeddable text through the model and returns one
+    /// [`ComputedEmbedding`] for each one that succeeded. Empty, quickly, if
     /// no model is loaded (or loadable) - the same fast path `apply` always
     /// had.
     ///
@@ -165,12 +173,15 @@ impl EmbeddingPipeline {
     /// `BATCH_ITEMS` nodes' worth of inference used to run inside the same
     /// `Mutex::lock` every MCP handler takes, which is what let a bulk walk's
     /// embedding step block `mcp::mod::GMeshMcpServer::get_info` for as long
-    /// as the batch's inference took.
+    /// as the batch's inference took. GM-396 gave `watcher::apply::round_trip`
+    /// the identical seam for an incremental reparse's own diff - see
+    /// [`store`](Self::store)'s own doc comment for why the two callers need
+    /// more than a bare `(node_id, embedding)` pair back from this.
     ///
     /// Best-effort per node, exactly as `apply` always was: one node's
     /// inference failing is reported and skipped, never allowed to lose the
     /// rest of the diff's embeddings.
-    pub fn compute(&self, diff: &Diff) -> Vec<(String, Vec<f32>)> {
+    pub fn compute(&self, diff: &Diff) -> Vec<ComputedEmbedding> {
         let Some(model) = self.model() else { return Vec::new() };
         let mut computed = Vec::new();
         for node in &diff.upsert_nodes {
@@ -178,7 +189,9 @@ impl EmbeddingPipeline {
                 continue;
             };
             match model.embed(&text) {
-                Ok(embedding) => computed.push((node.id.clone(), embedding)),
+                Ok(embedding) => {
+                    computed.push(ComputedEmbedding { node_id: node.id.clone(), embedding, text })
+                }
                 Err(err) => eprintln!(
                     "g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded",
                     node.id
@@ -189,31 +202,104 @@ impl EmbeddingPipeline {
     }
 
     /// The database-writing half of [`apply`](Self::apply): stores every
-    /// `(node_id, embedding)` pair [`compute`](Self::compute) produced, and
-    /// records the active embedding model - both no-ops when `computed` is
-    /// empty, which also covers "no model loaded" (`compute` never returns
-    /// anything in that case), so a disabled pipeline still never claims an
-    /// active model, matching `apply`'s original contract.
+    /// embedding [`compute`](Self::compute) produced, and records the active
+    /// embedding model - both no-ops when `computed` is empty, which also
+    /// covers "no model loaded" (`compute` never returns anything in that
+    /// case), so a disabled pipeline still never claims an active model,
+    /// matching `apply`'s original contract.
     ///
-    /// Best-effort per node, same as `compute`'s own inference step: a single
-    /// row failing to store is reported and skipped, not allowed to lose the
-    /// rest of the batch.
-    pub fn store(&self, conn: &Connection, computed: &[(String, Vec<f32>)]) {
+    /// # GM-396: a node's content may have moved on since it was computed
+    ///
+    /// `compute` and `store` run under two separate `conn` locks with the
+    /// lock released in between (`watcher::apply::round_trip`,
+    /// `daemon::bulk_index::commit`), precisely so that a slow inference step
+    /// never holds up a concurrent reader - but that same gap is a window in
+    /// which some *other* writer (a second reparse of the same file replayed
+    /// by a relaunched plugin, a workspace-triggered per-language re-walk)
+    /// can commit a diff of its own for the very node this one is about to
+    /// write a vector for. Blindly storing the embedding this call already
+    /// paid for would silently attach a stale vector to fresh content - worse
+    /// than skipping it, since nothing about a successful `INSERT` would ever
+    /// say so, and `storage::connection::open` runs with `foreign_keys OFF`
+    /// (see its own doc comment), so a node that was deleted in the meantime
+    /// would not even fail the insert - it would leave a vector row for an id
+    /// that no longer names anything.
+    ///
+    /// So before writing, this re-reads the node's *current* row and recomputes
+    /// the same `text_to_embed` it derives from - if it no longer exists, or
+    /// its doc comment/signature no longer combine to the exact text this
+    /// embedding was computed from, the write is skipped: only a node still
+    /// present with unchanged content gets its vector stored. A skip here is
+    /// not a lost update - whatever wrote the newer content is a diff of its
+    /// own, and either already ran (or will run) this same compute-then-store
+    /// pair for it, which is what actually keeps the node's vector current.
+    ///
+    /// Best-effort per node beyond that, same as `compute`'s own inference
+    /// step: a single row failing to store is reported and skipped, not
+    /// allowed to lose the rest of the batch.
+    pub fn store(&self, conn: &Connection, computed: &[ComputedEmbedding]) {
         if computed.is_empty() {
             return;
         }
         if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.config.model) {
             eprintln!("g-mesh daemon: failed to record the active embedding model ({err:#})");
         }
-        for (node_id, embedding) in computed {
-            if let Err(err) = vectors::insert(conn, node_id, embedding, &self.config.model) {
-                eprintln!(
-                    "g-mesh daemon: failed to store the embedding for node {node_id} ({err:#}) - it is \
-                     left unembedded"
-                );
+        for entry in computed {
+            match current_embeddable_text(conn, &entry.node_id) {
+                Ok(Some(current_text)) if current_text == entry.text => {
+                    if let Err(err) =
+                        vectors::insert(conn, &entry.node_id, &entry.embedding, &self.config.model)
+                    {
+                        eprintln!(
+                            "g-mesh daemon: failed to store the embedding for node {} ({err:#}) - it is \
+                             left unembedded",
+                            entry.node_id
+                        );
+                    }
+                }
+                // The node is gone, or its content moved on while this
+                // embedding was being computed with the lock released - see
+                // this method's own "GM-396" doc section. Whoever wrote the
+                // newer content owns re-embedding it; this vector would only
+                // ever be stale.
+                Ok(_) => {}
+                Err(err) => eprintln!(
+                    "g-mesh daemon: failed to verify node {} before storing its embedding ({err:#}) - it is \
+                     left unembedded",
+                    entry.node_id
+                ),
             }
         }
     }
+}
+
+/// One embedding [`EmbeddingPipeline::compute`] produced, still waiting to be
+/// written by [`EmbeddingPipeline::store`].
+///
+/// `text` is not the node's raw doc comment/signature - it is the exact
+/// string [`text_to_embed`] built and fed to the model, kept around purely so
+/// `store` can compare it against the same node's *current* row before
+/// writing - see `store`'s own "GM-396" doc section for why that comparison
+/// exists.
+pub struct ComputedEmbedding {
+    node_id: String,
+    embedding: Vec<f32>,
+    text: String,
+}
+
+/// The text a node's *current* row would embed as, or `None` if it has none
+/// (or the node no longer exists at all) - [`EmbeddingPipeline::store`]'s own
+/// half of the GM-396 staleness check, re-deriving exactly what
+/// [`text_to_embed`] would have produced had `compute` run against this row
+/// right now instead of whenever it actually ran.
+fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
+    let row = conn
+        .query_row("SELECT docComment, signature FROM nodes WHERE id = ?1", [node_id], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .optional()
+        .context("failed to read node for its embedding staleness check")?;
+    Ok(row.and_then(|(doc_comment, signature)| text_to_embed(doc_comment.as_deref(), signature.as_deref())))
 }
 
 /// Builds the text a node's doc comment and signature embed as, or `None` if
@@ -375,5 +461,117 @@ mod tests {
         let recorded: Option<String> =
             conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(recorded, None, "storing an empty computed list must not claim an active model");
+    }
+
+    /// Seeds a bare `nodes` row directly (no `apply_diff`, which needs a
+    /// `&mut Connection` this module's tests have no other use for) with the
+    /// given doc comment/signature - the two columns [`current_embeddable_text`]
+    /// reads back to judge staleness.
+    fn insert_node(conn: &Connection, id: &str, doc_comment: &str, signature: &str) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, docComment, signature, language)
+             VALUES (?1, 'Function', ?1, ?1, 'src/lib.rs', 1, 0, 3, 1, ?2, ?3, 'rust')",
+            rusqlite::params![id, doc_comment, signature],
+        )
+        .unwrap();
+    }
+
+    fn vector_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap()
+    }
+
+    /// GM-396's own control at the unit level, for the staleness check
+    /// [`EmbeddingPipeline::store`]'s doc comment describes: a node whose
+    /// *current* row still matches the exact text a [`ComputedEmbedding`] was
+    /// computed from gets its vector stored - the ordinary, no-race case the
+    /// lock-free window is supposed to cost nothing.
+    #[test]
+    fn store_writes_the_vector_when_the_nodes_current_content_still_matches_what_was_computed() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "n1", "Reads a file.", "fn foo()");
+
+        let pipeline = EmbeddingPipeline::disabled();
+        let computed = vec![ComputedEmbedding {
+            node_id: "n1".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            text: "Reads a file.\n\nfn foo()".to_string(),
+        }];
+        pipeline.store(&conn, &computed);
+
+        assert_eq!(
+            vector_count(&conn),
+            1,
+            "a node whose content still matches what was embedded must get its vector stored"
+        );
+    }
+
+    /// The actual regression this check exists for: `compute` ran against a
+    /// node's *old* doc comment/signature, and by the time `store` runs (with
+    /// the connection lock reacquired, per `watcher::apply::round_trip`'s own
+    /// "GM-396" doc section) some other writer has already committed newer
+    /// content for that same node id. Storing the stale embedding anyway
+    /// would silently attach it to content it was never computed from - this
+    /// asserts it is skipped instead.
+    ///
+    /// Disabling the check this test is about is exactly "compare the
+    /// current row's text against `entry.text` with `==`" in `store`'s match
+    /// arm - replacing it with an unconditional `Ok(_) => { store it anyway }`
+    /// makes this test fail (a row appears) while
+    /// `store_writes_the_vector_when_the_nodes_current_content_still_matches_what_was_computed`
+    /// above still passes, which is what shows this test is actually
+    /// exercising the staleness check and not some other reason.
+    #[test]
+    fn store_skips_a_node_whose_content_changed_since_the_embedding_was_computed() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        // The node's *current* row - as if a second writer already committed
+        // an edit to this file's signature after `compute` read the old one.
+        insert_node(&conn, "n1", "Reads a file, now with a path argument.", "fn foo(path: &Path)");
+
+        let pipeline = EmbeddingPipeline::disabled();
+        // What `compute` produced against the *old* text.
+        let computed = vec![ComputedEmbedding {
+            node_id: "n1".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            text: "Reads a file.\n\nfn foo()".to_string(),
+        }];
+        pipeline.store(&conn, &computed);
+
+        assert_eq!(
+            vector_count(&conn),
+            0,
+            "a node whose content moved on since it was computed must not get a stale vector"
+        );
+    }
+
+    /// The other half of the same window: the node was deleted entirely (a
+    /// second reparse removed it, or a bulk re-walk replaced the whole file)
+    /// before `store` got to it. `storage::connection::open` runs with
+    /// `foreign_keys OFF` (see its own doc comment), so nothing would stop
+    /// `vectors::insert` from writing a row for an id that names nothing -
+    /// `store`'s own existence check is what actually prevents that orphan.
+    #[test]
+    fn store_skips_a_node_that_no_longer_exists() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        // No `nodes` row for "n1" at all.
+
+        let pipeline = EmbeddingPipeline::disabled();
+        let computed = vec![ComputedEmbedding {
+            node_id: "n1".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            text: "Reads a file.".to_string(),
+        }];
+        pipeline.store(&conn, &computed);
+
+        assert_eq!(
+            vector_count(&conn),
+            0,
+            "a node that no longer exists must not get an orphaned vector row"
+        );
     }
 }

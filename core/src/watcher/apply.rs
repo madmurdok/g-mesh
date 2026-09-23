@@ -18,6 +18,7 @@
 //! `jsonrpc.rs`'s own pipe-based tests do.
 
 use std::io::{BufRead, Write};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -87,7 +88,7 @@ use crate::storage::write::{
 pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &mut Connection,
+    conn: &Mutex<Connection>,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -150,7 +151,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &mut Connection,
+    conn: &Mutex<Connection>,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -256,11 +257,49 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
 /// `std::io::pipe()`, so it cannot itself know what "make the peer stop being
 /// silent" means - only the caller that owns the transport does (for a real
 /// plugin, `daemon::plugin::PluginProcess` kills the child).
+///
+/// # GM-396: embedding inference runs with the connection lock released
+///
+/// `conn` is a `Mutex`, not an already-locked `&mut Connection`, so this
+/// function can choose exactly when to hold it - the same seam
+/// `daemon::bulk_index::commit` already uses for a bulk batch (see that
+/// function's own "GM-394" doc section). It is locked once for `apply_diff`
+/// and the two linking passes - ordinary SQLite writes, bounded by the size
+/// of one file's diff - then released before
+/// [`EmbeddingPipeline::compute`](crate::embedding::EmbeddingPipeline::compute)
+/// runs the model over whatever that diff upserted, and locked again only for
+/// [`EmbeddingPipeline::store`](crate::embedding::EmbeddingPipeline::store).
+///
+/// Before this, every caller of this function held `conn`'s lock (taken by
+/// `daemon::plugin::PluginProcess::send_one`/`ensure_fresh`/`semantic_pass`,
+/// once, around the whole round trip) for as long as inference took -
+/// GM-393 bounds one node's embedding input to
+/// [`DEFAULT_MAX_SEQUENCE_LENGTH`](crate::embedding::model::DEFAULT_MAX_SEQUENCE_LENGTH)
+/// tokens, but a diff from one large file can still upsert many embeddable
+/// nodes, and every one of them ran with every other connection - a tool
+/// call, the MCP handshake - locked out for however long that took. Nothing
+/// about the *plugin* round trip changes here: `daemon::plugin::PluginProcess`
+/// still serializes every call through this file's own `self.state` lock
+/// exactly as before (see `daemon::lifecycle`'s "Lock order" section), so two
+/// incremental reparses for the same language still never interleave on the
+/// wire - only `conn`'s lock, the one other connections actually wait on, is
+/// narrowed.
+///
+/// The lock-free gap this opens is a window in which some other writer (a
+/// second reparse of the same file replayed after a relaunch, a bulk walk, a
+/// workspace-triggered per-language re-walk) can commit its own diff for a
+/// node this round trip is about to write a vector for.
+/// [`EmbeddingPipeline::store`]'s own doc comment ("GM-396") is what actually
+/// closes that: it re-checks each node's current content before writing, so
+/// only a node still present with the exact text this embedding was computed
+/// from gets its vector stored - a node that changed or disappeared in the
+/// meantime is left alone, safely, for whatever wrote its newer content to
+/// re-embed.
 #[allow(clippy::too_many_arguments)]
 fn round_trip<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &mut Connection,
+    conn: &Mutex<Connection>,
     message: ControlMessage,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -285,24 +324,76 @@ fn round_trip<R: BufRead + Send, W: Write>(
     }
 
     let diff = to_storage_diff(response.result);
-    apply_diff(conn, &diff).with_context(|| format!("failed to apply the {method} diff"))?;
-    // After the commit, never before: linking points edges at `File` nodes,
-    // and the ones this diff brought with it have to be in the index first.
-    imports::link_diff(conn, &diff).context("failed to link the file's resolved imports")?;
-    // Symbols second, and for the same reason: a usage edge can only be
-    // repointed at an export that is already committed - including the ones
-    // this very diff added, which other files may have been waiting for.
-    symbol_links::link_diff(conn, &diff).context("failed to link the file's cross-file symbol usages")?;
+    {
+        let mut guard = conn.lock().unwrap();
+        apply_diff(&mut guard, &diff).with_context(|| format!("failed to apply the {method} diff"))?;
+        // After the commit, never before: linking points edges at `File`
+        // nodes, and the ones this diff brought with it have to be in the
+        // index first.
+        imports::link_diff(&mut guard, &diff).context("failed to link the file's resolved imports")?;
+        // Symbols second, and for the same reason: a usage edge can only be
+        // repointed at an export that is already committed - including the
+        // ones this very diff added, which other files may have been waiting
+        // for.
+        symbol_links::link_diff(&mut guard, &diff)
+            .context("failed to link the file's cross-file symbol usages")?;
+    } // GM-396: released here - see this function's own doc section.
+
+    // Test-only hook, honored between the lock release above and the
+    // re-lock below - see `HOLD_COMPUTE_FILE_ENV`'s own doc comment.
+    hold_compute_open_for_tests();
+
+    // Runs with no lock held at all - see this function's own "GM-396" doc
+    // section.
+    let computed = embedding.compute(&diff);
+
     // Embedding is best-effort and reported rather than propagated
-    // (`EmbeddingPipeline::apply`'s own doc comment), for the same reason a
+    // (`EmbeddingPipeline::store`'s own doc comment), for the same reason a
     // failed semantic pass does not fail this round trip: a diff that is
     // already committed and linked must not be undone by an optional layer
     // on top of it.
-    if let Err(err) = embedding.apply(conn, &diff) {
-        eprintln!("g-mesh daemon: failed to embed the {method} diff: {err:#}");
+    {
+        let guard = conn.lock().unwrap();
+        embedding.store(&guard, &computed);
     }
     Ok(RoundTrip { incomplete: response.incomplete })
 }
+
+/// Test-only: holds this round trip open, with `conn`'s lock already
+/// released, for as long as the file named by
+/// [`HOLD_COMPUTE_FILE_ENV`] exists - GM-396's counterpart to
+/// `daemon::bulk_index::HOLD_LOCK_FILE_ENV`/`hold_the_lock_open_for_tests`,
+/// which proves the opposite property (a lock genuinely *held* across a
+/// batch's embedding step). This one sits exactly where a real
+/// `EmbeddingPipeline::compute`'s inference would run - after `apply_diff`/
+/// the two linking passes have released `conn` and before `store` reacquires
+/// it - so a test can prove a concurrent connection user is never blocked on
+/// an incremental reparse's embedding step, without needing real model
+/// weights on the machine running it (this hook fires regardless of whether
+/// `compute` goes on to find a model loaded at all).
+///
+/// A no-op unless [`HOLD_COMPUTE_FILE_ENV`] is set, which is every real run.
+fn hold_compute_open_for_tests() {
+    let Some(path) = std::env::var_os(HOLD_COMPUTE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let path = std::path::PathBuf::from(path);
+    eprintln!(
+        "g-mesh: holding a reparse's lock-free embedding window open until {} is removed \
+         ({HOLD_COMPUTE_FILE_ENV})",
+        path.display()
+    );
+    // Bounded the same way `daemon::bulk_index`'s own test-only holds are:
+    // this is scaffolding for a test that deletes the file itself, and a test
+    // that forgets to must fail as a timeout rather than wedge the daemon
+    // forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Path whose *deletion* releases a round trip that is holding its lock-free
+/// embedding window open for a test - see [`hold_compute_open_for_tests`].
+pub const HOLD_COMPUTE_FILE_ENV: &str = "G_MESH_ROUND_TRIP_HOLD_COMPUTE_FILE";
 
 /// The wire `method` string for a control message, for error messages that
 /// name the request that failed. Matched rather than round-tripped through
@@ -512,8 +603,11 @@ mod tests {
         conn
     }
 
-    fn count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
+    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+        conn.lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
     }
 
     fn canned_node(id: &str) -> WireNode {
@@ -607,11 +701,13 @@ mod tests {
     /// (`"syntactic"`/`"semantic"`) `edges.source`'s CHECK now enforces,
     /// `engine` its own new column (`storage::schema`'s DDL comment on
     /// `edges`).
-    fn edge_source_and_resolved(conn: &Connection, id: &str) -> (String, String, bool) {
-        conn.query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .unwrap()
+    fn edge_source_and_resolved(conn: &Mutex<Connection>, id: &str) -> (String, String, bool) {
+        conn.lock()
+            .unwrap()
+            .query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
     }
 
     #[test]
@@ -746,7 +842,7 @@ mod tests {
     fn file_change_diff_is_committed_to_sqlite() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(1);
         let canned_response = FileChangeResponse {
@@ -783,7 +879,7 @@ mod tests {
         apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -798,29 +894,39 @@ mod tests {
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
 
-        let name: String =
-            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        let name: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "foo");
-        let start_line: i64 =
-            conn.query_row("SELECT startLine FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        let start_line: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT startLine FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(start_line, 1);
-        let edge_kind: String =
-            conn.query_row("SELECT kind FROM edges WHERE id = 'e1'", [], |row| row.get(0)).unwrap();
+        let edge_kind: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT kind FROM edges WHERE id = 'e1'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(edge_kind, "CALLS");
     }
 
     #[test]
     fn diff_with_deletes_removes_rows() {
-        let mut conn = setup_conn();
+        let mut raw_conn = setup_conn();
         // Seed rows the stub plugin's diff will delete.
         apply_diff(
-            &mut conn,
+            &mut raw_conn,
             &Diff {
                 upsert_nodes: vec![NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "rust")],
                 ..Default::default()
             },
         )
         .unwrap();
+        let conn = Mutex::new(raw_conn);
 
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -846,7 +952,7 @@ mod tests {
         apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -865,7 +971,7 @@ mod tests {
     fn mismatched_response_id_is_rejected() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(10);
         let wrong_id_response = FileChangeResponse {
@@ -890,7 +996,7 @@ mod tests {
         let result = apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -909,7 +1015,7 @@ mod tests {
     fn empty_diff_response_is_a_safe_no_op() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(3);
         let empty_response = FileChangeResponse {
@@ -932,7 +1038,7 @@ mod tests {
         apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/unchanged.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -981,9 +1087,9 @@ mod tests {
     /// else in the index moves.
     #[test]
     fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
-        let mut conn = setup_conn();
+        let mut raw_conn = setup_conn();
         apply_diff(
-            &mut conn,
+            &mut raw_conn,
             &Diff {
                 upsert_nodes: vec![
                     NodeRecord::new("n1", "Function", "foo", "m::foo", "src/lib.rs", "typescript"),
@@ -997,6 +1103,7 @@ mod tests {
             },
         )
         .unwrap();
+        let conn = Mutex::new(raw_conn);
 
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -1018,7 +1125,7 @@ mod tests {
         apply_semantic_pass(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             vec!["src/lib.rs".to_string()],
             RequestId::Number(9),
             &EmbeddingPipeline::disabled(),
@@ -1049,7 +1156,7 @@ mod tests {
     fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(4);
         let structural = FileChangeResponse {
@@ -1080,7 +1187,7 @@ mod tests {
         apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -1107,7 +1214,7 @@ mod tests {
     fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(5);
         let structural = FileChangeResponse {
@@ -1132,7 +1239,7 @@ mod tests {
         let outcome = apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -1166,7 +1273,7 @@ mod tests {
     fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let request_id = RequestId::Number(6);
         let structural = FileChangeResponse {
@@ -1193,7 +1300,7 @@ mod tests {
         apply_file_change(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -1218,7 +1325,7 @@ mod tests {
     fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let plugin =
             spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false);
@@ -1227,7 +1334,7 @@ mod tests {
         apply_semantic_pass(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             Vec::new(),
             RequestId::Number(1),
             &EmbeddingPipeline::disabled(),
@@ -1249,7 +1356,7 @@ mod tests {
     fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let plugin = spawn_semantic_stub(
             plugin_reader,
@@ -1263,7 +1370,7 @@ mod tests {
         let outcome = apply_semantic_pass(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             Vec::new(),
             RequestId::Number(1),
             &EmbeddingPipeline::disabled(),
@@ -1288,7 +1395,7 @@ mod tests {
     fn an_incomplete_per_file_pass_is_not_an_error() {
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let plugin = spawn_semantic_stub(
             plugin_reader,
@@ -1302,7 +1409,7 @@ mod tests {
         apply_semantic_pass(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             vec!["src/lib.rs".to_string()],
             RequestId::Number(1),
             &EmbeddingPipeline::disabled(),
