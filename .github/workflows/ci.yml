@@ -241,9 +241,9 @@ jobs:
       # gate on a condition we had already decided to defer. The gate was not
       # wrong; enabling it before the findings were dealt with was.
       #
-      # So it stays non-fatal until GM-347 settles `$Force` and the
-      # `Write-Log` collision. Then `continue-on-error` comes off and this
-      # becomes a gate on a file that passes it. The general rule the mistake
+      # So it stayed non-fatal until GM-347 settled `$Force` (see below for
+      # where `Write-Log` went). Then `continue-on-error` came off and this
+      # became a gate on a file that passes it. The general rule the mistake
       # illustrates: a check that can skip everything after it must be green
       # on the day it becomes required.
       #
@@ -257,22 +257,32 @@ jobs:
       # Latest` a call from any other scope would throw rather than default to
       # false. Filed rather than fixed blind: nothing has ever executed this
       # script (GM-333), so "it works today" is itself unverified.
-      - name: install.ps1 lint (non-fatal until GM-347)
+      #
+      # GM-347 settled `$Force` (Test-InstallDir now declares it and
+      # Install-GMesh passes it; release.yml's GM-333 step executes both the
+      # refusal and the replacement), so `continue-on-error` is off. The
+      # `Write-Log` collision is its own question with its own evidence to
+      # gather (GM-392), so `PSAvoidOverwritingBuiltInCmdlets` is excluded by
+      # name until that lands - every other rule, `PSReviewUnusedParameter`
+      # included, now fails the job.
+      - name: install.ps1 lint
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        continue-on-error: true
         run: |
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber | Out-Null
           }
+          # GM-392 owns PSAvoidOverwritingBuiltInCmdlets (Write-Log).
           $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' `
-            -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost
+            -Severity Error,Warning `
+            -ExcludeRule PSAvoidUsingWriteHost, PSAvoidOverwritingBuiltInCmdlets
           if (-not $found) {
             Write-Host 'PSScriptAnalyzer: nothing to report'
             return
           }
           $found | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200 | Write-Host
-          Write-Host "::warning file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s) - non-fatal until GM-347"
+          Write-Host "::error file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s)"
+          exit 1
 
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate

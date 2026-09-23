@@ -325,8 +325,15 @@ function Move-DirectoryRobust {
 # files should not linger beside new ones, a mistyped -InstallDir should not
 # silently eat an unrelated directory, and the check runs before the download
 # so a typo costs a moment, not tens of megabytes.
+# -Force is a parameter here, passed explicitly by Install-GMesh (GM-347).
+# It used to be read without being declared, resolving to Install-GMesh's
+# $Force through the caller's scope - under Set-StrictMode that throws when
+# called from any scope without one, turning a refusal into a crash.
 function Test-InstallDir {
-    param([string]$Dir)
+    param(
+        [string]$Dir,
+        [switch]$Force
+    )
     if (-not (Test-Path -LiteralPath $Dir)) {
         return
     }
@@ -361,7 +368,7 @@ function Install-GMesh {
         $InstallDir = Join-Path (Get-Location) $InstallDir
     }
 
-    Test-InstallDir -Dir $InstallDir
+    Test-InstallDir -Dir $InstallDir -Force:$Force
 
     if (-not $Target) {
         $Target = Get-Target
