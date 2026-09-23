@@ -83,17 +83,20 @@ pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
 /// they hope for.
 ///
 /// [`WALK_DELAY_ENV`] turns "the walk is about to finish" into a knob, and for
-/// most tests that is enough. It is not enough when the assertion is about a
-/// call landing inside `mcp::INDEXING_GRACE_WINDOW`, because the knob is a
-/// `sleep` in the *daemon*: a loaded machine can stretch a 400ms hold to 700
-/// and leave more time before completion than the window can absorb, so the
-/// call is refused and the test fails for a reason that has nothing to do with
-/// the grace-wait mechanism. That is what happened on all three non-Windows
-/// CI runners (GM-245).
-///
-/// With this, the test creates the file, lets the walk reach it, dispatches
-/// its call, and then deletes the file - so completion happens *after* the
-/// call is in flight by construction, not by arithmetic on two sleeps.
+/// most tests that is enough. It was not enough for the grace-window
+/// assertions GM-245 fixed and GM-394 later removed entirely (`mcp::mod::
+/// GMeshMcpServer::still_indexing` no longer gives a call a bounded wait
+/// before refusing - it waits, unconditionally, for the walk to actually
+/// finish - see that method's own doc comment), because the knob is a `sleep`
+/// in the *daemon*: a loaded machine can stretch a 400ms hold to 700, which
+/// only mattered when a test's whole point was landing inside a window
+/// narrower than that slop. It is kept for the property that outlives that
+/// history: a test can create the file, let the walk reach it, dispatch its
+/// own call, and only then delete the file - so completion happens *after*
+/// the call is already in flight by construction, not by arithmetic on two
+/// sleeps. See [`HOLD_LOCK_FILE_ENV`] for the sibling knob GM-394 added to
+/// hold the batch-commit *lock* itself open the same way, for assertions
+/// about that lock specifically rather than about the walk's completion.
 pub const WALK_HOLD_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_FILE";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -405,21 +408,83 @@ pub(crate) fn ingest<R: BufRead>(
 }
 
 /// Commits one batch and empties it, holding the connection only for as long
-/// as the transaction takes - the walk itself must not keep other readers out.
+/// as the transaction (and the embedding rows it stores) take - the walk
+/// itself must not keep other readers out.
+///
+/// # GM-394: embedding inference runs before the lock is taken
+///
+/// This used to call `EmbeddingPipeline::apply` - inference and storage in
+/// one step - while still holding `conn`'s guard, which meant a batch's whole
+/// embedding step (`EmbeddingModel::embed`, an ONNX forward pass per
+/// embeddable node, plus a one-time synchronous model load on its very first
+/// call - see `embedding::pipeline`'s "Where the model lives" section) ran
+/// with every other connection locked out of the daemon's one SQLite handle.
+/// `mcp::mod::GMeshMcpServer::get_info` is one of them: it is called during
+/// MCP `initialize`, so a client's handshake blocked for as long as that
+/// inference took - minutes, on a project big enough to matter, which is
+/// exactly the hang GM-394 traced.
+///
+/// `EmbeddingPipeline::compute` touches no database at all, so it runs here
+/// first, with no lock held - the fix's contained half; `get_info` no longer
+/// taking this lock while indexing at all (`daemon::indexing_status`'s own
+/// "GM-394" doc section) is the other, and the one that actually closes the
+/// bug regardless of how long this function's own lock-free window turns out
+/// to be. The lock is then taken once, for `apply_diff` and
+/// `EmbeddingPipeline::store` together - both are ordinary SQLite writes, not
+/// inference, so there is nothing left inside it that scales with batch size
+/// the way inference did.
 fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipeline) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
+    let computed = embedding.compute(batch);
     let mut conn = conn.lock().unwrap();
     apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
+    hold_the_lock_open_for_tests();
     // Best-effort, like every other embedding call - see
     // `watcher::apply::round_trip`'s identical handling for why a failure
     // here must not undo (or fail) a batch that is already durable.
-    if let Err(err) = embedding.apply(&conn, batch) {
-        eprintln!("g-mesh daemon: failed to embed a bulk-index batch: {err:#}");
-    }
+    embedding.store(&conn, &computed);
     *batch = Diff::default();
     Ok(())
+}
+
+/// Path whose *deletion* releases a batch commit that is holding `conn`'s
+/// lock open, for tests that need to prove something behaves correctly while
+/// that lock is actually held - not merely while `daemon::indexing_status::
+/// IndexingStatus` reads as indexing, which [`WALK_HOLD_FILE_ENV`] already
+/// controls without ever touching the lock at all (that hold runs after
+/// every batch has committed and released it - see [`run`]'s call to
+/// [`hold_the_walk_open_for_tests`]).
+///
+/// GM-394's own regression needs exactly this distinction. The bug it found
+/// was never "the walk takes a while" - `IndexingStatus` already told every
+/// caller that, honestly, since task 105 - it was "a batch commit holds the
+/// mutex every MCP handler shares for as long as its embedding inference
+/// takes". Reproducing that deterministically, on a machine that has not
+/// necessarily fetched the real ONNX weights `EmbeddingPipeline` would
+/// otherwise need, means holding the *lock* open on purpose, independent of
+/// whatever this build's embedding pipeline does - which is what this knob
+/// is for: a no-op unless set, and when set, held from directly inside the
+/// locked section of [`commit`] until the named file is removed.
+pub const HOLD_LOCK_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_LOCK_FILE";
+
+/// Honors [`HOLD_LOCK_FILE_ENV`]. A no-op unless it is set, which is every
+/// real run - same shape as [`hold_the_walk_open_for_tests`], polled rather
+/// than watched for the identical reason (test-only scaffolding, a
+/// millisecond-scale wait, bounded so a test that forgets to release it fails
+/// as a timeout rather than wedging the daemon forever).
+fn hold_the_lock_open_for_tests() {
+    let Some(path) = std::env::var_os(HOLD_LOCK_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let path = std::path::PathBuf::from(path);
+    eprintln!(
+        "g-mesh daemon: holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
+        path.display()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 #[cfg(test)]

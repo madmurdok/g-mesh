@@ -36,6 +36,38 @@
 //! resolves to the real answer a few milliseconds later than a poll would
 //! have, or to the exact same "still indexing" this module already gave.
 //!
+//! # GM-394: no tool call is ever answered "not ready"
+//!
+//! Task 107's [`wait_ready`](IndexingStatus::wait_ready) still ended in a
+//! refusal for a walk with real time left to run - the right call for its own
+//! problem (a call landing a few milliseconds early should not pay for a
+//! whole retry), but GM-394 found a second, worse failure hiding behind it:
+//! `mcp::mod::GMeshMcpServer::instructions` took the daemon's single SQLite
+//! mutex *unconditionally*, with no [`is_indexing`](Self::is_indexing) check
+//! at all, and that mutex is exactly what a bulk-index batch commit holds for
+//! as long as its embedding inference takes - minutes, on a project big
+//! enough to matter. `initialize` calls `get_info`, which calls that method,
+//! so an MCP client's handshake blocked on a lock a short grace wait was never
+//! going to help with, because nothing was even consulting the wait - the
+//! call was already inside `Mutex::lock`.
+//!
+//! GM-394's fix is two-layered, and this type carries both halves. First,
+//! `get_info`/`instructions` now checks [`is_indexing`](Self::is_indexing) -
+//! a lock-free atomic - *before* ever reaching for the mutex, so the
+//! handshake and `tools/list` are answerable however long the walk's lock is
+//! held for, at the cost of a coarser ("indexing in progress") answer while
+//! it runs rather than the fully-resolved one. Second, the owner's decision
+//! for tool calls that genuinely need the index is the opposite of task 105's:
+//! never answer "not ready" or partial - wait for the walk to actually finish
+//! and serve the real thing. [`wait_until_ready`](Self::wait_until_ready) is
+//! that unconditional wait, and it is what `mcp::mod::GMeshMcpServer::
+//! still_indexing` calls now instead of falling back to a `STILL_INDEXING`
+//! tool error after [`wait_ready`](Self::wait_ready)'s bounded window. Keeping
+//! such a wait alive against a client's *own* connection timeout - a progress
+//! notification, say - is GM-395's job, not this one's; `wait_ready`'s bounded
+//! form is kept, unused by this crate today, because that is the shape a
+//! progress-notification loop would need to poll it in.
+//!
 //! # Why the incremental-edit watcher path does not re-arm this
 //!
 //! Task 111 asked the mirror question of 105/107's: does a query landing
@@ -201,6 +233,31 @@ impl IndexingStatus {
         }
         tokio::time::timeout(timeout, notified).await.is_ok()
     }
+
+    /// Waits, with no timeout at all, for the walk to finish - GM-394's
+    /// replacement for the "give it a moment, then refuse" shape
+    /// [`wait_ready`](Self::wait_ready) gives a tool call. The owner's
+    /// decision for that task rules out ever answering a tool call "not
+    /// ready" or partially while the index is being built, so a caller that
+    /// needs the index simply waits however long the walk actually takes -
+    /// see this module's own "GM-394" doc section for the fuller argument and
+    /// for why `get_info`/`instructions` do not call this at all (they must
+    /// never wait on the mutex the walk holds in the first place).
+    ///
+    /// Same registration-before-check shape as [`wait_ready`](Self::wait_ready),
+    /// for the identical reason: `notified()` is created before the
+    /// `is_indexing` check that follows so a `mark_ready` racing this call
+    /// can never be missed.
+    ///
+    /// Returns immediately against an already-ready status, same as
+    /// [`wait_ready`](Self::wait_ready).
+    pub async fn wait_until_ready(&self) {
+        let notified = self.0.ready.notified();
+        if !self.is_indexing() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +323,34 @@ mod tests {
     async fn waiting_returns_false_once_the_timeout_elapses_with_no_mark_ready() {
         let status = IndexingStatus::indexing();
         assert!(!status.wait_ready(Duration::from_millis(20)).await);
+    }
+
+    /// [`wait_until_ready`]'s own fast path: an already-ready status resolves
+    /// without ever touching the `Notify`, same as `wait_ready`'s.
+    #[tokio::test]
+    async fn waiting_until_ready_on_an_already_ready_status_returns_immediately() {
+        let status = IndexingStatus::ready();
+        status.wait_until_ready().await;
+    }
+
+    /// GM-394's own acceptance criterion at this type's level: a call with no
+    /// timeout at all still resolves once `mark_ready` fires - it does not
+    /// have a `timeout` argument to give up on, so this is the only way to
+    /// prove it does not simply hang forever.
+    #[tokio::test]
+    async fn waiting_until_ready_returns_once_mark_ready_is_called() {
+        let status = IndexingStatus::indexing();
+        let marker = status.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            marker.mark_ready();
+        });
+
+        // No assertion beyond "this future resolves": `wait_until_ready`
+        // returns `()`, and a `mark_ready` that never happened would hang the
+        // test until its own harness timeout rather than fail an assertion
+        // here - which is exactly the failure mode this test exists to catch.
+        status.wait_until_ready().await;
+        assert!(!status.is_indexing(), "mark_ready must have run before this future resolved");
     }
 }
