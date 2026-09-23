@@ -138,8 +138,25 @@ impl Project {
         // the assertion that followed read `Starting` - a legitimate
         // intermediate state, reported correctly, about a daemon that simply
         // had not got there yet (GM-254).
+        //
+        // GM-390: `Serving` alone is not that whole fact either, for the same
+        // reason the pid file wasn't. `daemon::mod::run` binds the socket
+        // (what `Serving` reads), writes the main pid file, and only *then*
+        // calls `record_serving_owner` - three separate writes in that order,
+        // with nothing serialising a reader against the gaps between them.
+        // `wedge` deletes files and immediately asserts `Wedged`, which
+        // `inspect_daemon_lock` can only report once `record_serving_owner`
+        // has actually run - see its own doc comment: a lock held with no
+        // recorded serving owner reads as `Starting`, not `Wedged`, because a
+        // holder with nothing recorded yet is "entitled to a moment" rather
+        // than wedged. Seen at load average 89 on this machine: `Starting` at
+        // `wedge`'s own assertion, immediately after a `bootstrap_core` that
+        // had already observed `Serving`. So this waits for both facts to be
+        // true together, not just the one `DaemonLock` happens to collapse
+        // them into.
         wait_for("the daemon to publish itself as serving", || {
             daemon::inspect_daemon_lock(self.root()).ok() == Some(DaemonLock::Serving)
+                && daemon::serving_owner_in(&self.state_dir()).is_some()
         });
         let _ = shim.kill();
         let _ = shim.wait();
@@ -219,12 +236,44 @@ impl Drop for Project {
     }
 }
 
+/// GM-390: `daemon::mod::run` binds the listener and only *then* writes the
+/// pid file (see the comment on that ordering right above its
+/// `write_pid_file` call) - which means `is_listening`/`DaemonLock::Serving`
+/// can already be true for a window before this file exists. Every caller
+/// here reaches `read_pid` only after waiting for exactly that signal
+/// (`bootstrap_core` waits for `Serving`; the shim-bootstrap test waits for
+/// `is_listening`), so reading immediately raced that window and lost under
+/// load: `failed to read ... No such file or directory` at this line, once
+/// locally under load avg 44 and once on CI aarch64-apple-darwin.
+///
+/// So this waits for the file itself, via the same [`common::wait_for`] /
+/// [`common::startup_timeout`] budget [`wait_for`] above already uses for the
+/// rest of this family (GM-301). [`daemon::write_pid_file`] renames a
+/// complete file into place, so there is no "exists but half-written" state
+/// to additionally wait out - once `path` exists its contents are already
+/// whatever the writer meant to put there. That is what lets the two failure
+/// modes below stay distinct instead of collapsing into one generic message:
+/// a file that never shows up within the deadline is the race this comment
+/// describes, and a file that shows up holding something unparseable is a
+/// different, real bug that waiting longer would not fix.
 fn read_pid(path: &Path) -> u32 {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-        .trim()
-        .parse()
-        .expect("pid file does not contain a pid")
+    wait_for(&format!("{} to record a pid", path.display()), || path.exists());
+
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "{} existed a moment ago but could not be read now ({e}) - \
+             something removed it out from under this read",
+            path.display()
+        )
+    });
+    contents.trim().parse().unwrap_or_else(|e| {
+        panic!(
+            "{} exists but does not hold a parseable pid ({e}): {contents:?} - \
+             write_pid_file renames a complete file into place, so this is not the \
+             GM-390 race, the file that landed here is simply wrong",
+            path.display()
+        )
+    })
 }
 
 /// GM-301: delegates to [`common::wait_for`] with [`common::startup_timeout`]
