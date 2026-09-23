@@ -408,6 +408,7 @@ jobs:
             -RedirectStandardOutput $serverOutLog -RedirectStandardError $serverErrLog
 
           $installDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-installed'
+          $foreignDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-foreign'
 
           try {
             $ready = $false
@@ -453,11 +454,45 @@ jobs:
             }
 
             Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
+
+            # GM-347: -Force, executed rather than reasoned about. A non-empty
+            # directory with no g-mesh.exe in it must be refused without
+            # -Force, with its contents left alone, and replaced with it.
+            New-Item -ItemType Directory -Path $foreignDir -Force | Out-Null
+            $foreignFile = Join-Path $foreignDir 'someone-elses-file.txt'
+            Set-Content -LiteralPath $foreignFile -Value 'not g-mesh'
+
+            $refused = $null
+            try {
+              & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $foreignDir
+            } catch {
+              $refused = $_.Exception.Message
+            }
+            if (-not $refused) {
+              throw "install.ps1 without -Force installed over a non-empty foreign directory instead of refusing"
+            }
+            if ($refused -notmatch 'is not empty') {
+              throw "install.ps1 without -Force failed, but not with the non-empty refusal: $refused"
+            }
+            if (-not (Test-Path -LiteralPath $foreignFile -PathType Leaf)) {
+              throw "install.ps1 refused, but the foreign directory's file is gone"
+            }
+            Write-Host "PASS: without -Force, install.ps1 refused the non-empty directory and left it intact ($refused)"
+
+            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $foreignDir -Force
+            if (-not (Test-Path -LiteralPath (Join-Path $foreignDir 'g-mesh.exe') -PathType Leaf)) {
+              throw "install.ps1 -Force reported success but g-mesh.exe is not in $foreignDir"
+            }
+            if (Test-Path -LiteralPath $foreignFile) {
+              throw "install.ps1 -Force installed but left the directory's previous contents beside the new install"
+            }
+            Write-Host "PASS: with -Force, install.ps1 replaced the non-empty directory with a g-mesh install"
           } finally {
             if ($server -and -not $server.HasExited) {
               Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
             }
             Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $foreignDir -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $serveRoot -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item Env:G_MESH_DOWNLOAD_BASE -ErrorAction SilentlyContinue
           }
