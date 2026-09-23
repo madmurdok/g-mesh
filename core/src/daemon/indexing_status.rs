@@ -1,6 +1,6 @@
-//! Whether the daemon is still working through its cold-start bulk walk -
-//! the one fact every MCP tool handler has to consult before it reads the
-//! index.
+//! Whether the daemon's index is ready to answer, and how much of "ready" a
+//! given tool call actually needs - the one fact every MCP tool handler has
+//! to consult before it reads the index.
 //!
 //! # Why this exists at all
 //!
@@ -24,49 +24,49 @@
 //! So the guarantee moved from the transport layer to the response layer,
 //! keeping its spirit and dropping its mechanism: the socket is bound before
 //! the walk starts, and a caller who asks during the walk is *told* that the
-//! graph is not ready instead of having its connection refused. What is not
-//! given up is the part that matters - no caller is ever served a partial or
-//! subtly-wrong answer off a walk in progress.
-//!
-//! Task 107 added one more thing to be told: a caller that arrives close
-//! enough to the walk's end can be made to wait a short, bounded moment
-//! instead - see [`IndexingStatus::wait_ready`] and
-//! `mcp::GMeshMcpServer::still_indexing`'s `INDEXING_GRACE_WINDOW`. That is
-//! strictly a refinement of the same answer, not a third option: it either
-//! resolves to the real answer a few milliseconds later than a poll would
-//! have, or to the exact same "still indexing" this module already gave.
+//! graph is not ready instead of having its connection refused.
 //!
 //! # GM-394: no tool call is ever answered "not ready"
 //!
-//! Task 107's [`wait_ready`](IndexingStatus::wait_ready) still ended in a
-//! refusal for a walk with real time left to run - the right call for its own
-//! problem (a call landing a few milliseconds early should not pay for a
-//! whole retry), but GM-394 found a second, worse failure hiding behind it:
-//! `mcp::mod::GMeshMcpServer::instructions` took the daemon's single SQLite
-//! mutex *unconditionally*, with no [`is_indexing`](Self::is_indexing) check
-//! at all, and that mutex is exactly what a bulk-index batch commit holds for
-//! as long as its embedding inference takes - minutes, on a project big
-//! enough to matter. `initialize` calls `get_info`, which calls that method,
-//! so an MCP client's handshake blocked on a lock a short grace wait was never
-//! going to help with, because nothing was even consulting the wait - the
-//! call was already inside `Mutex::lock`.
+//! Task 107 gave a call landing close to the walk's end a short grace wait
+//! before refusing it - the right call for its own problem, but GM-394 found
+//! a second, worse failure hiding behind it: `mcp::mod::GMeshMcpServer::
+//! instructions` took the daemon's single SQLite mutex unconditionally, with
+//! no indexing check at all, and that mutex is exactly what a bulk-index
+//! batch commit holds for as long as its embedding inference takes - minutes,
+//! on a project big enough to matter. `initialize` calls `get_info`, which
+//! calls that method, so an MCP client's handshake blocked on a lock a short
+//! grace wait was never going to help with.
 //!
-//! GM-394's fix is two-layered, and this type carries both halves. First,
-//! `get_info`/`instructions` now checks [`is_indexing`](Self::is_indexing) -
-//! a lock-free atomic - *before* ever reaching for the mutex, so the
+//! GM-394's fix is two-layered, and this type still carries both halves.
+//! First, `get_info`/`instructions` check [`phase`](IndexingStatus::phase) -
+//! a lock-free atomic read - *before* ever reaching for the mutex, so the
 //! handshake and `tools/list` are answerable however long the walk's lock is
-//! held for, at the cost of a coarser ("indexing in progress") answer while
-//! it runs rather than the fully-resolved one. Second, the owner's decision
-//! for tool calls that genuinely need the index is the opposite of task 105's:
-//! never answer "not ready" or partial - wait for the walk to actually finish
-//! and serve the real thing. [`wait_until_ready`](Self::wait_until_ready) is
-//! that unconditional wait, and it is what `mcp::mod::GMeshMcpServer::
-//! still_indexing` calls now instead of falling back to a `STILL_INDEXING`
-//! tool error after [`wait_ready`](Self::wait_ready)'s bounded window. Keeping
-//! such a wait alive against a client's *own* connection timeout - a progress
-//! notification, say - is GM-395's job, not this one's; `wait_ready`'s bounded
-//! form is kept, unused by this crate today, because that is the shape a
-//! progress-notification loop would need to poll it in.
+//! held for. Second, a tool call that genuinely needs the index never answers
+//! "not ready" or partial - it waits for the index to actually reach the
+//! phase it needs and serves the real thing
+//! ([`wait_for`](IndexingStatus::wait_for)).
+//!
+//! # GM-395: two phases instead of one flag, so embeddings can lag structure
+//!
+//! Before GM-395 this type was a single "still walking" flag: a project was
+//! either mid-walk or fully ready, and the walk itself computed every node's
+//! embedding inline, batch by batch. That made a cold start on a
+//! large project take as long as the slowest part of indexing it (embedding
+//! inference), even for a caller who only ever asks structural questions
+//! (`find_definition`, `find_references`, ...) and never touches
+//! `search_code` at all.
+//!
+//! [`Phase`] splits "the walk is done" from "everything, including
+//! embeddings, is done": a structural tool needs only [`Phase::Structural`]
+//! (or later), so it stops waiting the moment the walk itself - now run with
+//! `embedding: None`, see `daemon::bulk_index` - finishes linking, while
+//! `search_code` alone needs [`Phase::Ready`] and waits out the embedding
+//! backfill pass (`embedding::backfill::run`) that now runs as its own step
+//! afterward. See `docs/architecture/lazy-indexing.md`'s D3 for the full
+//! design this slice implements (the phase machine here; nothing about
+//! *when* a walk starts becomes lazy until a later slice - this daemon still
+//! starts every phase eagerly, at launch).
 //!
 //! # Why the incremental-edit watcher path does not re-arm this
 //!
@@ -109,154 +109,340 @@
 //!   nodes with no edges yet: a confidently *wrong* answer, not merely a
 //!   delayed one.
 //! - **Reusing this type's shape would widen the blast radius it is meant to
-//!   narrow.** `IndexingStatus` is deliberately one project-wide flag -
+//!   narrow.** `IndexingStatus` is deliberately one project-wide phase -
 //!   correct for the bulk walk, because the whole graph really is incomplete
-//!   until `mark_ready` fires. A single incremental edit touches one file.
-//!   Flipping the same global flag around every watcher commit would make an
-//!   unrelated query - about a file the edit never touched - pause or read
-//!   "still indexing" on every save in a live-edited project, which trades a
-//!   rare, narrow, internally-consistent staleness for a far more common
-//!   false positive. Honestly closing this window would need a per-file
-//!   signal, not a global one - a different and larger mechanism than this
-//!   type provides. `watcher::staleness::ensure_fresh` was written for close
-//!   to that shape (an mtime/hash check before answering) but, per this
-//!   investigation, is not currently called from any MCP handler - a real,
-//!   separate gap worth its own task, not a reason to bend this one into a
-//!   shape it does not fit.
+//!   until it reaches [`Phase::Structural`]. A single incremental edit
+//!   touches one file. Flipping the same project-wide phase around every
+//!   watcher commit would make an unrelated query - about a file the edit
+//!   never touched - pause on every save in a live-edited project, which
+//!   trades a rare, narrow, internally-consistent staleness for a far more
+//!   common false positive. Honestly closing this window would need a
+//!   per-file signal, not a project-wide one - a different and larger
+//!   mechanism than this type provides. `watcher::staleness::ensure_fresh`
+//!   was written for close to that shape (an mtime/hash check before
+//!   answering) but, per this investigation, is not currently called from
+//!   any MCP handler - a real, separate gap worth its own task, not a reason
+//!   to bend this one into a shape it does not fit.
 //!
-//! So `mark_ready` stays a once-only call from the bulk walk. See
-//! `docs/architecture/g-mesh-v1.md`'s "Ideas surfaced while comparing
-//! kungfu" subsection for the fuller writeup this decision closes out.
+//! So a phase transition stays a once-only call from the bulk walk or the
+//! embedding backfill pass. See `docs/architecture/g-mesh-v1.md`'s "Ideas
+//! surfaced while comparing kungfu" subsection for the fuller writeup this
+//! decision closes out.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-/// Shared "is the cold-start walk still running?" state: a lock-free flag for
-/// the check every tool handler makes, plus a wakeup a handler can wait on
-/// for a bounded time before it commits to "still indexing".
+/// One step of the cold-start machine a project's index moves through, once,
+/// left to right - see this module's own "GM-395" doc section.
 ///
-/// The flag stays a bare atomic rather than growing a `Mutex` around it - the
-/// whole point is to answer *while* the walk holds the daemon's single SQLite
-/// connection for a batch commit, and a handler that had to take a mutex to
-/// find out whether it may take that mutex would queue behind exactly the
-/// work it is trying not to wait for. The wakeup is a separate `Notify`
-/// rather than a `Condvar` paired with that same atomic for the same reason:
-/// every reader of this type is an async tool handler on the daemon's own
-/// tokio runtime (`mcp::GMeshMcpServer`), and `Notify::notified().await`
-/// suspends the calling task without holding a worker thread, where a
-/// `Condvar::wait` would either block a worker outright or need
-/// `spawn_blocking` - a whole borrowed thread - to wait out what is, in the
-/// overwhelmingly common case, a handful of milliseconds.
+/// `Unindexed` is not produced by anything in this slice (a cold start begins
+/// at [`Walking`](Phase::Walking) - see [`IndexingStatus::walking`]); it
+/// exists in the enum now because a later slice's lazy activation needs a
+/// phase for "nothing has ever asked this project to index itself yet",
+/// distinct from "a walk is in progress".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    /// No walk has ever run, and none is running - reachable only once lazy
+    /// activation exists (a later slice); nothing in this daemon produces it
+    /// yet.
+    Unindexed,
+    /// The structural walk is running (`daemon::bulk_index::run`, called
+    /// with `embedding: None`). No tool call may answer off the graph yet -
+    /// it may have nodes with no edges linked, or no rows at all.
+    Walking,
+    /// The walk is done and linked. Structural tools
+    /// ([`Need::Structural`]) may answer. This phase also covers "the
+    /// embedding backfill pass is owed but has not started running yet" -
+    /// there is no separate phase for that, since a structural tool does not
+    /// care either way.
+    Structural,
+    /// The embedding backfill pass (`embedding::backfill::run`) is running.
+    /// Structural tools still answer; `search_code`
+    /// ([`Need::Embeddings`]) waits.
+    Embedding,
+    /// The backfill pass is done - every embeddable node has a `vectors` row,
+    /// or the pass determined none could be produced (no model available).
+    /// Everything answers.
+    Ready,
+    /// The walk failed outright. Carries the failure's message so a waiter
+    /// can report *why* rather than just "never became ready". Nothing in
+    /// this slice's eager startup path ever sets this - a failed cold-start
+    /// walk is still fatal to the whole daemon (`daemon::run`'s `?` on
+    /// `bulk_index::run`) rather than recorded here - but the phase exists
+    /// now because a later slice's lazy activation runs the walk *after* the
+    /// daemon (and its socket) already exist, where a walk failure has
+    /// nowhere else to go but here.
+    Failed(String),
+}
+
+/// What a tool call actually needs from the index before it may read it -
+/// the caller-facing half of [`Phase`]. Two callers can be waiting on the
+/// very same [`IndexingStatus`] and be satisfied at different moments: the
+/// seven structural tools only ever need [`Need::Structural`], and
+/// `search_code` alone needs [`Need::Embeddings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// Satisfied by [`Phase::Structural`], [`Phase::Embedding`] or
+    /// [`Phase::Ready`] - the walk is done and linked, whatever state the
+    /// embedding backfill pass is in.
+    Structural,
+    /// Satisfied only by [`Phase::Ready`] - every embeddable node the walk
+    /// found has had its chance to be embedded.
+    Embeddings,
+}
+
+impl Need {
+    fn satisfied_by(self, phase: &Phase) -> bool {
+        match self {
+            Need::Structural => matches!(phase, Phase::Structural | Phase::Embedding | Phase::Ready),
+            Need::Embeddings => matches!(phase, Phase::Ready),
+        }
+    }
+}
+
+/// What [`IndexingStatus::wait_for`] resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The phase this call needed was reached.
+    Satisfied,
+    /// The walk failed outright ([`Phase::Failed`]) before this need was
+    /// ever satisfied - carries the same message.
+    Failed(String),
+    /// The deadline passed (only possible when [`IndexingStatus::wait_for`]
+    /// was given one) before either of the above happened.
+    TimedOut,
+}
+
+const UNINDEXED: u8 = 0;
+const WALKING: u8 = 1;
+const STRUCTURAL: u8 = 2;
+const EMBEDDING: u8 = 3;
+const READY: u8 = 4;
+const FAILED: u8 = 5;
+
+/// Shared cold-start phase state: a lock-free atomic for the phase every tool
+/// handler checks, plus a wakeup a handler can wait on, plus the small amount
+/// of mutable state ([`Phase::Failed`]'s message, the progress counters) that
+/// does not fit in one atomic.
+///
+/// The phase stays a bare atomic rather than growing a `Mutex` around it -
+/// the whole point is to answer *while* the walk holds the daemon's single
+/// SQLite connection for a batch commit, and a handler that had to take a
+/// mutex to find out whether it may take that mutex would queue behind
+/// exactly the work it is trying not to wait for. The wakeup is a separate
+/// `Notify` rather than a `Condvar` paired with the same atomic for the same
+/// reason: every reader of this type is an async tool handler on the
+/// daemon's own tokio runtime (`mcp::GMeshMcpServer`), and
+/// `Notify::notified().await` suspends the calling task without holding a
+/// worker thread, where a `Condvar::wait` would either block a worker
+/// outright or need `spawn_blocking` - a whole borrowed thread - to wait out
+/// what is, in the overwhelmingly common case, a handful of milliseconds.
 #[derive(Clone)]
 pub struct IndexingStatus(Arc<Inner>);
 
 struct Inner {
-    indexing: AtomicBool,
-    /// Fired once, by [`mark_ready`](IndexingStatus::mark_ready), so a task
-    /// already parked in [`wait_ready`](IndexingStatus::wait_ready) is woken
-    /// instead of having to poll the atomic on a timer.
-    ready: Notify,
+    phase: AtomicU8,
+    /// Only meaningful while `phase` reads [`FAILED`] - the message
+    /// [`Phase::Failed`] carries. A plain `Mutex` rather than another atomic:
+    /// this is written at most once per `IndexingStatus` (a walk fails at
+    /// most once) and read rarely (only by a waiter that observes `FAILED`),
+    /// so there is no hot path here to keep lock-free the way the phase
+    /// itself has to be.
+    failure: Mutex<Option<String>>,
+    /// Fired on every phase transition, so a task already parked in
+    /// [`wait_for`](IndexingStatus::wait_for) is woken instead of having to
+    /// poll the atomic on a timer.
+    notify: Notify,
+    /// When the current phase was entered - for a future progress
+    /// notification ("indexing for 42s") to report against; nothing in this
+    /// slice reads it back yet.
+    phase_since: Mutex<Instant>,
+    // --- Progress counters (D3 in docs/architecture/lazy-indexing.md). ---
+    // Nothing in this slice consumes these yet - the progress notifications
+    // that would read them are GM-395's slice 3 (D6) - but the type and its
+    // setters exist now, as part of the phase machine's full API, so that
+    // slice has somewhere to write and read rather than growing this struct
+    // again later.
+    items_ingested: std::sync::atomic::AtomicU64,
+    languages_done: std::sync::atomic::AtomicU32,
+    languages_total: std::sync::atomic::AtomicU32,
+    current_language: Mutex<Option<String>>,
+    embed_done: std::sync::atomic::AtomicU64,
+    embed_total: std::sync::atomic::AtomicU64,
 }
 
 impl IndexingStatus {
-    /// A daemon that owes its project a cold-start walk. Everything it is
-    /// asked before that walk commits is answered with "still indexing" -
-    /// modulo the grace wait `wait_ready` gives a call that arrives close to
-    /// the end of it.
-    pub fn indexing() -> Self {
-        Self(Arc::new(Inner { indexing: AtomicBool::new(true), ready: Notify::new() }))
+    fn starting_at(phase: u8) -> Self {
+        Self(Arc::new(Inner {
+            phase: AtomicU8::new(phase),
+            failure: Mutex::new(None),
+            notify: Notify::new(),
+            phase_since: Mutex::new(Instant::now()),
+            items_ingested: std::sync::atomic::AtomicU64::new(0),
+            languages_done: std::sync::atomic::AtomicU32::new(0),
+            languages_total: std::sync::atomic::AtomicU32::new(0),
+            current_language: Mutex::new(None),
+            embed_done: std::sync::atomic::AtomicU64::new(0),
+            embed_total: std::sync::atomic::AtomicU64::new(0),
+        }))
     }
 
-    /// A daemon whose index was already complete when it started - every
-    /// restart of an already-walked project, which is the overwhelmingly
-    /// common case. Nothing ever reads as "still indexing" for such a
-    /// project; its socket is bound and answering as before.
-    pub fn ready() -> Self {
-        Self(Arc::new(Inner { indexing: AtomicBool::new(false), ready: Notify::new() }))
+    /// A daemon that owes its project a cold-start structural walk. Every
+    /// [`Need`] reads as unsatisfied until the walk finishes and moves this
+    /// to [`Phase::Structural`].
+    pub fn walking() -> Self {
+        Self::starting_at(WALKING)
     }
 
-    /// Flipped once, by `daemon::run`, after the walk's *final* commit - not
-    /// once per committed batch.
-    ///
-    /// Per-batch would be the bug this type exists to prevent: the walk
-    /// commits in batches of `bulk_index::BATCH_ITEMS`, and cross-file edges
-    /// are linked only after the last of them (`graph::imports`,
-    /// `graph::symbol_links`), so a graph that is k batches in is a graph in
-    /// which a real symbol can have no callers, no references and no
-    /// importers yet. Every one of those is a well-formed, confident, wrong
-    /// answer - the exact failure `storage::schema::CURRENT_INDEXER_VERSION`
-    /// was introduced to end, and not one worth reintroducing at a finer
-    /// grain.
-    ///
-    /// `Release`, paired with `Acquire` in [`is_indexing`](Self::is_indexing):
-    /// a reader that sees `false` is guaranteed to see everything the walk
-    /// wrote before flipping it. The `Notify` wakeup that follows piggybacks
-    /// on that same guarantee - anything woken by it observes the store,
-    /// because the store happened-before the notification that woke it.
-    pub fn mark_ready(&self) {
-        self.0.indexing.store(false, Ordering::Release);
-        self.0.ready.notify_waiters();
+    /// A daemon whose structural walk was already complete when it started -
+    /// every restart of an already-walked project, which is the
+    /// overwhelmingly common case. [`Need::Structural`] is satisfied from the
+    /// first instant; the embedding backfill pass this same startup runs
+    /// (`embedding::backfill::run`) still has to move this on to
+    /// [`Phase::Embedding`] and then [`Phase::Ready`] before
+    /// [`Need::Embeddings`] is - see this module's "GM-395" doc section for
+    /// why an already-walked project is not simply started at `Ready`.
+    pub fn structural() -> Self {
+        Self::starting_at(STRUCTURAL)
     }
 
-    /// Whether a query asked right now would be reading a graph the walk has
-    /// not finished building.
-    pub fn is_indexing(&self) -> bool {
-        self.0.indexing.load(Ordering::Acquire)
+    /// Moves to `phase`, notifying every waiter. Not required to move
+    /// forward one step at a time from the caller's point of view - a waiter
+    /// loops (see [`wait_for`](Self::wait_for)) precisely so a phase that
+    /// advances several steps between two checks is never missed - but every
+    /// real caller in this crate does call this once per step, in order.
+    ///
+    /// `Release`, paired with `Acquire` in [`phase`](Self::phase): a reader
+    /// that observes the new phase is guaranteed to see everything written
+    /// before this call - the walk's committed rows for
+    /// [`Phase::Structural`], the backfill's stored vectors for
+    /// [`Phase::Ready`]. The `Notify` wakeup piggybacks on that same
+    /// guarantee.
+    pub fn set_phase(&self, phase: Phase) {
+        let discriminant = match &phase {
+            Phase::Unindexed => UNINDEXED,
+            Phase::Walking => WALKING,
+            Phase::Structural => STRUCTURAL,
+            Phase::Embedding => EMBEDDING,
+            Phase::Ready => READY,
+            Phase::Failed(message) => {
+                *self.0.failure.lock().unwrap() = Some(message.clone());
+                FAILED
+            }
+        };
+        self.0.phase.store(discriminant, Ordering::Release);
+        *self.0.phase_since.lock().unwrap() = Instant::now();
+        self.0.notify.notify_waiters();
     }
 
-    /// Waits up to `timeout` for the walk to finish. Returns `true` if it
-    /// finished within the window - the caller should go on to serve the
-    /// real answer - or `false` if `timeout` elapsed first, in which case the
-    /// caller should answer exactly as it would have without calling this at
-    /// all.
-    ///
-    /// Meant for a caller that has already seen [`is_indexing`](Self::is_indexing)
-    /// return `true` and wants to give the walk a short chance to finish
-    /// before refusing; calling it against an already-ready status just
-    /// returns `true` immediately.
-    ///
-    /// `notified()` is created *before* the check that follows, not after:
-    /// `notify_waiters` only wakes tasks that were already waiting, so if
-    /// `mark_ready` ran between a naive `is_indexing` check and a later call
-    /// to `notified()`, the notification would already be gone and this
-    /// future would sit out the whole timeout despite the walk having
-    /// already finished. Registering first closes that window - by the time
-    /// the walk is asked about at all, this task is already able to hear
-    /// about it.
-    pub async fn wait_ready(&self, timeout: Duration) -> bool {
-        let notified = self.0.ready.notified();
-        if !self.is_indexing() {
-            return true;
+    /// The current phase, including [`Phase::Failed`]'s message if that is
+    /// where things stand. Lock-free except in the (rare, terminal) `Failed`
+    /// case.
+    pub fn phase(&self) -> Phase {
+        match self.0.phase.load(Ordering::Acquire) {
+            UNINDEXED => Phase::Unindexed,
+            WALKING => Phase::Walking,
+            STRUCTURAL => Phase::Structural,
+            EMBEDDING => Phase::Embedding,
+            READY => Phase::Ready,
+            FAILED => Phase::Failed(self.0.failure.lock().unwrap().clone().unwrap_or_default()),
+            other => unreachable!("indexing status phase discriminant out of range: {other}"),
         }
-        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
-    /// Waits, with no timeout at all, for the walk to finish - GM-394's
-    /// replacement for the "give it a moment, then refuse" shape
-    /// [`wait_ready`](Self::wait_ready) gives a tool call. The owner's
-    /// decision for that task rules out ever answering a tool call "not
-    /// ready" or partially while the index is being built, so a caller that
-    /// needs the index simply waits however long the walk actually takes -
-    /// see this module's own "GM-394" doc section for the fuller argument and
-    /// for why `get_info`/`instructions` do not call this at all (they must
-    /// never wait on the mutex the walk holds in the first place).
+    /// When the current phase was entered.
+    pub fn phase_since(&self) -> Instant {
+        *self.0.phase_since.lock().unwrap()
+    }
+
+    /// Waits for `need` to be satisfied, or for the walk to fail, or - only
+    /// if `deadline` is given - for time to run out. A call against a status
+    /// that already satisfies `need` returns [`WaitOutcome::Satisfied`]
+    /// immediately without ever touching the `Notify`.
     ///
-    /// Same registration-before-check shape as [`wait_ready`](Self::wait_ready),
-    /// for the identical reason: `notified()` is created before the
-    /// `is_indexing` check that follows so a `mark_ready` racing this call
-    /// can never be missed.
+    /// `notified()` is created *before* the phase check that follows, not
+    /// after, in every iteration - the same lost-wakeup-safe pattern this
+    /// type has always used: `notify_waiters` only wakes tasks that were
+    /// already waiting, so if a phase transition ran between a naive phase
+    /// check and a later call to `notified()`, the notification would already
+    /// be gone and this future would sit out the whole wait despite the
+    /// transition it wanted having already happened. Registering first closes
+    /// that window.
     ///
-    /// Returns immediately against an already-ready status, same as
-    /// [`wait_ready`](Self::wait_ready).
-    pub async fn wait_until_ready(&self) {
-        let notified = self.0.ready.notified();
-        if !self.is_indexing() {
-            return;
+    /// This loops, rather than checking once and then awaiting one
+    /// notification, because a phase can move several steps between the
+    /// moment this task is woken and the moment it gets to run again (e.g.
+    /// `Structural` to `Embedding` to `Ready` while this task was merely
+    /// descheduled) - each iteration re-checks against the *current* phase,
+    /// not the one that triggered the wakeup.
+    pub async fn wait_for(&self, need: Need, deadline: Option<Instant>) -> WaitOutcome {
+        loop {
+            let notified = self.0.notify.notified();
+            match self.phase() {
+                Phase::Failed(message) => return WaitOutcome::Failed(message),
+                phase if need.satisfied_by(&phase) => return WaitOutcome::Satisfied,
+                _ => {}
+            }
+
+            match deadline {
+                None => notified.await,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining == Duration::ZERO {
+                        return WaitOutcome::TimedOut;
+                    }
+                    if tokio::time::timeout(remaining, notified).await.is_err() {
+                        return WaitOutcome::TimedOut;
+                    }
+                }
+            }
         }
-        notified.await;
+    }
+
+    // --- Progress counters - see `Inner`'s own doc comment on why these are
+    // unused within this crate for now. ---
+
+    pub fn add_items_ingested(&self, count: u64) {
+        self.0.items_ingested.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn items_ingested(&self) -> u64 {
+        self.0.items_ingested.load(Ordering::Relaxed)
+    }
+
+    pub fn set_languages_total(&self, total: u32) {
+        self.0.languages_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn mark_language_started(&self, language: &str) {
+        *self.0.current_language.lock().unwrap() = Some(language.to_string());
+    }
+
+    pub fn mark_language_done(&self) {
+        self.0.languages_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn language_progress(&self) -> (u32, u32, Option<String>) {
+        (
+            self.0.languages_done.load(Ordering::Relaxed),
+            self.0.languages_total.load(Ordering::Relaxed),
+            self.0.current_language.lock().unwrap().clone(),
+        )
+    }
+
+    pub fn set_embed_total(&self, total: u64) {
+        self.0.embed_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn add_embed_done(&self, count: u64) {
+        self.0.embed_done.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn embed_progress(&self) -> (u64, u64) {
+        (self.0.embed_done.load(Ordering::Relaxed), self.0.embed_total.load(Ordering::Relaxed))
     }
 }
 
@@ -265,92 +451,126 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_project_that_owes_a_walk_reads_as_indexing_until_the_walk_is_marked_done() {
-        let status = IndexingStatus::indexing();
-        assert!(status.is_indexing());
-
-        status.mark_ready();
-        assert!(!status.is_indexing());
+    fn a_project_that_owes_a_walk_starts_at_walking_and_not_yet_structural() {
+        let status = IndexingStatus::walking();
+        assert_eq!(status.phase(), Phase::Walking);
     }
 
-    /// The fast path task 96/99 left intact: a restart against an index that
-    /// was already fully walked never shows an agent a "still indexing"
-    /// answer, because there is no walk to be in the middle of.
+    /// The fast path task 96/99 left intact: a restart against an
+    /// already-walked index starts satisfying `Need::Structural` from its
+    /// first instant, with no wait ever observed by a structural caller.
     #[test]
-    fn a_project_with_a_complete_index_never_reads_as_indexing() {
-        let status = IndexingStatus::ready();
-        assert!(!status.is_indexing());
+    fn a_project_with_a_complete_walk_starts_at_structural() {
+        let status = IndexingStatus::structural();
+        assert_eq!(status.phase(), Phase::Structural);
     }
 
-    /// Every connection the accept loop serves holds its own clone, so the
-    /// flip has to be visible through all of them at once.
+    /// Every connection the accept loop serves holds its own clone, so a
+    /// transition has to be visible through all of them at once.
     #[test]
-    fn every_clone_sees_the_same_flip() {
-        let status = IndexingStatus::indexing();
+    fn every_clone_sees_the_same_transition() {
+        let status = IndexingStatus::walking();
         let seen_by_a_connection = status.clone();
 
-        status.mark_ready();
+        status.set_phase(Phase::Structural);
 
-        assert!(!seen_by_a_connection.is_indexing());
+        assert_eq!(seen_by_a_connection.phase(), Phase::Structural);
     }
 
-    /// The fast path `wait_ready` must not lose either: an already-ready
-    /// status resolves without ever touching the `Notify`.
+    /// `Need::Structural`'s own acceptance criterion: satisfied by
+    /// `Structural` itself and by both phases after it, never by `Walking`.
     #[tokio::test]
-    async fn waiting_on_an_already_ready_status_returns_true_immediately() {
-        let status = IndexingStatus::ready();
-        assert!(status.wait_ready(Duration::from_secs(10)).await);
+    async fn wait_for_structural_resolves_at_structural_and_at_embedding() {
+        let status = IndexingStatus::walking();
+        status.set_phase(Phase::Structural);
+        assert_eq!(status.wait_for(Need::Structural, None).await, WaitOutcome::Satisfied);
+
+        let status = IndexingStatus::walking();
+        status.set_phase(Phase::Embedding);
+        assert_eq!(status.wait_for(Need::Structural, None).await, WaitOutcome::Satisfied);
     }
 
-    /// The race this type exists to absorb: a `mark_ready` that lands while
-    /// something is already inside `wait_ready` must wake it rather than
-    /// making it sit out the rest of the timeout.
+    /// `Need::Embeddings`'s own acceptance criterion: satisfied only by
+    /// `Ready`, not by `Structural` or `Embedding` even though a structural
+    /// caller is already happy at either of those.
     #[tokio::test]
-    async fn waiting_returns_true_as_soon_as_mark_ready_is_called() {
-        let status = IndexingStatus::indexing();
+    async fn wait_for_embeddings_resolves_only_at_ready() {
+        let status = IndexingStatus::walking();
+        status.set_phase(Phase::Structural);
+        status.set_phase(Phase::Embedding);
+
         let marker = status.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            marker.mark_ready();
+            marker.set_phase(Phase::Ready);
         });
 
-        assert!(status.wait_ready(Duration::from_secs(10)).await);
+        assert_eq!(status.wait_for(Need::Embeddings, None).await, WaitOutcome::Satisfied);
     }
 
-    /// The huge-project case task 105 exists for: nothing ever marks the walk
-    /// ready, so the wait must give up at `timeout` rather than hang.
+    /// A transition straight to `Failed` resolves *both* kinds of wait, with
+    /// the same message either way - a failed walk has no structural graph
+    /// to offer either need.
     #[tokio::test]
-    async fn waiting_returns_false_once_the_timeout_elapses_with_no_mark_ready() {
-        let status = IndexingStatus::indexing();
-        assert!(!status.wait_ready(Duration::from_millis(20)).await);
+    async fn a_failed_phase_resolves_both_needs_with_its_message() {
+        let structural_status = IndexingStatus::walking();
+        let marker = structural_status.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            marker.set_phase(Phase::Failed("the plugin crashed".to_string()));
+        });
+        assert_eq!(
+            structural_status.wait_for(Need::Structural, None).await,
+            WaitOutcome::Failed("the plugin crashed".to_string())
+        );
+
+        let embeddings_status = IndexingStatus::walking();
+        let marker = embeddings_status.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            marker.set_phase(Phase::Failed("the plugin crashed".to_string()));
+        });
+        assert_eq!(
+            embeddings_status.wait_for(Need::Embeddings, None).await,
+            WaitOutcome::Failed("the plugin crashed".to_string())
+        );
     }
 
-    /// [`wait_until_ready`]'s own fast path: an already-ready status resolves
-    /// without ever touching the `Notify`, same as `wait_ready`'s.
+    /// The huge-project case task 105 exists for, now expressed against a
+    /// deadline rather than an unconditional wait: nothing ever satisfies the
+    /// need, so the wait must give up once `deadline` passes rather than hang
+    /// - the shape a future progress-notification loop (GM-395 slice 3) will
+    /// poll this in.
     #[tokio::test]
-    async fn waiting_until_ready_on_an_already_ready_status_returns_immediately() {
-        let status = IndexingStatus::ready();
-        status.wait_until_ready().await;
+    async fn a_deadline_returns_timed_out_once_it_passes_with_nothing_satisfied() {
+        let status = IndexingStatus::walking();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::TimedOut);
     }
 
-    /// GM-394's own acceptance criterion at this type's level: a call with no
-    /// timeout at all still resolves once `mark_ready` fires - it does not
-    /// have a `timeout` argument to give up on, so this is the only way to
-    /// prove it does not simply hang forever.
+    /// A `deadline` that has already passed by the time this is called must
+    /// not be treated as "wait forever" - the `Duration::ZERO` fast path in
+    /// [`IndexingStatus::wait_for`].
     #[tokio::test]
-    async fn waiting_until_ready_returns_once_mark_ready_is_called() {
-        let status = IndexingStatus::indexing();
+    async fn a_deadline_already_in_the_past_times_out_without_waiting() {
+        let status = IndexingStatus::walking();
+        let deadline = Instant::now() - Duration::from_millis(20);
+        assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::TimedOut);
+    }
+
+    /// The race this type exists to absorb: a transition that lands while
+    /// something is already inside `wait_for` must wake it rather than making
+    /// it sit out the rest of the deadline.
+    #[tokio::test]
+    async fn wait_for_resolves_as_soon_as_the_phase_transitions_even_with_a_deadline() {
+        let status = IndexingStatus::walking();
         let marker = status.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            marker.mark_ready();
+            marker.set_phase(Phase::Structural);
         });
 
-        // No assertion beyond "this future resolves": `wait_until_ready`
-        // returns `()`, and a `mark_ready` that never happened would hang the
-        // test until its own harness timeout rather than fail an assertion
-        // here - which is exactly the failure mode this test exists to catch.
-        status.wait_until_ready().await;
-        assert!(!status.is_indexing(), "mark_ready must have run before this future resolved");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::Satisfied);
     }
 }

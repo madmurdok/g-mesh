@@ -95,8 +95,9 @@ use anyhow::{Context, Result};
 use crate::cli::{agent_instructions, stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{manifest, registry, semantic};
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{backfill, EmbeddingPipeline};
 use crate::storage::{connection, schema};
 
 /// What a single `init` actually did.
@@ -206,6 +207,14 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
                 semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
             run.log("the already-indexed project");
             semantic_pass_ran = run.any_ran();
+            // GM-395: this project's own walk may predate the embedding
+            // backfill pass splitting out of it (an index built before this
+            // slice already embedded everything inline), or its embedding
+            // model may not have been available at the time - either way,
+            // `is_available` makes this a fast no-op query when there is
+            // nothing left to do, same as `daemon::run`'s own cold start.
+            let progress = IndexingStatus::structural();
+            backfill::run(&conn, &embedding_pipeline, &progress);
         }
         None
     } else {
@@ -222,20 +231,26 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
-        // directly rather than a `PluginRegistry`.
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline, &discovered)
+        // directly rather than a `PluginRegistry`. `embedding: None` -
+        // GM-395: this walk is structural-only now, matching `daemon::run`'s
+        // own cold start; the pipeline above is used by the semantic pass and
+        // the backfill pass below instead.
+        let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
             .context("failed to build the project's initial index")?;
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
-        // The walk is only the half of a complete index that tree-sitter can
-        // see, and the record just written is what stops any later daemon
-        // start from finishing the other half - see `daemon::semantic`. So
-        // this command owes the pass it just made unreachable, and running it
-        // here is also the only way `init`'s promise stays true: that the
-        // index is *ready* when it returns, not merely walked.
+        // The walk is only the structural half of a complete index, and the
+        // record just written is what stops any later daemon start from
+        // finishing the rest - see `daemon::semantic` and
+        // `embedding::backfill`. So this command owes both passes it just
+        // made unreachable, and running them here is also the only way
+        // `init`'s promise stays true: that the index is *ready* when it
+        // returns, not merely walked.
         let run = semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
         run.log("the freshly built index");
         semantic_pass_ran = run.any_ran();
+        let progress = IndexingStatus::structural();
+        backfill::run(&conn, &embedding_pipeline, &progress);
         Some(summary)
     };
 

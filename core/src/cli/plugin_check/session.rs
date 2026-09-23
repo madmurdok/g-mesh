@@ -537,7 +537,7 @@ pub(crate) fn open_index() -> Result<Arc<Mutex<Connection>>> {
 /// project-wide, exactly as `bulk_index::run` does after its walk.
 pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<()> {
     let mut summary = BulkIndexSummary::default();
-    bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, &EmbeddingPipeline::disabled())?;
+    bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None)?;
     let mut conn = conn.lock().unwrap();
     imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?;
     symbol_links::link_all(&mut conn).context("failed to link the walk's cross-file symbol usages")?;

@@ -26,7 +26,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
 use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
@@ -534,9 +534,13 @@ pub fn run(root: &Path) -> Result<()> {
     let core_activity = CoreActivity::new();
 
     // Decided from a fact recorded on disk, not from how this start went, so
-    // a restart against an already-walked project (the common case) is `ready`
-    // from its first instant and no caller is ever kept waiting for it.
-    let indexing = if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
+    // a restart against an already-walked project (the common case) starts at
+    // `Structural` from its first instant and no structural caller is ever
+    // kept waiting for it - see `daemon::indexing_status::Phase::Structural`'s
+    // own doc comment for why that is not `Ready`: this same startup still
+    // owes the project an embedding backfill pass (below) before
+    // `Need::Embeddings` is satisfied.
+    let indexing = if needs_bulk_index { IndexingStatus::walking() } else { IndexingStatus::structural() };
 
     // The accept loop moves to a thread of its own so the walk below can run
     // alongside it. It, not this function, is the daemon's real main loop;
@@ -585,7 +589,7 @@ pub fn run(root: &Path) -> Result<()> {
     // Cold start only, and before the watcher is *drained*: a bulk walk racing
     // incremental updates could commit its own (older) parse of a file over
     // one the watcher had just refreshed. A tool call issued while this runs
-    // waits for it to finish (`mcp::mod::GMeshMcpServer::still_indexing`)
+    // waits for it to finish (`mcp::mod::GMeshMcpServer::wait_for_index`)
     // rather than ever being answered off the batches committed so far, so a
     // client's query is never answered off a half-built graph - the same
     // promise the old "bind only once this returns" ordering made, kept
@@ -599,24 +603,30 @@ pub fn run(root: &Path) -> Result<()> {
     // serving nothing, and every later shim would find it listening, current,
     // and reuse it forever.
     if needs_bulk_index {
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding, &discovered_for_bulk_index)
+        // `embedding: None` - GM-395's slice 1: the cold-start walk is
+        // structural-only now, about 31s on g-mesh instead of about 814s.
+        // Embedding moves to its own pass, `embedding::backfill::run`, below -
+        // after this whole if/else-if block, unconditionally, so an
+        // already-walked project (which never takes this branch) still gets
+        // its owed backfill on every restart.
+        let summary = bulk_index::run(&canonical_root, &conn, None, &discovered_for_bulk_index)
             .context("failed to build the project's initial index")?;
         // Flipped *before* the completion marker is written, and the order
         // matters. The two facts become true at the same moment - the walk is
-        // over - but they are read by different parties: the flag governs
+        // over - but they are read by different parties: the phase governs
         // what this process answers, `bulkIndexedAt` governs whether the
         // *next* process walks again. Writing the marker second means any
         // outside observer of it (`cli::status`, the integration tests) can
-        // only ever see it once real answers are already being given; the
-        // other order would let someone read "indexed" off the database while
-        // a tool call issued to this same daemon still waited on a flag that
-        // had not caught up to it.
+        // only ever see it once real (structural) answers are already being
+        // given; the other order would let someone read "indexed" off the
+        // database while a tool call issued to this same daemon still waited
+        // on a phase that had not caught up to it.
         //
         // Ahead of the watcher for the same reason a project that owed no
-        // walk starts out `ready`: the watcher only ever matters for edits
-        // made after it is registered, so gating answers on it would buy
-        // nothing the fast path does not already do without.
-        indexing.mark_ready();
+        // walk starts out at `Structural` already: the watcher only ever
+        // matters for edits made after it is registered, so gating answers on
+        // it would buy nothing the fast path does not already do without.
+        indexing.set_phase(Phase::Structural);
         schema::record_bulk_index(&conn.lock().unwrap())
             .context("failed to record that the project was indexed")?;
         // A walk that took minutes is minutes the core spent working, not
@@ -636,8 +646,9 @@ pub fn run(root: &Path) -> Result<()> {
 
         // The walk's edges are in and linked, so the graph is complete enough
         // to be worth asking the type checker about - and the daemon is
-        // already answering off it (`mark_ready` above), which is why this
-        // sits *after* that call rather than in front of it: the semantic
+        // already answering structural questions off it (`set_phase` above),
+        // which is why this sits *after* that call rather than in front of
+        // it: the semantic
         // layer's job is to make existing answers better, never to delay the
         // first one. An empty file list is what "the whole project" looks
         // like on the wire (see `ControlMessage::SemanticPass`); no single
@@ -699,6 +710,23 @@ pub fn run(root: &Path) -> Result<()> {
         semantic::run_with_registry(&registry, &conn).log("the previously-interrupted index");
     }
 
+    // GM-395: spawned here, *before* the embedding backfill pass below,
+    // rather than after it the way this thread used to follow the walk
+    // directly. The backfill pass can run for as long as the old inline
+    // per-batch embedding step used to (minutes, on a project big enough to
+    // matter), and moving the watcher's consumer thread ahead of it is what
+    // lets an incremental edit made *during* that pass still be applied
+    // rather than left queued until the pass finally returns - the pass
+    // itself does not hold `conn`'s mutex between its own batches (see
+    // `embedding::backfill::run`), so there is nothing here for the two to
+    // race over the way a structural walk's batches would.
+    //
+    // Still *after* the structural walk (and its semantic-pass retry) above,
+    // unchanged from before: a bulk walk racing incremental updates could
+    // commit its own (older) parse of a file over one the watcher had just
+    // refreshed (see the comment above the walk itself), and that hazard is
+    // about the walk specifically, not about this daemon's startup as a
+    // whole.
     {
         let conn = Arc::clone(&conn);
         let registry = Arc::clone(&registry);
@@ -741,6 +769,25 @@ pub fn run(root: &Path) -> Result<()> {
             }
         });
     }
+
+    // GM-395: the embedding backfill pass, unconditional and eager in this
+    // slice - it runs on *every* startup, not only a cold-start walk's own,
+    // because "the structural graph is complete" (`needs_bulk_index` false)
+    // says nothing about whether every embeddable node in it has a `vectors`
+    // row yet (a previous start with no model available, an interrupted
+    // pass, GM-396's staleness skip on an incremental edit). Fast, quickly,
+    // on a project with nothing left to embed - `embedding::backfill::run`'s
+    // own `COUNT(*)` check is what makes that so - so this does not meaningfully
+    // slow down the overwhelmingly common "nothing to do" restart.
+    indexing.set_phase(Phase::Embedding);
+    let backfill_summary = crate::embedding::backfill::run(&conn, &embedding, &indexing);
+    if backfill_summary.candidates > 0 {
+        eprintln!(
+            "g-mesh daemon: embedding backfill - {} of {} candidate nodes embedded",
+            backfill_summary.embedded, backfill_summary.candidates
+        );
+    }
+    indexing.set_phase(Phase::Ready);
 
     // Startup is over; what is left is the two idle timers, the orphan check
     // riding the same tick (GM-320), and the accept loop's outcome, whichever

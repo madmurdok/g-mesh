@@ -92,10 +92,34 @@ impl Project {
         let conn = Mutex::new(conn);
         let discovered = only_the_bundled_plugin();
         let summary =
-            bulk_index::run(self.root(), &conn, embedding, &discovered).expect("the bulk walk failed");
+            bulk_index::run(self.root(), &conn, Some(embedding), &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()
+    }
+
+    /// GM-395's slice 1 shape: a structural-only walk (`embedding: None`)
+    /// followed by the embedding backfill pass as its own step, mirroring
+    /// what `daemon::run`'s cold start now does instead of [`walk`](Self::walk)'s
+    /// inline embedding. Returns the same kind of filled index [`walk`] does,
+    /// plus the backfill pass's own summary.
+    fn walk_then_backfill(
+        &self,
+        embedding: &EmbeddingPipeline,
+    ) -> (Connection, g_mesh::embedding::backfill::BackfillSummary) {
+        let conn = open(self.root()).expect("failed to open the project index");
+        schema::ensure_current(&conn, "embedding-generation-pipeline-test")
+            .expect("failed to prepare the index");
+        let conn = Mutex::new(conn);
+        let discovered = only_the_bundled_plugin();
+        let summary =
+            bulk_index::run(self.root(), &conn, None, &discovered).expect("the structural walk failed");
+        assert!(summary.nodes > 0, "the walk produced no nodes at all");
+        assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
+
+        let progress = g_mesh::daemon::indexing_status::IndexingStatus::structural();
+        let backfill_summary = g_mesh::embedding::backfill::run(&conn, embedding, &progress);
+        (conn.into_inner().unwrap(), backfill_summary)
     }
 }
 
@@ -196,6 +220,35 @@ fn indexing_a_fixture_file_embeds_its_documented_symbols() {
     // sqlite-vec's packed format: 4 bytes per f32 dimension.
     assert_eq!(embedding_len, (g_mesh::embedding::EMBEDDING_DIM as i64) * 4);
     assert_eq!(version, g_mesh::config::EmbeddingConfig::default().model);
+}
+
+/// GM-395's slice 1 acceptance criterion: a structural-only walk
+/// (`embedding: None`) followed by the embedding backfill pass
+/// (`embedding::backfill::run`) as its own step embeds exactly the same
+/// symbols the old inline walk did in
+/// [`indexing_a_fixture_file_embeds_its_documented_symbols`] above -
+/// splitting embedding out of the walk must not change *what* gets embedded,
+/// only *when*.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn a_structural_walk_followed_by_backfill_embeds_the_same_symbols_as_the_old_inline_walk() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, backfill_summary) = project.walk_then_backfill(&pipeline);
+
+    assert_eq!(backfill_summary.candidates, 2, "the fixture has exactly two embeddable nodes");
+    assert_eq!(backfill_summary.embedded, 2, "both candidates must have been embedded");
+
+    let documented = node_id(&conn, "readFileAsString");
+    let bare = node_id(&conn, "bare");
+    assert!(
+        vector_row_exists(&conn, &documented),
+        "a node with a doc comment and a signature must be embedded"
+    );
+    assert!(
+        vector_row_exists(&conn, &bare),
+        "a node with a signature but no doc comment must still be embedded off its signature"
+    );
 }
 
 /// Task #51's acceptance criterion: after a walk embeds anything at all,

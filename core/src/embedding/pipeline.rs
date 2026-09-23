@@ -50,7 +50,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::EmbeddingConfig;
-use crate::embedding::model::{default_model_dir, EmbeddingModel};
+use crate::embedding::model::{default_model_dir, EmbeddingModel, ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 use crate::storage::vectors;
 use crate::storage::write::Diff;
 
@@ -105,6 +105,33 @@ impl EmbeddingPipeline {
                 }
             })
             .as_ref()
+    }
+
+    /// Cheap check for whether the embedding backfill pass
+    /// (`embedding::backfill::run`) has anything to do at all, *without*
+    /// paying [`model`](Self::model)'s load cost to find out.
+    ///
+    /// A pipeline this same process has already resolved - loaded, failed to
+    /// load, or [`disabled`](Self::disabled) - answers from that cached
+    /// outcome (`self.model.get()`), never re-checking the filesystem: once
+    /// [`model`](Self::model) has decided, that decision is the one source of
+    /// truth, and a `disabled` pipeline in particular must read as
+    /// unavailable regardless of what happens to exist under
+    /// `default_model_dir` (a test's real weights, say) - it was
+    /// constructed to never try. Otherwise - the common cold-start case,
+    /// nothing has asked to embed yet - this falls back to the one fact that
+    /// can be checked without loading anything: do `model.onnx` and
+    /// `tokenizer.json` exist in the directory [`model`](Self::model) would
+    /// resolve to. `false` from either path means [`model`](Self::model)
+    /// would return `None` if called right now; `true` is not a promise it
+    /// will *succeed* (the files could still be corrupt), only that there is
+    /// something worth the load's cost.
+    pub fn is_available(&self) -> bool {
+        if let Some(loaded) = self.model.get() {
+            return loaded.is_some();
+        }
+        let Ok(dir) = default_model_dir(&self.config.model) else { return false };
+        dir.join(ONNX_FILE_NAME).exists() && dir.join(TOKENIZER_FILE_NAME).exists()
     }
 
     /// Embeds a free-text query (`search_code`'s input) with the same model
