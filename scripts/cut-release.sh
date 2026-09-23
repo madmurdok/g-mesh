@@ -181,6 +181,9 @@
 #   - the tag already exists, locally or on the remote
 #   - an earlier `merge: release-X into main` commit has no tag at all
 #     (GM-374 - see the comment above this section)
+#   - `main`'s HEAD not being `merge: release-<version> into main`, or that
+#     merge's release-side parent not being the tip of
+#     `origin/release-<version>` with a successful ci.yml run (GM-391)
 #   - a version string that is not `X.Y.Z`
 #   - `core/Cargo.toml`'s version disagreeing with the argument
 #   - any other workspace member's version disagreeing with core's (GM-288)
@@ -462,6 +465,54 @@ origin_slug() {
 	printf '%s\n' "$url"
 }
 
+# GM-391: the release-side parent of `merge: release-<version> into main` must
+# be the tip of `origin/release-<version>` and must have a successful ci.yml
+# run for that exact commit. `ci.yml` has triggered on `release-*` pushes since
+# d508f09, but release-3.8.0 through 3.10.1 were never pushed, so that trigger
+# never saw them - and 3.5.0/3.6.0 were pushed, went red, and shipped anyway.
+# Any successful run on the SHA counts (a push run, or a workflow_dispatch
+# re-run of the same commit); a red run followed by a green one on the same
+# SHA is a flake someone re-ran, not an untested commit.
+#
+# `merge_rev` defaults to `main`; it is a parameter so this can be checked
+# against an earlier release's merge commit by sourcing this file.
+check_release_branch_ci_passed() {
+	local version="$1" merge_rev="${2:-main}"
+	local branch="release-$version"
+
+	local subject
+	subject="$(git -C "$REPO_ROOT" log -1 --format=%s "$merge_rev")"
+	[ "$subject" = "merge: $branch into main" ] ||
+		die "$merge_rev is '$subject', not 'merge: $branch into main' - merge the release branch into main with that subject before cutting $version"
+
+	local tip
+	tip="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "$merge_rev^2")" ||
+		die "$merge_rev has no second parent - merge $branch with --no-ff so the tested release commit stays identifiable"
+
+	local slug
+	slug="$(origin_slug)" || die "could not read the origin remote's GitHub owner/repo"
+
+	local remote_tip
+	remote_tip="$(git -C "$REPO_ROOT" ls-remote origin "refs/heads/$branch" | cut -f1)" ||
+		die "could not list $branch on origin - check network/remote access and try again"
+	[ -n "$remote_tip" ] ||
+		die "$branch was never pushed, so ci.yml never ran on it - push it ('git push origin $branch'), wait for a green run (https://github.com/$slug/actions?query=branch%3A$branch), then re-run this"
+	[ "$remote_tip" = "$tip" ] ||
+		die "origin/$branch is at ${remote_tip:0:7}, but main merged ${tip:0:7} - main does not contain what was pushed and tested; reconcile the two before tagging"
+
+	command -v gh >/dev/null 2>&1 ||
+		die "gh (GitHub CLI) not found - it is needed to confirm ci.yml passed on $branch at ${tip:0:7}"
+
+	local green
+	green="$(gh api "repos/$slug/actions/workflows/ci.yml/runs?head_sha=$tip&per_page=100" \
+		--jq '[.workflow_runs[] | select(.conclusion == "success")] | length')" ||
+		die "could not query ci.yml runs for ${tip:0:7} (is 'gh auth status' logged in?)"
+	[ "$green" -gt 0 ] ||
+		die "no successful ci.yml run for $branch at ${tip:0:7} - fix it on $branch and push, or re-run a flaky job (https://github.com/$slug/actions?query=branch%3A$branch); main has not been verified by CI"
+
+	log "$branch at ${tip:0:7} is on origin and passed ci.yml ($green successful run(s))"
+}
+
 main() {
 	local version="" push=0 skip_tests=0
 	while [ $# -gt 0 ]; do
@@ -532,6 +583,10 @@ main() {
 	# GM-374: refuses if an earlier release shipped without this script
 	# tagging it - see the GM-374 header comment and the function itself.
 	check_no_untagged_prior_releases
+
+	# GM-391: the release branch must have been pushed and passed CI before
+	# it was merged - see the function's own comment.
+	check_release_branch_ci_passed "$version"
 
 	# The exact check .github/workflows/release.yml's "Check the tag matches
 	# the crate version" step runs, so a mismatch is caught here instead of
