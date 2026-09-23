@@ -89,6 +89,8 @@ impl Project {
             .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn the shim");
+        // GM-395 slice 2: the daemon walks - and so spawns its plugin - only once a tool call asks.
+        common::trigger_activation(self.root());
         wait_for("the daemon to spawn its plugin", || self.plugin_pid_file().exists());
         wait_until_indexed(self.root());
         // The shim was only the vehicle: the daemon it spawned is detached

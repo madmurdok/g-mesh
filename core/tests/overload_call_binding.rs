@@ -30,6 +30,8 @@ use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Same budget as the ambiguous-barrel test's: this wait pays for a `tsserver`
@@ -131,6 +133,8 @@ fn each_call_of_an_overloaded_function_is_stored_against_the_overload_it_binds()
         assert!(Instant::now() < deadline, "timed out waiting for the daemon and its plugin to start");
         thread::sleep(Duration::from_millis(20));
     }
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(project.root());
 
     let db_path = project_dir(project.root()).unwrap().join("index.db");
 

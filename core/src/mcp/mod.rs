@@ -165,9 +165,19 @@ impl GMeshMcpServer {
     /// Everything every handler owes before it reads the index, in the one
     /// order they may happen in.
     ///
+    /// `Some` is a finished tool result the handler returns as is: today only
+    /// a failed walk ([`Phase::Failed`]), reported as a tool error carrying
+    /// the failure's message.
+    ///
     /// The order is not arbitrary:
     ///
-    /// 1. [`wait_for_index`](Self::wait_for_index) first: a project that has
+    /// 0. [`IndexingStatus::request_activation`] before anything else
+    ///    (GM-395 slice 2): the daemon builds nothing until a tool call
+    ///    needs it, so this is what starts the walk, the semantic pass and
+    ///    the embedding backfill pass - once, however many calls ask. It
+    ///    returns at once; the work runs on `daemon::activation`'s thread,
+    ///    independently of this call.
+    /// 1. [`wait_for_index`](Self::wait_for_index) next: a project that has
     ///    not yet reached `need`'s phase has no graph (or no complete-enough
     ///    graph) to bring up to date, so every step after this one may assume
     ///    it does rather than each having to ask again. GM-394's owner
@@ -180,13 +190,17 @@ impl GMeshMcpServer {
     ///    lock the replay below holds (see `daemon::lifecycle`'s lock order).
     /// 3. The replay last, so the rows this call is about to read already
     ///    include every change made while the plugin was asleep.
-    async fn prepare(&self, need: Need) {
+    async fn prepare(&self, need: Need) -> Option<CallToolResult> {
         trace_call("prepare: entered");
-        self.wait_for_index(need).await;
+        self.indexing.request_activation();
+        if let Some(failed) = self.wait_for_index(need).await {
+            return Some(failed);
+        }
         trace_call("prepare: past the indexing wait");
         self.mark_used();
         self.replay_queued_changes().await;
         trace_call("prepare: done");
+        None
     }
 
     /// Brings the index up to date with whatever changed while any language's
@@ -323,24 +337,25 @@ impl GMeshMcpServer {
     /// the task, not the worker thread it runs on (see
     /// `daemon::serve_forever`'s two-worker runtime, and `IndexingStatus`'s
     /// own doc comment for why a `Notify` rather than a blocking primitive).
-    async fn wait_for_index(&self, need: Need) {
+    async fn wait_for_index(&self, need: Need) -> Option<CallToolResult> {
         match self.indexing.wait_for(need, None).await {
-            WaitOutcome::Satisfied => {}
+            WaitOutcome::Satisfied => None,
             // Unreachable with `deadline: None` - `wait_for` never returns
             // `TimedOut` without one - kept exhaustive rather than matched
             // with `_` so a later slice that starts passing a real deadline
             // here is forced to decide what this arm should do instead of
             // silently inheriting whatever `_` happened to do.
             WaitOutcome::TimedOut => unreachable!("wait_for(..., None) never times out"),
-            // Nothing in this slice ever moves a phase to `Failed` - see
-            // `Phase::Failed`'s own doc comment - so this is unreached today.
-            // Logged rather than turned into a tool error against the day it
-            // is reachable: GM-394's decision is that a tool call is never
-            // refused outright, and a handler that goes on to read an empty
-            // or partial graph after a failed walk is a strictly better
-            // outcome than one that cannot answer at all.
+            // GM-395 slice 2 (D2): a failed walk is a tool error carrying its
+            // message, not an answer read off an empty or partial graph -
+            // that would be confidently wrong, where this says why and that
+            // the next call retries (`IndexingStatus::request_activation`).
+            // Not "not ready" either: the wait is over, and it failed.
             WaitOutcome::Failed(message) => {
-                eprintln!("g-mesh daemon: indexing failed ({message}) - answering off whatever exists");
+                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "g-mesh could not build this project's index: {message}. The next tool call retries \
+                     the build."
+                ))]))
             }
         }
     }
@@ -460,7 +475,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindDefinitionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
@@ -475,21 +492,27 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<SymbolQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         let capabilities = self.capabilities();
         find_references::handle(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
     async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         let capabilities = self.capabilities();
         find_callers_callees::handle_callers(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
     async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         let capabilities = self.capabilities();
         find_callers_callees::handle_callees(&self.conn, &self.embedding, &capabilities, params.0)
     }
@@ -502,7 +525,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<FindImplementationsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         let capabilities = self.capabilities();
         find_implementations::dispatch(&self.conn, &self.embedding, &capabilities, params.0)
     }
@@ -515,7 +540,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetFileOutlineParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         self.ensure_file_fresh(&params.0.file_path).await;
         get_file_outline::handle(&self.conn, params.0)
     }
@@ -528,7 +555,9 @@ impl GMeshMcpServer {
         &self,
         params: Parameters<GetDependenciesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Structural).await;
+        if let Some(failed) = self.prepare(Need::Structural).await {
+            return Ok(failed);
+        }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
@@ -549,7 +578,9 @@ impl GMeshMcpServer {
         description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Results are ranked by similarity, most relevant first. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
     )]
     async fn search_code(&self, params: Parameters<SearchCodeParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare(Need::Embeddings).await;
+        if let Some(failed) = self.prepare(Need::Embeddings).await {
+            return Ok(failed);
+        }
         search_code::handle(&self.conn, &self.embedding, params.0)
     }
 }

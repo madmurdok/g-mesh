@@ -64,9 +64,17 @@
 //! `search_code` alone needs [`Phase::Ready`] and waits out the embedding
 //! backfill pass (`embedding::backfill::run`) that now runs as its own step
 //! afterward. See `docs/architecture/lazy-indexing.md`'s D3 for the full
-//! design this slice implements (the phase machine here; nothing about
-//! *when* a walk starts becomes lazy until a later slice - this daemon still
-//! starts every phase eagerly, at launch).
+//! design this implements.
+//!
+//! # GM-395 slice 2: nothing moves until a tool call asks
+//!
+//! A daemon no longer starts its walk (or its embedding backfill pass) at
+//! launch. It starts at [`Phase::Unindexed`] (or [`Phase::Structural`] for an
+//! already-walked project) and stays there until the first index-needing
+//! tool call runs [`request_activation`](IndexingStatus::request_activation),
+//! which wakes `daemon::activation`'s parked thread exactly once. A walk that
+//! fails lands in [`Phase::Failed`] instead of ending the process, and the
+//! next call's `request_activation` retries it.
 //!
 //! # Why the incremental-edit watcher path does not re-arm this
 //!
@@ -130,6 +138,7 @@
 //! decision closes out.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,16 +147,14 @@ use tokio::sync::Notify;
 /// One step of the cold-start machine a project's index moves through, once,
 /// left to right - see this module's own "GM-395" doc section.
 ///
-/// `Unindexed` is not produced by anything in this slice (a cold start begins
-/// at [`Walking`](Phase::Walking) - see [`IndexingStatus::walking`]); it
-/// exists in the enum now because a later slice's lazy activation needs a
-/// phase for "nothing has ever asked this project to index itself yet",
-/// distinct from "a walk is in progress".
+/// A failed walk is the one step backwards: [`Failed`](Phase::Failed) goes
+/// back to [`Walking`](Phase::Walking) when the next tool call asks again
+/// ([`IndexingStatus::request_activation`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    /// No walk has ever run, and none is running - reachable only once lazy
-    /// activation exists (a later slice); nothing in this daemon produces it
-    /// yet.
+    /// No walk has ever run, and none is running: the startup phase of a
+    /// daemon whose project owes its walk, until the first index-needing
+    /// tool call asks for it ([`IndexingStatus::request_activation`]).
     Unindexed,
     /// The structural walk is running (`daemon::bulk_index::run`, called
     /// with `embedding: None`). No tool call may answer off the graph yet -
@@ -168,13 +175,12 @@ pub enum Phase {
     /// Everything answers.
     Ready,
     /// The walk failed outright. Carries the failure's message so a waiter
-    /// can report *why* rather than just "never became ready". Nothing in
-    /// this slice's eager startup path ever sets this - a failed cold-start
-    /// walk is still fatal to the whole daemon (`daemon::run`'s `?` on
-    /// `bulk_index::run`) rather than recorded here - but the phase exists
-    /// now because a later slice's lazy activation runs the walk *after* the
-    /// daemon (and its socket) already exist, where a walk failure has
-    /// nowhere else to go but here.
+    /// can report *why* rather than just "never became ready" - every waiter
+    /// turns it into a tool error (`mcp::GMeshMcpServer::prepare`). Not
+    /// terminal: the next [`IndexingStatus::request_activation`] moves it
+    /// back to [`Walking`](Phase::Walking) and retries. Before GM-395's
+    /// slice 2 a failed walk ended the daemon instead, which under a lazy
+    /// trigger would drop the session of the very call that asked for it.
     Failed(String),
 }
 
@@ -272,6 +278,27 @@ struct Inner {
     current_language: Mutex<Option<String>>,
     embed_done: std::sync::atomic::AtomicU64,
     embed_total: std::sync::atomic::AtomicU64,
+    /// Lazy activation's trigger - see
+    /// [`request_activation`](IndexingStatus::request_activation). A `Mutex`
+    /// rather than an atomic flag because "is an activation already
+    /// requested" and "record a failure, and allow the next retry" have to
+    /// change together: see [`activation_failed`](IndexingStatus::activation_failed).
+    activation: Mutex<Activation>,
+}
+
+/// The sending half of `daemon::activation`'s trigger channel, and whether
+/// the activation it wakes has already been asked for.
+#[derive(Default)]
+struct Activation {
+    /// `None` until [`IndexingStatus::attach_activation`] is called - which
+    /// only `daemon::run` does. A status with no activation thread behind it
+    /// (the CLI's in-process walks, unit tests) never sends anything.
+    trigger: Option<mpsc::Sender<()>>,
+    /// Set by the first [`IndexingStatus::request_activation`] and cleared
+    /// only by [`IndexingStatus::activation_failed`], so after a successful
+    /// activation it stays set for the rest of the process: there is nothing
+    /// left to trigger.
+    requested: bool,
 }
 
 impl IndexingStatus {
@@ -287,12 +314,23 @@ impl IndexingStatus {
             current_language: Mutex::new(None),
             embed_done: std::sync::atomic::AtomicU64::new(0),
             embed_total: std::sync::atomic::AtomicU64::new(0),
+            activation: Mutex::new(Activation::default()),
         }))
     }
 
-    /// A daemon that owes its project a cold-start structural walk. Every
-    /// [`Need`] reads as unsatisfied until the walk finishes and moves this
-    /// to [`Phase::Structural`].
+    /// A daemon that owes its project a walk and has not been asked for it
+    /// yet - GM-395's lazy startup. Every [`Need`] reads as unsatisfied until
+    /// a tool call runs [`request_activation`](Self::request_activation) and
+    /// the walk it starts finishes.
+    pub fn unindexed() -> Self {
+        Self::starting_at(UNINDEXED)
+    }
+
+    /// A status whose structural walk is already under way. Every [`Need`]
+    /// reads as unsatisfied until the walk finishes and moves this to
+    /// [`Phase::Structural`]. The daemon itself starts at
+    /// [`unindexed`](Self::unindexed) now; this remains for the unit tests
+    /// that exercise the waits.
     pub fn walking() -> Self {
         Self::starting_at(WALKING)
     }
@@ -300,8 +338,9 @@ impl IndexingStatus {
     /// A daemon whose structural walk was already complete when it started -
     /// every restart of an already-walked project, which is the
     /// overwhelmingly common case. [`Need::Structural`] is satisfied from the
-    /// first instant; the embedding backfill pass this same startup runs
-    /// (`embedding::backfill::run`) still has to move this on to
+    /// first instant; the embedding backfill pass the first tool call starts
+    /// (`embedding::backfill::run`, via `daemon::activation`) still has to
+    /// move this on to
     /// [`Phase::Embedding`] and then [`Phase::Ready`] before
     /// [`Need::Embeddings`] is - see this module's "GM-395" doc section for
     /// why an already-walked project is not simply started at `Ready`.
@@ -402,6 +441,67 @@ impl IndexingStatus {
         }
     }
 
+    /// Connects this status to `daemon::activation`'s parked thread and
+    /// returns the receiving end that thread waits on. Called once, by
+    /// `daemon::run`, before the accept loop can hand this status to any
+    /// session - so no tool call can ever find it unattached in a daemon.
+    pub fn attach_activation(&self) -> mpsc::Receiver<()> {
+        let (trigger, triggered) = mpsc::channel();
+        self.0.activation.lock().unwrap().trigger = Some(trigger);
+        triggered
+    }
+
+    /// Asks the activation thread to do whatever this project still owes -
+    /// the walk, the semantic pass (or its owed retry), and the embedding
+    /// backfill pass (D2 in `docs/architecture/lazy-indexing.md`). Called at
+    /// the top of every tool handler's `prepare`, so the first index-needing
+    /// call starts it and every later call is a no-op. Returns `true` only
+    /// for the one call that actually sent the trigger.
+    ///
+    /// Check-and-set under one lock, so concurrent calls from several
+    /// sessions start it exactly once. The activation it starts is
+    /// independent of the caller: a call that is cancelled, or whose session
+    /// goes away, does not stop it.
+    ///
+    /// When this call is the one that (re)starts a walk - from
+    /// [`Phase::Unindexed`], or from [`Phase::Failed`] on a retry - the phase
+    /// moves to [`Phase::Walking`] *here*, synchronously, rather than when
+    /// the activation thread gets round to it. Otherwise the caller's own
+    /// wait that follows would read the previous attempt's `Failed` and
+    /// report a failure the retry it just asked for has not had a chance to
+    /// repeat or fix.
+    pub fn request_activation(&self) -> bool {
+        let mut activation = self.0.activation.lock().unwrap();
+        if activation.requested {
+            return false;
+        }
+        if activation.trigger.is_none() {
+            return false;
+        }
+        activation.requested = true;
+        if matches!(self.phase(), Phase::Unindexed | Phase::Failed(_)) {
+            self.set_phase(Phase::Walking);
+        }
+        // A send only fails once the activation thread has returned, which
+        // it does only after a successful activation - and then `requested`
+        // is never cleared again, so this line is not reached.
+        if let Some(trigger) = &activation.trigger {
+            let _ = trigger.send(());
+        }
+        true
+    }
+
+    /// Records a failed activation as [`Phase::Failed`] and re-arms
+    /// [`request_activation`](Self::request_activation) so the next tool
+    /// call retries. Both under the activation lock, so there is no moment
+    /// in which a waiter has been told `Failed` but a new request would
+    /// still be refused as "already requested".
+    pub fn activation_failed(&self, message: String) {
+        let mut activation = self.0.activation.lock().unwrap();
+        self.set_phase(Phase::Failed(message));
+        activation.requested = false;
+    }
+
     // --- Progress counters - see `Inner`'s own doc comment on why these are
     // unused within this crate for now. ---
 
@@ -459,6 +559,91 @@ mod tests {
     /// The fast path task 96/99 left intact: a restart against an
     /// already-walked index starts satisfying `Need::Structural` from its
     /// first instant, with no wait ever observed by a structural caller.
+    /// GM-395 slice 2's lazy startup: a project that owes its walk sits at
+    /// `Unindexed` until something asks, and nothing is satisfied there.
+    #[tokio::test]
+    async fn an_unindexed_project_satisfies_no_need() {
+        let status = IndexingStatus::unindexed();
+        assert_eq!(status.phase(), Phase::Unindexed);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::TimedOut);
+    }
+
+    /// With no activation thread attached (the CLI's in-process walks, unit
+    /// tests), a request is a no-op rather than a phase change nothing will
+    /// ever follow up on.
+    #[test]
+    fn a_request_with_no_activation_attached_changes_nothing() {
+        let status = IndexingStatus::unindexed();
+        assert!(!status.request_activation());
+        assert_eq!(status.phase(), Phase::Unindexed);
+    }
+
+    /// The first request sends exactly one trigger and moves `Unindexed` to
+    /// `Walking` synchronously; every later one is a no-op.
+    #[test]
+    fn only_the_first_request_triggers_and_it_moves_to_walking() {
+        let status = IndexingStatus::unindexed();
+        let triggered = status.attach_activation();
+
+        assert!(status.request_activation());
+        assert_eq!(status.phase(), Phase::Walking);
+        assert!(!status.request_activation());
+        assert!(!status.clone().request_activation());
+
+        assert!(triggered.try_recv().is_ok());
+        assert!(triggered.try_recv().is_err(), "a second request must not send a second trigger");
+    }
+
+    /// An already-walked project's request starts the owed background work
+    /// but must not move a structural caller's phase backwards.
+    #[test]
+    fn a_request_on_a_walked_project_triggers_without_leaving_structural() {
+        let status = IndexingStatus::structural();
+        let triggered = status.attach_activation();
+
+        assert!(status.request_activation());
+        assert_eq!(status.phase(), Phase::Structural);
+        assert!(triggered.try_recv().is_ok());
+    }
+
+    /// D2's retry: a failed activation re-arms the trigger, and the retrying
+    /// request moves `Failed` back to `Walking` before it returns - so the
+    /// caller's own wait never reads the previous attempt's failure.
+    #[test]
+    fn a_failed_activation_is_retried_by_the_next_request() {
+        let status = IndexingStatus::unindexed();
+        let triggered = status.attach_activation();
+        assert!(status.request_activation());
+        assert!(triggered.try_recv().is_ok());
+
+        status.activation_failed("the plugin is missing".to_string());
+        assert_eq!(status.phase(), Phase::Failed("the plugin is missing".to_string()));
+
+        assert!(status.request_activation());
+        assert_eq!(status.phase(), Phase::Walking);
+        assert!(triggered.try_recv().is_ok());
+        assert!(!status.request_activation());
+    }
+
+    /// Several sessions asking at once start the activation exactly once.
+    #[test]
+    fn concurrent_requests_trigger_exactly_once() {
+        let status = IndexingStatus::unindexed();
+        let triggered = status.attach_activation();
+        let winners: usize = (0..16)
+            .map(|_| {
+                let status = status.clone();
+                std::thread::spawn(move || status.request_activation())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| usize::from(handle.join().unwrap()))
+            .sum();
+        assert_eq!(winners, 1);
+        assert_eq!(triggered.try_iter().count(), 1);
+    }
+
     #[test]
     fn a_project_with_a_complete_walk_starts_at_structural() {
         let status = IndexingStatus::structural();

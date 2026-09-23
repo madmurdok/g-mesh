@@ -107,6 +107,8 @@ fn an_edit_made_while_the_cold_start_walk_is_finishing_is_not_lost() {
         .expect("failed to spawn the daemon");
 
     let db_path = project_dir(project.root()).unwrap().join("index.db");
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(project.root());
     wait_for("the cold-start walk to commit its own fixture", || nodes_named(&db_path, "seeded") > 0);
 
     // Inside the window: the walk is finished but still held, so the daemon
@@ -136,6 +138,8 @@ fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() 
     // proves the plugin came up cleanly.
     let pid_file = daemon::pid_path(project.root()).unwrap();
     wait_for("the daemon (and its JS/TS plugin) to start", || pid_file.exists());
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(project.root());
 
     let fixture = project.root().join("fixture.ts");
     fs::write(&fixture, "export function add(a: number, b: number): number {\n  return a + b;\n}\n")
@@ -184,6 +188,8 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
 
     let pid_file = daemon::pid_path(project.root()).unwrap();
     wait_for("the daemon (and its JS/TS plugin) to start", || pid_file.exists());
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(project.root());
 
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     let count = |sql: &str| -> i64 {

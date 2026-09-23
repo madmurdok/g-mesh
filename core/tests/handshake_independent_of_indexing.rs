@@ -23,7 +23,9 @@
 //! all, passing for a reason that has nothing to do with the fix. This file
 //! splits the two: [`spawn_daemon_holding_the_lock`] starts the daemon
 //! directly (the same `g-mesh daemon --project-root` the shim's own
-//! `spawn_detached_daemon` uses) and [`Project::wait_until_the_graph_holds`]
+//! `spawn_detached_daemon` uses), `common::trigger_activation` asks it to
+//! walk (GM-395 slice 2: nothing is walked until a tool call asks), and
+//! [`Project::wait_until_the_graph_holds`]
 //! blocks until the lock is *provably* held (a row from the batch that just
 //! ran `apply_diff` is visible, and `commit` only reaches the hold after
 //! that). Only then does [`attach`] connect a client - to a daemon already
@@ -290,6 +292,9 @@ async fn initialize_and_tools_list_answer_quickly_while_a_batch_commit_holds_the
     std::fs::write(&hold_file, b"").expect("failed to plant the lock-hold file");
 
     spawn_daemon_holding_the_lock(&mut project, &hold_file);
+    // GM-395 slice 2: the daemon walks nothing until a tool call asks, so the
+    // walk (and the hold inside it) has to be triggered first.
+    common::trigger_activation(project.root());
     // Confirms the lock is genuinely held right now, not merely that
     // `IndexingStatus` reads as indexing - which never needed this fix at
     // all, see `daemon::indexing_status`'s own "GM-394" doc section for the
@@ -353,6 +358,7 @@ async fn a_tool_call_issued_while_the_lock_is_held_waits_and_then_answers_in_ful
     std::fs::write(&hold_file, b"").expect("failed to plant the lock-hold file");
 
     spawn_daemon_holding_the_lock(&mut project, &hold_file);
+    common::trigger_activation(project.root());
     project.wait_until_the_graph_holds("connect");
     let client = attach(&project).await;
 
