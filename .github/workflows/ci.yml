@@ -241,9 +241,9 @@ jobs:
       # gate on a condition we had already decided to defer. The gate was not
       # wrong; enabling it before the findings were dealt with was.
       #
-      # So it stays non-fatal until GM-347 settles `$Force` and the
-      # `Write-Log` collision. Then `continue-on-error` comes off and this
-      # becomes a gate on a file that passes it. The general rule the mistake
+      # So it stayed non-fatal until GM-347 settled `$Force` (see below for
+      # where `Write-Log` went). Then `continue-on-error` came off and this
+      # became a gate on a file that passes it. The general rule the mistake
       # illustrates: a check that can skip everything after it must be green
       # on the day it becomes required.
       #
@@ -257,22 +257,32 @@ jobs:
       # Latest` a call from any other scope would throw rather than default to
       # false. Filed rather than fixed blind: nothing has ever executed this
       # script (GM-333), so "it works today" is itself unverified.
-      - name: install.ps1 lint (non-fatal until GM-347)
+      #
+      # GM-347 settled `$Force` (Test-InstallDir now declares it and
+      # Install-GMesh passes it; release.yml's GM-333 step executes both the
+      # refusal and the replacement), so `continue-on-error` is off. The
+      # `Write-Log` collision is its own question with its own evidence to
+      # gather (GM-392), so `PSAvoidOverwritingBuiltInCmdlets` is excluded by
+      # name until that lands - every other rule, `PSReviewUnusedParameter`
+      # included, now fails the job.
+      - name: install.ps1 lint
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        continue-on-error: true
         run: |
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber | Out-Null
           }
+          # GM-392 owns PSAvoidOverwritingBuiltInCmdlets (Write-Log).
           $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' `
-            -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost
+            -Severity Error,Warning `
+            -ExcludeRule PSAvoidUsingWriteHost, PSAvoidOverwritingBuiltInCmdlets
           if (-not $found) {
             Write-Host 'PSScriptAnalyzer: nothing to report'
             return
           }
           $found | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200 | Write-Host
-          Write-Host "::warning file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s) - non-fatal until GM-347"
+          Write-Host "::error file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s)"
+          exit 1
 
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate
@@ -359,12 +369,56 @@ jobs:
       # exercised for real rather than unit-tested (GM-299 lists it as
       # unverified). A Windows failure in this step is therefore information
       # about that path, not noise to route around.
+      #
+      # GM-390: the paragraph above says "unlike rustup's machine-wide
+      # rust-analyzer" and stopped there, which is exactly the gap. The
+      # conformance step below (`g-mesh plugins check`, and the same
+      # `plugins/python/conformance/project` fixture `cargo nextest run`
+      # exercises) runs pyright discovery with the *fixture's own copied
+      # temp workspace* as the project root - the copy the rejected
+      # alternative above would have polluted - which has no `node_modules`
+      # of its own and is not this `working-directory`. So
+      # `plugins/python/src/semantic.rs`'s two local candidates (`PATH`, and
+      # the indexed project's own `node_modules/.bin`) can never reach what
+      # this step just installed; only the third, network-dependent `npx`
+      # candidate can, and on x86_64-pc-windows-msvc it lost that race,
+      # `npx.cmd --version` not answering inside the 60s `PROBE_BUDGET`.
+      # Every prior green Windows run of this step proves only that npx won
+      # that same race before - never that this step's own install was
+      # reachable at all. The `.cmd`-shim path GM-299 wanted verified for
+      # real has therefore never actually been exercised by this job, on any
+      # of the four triples.
+      #
+      # `echo ... >> "$GITHUB_PATH"` closes that gap the same way rustup
+      # closes it for rust-analyzer: putting this install where the `PATH`
+      # candidate - not the network one - can find it, for every later step
+      # in this job, including the fixture-copied conformance run. This is
+      # not a wider timeout or a retry around the 60s bound; it makes the
+      # `PATH` candidate (tried first, and already the discovery order this
+      # module's doc calls out as "a global install over a project-local one
+      # over the network") actually win, so `npx` is no longer the only
+      # candidate that can succeed here. What still needs a Windows CI run to
+      # confirm: that `pyright.cmd` on `PATH` is actually found by
+      # `Command::new` there the way this repository's own host-independent
+      # unit tests for `script_spellings`/Decision 1b predict, since no
+      # Windows host is available to run this on directly.
       - name: Install pyright
         working-directory: plugins/python
         shell: bash
         run: |
           npm install pyright
           ./node_modules/.bin/pyright --version
+          # `pwd` here is Git Bash's own MSYS-style path on Windows
+          # (`/d/a/...`), which only that shell's process launcher
+          # understands - a later, non-bash consumer of `PATH` (like the
+          # `g-mesh` binary's own `CreateProcess` calls) needs the native
+          # `D:\...` spelling `cygpath -w` gives, which Git for Windows
+          # ships alongside this same `bash`.
+          bin_dir="$(pwd)/node_modules/.bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin_dir="$(cygpath -w "$bin_dir")"
+          fi
+          echo "$bin_dir" >> "$GITHUB_PATH"
 
       # The plugin's own suite (protocol.ts/extract.ts/bulkIndex.ts/
       # incremental.ts/semanticPass.ts unit and e2e tests) was not run in CI

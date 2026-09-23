@@ -356,18 +356,27 @@ build machine's own Node runtime and cannot be cross-built.
 
 ### Cutting a release
 
-1. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
+1. Push the release branch (`git push origin release-<version>`) and wait for
+   `ci.yml` to go green on its tip. Only then merge it. `ci.yml` runs on
+   `release-*` pushes, but a branch that is never pushed is never tested:
+   3.8.0 through 3.10.1 were merged locally and reached `main` without a
+   single CI run, which is how v3.10.0 was tagged with nothing to publish
+   (GM-391).
+2. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
    `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
    since GM-298, `plugins/python/Cargo.toml`, which must all agree with it —
-   already bumped to the new version) into `main`.
-2. Run `scripts/cut-release.sh <version>` on `main`. It verifies the crate
+   already bumped to the new version) into `main` with `--no-ff` and the
+   subject `merge: release-<version> into main`.
+3. Run `scripts/cut-release.sh <version>` on `main`. It refuses unless the
+   merged release commit is the tip of `origin/release-<version>` and has a
+   successful `ci.yml` run — so step 1 cannot be skipped silently. It verifies the crate
    version (every workspace member's, not only core's), working tree and
    branch state, runs `cargo test --workspace`, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the
    tag is what starts the public four-platform build and drafts a Release.
    Pass `--push` to push it in the same step, or run the printed
    `git push origin v<version>` yourself when ready.
-3. Once the build finishes, approve the draft on GitHub.
+4. Once the build finishes, approve the draft on GitHub.
 
 ## How it finds a project
 
