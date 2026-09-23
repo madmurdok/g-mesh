@@ -1212,8 +1212,8 @@ mod tests {
     ///
     /// # GM-390: reached through the injected sampler, not the real one
     ///
-    /// This used to call `check_memory_limit()`, the real, OS-backed sampler
-    /// - and so, exactly like `daemon::lifecycle`'s own acceptance test
+    /// This used to call `check_memory_limit()`, the real, OS-backed sampler -
+    /// and so, exactly like `daemon::lifecycle`'s own acceptance test
     /// before GM-340 fixed it there, depended on `sysinfo` reporting this
     /// fixture's 200MB buffer as over `memoryLimitMb` on *two* consecutive
     /// whole-system scans. Seen failing on x86_64-apple-darwin: a first scan
