@@ -304,11 +304,16 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// It used to be bound after the cold-start walk, so that a client could not
 /// reach a daemon whose graph was half built. Task 105 moved it ahead of the
 /// walk and put the same guarantee in the response layer instead: an accepted
-/// connection is answered with an explicit "still indexing" tool error until
-/// the walk commits (see `daemon::indexing_status`, which carries the full
-/// argument). Nobody is served off a partial graph either way; the difference
-/// is that a walk longer than `shim::BOOTSTRAP_TIMEOUT` now costs the caller a
-/// retry instead of costing it its whole tool surface.
+/// connection's handshake (`initialize`, `tools/list`) is answered
+/// immediately regardless of the walk, and a tool call that actually needs
+/// the graph waits for the walk to finish before answering in full rather
+/// than ever reading a half-built one (see `daemon::indexing_status`, which
+/// carries the full argument, and GM-394's own section there for why a wait
+/// replaced task 105's original "still indexing" tool error). Nobody is
+/// served off a partial graph either way; the difference from the old
+/// "bind only after the walk" ordering is that a walk longer than
+/// `shim::BOOTSTRAP_TIMEOUT` now costs the caller a wait instead of costing it
+/// its whole tool surface.
 ///
 /// The bind is deliberately the *first* slow-ish thing that happens, ahead of
 /// even the plugin spawn: the shim's bootstrap budget is a race against the
@@ -530,7 +535,7 @@ pub fn run(root: &Path) -> Result<()> {
 
     // Decided from a fact recorded on disk, not from how this start went, so
     // a restart against an already-walked project (the common case) is `ready`
-    // from its first instant and no caller ever sees "still indexing" for it.
+    // from its first instant and no caller is ever kept waiting for it.
     let indexing = if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
 
     // The accept loop moves to a thread of its own so the walk below can run
@@ -579,11 +584,12 @@ pub fn run(root: &Path) -> Result<()> {
 
     // Cold start only, and before the watcher is *drained*: a bulk walk racing
     // incremental updates could commit its own (older) parse of a file over
-    // one the watcher had just refreshed. Connections accepted while this runs are
-    // answered with `mcp`'s "still indexing" error rather than off the batches
-    // committed so far, so a client's query is never answered off a half-built
-    // graph - the same promise the old "bind only once this returns" ordering
-    // made, kept without making the client unreachable to make it. A failure
+    // one the watcher had just refreshed. A tool call issued while this runs
+    // waits for it to finish (`mcp::mod::GMeshMcpServer::still_indexing`)
+    // rather than ever being answered off the batches committed so far, so a
+    // client's query is never answered off a half-built graph - the same
+    // promise the old "bind only once this returns" ordering made, kept
+    // without making the client unreachable to make it. A failure
     // here is fatal for the same reason a failed plugin handshake is - an
     // empty index that looks like a working one is worse than a daemon that
     // says why it didn't start - and is recoverable: the completion marker
@@ -602,8 +608,9 @@ pub fn run(root: &Path) -> Result<()> {
         // *next* process walks again. Writing the marker second means any
         // outside observer of it (`cli::status`, the integration tests) can
         // only ever see it once real answers are already being given; the
-        // other order would let someone read "indexed" off the database and
-        // still be told "still indexing" by the daemon that wrote it.
+        // other order would let someone read "indexed" off the database while
+        // a tool call issued to this same daemon still waited on a flag that
+        // had not caught up to it.
         //
         // Ahead of the watcher for the same reason a project that owed no
         // walk starts out `ready`: the watcher only ever matters for edits

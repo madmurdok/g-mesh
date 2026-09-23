@@ -59,7 +59,6 @@ use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
-use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
@@ -101,37 +100,6 @@ impl Project {
 
     fn root(&self) -> &Path {
         self.dir.path()
-    }
-
-    /// Blocks until the walk has committed a node by this name, read straight
-    /// out of the index the daemon is writing (WAL, so a second process may
-    /// read it mid-transaction).
-    ///
-    /// This is what turns "the daemon refused" into "the daemon refused
-    /// *while holding the answer*": `WALK_DELAY_ENV` keeps the walk running
-    /// for seconds after its last commit, so a question asked once this
-    /// returns could have been answered correctly - and is deliberately not.
-    fn wait_until_the_graph_holds(&self, name: &str) {
-        let db = project_dir(self.root()).expect("failed to resolve the state directory").join("index.db");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let committed = Connection::open(&db)
-                .ok()
-                .and_then(|conn| {
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM nodes WHERE name = ?1 AND kind = 'Function'",
-                        [name],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .ok()
-                })
-                .unwrap_or(0);
-            if committed > 0 {
-                return;
-            }
-            assert!(Instant::now() < deadline, "the walk never committed a node named `{name}`");
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     /// Kills the daemon and its plugin the way a reboot would, leaving the
@@ -286,69 +254,65 @@ fn body(result: &CallToolResult) -> Value {
 }
 
 /// The headline case: a walk that outlasts the shim's bootstrap budget by
-/// three times over, and the client is served throughout - first the honest
-/// refusal, then, on the very same session, the real answer.
+/// three times over. The client is never lost (task 105's own criterion:
+/// connecting must not itself wait on the walk), and a tool call issued while
+/// the walk is still running waits for it rather than being refused - GM-394's
+/// owner decision, which replaced task 105/107's "answer `STILL_INDEXING`,
+/// with at most a short grace wait" with "never answer a tool call 'not
+/// ready' or partially; wait however long the walk actually takes and serve
+/// the real thing".
 #[tokio::test]
-async fn a_walk_that_outlasts_the_bootstrap_timeout_is_answered_with_still_indexing_rather_than_losing_the_client(
-) {
+async fn a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_losing_the_client() {
     let project = Project::new();
     // Warms the calibration cache (see `calibrate`) before the clock starts -
     // otherwise the one-off cost of measuring this machine's own speed would
     // count against the very budget it is calibrating, on whichever test
     // happens to run first.
     let hold_open = walk_held_open().await;
-    let started = Instant::now();
+
+    let connect_started = Instant::now();
     let client = connect_with(&project, Some(hold_open)).await;
-
-    let during_the_walk = find_definition(&client, "connect").await;
+    let connect_elapsed = connect_started.elapsed();
+    // Task 105's own criterion, unchanged by GM-394: reaching the daemon at
+    // all must not wait on the walk - the socket is bound long before the
+    // walk even starts.
     assert!(
-        started.elapsed() < hold_open,
-        "this call has to land while the walk is still running, and it took {:?} against a budget \
-         of {hold_open:?}",
-        started.elapsed()
+        connect_elapsed < hold_open,
+        "connecting must not itself wait on the walk, and it took {connect_elapsed:?} against a hold \
+         of {hold_open:?}"
     );
 
-    // A tool-level error, so no caller can mistake it for a complete answer -
-    // and one that names indexing, so no caller has to guess what to do next.
-    assert_eq!(during_the_walk.is_error, Some(true), "a half-built graph must not be answered from");
-    assert_eq!(
-        text(&during_the_walk),
-        g_mesh::mcp::STILL_INDEXING,
-        "the wording an agent acts on is part of the contract"
-    );
-    assert!(
-        text(&during_the_walk).contains("still being built"),
-        "the reason has to be indexing, not a bare failure: {}",
-        text(&during_the_walk)
-    );
+    // Dispatched while the walk is still running (by construction: `hold_open`
+    // outlasts the bootstrap budget several times over) - GM-394's own
+    // criterion is that this call waits for the walk rather than coming back
+    // early or with an error.
+    let call_started = Instant::now();
+    let result = find_definition(&client, "connect").await;
+    let call_elapsed = call_started.elapsed();
 
-    // The refusal above could still, on its own, have been an accident of an
-    // empty table: this early in the walk there genuinely is no `connect` node
-    // yet, and with the guard removed the call comes back "no symbol named
-    // 'connect' found" - a confident, well-formed, wrong answer, which is the
-    // whole failure being prevented. So ask again once the node *is*
-    // committed. Same refusal, with the answer sitting in the database: it is
-    // the flag doing the work, not the emptiness.
-    project.wait_until_the_graph_holds("connect");
-    let with_the_answer_committed = find_definition(&client, "connect").await;
-    assert_eq!(
-        with_the_answer_committed.is_error,
+    assert_ne!(
+        result.is_error,
         Some(true),
-        "a walk that has committed a node has still not committed the graph around it"
+        "a tool call issued during indexing must wait and then answer in full, never refuse: {}",
+        text(&result)
     );
-    assert_eq!(text(&with_the_answer_committed), g_mesh::mcp::STILL_INDEXING);
+    let node = body(&result);
+    assert_eq!(node["filePath"], "src/db/connection.ts");
+    assert_eq!(node["name"], "connect");
 
-    // Not the plain `wait_until_indexed` the other tests in this file use:
-    // this walk's own completion was deliberately pushed back by `hold_open`
-    // (see `calibrate`), which under real contention can be a large fraction
-    // of `common`'s default 90s budget on its own - so the wait for the real
-    // walk to finish has to get at least that much added on top, or a
-    // calibration generous enough to survive the connect race would leave
-    // this wait no room to survive the walk it was built to hold open.
-    common::wait_until_indexed_within(project.root(), hold_open + Duration::from_secs(90));
+    // Timing, not just the response shape, is the point: a call answered this
+    // fast could only mean the wait was skipped, since the walk was held open
+    // for `hold_open` on purpose. Some slack under `hold_open` itself absorbs
+    // ordinary scheduling noise without letting a skipped wait pass unnoticed.
+    assert!(
+        call_elapsed >= hold_open.mul_f64(0.8),
+        "a call served this fast looks like it did not actually wait for the walk: {call_elapsed:?} \
+         against a hold of {hold_open:?}"
+    );
 
     // Same client, same session, nothing reconnected or re-initialized: the
-    // status is consulted per call, so the next one simply works.
+    // status is consulted per call, so the next one simply works, same as it
+    // always has once a project is indexed.
     let after_the_walk = find_definition(&client, "connect").await;
     let node = body(&after_the_walk);
     assert_eq!(node["filePath"], "src/db/connection.ts");
@@ -380,8 +344,10 @@ async fn a_first_call_is_answered_normally_when_nothing_holds_the_walk_open() {
 /// Proven by the delay knob rather than by timing: the restarted daemon is
 /// started with the walk held open for far longer than this test's own
 /// patience, so if it walked at all - if the flag were set from anything other
-/// than the recorded `bulkIndexedAt` - the call below could only come back as
-/// "still indexing".
+/// than the recorded `bulkIndexedAt` - the call below (which now waits
+/// unconditionally rather than failing fast, see GM-394) could only hang
+/// until that artificially-extended walk finally finished, which this test's
+/// own patience does not survive.
 #[tokio::test]
 async fn a_restart_against_an_already_walked_project_never_reports_itself_as_still_indexing() {
     let project = Project::new();

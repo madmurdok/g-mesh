@@ -151,12 +151,14 @@ fn receive<R: Read>(reader: &mut BufReader<R>) -> Value {
 fn a_daemon_start_and_every_handled_request_advance_last_used_on_disk() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    // Waited out in full rather than just to the bind: a call answered with
-    // "still indexing" deliberately does not touch `lastUsed` (see
-    // `mcp::GMeshMcpServer::still_indexing` on why it must not take the
-    // SQLite mutex the walk is holding), and the daemon's own startup touch
-    // already covers the walk. This test is about what a *handled* request
-    // does, so it has to make one.
+    // Waited out in full rather than just to the bind: a call issued while
+    // the walk is still running now waits for it rather than answering "still
+    // indexing" (GM-394's `mcp::GMeshMcpServer::still_indexing`), and
+    // `prepare` calls that wait *before* `mark_used` - see its own doc
+    // comment - so a call dispatched here would only advance `lastUsed` once
+    // the walk finishes anyway. The daemon's own startup touch already covers
+    // the walk itself; this test is about what a *handled* request does, so
+    // it has to make one.
     wait_until_indexed(project.root());
 
     let after_start = project.last_used();

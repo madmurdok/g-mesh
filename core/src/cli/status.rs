@@ -13,10 +13,12 @@
 //!   accepting connections on the socket. Both, because either alone lies in
 //!   a way the other catches - a recycled pid looks alive, and a socket file
 //!   outlives the process that bound it. Note that "running" no longer
-//!   implies "ready to answer": since task 105 the socket is bound before the
-//!   cold-start walk, so a daemon can be running, listening, and still
-//!   answering every tool call with "still indexing" - which is what the
-//!   `index:` line below reports on.
+//!   implies "ready to answer at once": since task 105 the socket is bound
+//!   before the cold-start walk, so a daemon can be running and listening
+//!   while its first tool call is still waiting on that walk to finish
+//!   (GM-394 - it waits rather than erroring, so "answering" is no longer the
+//!   binary this note used to describe, just "answering slowly") - which is
+//!   what the `index:` line below reports on.
 //! - **Daemon build**: the stamp a live daemon publishes about the executable
 //!   it started from (`daemon::build_stamp`), compared with this command's
 //!   own. A daemon that outlived an upgrade answers every query correctly
@@ -76,10 +78,12 @@ const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"
 pub enum CoreState {
     /// Its pid is alive and its socket is bound. Says nothing about whether
     /// the index behind it is complete - a daemon in its cold-start walk
-    /// binds first and reports itself as still indexing per call (task 105).
-    /// `render` cross-references this with `IndexStatus::bulk_indexed` (task
-    /// 108) so a walk in progress reads as exactly that, not as a stuck
-    /// daemon next to an unrelated-looking "cold start still owed" line.
+    /// binds first and answers its handshake immediately, but a tool call
+    /// waits for the walk to finish before it answers (task 105, later
+    /// GM-394). `render` cross-references this with `IndexStatus::
+    /// bulk_indexed` (task 108) so a walk in progress reads as exactly that,
+    /// not as a stuck daemon next to an unrelated-looking "cold start still
+    /// owed" line.
     Running { pid: u32 },
     /// Its pid is alive but nothing answers on the socket. Since the bind
     /// moved ahead of the cold-start walk this no longer covers a daemon that

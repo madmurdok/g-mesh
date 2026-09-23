@@ -135,27 +135,84 @@ impl EmbeddingPipeline {
     /// ONNX runtime error) is reported and skipped, not allowed to lose the
     /// rest of the diff's embeddings or - worse - the diff's already-committed
     /// rows.
+    ///
+    /// A thin composition of [`compute`](Self::compute) and
+    /// [`store`](Self::store) - see their doc comments for why GM-394 split
+    /// what used to be one method into two. `watcher::apply::round_trip` is
+    /// the caller this composed form still exists for: it is handed an
+    /// already-locked `conn` by `daemon::plugin::PluginProcess::
+    /// apply_file_change` and has no lock of its own to release between the
+    /// two halves, so splitting the call there would buy it nothing - one
+    /// file's worth of inference is nowhere near a bulk batch's.
     pub fn apply(&self, conn: &Connection, diff: &Diff) -> Result<()> {
-        let Some(model) = self.model() else { return Ok(()) };
+        let computed = self.compute(diff);
+        self.store(conn, &computed);
+        Ok(())
+    }
+
+    /// The database-free half of [`apply`](Self::apply): runs every upserted
+    /// node in `diff` with embeddable text through the model and returns
+    /// `(node_id, embedding)` for each one that succeeded. Empty, quickly, if
+    /// no model is loaded (or loadable) - the same fast path `apply` always
+    /// had.
+    ///
+    /// GM-394: split out so a caller that holds `conn` behind a lock other
+    /// connections need can run this - pure CPU (or, on the model's first
+    /// use, a one-time synchronous load measured at multi-second - see this
+    /// module's own "Where the model lives" section) with no database access
+    /// at all - *before* taking that lock, rather than while holding it.
+    /// `daemon::bulk_index::commit` is exactly that caller: a batch of
+    /// `BATCH_ITEMS` nodes' worth of inference used to run inside the same
+    /// `Mutex::lock` every MCP handler takes, which is what let a bulk walk's
+    /// embedding step block `mcp::mod::GMeshMcpServer::get_info` for as long
+    /// as the batch's inference took.
+    ///
+    /// Best-effort per node, exactly as `apply` always was: one node's
+    /// inference failing is reported and skipped, never allowed to lose the
+    /// rest of the diff's embeddings.
+    pub fn compute(&self, diff: &Diff) -> Vec<(String, Vec<f32>)> {
+        let Some(model) = self.model() else { return Vec::new() };
+        let mut computed = Vec::new();
+        for node in &diff.upsert_nodes {
+            let Some(text) = text_to_embed(node.doc_comment.as_deref(), node.signature.as_deref()) else {
+                continue;
+            };
+            match model.embed(&text) {
+                Ok(embedding) => computed.push((node.id.clone(), embedding)),
+                Err(err) => eprintln!(
+                    "g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded",
+                    node.id
+                ),
+            }
+        }
+        computed
+    }
+
+    /// The database-writing half of [`apply`](Self::apply): stores every
+    /// `(node_id, embedding)` pair [`compute`](Self::compute) produced, and
+    /// records the active embedding model - both no-ops when `computed` is
+    /// empty, which also covers "no model loaded" (`compute` never returns
+    /// anything in that case), so a disabled pipeline still never claims an
+    /// active model, matching `apply`'s original contract.
+    ///
+    /// Best-effort per node, same as `compute`'s own inference step: a single
+    /// row failing to store is reported and skipped, not allowed to lose the
+    /// rest of the batch.
+    pub fn store(&self, conn: &Connection, computed: &[(String, Vec<f32>)]) {
+        if computed.is_empty() {
+            return;
+        }
         if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.config.model) {
             eprintln!("g-mesh daemon: failed to record the active embedding model ({err:#})");
         }
-        for node in &diff.upsert_nodes {
-            if let Err(err) = embed_node(
-                model,
-                conn,
-                &node.id,
-                node.doc_comment.as_deref(),
-                node.signature.as_deref(),
-                &self.config.model,
-            ) {
+        for (node_id, embedding) in computed {
+            if let Err(err) = vectors::insert(conn, node_id, embedding, &self.config.model) {
                 eprintln!(
-                    "g-mesh daemon: failed to embed node {} ({err:#}) - it is left unembedded",
-                    node.id
+                    "g-mesh daemon: failed to store the embedding for node {node_id} ({err:#}) - it is \
+                     left unembedded"
                 );
             }
         }
-        Ok(())
     }
 }
 
@@ -277,5 +334,46 @@ mod tests {
         let recorded: Option<String> =
             conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
         assert_eq!(recorded, None, "a disabled pipeline must never claim an active model either");
+    }
+
+    /// GM-394's own split, exercised directly rather than only through
+    /// `apply`'s composition: a disabled pipeline's [`EmbeddingPipeline::compute`]
+    /// touches no database at all (it takes no `Connection` to touch), and
+    /// its empty result makes [`EmbeddingPipeline::store`] a no-op too -
+    /// mirroring `a_disabled_pipeline_applies_as_a_no_op` one layer down, so
+    /// a regression that reintroduced a `set_embedding_model` write inside
+    /// `store` for an empty `computed` slice (or a `compute` that returned
+    /// something for a disabled pipeline) would fail here without needing a
+    /// real model.
+    #[test]
+    fn compute_and_store_compose_to_the_same_no_op_a_disabled_pipeline_gives_apply() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+
+        let pipeline = EmbeddingPipeline::disabled();
+        let diff = Diff {
+            upsert_nodes: vec![crate::storage::write::NodeRecord::new(
+                "n1",
+                "Function",
+                "foo",
+                "foo",
+                "src/lib.rs",
+                "rust",
+            )],
+            ..Default::default()
+        };
+
+        let computed = pipeline.compute(&diff);
+        assert!(computed.is_empty(), "a disabled pipeline must compute no embeddings");
+
+        pipeline.store(&conn, &computed);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "storing an empty computed list must write no vector row");
+
+        let recorded: Option<String> =
+            conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(recorded, None, "storing an empty computed list must not claim an active model");
     }
 }
