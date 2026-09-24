@@ -24,6 +24,14 @@ Everything else goes somewhere other than the comment, never into it:
   actually embodied — never per function. A decision that shaped ten
   functions gets one link, not ten.
 
+**A comment that mixes these is split, not kept or dropped whole.** Keep
+the sentence that states the present invariant, rewritten in the present
+tense with no ticket id ("Unchanged by GM-294: X is checked before Y"
+becomes "X is checked before Y"). Drop the history. If the "because" is a
+design choice (why this and not an alternative), it goes to an ADR; if it
+only says what breaks when the invariant is violated, it stays as part of
+the invariant.
+
 This rule **overrides "match the surrounding comment density."** A file
 full of history comments is not a style to match; it's exactly what this
 rule removes. Don't add a new history comment because the ones around it
