@@ -284,6 +284,97 @@ jobs:
           Write-Host "::error file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s)"
           exit 1
 
+      # GM-392 TEMP - remove in S2.
+      #
+      # PSAvoidOverwritingBuiltInCmdlets (excluded above) claims `Write-Log`
+      # collides with a built-in cmdlet, but that claim comes from the rule's
+      # compatibility profile (a recorded cmdlet list for
+      # "core-6.1.0-windows"), not from what actually resolves on a real
+      # Windows runner. This step and the next one answer that directly, on
+      # both shells the `irm | iex` install path can run under. Diagnostic
+      # only - it never fails the job.
+      #
+      # install.ps1's very last line unconditionally calls `Install-GMesh`
+      # (real download/verify/unpack), so it can run piped into `iex` with no
+      # argv. Dot-sourcing the file as-is would therefore execute a real
+      # install. Instead this strips exactly that last line and dot-sources
+      # the rest, which loads every function and top-level variable
+      # (`Write-Log` included) without running the installer.
+      - name: GM-392 TEMP - Write-Log collision diagnostics (pwsh 7)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host '=== GM-392 TEMP [pwsh] PSVersionTable ==='
+          $PSVersionTable | Format-List | Out-String | Write-Host
+
+          Write-Host '=== GM-392 TEMP [pwsh] clean session, BEFORE dot-sourcing install.ps1 ==='
+          Write-Host '--- Get-Command Write-Log ---'
+          Get-Command Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Command -All Write-Log ---'
+          Get-Command -All Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Module -ListAvailable exporting Write-Log ---'
+          Get-Module -ListAvailable | Where-Object { $_.ExportedCommands.Keys -contains 'Write-Log' } |
+            Format-List Name, Version, Path | Out-String | Write-Host
+
+          $raw = Get-Content -Path 'scripts/install.ps1'
+          if ($raw[-1] -notmatch '^Install-GMesh -Version') {
+            Write-Host "::error::GM-392 TEMP [pwsh]: install.ps1's last line no longer matches what this diagnostic strips - update it"
+            exit 1
+          }
+          $funcsOnly = $raw[0..($raw.Count - 2)] -join "`n"
+          $tmp = Join-Path $env:RUNNER_TEMP 'gm392-install-funcs-only-pwsh.ps1'
+          Set-Content -Path $tmp -Value $funcsOnly
+          . $tmp
+
+          Write-Host '=== GM-392 TEMP [pwsh] AFTER dot-sourcing install.ps1 function definitions only (no install ran) ==='
+          Write-Host '--- Get-Command Write-Log ---'
+          Get-Command Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Command -All Write-Log ---'
+          Get-Command -All Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Module -ListAvailable exporting Write-Log ---'
+          Get-Module -ListAvailable | Where-Object { $_.ExportedCommands.Keys -contains 'Write-Log' } |
+            Format-List Name, Version, Path | Out-String | Write-Host
+
+      # GM-392 TEMP - remove in S2. Same diagnostic as above, under Windows
+      # PowerShell 5.1 (`shell: powershell`) - the other shell the
+      # `irm | iex` one-liner can run under.
+      - name: GM-392 TEMP - Write-Log collision diagnostics (Windows PowerShell 5.1)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Write-Host '=== GM-392 TEMP [powershell 5.1] PSVersionTable ==='
+          $PSVersionTable | Format-List | Out-String | Write-Host
+
+          Write-Host '=== GM-392 TEMP [powershell 5.1] clean session, BEFORE dot-sourcing install.ps1 ==='
+          Write-Host '--- Get-Command Write-Log ---'
+          Get-Command Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Command -All Write-Log ---'
+          Get-Command -All Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Module -ListAvailable exporting Write-Log ---'
+          Get-Module -ListAvailable | Where-Object { $_.ExportedCommands.Keys -contains 'Write-Log' } |
+            Format-List Name, Version, Path | Out-String | Write-Host
+
+          $raw = Get-Content -Path 'scripts/install.ps1'
+          if ($raw[-1] -notmatch '^Install-GMesh -Version') {
+            Write-Host "::error::GM-392 TEMP [powershell 5.1]: install.ps1's last line no longer matches what this diagnostic strips - update it"
+            exit 1
+          }
+          $funcsOnly = $raw[0..($raw.Count - 2)] -join "`n"
+          $tmp = Join-Path $env:RUNNER_TEMP 'gm392-install-funcs-only-ps51.ps1'
+          Set-Content -Path $tmp -Value $funcsOnly
+          . $tmp
+
+          Write-Host '=== GM-392 TEMP [powershell 5.1] AFTER dot-sourcing install.ps1 function definitions only (no install ran) ==='
+          Write-Host '--- Get-Command Write-Log ---'
+          Get-Command Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Command -All Write-Log ---'
+          Get-Command -All Write-Log -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
+          Write-Host '--- Get-Module -ListAvailable exporting Write-Log ---'
+          Get-Module -ListAvailable | Where-Object { $_.ExportedCommands.Keys -contains 'Write-Log' } |
+            Format-List Name, Version, Path | Out-String | Write-Host
+
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate
       # red on code nobody had touched. Same reasoning as the ShellCheck pin -
