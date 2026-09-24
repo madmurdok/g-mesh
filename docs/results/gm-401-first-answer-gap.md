@@ -413,3 +413,190 @@ A follow-up check found nothing left over:
 $ ps -axo pid,command | grep -E 'g-mesh (daemon|mcp-shim)|bulk-index|wt-gm401-ctl' | grep -v grep
 (no output)
 ```
+
+## Upgrade from 3.11.1 (GM-402)
+
+Slice S1 (measure) of GM-402. Question: when a project's index was built by
+g-mesh 3.11.1 and a 3.12.0 daemon opens it, does the daemon wipe and re-walk
+it, and does the re-walk write `indexed_files` staleness baselines (the
+table GM-401 made the bulk walk populate)?
+
+### Verdict
+
+**Yes, the upgrade gets baselines** - but the generation mismatch that
+triggers the wipe+rewalk is driven entirely by the Python and Rust plugins'
+release-version bump, not by anything that changed in what a plugin
+actually does. The bundled TypeScript plugin - the one plugin this
+fixture's own language exercises - is byte-for-byte identical between the
+two releases, dist output included, and never moves the digest on its own.
+
+### What `plugins_digest` hashes
+
+`daemon::registry::indexer_version` = `CURRENT_INDEXER_VERSION + "+" +
+plugins_digest(discovered)`
+(`core/src/daemon/registry.rs:296`). `plugins_digest` re-hashes, over every
+*discovered* plugin sorted by language, `(language, plugin::fingerprint(manifest))`.
+`fingerprint` (`core/src/daemon/plugin.rs:520`, `digest_of_plugin_build`)
+hashes every regular file's path/length/bytes under that plugin's
+`manifest_dir`, skipping only `.git`, `node_modules`, `__pycache__`,
+`.venv`, `venv`, `.pytest_cache` (`BASELINE_FINGERPRINT_IGNORE`) plus a
+manifest's own `fingerprint_ignore`. `manifest_dir` is "this plugin's own
+directory - the one `plugin.toml` was read from" (`core/src/daemon/manifest.rs:337`):
+in a dev checkout that is the whole `plugins/<language>/` tree (source,
+`dist/`, tests, `Cargo.toml`/`package.json`, README - everything except the
+ignored dirs); in an installed layout (`scripts/bundle-*-plugin.sh`) it is
+the much smaller staged directory (a generated `plugin.toml` plus the
+compiled executable, `node_modules` pruned to prebuilt addons and ignored
+either way).
+
+Discovery (`daemon::manifest::discover`) scans **every** bundled plugin
+under `plugins/` unconditionally - not just the languages a project
+contains - so a pure-TypeScript project's generation still depends on the
+Python, Rust and Go plugins' fingerprints.
+
+### Which plugins actually changed between 3.11.1 and 3.12.0
+
+`git diff --stat release-3.11.1 release-3.12.0 -- plugins`:
+
+```
+ plugins/python/Cargo.toml  | 2 +-
+ plugins/python/plugin.toml | 2 +-
+ plugins/rust/Cargo.toml    | 2 +-
+ plugins/rust/plugin.toml   | 2 +-
+ plugins/sdk/Cargo.toml     | 2 +-
+ 5 files changed, 5 insertions(+), 5 deletions(-)
+```
+
+Every changed line is a `version`/`plugin_version` bump, `3.11.1` ->
+`3.12.0` - the release commit `0d122a7` ("chore: bump the workspace to
+3.12.0"). `plugins/typescript` and `plugins/go` have **zero** diff at all.
+Confirmed live, freshly built, in the two build worktrees (`wt-gm402-old`
+at `2483483`/release-3.11.1, `wt-gm402` at `2049f8f`/release-3.12.0), each
+after `cd plugins/typescript && npm ci && npm run build`:
+
+```
+$ diff -rq -x node_modules /path/to/wt-gm402-old/plugins/typescript /path/to/wt-gm402/plugins/typescript
+(no output)
+```
+
+- The `tsc`-compiled `dist/` tree, `src/version.generated.ts` (written by the
+  `prebuild` script from `package.json`'s own `version`, unrelated to the
+  g-mesh release number), everything - byte-identical, because
+  `plugins/typescript/package.json`'s `version` (`2.2.0`) itself did not
+  change between these releases.
+- `g-mesh plugins list`, run against each worktree's freshly built release
+  binary (`G_MESH_HOME` pointed at a throwaway dir, no project needed - this
+  is static discovery, not daemon state):
+
+  ```
+  # 3.11.1 (wt-gm402-old)
+  go          0.2.0    bundled  ...
+  python      3.11.1   bundled  ...
+  typescript  2.2.0    bundled  ...
+  rust        3.11.1   bundled  ...
+
+  # 3.12.0 (wt-gm402)
+  go          0.2.0    bundled  ...
+  python      3.12.0   bundled  ...
+  typescript  2.2.0    bundled  ...
+  rust        3.12.0   bundled  ...
+  ```
+
+  This is `registry.rs`'s documented "two rules, not one": Python and Rust
+  join the core Cargo workspace and get bumped in lockstep with every
+  g-mesh release; TypeScript and Go each track their own independent
+  manifest of record and only move when that plugin's own version changes.
+  On this release pair, only the core-versioned half moved.
+
+### Measured generation, re-walk and baselines
+
+Fixture: `/tmp/gm402/proj` - `a.ts` (exports `add`/`mul`), `b.ts` (imports
+`add`), `main.rs` (a `fn main`) - with `G_MESH_HOME=/tmp/gm402/home`, kept
+under `/tmp` for the socket path limit. `wt-gm402-old` and `wt-gm402` were
+each built with `cd plugins/typescript && npm ci && npm run build`, then
+`cargo build --release --workspace` (10m32s / 10m29s) and `cargo build
+--workspace` (4m37s / 4m40s, needed because the checked-in
+`plugins/{python,rust}/plugin.toml` name `../../target/debug/...` -
+GM-404). Machine was under heavy load throughout (1m load 46-583 across the
+session). A raw MCP client (`gm402/client_gm402.py`, adapted from GM-401's
+`client.py`) drove one `get_file_outline` call per run over `g-mesh
+mcp-shim`.
+
+**Which plugin binaries each daemon actually spawned** (from the daemon
+logs): `[g-mesh-go]` (no `.go` files - 0 nodes both times), `python` (no
+`.py` files - 0 nodes both times, spawned from each worktree's own
+`target/debug/g-mesh-plugin-python`), `[rust]` (`target/debug/g-mesh-plugin-rust`,
+1 file/2 nodes/1 edge), `[g-mesh-js-ts]`/`typescript` (`node` running
+`plugins/typescript/dist/src/index.js`, 2 files/7 nodes/8 edges). Same set
+for both the 3.11.1 and 3.12.0 runs.
+
+1. **Index with 3.11.1** (`target/release/g-mesh`, fresh `G_MESH_HOME`),
+   one `get_file_outline` on `a.ts`:
+   - `meta`: `indexer_version = 2+bae6159303144660`, `bulkIndexedAt` and
+     `semanticPassAt` both set.
+   - Daemon log: `initial index built - 9 nodes, 9 edges (1 imports linked
+     to their target file)`.
+   - `indexed_files`: **1 row** (`a.ts` only) - exactly GM-401's diagnosed
+     gap: the bulk walk (pre-fix, this binary predates it) writes no
+     baseline, so the one file this run happened to query got its baseline
+     only from the per-query synchronous reindex path (`[g-mesh-js-ts] file
+     changed: a.ts` in the log), not from the walk.
+   - `nodes`: 9. Stopped cleanly with `g-mesh stop`.
+2. **Open the same `G_MESH_HOME` with 3.12.0** (`target/release/g-mesh`,
+   `G_MESH_TRACE_CALLS=1`), one `get_file_outline` on the same, unedited
+   `a.ts`:
+   - Daemon log opens with `index (re)initialized - a full reindex is
+     needed`, then a full bulk walk across all four languages
+     (`[g-mesh-go]`/`python`/`[rust]`/`[g-mesh-js-ts] bulk index complete`),
+     then `initial index built - 9 nodes, 9 edges (1 imports linked to
+     their target file)` - the wipe-and-rewalk did happen.
+   - `meta` afterward: `indexer_version = 2+d954a1d18f856e46` - different
+     from `2+bae6159303144660`, `CURRENT_INDEXER_VERSION` itself unchanged
+     ("2" on both sides, confirmed with `git diff` on `schema.rs`). The
+     mismatch is exactly the Python/Rust version-bump digest change above.
+   - `indexed_files` after the rewalk: **3 rows** (`a.ts`, `b.ts`,
+     `main.rs`) - every walked file, confirming GM-401's fix (present in
+     this 3.12.0 build, `bulk_index.rs`'s `record_walk_baselines` call)
+     applies to a fresh post-upgrade walk exactly as it does to any other
+     fresh walk.
+   - Trace line for the query itself: `g-mesh daemon: ensure_fresh:
+     tool=get_file_outline request=2 file=a.ts outcome=AlreadyFresh
+     elapsed_ms=0 progress_sent=0` - the first post-upgrade query on an
+     unedited file is the fast path, not a synchronous reindex.
+   - `nodes`: 9 (same fixture, same graph).
+
+### Does this generalize to a release-archive upgrade?
+
+Yes, for the mechanism actually observed here, by reading (not running)
+`scripts/bundle-rust-plugin.sh` and `scripts/bundle-python-plugin.sh`: each
+stages an installed `plugin.toml` "derived from [the checked-in] file with
+only its `command` line rewritten" - so the `plugin_version = "3.12.0"`
+line that changed above is staged into the release archive unmodified, and
+an archive install's Python/Rust fingerprints move the same way a checkout's
+do. Since Python and Rust are re-versioned to the core's own release number
+on every release (not just this one - `registry.rs`'s "core version" half
+of the two-rules split), a release-archive user upgrading between *any* two
+g-mesh releases should see the same generation mismatch and the same
+wipe+rewalk, independent of whether the TypeScript plugin's own build
+happens to change.
+
+What was **not** verified: whether `scripts/bundle-plugin.sh`'s Node SEA
+build is itself byte-reproducible across two otherwise-identical releases
+(unchanged `plugins/typescript` source, as here). That question is moot for
+the generation check as it exists today - Python/Rust already force a
+mismatch on every release - but it would matter if that pair ever stopped
+moving (e.g. a release that touches neither), since it is currently the
+only thing making the TypeScript-relevant half of the digest move at all.
+Running the actual bundlers on both releases and diffing the staged
+directories would settle it; this slice did not build release archives.
+
+### Cleanup
+
+```
+$ ps -axo pid,command | grep -E 'g-mesh (daemon|mcp-shim)|bulk-index' | grep gm402
+(no output)
+```
+
+`wt-gm402-old` (the 3.11.1 build worktree) was removed with `git worktree
+remove --force` once both runs were done - it existed only to build the old
+release.
