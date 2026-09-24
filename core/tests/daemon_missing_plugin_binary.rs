@@ -1,8 +1,15 @@
 //! GM-316: a discovered plugin whose `command` is a cargo-workspace binary
-//! that was never built must fail daemon startup with a message naming the
+//! that was never built must fail the walk with a message naming the
 //! binary, the fact it was never built, and `cargo build --workspace` - not
 //! the bare `No such file or directory (os error 2)` `Command::spawn`
 //! reports on its own.
+//!
+//! GM-395 slice 2 changed *where* that message goes. The walk no longer
+//! runs at daemon startup but on the first tool call, and a failed walk no
+//! longer ends the daemon - that would drop the session of the very call
+//! that asked. So the message now comes back as that call's tool error, and
+//! the daemon keeps serving (and retries the walk on the next call - see
+//! `lazy_activation.rs`).
 //!
 //! Traced while verifying GM-301: a worktree where `cargo build --workspace`
 //! had not been run failed `cargo test -p g-mesh --test cli_stop` with
@@ -17,7 +24,8 @@
 //! a plugin pid timed out naming the daemon, because the daemon's cold-start
 //! walk had already failed and nothing had spawned.
 //!
-//! This exercises the real `g-mesh daemon` binary against a fixture plugin
+//! This exercises the real `g-mesh daemon` binary, through a real shim,
+//! against a fixture plugin (`common::missing_workspace_binary_plugin_root`)
 //! whose `command` points at a `target/debug/` binary that is deliberately
 //! never created - the same shape as the real bug, without needing an actual
 //! cargo build to reproduce it - the same approach
@@ -25,12 +33,14 @@
 //! `discover()`-time failure.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
-use g_mesh::protocol::types::CURRENT_PROTOCOL_VERSION;
 use g_mesh::storage::connection::project_dir;
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::ServiceExt;
+use serde_json::json;
+use tokio::process::Command;
 
 mod common;
 
@@ -52,112 +62,80 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
+        if let Ok(path) = daemon::pid_path(self.root()) {
+            common::kill_pid_file(&path);
+        }
+        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+            endpoint.clear_stale();
+        }
         if let Ok(state) = project_dir(self.root()) {
             let _ = std::fs::remove_dir_all(&state);
         }
     }
 }
 
-/// A discovery root with one plugin - "python", matching the real bundled
-/// plugin's directory name - whose `command` names a `target/debug/`
-/// binary that is never created. A `Cargo.toml` sits beside it so the fixed
-/// message's "Run `cargo build --workspace` in <root>" branch has a real
-/// workspace root to name, exactly like the real repository root does for
-/// the genuine bundled plugin.
-fn missing_workspace_binary_plugin_root() -> (tempfile::TempDir, std::path::PathBuf) {
-    let root = tempfile::tempdir().expect("failed to create a plugin discovery root");
-    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
-        .expect("failed to write a fixture Cargo.toml");
-
-    let dir = root.path().join("python");
-    std::fs::create_dir_all(&dir).expect("failed to create a fixture plugin directory");
-
-    let binary = root.path().join("target").join("debug").join("g-mesh-plugin-python");
-    // Deliberately not created - this is the "never built" case.
-
-    let manifest = format!(
-        r#"
-[plugin]
-language = "python"
-protocol_version = {version}
-plugin_version = "0.1.0"
-
-[plugin.spawn]
-command = "{command}"
-
-[plugin.languages]
-extensions = [".py"]
-"#,
-        version = CURRENT_PROTOCOL_VERSION,
-        // TOML string: escape backslashes for a Windows path.
-        command = binary.display().to_string().replace('\\', "\\\\"),
-    );
-    std::fs::write(dir.join("plugin.toml"), manifest).expect("failed to write a fixture plugin.toml");
-
-    (root, binary)
+fn text(result: &CallToolResult) -> String {
+    match &result.content[0] {
+        ContentBlock::Text(block) => block.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    }
 }
 
-#[test]
-fn a_missing_workspace_built_plugin_binary_fails_daemon_startup_naming_the_build_command() {
+#[tokio::test]
+async fn a_missing_workspace_built_plugin_binary_is_a_tool_error_naming_the_build_command() {
     let project = Project::new();
-    let (plugin_root, binary) = missing_workspace_binary_plugin_root();
+    let (plugin_root, binary) = common::missing_workspace_binary_plugin_root();
 
-    let mut daemon = Command::new(BIN)
-        .arg("daemon")
-        .arg("--project-root")
-        .arg(project.root())
-        .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugin_root.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn the daemon");
+    let root = project.root().to_path_buf();
+    let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            // Inherited by the daemon the shim bootstraps.
+            .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugin_root.path())
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
+    }))
+    .expect("failed to spawn the shim");
+    let client = ().serve(transport).await.expect("the shim must reach the daemon");
 
-    let status = {
-        let timeout = common::startup_timeout();
-        let deadline = Instant::now() + timeout;
-        loop {
-            match daemon.try_wait().expect("failed to poll the daemon") {
-                Some(status) => break status,
-                None if Instant::now() >= deadline => {
-                    let _ = daemon.kill();
-                    panic!(
-                        "a daemon whose bulk index must hard-fail on a missing plugin binary did \
-                         not exit within {timeout:?} - it may be waiting on the plugin it can never \
-                         spawn instead of failing fast"
-                    );
-                }
-                None => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-    };
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("find_definition").with_arguments(
+                json!({ "symbol_name": "anything" })
+                    .as_object()
+                    .cloned()
+                    .expect("arguments literal is an object"),
+            ),
+        )
+        .await
+        .expect("a failed walk must come back as a tool result, not end the session");
 
+    assert_eq!(result.is_error, Some(true), "a failed walk must be a tool error: {}", text(&result));
+    let message = text(&result);
     assert!(
-        !status.success(),
-        "a missing workspace-built plugin binary must fail daemon startup, not exit cleanly: {status}"
-    );
-
-    let mut stderr = String::new();
-    use std::io::Read;
-    daemon.stderr.take().unwrap().read_to_string(&mut stderr).expect("failed to read the daemon's stderr");
-
-    assert!(
-        stderr.contains(&binary.display().to_string()),
-        "the error must name the missing binary's path: {stderr}"
+        message.contains(&binary.display().to_string()),
+        "the error must name the missing binary's path: {message}"
     );
     assert!(
-        stderr.contains("has not been built yet"),
-        "the error must say the binary was never built, not just that spawn failed: {stderr}"
+        message.contains("has not been built yet"),
+        "the error must say the binary was never built, not just that spawn failed: {message}"
     );
-    assert!(stderr.contains("cargo build --workspace"), "the error must name the fix: {stderr}");
+    assert!(message.contains("cargo build --workspace"), "the error must name the fix: {message}");
     assert!(
-        !stderr.contains("os error 2"),
+        !message.contains("os error 2"),
         "the raw OS error must not be the only thing surfaced - the hint should replace it, not \
-         merely accompany it: {stderr}"
+         merely accompany it: {message}"
     );
 
+    // The daemon keeps serving: the same session still answers, and the
+    // daemon is still listening for new ones.
+    let listed = client.list_tools(None).await.expect("the session must survive a failed walk");
+    assert!(!listed.tools.is_empty());
     assert!(
-        !daemon::is_listening(project.root()).unwrap(),
-        "a daemon that failed to start must not be answering connections"
+        daemon::is_listening(project.root()).unwrap(),
+        "a failed walk must not take the daemon down with it"
     );
+
+    client.cancel().await.expect("failed to shut the client down");
 }

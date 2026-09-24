@@ -39,6 +39,7 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
@@ -138,8 +139,24 @@ pub struct BulkIndexSummary {
 pub fn run(
     project_root: &Path,
     conn: &Mutex<Connection>,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
+) -> Result<BulkIndexSummary> {
+    run_with_progress(project_root, conn, embedding, discovered, None)
+}
+
+/// [`run`], also reporting how far it has got through `progress`'s walk
+/// counters - languages done out of total, the language being walked, and
+/// nodes plus edges ingested so far (GM-395 D6). Only the daemon's
+/// activation passes `Some`: a waiting tool call renders those counters into
+/// its progress notifications. The CLI's in-process walks have nobody to
+/// report to and call [`run`].
+pub fn run_with_progress(
+    project_root: &Path,
+    conn: &Mutex<Connection>,
+    embedding: Option<&EmbeddingPipeline>,
+    discovered: &DiscoveredPlugins,
+    progress: Option<&IndexingStatus>,
 ) -> Result<BulkIndexSummary> {
     let mut summary = BulkIndexSummary::default();
 
@@ -204,8 +221,17 @@ pub fn run(
     // shipped with it (`scripts/bundle-rust-plugin.sh` and its
     // not-yet-written Python counterpart), so a real end user with no
     // interest in Python never has a `target/debug/` path to be missing.
+    if let Some(progress) = progress {
+        progress.start_walk_progress(u32::try_from(manifests.len()).unwrap_or(u32::MAX));
+    }
     for manifest in manifests {
-        walk_one_language(project_root, manifest, conn, &mut summary, embedding)?;
+        if let Some(progress) = progress {
+            progress.mark_language_started(&manifest.language);
+        }
+        walk_one_language(project_root, manifest, conn, &mut summary, embedding, progress)?;
+        if let Some(progress) = progress {
+            progress.mark_language_done();
+        }
     }
 
     // Only now, with every language's stream over: an import can only be
@@ -247,7 +273,8 @@ pub(crate) fn walk_one_language(
     manifest: &PluginManifest,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     // Same check `daemon::plugin::PluginState::spawn` makes before spawning
     // the interactive process - see `plugin::missing_plugin_binary_hint`'s
@@ -284,7 +311,7 @@ pub(crate) fn walk_one_language(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -367,7 +394,8 @@ pub(crate) fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
@@ -396,6 +424,9 @@ pub(crate) fn ingest<R: BufRead>(
             }
         }
 
+        if let Some(progress) = progress {
+            progress.add_items_ingested(1);
+        }
         batched += 1;
         if batched >= BATCH_ITEMS {
             commit(conn, &mut batch, embedding)?;
@@ -433,18 +464,34 @@ pub(crate) fn ingest<R: BufRead>(
 /// `EmbeddingPipeline::store` together - both are ordinary SQLite writes, not
 /// inference, so there is nothing left inside it that scales with batch size
 /// the way inference did.
-fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipeline) -> Result<()> {
+///
+/// # GM-395: `embedding: None` for the cold-start walk
+///
+/// Since GM-395's slice 1, the cold-start walk (`run`'s only caller through
+/// `daemon::mod::run`, `cli::init`, `cli::reindex`) passes `None` here: the
+/// walk is structural-only now, and embedding moved out to its own pass
+/// (`embedding::backfill::run`), run once, project-wide, after every
+/// language's walk is linked - see that module's own doc comment. `None`
+/// skips both `compute` and `store` outright, which is strictly cheaper than
+/// calling them against a disabled pipeline (no model lookup, no per-node
+/// loop over an empty `Vec`). `daemon::workspace_reindex`'s per-language
+/// re-walk is the one caller that still passes `Some` - it is a full re-walk
+/// of one language, not the initial cold start, so its own embeddings still
+/// belong inline with it rather than waiting for the next backfill pass.
+fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
-    let computed = embedding.compute(batch);
+    let computed = embedding.map(|embedding| embedding.compute(batch)).unwrap_or_default();
     let mut conn = conn.lock().unwrap();
     apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
     hold_the_lock_open_for_tests();
     // Best-effort, like every other embedding call - see
     // `watcher::apply::round_trip`'s identical handling for why a failure
     // here must not undo (or fail) a batch that is already durable.
-    embedding.store(&conn, &computed);
+    if let Some(embedding) = embedding {
+        embedding.store(&conn, &computed);
+    }
     *batch = Diff::default();
     Ok(())
 }
@@ -552,7 +599,7 @@ mod tests {
 
     fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
-        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, &EmbeddingPipeline::disabled())?;
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None)?;
         Ok(summary)
     }
 
@@ -644,10 +691,8 @@ mod tests {
         assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
 
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
 
-        let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("the multi-language walk failed");
+        let summary = run(project.path(), &conn, None, &discovered).expect("the multi-language walk failed");
 
         assert_eq!(summary.nodes, 4, "both languages' nodes must be counted, not just one's");
         assert_eq!(summary.edges, 2, "both languages' edges must be counted, not just one's");
@@ -669,10 +714,8 @@ mod tests {
             .expect("the fixture plugin must discover cleanly");
 
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
 
-        let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("the single-language walk failed");
+        let summary = run(project.path(), &conn, None, &discovered).expect("the single-language walk failed");
 
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
@@ -687,11 +730,10 @@ mod tests {
     fn an_empty_discovery_walks_nothing_and_is_not_an_error() {
         let project = tempfile::tempdir().unwrap();
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
         let discovered = DiscoveredPlugins::default();
 
         let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("an empty discovery must not fail");
+            run(project.path(), &conn, None, &discovered).expect("an empty discovery must not fail");
 
         assert_eq!(summary, BulkIndexSummary::default());
         assert_eq!(count(&conn, "nodes"), 0);

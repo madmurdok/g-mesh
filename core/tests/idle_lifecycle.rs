@@ -305,6 +305,8 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     // Read before the walk is waited on, not after: the control-plane plugin
     // is idle for the whole cold start (the walk runs in a process of its
     // own), so it is entitled to fall asleep while that walk is still going.
+    // GM-395 slice 2: the daemon walks - and so spawns its plugin - only once a tool call asks.
+    common::trigger_activation(project.root());
     wait_for("the plugin to start", || plugin_pid_file.exists());
     let first_plugin_pid = recorded_pid(&plugin_pid_file);
     assert!(daemon::is_process_alive(first_plugin_pid), "the plugin must be up before it can sleep");

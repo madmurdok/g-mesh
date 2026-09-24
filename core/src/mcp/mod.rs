@@ -38,17 +38,21 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use rmcp::model::{
+    CallToolResult, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::manifest::Capabilities;
 use crate::daemon::registry::PluginRegistry;
@@ -90,7 +94,23 @@ mod tool_result;
 ///
 /// Off unless asked for: a line per call would bury the log's real content on
 /// a busy daemon.
-fn trace_call(what: &str) {
+///
+/// GM-395 slice 3 widened what `prepare` traces, because M1 in
+/// `docs/architecture/lazy-indexing.md` reads its results off these lines:
+/// entry names the tool, the request id and whether the request carried a
+/// `progressToken` (the one fact about a client's behaviour the daemon can
+/// see and M1 cannot otherwise observe), and the end of the wait names its
+/// outcome, how long it waited and how many progress notifications it sent.
+/// The shapes, one line each:
+///
+/// ```text
+/// g-mesh daemon: prepare: entered tool=get_file_outline request=3 progressToken=present
+/// g-mesh daemon: prepare: wait over tool=get_file_outline request=3 outcome=satisfied waited_ms=4212 progress_sent=21
+/// g-mesh daemon: prepare: cancelled tool=get_file_outline request=3 waited_ms=900 progress_sent=4
+/// ```
+///
+/// `outcome` is `satisfied`, `failed` or `timed_out` (the D7 cap).
+fn trace_call(what: std::fmt::Arguments<'_>) {
     if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
         eprintln!("g-mesh daemon: {what}");
     }
@@ -98,6 +118,51 @@ fn trace_call(what: &str) {
 
 /// Turns on [`trace_call`]. Any non-empty value.
 pub const TRACE_CALLS_ENV: &str = "G_MESH_TRACE_CALLS";
+
+/// How often a tool call that is waiting for the index sends a progress
+/// notification, in milliseconds - only ever to a request that carried a
+/// `progressToken` (D6 in `docs/architecture/lazy-indexing.md`). `0` sends
+/// none at all, which is M1's "progress off" arm. Unset or unparsable means
+/// [`DEFAULT_PROGRESS_INTERVAL`].
+pub const PROGRESS_INTERVAL_ENV: &str = "G_MESH_PROGRESS_INTERVAL_MS";
+
+/// D6's heartbeat: often enough to keep an idle timer measured in tens of
+/// seconds or more alive, rarely enough to be no load at all.
+pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The longest a tool call waits for the index before it gives up with an
+/// explicit "still indexing, call again" tool error, in milliseconds (D7).
+/// `0` removes the cap. Unset or unparsable means [`DEFAULT_INDEX_WAIT_CAP`].
+pub const INDEX_WAIT_CAP_ENV: &str = "G_MESH_INDEX_WAIT_CAP_MS";
+
+/// D7's default: under Claude Code's 30 min stdio idle window, so even a call
+/// that carries no progress token ends with an answer the agent can act on
+/// before the client aborts it with one that says nothing about indexing.
+pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
+
+/// Reads a millisecond-valued env var, falling back to `default` when it is
+/// unset, empty or not a number. Read per call, not once per process: it is a
+/// few nanoseconds, and a knob that only took effect on the next daemon would
+/// be one more thing to get wrong in a test.
+fn env_millis(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// A wait duration for a person: `"950ms"`, `"42s"`, `"18m 5s"`.
+fn human_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs == 0 {
+        format!("{}ms", elapsed.as_millis())
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
 
 /// Serves one accepted connection as an MCP session until the peer
 /// disconnects. One session per connection, and the shim opens exactly one
@@ -165,27 +230,55 @@ impl GMeshMcpServer {
     /// Everything every handler owes before it reads the index, in the one
     /// order they may happen in.
     ///
+    /// `Ok(Some)` is a finished tool result the handler returns as is: a
+    /// failed walk ([`Phase::Failed`]), reported as a tool error carrying the
+    /// failure's message, or a wait that reached the D7 cap ("still
+    /// indexing, call again"). `Err` means the client cancelled the request
+    /// (or its session ended) while it waited - see
+    /// [`wait_for_index`](Self::wait_for_index). `tool` only names the call
+    /// in [`trace_call`]'s lines.
+    ///
     /// The order is not arbitrary:
     ///
-    /// 1. [`still_indexing`](Self::still_indexing) first: a project whose
-    ///    first walk has not finished has no graph to bring up to date, so
-    ///    every step after this one may assume the index is complete rather
-    ///    than each having to ask again. GM-394's owner decision is that this
-    ///    wait has no timeout and this method has nothing to return on its
-    ///    own account - see [`still_indexing`](Self::still_indexing)'s own
-    ///    doc comment for why a tool call is never answered "not ready".
+    /// 0. [`IndexingStatus::request_activation`] before anything else
+    ///    (GM-395 slice 2): the daemon builds nothing until a tool call
+    ///    needs it, so this is what starts the walk, the semantic pass and
+    ///    the embedding backfill pass - once, however many calls ask. It
+    ///    returns at once; the work runs on `daemon::activation`'s thread,
+    ///    independently of this call.
+    /// 1. [`wait_for_index`](Self::wait_for_index) next: a project that has
+    ///    not yet reached `need`'s phase has no graph (or no complete-enough
+    ///    graph) to bring up to date, so every step after this one may assume
+    ///    it does rather than each having to ask again. It never answers
+    ///    off a half-built graph; the one way it ends without the phase it
+    ///    needs is the D7 cap, which answers nothing at all - see
+    ///    [`wait_for_index`](Self::wait_for_index)'s own doc comment.
     /// 2. [`mark_used`](Self::mark_used) next: it takes and releases the
     ///    SQLite mutex on its own, and it must not be nested inside the plugin
     ///    lock the replay below holds (see `daemon::lifecycle`'s lock order).
     /// 3. The replay last, so the rows this call is about to read already
     ///    include every change made while the plugin was asleep.
-    async fn prepare(&self) {
-        trace_call("prepare: entered");
-        self.still_indexing().await;
-        trace_call("prepare: past the indexing wait");
+    async fn prepare(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        need: Need,
+    ) -> Result<Option<CallToolResult>, ErrorData> {
+        let token = ctx.meta.get_progress_token();
+        trace_call(format_args!(
+            "prepare: entered tool={tool} request={} progressToken={}",
+            ctx.id,
+            if token.is_some() { "present" } else { "absent" }
+        ));
+        self.indexing.request_activation();
+        if let Some(early) = self.wait_for_index(ctx, tool, need).await? {
+            return Ok(Some(early));
+        }
+        trace_call(format_args!("prepare: past the indexing wait tool={tool} request={}", ctx.id));
         self.mark_used();
         self.replay_queued_changes().await;
-        trace_call("prepare: done");
+        trace_call(format_args!("prepare: done tool={tool} request={}", ctx.id));
+        Ok(None)
     }
 
     /// Brings the index up to date with whatever changed while any language's
@@ -276,7 +369,8 @@ impl GMeshMcpServer {
         }
     }
 
-    /// Waits for the cold-start walk to finish, if it has not already.
+    /// Waits until the index has reached the phase `need` requires, if it has
+    /// not already.
     ///
     /// # GM-394: a tool call is never answered "not ready"
     ///
@@ -287,11 +381,47 @@ impl GMeshMcpServer {
     /// call may ever be answered "not ready" or partially while the index is
     /// being built - a caller retrying an error is strictly worse than a
     /// caller that simply waits a little longer for the truth - so this now
-    /// waits, with no timeout, for the walk to finish
-    /// (`daemon::indexing_status::IndexingStatus::wait_until_ready`) and lets
-    /// the handler serve the real answer. Keeping such a wait alive against a
-    /// client's own connection timeout - a progress notification, say - is
-    /// GM-395's job, not this one's.
+    /// waits - bounded only by the D7 cap below - for `need` to be satisfied
+    /// (`daemon::indexing_status::IndexingStatus::wait_for`) and lets the
+    /// handler serve the real answer.
+    ///
+    /// # GM-395 slice 3: progress, the wait cap and cancellation (D6, D7)
+    ///
+    /// Three things can end the wait besides the phase being reached, raced
+    /// in one `select!`:
+    ///
+    /// - **Progress.** While it waits, and only if the request carried a
+    ///   `progressToken` (the spec ties progress to a requester's token), a
+    ///   ticker sends `notifications/progress` every
+    ///   [`PROGRESS_INTERVAL_ENV`] (default 5 s). `progress` is the seconds
+    ///   waited so far - strictly increasing as the spec requires, which no
+    ///   work counter is (they stall while linking and during the one-time
+    ///   model load) - and `message` carries the real counters
+    ///   (`IndexingStatus::progress_message`). A send failure is logged and
+    ///   ignored: the client may already be gone, and the cancellation branch
+    ///   is what reacts to that.
+    /// - **The cap** ([`INDEX_WAIT_CAP_ENV`], default 25 min). On reaching
+    ///   it the call returns a tool error saying the index is still being
+    ///   built and no answer was computed. That does not break "never a
+    ///   partial answer": it answers no part of the question - no rows, no
+    ///   `hasMore` - it is an explicit, retryable precondition failure, and it
+    ///   only fires when a walk outlasts the cap. Without it a call with no
+    ///   progress token would outlive the client's own idle window and be
+    ///   killed with an error that says nothing about indexing.
+    /// - **Cancellation.** `ctx.ct` fires on `notifications/cancelled` for
+    ///   this request and when the session ends. The call returns an error at
+    ///   once (the client has stopped listening for it). Indexing itself runs
+    ///   on `daemon::activation`'s thread and does not notice (D2): the next
+    ///   call finds it running or finished.
+    ///
+    /// # GM-395: which phase `need` names is what makes structural tools stop
+    /// waiting on embeddings
+    ///
+    /// The seven structural tools pass [`Need::Structural`], satisfied the
+    /// moment the walk itself is linked - the embedding backfill pass
+    /// (`embedding::backfill::run`) may still be running, or not yet started,
+    /// and they do not care. `search_code` alone passes
+    /// [`Need::Embeddings`], satisfied only once that pass has finished.
     ///
     /// This is unrelated to why `get_info`/`instructions` never call this
     /// method at all: those run during MCP `initialize`, before a session has
@@ -305,16 +435,110 @@ impl GMeshMcpServer {
     /// commit, and asking it to record usage while that mutex might still be
     /// held would defeat the point of waiting here first.
     ///
-    /// The fast path - the walk was already done - never suspends: a project
-    /// that owes no walk, or one whose walk finished before this call
-    /// arrived, reads `is_indexing() == false` inside `wait_until_ready` and
-    /// returns on the spot. Only a call that actually lands mid-walk
-    /// suspends, and it suspends the task, not the worker thread it runs on
-    /// (see `daemon::serve_forever`'s two-worker runtime, and
-    /// `IndexingStatus`'s own doc comment for why a `Notify` rather than a
-    /// blocking primitive).
-    async fn still_indexing(&self) {
-        self.indexing.wait_until_ready().await;
+    /// The fast path - `need` was already satisfied - never suspends: a
+    /// project that owes no walk, or one whose walk finished before this call
+    /// arrived, resolves on the spot inside `wait_for`. Only a call that
+    /// actually lands before its phase is reached suspends, and it suspends
+    /// the task, not the worker thread it runs on (see
+    /// `daemon::serve_forever`'s two-worker runtime, and `IndexingStatus`'s
+    /// own doc comment for why a `Notify` rather than a blocking primitive).
+    async fn wait_for_index(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        need: Need,
+    ) -> Result<Option<CallToolResult>, ErrorData> {
+        let started = Instant::now();
+        let cap = env_millis(INDEX_WAIT_CAP_ENV, DEFAULT_INDEX_WAIT_CAP);
+        // `0` is "no cap": `checked_add` failing (a cap too large to be a
+        // real instant) means the same.
+        let deadline = if cap.is_zero() { None } else { started.checked_add(cap) };
+        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
+
+        // The ticker's first tick is one interval in, not immediately: a
+        // call that resolves on the fast path, or within one interval, sends
+        // nothing. `Delay` so a notification send that stalled does not come
+        // back to a burst of catch-up ticks.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
+            interval.max(Duration::from_millis(1)),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent = 0u32;
+
+        let wait = self.indexing.wait_for(need, deadline);
+        tokio::pin!(wait);
+        let outcome = loop {
+            tokio::select! {
+                // Biased, wait first: an outcome that is ready wins over a
+                // tick or a cancellation that happens to be ready as well.
+                biased;
+                outcome = &mut wait => break outcome,
+                () = ctx.ct.cancelled() => {
+                    trace_call(format_args!(
+                        "prepare: cancelled tool={tool} request={} waited_ms={} progress_sent={sent}",
+                        ctx.id,
+                        started.elapsed().as_millis()
+                    ));
+                    return Err(ErrorData::internal_error(
+                        "g-mesh: the request was cancelled while it waited for the index; the index keeps \
+                         building in the background",
+                        None,
+                    ));
+                }
+                _ = ticker.tick(), if token.is_some() => {
+                    let token = token.clone().expect("the branch is only enabled with a token");
+                    let param = ProgressNotificationParam::new(token, started.elapsed().as_secs_f64())
+                        .with_message(self.indexing.progress_message(self.registry.project_root()));
+                    match ctx.peer.notify_progress(param).await {
+                        Ok(()) => sent += 1,
+                        Err(err) => eprintln!(
+                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                            ctx.id
+                        ),
+                    }
+                }
+            }
+        };
+
+        trace_call(format_args!(
+            "prepare: wait over tool={tool} request={} outcome={} waited_ms={} progress_sent={sent}",
+            ctx.id,
+            match &outcome {
+                WaitOutcome::Satisfied => "satisfied",
+                WaitOutcome::Failed(_) => "failed",
+                WaitOutcome::TimedOut => "timed_out",
+            },
+            started.elapsed().as_millis()
+        ));
+
+        Ok(match outcome {
+            WaitOutcome::Satisfied => None,
+            // D7: the cap. No part of the question is answered - no rows,
+            // nothing that could be read as a result - only why, and that
+            // calling again is the remedy.
+            WaitOutcome::TimedOut => {
+                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
+                 computed - call this tool again; the index keeps building in the background.",
+                    self.registry.project_root().display(),
+                    self.indexing.progress_detail(),
+                    human_duration(started.elapsed())
+                ))]))
+            }
+            // GM-395 slice 2 (D2): a failed walk is a tool error carrying its
+            // message, not an answer read off an empty or partial graph -
+            // that would be confidently wrong, where this says why and that
+            // the next call retries (`IndexingStatus::request_activation`).
+            // Not "not ready" either: the wait is over, and it failed.
+            WaitOutcome::Failed(message) => {
+                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "g-mesh could not build this project's index: {message}. The next tool call retries \
+                     the build."
+                ))]))
+            }
+        })
     }
 
     /// Advances the project's `lastUsed` stamp, which a later GC scan reads
@@ -364,15 +588,23 @@ impl GMeshMcpServer {
     /// to lock unconditionally - see `daemon::bulk_index::commit` and
     /// `daemon::indexing_status`'s own "GM-394" doc section).
     ///
-    /// So [`self.indexing.is_indexing()`](IndexingStatus::is_indexing) - a
-    /// lock-free atomic - is checked *first*, and only a caller that finds it
-    /// `false` ever takes `self.conn`'s mutex at all. A caller mid-walk skips
-    /// the query entirely and gets capabilities-only instructions (the same
-    /// shape the `Err` fallback below already produced, for the same "if the
-    /// index isn't open yet, fall back to capabilities only" reason), prefixed
-    /// with [`instructions::INDEXING_NOTE`] so the one fact that is true only
-    /// for this moment - the index is still being built - is stated rather
-    /// than left for a caller to infer from an unusually generic paragraph.
+    /// So [`self.indexing.phase()`](IndexingStatus::phase) - a lock-free
+    /// atomic read - is checked *first*, and only a caller that finds it past
+    /// [`Phase::Walking`] ever takes `self.conn`'s mutex at all. A caller in
+    /// [`Phase::Unindexed`] or [`Phase::Walking`] skips the query entirely
+    /// and gets capabilities-only instructions (the same shape the `Err`
+    /// fallback below already produces, for the same "if the index isn't
+    /// open yet, fall back to capabilities only" reason), through
+    /// [`instructions::cold_start`] - GM-395's D12 - so the one fact that is
+    /// true only for this moment (the project's own root, and whether its
+    /// walk has started or is still owed) is stated rather than left for a
+    /// caller to infer from an unusually generic paragraph. `Phase::Failed`
+    /// is deliberately not included here: nothing holds `self.conn`'s mutex
+    /// once a walk has failed and returned, so there is no GM-394 hazard in
+    /// taking it, and this method's ordinary query-then-render path already
+    /// handles a project with nothing indexed yet (`present` comes back
+    /// empty, and [`build`](instructions::build) renders the same
+    /// unqualified paragraph a fresh project always has).
     ///
     /// Two independent data sources feed the builder once the index is open,
     /// and only one of them can fail in a way this method has to handle
@@ -400,10 +632,11 @@ impl GMeshMcpServer {
     fn instructions(&self) -> String {
         let capabilities = self.registry.receiver_call_capabilities();
 
-        if self.indexing.is_indexing() {
+        let phase = self.indexing.phase();
+        if let Phase::Unindexed | Phase::Walking = phase {
             let present = capabilities.keys().map(|language| (language.clone(), false)).collect();
-            let built = instructions::build(&instructions::present_languages(present, &capabilities));
-            return format!("{}\n\n{built}", instructions::INDEXING_NOTE);
+            let present = instructions::present_languages(present, &capabilities);
+            return instructions::cold_start(self.registry.project_root(), phase == Phase::Walking, &present);
         }
 
         let present = {
@@ -430,8 +663,11 @@ impl GMeshMcpServer {
     async fn find_definition(
         &self,
         params: Parameters<FindDefinitionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+        if let Some(early) = self.prepare(&ctx, "find_definition", Need::Structural).await? {
+            return Ok(early);
+        }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
@@ -445,22 +681,37 @@ impl GMeshMcpServer {
     async fn find_references(
         &self,
         params: Parameters<SymbolQueryParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+        if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
+            return Ok(early);
+        }
         let capabilities = self.capabilities();
         find_references::handle(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
-    async fn find_callers(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+    async fn find_callers(
+        &self,
+        params: Parameters<SymbolQueryParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
+            return Ok(early);
+        }
         let capabilities = self.capabilities();
         find_callers_callees::handle_callers(&self.conn, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
-    async fn find_callees(&self, params: Parameters<SymbolQueryParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+    async fn find_callees(
+        &self,
+        params: Parameters<SymbolQueryParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
+            return Ok(early);
+        }
         let capabilities = self.capabilities();
         find_callers_callees::handle_callees(&self.conn, &self.embedding, &capabilities, params.0)
     }
@@ -472,8 +723,11 @@ impl GMeshMcpServer {
     async fn find_implementations(
         &self,
         params: Parameters<FindImplementationsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+        if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
+            return Ok(early);
+        }
         let capabilities = self.capabilities();
         find_implementations::dispatch(&self.conn, &self.embedding, &capabilities, params.0)
     }
@@ -485,8 +739,11 @@ impl GMeshMcpServer {
     async fn get_file_outline(
         &self,
         params: Parameters<GetFileOutlineParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+        if let Some(early) = self.prepare(&ctx, "get_file_outline", Need::Structural).await? {
+            return Ok(early);
+        }
         self.ensure_file_fresh(&params.0.file_path).await;
         get_file_outline::handle(&self.conn, params.0)
     }
@@ -498,8 +755,11 @@ impl GMeshMcpServer {
     async fn get_dependencies(
         &self,
         params: Parameters<GetDependenciesParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+        if let Some(early) = self.prepare(&ctx, "get_dependencies", Need::Structural).await? {
+            return Ok(early);
+        }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(file_path).await;
         }
@@ -519,8 +779,14 @@ impl GMeshMcpServer {
         name = "search_code",
         description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Results are ranked by similarity, most relevant first. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
     )]
-    async fn search_code(&self, params: Parameters<SearchCodeParams>) -> Result<CallToolResult, ErrorData> {
-        self.prepare().await;
+    async fn search_code(
+        &self,
+        params: Parameters<SearchCodeParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(early) = self.prepare(&ctx, "search_code", Need::Embeddings).await? {
+            return Ok(early);
+        }
         search_code::handle(&self.conn, &self.embedding, params.0)
     }
 }

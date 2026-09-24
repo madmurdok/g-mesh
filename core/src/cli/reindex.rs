@@ -45,8 +45,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::stop;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{manifest, registry, semantic};
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{backfill, EmbeddingPipeline};
 use crate::storage::{connection, schema};
 
 /// What a `reindex` actually did.
@@ -102,7 +103,10 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
     let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-    let summary = bulk_index::run(&canonical_root, &conn, &embedding_pipeline, &discovered)
+    // `embedding: None` - GM-395: this walk is structural-only now, matching
+    // `daemon::run`'s own cold start; the pipeline above is used by the
+    // semantic pass and the backfill pass below instead.
+    let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
         .context("failed to rebuild the project's index")?;
     schema::record_bulk_index(&conn.lock().unwrap())
         .context("failed to record that the project was fully reindexed")?;
@@ -118,6 +122,15 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let run = semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
     run.log("the rebuilt index");
     let semantic_pass_ran = run.any_ran();
+
+    // GM-395: the embedding backfill pass, in the foreground, same as
+    // `daemon::run`'s own cold start and `cli::init` - a rebuild that stopped
+    // at the structural walk plus the semantic pass would hand back an index
+    // missing every embedding `search_code` needs, which is exactly the
+    // "strictly worse than a zero-config cold start" outcome this module's
+    // own doc comment already rules out for the semantic pass.
+    let progress = IndexingStatus::structural();
+    backfill::run(&conn, &embedding_pipeline, &progress);
 
     Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary, semantic_pass_ran })
 }

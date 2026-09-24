@@ -275,12 +275,19 @@ async fn a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_lo
     let connect_elapsed = connect_started.elapsed();
     // Task 105's own criterion, unchanged by GM-394: reaching the daemon at
     // all must not wait on the walk - the socket is bound long before the
-    // walk even starts.
+    // walk even starts. Since GM-395 slice 2 the walk does not start at all
+    // until a tool call asks, so this can only hold more easily than before.
     assert!(
         connect_elapsed < hold_open,
         "connecting must not itself wait on the walk, and it took {connect_elapsed:?} against a hold \
          of {hold_open:?}"
     );
+
+    // GM-395 slice 2: the daemon walks nothing until a tool call asks, so
+    // the walk is started here, by a separate throwaway call, and the timed
+    // call below lands on a walk already in progress - the shape this test
+    // was written for.
+    common::trigger_activation(project.root());
 
     // Dispatched while the walk is still running (by construction: `hold_open`
     // outlasts the bootstrap budget several times over) - GM-394's own

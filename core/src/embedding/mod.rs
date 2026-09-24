@@ -16,6 +16,7 @@
 //! project code going out) and is deliberately not done by this module: see
 //! [`model`] on where weights are expected to already be.
 
+pub mod backfill;
 pub mod model;
 pub mod pipeline;
 

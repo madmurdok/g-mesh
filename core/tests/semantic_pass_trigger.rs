@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -210,6 +212,8 @@ fn position_of(methods: &[String], method: &str) -> Option<usize> {
 fn core_asks_for_a_semantic_pass_once_the_bulk_index_is_built() {
     let harness = Harness::new();
     let mut daemon = harness.spawn_daemon();
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(harness.root());
 
     let methods = harness.wait_for("a semantic pass after the bulk walk", |methods| {
         methods.iter().any(|m| m == "semanticPass")
@@ -229,6 +233,8 @@ fn core_asks_for_a_semantic_pass_once_the_bulk_index_is_built() {
 fn core_asks_for_a_semantic_pass_after_each_incremental_reparse() {
     let harness = Harness::new();
     let mut daemon = harness.spawn_daemon();
+    // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
+    common::trigger_activation(harness.root());
 
     // Let the cold-start pass happen first, so what is counted afterwards can
     // only have come from the watcher.

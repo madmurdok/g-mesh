@@ -202,12 +202,11 @@ fn in_memory_index() -> Mutex<Connection> {
 /// TypeScript/Go plugins the real `bundled_roots()` discovery would also
 /// find in this checkout.
 fn structural_bulk_index(project_root: &Path, conn: &Mutex<Connection>, manifest: &PluginManifest) {
-    let embedding = EmbeddingPipeline::disabled();
     let discovered = DiscoveredPlugins {
         manifests: HashMap::from([("rust".to_string(), manifest.clone())]),
         routing: HashMap::from([(".rs".to_string(), "rust".to_string())]),
     };
-    let summary = bulk_index::run(project_root, conn, &embedding, &discovered)
+    let summary = bulk_index::run(project_root, conn, None, &discovered)
         .expect("the real one-shot structural bulk index must succeed");
     assert!(summary.nodes > 0, "the structural walk over a real fixture must find real nodes: {summary:?}");
 }

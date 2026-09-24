@@ -406,13 +406,16 @@ in the client's server log rather than as an empty answer.
 
 The shim is a stateless proxy: on first connect for a project it bootstraps
 a detached daemon (`g-mesh daemon --project-root <root>`), which opens the
-project's SQLite index, spawns every bundled language plugin it discovers —
-unconditionally, regardless of which languages the project actually contains
-(`daemon::bulk_index::run`) — builds the initial index if the project has
-never been indexed (see below), starts the file watcher, and
-serves the MCP tool surface over a per-project endpoint (an `AF_UNIX` socket on
-Linux and macOS, a named pipe on Windows). The daemon outlives the shim and is
-reused by later connections for the same project.
+project's SQLite index and serves the MCP tool surface over a per-project
+endpoint (an `AF_UNIX` socket on Linux and macOS, a named pipe on Windows)
+right away — connecting and listing tools cost nothing on their own. Building
+the initial index, if the project has never been indexed (see below), and
+starting the file watcher both wait for the first tool call that actually
+needs them; each bundled language's plugin is likewise spawned lazily, on the
+first call that touches that language. See
+`docs/architecture/lazy-indexing.md` for the full design and why connecting
+alone is free. The daemon outlives the shim and is reused by later
+connections for the same project.
 
 ## Is this worth registering?
 
@@ -580,21 +583,24 @@ claude mcp add g-mesh -- /path/to/g-mesh/target/release/g-mesh mcp-shim
 
 ## First run: the initial index
 
-The first time a daemon starts for a project it walks the whole tree once
-(gitignore-aware, skipping `.git`, `node_modules`, `dist`, and `.claude`), parses
-every file each bundled plugin claims by extension — `.ts`/`.tsx`/`.mts`/`.cts`/
-`.js`/`.jsx`/`.mjs`/`.cjs` for TypeScript/JavaScript, `.go` for Go, `.py`/`.pyi`
-for Python, `.rs` for Rust — and commits the result **before** it accepts
-any MCP connection — so a client's first tool call already sees a complete
-graph, with nothing to touch or warm up first. Expect that first start to
-take proportionally longer on a large project; every later start is
-immediate.
+Connecting to a project's daemon for the first time costs nothing by itself —
+`initialize` and `tools/list` answer at once, and nothing is walked yet. The
+walk starts lazily, on the first tool call that actually needs the index (see
+`docs/architecture/lazy-indexing.md`), and that call waits for it to finish
+before answering: the whole tree once (gitignore-aware, skipping `.git`,
+`node_modules`, `dist`, and `.claude`), parsing every file each bundled
+plugin claims by extension — `.ts`/`.tsx`/`.mts`/`.cts`/`.js`/`.jsx`/`.mjs`/
+`.cjs` for TypeScript/JavaScript, `.go` for Go, `.py`/`.pyi` for Python,
+`.rs` for Rust. Every structural tool answers as soon as that walk is linked;
+`search_code` alone also waits out the embedding pass that follows it. Expect
+that first call to take proportionally longer on a large project; every
+later call is immediate.
 
 The walk is a cold start, not a startup routine: it runs only until it has
 succeeded once (recorded as `meta.bulkIndexedAt` in the project's index), so
-restarting a daemon against an already-indexed project skips it entirely. A
-walk that was interrupted part way counts as unfinished and is redone on the
-next start.
+a session against an already-indexed project never walks it again. A walk
+that was interrupted part way counts as unfinished and is a tool error, with
+the next tool call retrying it.
 
 From then on the file watcher keeps the index live, reindexing each file as
 it changes. Edits made while **no** daemon is running are the one gap: there

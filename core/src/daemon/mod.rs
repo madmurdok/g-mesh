@@ -1,3 +1,4 @@
+mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
 pub mod identity;
@@ -71,6 +72,19 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 /// holder ever writes this file, because it is written after taking the lock
 /// and cleared by whoever takes it next.
 const DAEMON_SERVING_FILE: &str = "daemon.serving";
+
+/// Where the daemon publishes its cold-start phase (D13 in
+/// `docs/architecture/lazy-indexing.md`): one line, one of `unindexed`,
+/// `walking`, `structural`, `embedding`, `ready` or `failed` - the same words
+/// [`crate::daemon::indexing_status::Phase`]'s variants are named after,
+/// lowercased. Written on every transition
+/// ([`indexing_status::IndexingStatus::attach_phase_file`]) and removed on
+/// the way out ([`lifecycle::release_state_files`]), so `cli::status` and the
+/// test suite can tell "idle, never indexed" apart from "building right now"
+/// without asking a live daemon a question - the same "answered from outside
+/// the daemon" principle `cli::status`'s own module doc already applies to
+/// everything else it reports.
+const PHASE_FILE: &str = "index.phase";
 
 /// How long the watcher thread waits, after the most recent raw filesystem
 /// event for a given path, before treating that path's burst as settled and
@@ -176,6 +190,24 @@ pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(registry::plugin_pid_file_name(plugin::BUNDLED_LANGUAGE))
 }
 
+/// Where [`PHASE_FILE`] lives for a given state directory - the same shape as
+/// [`pid_path_in`], for the same reason: `cli::status` and the test suite
+/// resolve a state directory once and ask it for every one of these files
+/// rather than reconstructing a project root.
+pub fn phase_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(PHASE_FILE)
+}
+
+/// The current phase word [`indexing_status::IndexingStatus::attach_phase_file`]
+/// published for this state directory, if a daemon is running and has
+/// written one. `None` covers both "no daemon has ever run here" and "the
+/// daemon that did has since exited" (`lifecycle::release_state_files`
+/// removes the file on its way out) - the same "absent means nothing to
+/// report" reading every other state file in this module gets.
+pub fn read_phase_in(state_dir: &Path) -> Option<String> {
+    fs::read_to_string(phase_path_in(state_dir)).ok().map(|contents| contents.trim().to_string())
+}
+
 /// Where the live daemon records the build it started from, resolved from a
 /// project root and - like the pid files - from an already-known state
 /// directory too, for callers that have one but no root.
@@ -262,13 +294,22 @@ pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
 /// finds nothing degrades to "nothing recorded", which they all already
 /// handle.
 pub fn write_pid_file(path: &Path, pid: u32) {
+    write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
+}
+
+/// The same atomic temp-then-rename shape [`write_pid_file`] uses, factored
+/// out so [`indexing_status::IndexingStatus`]'s phase-file writes ([`PHASE_FILE`],
+/// D13 in `docs/architecture/lazy-indexing.md`) get the same "never
+/// observable half-written" guarantee for a second kind of state file rather
+/// than reimplementing it with a plain `fs::write`.
+pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if let Err(err) = fs::write(&temporary, format!("{pid}\n")) {
-        eprintln!("g-mesh daemon: failed to write pid file {}: {err}", temporary.display());
+    if let Err(err) = fs::write(&temporary, contents) {
+        eprintln!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
         return;
     }
     if let Err(err) = fs::rename(&temporary, path) {
-        eprintln!("g-mesh daemon: failed to put pid file {} in place: {err}", path.display());
+        eprintln!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
         let _ = fs::remove_file(&temporary);
     }
 }
@@ -294,10 +335,12 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 }
 
 /// Per-project daemon core: opens the SQLite index (checking schema
-/// version), binds the project's daemon endpoint, builds the initial index if
-/// the project has never been walked (`bulk_index`), registers the file
-/// watcher, and serves an MCP session per connection until it is stopped or
-/// its own long idle timeout expires (`daemon::lifecycle`).
+/// version), binds the project's daemon endpoint, and serves an MCP session
+/// per connection until it is stopped or its own long idle timeout expires
+/// (`daemon::lifecycle`). Building the index - the walk if the project has
+/// never been walked (`bulk_index`), the semantic and embedding passes, and
+/// for an unwalked project the file watcher too - waits for the first tool
+/// call that needs it (`daemon::activation`, GM-395 slice 2).
 ///
 /// # Why the socket is bound before the index exists
 ///
@@ -387,7 +430,7 @@ pub fn run(root: &Path) -> Result<()> {
     // The generation names every discovered plugin's build as well as core's
     // own pipeline (`registry::indexer_version`), so an index filled by a
     // plugin that has since been rebuilt is thrown away here - which is what
-    // makes the walk below happen at all. Before task 116 only core's half was
+    // makes the walk (`daemon::activation`) happen at all. Before task 116 only core's half was
     // compared, and a plugin-only change left every existing index intact and
     // wrong; before task 163 only the *bundled* plugin's half was, which said
     // the same thing about every other language.
@@ -448,7 +491,7 @@ pub fn run(root: &Path) -> Result<()> {
     // on to spawn - a marker for a language nothing touches this run is exactly
     // as stale as one for a language it does.
     registry::clear_stale_suspension_markers(&dir);
-    // Bound here, before the plugin and long before the bulk walk: from this
+    // Bound here, before the plugin and long before any bulk walk: from this
     // point a shim's `connect()` succeeds (the kernel queues it on the
     // listener's backlog until the accept loop below is up), which is what
     // its bootstrap timeout is actually waiting for. See this function's doc
@@ -462,6 +505,24 @@ pub fn run(root: &Path) -> Result<()> {
     // is complete", which `meta.bulkIndexedAt` is the record of.
     let pid_file = dir.join(PID_FILE);
     write_pid_file(&pid_file, std::process::id());
+
+    // Decided from a fact recorded on disk, not from how this start went.
+    // GM-395 slice 2: a project that owes its walk starts `Unindexed` and
+    // stays there until the first index-needing tool call asks
+    // (`daemon::activation`); a restart against an already-walked project
+    // (the common case) starts at `Structural`, so no structural caller is
+    // ever kept waiting - see `Phase::Structural`'s doc comment for why that
+    // is not `Ready`: the embedding backfill pass is still owed, and runs on
+    // that first call too.
+    //
+    // Constructed here, right next to the pid file's own write, so its phase
+    // file (D13) gets the same property: published before anything can
+    // observe its absence as meaningful, never merely "eventually" true.
+    let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
+    indexing.attach_phase_file(phase_path_in(&dir));
+    // Attached before the accept loop can hand `indexing` to any session, so
+    // no tool call ever finds it with nothing to trigger.
+    let activation_trigger = indexing.attach_activation();
 
     // And recorded beside the lock too, now that this process is genuinely
     // serving. The pid file above answers "which process is the daemon"; this
@@ -488,7 +549,7 @@ pub fn run(root: &Path) -> Result<()> {
     // `cli::clean`'s 10s "daemon is listening" wait under load - a bare
     // thread spawn competing with the plugin spawn and the accept loop for
     // scheduling, on top of the ~600MiB ONNX load itself once it actually
-    // runs. Whichever of the bulk walk below or the plugin supervisor's first
+    // runs. Whichever of the embedding backfill pass or the plugin supervisor's first
     // incremental write asks first pays the real load cost, synchronously, on
     // its own thread - never this one, and never before something has
     // actually asked to embed. A model that is not available on this machine
@@ -498,7 +559,8 @@ pub fn run(root: &Path) -> Result<()> {
     // way to reach the fetcher (see `cli::model`), on purpose.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
 
-    // The cold-start bulk walk below (`daemon::bulk_index::run`) needs its
+    // The cold-start bulk walk (`daemon::bulk_index::run`, run by
+    // `daemon::activation`) needs its
     // own view of what was discovered: it spawns one one-shot `--bulk-index`
     // process per language directly from each manifest's `command`/`args`,
     // which is a different (and simpler) shape than `PluginRegistry`'s lazy,
@@ -533,15 +595,9 @@ pub fn run(root: &Path) -> Result<()> {
     // reboots.
     let core_activity = CoreActivity::new();
 
-    // Decided from a fact recorded on disk, not from how this start went, so
-    // a restart against an already-walked project (the common case) is `ready`
-    // from its first instant and no caller is ever kept waiting for it.
-    let indexing = if needs_bulk_index { IndexingStatus::indexing() } else { IndexingStatus::ready() };
-
-    // The accept loop moves to a thread of its own so the walk below can run
-    // alongside it. It, not this function, is the daemon's real main loop;
-    // what is left here is finite startup work, and this thread spends the
-    // rest of its life supervising (`lifecycle::supervise`).
+    // The accept loop moves to a thread of its own, and so does activation
+    // (below); this thread spends the rest of its life supervising
+    // (`lifecycle::supervise`).
     //
     // Its outcome comes back over a channel rather than through `join`,
     // because the supervising thread has to wake on a schedule of its own -
@@ -566,181 +622,48 @@ pub fn run(root: &Path) -> Result<()> {
         });
     }
 
-    // Registered here, before the walk, and deliberately not *drained* until
-    // after it. The two are separable and conflating them cost a lost edit:
-    // `ProjectWatcher` is backed by an mpsc channel, so from this line on the
-    // OS watch exists and every event queues up whether or not anyone is
-    // reading. What the ordering below protects against is the walk racing
-    // incremental *processing*, and that only begins when the consumer thread
-    // further down starts calling `next_change` - so the guarantee is
-    // untouched while the window closes.
+    // The watcher (D8 in `docs/architecture/lazy-indexing.md`). An unindexed
+    // project gets none here: activation registers it right before its walk
+    // (`activation::ActivationCtx::walk`), keeping GM-250's "no unobserved
+    // window" ordering, and a session that never calls a tool never pays
+    // for it. An already-walked project registers it now, as before - it
+    // keeps a live index fresh, and costs nothing on macOS. Its consumer
+    // starts now too, unless a semantic-pass retry is owed: that retry must
+    // run before any incremental pass the consumer could trigger (see
+    // `activation`'s ordering comments), so activation starts the consumer
+    // after it. Events queue in the watcher's channel in the meantime.
     //
-    // The window was real. Between the walk finishing its enumeration and the
-    // watcher existing, an edit had no observer at all and was dropped until
-    // something touched the file again - during cold start only, and narrow,
-    // but wide enough that one integration test caught it five times in a day
-    // on a loaded runner (GM-250), and wide enough to lose a user's edit.
-    let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-
-    // Cold start only, and before the watcher is *drained*: a bulk walk racing
-    // incremental updates could commit its own (older) parse of a file over
-    // one the watcher had just refreshed. A tool call issued while this runs
-    // waits for it to finish (`mcp::mod::GMeshMcpServer::still_indexing`)
-    // rather than ever being answered off the batches committed so far, so a
-    // client's query is never answered off a half-built graph - the same
-    // promise the old "bind only once this returns" ordering made, kept
-    // without making the client unreachable to make it. A failure
-    // here is fatal for the same reason a failed plugin handshake is - an
-    // empty index that looks like a working one is worse than a daemon that
-    // says why it didn't start - and is recoverable: the completion marker
-    // stays unset, so the next start walks again. Any client connected at that
-    // moment loses its session when this process exits, which is the honest
-    // outcome: a daemon that stayed up would hold the singleton lock while
-    // serving nothing, and every later shim would find it listening, current,
-    // and reuse it forever.
-    if needs_bulk_index {
-        let summary = bulk_index::run(&canonical_root, &conn, &embedding, &discovered_for_bulk_index)
-            .context("failed to build the project's initial index")?;
-        // Flipped *before* the completion marker is written, and the order
-        // matters. The two facts become true at the same moment - the walk is
-        // over - but they are read by different parties: the flag governs
-        // what this process answers, `bulkIndexedAt` governs whether the
-        // *next* process walks again. Writing the marker second means any
-        // outside observer of it (`cli::status`, the integration tests) can
-        // only ever see it once real answers are already being given; the
-        // other order would let someone read "indexed" off the database while
-        // a tool call issued to this same daemon still waited on a flag that
-        // had not caught up to it.
-        //
-        // Ahead of the watcher for the same reason a project that owed no
-        // walk starts out `ready`: the watcher only ever matters for edits
-        // made after it is registered, so gating answers on it would buy
-        // nothing the fast path does not already do without.
-        indexing.mark_ready();
-        schema::record_bulk_index(&conn.lock().unwrap())
-            .context("failed to record that the project was indexed")?;
-        // A walk that took minutes is minutes the core spent working, not
-        // minutes of silence - the same reasoning `last_used::touch` above
-        // applies to a GC scan, applied to the core's own idle timer.
-        core_activity.request();
-        eprintln!(
-            "g-mesh daemon: initial index built - {} nodes, {} edges ({} imports linked to their target file)",
-            summary.nodes, summary.edges, summary.linked_imports
-        );
-        if summary.skipped_lines > 0 {
-            eprintln!(
-                "g-mesh daemon: {} unreadable lines were skipped - the index may be incomplete",
-                summary.skipped_lines
-            );
+    // Still fatal here for an already-walked project, as it always was: this
+    // is startup, not a tool call, and no session exists yet to lose.
+    let pending_watcher = if needs_bulk_index {
+        None
+    } else {
+        let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
+        if needs_semantic_pass_retry {
+            Some(watcher)
+        } else {
+            spawn_watch_consumer(watcher, Arc::clone(&conn), Arc::clone(&registry), canonical_root.clone());
+            None
         }
+    };
 
-        // The walk's edges are in and linked, so the graph is complete enough
-        // to be worth asking the type checker about - and the daemon is
-        // already answering off it (`mark_ready` above), which is why this
-        // sits *after* that call rather than in front of it: the semantic
-        // layer's job is to make existing answers better, never to delay the
-        // first one. An empty file list is what "the whole project" looks
-        // like on the wire (see `ControlMessage::SemanticPass`); no single
-        // file changed here, the project simply became resolvable at once.
-        //
-        // Best-effort, like every other semantic pass: a project whose
-        // checker cannot start is a project served by its structural graph,
-        // which is the state it was in a moment ago anyway. Failing daemon
-        // startup over it would throw away a perfectly good index.
-        //
-        // Run inline, not backgrounded, deliberately - a background thread
-        // was tried here and reverted. `get_or_spawn` has to spawn the plugin
-        // process itself the first time anything needs it (this call used to
-        // be the one exception, running against a supervisor the daemon had
-        // already spawned unconditionally before this point), and a query
-        // arriving alongside it used to wait out that whole spawn - the
-        // registry's supervisors lock was held for all of it. That was task
-        // 164, and it is fixed where it belonged: the lock is now held for a
-        // map lookup only, so a concurrent query waits on nothing (see
-        // `daemon::registry`'s doc comment). Backgrounding this call instead
-        // was the wrong fix for it, and still is: this pass
-        // and the watcher's own incremental per-file semantic passes both
-        // ultimately serialize on the same plugin process, but nothing
-        // orders *which* of two independently-triggered passes commits last,
-        // and a whole-project pass that lands after a newer incremental one
-        // can overwrite its correct, fresher edges with stale ones - exactly
-        // the failure `core/tests/overload_call_binding.rs` caught when this
-        // was tried backgrounded (a collapsed edge the incremental pass had
-        // already cleaned up came back). Inline keeps this pass strictly
-        // before the watcher (registered further down) can trigger any of
-        // its own, which is what baseline's eager, pre-registry spawn timing
-        // gave for free and this daemon still needs.
-        //
-        // Which plugins this asks, and why per language rather than one
-        // hardcoded plugin, is `daemon::semantic`'s to say (GM-270) - as is
-        // the reason `cli::init` and `cli::reindex` now run the very same
-        // pass off their own walks rather than leaving it to a daemon start
-        // that will never come. Spawns each owed language's plugin if
-        // nothing has needed it yet, same as any other first touch; recording
-        // `language_state.semanticPassAt` (and the project-wide roll-up) per
-        // language is `run_with_registry`'s own job now, not this call site's.
-        semantic::run_with_registry(&registry, &conn).log("the freshly built index");
-    } else if needs_semantic_pass_retry {
-        // The walk this project was owed already happened, in some earlier
-        // start or in `cli::init` / `cli::reindex` - `needs_bulk_index` above
-        // is false, so the branch that would normally ask for this pass will
-        // never run. Asked for here instead, at the same point in startup
-        // (before the watcher, for the same race the comment above this
-        // block explains) and against the same registry, so a project whose
-        // pass was interrupted gets exactly one more chance at it per daemon
-        // start rather than none - per language: `run_with_registry` only
-        // ever asks a language that is still owed one (`storage::schema::
-        // owed_semantic_pass_languages`), so a language that already
-        // completed here on some earlier start is not re-run just because
-        // another one still owes its pass.
-        eprintln!(
-            "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
-        );
-        semantic::run_with_registry(&registry, &conn).log("the previously-interrupted index");
-    }
-
-    {
-        let conn = Arc::clone(&conn);
-        let registry = Arc::clone(&registry);
-        let root = canonical_root.clone();
-        // `watcher::debounce::Debouncer` is wired in here (task 129): raw
-        // events are recorded into it instead of routed straight to the
-        // registry, and only a path whose debounce window has gone quiet is
-        // actually sent to the plugin - see `watch_and_route_once` below for
-        // the per-iteration shape and `DEBOUNCE_WINDOW` for the window and
-        // why its value is no longer a "nothing depends on this" constant.
-        //
-        // `watcher::burst::BurstBatcher` is a different type for a different
-        // problem and is deliberately *not* wired in here. Its job is
-        // coalescing already-produced diffs from *several different files*
-        // into one SQLite transaction - but the plugin's own wire protocol
-        // (`protocol::types`, `plugins/typescript/src/protocol.ts`) has no
-        // batch request: every file still needs its own `FileChanged`
-        // round trip to the plugin no matter how those round trips' diffs
-        // get committed afterward, so `BurstBatcher` would not reduce the
-        // thing this ticket is about - plugin round trips - for a burst
-        // touching many distinct files (a `git checkout`, say). What it
-        // would reduce is SQLite commit count, and reaching that would mean
-        // splitting `daemon::plugin::PluginProcess::apply_file_change`'s
-        // single locked round trip into "get the diff from the plugin" and
-        // "commit it", so several files' round trips could share one
-        // `BurstBatcher::flush_if_ready` commit - a real change to that
-        // module's crash-recovery/pending-queue contract and to
-        // `ensure_fresh`'s synchronous per-file check (both hold the same
-        // connection this would need to leave uncommitted for longer), not
-        // "construct an existing type here". `Debouncer` alone already
-        // clears this ticket's acceptance bar - fewer plugin round trips for
-        // a burst of rapid saves - for the shape its own problem statement
-        // leads with (editor autosave rewriting the same file repeatedly);
-        // batching *different* files' commits is real, separate work left
-        // for its own ticket rather than folded in here as scope creep.
-        thread::spawn(move || {
-            let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
-            loop {
-                watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
-            }
-        });
-    }
+    // Parked until the first tool call - see `daemon::activation`.
+    activation::spawn(
+        activation::ActivationCtx {
+            conn: Arc::clone(&conn),
+            registry: Arc::clone(&registry),
+            embedding: Arc::clone(&embedding),
+            discovered_for_bulk_index,
+            canonical_root: canonical_root.clone(),
+            root: root.to_path_buf(),
+            indexing,
+            core_activity: Arc::clone(&core_activity),
+            needs_walk: needs_bulk_index,
+            needs_semantic_pass_retry,
+            watcher: pending_watcher,
+        },
+        activation_trigger,
+    )?;
 
     // Startup is over; what is left is the two idle timers, the orphan check
     // riding the same tick (GM-320), and the accept loop's outcome, whichever
@@ -797,6 +720,25 @@ fn stand_down(root: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Starts the watcher's consumer thread: [`watch_and_route_once`], forever.
+///
+/// Called by [`run`] for an already-walked project, and by
+/// `activation::ActivationCtx::activate` otherwise - in both cases only once
+/// no structural walk or whole-project semantic pass can still race it.
+fn spawn_watch_consumer(
+    watcher: ProjectWatcher,
+    conn: Arc<Mutex<Connection>>,
+    registry: Arc<PluginRegistry>,
+    root: PathBuf,
+) {
+    thread::spawn(move || {
+        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+        loop {
+            watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+        }
+    });
 }
 
 /// One iteration of the watcher thread's loop: waits up to [`DEBOUNCE_WINDOW`]
