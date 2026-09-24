@@ -339,23 +339,46 @@ mod tests {
         assert_eq!(seen, expected_sorted, "every candidate must be visited exactly once");
     }
 
-    /// `is_available() == false` makes the pass return without ever running a
-    /// query - proven by handing it a connection with no schema applied at
-    /// all, which any real query against `nodes`/`vectors` would fail
-    /// against.
+    /// `is_available() == false` makes the pass return before it ever runs
+    /// `count_candidates` - proven with a connection that *does* have the
+    /// schema and *does* owe one node an embedding, so an available path
+    /// would count it (`candidates == 1`) and only the unavailable, no-query
+    /// path reports `candidates == 0`.
+    ///
+    /// This has to observe `candidates`, not the whole `BackfillSummary`
+    /// against `Connection::open_in_memory()` with no schema applied: `run`
+    /// swallows `count_candidates`'s missing-table error and *also* returns
+    /// `BackfillSummary::default()` on that path, so a schema-less connection
+    /// cannot tell "skipped because unavailable" apart from "tried, hit a
+    /// missing table, and gave up anyway" - both read as the same default
+    /// summary.
     ///
     /// *Control:* in `EmbeddingPipeline::is_available`, drop the early
-    /// `self.model.get()` check (or hardcode `true`), and this test panics
-    /// on the missing-table error instead of returning a default summary.
+    /// `self.model.get()` check (or hardcode `true`). `run` then reaches
+    /// `count_candidates` against this test's real schema, finds the one
+    /// candidate node below, and `summary.candidates` reads `1`.
     #[test]
     fn an_unavailable_model_returns_without_running_a_query() {
-        let conn = Connection::open_in_memory().unwrap(); // deliberately no schema::apply
+        let mut conn = open_conn();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![node("owed_an_embedding", Some("does a thing"), None)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let conn = Mutex::new(conn);
         let embedding = EmbeddingPipeline::disabled();
         let progress = IndexingStatus::structural();
 
         let summary = run(&conn, &embedding, &progress);
 
-        assert_eq!(summary, BackfillSummary::default());
+        assert_eq!(
+            summary.candidates, 0,
+            "an unavailable model must return before counting candidates, even though this project has \
+             one node ({:?}) owed an embedding",
+            summary
+        );
     }
 }

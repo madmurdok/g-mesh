@@ -395,8 +395,44 @@ async fn a_panicking_embedding_pass_does_not_fail_structural_tools() {
         "a panicking embedding pass must not block or corrupt the structural answer: {outline}"
     );
 
-    // A second call must also answer, not error: the phase must have moved
-    // on to `Ready` (never `Failed`), so nothing here is still owed and
+    // The call above only needed `Need::Structural`, satisfied the moment
+    // `walk()` sets `Phase::Structural` - well before `activate()` even gets
+    // to the panicking backfill pass. So it answers (successfully) whether
+    // or not the panic is later caught, and proves nothing about the phase
+    // this test actually cares about on its own: wait for the background
+    // activation thread to settle the phase to `ready` or `failed` before
+    // asserting which one it picked.
+    //
+    // Polled with its own short deadline rather than
+    // `common::wait_until_phase(root, "ready")`: with the control applied
+    // the phase never becomes `ready` at all, and that helper would then run
+    // out its whole (90s-scale) timeout instead of failing fast on the
+    // `failed` it actually reached.
+    let phase_path =
+        daemon::phase_path_in(&project_dir(project.root()).expect("failed to resolve state dir"));
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let settled = loop {
+        let phase = std::fs::read_to_string(&phase_path).unwrap_or_default();
+        let phase = phase.trim().to_string();
+        if phase == "ready" || phase == "failed" {
+            break phase;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "index.phase for {} did not settle to \"ready\" or \"failed\" within {:?}",
+            project.root().display(),
+            Duration::from_secs(20)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        settled, "ready",
+        "a panicking embedding backfill pass must leave the project Ready, not Failed - structural tools \
+         must keep answering"
+    );
+
+    // A second call must also answer, not error: the phase settled to
+    // `Ready` above (never `Failed`), so nothing here is still owed and
     // nothing is retried.
     let again = call(&client, "get_file_outline", json!({ "file_path": "src/index.ts" })).await;
     assert_ne!(

@@ -162,8 +162,18 @@ async fn structural_tools_answer_while_the_embedding_backfill_pass_is_held_open(
     // ever finish, which is the whole point being tested below.
     wait_until_indexed(project.root());
 
+    // Deliberately much shorter than `startup_timeout()` (60s), and clearly
+    // shorter than `hold_before_first_batch_for_tests`'s own 30s hold cap
+    // (`core/src/embedding/backfill.rs`): a `find_definition` that wrongly
+    // waited on the hold would still return in ~30-33s (the hold's cap, plus
+    // its own immediate-unavailable-model return) - well inside 60s, so that
+    // bound alone could not tell a wrongly-waiting call apart from one that
+    // never waited. 10s cannot be reached by a wrongly-waiting call, only by
+    // one that answers off `Need::Structural` alone.
+    const MUST_NOT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
     let result =
-        tokio::time::timeout(common::startup_timeout(), find_definition(&client, "connect")).await.expect(
+        tokio::time::timeout(MUST_NOT_WAIT_TIMEOUT, find_definition(&client, "connect")).await.expect(
             "find_definition must not wait for the embedding backfill pass - it only needs \
              Need::Structural, which the structural walk above already satisfies",
         );
