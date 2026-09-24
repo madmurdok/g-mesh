@@ -264,6 +264,12 @@ impl GMeshMcpServer {
         tool: &str,
         need: Need,
     ) -> Result<Option<CallToolResult>, ErrorData> {
+        // Taken before anything below runs, including the indexing wait, so
+        // that if the replay at the bottom also has to heartbeat (GM-403) its
+        // `progress` values pick up exactly where the wait's own left off -
+        // the same reason `ensure_file_fresh`'s caller takes its own
+        // `call_started` ahead of `prepare` (see that method's doc comment).
+        let call_started = Instant::now();
         let token = ctx.meta.get_progress_token();
         trace_call(format_args!(
             "prepare: entered tool={tool} request={} progressToken={}",
@@ -276,7 +282,7 @@ impl GMeshMcpServer {
         }
         trace_call(format_args!("prepare: past the indexing wait tool={tool} request={}", ctx.id));
         self.mark_used();
-        self.replay_queued_changes().await;
+        self.replay_queued_changes(ctx, tool, call_started).await;
         trace_call(format_args!("prepare: done tool={tool} request={}", ctx.id));
         Ok(None)
     }
@@ -297,19 +303,92 @@ impl GMeshMcpServer {
     /// index can already answer; refusing it because a *later* edit could not
     /// be replayed would turn one unreadable file into a dead tool surface,
     /// and each language's queue is left intact for the next call to retry.
-    async fn replay_queued_changes(&self) {
+    ///
+    /// # GM-403: heartbeats while a replay runs
+    ///
+    /// A replay is a `fileChanged` round trip (plus a per-file semantic pass)
+    /// for every queued file, sent to whichever language's plugin was asleep
+    /// - on a cold language server that is the same tens-of-seconds cost
+    /// [`ensure_file_fresh`](Self::ensure_file_fresh) already heartbeats for
+    /// GM-401, just paid for a whole queue instead of one file. Without a
+    /// ticker of its own this step was the one silent gap GM-401 left: the
+    /// indexing wait's heartbeat had already ended by the time `prepare`
+    /// reaches here.
+    ///
+    /// The same rules as both of those tickers: only for a request that
+    /// carried a `progressToken`, one interval in, a failed send logged and
+    /// ignored. `message` names the language(s) and how many files each owes
+    /// ([`PluginRegistry::pending_summary`]), read once before the replay
+    /// starts draining the queue it describes, not on every tick - a ticker
+    /// that re-asked mid-replay would watch the count fall to zero and call
+    /// that news. `progress` is `call_started.elapsed()` - taken by
+    /// [`prepare`](Self::prepare) before the indexing wait, so it keeps
+    /// strictly increasing whether or not that wait also heartbeated.
+    ///
+    /// Not cancellable, as before: the replay runs on the blocking pool and
+    /// finishes whether or not anyone is still listening.
+    async fn replay_queued_changes(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        call_started: Instant,
+    ) {
         if !self.registry.has_pending() {
             return;
         }
+        let summary = self.registry.pending_summary();
         let registry = Arc::clone(&self.registry);
         let conn = Arc::clone(&self.conn);
-        if let Err(err) = tokio::task::spawn_blocking(move || {
-            registry.replay_pending(&conn);
-        })
-        .await
-        {
-            eprintln!("g-mesh daemon: the plugin wake task failed: {err}");
-        }
+        let started = Instant::now();
+        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&conn));
+        tokio::pin!(task);
+
+        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
+            interval.max(Duration::from_millis(1)),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent = 0u32;
+
+        let joined = loop {
+            tokio::select! {
+                biased;
+                joined = &mut task => break joined,
+                _ = ticker.tick(), if token.is_some() => {
+                    let token = token.clone().expect("the branch is only enabled with a token");
+                    let message = format!(
+                        "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
+                        self.registry.project_root().display(),
+                        human_duration(started.elapsed())
+                    );
+                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
+                        .with_message(message);
+                    match ctx.peer.notify_progress(param).await {
+                        Ok(()) => sent += 1,
+                        Err(err) => eprintln!(
+                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                            ctx.id
+                        ),
+                    }
+                }
+            }
+        };
+
+        let replayed = match joined {
+            Ok(count) => count,
+            Err(err) => {
+                eprintln!("g-mesh daemon: the plugin wake task failed: {err}");
+                0
+            }
+        };
+        trace_call(format_args!(
+            "replay: tool={tool} request={} summary={summary} replayed={replayed} elapsed_ms={} \
+             progress_sent={sent}",
+            ctx.id,
+            started.elapsed().as_millis()
+        ));
     }
 
     /// Every discovered plugin's declared `[plugin.capabilities]`, which the

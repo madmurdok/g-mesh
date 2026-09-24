@@ -294,6 +294,13 @@ impl DirtyQueue {
         self.order.is_empty()
     }
 
+    /// How many distinct files are queued right now - GM-403's progress
+    /// ticker names this alongside the language while a replay is in flight,
+    /// so it is read (not drained) while `replay_pending` is still running.
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
     fn drain(&mut self) -> Vec<String> {
         self.seen.clear();
         std::mem::take(&mut self.order)
@@ -473,6 +480,16 @@ impl PluginSupervisor {
     /// every tool call.
     pub fn has_pending(&self) -> bool {
         self.pending.load(Ordering::SeqCst)
+    }
+
+    /// How many files are queued right now, for GM-403's replay progress
+    /// message - `0` once [`replay_pending`](Self::replay_pending) has
+    /// drained the queue, same as [`has_pending`](Self::has_pending) going
+    /// false at that point. Takes the same lock `replay_pending` holds for
+    /// its own read of the queue, so this is a snapshot, not a promise that
+    /// the count will still be true by the time it is printed.
+    pub fn pending_len(&self) -> usize {
+        self.inner.lock().unwrap().dirty.len()
     }
 
     /// The watcher thread's entry point: reindex `file_path` now if the plugin
