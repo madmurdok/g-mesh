@@ -498,3 +498,78 @@ async fn progress_passes_through_after_a_switch() {
 
     client.cancel().await.expect("failed to shut the client down");
 }
+
+/// Defect 1 of `docs/results/gm399-multi-project-measurements.md`: with `b`
+/// already indexed by its own session, the front's instructions no longer
+/// say "has indexed none of them" - they count `b` and list it first,
+/// marked.
+///
+/// Control: in `mcp::front::Front::new`, pass an empty set to `build_front`
+/// instead of the candidates `has_completed_index` accepts: the text says
+/// "has indexed none of them" and lists `a, b, c.` again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_front_names_the_projects_already_indexed() {
+    let folder = Folder::new();
+    let b = folder.sub("b");
+    let in_b = folder.connect_in(&b, (), &[]).await;
+    common::wait_until_indexed(&b);
+    common::wait_for("b's index to record a completed walk", common::startup_timeout(), || bulk_indexed(&b));
+
+    let client = folder.connect(None).await;
+    let instructions =
+        client.peer_info().and_then(|info| info.instructions.clone()).expect("front instructions");
+    assert!(!instructions.contains("indexed none"), "{instructions}");
+    assert!(instructions.contains("has already indexed 1 of them"), "{instructions}");
+    assert!(instructions.ends_with("Projects: b (indexed), a, c."), "{instructions}");
+
+    client.cancel().await.expect("failed to shut the client down");
+    in_b.cancel().await.expect("failed to shut the b session down");
+}
+
+/// Defect 2 of `docs/results/gm399-multi-project-measurements.md`: the shim's
+/// cold-start line for a selected project says it was selected in the front,
+/// not that it is "the current directory" (the folder is).
+///
+/// Control: in `shim::run`, give the router's connector `launch_origin()`
+/// instead of `origin`: the line for `b` ends "(the current directory)".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_switch_log_line_names_where_the_project_came_from() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let folder = Folder::new();
+    let root = folder.root().to_path_buf();
+    let (transport, stderr) = TokioChildProcess::builder(Command::new(BIN).configure(|cmd| {
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
+            .current_dir(&root)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
+    }))
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("failed to spawn the shim");
+    let client = ().serve(transport).await.expect("MCP initialization failed");
+
+    guidance_of(&select(&client, "b").await, &folder.sub("b"));
+
+    let wanted = format!("nothing is serving {} (", canonical(&folder.sub("b")));
+    let mut lines = BufReader::new(stderr.expect("stderr was piped")).lines();
+    let line = tokio::time::timeout(common::startup_timeout(), async {
+        while let Some(line) = lines.next_line().await.expect("failed to read the shim's stderr") {
+            if line.contains(&wanted) {
+                return line;
+            }
+        }
+        panic!("the shim's stderr ended without `{wanted}`");
+    })
+    .await
+    .expect("the shim never logged b's cold start");
+
+    assert!(!line.contains("the current directory"), "{line}");
+    assert!(
+        line.contains(&format!("(selected with select_project in {})", canonical(folder.root()))),
+        "{line}"
+    );
+
+    client.cancel().await.expect("failed to shut the client down");
+}

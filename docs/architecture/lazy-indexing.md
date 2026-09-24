@@ -599,7 +599,7 @@ Options considered:
    `mcp/mod.rs:218`):
    - `get_info`: the same `ServerInfo` shape as `mcp/mod.rs:954-968` (same
      name and version), with instructions from
-     `instructions::build_front(root, &detection)` (D12).
+     `instructions::build_front(root, &detection, &indexed)` (D12).
    - `list_tools`: `GMeshMcpServer::tool_router().list_all()` (the 8 tools,
      `mcp/mod.rs:812-934`) plus `select_project`. The 8 schemas are
      byte-identical to a normal daemon's.
@@ -729,8 +729,9 @@ Options considered:
   adds nothing here; D11 step 5 reuses this rendering as `C`'s guidance.
 - **The `P4_*` wait clause** stays true and needs no edit.
 - **Front mode:** new `pub fn build_front(root: &Path, detection:
-  &Detection) -> String` in `mcp/instructions.rs`. It renders `P1`
-  (`:268`, which stays true after a switch), a blank line, then:
+  &Detection, indexed: &HashSet<&str>) -> String` in `mcp/instructions.rs`.
+  It renders `P1` (`:268`, which stays true after a switch), a blank line,
+  then:
 
   > `<abs root> is a folder of N projects; g-mesh serves one at a time and
   > has indexed none of them. Before any other g-mesh tool, call
@@ -742,6 +743,14 @@ Options considered:
   then candidate `rel_path`s joined by `, ` until the ceiling, then `" (+K
   more - call select_project with no argument for the full list)"`. With
   `truncated`, `N` renders as `N+`.
+  - *As built (GM-399 follow-up):* `indexed` holds the candidates that
+    already have a completed index of their own - rule 2's check
+    (`candidates::has_completed_index`), run per candidate by
+    `mcp::front::Front::new`. When it is non-empty, "has indexed none of
+    them" becomes "has already indexed K of them, listed first and marked
+    (indexed)", and those candidates lead the list as `<rel_path>
+    (indexed)`, so the ceiling cuts unindexed names first. With none
+    indexed the text is exactly the one above.
   - The wording is chosen to stay true after a switch (D11 step 5): it does
     not say "nothing is selected", only "before any other tool".
   - The language paragraphs (`P2`-`P5`) are omitted: no language is known

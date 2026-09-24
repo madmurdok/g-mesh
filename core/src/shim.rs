@@ -101,17 +101,34 @@ pub fn run() -> Result<()> {
     process::keep_our_stdio_from_children();
 
     let root = resolve_project_root()?;
-    let stream = connect_or_bootstrap(&root)?;
+    let stream = connect_or_bootstrap(&root, &launch_origin())?;
     // The router compares switch targets against it (D11 step 3), and a
     // front names its projects by canonical path.
     let canonical = root.canonicalize().unwrap_or(root);
+    let origin = selected_origin(&canonical);
     router::serve(
         BufReader::new(io::stdin()),
         io::stdout().lock(),
         link(stream)?,
         canonical,
-        Box::new(|root: &Path| link(connect_or_bootstrap(root)?)),
+        Box::new(move |root: &Path| link(connect_or_bootstrap(root, &origin)?)),
     )
+}
+
+/// Where the session's first root came from, for the cold-start line in
+/// [`connect_or_bootstrap`].
+fn launch_origin() -> String {
+    match std::env::var_os(PROJECT_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => format!("from {PROJECT_DIR_ENV}"),
+        _ => "the current directory".to_string(),
+    }
+}
+
+/// Where a switch target came from: a project picked with `select_project`
+/// in the front serving `front_root` (D11 step 3). Never "the current
+/// directory", which is the folder, not the project.
+fn selected_origin(front_root: &Path) -> String {
+    format!("selected with select_project in {}", front_root.display())
 }
 
 fn resolve_project_root() -> Result<PathBuf> {
@@ -157,7 +174,10 @@ enum Incumbent {
 /// trade - it happens once, at the moment a build changes, and the
 /// alternative is every session on the machine going on being answered by a
 /// build that has been replaced.
-fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
+///
+/// `origin` says where `root` came from (see [`launch_origin`] and
+/// [`selected_origin`]); it only colors the cold-start line.
+fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
     let endpoint = daemon::endpoint(root)?;
     // Checked before anything is attempted, because every step below assumes
     // the endpoint is one a daemon could listen on. An over-long AF_UNIX path
@@ -222,10 +242,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
     eprintln!(
         "g-mesh mcp-shim: nothing is serving {} ({}) - starting a daemon for it",
         root.display(),
-        match std::env::var_os(PROJECT_DIR_ENV) {
-            Some(dir) if !dir.is_empty() => format!("from {PROJECT_DIR_ENV}"),
-            _ => "the current directory".to_string(),
-        }
+        origin
     );
     spawn_detached_daemon(root)?;
     let stream = wait_until_listening(&endpoint);

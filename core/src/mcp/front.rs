@@ -72,7 +72,13 @@ impl Front {
             SELECT_PROJECT_DESCRIPTION,
             schema_for_type::<SelectProjectParams>(),
         ));
-        let instructions = instructions::build_front(&root, detection);
+        let indexed: HashSet<&str> = detection
+            .candidates
+            .iter()
+            .filter(|candidate| candidates::has_completed_index(&candidate.abs_path))
+            .map(|candidate| candidate.rel_path.as_str())
+            .collect();
+        let instructions = instructions::build_front(&root, detection, &indexed);
         Self { root, instructions, tools, index_tools }
     }
 

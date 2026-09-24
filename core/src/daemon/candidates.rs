@@ -170,6 +170,15 @@ fn decide(root: &Path, state_dir: Option<&Path>, limits: Limits) -> Detection {
     }
 }
 
+/// Whether `project_root` (canonical) already has a completed index of its
+/// own - rule 2's check, applied to a candidate instead of the root. The
+/// front uses it to say which of its projects are indexed (D12). A state
+/// directory that cannot be resolved counts as "not indexed", as in
+/// [`detect`].
+pub fn has_completed_index(project_root: &Path) -> bool {
+    project_dir(project_root).is_ok_and(|state_dir| completed_index_in(&state_dir))
+}
+
 /// Rule 2: `<state dir>/index.db` exists and records a finished walk.
 ///
 /// Opened read-write *without* `CREATE`, as `cli::status::index_status` and
