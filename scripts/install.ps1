@@ -166,7 +166,7 @@ if (-not $InstallDir) {
 # only this one and refuses to anything else.
 $SupportedTarget = 'x86_64-pc-windows-msvc'
 
-function Write-Log {
+function Write-Step {
     param([string]$Message)
     Write-Host "==> $Message"
 }
@@ -384,7 +384,7 @@ function Install-GMesh {
         }
     }
     else {
-        Write-Log "resolving the latest published release"
+        Write-Step "resolving the latest published release"
         $Version = Resolve-LatestVersion
     }
 
@@ -392,7 +392,7 @@ function Install-GMesh {
     $asset = "$stem.zip"
     $url = "$DownloadBase/v$Version/$asset"
 
-    Write-Log "g-mesh $Version for $Target -> $InstallDir"
+    Write-Step "g-mesh $Version for $Target -> $InstallDir"
 
     $work = Join-Path ([System.IO.Path]::GetTempPath()) "g-mesh-install-$([System.IO.Path]::GetRandomFileName())"
     New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -400,7 +400,7 @@ function Install-GMesh {
         $archivePath = Join-Path $work $asset
         $shaPath = "$archivePath.sha256"
 
-        Write-Log "downloading $asset"
+        Write-Step "downloading $asset"
         try {
             Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing -ErrorAction Stop
         }
@@ -408,7 +408,7 @@ function Install-GMesh {
             Die "could not download $url`nThe release may not be published yet, or may not include a build for $Target.`nCheck https://github.com/$Repo/releases"
         }
 
-        Write-Log "downloading its checksum"
+        Write-Step "downloading its checksum"
         try {
             Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaPath -UseBasicParsing -ErrorAction Stop
         }
@@ -428,9 +428,9 @@ function Install-GMesh {
         if ($expected -ne $actual) {
             Die "checksum mismatch for $asset - NOTHING was installed.`n  expected: $expected`n  actual:   $actual`nThe download is corrupt or has been tampered with. Retry; if it keeps`nfailing, report it at https://github.com/$Repo/issues rather than installing`nthis binary."
         }
-        Write-Log "checksum ok"
+        Write-Step "checksum ok"
 
-        Write-Log "unpacking"
+        Write-Step "unpacking"
         $unpackDir = Join-Path $work 'unpack'
         New-Item -ItemType Directory -Path $unpackDir -Force | Out-Null
         try {
@@ -460,7 +460,7 @@ function Install-GMesh {
         # refuses to start. This is a per-machine check, not a claim about
         # the artifact in general: it can only prove the copy just
         # downloaded runs *here*, on this Windows machine, right now.
-        Write-Log "verifying the downloaded binary runs"
+        Write-Step "verifying the downloaded binary runs"
         try {
             $reportedLines = & $exePath --version 2>$null
         }
@@ -486,7 +486,7 @@ function Install-GMesh {
             Die "the downloaded g-mesh does not see the plugin that shipped with it - nothing was installed"
         }
 
-        Write-Log "installing into $InstallDir"
+        Write-Step "installing into $InstallDir"
         $parent = Split-Path -Parent $InstallDir
         if ($parent -and -not (Test-Path -LiteralPath $parent)) {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
@@ -526,7 +526,7 @@ function Install-GMesh {
         Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Host ""
-        Write-Log "installed g-mesh $Version"
+        Write-Step "installed g-mesh $Version"
         Write-Host "  binary:  $InstallDir\g-mesh.exe"
         Write-Host "  plugins: $InstallDir\plugins\  (must stay beside the binary)"
         Write-Host ""
