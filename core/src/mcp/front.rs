@@ -198,19 +198,39 @@ fn find_candidate<'a>(candidates: &'a [Candidate], project: &str) -> Option<&'a 
 
 /// The candidate whose directory holds `file_path` (relative to the root,
 /// or absolute under it), matched by whole path segments.
+///
+/// Separator-agnostic: the path is compared as segments split on `/` and `\`
+/// alike (an absolute one after [`Path::strip_prefix`], which compares
+/// components), so a Windows client's `group\bb\x.go` and a POSIX
+/// `group/bb/x.go` land on the same candidate. `has_root` rather than
+/// `is_absolute` picks the branch: on Windows `/root/x` has a root but no
+/// drive, so it is not absolute, and it is still not relative to the root.
 fn containing_candidate<'a>(
     root: &Path,
     candidates: &'a [Candidate],
     file_path: &str,
 ) -> Option<&'a Candidate> {
     let as_path = Path::new(file_path);
-    let rel = if as_path.is_absolute() {
-        let stripped = as_path.strip_prefix(root).ok()?;
-        normalize(&stripped.to_string_lossy())
+    let rel = if as_path.has_root() {
+        relative_to_root(root, as_path)?.to_string_lossy().into_owned()
     } else {
-        normalize(file_path)
+        file_path.to_string()
     };
-    candidates.iter().find(|c| rel.starts_with(&c.rel_path) && rel[c.rel_path.len()..].starts_with('/'))
+    let rel: Vec<&str> = rel.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect();
+    candidates.iter().find(|c| {
+        let candidate: Vec<&str> = c.rel_path.split('/').collect();
+        rel.len() > candidate.len() && rel.iter().zip(&candidate).all(|(a, b)| a == b)
+    })
+}
+
+/// `path` below `root`, compared by components. `root` is canonical, so a
+/// spelling of it that differs textually (a symlink, or on Windows the `\\?\`
+/// prefix `canonicalize` adds) is retried canonicalized.
+fn relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    path.canonicalize().ok()?.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
 /// Serves one connection until the client goes away.
@@ -292,6 +312,51 @@ mod tests {
         assert_eq!(hit("bb/x.ts"), None, "a prefix of a segment is not a match");
         assert_eq!(hit("b"), None, "the candidate directory itself is not a file in it");
         assert_eq!(hit("/elsewhere/b/x.ts"), None);
+    }
+
+    #[test]
+    fn a_backslash_separated_path_is_matched_like_a_slash_separated_one() {
+        let root = Path::new("/root");
+        let candidates = [candidate("b"), candidate("group/bb")];
+        let hit = |path: &str| containing_candidate(root, &candidates, path).map(|c| c.rel_path.as_str());
+        assert_eq!(hit("group\\bb\\x.go"), Some("group/bb"));
+        assert_eq!(hit(".\\b\\src\\x.ts"), Some("b"));
+        assert_eq!(hit("group/bb\\x.go"), Some("group/bb"), "mixed separators");
+        assert_eq!(hit("group\\b\\x.go"), None, "still whole segments");
+    }
+
+    /// The root is canonical; a file path spelling it differently (here a
+    /// symlink, on Windows the `\\?\` prefix `canonicalize` adds to the root
+    /// but no client sends) must still land inside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_path_through_another_spelling_of_the_root_is_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("group").join("bb")).unwrap();
+        std::fs::write(root.join("group").join("bb").join("x.go"), "").unwrap();
+        let root = root.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&root, dir.path().join("link")).unwrap();
+        let candidates = [candidate("group/bb")];
+        let file = dir.path().join("link").join("group").join("bb").join("x.go");
+        let hit = containing_candidate(&root, &candidates, file.to_str().unwrap());
+        assert_eq!(hit.map(|c| c.rel_path.as_str()), Some("group/bb"));
+    }
+
+    /// The Windows shape of the test above: the served root carries the
+    /// verbatim prefix, the client's path does not.
+    #[cfg(windows)]
+    #[test]
+    fn an_absolute_path_without_the_verbatim_prefix_is_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("root");
+        std::fs::create_dir_all(plain.join("group").join("bb")).unwrap();
+        std::fs::write(plain.join("group").join("bb").join("x.go"), "").unwrap();
+        let root = plain.canonicalize().unwrap();
+        let candidates = [candidate("group/bb")];
+        let file = plain.join("group").join("bb").join("x.go");
+        let hit = containing_candidate(&root, &candidates, file.to_str().unwrap());
+        assert_eq!(hit.map(|c| c.rel_path.as_str()), Some("group/bb"));
     }
 
     #[test]
