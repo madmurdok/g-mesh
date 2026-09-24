@@ -493,6 +493,68 @@ pub struct DiscoveredPlugins {
     pub routing: HashMap<String, String>,
 }
 
+impl DiscoveredPlugins {
+    /// Which language claims `file_path` (project-relative, forward-slash
+    /// separated), by its extension alone; `None` if no discovered plugin
+    /// does. The extension is lowercased first, since the routing table's
+    /// keys are lowercase-with-leading-dot by manifest convention.
+    pub fn language_for(&self, file_path: &str) -> Option<&str> {
+        let extension = extension_of(file_path)?;
+        self.routing.get(&extension).map(String::as_str)
+    }
+
+    /// The language whose plugin indexes `file_path`: the one that claims its
+    /// extension ([`language_for`](Self::language_for)), unless the file sits
+    /// under a directory that same language's `[plugin.workspace]
+    /// exclude_dirs` names ([`under_excluded_dir`]). Each language's
+    /// exclusions are its own - `dist/app.py` is Python's even though
+    /// TypeScript excludes `dist` - so this is a per-language check, never a
+    /// union of every manifest's list.
+    ///
+    /// The single core-side answer to "is this a file the index should hold?",
+    /// shared by the watcher's routing (`daemon::registry::PluginRegistry::
+    /// file_changed`) and `g-mesh status`'s coverage walk (`cli::status`), so
+    /// the two cannot disagree about which files a project has.
+    pub fn indexing_language(&self, file_path: &str) -> Option<&str> {
+        let language = self.language_for(file_path)?;
+        match self.manifests.get(language) {
+            Some(manifest) if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs) => None,
+            _ => Some(language),
+        }
+    }
+}
+
+/// `src/App.TSX` -> `".tsx"`: the lowercase, leading-dot form the routing
+/// table is keyed by. `None` for a path with no (UTF-8) extension.
+pub(crate) fn extension_of(file_path: &str) -> Option<String> {
+    let extension = Path::new(file_path).extension()?.to_str()?;
+    Some(format!(".{}", extension.to_lowercase()))
+}
+
+/// Whether `file_path` sits under a directory literally named one of
+/// `exclude_dirs`, checked against **every path segment except the file name
+/// itself** - the architecture doc's `[plugin.workspace] exclude_dirs`
+/// ("directory names... matched by exact name, not glob") and GM-272's
+/// decision 5 ("match directory NAMES on any path segment, not prefixes"):
+/// `vendor/pkg/build.alpha` is excluded by `exclude_dirs = ["vendor"]`
+/// exactly as `pkg/vendor/build.alpha` is - the excluded name can sit at any
+/// depth, not only as a leading path component - while
+/// `vendored-tools/build.alpha` is **not**, because `"vendored-tools" !=
+/// "vendor"` as a whole segment; a prefix/substring match would wrongly
+/// exclude it.
+///
+/// Empty `exclude_dirs` (the common case - most manifests declare none, and
+/// every fixture that predates GM-272) short-circuits without walking the
+/// path at all.
+pub(crate) fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    let mut segments = file_path.split('/');
+    segments.next_back(); // the file name itself names no directory
+    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
+}
+
 /// Every language among `manifests` whose `capabilities.semantic_pass` is
 /// `true`, sorted.
 ///

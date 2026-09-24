@@ -66,22 +66,12 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
+use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::storage::connection::project_dir;
 use crate::watcher::staleness::mtime_millis;
-
-/// Extensions the bundled JS/TS plugin will index, mirroring `grammarFor` in
-/// plugins/typescript/src/extract.ts. Anything else on disk is not a file this
-/// project's index is ever expected to cover, so counting it would make
-/// coverage look permanently broken.
-const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"];
-
-/// Directory names excluded whatever `.gitignore` says, mirroring
-/// `HARD_EXCLUDED_DIRS` in plugins/typescript/src/ignorePolicy.ts - the walk here
-/// has to agree with the walk that built the index, or every file the plugin
-/// skipped would read as a coverage gap.
-const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"];
+use crate::watcher::BASELINE_EXCLUDED_DIRS;
 
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,7 +309,12 @@ pub fn collect(project_root: &Path) -> Result<Report> {
             syntax_error_files: Vec::new(),
         }
     } else {
-        index_status(project_root, &state_dir.join("index.db"))?
+        // The same discovery the daemon runs at startup, so the files counted
+        // here are the files the discovered plugins index - every language,
+        // not only JS/TS (GM-412).
+        let plugins =
+            manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
+        index_status(project_root, &state_dir.join("index.db"), &plugins)?
     };
     Ok(Report {
         project_id,
@@ -437,8 +432,8 @@ fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
 /// Split out from [`collect`] - and given the database path explicitly -
 /// because this is the part with real logic in it, and it should be testable
 /// against a hand-built index rather than only through a live daemon.
-pub fn index_status(project_root: &Path, db_path: &Path) -> Result<IndexStatus> {
-    let discovered = discover_source_files(project_root)?;
+pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlugins) -> Result<IndexStatus> {
+    let discovered = discover_source_files(project_root, plugins)?;
 
     // No index yet (never bootstrapped, or deleted by hand): everything on
     // disk is owed work, and none of it is covered.
@@ -499,28 +494,49 @@ struct SourceFile {
     mtime_millis: i64,
 }
 
-/// Walks `project_root` for files the plugin would index, honoring
-/// `.gitignore` and the hard exclusions the plugin's own walk applies.
+/// Walks `project_root` for files some discovered plugin would index,
+/// honoring `.gitignore`, [`BASELINE_EXCLUDED_DIRS`], and each language's own
+/// `[plugin.workspace] exclude_dirs` - the file-level decision is
+/// [`DiscoveredPlugins::indexing_language`], the same filter the watcher
+/// routes changes through.
 ///
-/// Two deliberate divergences from that walk, both in the direction of doing
-/// less: symlinks are not followed (the plugin follows them under a cycle
+/// Core cannot literally reuse the bulk walk: each plugin walks the project
+/// itself, in its own process (the TS plugin's `ignorePolicy.ts`, the Go
+/// plugin's `walk.go`, the SDK's `walk_project` for Rust and Python). What they
+/// share, and what this mirrors, is the manifest: extensions claimed, the
+/// directories excluded per language, and the baseline pair.
+///
+/// Deliberate divergences from those walks, all in the direction of doing
+/// less: symlinks are not followed (the TS plugin follows them under a cycle
 /// guard), and a file whose metadata cannot be read is skipped rather than
 /// failing the report. Neither can make a broken index look healthy.
-fn discover_source_files(project_root: &Path) -> Result<Vec<SourceFile>> {
+fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Result<Vec<SourceFile>> {
+    // Pruned outright: the baseline, plus any directory *every* discovered
+    // language excludes. A directory only some languages exclude is still
+    // walked (`dist/app.py` is Python's even though TypeScript skips `dist`),
+    // and its files are filtered one by one below.
+    let pruned: Vec<String> = BASELINE_EXCLUDED_DIRS
+        .iter()
+        .map(|dir| (*dir).to_string())
+        .chain(excluded_by_every_language(plugins))
+        .collect();
+
     let mut files = Vec::new();
     let walk = WalkBuilder::new(project_root)
-        // Matching the plugin's walk, which reads each directory's own
+        // Matching the plugins' walks, which read each directory's own
         // .gitignore and nothing else: no dotfile skipping, no rules from
         // above the project root, no global/`info/exclude` rules, and rules
         // honored even outside a git repository.
         .hidden(false)
         .parents(false)
+        .ignore(false)
         .git_global(false)
         .git_exclude(false)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|entry| {
-            !entry.file_name().to_str().is_some_and(|name| HARD_EXCLUDED_DIRS.contains(&name))
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            !is_dir || !entry.file_name().to_str().is_some_and(|name| pruned.iter().any(|dir| dir == name))
         })
         .build();
 
@@ -533,12 +549,12 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<SourceFile>> {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        if !is_source_file(entry.path()) {
-            continue;
-        }
         let Some(relative) = relative_wire_path(project_root, entry.path()) else {
             continue;
         };
+        if plugins.indexing_language(&relative).is_none() {
+            continue;
+        }
         let Ok(metadata) = fs::metadata(entry.path()) else {
             continue;
         };
@@ -550,10 +566,19 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<SourceFile>> {
     Ok(files)
 }
 
-fn is_source_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+/// The directory names in every discovered manifest's `exclude_dirs` - safe to
+/// prune from the walk, since no language would index anything under them.
+/// Empty when nothing was discovered.
+fn excluded_by_every_language(plugins: &DiscoveredPlugins) -> Vec<String> {
+    let mut manifests = plugins.manifests.values();
+    let Some(first) = manifests.next() else {
+        return Vec::new();
+    };
+    let mut common: Vec<String> = first.workspace.exclude_dirs.clone();
+    for manifest in manifests {
+        common.retain(|dir| manifest.workspace.exclude_dirs.contains(dir));
+    }
+    common
 }
 
 fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {

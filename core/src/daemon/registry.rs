@@ -112,7 +112,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, DiscoveredPlugins};
+use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
@@ -612,8 +612,7 @@ impl PluginRegistry {
     /// are already lowercase-with-leading-dot by the manifest convention
     /// `daemon::manifest` documents.
     pub fn language_for(&self, file_path: &str) -> Option<&str> {
-        let extension = extension_of(file_path)?;
-        self.discovered.routing.get(&extension).map(String::as_str)
+        self.discovered.language_for(file_path)
     }
 
     /// Every language whose manifest routes `file_path` as a **workspace**
@@ -900,18 +899,18 @@ impl PluginRegistry {
     /// ordinary and expected as `.gitignore` already is at the filesystem-
     /// watch layer.
     pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
-        let Some(language) = self.language_for(&file_path).map(str::to_string) else {
+        if self.language_for(&file_path).is_none() {
             if let Some(notice) = self.unroutable_notice(&file_path) {
                 eprintln!("{notice}");
             }
             return;
-        };
-
-        if let Some(manifest) = self.discovered.manifests.get(&language) {
-            if under_excluded_dir(&file_path, &manifest.workspace.exclude_dirs) {
-                return;
-            }
         }
+        // Claimed, but under that language's own `exclude_dirs` - the same
+        // `DiscoveredPlugins::indexing_language` filter `g-mesh status`'s
+        // coverage walk applies, so the two agree on which files exist.
+        let Some(language) = self.discovered.indexing_language(&file_path).map(str::to_string) else {
+            return;
+        };
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
@@ -1217,43 +1216,12 @@ impl PluginRegistry {
     }
 }
 
-/// `some/dir/App.TSX` -> `Some(".tsx")`; `None` for a path with no extension
-/// at all (`Makefile`, `.gitignore`, a bare directory name).
-fn extension_of(file_path: &str) -> Option<String> {
-    let extension = Path::new(file_path).extension()?.to_str()?;
-    Some(format!(".{}", extension.to_lowercase()))
-}
-
 /// `some/dir/go.mod` -> `"go.mod"` - the final path segment, matching the
 /// project-relative, forward-slash-joined convention `relative_wire_path`
 /// (`daemon::mod`) already produces for every path this module ever sees.
 /// A path with no `/` at all (a root-level file) returns itself unchanged.
 fn file_name_of(file_path: &str) -> &str {
     file_path.rsplit('/').next().unwrap_or(file_path)
-}
-
-/// Whether `file_path` sits under a directory literally named one of
-/// `exclude_dirs`, checked against **every path segment except the file name
-/// itself** - the architecture doc's `[plugin.workspace] exclude_dirs`
-/// ("directory names... matched by exact name, not glob") and this task's
-/// own decision 5 ("match directory NAMES on any path segment, not
-/// prefixes"): `vendor/pkg/build.alpha` is excluded by `exclude_dirs =
-/// ["vendor"]` exactly as `pkg/vendor/build.alpha` is - the excluded name can
-/// sit at any depth, not only as a leading path component - while
-/// `vendored-tools/build.alpha` is **not**, because `"vendored-tools" !=
-/// "vendor"` as a whole segment; a prefix/substring match would wrongly
-/// exclude it.
-///
-/// Empty `exclude_dirs` (the common case - most manifests declare none, and
-/// every fixture that predates GM-272) short-circuits without walking the
-/// path at all.
-fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
-    if exclude_dirs.is_empty() {
-        return false;
-    }
-    let mut segments = file_path.split('/');
-    segments.next_back(); // the file name itself names no directory
-    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
 }
 
 #[cfg(test)]
