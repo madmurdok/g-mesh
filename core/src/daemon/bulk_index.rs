@@ -55,6 +55,16 @@ use crate::watcher::staleness;
 /// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
 pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 
+/// Set to `1` on every bulk spawn, telling the plugin its stdin is a lifeline
+/// (GM-397): a pipe core holds open and never writes, whose EOF means core is
+/// gone, so the walk should stop. Opt-in by the spawner, so a plugin run by an
+/// older core or by hand with `< /dev/null` does not read an immediate EOF as
+/// "exit before walking". Must stay in sync with the plugins' own copies
+/// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`,
+/// `plugins/typescript/src/index.ts`) - see
+/// `docs/architecture/plugin-lifetime.md` §2.
+pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
+
 /// Nodes plus edges accumulated before a batch is committed. One `Diff` for
 /// the whole project would mean holding a large repo's entire graph in memory
 /// before a single row is written; one per item would mean a transaction per
@@ -341,23 +351,31 @@ pub(crate) fn walk_one_language(
         bail!("failed to spawn the {} plugin's bulk index: {hint}", manifest.language);
     }
 
-    let mut child = Command::new(&manifest.command)
+    let mut command = Command::new(&manifest.command);
+    command
         .args(&manifest.args)
         .arg(BULK_INDEX_FLAG)
         .arg(project_root)
-        .stdin(Stdio::null())
+        // The lifeline (GM-397): a pipe this process never writes to. It
+        // stays inside `child` - never taken, never dropped early - so the
+        // plugin sees EOF exactly when this process's end closes, which the
+        // kernel does even on SIGKILL. `Child::wait` below closes it before
+        // waiting, which is harmless: by then stdout has reached EOF, so the
+        // plugin is already exiting. The env var is what arms the plugin's
+        // watcher - see `BULK_STDIN_LIFELINE_ENV`.
+        .stdin(Stdio::piped())
+        .env(BULK_STDIN_LIFELINE_ENV, "1")
         .stdout(Stdio::piped())
         // Same reasoning as PluginProcess::spawn: plugin logs are diagnostic
         // only, so they go wherever the daemon's own stderr goes.
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn the {} plugin's bulk index ({})",
-                manifest.language,
-                manifest.command.display()
-            )
-        })?;
+        .stderr(Stdio::inherit());
+    let mut child = crate::process::spawn_serialized(&mut command).with_context(|| {
+        format!(
+            "failed to spawn the {} plugin's bulk index ({})",
+            manifest.language,
+            manifest.command.display()
+        )
+    })?;
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 

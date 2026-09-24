@@ -27,6 +27,7 @@ import {
   type GitignoreLayer,
 } from "./ignorePolicy";
 import { createProjectResolver } from "./resolve";
+import { holdPoint } from "./testHold";
 import { canonicalizeProjectRoot, createSymlinkGuard, type SymlinkGuard } from "./symlinks";
 
 /**
@@ -256,6 +257,10 @@ export async function bulkIndexProject(
   // back while it runs, and the same handful of shared modules is otherwise
   // re-stat-ed once per importing file.
   const resolveSpecifier = createProjectResolver(projectRoot);
+
+  // Test-only (GM-397): parks the walk before its first write - the silent
+  // stretch in which a killed core goes unnoticed. See testHold.ts.
+  await holdPoint("bulk");
 
   for await (const relPath of walkProjectFiles(projectRoot)) {
     const absPath = path.join(projectRoot, relPath);

@@ -491,6 +491,30 @@ The control messages are unchanged apart from one addition. `fileChanged` and
   can drop cached module or crate maps. Core follows it with the per-language
   reindex, so the plugin does not have to answer with a diff.
 
+### Process lifetime: stdin is the lifeline (GM-397)
+
+A plugin must not outlive the daemon that spawned it, including a daemon
+killed with SIGKILL, where no daemon code runs. The only signal that survives
+every way a daemon can die is the kernel closing the daemon's end of a pipe,
+so that is the contract (design and measurements:
+[plugin-lifetime.md](plugin-lifetime.md)):
+
+- **Bulk mode (`--bulk-index`).** When `G_MESH_BULK_STDIN_LIFELINE=1` is set,
+  stdin is a pipe core holds open and never writes. Its EOF means core is
+  gone: exit at once, non-zero, whatever the walk is doing. Without the
+  variable, leave stdin alone - an older core, or a hand run with
+  `< /dev/null`, would otherwise read as "exit before walking". A plugin
+  whose runtime keeps a process alive while stdin is open (Node) must let go
+  of stdin once the walk has settled, or it never exits and core, reading its
+  stdout to EOF, waits forever.
+- **Long-lived mode.** stdin EOF means exit, even mid-request: stdin has to be
+  read while a request is being handled, not only between requests. A plugin
+  that owns a language server ends it on the way out.
+
+The SDK, Go and TypeScript plugins all implement both clauses. A third-party
+plugin that ignores stdin keeps living until its next write or read fails;
+core does not enforce the contract.
+
 ### Linker contract: what `graph::symbol_links` guarantees
 
 For a placeholder with target `(scope, key, fromContainer, fromFile)` and a usage
