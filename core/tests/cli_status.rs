@@ -300,3 +300,27 @@ fn status_prints_no_warning_when_cleanup_is_disabled() {
 
     assert!(!status.contains("idle for more than"), "{status}");
 }
+
+/// GM-399 slice 4 (D11): a folder of projects is served by the front, which
+/// has no index. `status` says so in one line and prints no coverage: the
+/// whole-folder file walk behind a coverage figure is the cost a front
+/// exists to avoid.
+#[test]
+fn status_in_a_front_served_folder_prints_the_front_line_and_no_coverage() {
+    let project = Project::new();
+    for repo in ["a/.git", "b/.git"] {
+        std::fs::create_dir_all(project.root().join(repo)).expect("failed to create a candidate repo");
+    }
+    let mut daemon_process = spawn_daemon(project.root());
+    let phase_file = daemon::phase_path_in(&project.state_dir());
+    wait_for("the front to publish its phase", || {
+        std::fs::read_to_string(&phase_file).map(|phase| phase.trim() == "front").unwrap_or(false)
+    });
+
+    let status = project.status();
+
+    assert_contains(&status, "index:           folder of 2 projects - no index; a session selects one");
+    assert!(!status.contains("index coverage"), "a front has no coverage to report:\n{status}");
+    assert!(!status.contains("dirty files"), "a front has no dirty files to report:\n{status}");
+    assert!(daemon_process.try_wait().unwrap().is_none(), "the front must still be running");
+}

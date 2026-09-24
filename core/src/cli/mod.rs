@@ -28,6 +28,7 @@
 pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;
+pub mod debug_candidates;
 pub mod init;
 pub mod model;
 pub mod plugin_check;
@@ -105,6 +106,18 @@ pub enum Command {
         /// depend on.
         #[arg(long)]
         project_root: PathBuf,
+    },
+    /// Prints how multi-project detection sees a folder (D10 in
+    /// `docs/architecture/lazy-indexing.md`): the mode decision, the
+    /// candidates, and what the walk cost. For support and for measuring
+    /// the walk (M4) - not a user-facing command.
+    #[command(hide = true)]
+    DebugCandidates {
+        /// Folder to inspect; the current directory when omitted.
+        dir: Option<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -208,6 +221,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),
+        Command::DebugCandidates { dir, json } => debug_candidates::run(dir, json),
     }
 }
 
@@ -451,5 +465,23 @@ mod tests {
             .expect("the daemon subcommand must still exist")
             .clone();
         assert!(daemon.is_hide_set(), "the shim's private daemon entry point must stay out of --help");
+    }
+
+    #[test]
+    fn debug_candidates_parses_and_stays_hidden() {
+        let cli = Cli::try_parse_from(["g-mesh", "debug-candidates", "/some/dir", "--json"]).unwrap();
+        match cli.command {
+            Command::DebugCandidates { dir, json } => {
+                assert_eq!(dir, Some(PathBuf::from("/some/dir")));
+                assert!(json);
+            }
+            other => panic!("expected debug-candidates, got {other:?}"),
+        }
+        let sub = Cli::command()
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "debug-candidates")
+            .expect("debug-candidates must exist")
+            .clone();
+        assert!(sub.is_hide_set(), "debug-candidates is for support and M4, not --help");
     }
 }

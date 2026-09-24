@@ -198,3 +198,31 @@ fn clean_refuses_a_path_shaped_project_id() {
         );
     }
 }
+
+/// GM-399 slice 4 (D11): a front's state directory holds a socket, a pid
+/// file and `index.phase`, and no `index.db`. `clean orphaned` and `clean`
+/// must handle it like any other. A regression guard: no code changed to
+/// make this pass.
+#[test]
+fn clean_and_clean_orphaned_handle_a_front_state_dir() {
+    let project = Project::new();
+    for repo in ["a/.git", "b/.git"] {
+        std::fs::create_dir_all(project.root().join(repo)).expect("failed to create a candidate repo");
+    }
+    project.bootstrap_daemon();
+    let state_dir = project.state_dir();
+    wait_for("the fixture's daemon to be a front", || {
+        daemon::read_phase_in(&state_dir).as_deref() == Some("front")
+    });
+    assert!(!state_dir.join("index.db").exists(), "a front has no index.db");
+
+    let reported = project.command(&["clean", "orphaned"]);
+    assert!(reported.status.success(), "clean orphaned failed: {}", stderr_of(&reported));
+    assert!(state_dir.is_dir(), "`clean orphaned` must leave a live front's state alone");
+
+    let stopped = project.command(&["stop"]);
+    assert!(stopped.status.success(), "stop failed: {}", stderr_of(&stopped));
+    let cleaned = project.command(&["clean"]);
+    assert!(cleaned.status.success(), "clean failed: {}", stderr_of(&cleaned));
+    assert!(!state_dir.exists(), "the front's state directory must be gone");
+}
