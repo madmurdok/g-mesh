@@ -480,6 +480,33 @@ export class Broken {
   assert.ok(clean.nodes.every((n) => !n.hasSyntaxErrors));
 });
 
+// GM-413: extract.ts itself separates hash fields with raw NULs inside
+// template literals, which the grammars' lexers read as end of input.
+test("a raw NUL inside a string or template literal is not a syntax error", () => {
+  const source =
+    "export function key(a: string, b: string): string {\n" +
+    "  return `node\u0000${a}\u0000${b}`;\n" +
+    "}\n" +
+    'export const SEP = "x\u0000y";\n';
+  for (const file of ["src/nul.ts", "src/nul.tsx", "src/nul.js"]) {
+    const result = extractFile(file, source.replace(/: string/g, file.endsWith(".js") ? "" : ": string"));
+    assert.equal(result.hasSyntaxErrors, false, file);
+    assert.ok(result.nodes.every((n) => !n.hasSyntaxErrors), file);
+    assert.equal(node(result, "Function", "key").name, "key");
+  }
+});
+
+test("a raw NUL outside any literal is still a syntax error", () => {
+  const result = extractFile("src/nul.ts", "export const a = 1;\u0000\nexport const b = 2;\n");
+  assert.equal(result.hasSyntaxErrors, true);
+});
+
+test("text read back from a literal keeps its raw NUL", () => {
+  const result = extractFile("src/nul.ts", 'import { a } from "./a\u0000b";\nexport const c = a;\n');
+  assert.equal(result.hasSyntaxErrors, false);
+  assert.equal(node(result, "Module", "./a\u0000b").name, "./a\u0000b");
+});
+
 test("node ids survive edits elsewhere in the file", () => {
   const before = extractFile("src/greeter.ts", GREETER_TS);
   const after = extractFile(
