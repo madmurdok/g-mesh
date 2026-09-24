@@ -308,3 +308,108 @@ $ ps -axo pid,command | grep -E 'g-mesh (daemon|mcp-shim)|bulk-index'
 47122 /bin/zsh -c source .../shell-snapshots/snapshot-zsh-...sh ... eval 'ps -axo pid,command | grep -E ...'
 47125 ugrep -G ... -E g-mesh (daemon|mcp-shim)|bulk-index
 ```
+
+## After the fix (GM-401 S3)
+
+Slice S3 (verify) of GM-401. Independent re-measurement of commit `74b8a04`
+("fix: answer the first query after a walk without reindexing the file
+(GM-401 S2)"), in a fresh worktree (`wt-gm401-ctl`) checked out detached at
+that commit, never the branch's original working tree.
+
+### Controls (each reverted with `git checkout -- .` before the next; worktree
+confirmed clean via `git status --short` between every one)
+
+| # | Reverted | Expectation | Result |
+|---|---|---|---|
+| 1 | `walk_baseline_for`'s `mtime >= cutoff` check dropped | `walk_baselines_vouch_only_for_files_untouched_since_the_walk_started` fails | **Failed as predicted**: `WalkBaselines { recorded: 3, skipped: 2 }` vs expected `{ recorded: 1, skipped: 4 }` (`fresh.rs`/`edge.rs` wrongly baselined) |
+| 2 | `record_walk_baselines` call removed from `bulk_index::run_with_progress` | `the_first_query_after_a_walk_takes_the_fast_path` fails, empty table | **Failed as predicted**: `project.baselines()` returned `[]` instead of `["src/index.ts", "src/other.ts"]` |
+| 3 | `staleness::decide` returns `AlreadyFresh` whenever a prior record exists | `a_file_edited_after_the_walk_is_still_reindexed` fails | **Failed as predicted**: outline came back `["size"]`, missing the post-walk edit (`"grown"` never seen) |
+| 4 | Progress-ticker `select!` branch deleted from `ensure_file_fresh` | `a_slow_query_time_reindex_sends_a_heartbeat_then_the_full_answer` fails | **Failed as predicted**: "expected at least 3 progress notifications ... got 0: []" |
+
+All four controls demonstrate the tests actually exercise the fix, not just
+pass incidentally.
+
+### fmt / clippy / full suite (on the untouched tip, worktree clean before and after)
+
+- `cargo fmt --all -- --check`: clean, no diff.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, exit 0, zero
+  warnings.
+- One full `cargo test -p g-mesh --no-fail-fast`: **931 passed, 0 failed, 7
+  ignored** (plus the doctests/integration binaries: every `test result: ok`
+  line across the run reports `0 failed`). The log was read in full and
+  grepped for `FAILED|panicked|test result`; the only lines matching
+  `failed`/`FAILED` as a keyword are test *names* describing failure-handling
+  behavior (e.g. `a_failed_walk_is_a_tool_error_and_is_retried ... ok`), not
+  actual failures. This full run had not been executed after the S2
+  implementer's last assertion change; it now has, and it's green.
+
+### Re-measurement
+
+Built `cargo build --release --workspace` in the worktree (debug plugin
+binaries and the TypeScript/Go plugins were already built during setup).
+Reused the S1 harness (`gm401/run.sh`, `client.py`, `sampler.py`,
+`tailer.py`), copied to `run-ctl.sh`/`client-ctl.py` pointing at
+`wt-gm401-ctl`'s own `target/release/g-mesh` and using it as both the spawn
+binary and the project root, otherwise unchanged. One cold run, fresh
+`G_MESH_HOME=/tmp/gm401-ctl-1/home`, `get_file_outline` of
+`core/src/daemon/mod.rs` (as specified for this slice; S1 run 2 used
+`core/src/mcp/mod.rs`).
+
+| | S1 (before, runs 1-2) | S3 (after, run 1) |
+|---|---|---|
+| `waited_ms` (walk) | 22,493 / 24,056 | 12,869 |
+| client-observed first answer | 101.26s / 75.66s | **14.916s** |
+| gap after `wait over` | 77.02s / 51.02s | **0.022s** (14.938 - 14.916 sent-vs-log clock skew; `ensure_fresh` itself took 6ms) |
+| `ensure_fresh` outcome | (not traced; a synchronous reindex ran) | `outcome=AlreadyFresh elapsed_ms=6 progress_sent=0` |
+
+Full trace (`daemon.ts.log`, times are wall-clock via `tailer.py`):
+
+```
+prepare: entered tool=get_file_outline request=2 progressToken=present
+prepare: wait over tool=get_file_outline request=2 outcome=satisfied waited_ms=12869 progress_sent=2
+prepare: past the indexing wait tool=get_file_outline request=2
+prepare: done tool=get_file_outline request=2
+ensure_fresh: tool=get_file_outline request=2 file=core/src/daemon/mod.rs outcome=AlreadyFresh elapsed_ms=6 progress_sent=0
+```
+
+Client's own timeline (`events.log`, seconds since the shim was spawned):
+`tools/call` sent at +2.026s, two walk-progress notifications at +7.03s and
++12.04s, reply at **+14.916s**. `/usr/bin/time -p`: real 15.07, user 0.52,
+sys 0.49 - real far exceeds user+sys, confirming the client process was
+waiting on the daemon's walk, not CPU-bound itself.
+
+The expectation set for this slice ("close to the walk's ~24s") is met and
+exceeded: the walk itself was faster here (12.9s vs S1's 22.5-24.1s,
+plausibly machine-load-dependent - `uptime` before the run read load
+averages `53.00 166.17 119.31`, an extremely loaded machine, against S1's
+4-12), and the post-wait gap that GM-401 targeted is gone: 6ms of
+`ensure_fresh` instead of 51-77s of synchronous reindex + cold
+rust-analyzer semantic pass. The old per-file semantic-pass cost (a Rust
+file's rust-analyzer cold start) simply never runs, because the walk's own
+baseline is trusted.
+
+`uptime`:
+
+| | before | after |
+|---|---|---|
+| S3 run 1 | 2026-09-24T14:27:06+0300, load 53.00 166.17 119.31 | 2026-09-24T14:27:21+0300, load 42.95 158.41 117.35 |
+
+### Cleanup
+
+`run-ctl.sh` stopped the daemon itself (`G_MESH_HOME=/tmp/gm401-ctl-1/home
+target/release/g-mesh stop`, run in the worktree):
+
+```
+g-mesh: stopped the daemon for /Users/Valentin_Taiurskii/Projects/ClaudeProjects/wt-gm401-ctl
+  daemon core: pid 95397 (terminated)
+  plugin (go): pid 95476 (exited with its core)
+  plugin (python): pid 95550 (exited with its core)
+  plugin (rust): pid 95699 (terminated)
+```
+
+A follow-up check found nothing left over:
+
+```
+$ ps -axo pid,command | grep -E 'g-mesh (daemon|mcp-shim)|bulk-index|wt-gm401-ctl' | grep -v grep
+(no output)
+```
