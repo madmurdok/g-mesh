@@ -157,6 +157,8 @@ main() {
 	# why the checked-in manifest is not reused as-is.
 	log "generating $stage/plugin.toml for $exe_name"
 	local src_manifest="$PLUGIN_DIR/plugin.toml"
+	# The placeholder is literal on purpose: it is what the manifest spells (GM-404).
+	# shellcheck disable=SC2016
 	local marker='command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"'
 	grep -qF "$marker" "$src_manifest" ||
 		die "$src_manifest no longer contains '$marker' - update this script's substitution to match its new spelling"
