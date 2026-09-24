@@ -18,6 +18,9 @@
 # GM-406: move inline `mod tests` blocks into sibling tests.rs files
 #
 # Pure moves: each body was de-indented one level and re-run through
-# rustfmt, nothing else.
+# rustfmt, nothing else (plus one `include_str!` path gaining a `../`).
+# Ignoring these revs only helps blame on the parent files: blame cannot
+# follow lines into a new file, so for a moved tests.rs use
+# `git blame -w -C <path>` to reach the pre-move history.
 dd22b800c5e4cdaa7018cf25fb93bd9bf5c97d15
 b581fb31aa18c153cc6f08adb03bbec5ceced836
