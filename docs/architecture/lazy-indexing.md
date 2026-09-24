@@ -1167,7 +1167,11 @@ builds each control in its own worktree and reports any that does not fail.*
 **Goal:** A2 (select, then work on the selected project), end to end.
 
 **Change:** in `shim.rs`, replace `proxy`/`pump` (`:469-507`) with a
-switchable router (D11 step 3):
+switchable router (D11 step 3). *As built* it lives in `shim/router.rs`,
+generic over its streams so the byte-identity unit test drives it through
+`std::io::pipe`; stdout is written by the thread running `router::serve`,
+fed by the channel. Slice 4's front test no longer checks the `_meta`
+directive through the shim, since the shim now consumes it:
 
 - `Router { front: Upstream, current: Upstream, init_frame,
   initialized_frame, select_ids: HashSet<serde_json::Value>, replay_seq }`
@@ -1192,7 +1196,7 @@ plus router unit tests in `shim.rs`):
 | Test | What it asserts | Control |
 |---|---|---|
 | `selecting_a_project_switches_the_session` | after `select_project {project:"b"}`, `get_file_outline {file_path:"b.ts"}` returns `b.ts`'s outline; afterwards `project_dir(b)/index.db` has `bulkIndexedAt` set, and `project_dir(root)` and `project_dir(a)` have no `index.db` | the shim ignores the directive: the outline call gets the front's "none is selected" error |
-| `select_project_carries_the_selected_projects_own_guidance` **(the instructions gap)** | (1) with `b` unindexed, the result text contains `this session now serves <canon b>`, `Index root: <canon b>. Not indexed yet`, and `P1`'s first sentence; (2) `peer_info().instructions` is still the front's text, pinning the known limitation so a change in it is noticed; (3) the result has no `_meta` directive | (1) skip D11 step 3.6 (forward the front's result as is); (3) keep the directive |
+| `select_project_carries_the_selected_projects_own_guidance` **(the instructions gap)** | (1) with `b` unindexed, the result text contains `this session now serves <canon b>`, then guidance that opens with `cold_start`'s line (`Index root: <canon b>. Not indexed yet`, or, *as built*, its no-root fallback `Not indexed yet`, which a long temp dir triggers under the byte ceiling), and `P1`'s first sentence; (2) `peer_info().instructions` is still the front's text, pinning the known limitation so a change in it is noticed; (3) the result has no `_meta` directive | (1) skip D11 step 3.6 (forward the front's result as is); (3) keep the directive |
 | `guidance_reflects_the_projects_current_state` | index `b` first (a separate shim session started in `b`, then `common::wait_until_indexed`), then from the root session select `b`: the text contains `P1` and does **not** contain `Not indexed yet` | the shim appends a text rendered from `instructions::cold_start(b, false, ..)` instead of the replayed one. This is the control that tells "`C`'s own live text" apart from "a plausible text about `C`" |
 | `reselecting_the_same_project_refreshes_its_guidance` | select `b` (text says `Not indexed yet`), call `get_file_outline` and wait until indexed, select `b` again: the second text no longer says `Not indexed yet` | a same-project shortcut that re-sends the first switch's cached instructions |
 | `reselecting_switches_again` | select `b`, then `a`: `get_file_outline {file_path:"a.ts"}` works and `{file_path:"b.ts"}` is a not-found result from `a`'s daemon (the session no longer talks to `b`) | keep routing to the first sub-project upstream |
