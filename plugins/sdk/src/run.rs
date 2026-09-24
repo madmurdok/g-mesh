@@ -58,6 +58,7 @@ use g_mesh_wire::{FileChangeDiff, Handshake, CURRENT_PROTOCOL_VERSION, JSONRPC_V
 use crate::diff::diff_file;
 use crate::framing::{read_frame, write_message};
 use crate::graph::FileGraph;
+use crate::hold::hold_point;
 use crate::index::SdkIndex;
 use crate::manifest::{PluginSpec, ResolvedSpec};
 use crate::semantic::{LazyEngine, SemanticEngineFactory};
@@ -126,6 +127,10 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
             return 1;
         }
     };
+
+    // Test-only (GM-397): parks the walk after the load and before the
+    // first write - the silent stretch in which a killed core goes unnoticed.
+    hold_point("bulk", &spec.language);
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -290,6 +295,9 @@ impl<E: Extractor> Session<'_, E> {
                 self.respond(out, id, diff)
             }
             "semanticPass" => {
+                // Test-only (GM-397): parks the pass before any engine
+                // starts, blocking this thread as a long pass would.
+                hold_point("semantic", &self.spec.language);
                 let files: Vec<RelPath> = params
                     .and_then(|params| params.get("filePaths"))
                     .and_then(|paths| paths.as_array())

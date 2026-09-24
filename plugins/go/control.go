@@ -238,6 +238,9 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		return
 
 	case "semanticPass":
+		// Test-only (GM-397): parks the pass before any work starts, blocking
+		// this goroutine as a long pass would. See hold.go.
+		holdPoint("semantic")
 		var params filePathsParams
 		if err := json.Unmarshal(env.Params, &params); err != nil {
 			logf("malformed semanticPass params: %v", err)

@@ -46,6 +46,10 @@ func runBulkIndex(root string, out io.Writer) (bulkIndexSummary, error) {
 	var summary bulkIndexSummary
 
 	ws := loadWorkspace(root)
+	// Test-only (GM-397): parks the walk after the workspace load and before
+	// the first write - the silent stretch in which a killed core goes
+	// unnoticed. See hold.go.
+	holdPoint("bulk")
 	w := bufio.NewWriter(out)
 	write := func(value interface{}) error {
 		line, err := json.Marshal(value)

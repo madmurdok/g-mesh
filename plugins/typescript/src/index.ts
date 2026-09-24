@@ -6,6 +6,7 @@ import { stopSemanticProjects } from "./semantic";
 import { runSemanticPass } from "./semanticPass";
 import { RUN_NODE_FLAG, runNodeScript } from "./runtime";
 import { PLUGIN_VERSION } from "./version.generated";
+import { holdPoint } from "./testHold";
 
 /** Selects one-shot bulk-index mode instead of the control-plane loop; must
  * stay in sync with core's `daemon::bulk_index::BULK_INDEX_FLAG`. */
@@ -154,6 +155,9 @@ async function handleEnvelope(envelope: ControlEnvelope, projectRoot: string): P
       await handleFileChanged(projectRoot, envelope.params?.filePath ?? "", envelope.id);
       return; // handleFileChanged already sent the (only) response, if any
     case "semanticPass":
+      // Test-only (GM-397): parks the pass before any work starts. See
+      // testHold.ts.
+      await holdPoint("semantic");
       // parseControlEnvelope has already established filePaths is a real
       // string[] for this method; the `?? []` is for the type, not a case
       // that can happen.
