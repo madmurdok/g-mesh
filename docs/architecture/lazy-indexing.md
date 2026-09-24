@@ -460,20 +460,30 @@ This is unchanged in rule (§1.3), with two clarifications:
 
 ### D10. Multi-project detection (cheap, bounded, marker-based)
 
+*Revised for GM-399 against the code at `release-3.12.0` (commit `bcaa317`).
+Line references below are to that commit.*
+
 New module `core/src/daemon/candidates.rs`:
 `pub fn detect(root: &Path, limits: Limits) -> Detection`.
 
 - **Markers:** `.git` (directory = a repo; *file* = a worktree or submodule),
   `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`. Each one is a
-  `stat` of `<dir>/<marker>`, never a listing.
-- **Root is a single project** (normal mode, as today but lazy) if any of
-  these holds:
-  1. the root has a marker itself (a monorepo such as g-mesh, with nested
-     `plugins/*/package.json`, stays single);
-  2. the root already has a completed index (`bulkIndexedAt` set; open
-     `index.db` read-only if it exists; never create it). See Q2;
+  `stat` (`symlink_metadata`) of `<dir>/<marker>`, never a listing.
+- **Root is a single project** (normal mode, lazy exactly as GM-395 shipped
+  it) if any of these holds, checked **in this order** so a normal project
+  pays only rule 1:
+  1. the root has a marker itself: at most 5 `stat`s. A monorepo such as
+     g-mesh, with nested `plugins/*/package.json`, stays single;
+  2. the root already has a completed index: `<state dir>/index.db` exists
+     and `schema::bulk_index_completed` (`storage/schema.rs:555`) is true. It
+     is opened **read-write without `CREATE`**, the way `cli/status.rs:429`
+     and `gc/last_used.rs:106` already open it (WAL recovery needs write
+     access; a missing file must never be conjured). Never through
+     `connection::open` (`storage/connection.rs:101`), which creates the file.
+     A missing `meta` table or row counts as "not completed". See Q2 and Q7;
   3. fewer than 2 candidates are found. See Q3.
-- **Walk:** breadth-first from the root.
+- **Walk** (only when rules 1 and 2 did not settle it): breadth-first from
+  the root.
   - `max_depth` = 2: the root's children and grandchildren. That covers
     `ClaudeProjects/g-mesh` and `ClaudeProjects/torpeek-worktrees/<wt>`.
   - **Do not descend into a candidate:** once a directory has a marker, its
@@ -488,14 +498,31 @@ New module `core/src/daemon/candidates.rs`:
     what was found.
 - **Output:** `Detection { mode: Single|Multi, candidates: Vec<Candidate {
   rel_path, abs_path, markers: Vec<&'static str>, is_worktree: bool }>,
-  entries_read, elapsed, truncated }`, sorted by `rel_path`.
-- **Where it runs:** in `daemon::run`, after the singleton lock and build
-  stamp and **before** `connection::open`, because front mode must not create
-  an `index.db` for the root. Its cost is bounded by `max_entries`
-  (milliseconds), well inside the 10 s bootstrap and the 30 s `MCP_TIMEOUT`.
-  M4 measures it.
-- A hidden CLI, `g-mesh debug-candidates [DIR] [--json]`, prints `Detection`
-  including `entries_read` and `elapsed`. It exists for M4 and for support.
+  entries_read, elapsed, truncated }`, sorted by `rel_path`. `abs_path` is
+  canonical (the shim compares it against its own canonical root, D11 step 3).
+  *As built (slice 4):* `Mode::Single` carries which rule settled it, and
+  `Detection.walked` says whether the walk ran; the walk itself is also
+  exposed alone as `candidates::walk`, which `select_project` and `g-mesh
+  status` use to re-list a folder already known to be a front.
+- **Where it runs:** in `daemon::run` (`daemon/mod.rs:370`), after the
+  singleton lock (`:383`) and the build stamp (`:396-403`), and **before
+  plugin discovery** (`:426`) and `connection::open` (`:429`).
+  - *Changed from the accepted text* ("before `connection::open`"): moving
+    it one step earlier, ahead of discovery, keeps a malformed plugin
+    manifest from stopping a daemon that needs no plugins at all. Discovery
+    only reads `plugin.toml` files and depends on nothing detection produces,
+    so single mode is unaffected by the reorder.
+  - `ensure_project_dir` (`:375`) has already created the state dir and its
+    `project.root` by then; the front needs that dir for its lock, socket and
+    pid file, so this is correct as is.
+  - Its cost is bounded by `max_entries` (milliseconds), well inside the 10 s
+    bootstrap (`shim.rs:28`) and the 30 s `MCP_TIMEOUT`. M4 measures it.
+- A hidden CLI, `g-mesh debug-candidates [DIR] [--json]` (`#[command(hide =
+  true)]`, as `cli/mod.rs:101` already does for another subcommand), prints
+  `Detection` including `entries_read` and `elapsed`. It exists for M4 and for
+  support. *As built:* when rule 1 or 2 settled the mode without a walk, it
+  runs the walk anyway (and says so, `walkNeeded: false`), so M4 can measure
+  folders that already have an index.
 
 ### D11. Multi-project roots: a front daemon plus a session switch in the shim
 
@@ -537,28 +564,54 @@ Options considered:
 
 1. **Front mode (daemon).** When `candidates::detect` returns `Multi`,
    `daemon::run` branches into `daemon::front::run(root, dir, singleton,
-   detection)` before `connection::open`.
-   - It binds the endpoint, writes the pid and serving-owner files and runs
-     an accept loop that serves `mcp::front::FrontServer`, a hand-written
-     `ServerHandler` with no DB, no watcher and no plugins. It calls
-     `lifecycle::supervise` with a registry built from discovery, which
-     spawns nothing.
-   - Core idle timeout: `FRONT_CORE_IDLE` = 60 s, so the front leaves soon
-     after its last session closes.
-   - It writes `daemon.mode` = `front` into the state dir for `status`.
-2. **What the front serves:**
-   - `get_info`: instructions from `instructions::build_front(root,
-     &candidates)` (D12).
-   - `list_tools`: `GMeshMcpServer::tool_router().list_all()` plus
-     `select_project`. The schemas are identical to a normal daemon's.
+   detection)` right after detection, so none of `daemon/mod.rs:426-666`
+   runs: no discovery, no `connection::open`, no `schema::ensure_current`, no
+   `last_used::touch`, no `IndexingStatus`, no watcher, no
+   `activation::spawn` (`:651`).
+   - It repeats the normal daemon's publish sequence in the same order:
+     `endpoint.clear_stale()` (`:483`), `ipc::Listener::bind` (`:499`), the
+     pid file (`:506-507`), then `record_serving_owner` (`:533`). The shim's
+     bootstrap and `cli::status` see a front exactly as they see any daemon.
+   - **Mode marker:** it writes the word `front` to `index.phase` with
+     `write_state_file_atomic` (`daemon/mod.rs:305`), *instead of* the new
+     `daemon.mode` file the accepted text named. *Changed* because the phase
+     file already has every property wanted: `release_state_files` removes it
+     on exit (`daemon/lifecycle.rs:1253`), `cli::status` already reads it
+     (`daemon::read_phase_in`, `daemon/mod.rs:207`; `cli/status.rs:615`), and
+     tests already wait on it (`tests/common/mod.rs:300`,
+     `wait_until_phase`). A second file would need its own teardown and its
+     own reader.
+   - The accept loop is `serve_forever`'s shape (`daemon/mod.rs:809-853`):
+     one tokio runtime on its own thread, each accepted connection holding a
+     `CoreActivity::connection_opened()` guard, but serving
+     `mcp::front::FrontServer` instead of `mcp::serve_connection`.
+   - It calls `lifecycle::supervise` (`daemon/lifecycle.rs:1165`) with a
+     `PluginRegistry` built from an **empty** discovered list (it spawns
+     nothing and needs no discovery; *changed* from "built from discovery",
+     which would re-introduce the manifest dependency removed above), and
+     `IdleTimeouts { plugin: None, core: Some(FRONT_CORE_IDLE) }`.
+     `FRONT_CORE_IDLE` = 60 s, fixed rather than read from `config.toml`, and
+     overridable by `G_MESH_FRONT_IDLE_MS` for tests. The orphan check that
+     `supervise` runs on each tick applies unchanged.
+2. **What the front serves** (`mcp::front::FrontServer`, a hand-written
+   `ServerHandler` in a child module of `mcp`, so it may call the private
+   `GMeshMcpServer::tool_router()` that `#[tool_router]` generates at
+   `mcp/mod.rs:218`):
+   - `get_info`: the same `ServerInfo` shape as `mcp/mod.rs:954-968` (same
+     name and version), with instructions from
+     `instructions::build_front(root, &detection, &indexed)` (D12).
+   - `list_tools`: `GMeshMcpServer::tool_router().list_all()` (the 8 tools,
+     `mcp/mod.rs:812-934`) plus `select_project`. The 8 schemas are
+     byte-identical to a normal daemon's.
    - `select_project { project?: string }`:
      - Without `project`, it returns the candidate list, re-detected on each
        call (cheap, and always current), as text: `rel_path`, markers,
        worktree flag, and `truncated`.
      - With `project`, it validates the value against a fresh detection
-       (`rel_path` or absolute path) and returns a success result whose
-       `_meta` is `{"g-mesh/switchProject": {"root": "<abs path>"}}`, with
-       text such as `"Selected <abs>"`.
+       (`rel_path` or absolute path) and returns a success result with
+       `CallToolResult.meta` (serialized as `_meta`; rmcp 2.2.0 has the
+       field) set to `{"g-mesh/switchProject": {"root": "<canonical abs
+       path>"}}`, and text `"Selected <abs>"`.
      - An unknown `project` is a tool error that lists the candidates.
    - Any other tool: a tool error such as `"g-mesh: /abs/root is a folder of
      N projects and none is selected. Call select_project with one of: a, b,
@@ -566,77 +619,149 @@ Options considered:
      a `file_path` whose first segments match a candidate, it adds `"The
      file_path you passed lies in '<cand>': select it, then pass paths
      relative to it."`. This is not a partial answer, since there is no index
-     to answer from and nothing was asked of one.
-3. **Session switch (shim).** The shim becomes JSON-aware, but only
-   minimally (slice 5). It records the client's `initialize` request frame
-   and its `notifications/initialized` frame. It remembers the ids of
-   `tools/call` frames whose `params.name == "select_project"`.
-   - When a response to one of those ids comes back from the front with
-     `result._meta["g-mesh/switchProject"].root = C`, the shim:
-     1. runs `connect_or_bootstrap(C)`, which is the existing code, so
-        `C`'s daemon is a completely normal (lazy) daemon that is reused if
-        one is already running;
+     to answer from and nothing was asked of one. The front has no `prepare`
+     (`mcp/mod.rs:261`): it answers at once, triggers nothing and sends no
+     progress notifications.
+3. **Session switch (shim).** Today's shim is `proxy`/`pump`
+   (`shim.rs:469-507`), whose stated invariant is that it "never parses a
+   payload" (`shim.rs:498-501`). Slice S3 breaks that invariant on purpose,
+   and only as far as needed: it parses client frames and the *front's*
+   response frames, never a sub-project daemon's. It records the client's
+   `initialize` request frame and its `notifications/initialized` frame, and
+   remembers the ids of `tools/call` frames whose `params.name ==
+   "select_project"`.
+   - When a response to one of those ids comes back **from the front** with
+     `result._meta["g-mesh/switchProject"].root = C`, and `C` is a
+     descendant of the shim's own canonical root (a cheap guard against a
+     directive the shim did not expect), the shim:
+     1. runs `connect_or_bootstrap(C)` (`shim.rs:146`), which is the existing
+        code, so `C`'s daemon is a completely normal (lazy) daemon that is
+        reused if one is already running, and retired if it is outdated;
      2. replays the recorded `initialize` to `C` with a shim-owned id
-        (`"g-mesh-shim-replay-<n>"`), consumes the response and keeps its
-        `result.instructions`;
+        (`"g-mesh-shim-replay-<n>"`), reads that one response synchronously
+        (before `C`'s reader thread exists, so it can never reach the
+        client), and keeps its `result.instructions`;
      3. sends the recorded `notifications/initialized`;
      4. starts a reader thread for `C`;
      5. routes every later client frame to `C`, **except** `select_project`
         calls and `tools/list`, which keep going to the front. That lets the
-        agent switch again, and keeps `select_project` in the tool list;
-     6. appends a text block to the `select_project` result: `"This session
-        now serves <C>. File paths are relative to <C>. Its index is built on
-        the first tool call. Guidance for this project:\n\n<C's
-        instructions>"`, then forwards it;
+        agent switch again, and keeps `select_project` in the tool list.
+        Everything else (`ping`, `notifications/cancelled`, any other
+        method) goes to the current upstream;
+     6. rewrites the `select_project` result as the "Instructions after a
+        switch" subsection below specifies, removes the `_meta` directive,
+        and forwards it;
      7. if a sub-project daemon was already current, shuts down its write
         half (its reader drains in-flight responses, then ends).
+   - **Reselection is always a full switch**, including selecting the
+     project that is already current: a new connection, a new replay, the
+     old write half shut down. There is no same-project shortcut, because the
+     replay is what yields the project's *current* instructions (see below).
    - If bootstrapping `C` or the replay fails, the shim replaces the
      response with an `isError` result naming the failure, and routing is
      left unchanged.
+   - All frames to stdout go through **one writer thread fed by a channel**,
+     not a mutex around stdout: interleaving two readers' frames then becomes
+     impossible by construction rather than by discipline.
+   - If the front's connection ends after a switch (for example, it was
+     retired as outdated), `tools/list` falls back to the current upstream
+     and `select_project` calls get an error saying the front is gone. The
+     session itself continues on `C`.
    - A **single-project** session never sees a `switchProject` directive, so
-     for it the shim's behaviour is byte-for-byte today's.
+     for it the shim forwards every frame byte-for-byte as today (a frame that
+     fails to parse is forwarded raw).
 4. **Why the switch sits in the shim and not in the front:** the shim
    already owns stdio, bootstrapping and the per-session lifetime. A daemon
    cannot hand a client's stdio to another process. The paths the agent sees
    after the switch are `C`-relative, exactly as if it had been launched in
    `C`, which is the best-tested configuration g-mesh has.
-5. **Risks:**
-   - The MCP `instructions` field cannot change after `initialize`. The
-     client keeps the front's text, and the up-to-date guidance comes only
-     in the `select_project` result. That is acceptable, because the agent
-     reads that result right after acting on it.
+5. **Instructions after a switch (the known gap).** MCP's `instructions`
+   field is read once, from the `initialize` response. After the switch the
+   client keeps the *front's* text for the rest of the session and never
+   sees `C`'s. MCP has no notification that replaces it. Three ways for the
+   agent to learn `C`'s state:
+
+   | Option | How | For | Against |
+   |---|---|---|---|
+   | **(A) The `select_project` result carries `C`'s own instructions (recommended)** | Step 2's replay already receives `C`'s `initialize` response. Its `instructions` is `GMeshMcpServer::instructions()` (`mcp/mod.rs:784`), rendered by `C`'s daemon for `C`'s *actual* phase: `instructions::cold_start` (`mcp/instructions.rs:175`, the `Index root: <C>. Not indexed yet ...` / `Being built now ...` line) while `Unindexed`/`Walking`, `instructions::build` (`:589`) otherwise. The shim puts it in the result verbatim | The exact text a session launched in `C` gets, from the one process that knows `C`'s phase and languages. No new rendering code, no extra tool schema, works with any client. It is a snapshot at switch time, but so are a single-project session's instructions (fixed at `initialize`) | Lives in a tool result, so it can be lost on context compaction, while the front's (now stale) instructions persist. Mitigated by D12's front wording ("call it again to re-read") and by reselection being a full switch that re-renders |
+   | (B) `notifications/tools/list_changed` plus a per-session `select_project` description | After the switch the shim sends `tools/list_changed`; the re-listed `select_project` description states the current project and its guidance | Persists across compaction, like instructions | Depends on the client re-fetching the list; Claude Code's deferred tool search may not load the description at all. The description has its own ~2 KB budget, and `C`'s guidance alone is up to 1,900 bytes. The selection is known to the shim, not the front, and one front serves several sessions, so the shim would have to rewrite `tools/list` responses too |
+   | (C) The front renders a status itself | The front reads `C`'s `index.phase` and `bulkIndexedAt` off `C`'s state dir and describes them | No dependence on the replay for text | Duplicates the instructions logic outside the daemon that owns it, cannot render the language paragraphs (P2-P5 need `C`'s registry and index), and can disagree with what `C` would say |
+
+   **Recommendation: (A).** The shim rewrites the result's content to:
+
+   > `g-mesh: this session now serves <C>; file paths are relative to it.
+   > Guidance for this project, as a session started in <C> would receive
+   > it:` followed by a blank line and `C`'s instructions verbatim.
+
+   `C`'s own text already states whether its index exists (the `Index root:`
+   line), so the shim adds no index-state claim of its own that could
+   disagree with it. (B) stays a follow-up if M3 part b shows agents losing
+   the guidance after compaction. See Q8.
+6. **Risks:**
+   - The gap above: `C`'s guidance is transient; the front's is permanent.
+     D12 words the front's text so it stays true after a switch.
    - Replay assumes the front and `C` negotiate the same protocol version.
      They are the same binary, and `connect_or_bootstrap` already retires a
      daemon with a different build stamp.
    - Requests in flight to the old upstream at the moment of a switch still
-     complete, because its reader drains them.
+     complete, because its reader drains them. A `notifications/cancelled`
+     for such a request goes to the new upstream, which ignores the unknown
+     id, so that request cannot be cancelled. Accepted: switches are rare and
+     the call still ends (at worst at the D7 cap).
+   - After a switch the front's connection stays open (it serves
+     `tools/list` and `select_project`), so the front lives as long as the
+     session. It holds no index and no plugins, so this costs one idle
+     process.
    - Selection is not persisted: a new session in the same root asks again.
      That is deliberate, since the right sub-project can change from session
      to session.
 
 ### D12. Instructions text and the byte budget
 
-- **Normal mode, `Unindexed`:** replace `INDEXING_NOTE` with a state line,
-  `"Index root: <abs root>. Not indexed yet - the first tool call builds it
-  (structural first; semantic search after) and waits for it."`. While
-  `Walking`, use `"Index root: <abs root>. Being built now - ..."`. The root
-  path is what A2 asks to be visible in a single project. If the rendered
-  string would exceed `INSTRUCTIONS_BYTE_CEILING`, fall back to the same line
-  without the path (a test covers the eight-language worst case with a
-  103-byte root). `Structural`, `Embedding` and `Ready` render as today,
-  without the prefix: structural answers are immediate, and `search_code`'s
-  own description already covers waiting.
-- **The `P4_*` wait clause** ("On a project's first index ... a tool call
-  waits for the walk to finish before answering - slow, not wrong; do not
-  abandon it for grep.") stays true and needs no edit.
-- **Front mode:** `build_front` renders `P1`, then `"<abs root> is a folder
-  of N projects; nothing is indexed. Before using any tool, call
-  select_project with the one you are working on (ask the user if unclear):
-  "`, then candidate `rel_path`s joined by `, ` until the ceiling, then
-  `" (+K more - call select_project with no argument for the full list)"`.
-  The language paragraphs (`P2`-`P5`) are omitted: no language is present
-  yet, and they arrive in the `select_project` result (D11, step 6). A test
-  asserts ≤ ceiling for 64 candidates with 60-byte names.
+- **Normal mode: done in GM-395.** `instructions::cold_start`
+  (`mcp/instructions.rs:175`) prefixes `cold_start_line` (`:134`, `"Index
+  root: <abs root>. Not indexed yet - ..."` or `"... Being built now - ..."`)
+  to the `build` rendering, falling back to `cold_start_line_fallback`
+  (`:153`) when the root would push it over `INSTRUCTIONS_BYTE_CEILING`
+  (`:110`, 1,900 bytes). `GMeshMcpServer::instructions` (`mcp/mod.rs:784-791`)
+  uses it for `Phase::Unindexed | Phase::Walking` and `build` for every other
+  phase. The ceiling tests exist (`mcp/instructions.rs:1242-1295`). GM-399
+  adds nothing here; D11 step 5 reuses this rendering as `C`'s guidance.
+- **The `P4_*` wait clause** stays true and needs no edit.
+- **Front mode:** new `pub fn build_front(root: &Path, detection:
+  &Detection, indexed: &HashSet<&str>) -> String` in `mcp/instructions.rs`.
+  It renders `P1` (`:268`, which stays true after a switch), a blank line,
+  then:
+
+  > `<abs root> is a folder of N projects; g-mesh serves one at a time and
+  > has indexed none of them. Before any other g-mesh tool, call
+  > select_project with the one you are working on (ask the user if
+  > unclear). Its result names the project this session then serves and
+  > carries that project's guidance; call it again to switch, or to re-read
+  > that guidance. Projects: `
+
+  then candidate `rel_path`s joined by `, ` until the ceiling, then `" (+K
+  more - call select_project with no argument for the full list)"`. With
+  `truncated`, `N` renders as `N+`.
+  - *As built (GM-399 follow-up):* `indexed` holds the candidates that
+    already have a completed index of their own - rule 2's check
+    (`candidates::has_completed_index`), run per candidate by
+    `mcp::front::Front::new`. When it is non-empty, "has indexed none of
+    them" becomes "has already indexed K of them, listed first and marked
+    (indexed)", and those candidates lead the list as `<rel_path>
+    (indexed)`, so the ceiling cuts unindexed names first. With none
+    indexed the text is exactly the one above.
+  - The wording is chosen to stay true after a switch (D11 step 5): it does
+    not say "nothing is selected", only "before any other tool".
+  - The language paragraphs (`P2`-`P5`) are omitted: no language is known
+    yet, and they arrive in the `select_project` result.
+  - If the root path alone would break the ceiling, drop it (`"This folder
+    holds N projects; ..."`), the same fallback `cold_start` uses. *As
+    built:* the path is also dropped when keeping it would leave no room for
+    even the first project name.
+  - A test asserts the result is ≤ ceiling for 64 candidates with 60-byte
+    names under a 103-byte root (the same worst-case root as the existing
+    `cold_start` test), and that at least one name is listed.
 
 ### D13. CLI and other paths
 
@@ -650,16 +775,18 @@ Options considered:
   - `walking`: "building now";
   - `embedding`: "structural index ready; embeddings being computed";
   - `failed`: "last build failed - see daemon log; retried on the next tool call".
-  - A root served in front mode (`daemon.mode` = `front`) shows "folder of N
-    projects - no index; a session selects one".
+  - A root served in front mode (`index.phase` = `front`, D11 step 1) shows
+    "folder of N projects - no index; a session selects one", and skips the
+    coverage walk (slice 4).
 - `cli/agent_instructions.rs:55`: keep the sentence, and add "Launched from a
   folder of several projects, g-mesh asks you to pick one with
   `select_project` first."
 - `README.md` and `docs/architecture/g-mesh-v1.md`: one paragraph each,
   pointing at this file.
-- `g-mesh clean` and `stop`: no semantic change. Slice 4 must check that a
-  front-mode state dir (a socket, a pid and no `index.db`) does not trip
-  `status`, `clean orphaned` or `clean` (they may assume `index.db` exists).
+- `g-mesh clean` and `stop`: no semantic change. A front-mode state dir (a
+  socket, a pid, `index.phase` and no `index.db`) is already tolerated by
+  the code: `cli/status.rs:414` and `gc/last_used.rs:106` both check for a
+  missing `index.db`. Slice 4 keeps a regression test on it.
 
 ### D14. Test-suite migration
 
@@ -728,6 +855,29 @@ changing it changes only the slice named.
   `select_project`)?**
   **Recommend: one tool.** Each listed tool costs schema tokens every turn,
   and the tool exists only in front-mode sessions.
+
+**Open for GM-399 (2026-09-24).** Q2, Q3, Q4 and Q6 above stand as accepted.
+The revision of D10-D12 against the current code raised these:
+
+- **Q7. Rule 2 and an index from an older generation.** D10 rule 2 serves a
+  root as one project when `bulkIndexedAt` is set. But `schema::
+  ensure_current` (`daemon/mod.rs:437`) wipes an index whose schema or
+  generation differs, and the next tool call re-walks the *whole folder*.
+  Should rule 2 also require the stored generation to match (which needs
+  plugin discovery before detection, undoing D10's reorder), or count any
+  completed index? **Recommend: any completed index,** as Q2 accepted: `g-mesh
+  init` in a parent folder stays an explicit choice, and `g-mesh clean`
+  restores the front. (Affects slice 4's rule 2 test only.)
+- **Q8. The instructions gap (D11 step 5).** Accept option (A), `C`'s
+  guidance carried in the `select_project` result and therefore transient
+  (lost on compaction), with (B) as a follow-up only if M3 part b shows
+  agents losing it? **Recommend: yes.**
+- **Q9. Three small departures from the accepted text,** each argued where
+  it is made: detection runs before plugin discovery (D10); the front marks
+  itself with `index.phase` = `front` instead of a new `daemon.mode` file,
+  and supervises an empty plugin registry (D11 step 1); reselecting the
+  current project is a full switch (D11 step 3). **Recommend: accept all
+  three.**
 
 ---
 
@@ -935,7 +1085,13 @@ walk with `G_MESH_BULK_INDEX_HOLD_FILE` and set
 **Exit:** tests 1-4 green. M1 has been run and recorded (§5) before Slice 5
 starts, because its outcome may change `INDEX_WAIT_CAP`.
 
-### Slice 4: Candidate detection and the front daemon
+### Slice 4 (GM-399 S2): Candidate detection, front mode and `select_project`
+
+*GM-399 works this and slice 5 on `feat/GM-399-multi-project-front`, cut
+from `release-3.12.0`; the "Common rules" above apply with `wt-gm399-ctl` as
+the control worktree. Every test below names its **control**: the revert (of
+code, never of the test) that must make it fail. The verification slice
+builds each control in its own worktree and reports any that does not fail.*
 
 **Goal:** A2 (front side) and A3.
 
@@ -943,98 +1099,129 @@ starts, because its outcome may change `INDEX_WAIT_CAP`.
 
 - `daemon/candidates.rs` (new): D10.
 - `cli/mod.rs`: the hidden `debug-candidates` subcommand.
-- `daemon/mod.rs::run`: after the build stamp, a mode decision (D10 rules;
-  rule 2 opens `index.db` read-only only if it exists), then `Multi` goes to
-  `daemon::front::run`.
-- `daemon/front.rs` (new): bind, pid and serving-owner files,
-  `daemon.mode`, an accept loop with `FrontServer`, and `supervise` with
-  `FRONT_CORE_IDLE`.
+- `daemon/mod.rs::run` (`:370`): after the build stamp (`:403`) and before
+  discovery (`:426`), the mode decision (D10 rules, in order), then `Multi`
+  goes to `daemon::front::run`.
+- `daemon/front.rs` (new): D11 step 1 (bind, pid, `index.phase` = `front`,
+  serving owner, accept loop with `FrontServer`, `supervise` with an empty
+  registry and `FRONT_CORE_IDLE`).
 - `mcp/front.rs` (new): `FrontServer` (D11 step 2). `mcp/instructions.rs`:
   `build_front` (D12).
-- `cli/status.rs` and `cli/clean.rs`: make them tolerate a state dir without
-  `index.db` (D13).
+- `cli/status.rs`: a `Some("front")` arm (`:615`) printing "folder of N
+  projects - no index; a session selects one", and **skipping
+  `index_status`** (`:302`) in that case: its `discover_source_files` walk
+  over the whole folder is exactly the cost front mode exists to avoid.
+  `index_status` (`:414`) and `gc::last_used` (`:106`) already tolerate a
+  missing `index.db`, so `clean`, `clean orphaned` and GC need no change
+  beyond the test in item 4.
+- Before starting: check that no existing integration fixture has two or
+  more marked subdirectories and no root marker (it would silently turn into
+  a front). `tests/reexport_linking.rs:37` has a root `package.json`, so it
+  stays single by rule 1.
 
 **Tests:**
 
 1. `candidates.rs` unit tests on tempdir fixtures:
-   - three repos plus one worktree (a `.git` *file*) at depth 2 give exactly
-     those four, with `is_worktree` set;
-   - a repo containing nested `package.json`s is listed once;
-   - `node_modules/x/package.json` is not listed;
-   - a marker at depth 3 is not listed;
-   - a root marker gives `Single`;
-   - one candidate gives `Single`;
-   - `max_entries = 10` on a wide fixture gives `truncated` and
-     `entries_read <= 10`;
-   - a symlink to a repo is not followed.
-   *Control:* remove the "do not descend into a candidate" rule, and the
-   nested-package test fails.
+
+   | Test | Control |
+   |---|---|
+   | three repos plus one worktree (a `.git` *file*) at depth 2 give exactly those four, `is_worktree` set on the one | accept only a `.git` *directory* as a marker: the worktree is missing |
+   | a repo containing nested `package.json`s is listed once | remove "do not descend into a candidate": the nested packages appear |
+   | `node_modules/x/package.json` is not listed | drop `node_modules` from the skip list |
+   | a marker at depth 3 is not listed | `max_depth` = 3 |
+   | a root with a marker and two marked children gives `Single` | remove rule 1 |
+   | one candidate gives `Single` | threshold 1 instead of 2 |
+   | a root with two marked children and an `index.db` whose `bulkIndexedAt` is set gives `Single`; the same with `bulkIndexedAt` NULL gives `Multi` | remove rule 2 (first half fails); treat "`index.db` exists" as completed (second half fails) |
+   | the mode decision on a root with no `index.db` leaves none behind | open it through `connection::open` |
+   | `max_entries` = 10 on a wide fixture gives `truncated` and `entries_read <= 10` | remove the entry-count check |
+   | a symlink to a repo is not listed (Unix only) | use `metadata` instead of `symlink_metadata` |
+
 2. `tests/multi_project_front.rs`: a fixture root holding `a/` (`.git`
-   directory plus a TS file), `b/` (the same) and `c/` (`go.mod`), with no
-   root marker, served through `mcp-shim`.
-   - The handshake instructions contain `a`, `b` and `c`.
-   - `list_tools` contains `select_project` and the 8 usual tools.
-   - `select_project {}` lists all three.
-   - `select_project {project:"b"}` returns `_meta["g-mesh/switchProject"].root`
-     equal to the canonical path of `b`.
-   - `find_references` returns the "none is selected" error naming `a, b, c`.
-   - `get_file_outline {file_path:"b/x.ts"}` names `b`.
-   - `project_dir(root)` has no `index.db`, and no `--bulk-index` process runs.
-   (Until slice 5 lands, the shim forwards the `_meta` untouched, which is
-   what this test checks.)
-   *Control:* force `Single` in the mode decision, and the instructions lack
-   the candidates and an `index.db` appears.
-3. The `build_front` ceiling test from D12.
+   directory plus `a.ts`), `b/` (`.git` plus `b.ts`) and `c/` (`go.mod`), no
+   root marker, driven through the real `mcp-shim` with rmcp's
+   `TokioChildProcess`, as `tests/mcp_e2e.rs:101-110` does. Until slice 5
+   lands the shim forwards the `_meta` untouched, which is what this test
+   checks.
+
+   | Assertion | Control |
+   |---|---|
+   | `peer_info().instructions` contains `a`, `b`, `c` and `select_project` | force `Single` in the mode decision |
+   | `list_tools` is the 8 usual tools plus `select_project` | leave `select_project` out of `list_tools` |
+   | `select_project {}` lists all three; an unknown `project` is `isError` listing them | return an empty list |
+   | `select_project {project:"b"}` has `_meta["g-mesh/switchProject"].root` equal to `b`'s canonical path | omit `meta` |
+   | `find_references` returns the "none is selected" error naming `a, b, c` | answer with an empty success result |
+   | `get_file_outline {file_path:"b/b.ts"}` names `b` | drop the `file_path` hint |
+   | `project_dir(root)` has no `index.db`, `index.phase` reads `front` (`common::wait_until_phase`), and no plugin pid file exists | force `Single`: `connection::open` creates `index.db` and the phase reads `unindexed` |
+   | with `G_MESH_FRONT_IDLE_MS=500`, the front's pid file is gone within `startup_timeout()` after the client disconnects | ignore the env var (60 s) |
+
+3. `mcp/instructions.rs` unit tests for `build_front`:
+   - 64 candidates with 60-byte names under a 103-byte root: ≤ ceiling, at
+     least one name, and the `(+K more` suffix. *Control:* list every name
+     with no ceiling check.
+   - A 1,400-byte root: ≤ ceiling and no root path in the text. *Control:*
+     remove the no-path fallback. (*Changed from 600 bytes in slice 4:* the
+     front's text has no language paragraphs, so a 600-byte root still fits
+     beside it and would never reach the fallback.)
+4. `tests/cli_status.rs`: `g-mesh status` in a front-served root prints the
+   front line and no coverage line. *Control:* remove the `Some("front")`
+   arm. `tests/cli_clean.rs`: `clean` and `clean orphaned` on a front state
+   dir (socket, pid, `index.phase`, no `index.db`) succeed. This one is a
+   regression guard with no code change behind it, so it has no control;
+   say so in the report.
 
 **Exit:** tests green; M4 run and recorded.
 
-### Slice 5: Session switch in the shim
+### Slice 5 (GM-399 S3): Session switch in the shim
 
 **Goal:** A2 (select, then work on the selected project), end to end.
 
-**Change:** in `shim.rs`, replace `proxy`/`pump` (`:469-530`) with a
-switchable router (D11 step 3):
+**Change:** in `shim.rs`, replace `proxy`/`pump` (`:469-507`) with a
+switchable router (D11 step 3). *As built* it lives in `shim/router.rs`,
+generic over its streams so the byte-identity unit test drives it through
+`std::io::pipe`; stdout is written by the thread running `router::serve`,
+fed by the channel. Slice 4's front test no longer checks the `_meta`
+directive through the shim, since the shim now consumes it:
 
-- `Router { front: Upstream, current: Upstream, init_frame, initialized_frame,
-  select_ids: HashSet<serde_json::Value>, replay_seq }` behind a `Mutex`;
-  stdout behind its own `Mutex`, so that frames from two readers never
-  interleave.
+- `Router { front: Upstream, current: Upstream, init_frame,
+  initialized_frame, select_ids: HashSet<serde_json::Value>, replay_seq }`
+  behind a `Mutex`; stdout owned by a single writer thread fed by an
+  `mpsc` channel from every reader.
 - The stdin thread parses each client frame with `serde_json`. A frame that
   fails to parse is forwarded raw to `current`.
-- Each upstream reader thread checks `select_ids` only on the front and only
-  for response frames, so large tool results from sub-project daemons are
-  never parsed.
+- Each upstream reader checks `select_ids` only on the front and only for
+  response frames, so large tool results from sub-project daemons are never
+  parsed.
 - The switch holds the router lock across bootstrap and replay: client
-  frames wait, at most the bootstrap timeout.
+  frames wait, at most the bootstrap timeout (`shim.rs:399`).
 - Exit: on stdin EOF, shut down the write half of every upstream. The shim
-  exits when the current upstream's reader ends. That is the same "shim
-  lives as long as its session" semantics as today.
+  exits when the current upstream's reader ends: the same "shim lives as
+  long as its session" semantics as today.
+- Update `shim.rs`'s module and `pump` doc comments: the "never parses a
+  payload" invariant now holds only for single-project sessions.
 
-**Tests:**
+**Tests** (all in `tests/multi_project_front.rs`, same fixture as slice 4,
+plus router unit tests in `shim.rs`):
 
-1. `tests/multi_project_front.rs::selecting_a_project_switches_the_session`:
-   the fixture from slice 4.
-   - `select_project {project:"b"}`: the result text contains `b`'s absolute
-     path and the language guidance (`P1` text).
-   - Then `get_file_outline {file_path:"x.ts"}` (relative to `b`) returns
-     `b/x.ts`'s outline.
-   - `project_dir(b)/index.db` has `bulkIndexedAt` set, and
-     `project_dir(root)` and `project_dir(a)` have no `index.db`.
-   *Control:* in the worktree, make the shim ignore the directive, and
-   `get_file_outline` returns the front's "none is selected" error.
-2. `...::reselecting_switches_again`: select `b`, then `a`, and an outline of
-   `a`'s file works. The old `b` daemon keeps running, but the session no
-   longer talks to it: `b`'s daemon trace log shows no further calls.
-3. `...::a_failed_switch_leaves_the_session_on_the_front`: select a candidate
-   whose daemon cannot start (for example, make its state dir path exceed the
-   socket limit by setting `G_MESH_HOME` to a long path, or use an injected
-   failure env var). The result is `isError` naming the failure, and a
-   following `select_project {}` still answers.
-4. Regression: `tests/mcp_e2e.rs` and `tests/shim_bootstrap.rs` stay green,
-   since the single-project path must be unchanged.
+| Test | What it asserts | Control |
+|---|---|---|
+| `selecting_a_project_switches_the_session` | after `select_project {project:"b"}`, `get_file_outline {file_path:"b.ts"}` returns `b.ts`'s outline; afterwards `project_dir(b)/index.db` has `bulkIndexedAt` set, and `project_dir(root)` and `project_dir(a)` have no `index.db` | the shim ignores the directive: the outline call gets the front's "none is selected" error |
+| `select_project_carries_the_selected_projects_own_guidance` **(the instructions gap)** | (1) with `b` unindexed, the result text contains `this session now serves <canon b>`, then guidance that opens with `cold_start`'s line (`Index root: <canon b>. Not indexed yet`, or, *as built*, its no-root fallback `Not indexed yet`, which a long temp dir triggers under the byte ceiling), and `P1`'s first sentence; (2) `peer_info().instructions` is still the front's text, pinning the known limitation so a change in it is noticed; (3) the result has no `_meta` directive | (1) skip D11 step 3.6 (forward the front's result as is); (3) keep the directive |
+| `guidance_reflects_the_projects_current_state` | index `b` first (a separate shim session started in `b`, then `common::wait_until_indexed`), then from the root session select `b`: the text contains `P1` and does **not** contain `Not indexed yet` | the shim appends a text rendered from `instructions::cold_start(b, false, ..)` instead of the replayed one. This is the control that tells "`C`'s own live text" apart from "a plausible text about `C`" |
+| `reselecting_the_same_project_refreshes_its_guidance` | select `b` (text says `Not indexed yet`), call `get_file_outline` and wait until indexed, select `b` again: the second text no longer says `Not indexed yet` | a same-project shortcut that re-sends the first switch's cached instructions |
+| `reselecting_switches_again` | select `b`, then `a`: `get_file_outline {file_path:"a.ts"}` works and `{file_path:"b.ts"}` is a not-found result from `a`'s daemon (the session no longer talks to `b`) | keep routing to the first sub-project upstream |
+| `a_failed_switch_leaves_the_session_on_the_front` (Unix) | pre-create `project_dir(b)` with mode `000` so `b`'s bootstrap fails; `select_project {project:"b"}` is `isError` naming the failure, and a following `find_references` still gets the front's "none is selected" error | set `current` before the bootstrap result is checked: the next call errors at transport level or reaches no daemon |
+| `progress_passes_through_after_a_switch` | with `G_MESH_PROGRESS_INTERVAL_MS=200`, a first `get_file_outline` on unindexed `b` sent with a progress token receives at least one `notifications/progress` | the sub-project reader forwards only response frames |
+| router unit test: single-project frames are byte-identical | a scripted upstream and client exchange frames with unusual key order and whitespace, plus one unparsable line; the output bytes equal the input bytes | re-serialize parsed frames instead of forwarding the original bytes |
+
+Regression: `tests/mcp_e2e.rs`, `tests/shim_bootstrap.rs`,
+`tests/shim_handle_inheritance.rs` and `tests/index_wait_progress.rs` stay
+green, since the single-project path must be unchanged. The stdout
+single-writer design has no test of its own: interleaving is impossible by
+construction, and no reliable control exists for a race; the report says so.
 
 **Exit:** tests green, and a manual session in `~/Projects/ClaudeProjects`
-(M3 part b) recorded.
+(M3 part b) recorded, including one context compaction to see whether the
+agent re-calls `select_project` for the guidance (Q8).
 
 ---
 

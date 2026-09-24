@@ -218,8 +218,11 @@ pub struct IndexStatus {
     /// against a recorded baseline that no longer matches the file on disk.
     ///
     /// A bulk-indexed file with no `indexed_files` row is *not* counted:
-    /// `daemon::bulk_index` records nodes without baselines, so a missing
-    /// baseline means "walked, never edited since", not "stale".
+    /// `daemon::bulk_index` leaves a walked file without a baseline when it
+    /// cannot prove the walk saw its current bytes (GM-401,
+    /// `watcher::staleness::record_walk_baselines`), and an index built
+    /// before GM-401 has none at all - so a missing baseline means "walked,
+    /// not yet checked since", not "stale".
     pub dirty: usize,
     /// Project-relative paths of files the plugin flagged as only partially
     /// parseable, sorted.
@@ -264,6 +267,19 @@ pub struct Report {
     /// bulk_indexed` alone cannot make under GM-395's lazy activation, since
     /// a project can sit unwalked for as long as nothing has asked.
     pub phase: Option<String>,
+    /// Set when `phase` reads `front` (GM-399, D11): the folder's projects as
+    /// a fresh bounded walk counts them. `index` is then left empty, since
+    /// its whole-folder file walk is exactly the cost a front exists to
+    /// avoid.
+    pub front: Option<FrontSummary>,
+}
+
+/// What `g-mesh status` says about a front: how many projects, and whether
+/// the walk stopped at a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontSummary {
+    pub projects: usize,
+    pub truncated: bool,
 }
 
 /// Reports on the project the current directory belongs to.
@@ -288,6 +304,23 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     let core = core_state(project_root)?;
+    let phase = daemon::read_phase_in(&state_dir);
+    let front = (phase.as_deref() == Some(daemon::front::FRONT_PHASE)).then(|| {
+        let walk = daemon::candidates::walk(project_root, daemon::candidates::Limits::default());
+        FrontSummary { projects: walk.candidates.len(), truncated: walk.truncated }
+    });
+    let index = if front.is_some() {
+        IndexStatus {
+            bulk_indexed: false,
+            semantic_pass_completed: false,
+            discovered: 0,
+            indexed: 0,
+            dirty: 0,
+            syntax_error_files: Vec::new(),
+        }
+    } else {
+        index_status(project_root, &state_dir.join("index.db"))?
+    };
     Ok(Report {
         project_id,
         core,
@@ -296,8 +329,9 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         suspended_languages: suspended_language_reports(&state_dir),
         last_used: last_used::read_from_project_dir(&state_dir)
             .context("failed to read the project's lastUsed")?,
-        index: index_status(project_root, &state_dir.join("index.db"))?,
-        phase: daemon::read_phase_in(&state_dir),
+        index,
+        phase,
+        front,
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -618,6 +652,18 @@ pub fn render(report: &Report) -> String {
     // no line here, same as the pre-GM-395 "say nothing once the walk is
     // done" behaviour - `phase` is `None` whenever no daemon is running, which
     // falls through to the same two messages this reported before D13.
+    if let Some(front) = report.front {
+        // A front has no index: no coverage, no dirty files, nothing to
+        // repair. A session picks one of the projects, which is then served
+        // by its own daemon with its own `g-mesh status`.
+        let _ = writeln!(
+            out,
+            "  index:           folder of {}{} projects - no index; a session selects one",
+            front.projects,
+            if front.truncated { "+" } else { "" }
+        );
+        return out;
+    }
     match report.phase.as_deref() {
         Some("unindexed") => {
             let _ = writeln!(out, "  index:           not indexed yet - builds on the first tool call");
@@ -973,6 +1019,7 @@ mod tests {
                 syntax_error_files: vec!["src/broken.ts".to_string()],
             },
             phase: None,
+            front: None,
         };
 
         let rendered = render(&report);
@@ -1011,6 +1058,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: None,
+            front: None,
         };
 
         let rendered = render(&report);
@@ -1050,6 +1098,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: Some("walking".to_string()),
+            front: None,
         };
 
         let rendered = render(&report);
@@ -1088,6 +1137,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: phase.map(str::to_string),
+            front: None,
         }
     }
 
@@ -1177,6 +1227,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: None,
+            front: None,
         };
 
         let rendered = render(&report);
@@ -1263,6 +1314,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: None,
+            front: None,
         };
 
         let rendered = render(&report);
@@ -1469,6 +1521,7 @@ mod tests {
                 syntax_error_files: Vec::new(),
             },
             phase: None,
+            front: None,
         };
         let rendered = render(&report);
         assert!(!rendered.contains("semantic ("), "{rendered}");

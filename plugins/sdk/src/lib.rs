@@ -75,6 +75,7 @@
 mod diff;
 mod framing;
 mod graph;
+mod hold;
 pub mod ids;
 mod index;
 pub mod lsp;

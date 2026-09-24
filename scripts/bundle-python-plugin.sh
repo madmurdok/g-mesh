@@ -43,15 +43,16 @@
 # `exe_name_for` below only has to know the filename that will exist on disk
 # after the build. The manifest is still regenerated - not because of a
 # naming defect, but because the checked-in one's `command` is a dev-time
-# path into the workspace's own `target/debug/`, meaningless in an installed
+# path into the workspace's own `target/<profile>/`, meaningless in an installed
 # layout with no workspace around it (see the next section).
 #
 # ---------------------------------------------------------------------------
 # WHY THE MANIFEST IS STILL GENERATED, NOT REUSED AS-IS
 #
 # plugins/python/plugin.toml's checked-in `[plugin.spawn] command` is
-# `../../target/debug/g-mesh-plugin-python` - a path into the *workspace's*
-# build directory, meaningful only from inside a checkout
+# `${G_MESH_BIN_DIR}/g-mesh-plugin-python` - a path into the *workspace's*
+# build directory (the running g-mesh's own `target/<profile>/`, GM-404),
+# meaningful only from inside a checkout
 # (`g-mesh plugins check plugins/python --fixture <dir>` run from the repo
 # root, per that file's own header comment). The installed manifest this
 # script writes is derived from that file with only its `command` line
@@ -156,7 +157,9 @@ main() {
 	# why the checked-in manifest is not reused as-is.
 	log "generating $stage/plugin.toml for $exe_name"
 	local src_manifest="$PLUGIN_DIR/plugin.toml"
-	local marker='command = "../../target/debug/g-mesh-plugin-python"'
+	# The placeholder is literal on purpose: it is what the manifest spells (GM-404).
+	# shellcheck disable=SC2016
+	local marker='command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"'
 	grep -qF "$marker" "$src_manifest" ||
 		die "$src_manifest no longer contains '$marker' - update this script's substitution to match its new spelling"
 
@@ -167,7 +170,8 @@ main() {
 		echo "# from it, rewritten to name $exe_name, the binary actually staged beside"
 		echo "# this manifest for $target (see GM-298 in that script for why)."
 		echo "#"
-		sed "s#$marker#command = \"./$exe_name\"#" "$src_manifest"
+		# `[$]`: a literal `$` in the sed pattern, whatever position it is in.
+		sed "s#${marker/\$/[\$]}#command = \"./$exe_name\"#" "$src_manifest"
 	} >"$stage/plugin.toml"
 
 	grep -qF "command = \"./$exe_name\"" "$stage/plugin.toml" ||

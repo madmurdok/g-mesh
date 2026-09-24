@@ -260,11 +260,19 @@ jobs:
       #
       # GM-347 settled `$Force` (Test-InstallDir now declares it and
       # Install-GMesh passes it; release.yml's GM-333 step executes both the
-      # refusal and the replacement), so `continue-on-error` is off. The
-      # `Write-Log` collision is its own question with its own evidence to
-      # gather (GM-392), so `PSAvoidOverwritingBuiltInCmdlets` is excluded by
-      # name until that lands - every other rule, `PSReviewUnusedParameter`
-      # included, now fails the job.
+      # refusal and the replacement), so `continue-on-error` is off.
+      #
+      # GM-392 settled the other finding. `PSAvoidOverwritingBuiltInCmdlets`
+      # flagged `Write-Log` from its "core-6.1.0-windows" compatibility
+      # profile, not from anything that actually resolves at runtime: on a
+      # real Windows runner (run 35989152753), under both pwsh 7.6.6 and
+      # Windows PowerShell 5.1, `Get-Command Write-Log` resolved to nothing
+      # but this script's own function, and no module ships one - the
+      # collision the rule reports is absent, measured. But the rule has no
+      # way to be told that short of a named exclusion, so the function was
+      # renamed to `Write-Step` instead of carrying one: no exclusion for
+      # `PSAvoidOverwritingBuiltInCmdlets` remains, and every rule -
+      # `PSReviewUnusedParameter` included - fails the job.
       - name: install.ps1 lint
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -272,10 +280,9 @@ jobs:
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber | Out-Null
           }
-          # GM-392 owns PSAvoidOverwritingBuiltInCmdlets (Write-Log).
           $found = Invoke-ScriptAnalyzer -Path 'scripts/install.ps1' `
             -Severity Error,Warning `
-            -ExcludeRule PSAvoidUsingWriteHost, PSAvoidOverwritingBuiltInCmdlets
+            -ExcludeRule PSAvoidUsingWriteHost
           if (-not $found) {
             Write-Host 'PSScriptAnalyzer: nothing to report'
             return

@@ -73,6 +73,7 @@ pub(crate) mod find_callers_callees;
 pub(crate) mod find_definition;
 pub(crate) mod find_implementations;
 pub(crate) mod find_references;
+pub mod front;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
 mod instructions;
@@ -264,6 +265,12 @@ impl GMeshMcpServer {
         tool: &str,
         need: Need,
     ) -> Result<Option<CallToolResult>, ErrorData> {
+        // Taken before anything below runs, including the indexing wait, so
+        // that if the replay at the bottom also has to heartbeat (GM-403) its
+        // `progress` values pick up exactly where the wait's own left off -
+        // the same reason `ensure_file_fresh`'s caller takes its own
+        // `call_started` ahead of `prepare` (see that method's doc comment).
+        let call_started = Instant::now();
         let token = ctx.meta.get_progress_token();
         trace_call(format_args!(
             "prepare: entered tool={tool} request={} progressToken={}",
@@ -276,7 +283,7 @@ impl GMeshMcpServer {
         }
         trace_call(format_args!("prepare: past the indexing wait tool={tool} request={}", ctx.id));
         self.mark_used();
-        self.replay_queued_changes().await;
+        self.replay_queued_changes(ctx, tool, call_started).await;
         trace_call(format_args!("prepare: done tool={tool} request={}", ctx.id));
         Ok(None)
     }
@@ -297,19 +304,92 @@ impl GMeshMcpServer {
     /// index can already answer; refusing it because a *later* edit could not
     /// be replayed would turn one unreadable file into a dead tool surface,
     /// and each language's queue is left intact for the next call to retry.
-    async fn replay_queued_changes(&self) {
+    ///
+    /// # GM-403: heartbeats while a replay runs
+    ///
+    /// A replay is a `fileChanged` round trip (plus a per-file semantic pass)
+    /// for every queued file, sent to whichever language's plugin was asleep
+    /// - on a cold language server that is the same tens-of-seconds cost
+    /// [`ensure_file_fresh`](Self::ensure_file_fresh) already heartbeats for
+    /// GM-401, just paid for a whole queue instead of one file. Without a
+    /// ticker of its own this step was the one silent gap GM-401 left: the
+    /// indexing wait's heartbeat had already ended by the time `prepare`
+    /// reaches here.
+    ///
+    /// The same rules as both of those tickers: only for a request that
+    /// carried a `progressToken`, one interval in, a failed send logged and
+    /// ignored. `message` names the language(s) and how many files each owes
+    /// ([`PluginRegistry::pending_summary`]), read once before the replay
+    /// starts draining the queue it describes, not on every tick - a ticker
+    /// that re-asked mid-replay would watch the count fall to zero and call
+    /// that news. `progress` is `call_started.elapsed()` - taken by
+    /// [`prepare`](Self::prepare) before the indexing wait, so it keeps
+    /// strictly increasing whether or not that wait also heartbeated.
+    ///
+    /// Not cancellable, as before: the replay runs on the blocking pool and
+    /// finishes whether or not anyone is still listening.
+    async fn replay_queued_changes(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        call_started: Instant,
+    ) {
         if !self.registry.has_pending() {
             return;
         }
+        let summary = self.registry.pending_summary();
         let registry = Arc::clone(&self.registry);
         let conn = Arc::clone(&self.conn);
-        if let Err(err) = tokio::task::spawn_blocking(move || {
-            registry.replay_pending(&conn);
-        })
-        .await
-        {
-            eprintln!("g-mesh daemon: the plugin wake task failed: {err}");
-        }
+        let started = Instant::now();
+        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&conn));
+        tokio::pin!(task);
+
+        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
+            interval.max(Duration::from_millis(1)),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent = 0u32;
+
+        let joined = loop {
+            tokio::select! {
+                biased;
+                joined = &mut task => break joined,
+                _ = ticker.tick(), if token.is_some() => {
+                    let token = token.clone().expect("the branch is only enabled with a token");
+                    let message = format!(
+                        "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
+                        self.registry.project_root().display(),
+                        human_duration(started.elapsed())
+                    );
+                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
+                        .with_message(message);
+                    match ctx.peer.notify_progress(param).await {
+                        Ok(()) => sent += 1,
+                        Err(err) => eprintln!(
+                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                            ctx.id
+                        ),
+                    }
+                }
+            }
+        };
+
+        let replayed = match joined {
+            Ok(count) => count,
+            Err(err) => {
+                eprintln!("g-mesh daemon: the plugin wake task failed: {err}");
+                0
+            }
+        };
+        trace_call(format_args!(
+            "replay: tool={tool} request={} summary={summary} replayed={replayed} elapsed_ms={} \
+             progress_sent={sent}",
+            ctx.id,
+            started.elapsed().as_millis()
+        ));
     }
 
     /// Every discovered plugin's declared `[plugin.capabilities]`, which the
@@ -355,12 +435,85 @@ impl GMeshMcpServer {
     /// must not turn an otherwise-answerable query into a tool error, so it
     /// is logged and the handler proceeds with whatever the index currently
     /// holds.
-    async fn ensure_file_fresh(&self, file_path: &str) {
+    ///
+    /// # GM-401: heartbeats while a reindex runs
+    ///
+    /// A reindex here is a `fileChanged` round trip plus a per-file semantic
+    /// pass, and the latter waits on the language server: over a minute on a
+    /// cold rust-analyzer. [`wait_for_index`](Self::wait_for_index)'s
+    /// heartbeat has ended by then, so without one of its own the client
+    /// heard nothing for that whole stretch and its idle timer, not this
+    /// daemon, decided when the call ended. The same ticker runs here, under
+    /// the same rules: only for a request that carried a `progressToken`, one
+    /// interval in (the fast path sends nothing), and a failed send is logged
+    /// and ignored. `progress` is seconds since `call_started`, which the
+    /// handler takes *before* [`prepare`](Self::prepare) - earlier than the
+    /// indexing wait's own start - so it keeps strictly increasing across
+    /// both heartbeats of one call.
+    ///
+    /// Not cancellable, as before: the reindex runs on the blocking pool and
+    /// finishes whether or not anyone is still listening.
+    async fn ensure_file_fresh(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        call_started: Instant,
+        file_path: &str,
+    ) {
         let registry = Arc::clone(&self.registry);
         let conn = Arc::clone(&self.conn);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
-        match tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path)).await {
+        let started = Instant::now();
+        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path));
+        tokio::pin!(task);
+
+        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
+            interval.max(Duration::from_millis(1)),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent = 0u32;
+
+        let joined = loop {
+            tokio::select! {
+                biased;
+                joined = &mut task => break joined,
+                _ = ticker.tick(), if token.is_some() => {
+                    let token = token.clone().expect("the branch is only enabled with a token");
+                    let message = format!(
+                        "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
+                        self.registry.project_root().display(),
+                        human_duration(started.elapsed())
+                    );
+                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
+                        .with_message(message);
+                    match ctx.peer.notify_progress(param).await {
+                        Ok(()) => sent += 1,
+                        Err(err) => eprintln!(
+                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                            ctx.id
+                        ),
+                    }
+                }
+            }
+        };
+
+        let outcome = match &joined {
+            Ok(Ok(Some(outcome))) => format!("{outcome:?}"),
+            Ok(Ok(None)) => "no_plugin".to_string(),
+            Ok(Err(_)) => "failed".to_string(),
+            Err(_) => "task_failed".to_string(),
+        };
+        trace_call(format_args!(
+            "ensure_fresh: tool={tool} request={} file={owned_path} outcome={outcome} elapsed_ms={} \
+             progress_sent={sent}",
+            ctx.id,
+            started.elapsed().as_millis()
+        ));
+        match joined {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
                 eprintln!("g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}")
@@ -665,11 +818,12 @@ impl GMeshMcpServer {
         params: Parameters<FindDefinitionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "find_definition", Need::Structural).await? {
             return Ok(early);
         }
         if let Some(file_path) = &params.0.file_path {
-            self.ensure_file_fresh(file_path).await;
+            self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
         find_definition::handle(&self.conn, self.registry.project_root(), &self.embedding, params.0)
     }
@@ -741,10 +895,11 @@ impl GMeshMcpServer {
         params: Parameters<GetFileOutlineParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_file_outline", Need::Structural).await? {
             return Ok(early);
         }
-        self.ensure_file_fresh(&params.0.file_path).await;
+        self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
         get_file_outline::handle(&self.conn, params.0)
     }
 
@@ -757,11 +912,12 @@ impl GMeshMcpServer {
         params: Parameters<GetDependenciesParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_dependencies", Need::Structural).await? {
             return Ok(early);
         }
         if let Some(file_path) = &params.0.file_path {
-            self.ensure_file_fresh(file_path).await;
+            self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
         // The union of every discovered plugin's declared entry points (GM-273)
         // - see `PluginRegistry::entry_points` and

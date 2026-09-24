@@ -233,13 +233,22 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
 /// `TempDir` is returned rather than dropped because dropping it deletes the
 /// directory - the caller has to hold it for as long as the daemon runs.
 ///
-/// The copy still finds the repository's plugins: `manifest::bundled_roots`
-/// resolves them through `env!("CARGO_MANIFEST_DIR")`, which is compiled into
-/// the binary rather than derived from where it happens to sit.
+/// The copy still finds the repository's plugin manifests:
+/// `manifest::bundled_roots` resolves them through `env!("CARGO_MANIFEST_DIR")`,
+/// which is compiled into the binary rather than derived from where it happens
+/// to sit. The cargo-workspace plugins' binaries are another matter: their
+/// manifests name `${G_MESH_BIN_DIR}/g-mesh-plugin-*`, the running
+/// executable's own directory (GM-404), so they are copied beside it too.
 fn daemon_from_a_copy_of_the_binary() -> (tempfile::TempDir, PathBuf) {
     let bin_dir = tempfile::tempdir().expect("failed to create a directory for the daemon's binary");
     let copied_bin = bin_dir.path().join(Path::new(BIN).file_name().expect("the test binary has a name"));
     std::fs::copy(BIN, &copied_bin).expect("failed to copy the g-mesh binary");
+    let built_dir = Path::new(BIN).parent().expect("the test binary has a directory");
+    for plugin in ["g-mesh-plugin-rust", "g-mesh-plugin-python"] {
+        let name = format!("{plugin}{}", std::env::consts::EXE_SUFFIX);
+        std::fs::copy(built_dir.join(&name), bin_dir.path().join(&name))
+            .unwrap_or_else(|err| panic!("failed to copy {name} (run `cargo build --workspace`): {err}"));
+    }
     (bin_dir, copied_bin)
 }
 

@@ -32,11 +32,23 @@
 //! already-absolute value (it replaces the base entirely), so no separate
 //! "is it absolute" branch is needed.
 //!
+//! # `${G_MESH_BIN_DIR}`
+//!
+//! A `command` that starts with [`BIN_DIR_PLACEHOLDER`] is resolved against
+//! the directory of the running g-mesh executable ([`current_bin_dir`])
+//! instead of the manifest's directory. `plugins/python/plugin.toml` and
+//! `plugins/rust/plugin.toml` use it (GM-404): they name a cargo build output,
+//! and before this they hard-coded `../../target/debug/...`, so a g-mesh run
+//! from `target/release` still spawned the unoptimized debug plugins. The
+//! placeholder makes the plugin's profile follow the core binary's. Only
+//! `command` expands it, and only as a prefix; anywhere else it is a hard
+//! error rather than a literal directory named `${G_MESH_BIN_DIR}`.
+//!
 //! `command` gets one more step a plain `args` entry does not: [`resolve_exe_suffix`]
 //! falls back to the platform's suffixed spelling (`.exe` on Windows) when the
 //! path as joined doesn't exist. `plugins/python/plugin.toml` and
 //! `plugins/rust/plugin.toml` name their `command` as a cargo build output
-//! (`../../target/debug/g-mesh-plugin-<language>`), and cargo always emits
+//! (`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`), and cargo always emits
 //! `<name>.exe` there on Windows - never the suffix-less name the manifest
 //! (deliberately platform-neutral, per GM-335) actually writes - so without
 //! this fallback those two plugins are unspawnable from any Windows checkout,
@@ -84,6 +96,31 @@ use serde::Deserialize;
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
+
+/// The `command` prefix that stands for [`current_bin_dir`] - see this
+/// module's doc comment (GM-404).
+pub const BIN_DIR_PLACEHOLDER: &str = "${G_MESH_BIN_DIR}";
+
+/// The directory of the running g-mesh executable, which is what
+/// [`BIN_DIR_PLACEHOLDER`] expands to: `target/release` for a release build,
+/// `target/debug` for a debug one, and the install directory otherwise.
+/// `None` only when this process cannot resolve its own path.
+pub fn current_bin_dir() -> Option<PathBuf> {
+    bin_dir_of(&std::env::current_exe().ok()?)
+}
+
+/// [`current_bin_dir`] for a given executable path. A cargo test binary
+/// lives one level deeper, in `target/<profile>/deps/`, while the plugin
+/// binaries it would spawn sit in `target/<profile>/`, so a parent named
+/// `deps` is stepped over: an in-process test resolves the same profile
+/// directory the real binary would.
+fn bin_dir_of(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    Some(parent.to_path_buf())
+}
 
 /// Where a spawned plugin is told to find the manifest core read about it.
 ///
@@ -397,7 +434,10 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         );
     }
 
-    let command = resolve_path_entry(&plugin.spawn.command, dir);
+    let command =
+        resolve_command(&plugin.spawn.command, dir, current_bin_dir().as_deref()).with_context(|| {
+            format!("invalid [plugin.spawn] command in plugin manifest at {}", manifest_path.display())
+        })?;
     let args = plugin.spawn.args.iter().map(|arg| resolve_arg(arg, dir)).collect();
 
     // `watch_files` entries parse as plain strings (`RawWorkspace`) rather
@@ -581,6 +621,28 @@ fn resolve_path_entry(value: &str, dir: &Path) -> PathBuf {
     } else {
         PathBuf::from(value)
     }
+}
+
+/// Resolves `command`: a [`BIN_DIR_PLACEHOLDER`] prefix is replaced by
+/// `bin_dir` (the running executable's directory, a parameter so a test can
+/// name any directory), anything else goes through [`resolve_path_entry`].
+/// Errors when the placeholder is used but `bin_dir` is unknown, or when the
+/// placeholder appears anywhere but at the start.
+fn resolve_command(value: &str, dir: &Path, bin_dir: Option<&Path>) -> Result<PathBuf> {
+    let Some(rest) = value.strip_prefix(BIN_DIR_PLACEHOLDER) else {
+        if value.contains(BIN_DIR_PLACEHOLDER) {
+            bail!("`{BIN_DIR_PLACEHOLDER}` is only expanded at the start of `command`, got \"{value}\"");
+        }
+        return Ok(resolve_path_entry(value, dir));
+    };
+    let bin_dir = bin_dir.with_context(|| {
+        format!("`command` \"{value}\" uses `{BIN_DIR_PLACEHOLDER}`, but the running executable's directory is unknown")
+    })?;
+    let rest = rest.trim_start_matches(['/', '\\']);
+    if rest.is_empty() || rest.contains(BIN_DIR_PLACEHOLDER) {
+        bail!("`command` \"{value}\" must be `{BIN_DIR_PLACEHOLDER}/<binary>`");
+    }
+    Ok(resolve_exe_suffix(bin_dir.join(rest), std::env::consts::EXE_SUFFIX))
 }
 
 /// Falls back to the platform's suffixed spelling (e.g. `.exe` on Windows)
@@ -1452,6 +1514,62 @@ watch_files = ["[unclosed"]
     #[test]
     fn an_arg_with_no_path_separator_is_left_untouched() {
         assert_eq!(resolve_arg("--verbose", Path::new("/plugins/python")), "--verbose");
+    }
+
+    // -----------------------------------------------------------------
+    // GM-404: `${G_MESH_BIN_DIR}` follows the running executable's profile
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_bin_dir_placeholder_expands_to_the_given_directory_not_the_manifest_directory() {
+        let bin_dir = Path::new("/ws/target/release");
+        let resolved = resolve_command(
+            "${G_MESH_BIN_DIR}/g-mesh-plugin-rust",
+            Path::new("/ws/plugins/rust"),
+            Some(bin_dir),
+        )
+        .unwrap();
+        assert_eq!(resolved, bin_dir.join("g-mesh-plugin-rust"));
+    }
+
+    #[test]
+    fn the_bin_dir_placeholder_without_a_known_bin_dir_is_an_error() {
+        let err = resolve_command("${G_MESH_BIN_DIR}/g-mesh-plugin-rust", Path::new("/p"), None).unwrap_err();
+        assert!(err.to_string().contains("running executable's directory is unknown"), "{err:#}");
+    }
+
+    #[test]
+    fn the_bin_dir_placeholder_anywhere_but_the_start_is_an_error() {
+        let bin_dir = Some(Path::new("/ws/target/debug"));
+        for value in ["./x/${G_MESH_BIN_DIR}/p", "${G_MESH_BIN_DIR}", "${G_MESH_BIN_DIR}/"] {
+            assert!(resolve_command(value, Path::new("/p"), bin_dir).is_err(), "{value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn bin_dir_of_steps_over_a_cargo_test_deps_directory() {
+        let debug = Path::new("/ws").join("target").join("debug");
+        assert_eq!(bin_dir_of(&debug.join("deps").join("g_mesh-abc123")), Some(debug.clone()));
+        assert_eq!(bin_dir_of(&debug.join("g-mesh")), Some(debug));
+    }
+
+    /// Both checked-in cargo-workspace plugin manifests, read in place, must
+    /// resolve their `command` inside the running executable's own profile
+    /// directory - the directory this test binary itself was built into -
+    /// rather than a path spelled relative to `plugins/<language>/`.
+    #[test]
+    fn the_bundled_cargo_plugins_resolve_their_command_in_the_running_profile_directory() {
+        let bin_dir = current_bin_dir().expect("the test binary must know its own directory");
+        for language in ["rust", "python"] {
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language);
+            let manifest = read_manifest(&dir).unwrap();
+            assert_eq!(
+                manifest.command.parent(),
+                Some(bin_dir.as_path()),
+                "{language}: resolved {}",
+                manifest.command.display()
+            );
+        }
     }
 
     // -----------------------------------------------------------------

@@ -1125,6 +1125,34 @@ impl PluginRegistry {
         self.active_supervisors().iter().any(|supervisor| supervisor.has_pending())
     }
 
+    /// "typescript (2 files), rust (1 file)" - one entry per active
+    /// supervisor that actually has something queued, in
+    /// [`active_supervisors`](Self::active_supervisors)' order. GM-403's
+    /// replay progress ticker names this so a caller staring at a silent
+    /// call for tens of seconds sees which language woke up and how much it
+    /// owes, not just that something is happening.
+    ///
+    /// Read once, before [`replay_pending`](Self::replay_pending) starts
+    /// draining the queue it describes - a ticker that re-asked this on
+    /// every tick would watch the count fall to zero mid-replay and call
+    /// that news, when it is only the replay's own progress.
+    pub fn pending_summary(&self) -> String {
+        let entries: Vec<String> = self
+            .active_supervisors()
+            .iter()
+            .filter(|supervisor| supervisor.has_pending())
+            .map(|supervisor| {
+                let count = supervisor.pending_len();
+                let noun = if count == 1 { "file" } else { "files" };
+                format!("{} ({count} {noun})", supervisor.language())
+            })
+            .collect();
+        if entries.is_empty() {
+            return "none".to_string();
+        }
+        entries.join(", ")
+    }
+
     /// Replays every active supervisor's queued changes, one language at a
     /// time. Best-effort per language, matching [`file_changed`](Self::file_changed)'s
     /// contract: one language's replay failing (or waking a plugin that

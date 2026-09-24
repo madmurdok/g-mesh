@@ -4,8 +4,10 @@
 # rules it must satisfy. `language` must equal this directory's own name
 # ("rust"), the same rule plugins/typescript's manifest documents.
 #
-# `command` is a dev-time path into the workspace's own `target/` (relative to
-# this manifest's directory, `plugins/rust/`), not a packaged layout - this is
+# `command` is a dev-time path into the workspace's own `target/<profile>/`
+# (`${G_MESH_BIN_DIR}` expands to the directory of the running g-mesh
+# executable, so a release g-mesh spawns the release plugin - GM-404), not a
+# packaged layout - this is
 # a dev-checkout contract, not a release one, the same distinction
 # plugins/go/plugin.toml documents for itself. `g-mesh plugins check
 # plugins/rust --fixture <dir>` run from the repository root, after `cargo
@@ -37,10 +39,10 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.11.1"
+plugin_version = "3.12.0"
 
 [plugin.spawn]
-command = "../../target/debug/g-mesh-plugin-rust"
+command = "${G_MESH_BIN_DIR}/g-mesh-plugin-rust"
 
 [plugin.languages]
 extensions = [".rs"]

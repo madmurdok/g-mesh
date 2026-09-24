@@ -96,9 +96,10 @@
 //! (GM-262 consideration 3's own alternative) is real future work, not
 //! built here; see [`build`]'s doc comment for why not now.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::daemon::candidates::Detection;
 use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 
 /// Working ceiling this module renders under - see this module's doc comment
@@ -634,6 +635,107 @@ pub fn present_languages(
             PresentLanguage { language, capabilities, semantic_pass_done }
         })
         .collect()
+}
+
+/// How a front counts its projects: `N`, or `N+` when the walk stopped at a
+/// limit and more may exist.
+pub(crate) fn project_count(count: usize, truncated: bool) -> String {
+    if truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
+}
+
+/// What the front's list appends to a candidate that already has a completed
+/// index of its own.
+const INDEXED_MARK: &str = " (indexed)";
+
+/// The front's sentence (D12), with `subject` naming the folder: either the
+/// root path (`"<root> is a folder of"`) or the no-path fallback (`"This
+/// folder holds"`). Worded to stay true after a session switch (D11 step 5):
+/// it says "before any other tool", never "nothing is selected".
+///
+/// `indexed` is how many candidates already have a completed index (rule 2's
+/// check, `candidates::has_completed_index`): none keeps the original
+/// wording; otherwise the sentence counts them and says they are listed
+/// first and marked with [`INDEXED_MARK`].
+fn front_sentence(subject: &str, count: &str, indexed: usize) -> String {
+    let state = if indexed == 0 {
+        "has indexed none of them".to_string()
+    } else {
+        format!("has already indexed {indexed} of them, listed first and marked (indexed)")
+    };
+    format!(
+        "{subject} {count} projects; g-mesh serves one at a time and {state}. \
+         Before any other g-mesh tool, call select_project with the one you are working on (ask the \
+         user if unclear). Its result names the project this session then serves and carries that \
+         project's guidance; call it again to switch, or to re-read that guidance. Projects: "
+    )
+}
+
+/// `head` followed by as many of `names` as fit under
+/// [`INSTRUCTIONS_BYTE_CEILING`], then either `.` (all listed) or the `(+K
+/// more ...)` pointer, with how many names made it. `None` when not even the
+/// head and its ending fit.
+fn front_with_names(head: &str, names: &[&str]) -> Option<(String, usize)> {
+    let ending = |listed: usize| {
+        if listed == names.len() {
+            ".".to_string()
+        } else {
+            format!(
+                " (+{} more - call select_project with no argument for the full list).",
+                names.len() - listed
+            )
+        }
+    };
+    let mut listed = 0;
+    let mut body = String::new();
+    while listed < names.len() {
+        let separator = if listed == 0 { "" } else { ", " };
+        let next = format!("{body}{separator}{}", names[listed]);
+        if head.len() + next.len() + ending(listed + 1).len() > INSTRUCTIONS_BYTE_CEILING {
+            break;
+        }
+        body = next;
+        listed += 1;
+    }
+    let rendered = format!("{head}{body}{}", ending(listed));
+    (rendered.len() <= INSTRUCTIONS_BYTE_CEILING).then_some((rendered, listed))
+}
+
+/// `get_info`'s instructions for a front (D12 in
+/// `docs/architecture/lazy-indexing.md`, GM-399): [`P1`] (true before and
+/// after a switch), then the folder sentence and as many candidate
+/// `rel_path`s as fit under [`INSTRUCTIONS_BYTE_CEILING`]. The language
+/// paragraphs are left out: no language is known yet, and the selected
+/// project's own guidance arrives in the `select_project` result.
+///
+/// `indexed` holds the `rel_path`s of the candidates that already have a
+/// completed index; they are listed first (so the ceiling cuts unindexed
+/// names before indexed ones), each followed by [`INDEXED_MARK`], and the
+/// rest keep their walk order.
+///
+/// When the root path would cost the list its first name (or break the
+/// ceiling outright), the path is dropped - the same fallback [`cold_start`]
+/// uses.
+pub fn build_front(root: &Path, detection: &Detection, indexed: &HashSet<&str>) -> String {
+    let (done, rest): (Vec<&str>, Vec<&str>) =
+        detection.candidates.iter().map(|c| c.rel_path.as_str()).partition(|name| indexed.contains(name));
+    let marked: Vec<String> = done.iter().map(|name| format!("{name}{INDEXED_MARK}")).collect();
+    let names: Vec<&str> = marked.iter().map(String::as_str).chain(rest).collect();
+    let count = project_count(names.len(), detection.truncated);
+    let with_path = format!(
+        "{P1}\n\n{}",
+        front_sentence(&format!("{} is a folder of", root.display()), &count, done.len())
+    );
+    if let Some((rendered, listed)) = front_with_names(&with_path, &names) {
+        if listed > 0 || names.is_empty() {
+            return rendered;
+        }
+    }
+    let without_path = format!("{P1}\n\n{}", front_sentence("This folder holds", &count, done.len()));
+    front_with_names(&without_path, &names).map(|(rendered, _)| rendered).unwrap_or(without_path)
 }
 
 #[cfg(test)]
@@ -1297,5 +1399,115 @@ results instead of paging.";
             rendered.starts_with("Not indexed yet"),
             "the fallback line replaces the whole prefix, not just the path: {rendered}"
         );
+    }
+
+    fn front_detection(names: &[String], truncated: bool) -> Detection {
+        use crate::daemon::candidates::{Candidate, Mode};
+        Detection {
+            mode: Mode::Multi,
+            candidates: names
+                .iter()
+                .map(|name| Candidate {
+                    rel_path: name.clone(),
+                    abs_path: std::path::PathBuf::from("/x").join(name),
+                    markers: vec![".git"],
+                    is_worktree: false,
+                })
+                .collect(),
+            entries_read: names.len(),
+            elapsed: std::time::Duration::ZERO,
+            truncated,
+            walked: true,
+        }
+    }
+
+    /// GM-399 slice 4 test 3 (D12): the worst case the design names - 64
+    /// candidates with 60-byte names under a 103-byte root - fits under the
+    /// ceiling, still lists at least one name, and points at the rest.
+    #[test]
+    fn build_front_with_64_long_names_under_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let names: Vec<String> = (0..64).map(|n| format!("{n:02}{}", "n".repeat(58))).collect();
+        assert!(names.iter().all(|name| name.len() == 60));
+        let rendered = build_front(&root, &front_detection(&names, false), &HashSet::new());
+        println!("front (64 x 60-byte names, 103-byte root) bytes: {}", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+        assert!(rendered.contains(&names[0]), "at least one name must be listed: {rendered}");
+        assert!(rendered.contains(" (+"), "the names that did not fit must be pointed at: {rendered}");
+        assert!(rendered.contains(" more - call select_project with no argument"));
+        assert!(rendered.contains(&root.display().to_string()), "a 103-byte root still fits: {rendered}");
+        assert!(rendered.contains("is a folder of 64 projects"));
+    }
+
+    /// GM-399 follow-up: with no candidate indexed, the front keeps D12's
+    /// original wording and lists the names unmarked, in walk order.
+    ///
+    /// Control: make `front_sentence` always take the "some indexed" branch
+    /// (`if false`): "has indexed none of them" disappears.
+    #[test]
+    fn build_front_with_nothing_indexed_says_none() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rendered = build_front(Path::new("/f"), &front_detection(&names, false), &HashSet::new());
+        assert!(
+            rendered.contains("/f is a folder of 3 projects; g-mesh serves one at a time and has indexed none of them. Before"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("(indexed)"), "{rendered}");
+        assert!(rendered.ends_with("Projects: a, b, c."), "{rendered}");
+    }
+
+    /// GM-399 follow-up (defect 1 of `docs/results/gm399-multi-project-measurements.md`):
+    /// with some candidates already indexed, the sentence no longer claims
+    /// "none", counts them, and lists them first with a mark.
+    ///
+    /// Control: pass `0` instead of `done.len()` to `front_sentence` in
+    /// `build_front`: the text says "has indexed none of them" again.
+    #[test]
+    fn build_front_with_some_indexed_names_them() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let indexed: HashSet<&str> = ["c", "b"].into_iter().collect();
+        let rendered = build_front(Path::new("/f"), &front_detection(&names, false), &indexed);
+        assert!(!rendered.contains("indexed none"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "/f is a folder of 3 projects; g-mesh serves one at a time and has already indexed 2 of them, \
+                 listed first and marked (indexed). Before"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.ends_with("Projects: b (indexed), c (indexed), a."), "{rendered}");
+    }
+
+    /// Indexed candidates come first, so the ceiling cuts unindexed names
+    /// before an indexed one: `63` is the last name in walk order and still
+    /// makes the list under the worst-case root.
+    ///
+    /// Control: drop the `partition` in `build_front` (list names in walk
+    /// order, marking in place): `63 (indexed)` falls past the ceiling.
+    #[test]
+    fn build_front_keeps_indexed_names_within_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let names: Vec<String> = (0..64).map(|n| format!("{n:02}{}", "n".repeat(58))).collect();
+        let indexed: HashSet<&str> = [names[63].as_str()].into_iter().collect();
+        let rendered = build_front(&root, &front_detection(&names, false), &indexed);
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+        assert!(rendered.contains(&format!("Projects: {} (indexed), ", names[63])), "{rendered}");
+        assert!(rendered.contains("has already indexed 1 of them"), "{rendered}");
+        assert!(rendered.contains(&root.display().to_string()), "{rendered}");
+    }
+
+    /// D12's no-path fallback: a root too long for the ceiling is dropped
+    /// from the text rather than truncated or allowed to overflow.
+    #[test]
+    fn build_front_drops_a_root_too_long_for_the_ceiling() {
+        // 1,400 bytes rather than `cold_start`'s 600: the front's text has
+        // no language paragraphs, so a 600-byte root still fits beside it.
+        let root = root_of_byte_len(1400);
+        let names = vec!["a".to_string(), "b".to_string()];
+        let rendered = build_front(&root, &front_detection(&names, true), &HashSet::new());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+        assert!(!rendered.contains("/rrrr"), "the root must not appear: {rendered}");
+        assert!(rendered.contains("This folder holds 2+ projects"), "{rendered}");
+        assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
     }
 }

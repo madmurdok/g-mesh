@@ -1,6 +1,8 @@
 mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
+pub mod candidates;
+pub mod front;
 pub mod identity;
 pub mod indexing_status;
 pub mod lifecycle;
@@ -400,6 +402,17 @@ pub fn run(root: &Path) -> Result<()> {
             }
         }
         Err(err) => eprintln!("g-mesh daemon: could not describe its own build: {err:#}"),
+    }
+
+    // D10/D11 (GM-399): the mode decision, ahead of plugin discovery and of
+    // `connection::open`. A folder of projects is served by the front, which
+    // needs neither: no plugin manifest can stop it, and no `index.db` is
+    // ever created for the folder. A single project (every root with a
+    // marker of its own pays one `stat` per marker here, nothing more)
+    // carries on below exactly as before.
+    let detection = candidates::detect_in(root, &dir, candidates::Limits::default());
+    if detection.mode == candidates::Mode::Multi {
+        return front::run(root, &dir, singleton, detection);
     }
 
     // Discovery runs here - ahead of the index, the socket and everything

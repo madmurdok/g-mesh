@@ -35,7 +35,8 @@
 //! all - the case the Unix path has to unlink around (see
 //! [`crate::ipc::windows`]).
 
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -94,6 +95,32 @@ pub fn detach(command: &mut Command) -> &mut Command {
 /// per-spawn version would be a flag to remember at every future call site.
 pub fn keep_our_stdio_from_children() {
     imp::keep_our_stdio_from_children()
+}
+
+/// The one lock every plugin spawn is taken under - see [`spawn_serialized`].
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Spawns `command` while holding a process-wide lock, so no two plugin
+/// spawns in this process overlap (GM-397).
+///
+/// **Unverified hardening.** Nothing reproduces the race this closes and no
+/// test can pin it; it is here because the standard library's source shows
+/// it, not because it was observed (`docs/architecture/plugin-lifetime.md`
+/// §1.3, §2 item 5, §5 Q1). On targets without `pipe2` - macOS among them -
+/// `Command::spawn` creates each stdio pipe with `pipe()` and only then marks
+/// it `FD_CLOEXEC`, and its `posix_spawn` path does not set
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`. A spawn on another thread that lands in that
+/// window hands the new pipe end to an unrelated child. For a plugin that is
+/// fatal to its lifeline: a sibling holding the write end of plugin A's stdin
+/// means A never sees EOF when the daemon dies, and two plugins can each hold
+/// the other's. Serializing the spawns - pipe creation included, since both
+/// happen inside `Command::spawn` - removes the overlap. Spawns are rare, so
+/// the lock costs nothing measurable.
+///
+/// A poisoned lock is taken anyway: it guards no data, only an interval.
+pub fn spawn_serialized(command: &mut Command) -> std::io::Result<Child> {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    command.spawn()
 }
 
 #[cfg(unix)]

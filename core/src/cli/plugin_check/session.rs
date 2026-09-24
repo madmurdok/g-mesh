@@ -356,7 +356,13 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         // see `daemon::manifest::MANIFEST_PATH_ENV`. Checking a plugin against
         // a manifest it cannot see is checking something else.
         .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
-        .stdin(Stdio::null())
+        // The daemon's lifeline, exactly as `walk_one_language` sets it up
+        // (GM-397): a stdin pipe kept inside `child` and never written, plus
+        // the variable that arms the plugin's watcher on it. Checking a
+        // plugin under a different stdin than the daemon gives it would be
+        // checking something else.
+        .stdin(Stdio::piped())
+        .env(crate::daemon::bulk_index::BULK_STDIN_LIFELINE_ENV, "1")
         .stdout(Stdio::piped())
         // Piped rather than inherited, and echoed on by `StderrCapture` - see
         // its own doc comment for what inheriting it cost.
@@ -390,7 +396,7 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         return BulkRun { bytes: Vec::new(), lines: Vec::new(), failure: Some(hint) };
     }
 
-    let mut child = match command.spawn() {
+    let mut child = match crate::process::spawn_serialized(&mut command) {
         Ok(child) => child,
         Err(err) => {
             return BulkRun {
@@ -537,7 +543,7 @@ pub(crate) fn open_index() -> Result<Arc<Mutex<Connection>>> {
 /// project-wide, exactly as `bulk_index::run` does after its walk.
 pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<()> {
     let mut summary = BulkIndexSummary::default();
-    bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None)?;
+    bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None, None)?;
     let mut conn = conn.lock().unwrap();
     imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?;
     symbol_links::link_all(&mut conn).context("failed to link the walk's cross-file symbol usages")?;
@@ -952,7 +958,7 @@ pub(crate) fn run_session(
         return Session { failure: Some(hint), ..Session::default() };
     }
 
-    let mut child = match command.spawn() {
+    let mut child = match crate::process::spawn_serialized(&mut command) {
         Ok(child) => child,
         Err(err) => {
             return Session {

@@ -1,6 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::Shutdown;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -13,8 +12,9 @@ use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::ipc;
 use crate::process;
-use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use crate::storage::connection::ensure_project_dir;
+
+mod router;
 
 /// How long to keep retrying the first connect after bootstrapping a daemon,
 /// and how long to wait between attempts. The daemon needs a few milliseconds
@@ -74,14 +74,16 @@ pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// diagnostic aid must never be the reason a daemon does not start.
 pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
 
-/// Stateless stdio<->daemon proxy. Project identity - the only thing the
-/// shim needs - comes from `CLAUDE_PROJECT_DIR` when the client set it, or
-/// the shim's own cwd otherwise (the only option for an MCP client that
-/// isn't Claude Code, and the historical behavior this falls back to). Once
-/// resolved, the shim hashes that path, connects to the project's daemon
-/// endpoint (bootstrapping a detached daemon if nothing is listening) and
-/// then moves JSON-RPC frames between the two sides without interpreting
-/// them. Which kind of endpoint that is - an AF_UNIX socket or a named pipe -
+/// Stdio<->daemon proxy. Project identity - the only thing the shim needs -
+/// comes from `CLAUDE_PROJECT_DIR` when the client set it, or the shim's own
+/// cwd otherwise (the only option for an MCP client that isn't Claude Code,
+/// and the historical behavior this falls back to). Once resolved, the shim
+/// hashes that path, connects to the project's daemon endpoint
+/// (bootstrapping a detached daemon if nothing is listening) and then moves
+/// JSON-RPC frames between the two sides. For a single project it forwards
+/// them byte-for-byte; when the root is a folder of projects, a
+/// `select_project` answer from the front re-points the session at the
+/// chosen project's own daemon (GM-399, see `router`). Which kind of endpoint that is - an AF_UNIX socket or a named pipe -
 /// is `crate::ipc`'s business and appears nowhere in this file.
 ///
 /// The shim is also the only process in the system that routinely holds both
@@ -99,8 +101,34 @@ pub fn run() -> Result<()> {
     process::keep_our_stdio_from_children();
 
     let root = resolve_project_root()?;
-    let stream = connect_or_bootstrap(&root)?;
-    proxy(stream)
+    let stream = connect_or_bootstrap(&root, &launch_origin())?;
+    // The router compares switch targets against it (D11 step 3), and a
+    // front names its projects by canonical path.
+    let canonical = root.canonicalize().unwrap_or(root);
+    let origin = selected_origin(&canonical);
+    router::serve(
+        BufReader::new(io::stdin()),
+        io::stdout().lock(),
+        link(stream)?,
+        canonical,
+        Box::new(move |root: &Path| link(connect_or_bootstrap(root, &origin)?)),
+    )
+}
+
+/// Where the session's first root came from, for the cold-start line in
+/// [`connect_or_bootstrap`].
+fn launch_origin() -> String {
+    match std::env::var_os(PROJECT_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => format!("from {PROJECT_DIR_ENV}"),
+        _ => "the current directory".to_string(),
+    }
+}
+
+/// Where a switch target came from: a project picked with `select_project`
+/// in the front serving `front_root` (D11 step 3). Never "the current
+/// directory", which is the folder, not the project.
+fn selected_origin(front_root: &Path) -> String {
+    format!("selected with select_project in {}", front_root.display())
 }
 
 fn resolve_project_root() -> Result<PathBuf> {
@@ -133,7 +161,10 @@ enum Incumbent {
 /// and the session that ends up on the socket only ever sees one daemon. A
 /// check anywhere later - sniffing the `initialize` response, polling
 /// mid-session - would mean tearing a live request down and replaying it, and
-/// would cost the shim its one real invariant: that it never parses a payload.
+/// would cost a single-project session its one real invariant: that the shim
+/// never parses a daemon's payload. (A multi-project session gives that up on
+/// purpose, and only for the front's `select_project` answers - see
+/// `router`.)
 /// The client's whole cost here is that the first connection took a moment
 /// longer.
 ///
@@ -143,7 +174,10 @@ enum Incumbent {
 /// trade - it happens once, at the moment a build changes, and the
 /// alternative is every session on the machine going on being answered by a
 /// build that has been replaced.
-fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
+///
+/// `origin` says where `root` came from (see [`launch_origin`] and
+/// [`selected_origin`]); it only colors the cold-start line.
+fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
     let endpoint = daemon::endpoint(root)?;
     // Checked before anything is attempted, because every step below assumes
     // the endpoint is one a daemon could listen on. An over-long AF_UNIX path
@@ -208,10 +242,7 @@ fn connect_or_bootstrap(root: &Path) -> Result<ipc::Stream> {
     eprintln!(
         "g-mesh mcp-shim: nothing is serving {} ({}) - starting a daemon for it",
         root.display(),
-        match std::env::var_os(PROJECT_DIR_ENV) {
-            Some(dir) if !dir.is_empty() => format!("from {PROJECT_DIR_ENV}"),
-            _ => "the current directory".to_string(),
-        }
+        origin
     );
     spawn_detached_daemon(root)?;
     let stream = wait_until_listening(&endpoint);
@@ -466,44 +497,19 @@ fn daemon_stderr() -> Stdio {
     }
 }
 
-fn proxy(stream: ipc::Stream) -> Result<()> {
-    let mut outbound = stream.try_clone().context("failed to clone the daemon connection")?;
-
-    // stdin->socket runs on its own thread while socket->stdout drives this
-    // one, so a daemon that goes away ends the proxy even while the client is
-    // idle. That thread is never joined: a blocking read on stdin cannot be
-    // interrupted, and process exit tears it down.
-    thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let result = pump(&mut stdin, &mut outbound);
-        let _ = match &result {
-            // EOF on stdin means the client is done: half-close so the daemon
-            // sees it, can still flush replies in flight, and then closes.
-            // Windows named pipes have no half-close, so there this ends the
-            // whole connection instead - see `ipc::windows::Stream::shutdown`
-            // for what that costs.
-            Ok(()) => outbound.shutdown(Shutdown::Write),
-            Err(_) => outbound.shutdown(Shutdown::Both),
-        };
-        if let Err(err) = result {
-            eprintln!("g-mesh mcp-shim: client stream ended: {err:#}");
-        }
-    });
-
-    let mut inbound = BufReader::new(stream);
-    let mut stdout = io::stdout().lock();
-    pump(&mut inbound, &mut stdout)
-}
-
-/// Moves whole MCP messages across, one at a time. Both legs are newline-
-/// delimited JSON - that is what the MCP stdio transport mandates on the
-/// client side, and the daemon speaks the same framing on the socket, so the
-/// shim can stay a repacking proxy that never parses a payload.
-fn pump<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
-    while let Some(frame) = read_ndjson_frame(reader)? {
-        write_ndjson_frame(writer, &frame)?;
-    }
-    Ok(())
+/// Wraps a daemon connection for the router: a buffered reader, a writer,
+/// and a third handle that can shut the connection down while another thread
+/// is blocked in the writer.
+fn link(stream: ipc::Stream) -> Result<router::Link> {
+    let writer = stream.try_clone().context("failed to clone the daemon connection")?;
+    let closer = stream.try_clone().context("failed to clone the daemon connection")?;
+    Ok(router::Link {
+        reader: Box::new(BufReader::new(stream)),
+        writer: Box::new(writer),
+        closer: Box::new(move |how| {
+            let _ = closer.shutdown(how);
+        }),
+    })
 }
 
 #[cfg(test)]
