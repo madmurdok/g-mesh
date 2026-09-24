@@ -1228,6 +1228,12 @@ fn release_state_files(state_dir: &Path) {
         let _ = fs::remove_file(pid_file);
     }
     let _ = fs::remove_file(super::build_stamp_path_in(state_dir));
+    // D13 in `docs/architecture/lazy-indexing.md`: the phase file exists only
+    // while a daemon is actually publishing it - removed here so an outside
+    // reader (`cli::status`, `common::wait_until_phase`) never mistakes a
+    // stale word left by a daemon that has since exited for a live one's
+    // current phase.
+    let _ = fs::remove_file(super::phase_path_in(state_dir));
     // Derived through the parent module rather than spelled out again here:
     // what a daemon binds and what it releases have to be the same endpoint by
     // construction. On Windows this is a no-op, because a pipe name is

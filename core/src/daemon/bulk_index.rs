@@ -39,6 +39,7 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
@@ -83,17 +84,20 @@ pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
 /// they hope for.
 ///
 /// [`WALK_DELAY_ENV`] turns "the walk is about to finish" into a knob, and for
-/// most tests that is enough. It is not enough when the assertion is about a
-/// call landing inside `mcp::INDEXING_GRACE_WINDOW`, because the knob is a
-/// `sleep` in the *daemon*: a loaded machine can stretch a 400ms hold to 700
-/// and leave more time before completion than the window can absorb, so the
-/// call is refused and the test fails for a reason that has nothing to do with
-/// the grace-wait mechanism. That is what happened on all three non-Windows
-/// CI runners (GM-245).
-///
-/// With this, the test creates the file, lets the walk reach it, dispatches
-/// its call, and then deletes the file - so completion happens *after* the
-/// call is in flight by construction, not by arithmetic on two sleeps.
+/// most tests that is enough. It was not enough for the grace-window
+/// assertions GM-245 fixed and GM-394 later removed entirely (`mcp::mod::
+/// GMeshMcpServer::still_indexing` no longer gives a call a bounded wait
+/// before refusing - it waits, unconditionally, for the walk to actually
+/// finish - see that method's own doc comment), because the knob is a `sleep`
+/// in the *daemon*: a loaded machine can stretch a 400ms hold to 700, which
+/// only mattered when a test's whole point was landing inside a window
+/// narrower than that slop. It is kept for the property that outlives that
+/// history: a test can create the file, let the walk reach it, dispatch its
+/// own call, and only then delete the file - so completion happens *after*
+/// the call is already in flight by construction, not by arithmetic on two
+/// sleeps. See [`HOLD_LOCK_FILE_ENV`] for the sibling knob GM-394 added to
+/// hold the batch-commit *lock* itself open the same way, for assertions
+/// about that lock specifically rather than about the walk's completion.
 pub const WALK_HOLD_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_FILE";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -135,8 +139,24 @@ pub struct BulkIndexSummary {
 pub fn run(
     project_root: &Path,
     conn: &Mutex<Connection>,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
+) -> Result<BulkIndexSummary> {
+    run_with_progress(project_root, conn, embedding, discovered, None)
+}
+
+/// [`run`], also reporting how far it has got through `progress`'s walk
+/// counters - languages done out of total, the language being walked, and
+/// nodes plus edges ingested so far (GM-395 D6). Only the daemon's
+/// activation passes `Some`: a waiting tool call renders those counters into
+/// its progress notifications. The CLI's in-process walks have nobody to
+/// report to and call [`run`].
+pub fn run_with_progress(
+    project_root: &Path,
+    conn: &Mutex<Connection>,
+    embedding: Option<&EmbeddingPipeline>,
+    discovered: &DiscoveredPlugins,
+    progress: Option<&IndexingStatus>,
 ) -> Result<BulkIndexSummary> {
     let mut summary = BulkIndexSummary::default();
 
@@ -201,8 +221,17 @@ pub fn run(
     // shipped with it (`scripts/bundle-rust-plugin.sh` and its
     // not-yet-written Python counterpart), so a real end user with no
     // interest in Python never has a `target/debug/` path to be missing.
+    if let Some(progress) = progress {
+        progress.start_walk_progress(u32::try_from(manifests.len()).unwrap_or(u32::MAX));
+    }
     for manifest in manifests {
-        walk_one_language(project_root, manifest, conn, &mut summary, embedding)?;
+        if let Some(progress) = progress {
+            progress.mark_language_started(&manifest.language);
+        }
+        walk_one_language(project_root, manifest, conn, &mut summary, embedding, progress)?;
+        if let Some(progress) = progress {
+            progress.mark_language_done();
+        }
     }
 
     // Only now, with every language's stream over: an import can only be
@@ -244,7 +273,8 @@ pub(crate) fn walk_one_language(
     manifest: &PluginManifest,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     // Same check `daemon::plugin::PluginState::spawn` makes before spawning
     // the interactive process - see `plugin::missing_plugin_binary_hint`'s
@@ -281,7 +311,7 @@ pub(crate) fn walk_one_language(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -364,7 +394,8 @@ pub(crate) fn ingest<R: BufRead>(
     reader: R,
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
-    embedding: &EmbeddingPipeline,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
@@ -393,6 +424,9 @@ pub(crate) fn ingest<R: BufRead>(
             }
         }
 
+        if let Some(progress) = progress {
+            progress.add_items_ingested(1);
+        }
         batched += 1;
         if batched >= BATCH_ITEMS {
             commit(conn, &mut batch, embedding)?;
@@ -405,21 +439,99 @@ pub(crate) fn ingest<R: BufRead>(
 }
 
 /// Commits one batch and empties it, holding the connection only for as long
-/// as the transaction takes - the walk itself must not keep other readers out.
-fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: &EmbeddingPipeline) -> Result<()> {
+/// as the transaction (and the embedding rows it stores) take - the walk
+/// itself must not keep other readers out.
+///
+/// # GM-394: embedding inference runs before the lock is taken
+///
+/// This used to call `EmbeddingPipeline::apply` - inference and storage in
+/// one step - while still holding `conn`'s guard, which meant a batch's whole
+/// embedding step (`EmbeddingModel::embed`, an ONNX forward pass per
+/// embeddable node, plus a one-time synchronous model load on its very first
+/// call - see `embedding::pipeline`'s "Where the model lives" section) ran
+/// with every other connection locked out of the daemon's one SQLite handle.
+/// `mcp::mod::GMeshMcpServer::get_info` is one of them: it is called during
+/// MCP `initialize`, so a client's handshake blocked for as long as that
+/// inference took - minutes, on a project big enough to matter, which is
+/// exactly the hang GM-394 traced.
+///
+/// `EmbeddingPipeline::compute` touches no database at all, so it runs here
+/// first, with no lock held - the fix's contained half; `get_info` no longer
+/// taking this lock while indexing at all (`daemon::indexing_status`'s own
+/// "GM-394" doc section) is the other, and the one that actually closes the
+/// bug regardless of how long this function's own lock-free window turns out
+/// to be. The lock is then taken once, for `apply_diff` and
+/// `EmbeddingPipeline::store` together - both are ordinary SQLite writes, not
+/// inference, so there is nothing left inside it that scales with batch size
+/// the way inference did.
+///
+/// # GM-395: `embedding: None` for the cold-start walk
+///
+/// Since GM-395's slice 1, the cold-start walk (`run`'s only caller through
+/// `daemon::mod::run`, `cli::init`, `cli::reindex`) passes `None` here: the
+/// walk is structural-only now, and embedding moved out to its own pass
+/// (`embedding::backfill::run`), run once, project-wide, after every
+/// language's walk is linked - see that module's own doc comment. `None`
+/// skips both `compute` and `store` outright, which is strictly cheaper than
+/// calling them against a disabled pipeline (no model lookup, no per-node
+/// loop over an empty `Vec`). `daemon::workspace_reindex`'s per-language
+/// re-walk is the one caller that still passes `Some` - it is a full re-walk
+/// of one language, not the initial cold start, so its own embeddings still
+/// belong inline with it rather than waiting for the next backfill pass.
+fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
+    let computed = embedding.map(|embedding| embedding.compute(batch)).unwrap_or_default();
     let mut conn = conn.lock().unwrap();
     apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
+    hold_the_lock_open_for_tests();
     // Best-effort, like every other embedding call - see
     // `watcher::apply::round_trip`'s identical handling for why a failure
     // here must not undo (or fail) a batch that is already durable.
-    if let Err(err) = embedding.apply(&conn, batch) {
-        eprintln!("g-mesh daemon: failed to embed a bulk-index batch: {err:#}");
+    if let Some(embedding) = embedding {
+        embedding.store(&conn, &computed);
     }
     *batch = Diff::default();
     Ok(())
+}
+
+/// Path whose *deletion* releases a batch commit that is holding `conn`'s
+/// lock open, for tests that need to prove something behaves correctly while
+/// that lock is actually held - not merely while `daemon::indexing_status::
+/// IndexingStatus` reads as indexing, which [`WALK_HOLD_FILE_ENV`] already
+/// controls without ever touching the lock at all (that hold runs after
+/// every batch has committed and released it - see [`run`]'s call to
+/// [`hold_the_walk_open_for_tests`]).
+///
+/// GM-394's own regression needs exactly this distinction. The bug it found
+/// was never "the walk takes a while" - `IndexingStatus` already told every
+/// caller that, honestly, since task 105 - it was "a batch commit holds the
+/// mutex every MCP handler shares for as long as its embedding inference
+/// takes". Reproducing that deterministically, on a machine that has not
+/// necessarily fetched the real ONNX weights `EmbeddingPipeline` would
+/// otherwise need, means holding the *lock* open on purpose, independent of
+/// whatever this build's embedding pipeline does - which is what this knob
+/// is for: a no-op unless set, and when set, held from directly inside the
+/// locked section of [`commit`] until the named file is removed.
+pub const HOLD_LOCK_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_LOCK_FILE";
+
+/// Honors [`HOLD_LOCK_FILE_ENV`]. A no-op unless it is set, which is every
+/// real run - same shape as [`hold_the_walk_open_for_tests`], polled rather
+/// than watched for the identical reason (test-only scaffolding, a
+/// millisecond-scale wait, bounded so a test that forgets to release it fails
+/// as a timeout rather than wedging the daemon forever).
+fn hold_the_lock_open_for_tests() {
+    let Some(path) = std::env::var_os(HOLD_LOCK_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let path = std::path::PathBuf::from(path);
+    eprintln!(
+        "g-mesh daemon: holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
+        path.display()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 #[cfg(test)]
@@ -487,7 +599,7 @@ mod tests {
 
     fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
-        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, &EmbeddingPipeline::disabled())?;
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None)?;
         Ok(summary)
     }
 
@@ -579,10 +691,8 @@ mod tests {
         assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
 
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
 
-        let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("the multi-language walk failed");
+        let summary = run(project.path(), &conn, None, &discovered).expect("the multi-language walk failed");
 
         assert_eq!(summary.nodes, 4, "both languages' nodes must be counted, not just one's");
         assert_eq!(summary.edges, 2, "both languages' edges must be counted, not just one's");
@@ -604,10 +714,8 @@ mod tests {
             .expect("the fixture plugin must discover cleanly");
 
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
 
-        let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("the single-language walk failed");
+        let summary = run(project.path(), &conn, None, &discovered).expect("the single-language walk failed");
 
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
@@ -622,11 +730,10 @@ mod tests {
     fn an_empty_discovery_walks_nothing_and_is_not_an_error() {
         let project = tempfile::tempdir().unwrap();
         let conn = setup_conn();
-        let embedding = EmbeddingPipeline::disabled();
         let discovered = DiscoveredPlugins::default();
 
         let summary =
-            run(project.path(), &conn, &embedding, &discovered).expect("an empty discovery must not fail");
+            run(project.path(), &conn, None, &discovered).expect("an empty discovery must not fail");
 
         assert_eq!(summary, BulkIndexSummary::default());
         assert_eq!(count(&conn, "nodes"), 0);

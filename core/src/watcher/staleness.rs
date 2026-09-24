@@ -60,6 +60,7 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -145,7 +146,7 @@ impl std::fmt::Display for ReindexFailed {
 pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &mut Connection,
+    conn: &Mutex<Connection>,
     project_root: &Path,
     file_path: &str,
     request_id: RequestId,
@@ -155,18 +156,24 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<StalenessOutcome> {
-    match decide(conn, project_root, file_path)? {
+    let decision = {
+        let guard = conn.lock().unwrap();
+        decide(&guard, project_root, file_path)?
+    };
+    match decision {
         Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
         Decision::ContentUnchanged { mtime, hash } => {
             // Content is unchanged (e.g. a touch, or a byte-identical
             // rewrite) - just refresh the mtime baseline so the next check
             // hits the fast path again. No reindex.
-            upsert_indexed_file(conn, file_path, mtime, &hash)?;
+            upsert_indexed_file(&conn.lock().unwrap(), file_path, mtime, &hash)?;
             Ok(StalenessOutcome::MtimeMismatchContentUnchanged)
         }
         Decision::NeedsReindex { mtime, hash, had_prior_record } => {
             // Genuinely stale (or never indexed) - synchronously reindex
-            // before recording the new baseline.
+            // before recording the new baseline. `apply_file_change` locks
+            // `conn` itself, only for as long as each of its steps actually
+            // needs it (GM-396) - it is never held across this call.
             apply_file_change(
                 reader,
                 writer,
@@ -180,7 +187,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                 on_timeout,
             )
             .context(ReindexFailed)?;
-            upsert_indexed_file(conn, file_path, mtime, &hash)?;
+            upsert_indexed_file(&conn.lock().unwrap(), file_path, mtime, &hash)?;
             Ok(if had_prior_record {
                 StalenessOutcome::ReindexedViaHashMismatch
             } else {
@@ -341,8 +348,11 @@ mod tests {
         conn
     }
 
-    fn count(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
+    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+        conn.lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
     }
 
     fn wire_node(id: &str, name: &str) -> WireNode {
@@ -437,7 +447,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         let file_path_on_disk = tmp.path().join("src/lib.rs");
         fs::write(&file_path_on_disk, b"fn foo() {}").unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -457,7 +467,7 @@ mod tests {
         let outcome = ensure_fresh(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             tmp.path(),
             "src/lib.rs",
             request_id,
@@ -488,7 +498,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn old() {}").unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         // --- initial index ---
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -507,7 +517,7 @@ mod tests {
         let outcome = ensure_fresh(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             request_id,
@@ -522,8 +532,11 @@ mod tests {
         assert_eq!(outcome, StalenessOutcome::ReindexedNoPriorRecord);
         invoked_rx.try_recv().unwrap();
 
-        let name: String =
-            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        let name: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "old");
 
         // --- modify the file directly on disk, bypassing the watcher entirely ---
@@ -549,7 +562,7 @@ mod tests {
         let outcome2 = ensure_fresh(
             &mut buf_reader2,
             &mut core_writer2,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             request_id2,
@@ -566,8 +579,11 @@ mod tests {
         assert!(outcome2.reindexed(), "a missed watcher event must trigger a synchronous reindex");
         assert!(invoked_rx2.try_recv().is_ok(), "plugin transport must have been invoked for the stale file");
 
-        let name_after: String =
-            conn.query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        let name_after: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name_after, "new_and_improved", "response must reflect the new on-disk content");
     }
 
@@ -576,7 +592,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn foo() {}").unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         // First call: no prior record, must reindex.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -595,7 +611,7 @@ mod tests {
         ensure_fresh(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             request_id,
@@ -633,7 +649,7 @@ mod tests {
         let outcome = ensure_fresh(
             &mut buf_reader2,
             &mut core_writer2,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             RequestId::Number(2),
@@ -665,7 +681,7 @@ mod tests {
         let file_on_disk = tmp.path().join("lib.rs");
         let content = b"fn stable() {}";
         fs::write(&file_on_disk, content).unwrap();
-        let mut conn = setup_conn();
+        let conn = Mutex::new(setup_conn());
 
         // Initial index.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -684,7 +700,7 @@ mod tests {
         ensure_fresh(
             &mut buf_reader,
             &mut core_writer,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             request_id,
@@ -699,6 +715,8 @@ mod tests {
         invoked_rx.try_recv().unwrap();
 
         let (mtime_before,): (i64,) = conn
+            .lock()
+            .unwrap()
             .query_row("SELECT mtimeMillis FROM indexed_files WHERE filePath = 'lib.rs'", [], |row| {
                 Ok((row.get(0)?,))
             })
@@ -726,7 +744,7 @@ mod tests {
         let outcome = ensure_fresh(
             &mut buf_reader2,
             &mut core_writer2,
-            &mut conn,
+            &conn,
             tmp.path(),
             "lib.rs",
             RequestId::Number(2),
@@ -749,6 +767,8 @@ mod tests {
         assert!(!outcome.reindexed());
 
         let (mtime_after,): (i64,) = conn
+            .lock()
+            .unwrap()
             .query_row("SELECT mtimeMillis FROM indexed_files WHERE filePath = 'lib.rs'", [], |row| {
                 Ok((row.get(0)?,))
             })

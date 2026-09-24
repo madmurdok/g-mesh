@@ -104,6 +104,8 @@ impl Project {
     fn bootstrap_daemon(&self) -> (u32, u32) {
         let core = self.bootstrap_core();
 
+        // GM-395 slice 2: the daemon walks - and so spawns its plugin - only once a tool call asks.
+        common::trigger_activation(self.root());
         wait_for("the daemon to spawn its plugin", || self.plugin_pid_file().exists());
         let plugin = read_pid(&self.plugin_pid_file());
         assert_ne!(core, plugin, "the plugin runs in a process of its own");

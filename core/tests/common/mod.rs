@@ -16,6 +16,13 @@
 //! every existing assertion about *what* gets served, without any of them
 //! having to become an assertion about *when*.
 //!
+//! GM-395 slice 2 made the daemon lazy: it walks nothing until a tool call
+//! asks. So polling alone would now wait forever on a daemon nobody has
+//! asked, and [`wait_until_indexed`] *triggers* activation first
+//! ([`trigger_activation`]) - one throwaway tool call over a raw connection -
+//! which keeps every test here on the same lazy path a user runs, rather
+//! than behind an eager-mode switch no user has.
+//!
 //! Living in `tests/common/` rather than being copied into each file for the
 //! usual Cargo reason: a subdirectory module is compiled into the test
 //! binaries that ask for it, not built as a test binary of its own.
@@ -25,11 +32,15 @@
 // here is unused by someone, and none of them is dead.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ipc;
+use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
+use g_mesh::protocol::types::CURRENT_PROTOCOL_VERSION;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -108,8 +119,75 @@ pub fn wait_for(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) 
     panic!("timed out waiting for {what} within {timeout:?}");
 }
 
+/// Asks the daemon serving `root` to build its index, the way the first
+/// tool call of a real session does (GM-395 slice 2, D14 in
+/// `docs/architecture/lazy-indexing.md`), and returns without waiting for
+/// the build: activation runs independently of the call that asked for it.
+///
+/// Retries the connection until [`startup_timeout`], so it is safe to call
+/// right after spawning a daemon or a shim that has not bound its endpoint
+/// yet.
+pub fn trigger_activation(root: &Path) {
+    let timeout = startup_timeout();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_trigger_activation(root) {
+            Ok(()) => return,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "could not trigger activation for {} within {timeout:?}: {err}",
+                    root.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// One attempt at [`trigger_activation`]: a small synchronous raw-NDJSON MCP
+/// client. It completes the handshake (so the session exists before the
+/// call is sent), sends one cheap `get_file_outline` - any index-needing
+/// tool call triggers - and disconnects without reading the answer. The
+/// daemon has already read the call off the connection by the time it sees
+/// the disconnect, and rmcp does not abort a request handler whose session
+/// ended, so the handler still reaches `prepare`'s `request_activation`.
+fn try_trigger_activation(root: &Path) -> Result<(), String> {
+    let endpoint = daemon::endpoint(root).map_err(|err| format!("no endpoint: {err:#}"))?;
+    let stream = ipc::Stream::connect(&endpoint).map_err(|err| format!("connecting to {endpoint}: {err}"))?;
+    let mut writer = stream.try_clone().map_err(|err| format!("cloning the connection: {err}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut send = |message: serde_json::Value| {
+        let body = serde_json::to_vec(&message).expect("a literal message always serializes");
+        write_ndjson_frame(&mut writer, &body).map_err(|err| format!("sending {message}: {err:#}"))
+    };
+
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "g-mesh-test-trigger", "version": "0" },
+        },
+    }))?;
+    read_ndjson_frame(&mut reader)
+        .map_err(|err| format!("reading the initialize response: {err:#}"))?
+        .ok_or("the daemon closed the connection instead of answering initialize")?;
+    send(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "get_file_outline", "arguments": { "file_path": "\u{0000}" } },
+    }))?;
+    Ok(())
+}
+
 /// Blocks until the daemon serving `root` has recorded a completed
-/// cold-start walk.
+/// cold-start walk, triggering activation first ([`trigger_activation`]) -
+/// the daemon walks nothing until something asks.
 ///
 /// Returning means tool calls are already being answered for real, not merely
 /// that they are about to be: `daemon::run` flips its in-memory flag *before*
@@ -150,6 +228,12 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
     // showed the walk completing while this loop timed out, and the reason it
     // could not be read was thrown away here.
     let mut last_error: Option<String>;
+    // Tried once per iteration until it succeeds, rather than up front with
+    // `trigger_activation`'s own retry loop: a caller may hand this a root
+    // whose index is already complete and whose daemon is not running at
+    // all (`g-mesh init` with no session), which must return, not wait out a
+    // connection that is never coming.
+    let mut triggered: Result<(), String> = Err("not attempted yet".to_string());
     loop {
         last_error = None;
         let indexed = match Connection::open(&db) {
@@ -168,6 +252,9 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
         if indexed {
             return;
         }
+        if triggered.is_err() {
+            triggered = try_trigger_activation(root);
+        }
         // Both ways this can fire are named, because for three releases only
         // the first one was and it was the wrong one every time. A walk that
         // is merely slow finishes eventually and wants a bigger budget; a walk
@@ -180,8 +267,12 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
              G_MESH_TEST_INDEXED_TIMEOUT_SECS if this machine is simply slow - but if a bigger \
              budget changes nothing, no daemon is walking this root at all: check that the shim \
              was not handed an inherited CLAUDE_PROJECT_DIR, and set G_MESH_DAEMON_LOG to see \
-             what the daemon that did start was doing.{}",
+             what the daemon that did start was doing.{}{}",
             root.display(),
+            match &triggered {
+                Ok(()) => String::new(),
+                Err(err) => format!("\n\nActivation was never triggered - the last attempt failed: {err}"),
+            },
             match &last_error {
                 Some(err) => format!(
                     "\n\nThe last attempt failed rather than reporting \
@@ -193,6 +284,25 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Blocks until this project's `index.phase` file (D13 in
+/// `docs/architecture/lazy-indexing.md`) reads `phase` exactly, triggering
+/// activation first ([`trigger_activation`]) - for tests that need the
+/// embedding backfill pass to have run, where [`wait_until_indexed`] alone
+/// (structural only, GM-395 slice 1/2) does not wait long enough: that one
+/// resolves the moment the walk is linked, well before `Phase::Ready`.
+///
+/// Every way of failing to read the phase file - not there yet, a daemon that
+/// has not attached one yet, a transient read error mid-rename - is treated
+/// as "not yet" and retried, the same reading [`wait_until_indexed_within`]
+/// gives `Connection::open` failing on `index.db`.
+pub fn wait_until_phase(root: &Path, phase: &str) {
+    trigger_activation(root);
+    let path = daemon::phase_path_in(&project_dir(root).expect("failed to resolve the state directory"));
+    wait_for(&format!("{}'s index.phase to read {phase:?}", root.display()), indexed_timeout(), || {
+        std::fs::read_to_string(&path).map(|contents| contents.trim() == phase).unwrap_or(false)
+    });
 }
 
 /// Sends `kill -9` to `pid` and does not return until the kernel has actually
@@ -264,4 +374,48 @@ fn force_kill(pid: u32) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+/// A plugin discovery root (for `G_MESH_PLUGIN_ROOTS_OVERRIDE`) with one
+/// plugin - "python", matching the real bundled plugin's directory name -
+/// whose `command` names a `target/debug/` binary that is never created, and
+/// that binary's path. A `Cargo.toml` sits beside it so
+/// `plugin::missing_plugin_binary_hint`'s "Run `cargo build --workspace` in
+/// <root>" branch has a real workspace root to name, exactly like the real
+/// repository root does for the genuine bundled plugin (GM-316).
+///
+/// Shared by `daemon_missing_plugin_binary.rs` and `lazy_activation.rs`; the
+/// latter creates the binary afterwards to show that a failed walk is
+/// retried.
+pub fn missing_workspace_binary_plugin_root() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().expect("failed to create a plugin discovery root");
+    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
+        .expect("failed to write a fixture Cargo.toml");
+
+    let dir = root.path().join("python");
+    std::fs::create_dir_all(&dir).expect("failed to create a fixture plugin directory");
+
+    let binary = root.path().join("target").join("debug").join("g-mesh-plugin-python");
+    // Deliberately not created - this is the "never built" case.
+
+    let manifest = format!(
+        r#"
+[plugin]
+language = "python"
+protocol_version = {version}
+plugin_version = "0.1.0"
+
+[plugin.spawn]
+command = "{command}"
+
+[plugin.languages]
+extensions = [".py"]
+"#,
+        version = CURRENT_PROTOCOL_VERSION,
+        // TOML string: escape backslashes for a Windows path.
+        command = binary.display().to_string().replace('\\', "\\\\"),
+    );
+    std::fs::write(dir.join("plugin.toml"), manifest).expect("failed to write a fixture plugin.toml");
+
+    (root, binary)
 }

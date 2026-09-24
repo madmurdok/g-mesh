@@ -350,7 +350,8 @@ pub(crate) fn run(
             &manifest,
             conn,
             &mut summary,
-            registry.embedding(),
+            Some(registry.embedding().as_ref()),
+            None,
         )
         .with_context(|| format!("failed to re-walk {} after {changed_file} changed", manifest.language))?;
 

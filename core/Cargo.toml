@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "3.11.0"
+version = "3.11.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -115,7 +115,7 @@ sqlite-vec = "0.1.9"
 # embedding model. `progressbar`/`esaxx_fast` are training-side extras we never
 # use; `onig` is kept because the model's ByteLevel pre-tokenizer is regex-based.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 toml = "0.8"
 # The HTTP client behind `g-mesh model fetch` (src/cli/model.rs) - the one and
 # only place in this crate that opens a network connection, enforced by a test

@@ -35,8 +35,10 @@
 //!    one) instead of dropping out. GM-385 measured why it must not drop
 //!    out; that constant's own doc has the arms.
 //! 2. **Nothing is known yet, or exactly one language has the gap**
-//!    ([`P4_GENERIC`]) - the original, un-generated sentence, unchanged byte
-//!    for byte. A single present language is never ambiguous about which
+//!    ([`P4_GENERIC`]) - the un-generated sentence: no language list is
+//!    spliced in. Byte-for-byte what `get_info` said before this module
+//!    existed until GM-394 rewrote its second clause (see that constant's own
+//!    doc). A single present language is never ambiguous about which
 //!    language "no edge by design" refers to, so naming it would only spend
 //!    bytes repeating what the sentence already means - see [`build`]'s own
 //!    comment on this case.
@@ -95,6 +97,7 @@
 //! built here; see [`build`]'s doc comment for why not now.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 
@@ -105,6 +108,79 @@ use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 /// decision and this module's own worst-case test both have to agree on
 /// exactly the same figure.
 pub const INSTRUCTIONS_BYTE_CEILING: usize = 1900;
+
+/// Prefixed to a session's instructions while the project owes its cold
+/// start - `Phase::Unindexed` or `Phase::Walking`
+/// (`mcp::mod::GMeshMcpServer::instructions`, GM-394 and GM-395's D12 in
+/// `docs/architecture/lazy-indexing.md`) - the one fact that is true only for
+/// *this* moment, for *this* session: the wait itself, and what a caller
+/// should do about it, is already stated in every [`build`] rendering's own
+/// final paragraph (see [`P4_GENERIC`] and its siblings) - text that is
+/// handed to *every* session, whether or not a walk happens to be running
+/// right now. This line exists only to say that the walk this session's own
+/// paragraph describes in the abstract is actually happening (or about to,
+/// once the first tool call asks), right now, so a caller does not have to
+/// notice a slow first call before connecting the two.
+///
+/// Before GM-395 slice 2b this was a fixed constant (`INDEXING_NOTE`) with no
+/// project identity in it at all - true when a session could only ever be
+/// talking to the one project a daemon indexed at startup. Lazy activation
+/// means a caller can now see this state for a project that has not been
+/// touched yet, not just one already mid-walk, and [`cold_start`] names the
+/// project's own root (A2 in the architecture doc) so a caller juggling more
+/// than one g-mesh session can tell which is which. [`cold_start_line_fallback`]
+/// is what a very long root falls back to, so this line can never itself be
+/// the reason the whole rendering exceeds [`INSTRUCTIONS_BYTE_CEILING`].
+fn cold_start_line(root: &Path, walking: bool) -> String {
+    if walking {
+        format!(
+            "Index root: {}. Being built now - the first tool call waits for it to finish before answering.",
+            root.display()
+        )
+    } else {
+        format!(
+            "Index root: {}. Not indexed yet - the first tool call builds it (structural first; semantic \
+             search after) and waits for it.",
+            root.display()
+        )
+    }
+}
+
+/// [`cold_start_line`] without the root - what [`cold_start`] falls back to
+/// when the root makes the rendered line too long for
+/// [`INSTRUCTIONS_BYTE_CEILING`] to afford (D12's own fallback rule, the same
+/// shape [`p4_fallback`] uses for a language list that does not fit).
+fn cold_start_line_fallback(walking: bool) -> &'static str {
+    if walking {
+        "Being built now - the first tool call waits for it to finish before answering."
+    } else {
+        "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
+         waits for it."
+    }
+}
+
+/// `get_info`'s `with_instructions` string for a session that connects while
+/// the project still owes its cold start (`Phase::Unindexed` or
+/// `Phase::Walking`) - [`cold_start_line`] (or its no-path fallback) stacked
+/// on top of the ordinary [`build`] rendering for `present`, exactly the way
+/// `INDEXING_NOTE` used to sit on top of it before GM-395 slice 2b.
+///
+/// `present` is capabilities-only (every discovered language,
+/// `semantic_pass_done: false`) in both cases - `mcp::mod::
+/// GMeshMcpServer::instructions` never takes the connection lock to build a
+/// real one while either phase holds, for the same GM-394 reason it never did
+/// for `Walking` alone before this slice: the walk (or the batch commit that
+/// follows it) may be holding that lock for as long as its embedding
+/// inference takes, and a caller mid-handshake cannot be made to wait on it.
+pub fn cold_start(root: &Path, walking: bool, present: &[PresentLanguage]) -> String {
+    let built = build(present);
+    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking));
+    if with_path.len() <= INSTRUCTIONS_BYTE_CEILING {
+        with_path
+    } else {
+        format!("{}\n\n{built}", cold_start_line_fallback(walking))
+    }
+}
 
 /// One language present in the index (`storage::schema::
 /// present_languages_with_semantic_state`), paired with the two facts
@@ -192,23 +268,35 @@ fn format_language_list(names: &[String]) -> String {
 const P1: &str = "Structural code-graph queries over this project's index. Prefer these over \
      grepping when you need definitions, references, call edges or imports.";
 
-/// The only P2 there is, and "two" is not a number [`build`] varies: every
-/// `P4_*` rendering below states exactly two gaps, because the receiver-call
-/// gap narrows but never closes (see [`P4_STATIC_RECEIVER`]).
+/// The only P2 there is, and "two" is not a number [`build`] ever varied -
+/// until GM-394. Before it, this constant was named `P2_TWO_GAPS`, because
+/// every `P4_*` rendering stated exactly two gaps (the receiver-call one and
+/// a second: "on a project's first index...every tool errors with a 'still
+/// building' message"), and its own "one of the two specific gaps below"
+/// matched that count word for word.
 ///
-/// Until GM-385 there was a second spelling, `P2_ONE_GAP`, paired with a
-/// `P4_NO_GAP` that dropped the receiver-call gap entirely once every
-/// present language's semantic tier had resolved it. Both are gone: the
-/// state they described - a project where a method's caller page is
-/// exhaustive - is not a state any of these plugins can reach, so a
-/// rendering that announced it was announcing something untrue. Keeping the
-/// constant as a parameter [`assemble`] threads through would leave a knob
-/// whose only honest setting is this one.
-const P2_TWO_GAPS: &str = "A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
+/// GM-394 removed the second gap by removing what made it a *gap*: a tool
+/// call issued while the index is being built no longer errors at all - it
+/// waits, unconditionally, for the walk to finish and answers in full (see
+/// `mcp::mod::GMeshMcpServer::still_indexing`'s own doc comment) - so there is
+/// nothing left to grep around there. What every `P4_*` rendering says about
+/// it moved out of the "reasons to grep" enumeration entirely, into its own
+/// sentence describing the wait; this constant's own count, and its name,
+/// followed it down to one.
+///
+/// Not renamed to `P2_ONE_GAP`: that name already had a meaning here, for a
+/// *different* one-gap state GM-385 considered and rejected - every present
+/// language's receiver-call resolution fully closed rather than merely
+/// narrowing, which no bundled plugin can actually reach (see
+/// [`P4_STATIC_RECEIVER`]'s own doc). Reusing that name for this constant,
+/// which describes an unrelated state, would read as if that closed-gap case
+/// had come back. Plain `P2` says only what is still true unconditionally:
+/// this is the one and only P2.
+const P2: &str = "A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
      (excludes other same-named declarations' call sites, same guarantee either \
      way), is already resolved per call site to that exact declaration - do not \
-     re-check it with grep as a routine habit. Only fall back to grep for one of \
-     the two specific gaps below, never as a general double-check.";
+     re-check it with grep as a routine habit. Only fall back to grep for the one \
+     specific gap below, never as a general double-check.";
 
 const P3: &str = "`resolved: false` marks the one thing the indexer could not settle alone: an \
      edge whose target is in *another* file, where whether that file exports the \
@@ -219,22 +307,37 @@ const P3: &str = "`resolved: false` marks the one thing the indexer could not se
      the page otherwise looks complete (`hasMore: false`, plausible results), so \
      check this field, not just individual rows. Never set on an empty page.";
 
-/// The original, un-generated receiver-call paragraph - byte-for-byte what
-/// `get_info` always said, before this module existed. [`build`] reaches for
-/// this whenever naming a language would add nothing a reader does not
-/// already get for free: nothing is known about the project yet, or exactly
-/// one language is present (see [`build`]'s own doc comment for why that
-/// case is never ambiguous), or every present language happens to still have
-/// the gap in a project where that is not this module's chosen case to name
-/// (see [`build`] for the exact branching).
-const P4_GENERIC: &str = "Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
-     call through a variable receiver (`x.foo()`) produces no edge by design, so \
-     caller/reference lists for methods can under-report; bare function calls and \
-     this/super/qualified-type calls have no such gap, and a `hasMore: false` \
-     page for those is exhaustive. (2) On a project's first index, or a re-index \
-     after an upgrade, every tool errors with a \"still building\" message - that \
-     is temporary, retry after a few seconds rather than concluding the symbol \
-     does not exist.";
+/// The receiver-call paragraph for the common cases (nothing known yet, or
+/// exactly one present language) - un-generated, in the sense that no
+/// language list is spliced into it. [`build`] reaches for this whenever
+/// naming a language would add nothing a reader does not already get for
+/// free: nothing is known about the project yet, or exactly one language is
+/// present (see [`build`]'s own doc comment for why that case is never
+/// ambiguous), or every present language happens to still have the gap in a
+/// project where that is not this module's chosen case to name (see
+/// [`build`] for the exact branching).
+///
+/// # GM-394: the second clause is a wait, not a gap
+///
+/// Until GM-394 this was byte-for-byte what `get_info` always said, and it
+/// numbered two "legitimate reasons to grep afterward": the receiver-call
+/// clause below, and "on a project's first index...every tool errors with a
+/// 'still building' message - retry". That second clause stopped being true
+/// the moment `mcp::mod::GMeshMcpServer::still_indexing` stopped erroring at
+/// all: a tool call issued while the index is being built now waits,
+/// unconditionally, for the walk to finish and answers in full - so grepping
+/// around it was never the right move, and telling an agent to "retry" a
+/// call that was never going to fail is actively misleading about what a slow
+/// first call means. The sentence moved out of the "reasons to grep"
+/// enumeration entirely, into a plain statement of the wait, and this
+/// constant's own count followed it down to one - see [`P2`]'s doc comment
+/// for the equivalent change one paragraph up.
+const P4_GENERIC: &str = "The one legitimate reason to grep afterward: a method call through a \
+     variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
+     lists for methods can under-report; bare function calls and this/super/qualified-type \
+     calls have no such gap, and a `hasMore: false` page for those is exhaustive. On a \
+     project's first index, or a re-index after an upgrade, a tool call waits for the walk \
+     to finish before answering - slow, not wrong; do not abandon it for grep.";
 
 /// Every present language *resolves* receiver calls - so clause (1) states
 /// what "resolved" actually bought, instead of dropping out.
@@ -336,23 +439,27 @@ const P4_GENERIC: &str = "Two real gaps - the only legitimate reasons to grep af
 /// This branch is the only one that withdrew the warning, and the only one
 /// fixed.
 ///
-/// That scope is also what the byte budget can afford, measured rather than
-/// assumed: [`p4_named`]'s eight-language worst case renders at 1,856 bytes
-/// against [`INSTRUCTIONS_BYTE_CEILING`]'s 1,900, and the shortest wording
-/// that adds this fact to it costs 43 more - one byte under a ceiling a
-/// ninth language breaks, after which [`p4_fallback`] replaces the named
-/// list with a vaguer sentence. Trading a specific language list for a
-/// vaguer one in order to gain specificity is a net loss, so it is not
-/// made.
+/// That scope is also what the byte budget affords, measured rather than
+/// assumed. Before GM-394 shortened the second clause across every `P4_*`
+/// constant, [`p4_named`]'s eight-language worst case rendered at 1,856 bytes
+/// against [`INSTRUCTIONS_BYTE_CEILING`]'s 1,900 - only 44 bytes of headroom,
+/// not enough to also add this constant's narrowing detail once per named
+/// language. GM-394's rewrite (the "still building" clause replaced by a
+/// short, no-longer-per-language wait note) measured the same eight-language
+/// case at 1,780 bytes, which would fit the narrowing detail too - but the
+/// scope decision below was never purely a budget one. Naming several
+/// languages while also describing what each one's resolution binds to would
+/// restate this whole doc comment's paragraph once per language in
+/// [`p4_named`]'s output, which is a complexity cost independent of whatever
+/// the ceiling currently allows, so it stays out.
 const P4_STATIC_RECEIVER: &str =
-    "Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
-     call through a variable receiver (`x.foo()`) binds to the receiver's declared \
-     or inferred type, not the one it holds at run time, so an override's caller \
-     page under-reports - calls reaching it through a base or interface sit on that \
-     base's page, and find_implementations is the way across. (2) On a project's \
-     first index, or a re-index after an upgrade, every tool errors with a \
-     \"still building\" message - that is temporary, retry after a few seconds \
-     rather than concluding the symbol does not exist.";
+    "The one legitimate reason to grep afterward: a method call through a variable \
+     receiver (`x.foo()`) binds to the receiver's declared or inferred type, not \
+     the one it holds at run time, so an override's caller page under-reports - \
+     calls reaching it through a base or interface sit on that base's page, and \
+     find_implementations is the way across. On a project's first index, or a \
+     re-index after an upgrade, a tool call waits for the walk to finish before \
+     answering - slow, not wrong; do not abandon it for grep.";
 
 /// [`P4_GENERIC`] with `"by design"` replaced by `"in {list}"` - the only
 /// difference, so that everything this clause says about bare/this/super/
@@ -368,14 +475,12 @@ const P4_STATIC_RECEIVER: &str =
 /// there are none to spend once several languages are already named.
 fn p4_named(list: &str) -> String {
     format!(
-        "Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
-         call through a variable receiver (`x.foo()`) produces no edge in {list}, so \
-         caller/reference lists for methods can under-report; bare function calls and \
-         this/super/qualified-type calls have no such gap, and a `hasMore: false` \
-         page for those is exhaustive. (2) On a project's first index, or a re-index \
-         after an upgrade, every tool errors with a \"still building\" message - that \
-         is temporary, retry after a few seconds rather than concluding the symbol \
-         does not exist."
+        "The one legitimate reason to grep afterward: a method call through a \
+         variable receiver (`x.foo()`) produces no edge in {list}, so caller/reference \
+         lists for methods can under-report; bare function calls and this/super/qualified-type \
+         calls have no such gap, and a `hasMore: false` page for those is exhaustive. On a \
+         project's first index, or a re-index after an upgrade, a tool call waits for the walk \
+         to finish before answering - slow, not wrong; do not abandon it for grep."
     )
 }
 
@@ -403,18 +508,20 @@ fn p4_named(list: &str) -> String {
 ///
 /// Deliberately shorter than [`p4_named`] ever gets for today's eight
 /// languages, not merely under the ceiling by a few bytes - measured by this
-/// module's own tests: 481 bytes against the eight-language sentence's 594.
-/// The eight-language case does not actually need this fallback yet (see
-/// [`build`]'s worst-case test, which stays under the ceiling without it), so
-/// the margin here is headroom for whichever *later* language makes it not
-/// fit, not headroom this fallback is spending on today's set.
+/// module's own tests: 413 bytes against the eight-language sentence's 526
+/// (both re-measured after GM-394 shortened the second clause; they were 481
+/// and 594 before it). The eight-language case does not actually need this
+/// fallback yet (see [`build`]'s worst-case test, which stays under the
+/// ceiling without it), so the margin here is headroom for whichever *later*
+/// language makes it not fit, not headroom this fallback is spending on
+/// today's set.
 fn p4_fallback() -> String {
-    "Two real gaps - the only legitimate reasons to grep afterward: (1) a method call \
-     through a variable receiver (`x.foo()`) produces no edge in some of this project's \
-     languages until their semantic layer finishes - check which before trusting a \
-     method's page as exhaustive. (2) On a project's first index, or a re-index after an \
-     upgrade, every tool errors with a \"still building\" message - that is temporary, \
-     retry after a few seconds rather than concluding the symbol does not exist."
+    "The one legitimate reason to grep afterward: a method call through a variable \
+     receiver (`x.foo()`) produces no edge in some of this project's languages until \
+     their semantic layer finishes - check which before trusting a method's page as \
+     exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
+     call waits for the walk to finish before answering - slow, not wrong; do not \
+     abandon it for grep."
         .to_string()
 }
 
@@ -427,7 +534,7 @@ const P5: &str = "Efficient usage: pass `symbol_name` directly to the four tools
 /// caller only ever varies `p2`/`p4`, never how they meet the fixed
 /// paragraphs around them.
 fn assemble(p4: &str) -> String {
-    [P1, P2_TWO_GAPS, P3, p4, P5].join("\n\n")
+    [P1, P2, P3, p4, P5].join("\n\n")
 }
 
 /// Builds `get_info`'s `with_instructions` string for this session, from
@@ -444,22 +551,25 @@ fn assemble(p4: &str) -> String {
 ///    discovered manifest with `semantic_pass_done: false` instead of
 ///    calling with an empty slice). Either way there is nothing to name yet,
 ///    and GM-262's own scope note picks the conservative, already-familiar
-///    default: render exactly what `get_info` always said, so a project
-///    mid-cold-start reads no differently than it read before this module
-///    existed.
+///    default: render [`P4_GENERIC`], the same sentence case 3 below renders,
+///    so a project mid-cold-start reads no differently than a project with
+///    exactly one present language does.
 /// 2. **No present language has an *open* gap** - [`P4_STATIC_RECEIVER`]:
 ///    every language here resolves receiver calls, so clause (1) says what
 ///    that resolution binds to rather than disappearing. Until GM-385 this
 ///    case dropped the clause and announced "One real gap", which measured
 ///    false in all three of the languages that can reach it.
 /// 3. **Exactly one language is present** (and it has the gap, since case 2
-///    already handled "it doesn't") - the original wording, unchanged. A
-///    single present language is never ambiguous about which language "no
-///    edge by design" describes, so naming it would spend bytes to restate
-///    what the unqualified sentence already means; this is also what keeps
-///    a TypeScript-only project's instructions byte-for-byte identical to
-///    what `get_info` returned before this task (this module's own
-///    `ts_only_is_byte_identical_to_the_original_string` test).
+///    already handled "it doesn't") - [`P4_GENERIC`] again, unchanged from
+///    case 1. A single present language is never ambiguous about which
+///    language "no edge by design" describes, so naming it would spend bytes
+///    to restate what the unqualified sentence already means; this is also
+///    what keeps a TypeScript-only project's instructions identical to what
+///    an empty index renders (this module's own
+///    `ts_only_is_byte_identical_to_the_original_string` test - "original"
+///    there meaning this module's own current baseline, re-pinned at GM-394,
+///    not literally the text `get_info` returned before GM-262 - see that
+///    test's own doc comment).
 /// 4. **Two or more languages are present, and at least one has an open
 ///    gap** - [`p4_named`], which names every gapped language (whether
 ///    that is some of the present languages or, per GM-262's own worst-case
@@ -530,20 +640,33 @@ pub fn present_languages(
 mod tests {
     use super::*;
 
-    /// The exact string `get_info` returned before GM-262, byte for byte -
-    /// copied from the git history of `mcp::mod::GMeshMcpServer::get_info`
-    /// rather than re-derived, so a transcription slip in this module's own
-    /// paragraph constants cannot accidentally agree with itself. This is
-    /// the fixture [`ts_only_is_byte_identical_to_the_original_string`]
-    /// checks [`build`] against.
+    /// This module's own baseline rendering, byte for byte - transcribed by
+    /// hand rather than derived from `assemble(P4_GENERIC)`, so a
+    /// transcription slip in this module's own paragraph constants cannot
+    /// accidentally agree with itself. This is the fixture
+    /// [`ts_only_is_byte_identical_to_the_original_string`] checks [`build`]
+    /// against.
+    ///
+    /// "Original" names what this constant has meant since GM-262: the text
+    /// `get_info` returns for the common, unqualified case (nothing known
+    /// yet, or exactly one present language), the one every later addition to
+    /// this module had to keep rendering unless it had a specific reason not
+    /// to. It stopped being *literally* the text `get_info` returned before
+    /// GM-262 at GM-394, which rewrote the second paragraph's closing clause
+    /// (see [`P4_GENERIC`]'s own doc comment for why: a tool call issued
+    /// while the index is being built now waits instead of erroring, so
+    /// telling an agent to grep around a "still building" error was no longer
+    /// honest). This constant was re-pinned to match, by the same hand
+    /// transcription rule, so it still catches a drift in the five paragraph
+    /// constants - just against the current baseline, not the GM-262 one.
     const ORIGINAL_INSTRUCTIONS: &str =
         "Structural code-graph queries over this project's index. Prefer these over \
 grepping when you need definitions, references, call edges or imports.\n\n\
 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
 (excludes other same-named declarations' call sites, same guarantee either \
 way), is already resolved per call site to that exact declaration - do not \
-re-check it with grep as a routine habit. Only fall back to grep for one of \
-the two specific gaps below, never as a general double-check.\n\n\
+re-check it with grep as a routine habit. Only fall back to grep for the one \
+specific gap below, never as a general double-check.\n\n\
 `resolved: false` marks the one thing the indexer could not settle alone: an \
 edge whose target is in *another* file, where whether that file exports the \
 name isn't knowable from the usage alone. Every same-file edge is \
@@ -552,14 +675,12 @@ find_callees/find_implementations also carry a response-level \
 `allUnresolved: true` when *every* row in a non-empty page is unconfirmed - \
 the page otherwise looks complete (`hasMore: false`, plausible results), so \
 check this field, not just individual rows. Never set on an empty page.\n\n\
-Two real gaps - the only legitimate reasons to grep afterward: (1) a method \
-call through a variable receiver (`x.foo()`) produces no edge by design, so \
-caller/reference lists for methods can under-report; bare function calls and \
-this/super/qualified-type calls have no such gap, and a `hasMore: false` \
-page for those is exhaustive. (2) On a project's first index, or a re-index \
-after an upgrade, every tool errors with a \"still building\" message - that \
-is temporary, retry after a few seconds rather than concluding the symbol \
-does not exist.\n\n\
+The one legitimate reason to grep afterward: a method call through a \
+variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
+lists for methods can under-report; bare function calls and this/super/qualified-type \
+calls have no such gap, and a `hasMore: false` page for those is exhaustive. On a \
+project's first index, or a re-index after an upgrade, a tool call waits for the walk \
+to finish before answering - slow, not wrong; do not abandon it for grep.\n\n\
 Efficient usage: pass `symbol_name` directly to the four tools above instead \
 of calling find_definition first, and raise `limit` for symbols with many \
 results instead of paging.";
@@ -665,15 +786,17 @@ results instead of paging.";
 
     /// GM-262's own discrimination requirement, and this module's real
     /// permanent regression guard for it - `ORIGINAL_INSTRUCTIONS` above is
-    /// transcribed independently of `P1`/`P2_TWO_GAPS`/`P3`/`P4_GENERIC`/`P5`,
-    /// so this assertion fails the moment any of those five drifts from what
-    /// `get_info` said before GM-262, not just on a change to the receiver-
-    /// call clause specifically. Proven by mutation, not merely asserted:
-    /// changing one byte of `P4_GENERIC` (`"by design"` to `"by desigm"`)
-    /// while leaving `ORIGINAL_INSTRUCTIONS` untouched turns this failing,
-    /// confirmed by hand while implementing this task and reverted afterward.
-    /// This assertion is what stands in for repeating that procedure on
-    /// every future run, so the constant's own doc comment does not.
+    /// transcribed independently of `P1`/`P2`/`P3`/`P4_GENERIC`/`P5`,
+    /// so this assertion fails the moment any of those five drifts from this
+    /// module's own current baseline (see `ORIGINAL_INSTRUCTIONS`'s own doc
+    /// comment for what "original" means since GM-394), not just on a change
+    /// to the receiver-call clause specifically. Proven by mutation, not
+    /// merely asserted: changing one byte of `P4_GENERIC` (`"by design"` to
+    /// `"by desigm"`) while leaving `ORIGINAL_INSTRUCTIONS` untouched turns
+    /// this failing, confirmed by hand while implementing GM-262 and reverted
+    /// afterward. This assertion is what stands in for repeating that
+    /// procedure on every future run, so the constant's own doc comment does
+    /// not.
     #[test]
     fn ts_only_is_byte_identical_to_the_original_string() {
         let rendered = build(&ts_only());
@@ -681,7 +804,10 @@ results instead of paging.";
             rendered, ORIGINAL_INSTRUCTIONS,
             "a TypeScript-only project must read exactly what it did before GM-262"
         );
-        assert_eq!(rendered.len(), 1804, "GM-262's own measured baseline");
+        // GM-262's own measured baseline was 1804 bytes; GM-394 shortened the
+        // second paragraph's closing clause (see `P4_GENERIC`'s own doc
+        // comment), so this is the re-measured baseline, not a re-derivation.
+        assert_eq!(rendered.len(), 1728, "this module's own current baseline, re-measured at GM-394");
     }
 
     #[test]
@@ -711,7 +837,10 @@ results instead of paging.";
     fn rust_only_before_its_semantic_pass_lists_the_receiver_gap() {
         let rendered = build(&[rust_pre_semantic()]);
         assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
-        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(
+            rendered.contains("The one legitimate reason to grep afterward"),
+            "the gap is real until the pass has run"
+        );
         assert!(rendered.contains("produces no edge by design"), "one present language is never named");
     }
 
@@ -727,7 +856,10 @@ results instead of paging.";
     /// `*_before_its_semantic_pass_*` test beside it - without it both arms
     /// would pass on a `build` that ignored `semantic_pass_done` entirely.
     fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
-        assert!(rendered.contains("Two real gaps"), "{language}: the gap narrows, it never closes");
+        assert!(
+            rendered.contains("The one legitimate reason to grep afterward"),
+            "{language}: the gap narrows, it never closes"
+        );
         assert!(!rendered.contains("One real gap"), "{language}: the withdrawn claim must not return");
         assert!(
             rendered.contains("binds to the receiver's declared or inferred type"),
@@ -741,7 +873,10 @@ results instead of paging.";
             !rendered.contains("produces no edge"),
             "{language}: that is the pre-pass wording, and this arm is past it:\n{rendered}"
         );
-        assert!(rendered.contains("still building"), "{language}: the second gap survives");
+        assert!(
+            rendered.contains("a tool call waits for the walk to finish before answering"),
+            "{language}: the wait note survives"
+        );
         assert!(
             rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
             "{language}: {} bytes exceeds the {INSTRUCTIONS_BYTE_CEILING}-byte ceiling",
@@ -797,7 +932,10 @@ results instead of paging.";
             semantic_pass_done: false,
         }]);
         assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
-        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(
+            rendered.contains("The one legitimate reason to grep afterward"),
+            "the gap is real until the pass has run"
+        );
         assert!(rendered.contains("produces no edge by design"), "one present language is never named");
     }
 
@@ -923,7 +1061,10 @@ results instead of paging.";
     #[test]
     fn go_only_before_its_semantic_pass_still_lists_the_receiver_gap() {
         let rendered = build(&[go_present(false)]);
-        assert!(rendered.contains("Two real gaps"), "the gap is real until the pass has run");
+        assert!(
+            rendered.contains("The one legitimate reason to grep afterward"),
+            "the gap is real until the pass has run"
+        );
         assert!(rendered.contains("produces no edge by design"), "one present language is never named");
         assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
     }
@@ -944,15 +1085,16 @@ results instead of paging.";
         assert!(!rendered.contains("rust"), "rust's own gap is closed once its semantic pass has run");
     }
 
-    /// GM-262's own worst-case scope note: typescript, go and rust plus the
-    /// five languages the architecture doc's "Paper stress test" section
-    /// names (C#, C++, Python, Java, Kotlin), all present and all still
-    /// gapped at once - a monorepo where nothing's semantic pass has
-    /// finished yet. This is the case the byte ceiling is actually checked
-    /// against, not the common one or two-language case.
-    #[test]
-    fn worst_case_every_bundled_and_planned_language_gapped_at_once() {
-        let present = vec![
+    /// GM-262's own worst-case scope note, factored out so
+    /// [`worst_case_every_bundled_and_planned_language_gapped_at_once`] and
+    /// GM-395 slice 2b's cold-start byte-budget tests below render from the
+    /// exact same fixture rather than two copies that could drift apart:
+    /// typescript, go and rust plus the five languages the architecture
+    /// doc's "Paper stress test" section names (C#, C++, Python, Java,
+    /// Kotlin), all present and all still gapped at once - a monorepo where
+    /// nothing's semantic pass has finished yet.
+    fn worst_case_present() -> Vec<PresentLanguage> {
+        vec![
             PresentLanguage {
                 language: "typescript".to_string(),
                 capabilities: Capabilities::default(),
@@ -973,8 +1115,14 @@ results instead of paging.";
             bridge_semantic_pre_pass("python"),
             bridge_semantic_pre_pass("java"),
             bridge_semantic_pre_pass("kotlin"),
-        ];
-        let rendered = build(&present);
+        ]
+    }
+
+    /// This is the case the byte ceiling is actually checked against, not the
+    /// common one or two-language case.
+    #[test]
+    fn worst_case_every_bundled_and_planned_language_gapped_at_once() {
+        let rendered = build(&worst_case_present());
         println!("worst-case bytes: {}", rendered.len());
         println!("worst-case text: {rendered}");
         assert!(
@@ -1017,6 +1165,13 @@ results instead of paging.";
     /// more languages than the design doc plans for today, standing in for
     /// "language 9, 10, ..." rather than a real one - and asserts the
     /// rendering that comes back is the fallback, not a truncated name list.
+    ///
+    /// Sixteen languages sufficed before GM-394; its shorter second clause
+    /// (see [`P4_GENERIC`]'s own doc comment) freed up enough headroom that
+    /// sixteen no longer overflows [`INSTRUCTIONS_BYTE_CEILING`] (measured:
+    /// 1,836 bytes, under the 1,900 ceiling) - so the fixture below has
+    /// twenty-eight, re-measured to overflow at 1,924 bytes, still standing in
+    /// for "more than the design doc plans for" rather than a real count.
     #[test]
     fn a_present_list_too_long_to_name_falls_back_instead_of_exceeding_the_ceiling() {
         let extra_languages = [
@@ -1036,14 +1191,26 @@ results instead of paging.";
             "erlang",
             "dart",
             "lua",
+            "clojure",
+            "fsharp",
+            "ocaml",
+            "perl",
+            "zig",
+            "nim",
+            "prolog",
+            "fortran",
+            "cobol",
+            "pascal",
+            "delphi",
+            "groovy",
         ];
         let present: Vec<PresentLanguage> =
             extra_languages.iter().map(|language| bridge_semantic_pre_pass(language)).collect();
 
-        // Sanity check on the test fixture itself: naming all sixteen really
-        // would overflow the ceiling, or this test would silently exercise
-        // the same branch as the worst-case test above instead of the one
-        // it means to.
+        // Sanity check on the test fixture itself: naming all twenty-eight
+        // really would overflow the ceiling, or this test would silently
+        // exercise the same branch as the worst-case test above instead of
+        // the one it means to.
         let would_be_named =
             assemble(&p4_named(&format_language_list(&languages_with_open_receiver_gap(&present))));
         assert!(
@@ -1055,5 +1222,80 @@ results instead of paging.";
         let rendered = build(&present);
         assert_eq!(rendered, assemble(&p4_fallback()), "must render the fallback, not a truncated name list");
         assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
+    }
+
+    /// A synthetic absolute root of exactly `len` bytes when [`Path::display`]
+    /// renders it - ASCII only, so `String::len` and the displayed byte count
+    /// agree exactly, which is what lets [`cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling`]
+    /// and its siblings target the specific budget D12 asks for without
+    /// depending on this machine's own checkout path.
+    fn root_of_byte_len(len: usize) -> std::path::PathBuf {
+        let mut root = String::from("/");
+        while root.len() < len {
+            root.push('r');
+        }
+        assert_eq!(root.len(), len, "test fixture construction must produce exactly the requested length");
+        std::path::PathBuf::from(root)
+    }
+
+    /// GM-395 slice 2b, test 5 (D12 in `docs/architecture/lazy-indexing.md`):
+    /// the `Unindexed` rendering at the eight-language worst case
+    /// ([`worst_case_present`]) with a 103-byte root must still fit under
+    /// [`INSTRUCTIONS_BYTE_CEILING`] - the exact case the design doc's own
+    /// ceiling test targets.
+    #[test]
+    fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, false, &worst_case_present());
+        println!("cold-start (unindexed, 103-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "must fit under the ceiling, falling back to the no-path line if it would not otherwise: \
+             {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// The `Walking`-phase sibling of the test above, and GM-395's own
+    /// "existing indexing variant" this task asked to check: before D12's
+    /// root-aware line, this phase's rendering was the fixed `INDEXING_NOTE`
+    /// constant plus the same worst-case body, which the phase-1 design
+    /// measured at about 1,867 bytes with nothing pinning it to the ceiling.
+    /// This is that missing test, now against the line D12 replaced
+    /// `INDEXING_NOTE` with.
+    #[test]
+    fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, true, &worst_case_present());
+        println!("cold-start (walking, 103-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "must fit under the ceiling, falling back to the no-path line if it would not otherwise: \
+             {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// D12's own fallback rule: a root long enough that including it would
+    /// push the rendering past the ceiling must drop the path entirely
+    /// rather than let the whole session lose its instructions. Checked by
+    /// actually confirming the path is gone from the output, not just that
+    /// the byte count happens to fit - a silently truncated root would also
+    /// measure short.
+    #[test]
+    fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
+        let root = root_of_byte_len(600);
+        let rendered = cold_start(&root, false, &worst_case_present());
+        println!("cold-start (unindexed, 600-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "the no-path fallback itself must fit under the ceiling: {} bytes",
+            rendered.len()
+        );
+        assert!(!rendered.contains("Index root:"), "a root this long must trigger the no-path fallback");
+        assert!(
+            rendered.starts_with("Not indexed yet"),
+            "the fallback line replaces the whole prefix, not just the path: {rendered}"
+        );
     }
 }

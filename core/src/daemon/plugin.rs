@@ -1265,12 +1265,16 @@ impl PluginProcess {
             let mut state = self.state.lock().unwrap();
             let asked = state.child.id();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
-            let mut conn = conn.lock().unwrap();
             let mut on_timeout = self.kill_on_timeout(child);
+            // `conn` is handed through as the `Mutex` it is, not pre-locked -
+            // GM-396: `staleness::ensure_fresh`/`apply_file_change` take it
+            // only for as long as each of their own steps needs it, so a
+            // reindex's embedding step never holds it for the round trip's
+            // whole duration.
             let result = staleness::ensure_fresh(
                 reader,
                 writer,
-                &mut conn,
+                conn,
                 &self.project_root,
                 file_path,
                 id,
@@ -1346,18 +1350,10 @@ impl PluginProcess {
         let result = {
             let mut state = self.state.lock().unwrap();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
-            let mut conn = conn.lock().unwrap();
             let mut on_timeout = self.kill_on_timeout(child);
-            apply_semantic_pass(
-                reader,
-                writer,
-                &mut conn,
-                file_paths,
-                id,
-                embedding,
-                timeout,
-                &mut on_timeout,
-            )
+            // See `Self::ensure_fresh`'s identical comment: `conn` is handed
+            // through as the `Mutex` it is (GM-396).
+            apply_semantic_pass(reader, writer, conn, file_paths, id, embedding, timeout, &mut on_timeout)
         };
         self.relaunch_after_timeout_if_needed(&result);
         result
@@ -1465,12 +1461,13 @@ impl PluginProcess {
         // typecheck through the `MutexGuard`'s `DerefMut` otherwise, and
         // `on_timeout` below needs `child` independently of the read.
         let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
-        let mut conn = conn.lock().unwrap();
         let mut on_timeout = self.kill_on_timeout(child);
+        // See `Self::ensure_fresh`'s identical comment: `conn` is handed
+        // through as the `Mutex` it is (GM-396).
         let result = apply_file_change_diff(
             reader,
             writer,
-            &mut conn,
+            conn,
             file_path,
             id,
             embedding,

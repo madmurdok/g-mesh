@@ -283,7 +283,8 @@ mod tests {
     /// `handle`'s own contract when no model is loaded: a tool-level error
     /// naming the fetch script, not a crash or a silently empty page - an
     /// empty page here would be indistinguishable from "no matches" (the same
-    /// reasoning `STILL_INDEXING` gives for the cold-start case).
+    /// reasoning task 104 gives for `allUnresolved`, and GM-394's cold-start
+    /// wait gives for never answering a tool call "not ready" instead).
     #[test]
     fn handle_reports_a_tool_error_when_no_embedding_model_is_loaded() {
         let conn = Arc::new(Mutex::new(setup()));

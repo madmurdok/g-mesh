@@ -537,7 +537,7 @@ completeness**, so the map can never be read as the guarantee the tools make.
 
 | Case | Behaviour |
 |---|---|
-| Project not indexed / index still building | `g-mesh map` errors with the same "still building, retry" message the MCP tools use. The daemon skips regeneration; the stale block stays. Never write a partial map. |
+| Project not indexed / index still building | `g-mesh map` waits for the walk to finish before regenerating, the same way an MCP tool call does (GM-394 - neither errors on this any more, both wait). The stale block stays until then. Never write a partial map. |
 | No `AGENTS.md`, or the map markers are absent | No-op. The map block is only ever refreshed in place; g-mesh does not create the file for this feature alone (`g-mesh init --agent` remains the entry point). |
 | User hand-edits inside the markers | Overwritten on next regeneration, exactly like the existing snippet block. Documented. |
 | Very large monorepo (100k files) | PageRank on ~100k nodes is still fast, but the map at 1k tokens becomes a vanishingly thin slice and its usefulness degrades toward zero. Consider suppressing the map above a node-count threshold rather than emitting a misleading one. Open question. |

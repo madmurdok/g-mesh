@@ -2,8 +2,10 @@
 //! actually doing.
 //!
 //! Everything here is answered from outside the daemon - the recorded pids,
-//! the socket, and the project's own `index.db` - and never by asking the
-//! daemon a question. That is deliberate: the single most useful moment to
+//! the socket, the project's own `index.db`, and the phase word a running
+//! daemon publishes to `index.phase` (D13 in
+//! `docs/architecture/lazy-indexing.md`) - and never by asking the daemon a
+//! question. That is deliberate: the single most useful moment to
 //! run `status` is when the daemon is *not* well, and a report that needs a
 //! healthy daemon to be produced would go quiet exactly then.
 //!
@@ -13,10 +15,12 @@
 //!   accepting connections on the socket. Both, because either alone lies in
 //!   a way the other catches - a recycled pid looks alive, and a socket file
 //!   outlives the process that bound it. Note that "running" no longer
-//!   implies "ready to answer": since task 105 the socket is bound before the
-//!   cold-start walk, so a daemon can be running, listening, and still
-//!   answering every tool call with "still indexing" - which is what the
-//!   `index:` line below reports on.
+//!   implies "ready to answer at once": since task 105 the socket is bound
+//!   before the cold-start walk, so a daemon can be running and listening
+//!   while its first tool call is still waiting on that walk to finish
+//!   (GM-394 - it waits rather than erroring, so "answering" is no longer the
+//!   binary this note used to describe, just "answering slowly") - which is
+//!   what the `index:` line below reports on.
 //! - **Daemon build**: the stamp a live daemon publishes about the executable
 //!   it started from (`daemon::build_stamp`), compared with this command's
 //!   own. A daemon that outlived an upgrade answers every query correctly
@@ -36,6 +40,14 @@
 //!   can honestly tell apart: "active" for a live pid, "orphaned" for one
 //!   whose core is gone, and a single summary line when no language has a pid
 //!   file at all.
+//! - **Index phase**: the word a running daemon last published to
+//!   `index.phase` (`daemon::read_phase_in`, D13) - `unindexed`, `walking`,
+//!   `structural`, `embedding`, `ready` or `failed`. GM-395's lazy activation
+//!   is what makes this its own field rather than something `bulk_indexed`
+//!   and `core` could keep implying together: a project can now sit
+//!   `unindexed` under a live, idle daemon for as long as nothing has asked,
+//!   which the old "`daemon_alive` implies a walk is under way" reasoning
+//!   could not tell apart from an actual walk in progress.
 //! - **Dirty files / index coverage**: a gitignore-aware walk of the project,
 //!   cross-referenced against the `File` nodes and `indexed_files` baselines
 //!   in the index. See [`IndexStatus`] for exactly what each number counts.
@@ -76,10 +88,12 @@ const HARD_EXCLUDED_DIRS: [&str; 4] = [".git", "node_modules", "dist", ".claude"
 pub enum CoreState {
     /// Its pid is alive and its socket is bound. Says nothing about whether
     /// the index behind it is complete - a daemon in its cold-start walk
-    /// binds first and reports itself as still indexing per call (task 105).
-    /// `render` cross-references this with `IndexStatus::bulk_indexed` (task
-    /// 108) so a walk in progress reads as exactly that, not as a stuck
-    /// daemon next to an unrelated-looking "cold start still owed" line.
+    /// binds first and answers its handshake immediately, but a tool call
+    /// waits for the walk to finish before it answers (task 105, later
+    /// GM-394). `render` cross-references this with `IndexStatus::
+    /// bulk_indexed` (task 108) so a walk in progress reads as exactly that,
+    /// not as a stuck daemon next to an unrelated-looking "cold start still
+    /// owed" line.
     Running { pid: u32 },
     /// Its pid is alive but nothing answers on the socket. Since the bind
     /// moved ahead of the cold-start walk this no longer covers a daemon that
@@ -241,6 +255,15 @@ pub struct Report {
     pub suspended_languages: Vec<SuspendedLanguage>,
     pub last_used: Option<LastUsed>,
     pub index: IndexStatus,
+    /// The word a running daemon last published to `index.phase` (D13 in
+    /// `docs/architecture/lazy-indexing.md`) - `None` when no daemon is
+    /// serving this project right now, since `daemon::lifecycle::
+    /// release_state_files` removes the file on the way out. This is what
+    /// [`render`] uses to tell "idle, never indexed" (`unindexed`) apart from
+    /// "building right now" (`walking`) - a distinction `IndexStatus::
+    /// bulk_indexed` alone cannot make under GM-395's lazy activation, since
+    /// a project can sit unwalked for as long as nothing has asked.
+    pub phase: Option<String>,
 }
 
 /// Reports on the project the current directory belongs to.
@@ -274,6 +297,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         last_used: last_used::read_from_project_dir(&state_dir)
             .context("failed to read the project's lastUsed")?,
         index: index_status(project_root, &state_dir.join("index.db"))?,
+        phase: daemon::read_phase_in(&state_dir),
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -584,13 +608,43 @@ pub fn render(report: &Report) -> String {
     // now" apart from "no daemon is doing anything about this at all", which
     // is the only case that still means "still owed".
     let daemon_alive = !matches!(report.core, CoreState::NotRunning);
-    if !index.bulk_indexed {
-        if daemon_alive {
-            let _ =
-                writeln!(out, "  index:           building now - first walk in progress, nothing to restart");
-        } else {
-            let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
+    // D13 in `docs/architecture/lazy-indexing.md`: `report.phase` is the
+    // running daemon's own word for where it stands, read off `index.phase`
+    // rather than inferred from `bulk_indexed`/`core` alone - the fact GM-395's
+    // lazy activation needs and the pre-existing fields cannot give on their
+    // own, since a project can now sit `unindexed` for as long as nothing has
+    // asked, indistinguishable from "about to be walked" under the old
+    // `daemon_alive && !bulk_indexed` reasoning. `structural` and `ready` get
+    // no line here, same as the pre-GM-395 "say nothing once the walk is
+    // done" behaviour - `phase` is `None` whenever no daemon is running, which
+    // falls through to the same two messages this reported before D13.
+    match report.phase.as_deref() {
+        Some("unindexed") => {
+            let _ = writeln!(out, "  index:           not indexed yet - builds on the first tool call");
         }
+        Some("walking") => {
+            let _ = writeln!(out, "  index:           building now");
+        }
+        Some("embedding") => {
+            let _ = writeln!(out, "  index:           structural index ready; embeddings being computed");
+        }
+        Some("failed") => {
+            let _ = writeln!(
+                out,
+                "  index:           last build failed - see daemon log; retried on the next tool call"
+            );
+        }
+        _ if !index.bulk_indexed => {
+            if daemon_alive {
+                let _ = writeln!(
+                    out,
+                    "  index:           building now - first walk in progress, nothing to restart"
+                );
+            } else {
+                let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
+            }
+        }
+        _ => {}
     }
     let _ = writeln!(
         out,
@@ -599,7 +653,7 @@ pub fn render(report: &Report) -> String {
         index.indexed,
         index.discovered
     );
-    if !index.bulk_indexed && daemon_alive {
+    if !index.bulk_indexed && report.phase.as_deref() == Some("walking") {
         let _ = writeln!(out, "  dirty files:     {} awaiting the walk already in progress", index.dirty);
     } else {
         let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
@@ -918,6 +972,7 @@ mod tests {
                 dirty: 1,
                 syntax_error_files: vec!["src/broken.ts".to_string()],
             },
+            phase: None,
         };
 
         let rendered = render(&report);
@@ -955,6 +1010,7 @@ mod tests {
                 dirty: 0,
                 syntax_error_files: Vec::new(),
             },
+            phase: None,
         };
 
         let rendered = render(&report);
@@ -993,6 +1049,7 @@ mod tests {
                 dirty: 3,
                 syntax_error_files: Vec::new(),
             },
+            phase: Some("walking".to_string()),
         };
 
         let rendered = render(&report);
@@ -1007,6 +1064,94 @@ mod tests {
             rendered.contains("3 awaiting the walk already in progress"),
             "the dirty count must not read as work nobody is doing:\n{rendered}"
         );
+    }
+
+    /// A minimal fixture for the GM-395 slice 2b tests below, which only vary
+    /// `phase` and `bulk_indexed` - everything else about a live, unwalked
+    /// project is incidental to what they check.
+    fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
+        Report {
+            project_root: PathBuf::from("/tmp/project"),
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            core: CoreState::Running { pid: 4242 },
+            build: BuildState::Current,
+            plugins: Vec::new(),
+            suspended_languages: Vec::new(),
+            last_used: None,
+            index: IndexStatus {
+                bulk_indexed,
+                semantic_pass_completed: false,
+                discovered: 4,
+                indexed: if bulk_indexed { 4 } else { 0 },
+                dirty: 4,
+                syntax_error_files: Vec::new(),
+            },
+            phase: phase.map(str::to_string),
+        }
+    }
+
+    /// D13 in `docs/architecture/lazy-indexing.md`: an idle daemon that owns
+    /// its project but has never been asked to walk it (GM-395's lazy
+    /// activation) must read as "not indexed yet", not as the pre-GM-395
+    /// "cold start still owed" - that line implied nothing was happening
+    /// about it, which a live daemon waiting for the first tool call is not.
+    #[test]
+    fn unindexed_phase_reports_not_indexed_yet_rather_than_cold_start_owed() {
+        let rendered = render(&phase_fixture(false, Some("unindexed")));
+        assert!(
+            rendered.contains("index:           not indexed yet - builds on the first tool call"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("cold start is still owed"), "{rendered}");
+        assert!(
+            !rendered.contains("building now"),
+            "an unindexed project is idle, not building:\n{rendered}"
+        );
+    }
+
+    /// D13: `embedding` is the phase covering "the structural walk is done
+    /// and answering, the embedding backfill pass is running" - distinct from
+    /// both `walking` (no structural answers yet) and silence (nothing left
+    /// to say once the whole project, embeddings included, is `ready`).
+    #[test]
+    fn embedding_phase_reports_structural_ready_with_embeddings_in_progress() {
+        let rendered = render(&phase_fixture(true, Some("embedding")));
+        assert!(
+            rendered.contains("index:           structural index ready; embeddings being computed"),
+            "{rendered}"
+        );
+    }
+
+    /// D13: `failed` names what happened and that the next tool call retries
+    /// it (`IndexingStatus::activation_failed`) - the daemon log is where the
+    /// actual failure message lives (`Phase::Failed`'s own doc comment), so
+    /// this line only has to point there, not repeat it.
+    #[test]
+    fn failed_phase_reports_the_last_build_failed_and_will_be_retried() {
+        let rendered = render(&phase_fixture(false, Some("failed")));
+        assert!(
+            rendered.contains(
+                "index:           last build failed - see daemon log; retried on the next tool call"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// `structural` and `ready` are deliberately silent on this line (D13
+    /// names messages only for `unindexed`, `walking`, `embedding` and
+    /// `failed`) - once the walk itself is done, `status` has nothing left to
+    /// add here that the coverage/dirty lines below do not already say.
+    #[test]
+    fn structural_and_ready_phases_print_no_index_line() {
+        for phase in ["structural", "ready"] {
+            let rendered = render(&phase_fixture(true, Some(phase)));
+            assert!(
+                !rendered.contains("index:"),
+                "phase {phase:?} must not print an \"index:\" line (\"index coverage:\" is a different \
+                 line and is unaffected):\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1031,6 +1176,7 @@ mod tests {
                 dirty: 2,
                 syntax_error_files: Vec::new(),
             },
+            phase: None,
         };
 
         let rendered = render(&report);
@@ -1116,6 +1262,7 @@ mod tests {
                 dirty: 0,
                 syntax_error_files: Vec::new(),
             },
+            phase: None,
         };
 
         let rendered = render(&report);
@@ -1321,6 +1468,7 @@ mod tests {
                 dirty: 0,
                 syntax_error_files: Vec::new(),
             },
+            phase: None,
         };
         let rendered = render(&report);
         assert!(!rendered.contains("semantic ("), "{rendered}");

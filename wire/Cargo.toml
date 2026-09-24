@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-wire"
-version = "3.11.0"
+version = "3.11.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The g-mesh core <-> language-plugin wire protocol types (protocol v2)"

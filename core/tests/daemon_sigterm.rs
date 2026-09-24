@@ -126,6 +126,8 @@ impl Project {
         let _ = shim.wait();
 
         let core = read_pid(&self.pid_file());
+        // GM-395 slice 2: the daemon walks - and so spawns its plugin - only once a tool call asks.
+        common::trigger_activation(self.root());
         common::wait_for("the daemon to spawn its plugin", common::startup_timeout(), || {
             self.plugin_pid_file().exists()
         });

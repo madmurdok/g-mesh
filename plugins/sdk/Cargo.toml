@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-sdk"
-version = "3.11.0"
+version = "3.11.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Everything a g-mesh language plugin needs that is not its language: protocol loop, project walk, incremental diff, ids"
