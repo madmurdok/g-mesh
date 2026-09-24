@@ -409,14 +409,21 @@ impl GMeshMcpServer {
     ///
     /// So [`self.indexing.phase()`](IndexingStatus::phase) - a lock-free
     /// atomic read - is checked *first*, and only a caller that finds it past
-    /// [`Phase::Walking`] ever takes `self.conn`'s mutex at all. A caller
-    /// mid-walk skips the query entirely and gets capabilities-only
-    /// instructions (the same
-    /// shape the `Err` fallback below already produced, for the same "if the
-    /// index isn't open yet, fall back to capabilities only" reason), prefixed
-    /// with [`instructions::INDEXING_NOTE`] so the one fact that is true only
-    /// for this moment - the index is still being built - is stated rather
-    /// than left for a caller to infer from an unusually generic paragraph.
+    /// [`Phase::Walking`] ever takes `self.conn`'s mutex at all. A caller in
+    /// [`Phase::Unindexed`] or [`Phase::Walking`] skips the query entirely
+    /// and gets capabilities-only instructions (the same shape the `Err`
+    /// fallback below already produces, for the same "if the index isn't
+    /// open yet, fall back to capabilities only" reason), through
+    /// [`instructions::cold_start`] - GM-395's D12 - so the one fact that is
+    /// true only for this moment (the project's own root, and whether its
+    /// walk has started or is still owed) is stated rather than left for a
+    /// caller to infer from an unusually generic paragraph. `Phase::Failed`
+    /// is deliberately not included here: nothing holds `self.conn`'s mutex
+    /// once a walk has failed and returned, so there is no GM-394 hazard in
+    /// taking it, and this method's ordinary query-then-render path already
+    /// handles a project with nothing indexed yet (`present` comes back
+    /// empty, and [`build`](instructions::build) renders the same
+    /// unqualified paragraph a fresh project always has).
     ///
     /// Two independent data sources feed the builder once the index is open,
     /// and only one of them can fail in a way this method has to handle
@@ -444,10 +451,11 @@ impl GMeshMcpServer {
     fn instructions(&self) -> String {
         let capabilities = self.registry.receiver_call_capabilities();
 
-        if matches!(self.indexing.phase(), Phase::Walking) {
+        let phase = self.indexing.phase();
+        if let Phase::Unindexed | Phase::Walking = phase {
             let present = capabilities.keys().map(|language| (language.clone(), false)).collect();
-            let built = instructions::build(&instructions::present_languages(present, &capabilities));
-            return format!("{}\n\n{built}", instructions::INDEXING_NOTE);
+            let present = instructions::present_languages(present, &capabilities);
+            return instructions::cold_start(self.registry.project_root(), phase == Phase::Walking, &present);
         }
 
         let present = {

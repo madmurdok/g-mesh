@@ -137,6 +137,7 @@
 //! surfaced while comparing kungfu" subsection for the fuller writeup this
 //! decision closes out.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -182,6 +183,29 @@ pub enum Phase {
     /// slice 2 a failed walk ended the daemon instead, which under a lazy
     /// trigger would drop the session of the very call that asked for it.
     Failed(String),
+}
+
+impl Phase {
+    /// The word [`IndexingStatus::attach_phase_file`] and
+    /// [`IndexingStatus::set_phase`] publish to the `index.phase` file
+    /// (`daemon::phase_path_in`, D13 in `docs/architecture/lazy-indexing.md`),
+    /// lowercase and one word, matching every other value that file can hold
+    /// so `cli::status` and the test suite can compare it with a plain string
+    /// literal rather than parsing one back into a [`Phase`]. `Failed`'s
+    /// message is deliberately not included: the file is a status word for
+    /// an outside reader, not a serialization of this type, and the message
+    /// already has a home the file's own readers are pointed at instead (the
+    /// daemon log - see `cli::status`'s rendering of this word).
+    fn word(&self) -> &'static str {
+        match self {
+            Phase::Unindexed => "unindexed",
+            Phase::Walking => "walking",
+            Phase::Structural => "structural",
+            Phase::Embedding => "embedding",
+            Phase::Ready => "ready",
+            Phase::Failed(_) => "failed",
+        }
+    }
 }
 
 /// What a tool call actually needs from the index before it may read it -
@@ -284,6 +308,14 @@ struct Inner {
     /// requested" and "record a failure, and allow the next retry" have to
     /// change together: see [`activation_failed`](IndexingStatus::activation_failed).
     activation: Mutex<Activation>,
+    /// Where [`Phase`] transitions are published for outside readers
+    /// (`cli::status`, the test suite's `wait_until_phase`) - D13 in
+    /// `docs/architecture/lazy-indexing.md`. `None` until
+    /// [`IndexingStatus::attach_phase_file`] is called - which only
+    /// `daemon::run` does, exactly like [`Activation::trigger`] above - so a
+    /// status with no daemon behind it (the CLI's in-process walks, unit
+    /// tests) writes nothing.
+    phase_file: Mutex<Option<PathBuf>>,
 }
 
 /// The sending half of `daemon::activation`'s trigger channel, and whether
@@ -315,6 +347,7 @@ impl IndexingStatus {
             embed_done: std::sync::atomic::AtomicU64::new(0),
             embed_total: std::sync::atomic::AtomicU64::new(0),
             activation: Mutex::new(Activation::default()),
+            phase_file: Mutex::new(None),
         }))
     }
 
@@ -375,6 +408,21 @@ impl IndexingStatus {
         self.0.phase.store(discriminant, Ordering::Release);
         *self.0.phase_since.lock().unwrap() = Instant::now();
         self.0.notify.notify_waiters();
+        self.publish_phase_file(phase.word());
+    }
+
+    /// Writes `word` to the attached phase file, if one has been
+    /// ([`attach_phase_file`](Self::attach_phase_file)) - a no-op otherwise,
+    /// same as every other best-effort state-file write in this daemon
+    /// (`daemon::write_pid_file`'s own doc comment gives the reasoning this
+    /// borrows: a reader that finds nothing degrades to "nothing recorded",
+    /// which every caller of `daemon::read_phase_in` already treats as a
+    /// valid outcome).
+    fn publish_phase_file(&self, word: &str) {
+        let guard = self.0.phase_file.lock().unwrap();
+        if let Some(path) = guard.as_ref() {
+            super::write_state_file_atomic(path, word, "phase file");
+        }
     }
 
     /// The current phase, including [`Phase::Failed`]'s message if that is
@@ -449,6 +497,20 @@ impl IndexingStatus {
         let (trigger, triggered) = mpsc::channel();
         self.0.activation.lock().unwrap().trigger = Some(trigger);
         triggered
+    }
+
+    /// Connects this status to a phase file at `path` (D13 in
+    /// `docs/architecture/lazy-indexing.md`) and publishes the current phase
+    /// to it immediately - called once, by `daemon::run`, right after the
+    /// daemon's pid file is written, so "the phase file exists" is never
+    /// transiently false the way `write_pid_file`'s own doc comment describes
+    /// for a half-written file: this call's own write is what puts the
+    /// *first* line in place, atomically, before anything can observe the
+    /// file's absence as meaningful. Every [`set_phase`](Self::set_phase)
+    /// after this call publishes too - see [`publish_phase_file`](Self::publish_phase_file).
+    pub fn attach_phase_file(&self, path: PathBuf) {
+        *self.0.phase_file.lock().unwrap() = Some(path);
+        self.publish_phase_file(self.phase().word());
     }
 
     /// Asks the activation thread to do whatever this project still owes -

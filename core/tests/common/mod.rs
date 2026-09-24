@@ -286,6 +286,25 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
     }
 }
 
+/// Blocks until this project's `index.phase` file (D13 in
+/// `docs/architecture/lazy-indexing.md`) reads `phase` exactly, triggering
+/// activation first ([`trigger_activation`]) - for tests that need the
+/// embedding backfill pass to have run, where [`wait_until_indexed`] alone
+/// (structural only, GM-395 slice 1/2) does not wait long enough: that one
+/// resolves the moment the walk is linked, well before `Phase::Ready`.
+///
+/// Every way of failing to read the phase file - not there yet, a daemon that
+/// has not attached one yet, a transient read error mid-rename - is treated
+/// as "not yet" and retried, the same reading [`wait_until_indexed_within`]
+/// gives `Connection::open` failing on `index.db`.
+pub fn wait_until_phase(root: &Path, phase: &str) {
+    trigger_activation(root);
+    let path = daemon::phase_path_in(&project_dir(root).expect("failed to resolve the state directory"));
+    wait_for(&format!("{}'s index.phase to read {phase:?}", root.display()), indexed_timeout(), || {
+        std::fs::read_to_string(&path).map(|contents| contents.trim() == phase).unwrap_or(false)
+    });
+}
+
 /// Sends `kill -9` to `pid` and does not return until the kernel has actually
 /// finished tearing the process down, not merely until the signal was
 /// delivered.

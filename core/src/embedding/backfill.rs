@@ -69,6 +69,19 @@ const PAGE_SIZE: i64 = 256;
 /// `daemon::bulk_index::WALK_HOLD_FILE_ENV`.
 pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
 
+/// While this env var is set to a non-empty value, [`run`] panics before its
+/// first batch - test-only, for GM-395 slice 2b's guard that a panic in this
+/// pass must not turn the whole activation into
+/// [`Phase::Failed`](crate::daemon::indexing_status::Phase::Failed):
+/// `daemon::activation::ActivationCtx::activate` wraps this call in
+/// `catch_unwind` precisely so that structural tools keep answering even if
+/// this pass blows up, and this knob is what lets a test make it blow up
+/// without needing a real, reproducible ONNX failure. Checked right after the
+/// hold above, before the availability check, for the same reason the hold
+/// itself runs early: a test needs this to fire whether or not the machine
+/// running it has ever fetched real weights.
+pub const PANIC_ENV: &str = "G_MESH_EMBED_PASS_PANIC";
+
 /// What one call to [`run`] actually did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BackfillSummary {
@@ -98,6 +111,7 @@ pub fn run(
     progress: &IndexingStatus,
 ) -> BackfillSummary {
     hold_before_first_batch_for_tests();
+    panic_before_first_batch_for_tests();
 
     if !embedding.is_available() {
         return BackfillSummary::default();
@@ -217,6 +231,17 @@ fn hold_before_first_batch_for_tests() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while path.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Honors [`PANIC_ENV`]. A no-op unless it is set, which is every real run -
+/// same shape as [`hold_before_first_batch_for_tests`], but panicking instead
+/// of holding: GM-395 slice 2b's test that a panic here does not turn a
+/// project's structural tools into a tool error needs this pass to actually
+/// panic, not merely pause.
+fn panic_before_first_batch_for_tests() {
+    if std::env::var_os(PANIC_ENV).filter(|p| !p.is_empty()).is_some() {
+        panic!("g-mesh daemon: G_MESH_EMBED_PASS_PANIC test knob fired - this panic is expected");
     }
 }
 

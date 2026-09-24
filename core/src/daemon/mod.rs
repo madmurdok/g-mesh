@@ -73,6 +73,19 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 /// and cleared by whoever takes it next.
 const DAEMON_SERVING_FILE: &str = "daemon.serving";
 
+/// Where the daemon publishes its cold-start phase (D13 in
+/// `docs/architecture/lazy-indexing.md`): one line, one of `unindexed`,
+/// `walking`, `structural`, `embedding`, `ready` or `failed` - the same words
+/// [`crate::daemon::indexing_status::Phase`]'s variants are named after,
+/// lowercased. Written on every transition
+/// ([`indexing_status::IndexingStatus::attach_phase_file`]) and removed on
+/// the way out ([`lifecycle::release_state_files`]), so `cli::status` and the
+/// test suite can tell "idle, never indexed" apart from "building right now"
+/// without asking a live daemon a question - the same "answered from outside
+/// the daemon" principle `cli::status`'s own module doc already applies to
+/// everything else it reports.
+const PHASE_FILE: &str = "index.phase";
+
 /// How long the watcher thread waits, after the most recent raw filesystem
 /// event for a given path, before treating that path's burst as settled and
 /// asking the plugin to reparse it - the window
@@ -177,6 +190,24 @@ pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(registry::plugin_pid_file_name(plugin::BUNDLED_LANGUAGE))
 }
 
+/// Where [`PHASE_FILE`] lives for a given state directory - the same shape as
+/// [`pid_path_in`], for the same reason: `cli::status` and the test suite
+/// resolve a state directory once and ask it for every one of these files
+/// rather than reconstructing a project root.
+pub fn phase_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(PHASE_FILE)
+}
+
+/// The current phase word [`indexing_status::IndexingStatus::attach_phase_file`]
+/// published for this state directory, if a daemon is running and has
+/// written one. `None` covers both "no daemon has ever run here" and "the
+/// daemon that did has since exited" (`lifecycle::release_state_files`
+/// removes the file on its way out) - the same "absent means nothing to
+/// report" reading every other state file in this module gets.
+pub fn read_phase_in(state_dir: &Path) -> Option<String> {
+    fs::read_to_string(phase_path_in(state_dir)).ok().map(|contents| contents.trim().to_string())
+}
+
 /// Where the live daemon records the build it started from, resolved from a
 /// project root and - like the pid files - from an already-known state
 /// directory too, for callers that have one but no root.
@@ -263,13 +294,22 @@ pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
 /// finds nothing degrades to "nothing recorded", which they all already
 /// handle.
 pub fn write_pid_file(path: &Path, pid: u32) {
+    write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
+}
+
+/// The same atomic temp-then-rename shape [`write_pid_file`] uses, factored
+/// out so [`indexing_status::IndexingStatus`]'s phase-file writes ([`PHASE_FILE`],
+/// D13 in `docs/architecture/lazy-indexing.md`) get the same "never
+/// observable half-written" guarantee for a second kind of state file rather
+/// than reimplementing it with a plain `fs::write`.
+pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if let Err(err) = fs::write(&temporary, format!("{pid}\n")) {
-        eprintln!("g-mesh daemon: failed to write pid file {}: {err}", temporary.display());
+    if let Err(err) = fs::write(&temporary, contents) {
+        eprintln!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
         return;
     }
     if let Err(err) = fs::rename(&temporary, path) {
-        eprintln!("g-mesh daemon: failed to put pid file {} in place: {err}", path.display());
+        eprintln!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
         let _ = fs::remove_file(&temporary);
     }
 }
@@ -466,6 +506,24 @@ pub fn run(root: &Path) -> Result<()> {
     let pid_file = dir.join(PID_FILE);
     write_pid_file(&pid_file, std::process::id());
 
+    // Decided from a fact recorded on disk, not from how this start went.
+    // GM-395 slice 2: a project that owes its walk starts `Unindexed` and
+    // stays there until the first index-needing tool call asks
+    // (`daemon::activation`); a restart against an already-walked project
+    // (the common case) starts at `Structural`, so no structural caller is
+    // ever kept waiting - see `Phase::Structural`'s doc comment for why that
+    // is not `Ready`: the embedding backfill pass is still owed, and runs on
+    // that first call too.
+    //
+    // Constructed here, right next to the pid file's own write, so its phase
+    // file (D13) gets the same property: published before anything can
+    // observe its absence as meaningful, never merely "eventually" true.
+    let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
+    indexing.attach_phase_file(phase_path_in(&dir));
+    // Attached before the accept loop can hand `indexing` to any session, so
+    // no tool call ever finds it with nothing to trigger.
+    let activation_trigger = indexing.attach_activation();
+
     // And recorded beside the lock too, now that this process is genuinely
     // serving. The pid file above answers "which process is the daemon"; this
     // answers "is the lock's holder still doing the job the lock entitles it
@@ -536,19 +594,6 @@ pub fn run(root: &Path) -> Result<()> {
     // goes away on its own eventually rather than living until the machine
     // reboots.
     let core_activity = CoreActivity::new();
-
-    // Decided from a fact recorded on disk, not from how this start went.
-    // GM-395 slice 2: a project that owes its walk starts `Unindexed` and
-    // stays there until the first index-needing tool call asks
-    // (`daemon::activation`); a restart against an already-walked project
-    // (the common case) starts at `Structural`, so no structural caller is
-    // ever kept waiting - see `Phase::Structural`'s doc comment for why that
-    // is not `Ready`: the embedding backfill pass is still owed, and runs on
-    // that first call too.
-    let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
-    // Attached before the accept loop can hand `indexing` to any session, so
-    // no tool call ever finds it with nothing to trigger.
-    let activation_trigger = indexing.attach_activation();
 
     // The accept loop moves to a thread of its own, and so does activation
     // (below); this thread spends the rest of its life supervising

@@ -311,14 +311,16 @@ async fn initialize_and_tools_list_answer_quickly_while_a_batch_commit_holds_the
 
     let info = client.peer_info().expect("server never reported its info");
     let instructions = info.instructions.clone().unwrap_or_default();
-    // The transient fact (`instructions::INDEXING_NOTE`) and the steady-state
-    // paragraph every session gets (`instructions::P4_GENERIC` and its
-    // siblings) both say something about this - checked separately since
-    // GM-394 moved the "index is being built" wording into the first and the
-    // "a tool call waits" wording into the second (see `INDEXING_NOTE`'s own
-    // doc comment for why they are not the same sentence).
+    // The transient fact (`instructions::cold_start`, D12 in
+    // `docs/architecture/lazy-indexing.md` - `INDEXING_NOTE` before GM-395
+    // slice 2b) and the steady-state paragraph every session gets
+    // (`instructions::P4_GENERIC` and its siblings) both say something about
+    // this - checked separately since GM-394 moved the "index is being
+    // built" wording into the first and the "a tool call waits" wording into
+    // the second (see `instructions::cold_start`'s own doc comment for why
+    // they are not the same sentence).
     assert!(
-        instructions.contains("index is being built right now"),
+        instructions.contains("Being built now"),
         "instructions must say indexing is in progress, right now, while it is: {instructions}"
     );
     assert!(

@@ -189,6 +189,17 @@ async fn connecting_alone_indexes_nothing() {
         seen_walking.is_empty(),
         "connecting alone must not start a --bulk-index run for the project, saw: {seen_walking:#?}"
     );
+    // GM-395 slice 2b (D13): the daemon's own `index.phase` file must agree -
+    // a session that never asked for anything leaves the daemon at
+    // `Unindexed`, not merely "not yet recorded as walked".
+    //
+    // *Control:* call `request_activation()` right after bind (in the
+    // worktree, inside `daemon::run`, right after `indexing.attach_phase_file`),
+    // and this assertion fails alongside the two above: the daemon moves to
+    // `Walking` before this test ever gets to read the file.
+    let phase = std::fs::read_to_string(daemon::phase_path_in(&project_dir(project.root()).unwrap()))
+        .expect("a running daemon must have published its index.phase");
+    assert_eq!(phase.trim(), "unindexed", "connecting alone must not move the daemon past Unindexed");
 
     client.cancel().await.expect("failed to shut the client down");
 }
@@ -345,6 +356,55 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
     let definition = body(&retried);
     assert_eq!(definition["name"], "greet", "the retried walk must answer: {definition}");
     assert!(project.bulk_indexed(), "the retried walk must have been recorded");
+
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// GM-395 slice 2b: a panic in the embedding backfill pass
+/// (`embedding::backfill::run`, forced here by its test-only
+/// `PANIC_ENV` knob) is caught by `daemon::activation::ActivationCtx::
+/// activate`'s `catch_unwind` around that call and logged, not turned into
+/// `Phase::Failed` - structural tools must keep answering even though
+/// `search_code` never will for this project, and the daemon must not
+/// re-run (or re-panic on) the same pass on a later call once it has moved
+/// on to `Phase::Ready`.
+///
+/// *Control:* remove the `catch_unwind` (and its `AssertUnwindSafe` wrapper)
+/// around the `embedding::backfill::run` call in
+/// `daemon::activation::ActivationCtx::activate`, propagating the panic as
+/// this method's `Err` instead. Both calls below then fail: the first
+/// becomes a tool error ("g-mesh could not build this project's index: the
+/// index build panicked: ..."), because the panic unwinds through `activate`
+/// before `Phase::Ready` is ever reached and `daemon::activation::run` records
+/// it as `Phase::Failed`.
+#[tokio::test]
+async fn a_panicking_embedding_pass_does_not_fail_structural_tools() {
+    let project = Project::new();
+    let client =
+        project.connect(&[(g_mesh::embedding::backfill::PANIC_ENV, std::ffi::OsStr::new("1"))]).await;
+
+    let outline = body(&call(&client, "get_file_outline", json!({ "file_path": "src/index.ts" })).await);
+    let names: Vec<&str> = outline["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an outline has a results array: {outline}"))
+        .iter()
+        .map(|symbol| symbol["name"].as_str().expect("every outline symbol has a name"))
+        .collect();
+    assert_eq!(
+        names, FULL_OUTLINE,
+        "a panicking embedding pass must not block or corrupt the structural answer: {outline}"
+    );
+
+    // A second call must also answer, not error: the phase must have moved
+    // on to `Ready` (never `Failed`), so nothing here is still owed and
+    // nothing is retried.
+    let again = call(&client, "get_file_outline", json!({ "file_path": "src/index.ts" })).await;
+    assert_ne!(
+        again.is_error,
+        Some(true),
+        "a second call must not error either - the panic must not have left the project `Failed`: {}",
+        text(&again)
+    );
 
     client.cancel().await.expect("failed to shut the client down");
 }

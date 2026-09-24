@@ -97,6 +97,7 @@
 //! built here; see [`build`]'s doc comment for why not now.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 
@@ -108,19 +109,78 @@ use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 /// exactly the same figure.
 pub const INSTRUCTIONS_BYTE_CEILING: usize = 1900;
 
-/// Prefixed to a session's instructions while the daemon's cold-start walk is
-/// still running (`mcp::mod::GMeshMcpServer::instructions`, GM-394) - the one
-/// fact that is true only for *this* moment, for *this* session: the wait
-/// itself, and what a caller should do about it, is already stated in every
-/// [`build`] rendering's own final paragraph (see [`P4_GENERIC`] and its
-/// siblings) - text that is handed to *every* session, whether or not a walk
-/// happens to be running right now. This note exists only to say that the
-/// walk this session's own paragraph describes in the abstract is actually
-/// happening, right now, so a caller does not have to notice a slow first
-/// call before connecting the two. Kept deliberately short for exactly that
-/// reason: everything else is already said elsewhere.
-pub const INDEXING_NOTE: &str =
-    "This project's index is being built right now, in this session - not just in general.";
+/// Prefixed to a session's instructions while the project owes its cold
+/// start - `Phase::Unindexed` or `Phase::Walking`
+/// (`mcp::mod::GMeshMcpServer::instructions`, GM-394 and GM-395's D12 in
+/// `docs/architecture/lazy-indexing.md`) - the one fact that is true only for
+/// *this* moment, for *this* session: the wait itself, and what a caller
+/// should do about it, is already stated in every [`build`] rendering's own
+/// final paragraph (see [`P4_GENERIC`] and its siblings) - text that is
+/// handed to *every* session, whether or not a walk happens to be running
+/// right now. This line exists only to say that the walk this session's own
+/// paragraph describes in the abstract is actually happening (or about to,
+/// once the first tool call asks), right now, so a caller does not have to
+/// notice a slow first call before connecting the two.
+///
+/// Before GM-395 slice 2b this was a fixed constant (`INDEXING_NOTE`) with no
+/// project identity in it at all - true when a session could only ever be
+/// talking to the one project a daemon indexed at startup. Lazy activation
+/// means a caller can now see this state for a project that has not been
+/// touched yet, not just one already mid-walk, and [`cold_start`] names the
+/// project's own root (A2 in the architecture doc) so a caller juggling more
+/// than one g-mesh session can tell which is which. [`cold_start_line_fallback`]
+/// is what a very long root falls back to, so this line can never itself be
+/// the reason the whole rendering exceeds [`INSTRUCTIONS_BYTE_CEILING`].
+fn cold_start_line(root: &Path, walking: bool) -> String {
+    if walking {
+        format!(
+            "Index root: {}. Being built now - the first tool call waits for it to finish before answering.",
+            root.display()
+        )
+    } else {
+        format!(
+            "Index root: {}. Not indexed yet - the first tool call builds it (structural first; semantic \
+             search after) and waits for it.",
+            root.display()
+        )
+    }
+}
+
+/// [`cold_start_line`] without the root - what [`cold_start`] falls back to
+/// when the root makes the rendered line too long for
+/// [`INSTRUCTIONS_BYTE_CEILING`] to afford (D12's own fallback rule, the same
+/// shape [`p4_fallback`] uses for a language list that does not fit).
+fn cold_start_line_fallback(walking: bool) -> &'static str {
+    if walking {
+        "Being built now - the first tool call waits for it to finish before answering."
+    } else {
+        "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
+         waits for it."
+    }
+}
+
+/// `get_info`'s `with_instructions` string for a session that connects while
+/// the project still owes its cold start (`Phase::Unindexed` or
+/// `Phase::Walking`) - [`cold_start_line`] (or its no-path fallback) stacked
+/// on top of the ordinary [`build`] rendering for `present`, exactly the way
+/// `INDEXING_NOTE` used to sit on top of it before GM-395 slice 2b.
+///
+/// `present` is capabilities-only (every discovered language,
+/// `semantic_pass_done: false`) in both cases - `mcp::mod::
+/// GMeshMcpServer::instructions` never takes the connection lock to build a
+/// real one while either phase holds, for the same GM-394 reason it never did
+/// for `Walking` alone before this slice: the walk (or the batch commit that
+/// follows it) may be holding that lock for as long as its embedding
+/// inference takes, and a caller mid-handshake cannot be made to wait on it.
+pub fn cold_start(root: &Path, walking: bool, present: &[PresentLanguage]) -> String {
+    let built = build(present);
+    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking));
+    if with_path.len() <= INSTRUCTIONS_BYTE_CEILING {
+        with_path
+    } else {
+        format!("{}\n\n{built}", cold_start_line_fallback(walking))
+    }
+}
 
 /// One language present in the index (`storage::schema::
 /// present_languages_with_semantic_state`), paired with the two facts
@@ -1025,15 +1085,16 @@ results instead of paging.";
         assert!(!rendered.contains("rust"), "rust's own gap is closed once its semantic pass has run");
     }
 
-    /// GM-262's own worst-case scope note: typescript, go and rust plus the
-    /// five languages the architecture doc's "Paper stress test" section
-    /// names (C#, C++, Python, Java, Kotlin), all present and all still
-    /// gapped at once - a monorepo where nothing's semantic pass has
-    /// finished yet. This is the case the byte ceiling is actually checked
-    /// against, not the common one or two-language case.
-    #[test]
-    fn worst_case_every_bundled_and_planned_language_gapped_at_once() {
-        let present = vec![
+    /// GM-262's own worst-case scope note, factored out so
+    /// [`worst_case_every_bundled_and_planned_language_gapped_at_once`] and
+    /// GM-395 slice 2b's cold-start byte-budget tests below render from the
+    /// exact same fixture rather than two copies that could drift apart:
+    /// typescript, go and rust plus the five languages the architecture
+    /// doc's "Paper stress test" section names (C#, C++, Python, Java,
+    /// Kotlin), all present and all still gapped at once - a monorepo where
+    /// nothing's semantic pass has finished yet.
+    fn worst_case_present() -> Vec<PresentLanguage> {
+        vec![
             PresentLanguage {
                 language: "typescript".to_string(),
                 capabilities: Capabilities::default(),
@@ -1054,8 +1115,14 @@ results instead of paging.";
             bridge_semantic_pre_pass("python"),
             bridge_semantic_pre_pass("java"),
             bridge_semantic_pre_pass("kotlin"),
-        ];
-        let rendered = build(&present);
+        ]
+    }
+
+    /// This is the case the byte ceiling is actually checked against, not the
+    /// common one or two-language case.
+    #[test]
+    fn worst_case_every_bundled_and_planned_language_gapped_at_once() {
+        let rendered = build(&worst_case_present());
         println!("worst-case bytes: {}", rendered.len());
         println!("worst-case text: {rendered}");
         assert!(
@@ -1155,5 +1222,80 @@ results instead of paging.";
         let rendered = build(&present);
         assert_eq!(rendered, assemble(&p4_fallback()), "must render the fallback, not a truncated name list");
         assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
+    }
+
+    /// A synthetic absolute root of exactly `len` bytes when [`Path::display`]
+    /// renders it - ASCII only, so `String::len` and the displayed byte count
+    /// agree exactly, which is what lets [`cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling`]
+    /// and its siblings target the specific budget D12 asks for without
+    /// depending on this machine's own checkout path.
+    fn root_of_byte_len(len: usize) -> std::path::PathBuf {
+        let mut root = String::from("/");
+        while root.len() < len {
+            root.push('r');
+        }
+        assert_eq!(root.len(), len, "test fixture construction must produce exactly the requested length");
+        std::path::PathBuf::from(root)
+    }
+
+    /// GM-395 slice 2b, test 5 (D12 in `docs/architecture/lazy-indexing.md`):
+    /// the `Unindexed` rendering at the eight-language worst case
+    /// ([`worst_case_present`]) with a 103-byte root must still fit under
+    /// [`INSTRUCTIONS_BYTE_CEILING`] - the exact case the design doc's own
+    /// ceiling test targets.
+    #[test]
+    fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, false, &worst_case_present());
+        println!("cold-start (unindexed, 103-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "must fit under the ceiling, falling back to the no-path line if it would not otherwise: \
+             {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// The `Walking`-phase sibling of the test above, and GM-395's own
+    /// "existing indexing variant" this task asked to check: before D12's
+    /// root-aware line, this phase's rendering was the fixed `INDEXING_NOTE`
+    /// constant plus the same worst-case body, which the phase-1 design
+    /// measured at about 1,867 bytes with nothing pinning it to the ceiling.
+    /// This is that missing test, now against the line D12 replaced
+    /// `INDEXING_NOTE` with.
+    #[test]
+    fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, true, &worst_case_present());
+        println!("cold-start (walking, 103-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "must fit under the ceiling, falling back to the no-path line if it would not otherwise: \
+             {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// D12's own fallback rule: a root long enough that including it would
+    /// push the rendering past the ceiling must drop the path entirely
+    /// rather than let the whole session lose its instructions. Checked by
+    /// actually confirming the path is gone from the output, not just that
+    /// the byte count happens to fit - a silently truncated root would also
+    /// measure short.
+    #[test]
+    fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
+        let root = root_of_byte_len(600);
+        let rendered = cold_start(&root, false, &worst_case_present());
+        println!("cold-start (unindexed, 600-byte root) bytes: {}", rendered.len());
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "the no-path fallback itself must fit under the ceiling: {} bytes",
+            rendered.len()
+        );
+        assert!(!rendered.contains("Index root:"), "a root this long must trigger the no-path fallback");
+        assert!(
+            rendered.starts_with("Not indexed yet"),
+            "the fallback line replaces the whole prefix, not just the path: {rendered}"
+        );
     }
 }
