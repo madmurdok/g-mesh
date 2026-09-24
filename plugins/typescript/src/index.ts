@@ -12,6 +12,13 @@ import { holdPoint } from "./testHold";
  * stay in sync with core's `daemon::bulk_index::BULK_INDEX_FLAG`. */
 const BULK_INDEX_FLAG = "--bulk-index";
 
+/** Set to "1" by core on every bulk spawn: stdin is then a pipe core holds
+ * open and never writes, and its end means core is gone (GM-397). Must stay
+ * in sync with core's `daemon::bulk_index::BULK_STDIN_LIFELINE_ENV`. Without
+ * it the bulk walk leaves stdin alone, so an older core or a hand run with
+ * `< /dev/null` is not read as "exit before walking". */
+const BULK_STDIN_LIFELINE_ENV = "G_MESH_BULK_STDIN_LIFELINE";
+
 function log(message: string): void {
   process.stderr.write(`[g-mesh-js-ts] ${message}\n`);
 }
@@ -222,6 +229,41 @@ async function runBulkIndex(projectRoot: string): Promise<void> {
   );
 }
 
+/**
+ * The bulk walk's lifeline watcher (GM-397): reads and discards stdin, and
+ * ends the process the moment it ends. The walk never touches stdin and can
+ * spend a long time between writes, so without this a killed core goes
+ * unnoticed until the walk is over. A read error counts as the end: with the
+ * variable set core promised a pipe, and one that cannot be read is not one
+ * core still holds. Exits 1, not 0: whatever is left to read this stream did
+ * not get a complete one.
+ */
+function onBulkLifelineEnd(): void {
+  log("core closed the bulk stream's lifeline - exiting");
+  process.exit(1);
+}
+
+function watchBulkLifeline(): void {
+  process.stdin.on("end", onBulkLifelineEnd);
+  process.stdin.on("error", onBulkLifelineEnd);
+  process.stdin.resume();
+}
+
+/**
+ * Lets go of stdin once the walk has settled. Required, not tidy-up: a
+ * flowing stdin is an open handle, and an open handle keeps the event loop -
+ * and so this process - alive. The process would never exit, its stdout
+ * would never reach EOF, and core, reading that stdout to its end before it
+ * ever gets to close the lifeline, would wait forever. This is the one
+ * deadlock the lifeline can introduce; `bulk_walk_still_completes_with_its_
+ * lifeline_open` in core/tests/plugins_die_with_daemon.rs guards it.
+ */
+function releaseBulkLifeline(): void {
+  process.stdin.removeListener("end", onBulkLifelineEnd);
+  process.stdin.removeListener("error", onBulkLifelineEnd);
+  process.stdin.destroy();
+}
+
 function main(): void {
   const args = process.argv.slice(2);
 
@@ -246,10 +288,25 @@ function main(): void {
     // writes can still be in flight, and exiting explicitly would truncate
     // the stream core is reading. Letting the event loop run dry exits only
     // once everything has actually been handed over.
-    runBulkIndex(args[1] ?? process.cwd()).catch((err) => {
-      log(`bulk index failed: ${(err as Error).message}`);
-      process.exitCode = 1;
+    //
+    // A write error on stdout (EPIPE: core stopped reading) ends the walk
+    // (GM-397). `waitForDrain` only resumes on it, and later writes to the
+    // destroyed stream fail silently, so without this a walk whose reader is
+    // gone runs to its end anyway.
+    process.stdout.on("error", (err) => {
+      log(`failed to write the bulk stream: ${err.message} - exiting`);
+      process.exit(1);
     });
+    const lifeline = process.env[BULK_STDIN_LIFELINE_ENV] === "1";
+    if (lifeline) watchBulkLifeline();
+    runBulkIndex(args[1] ?? process.cwd())
+      .catch((err) => {
+        log(`bulk index failed: ${(err as Error).message}`);
+        process.exitCode = 1;
+      })
+      .finally(() => {
+        if (lifeline) releaseBulkLifeline();
+      });
     return;
   }
 

@@ -86,3 +86,5 @@ mod position;
 
 pub use bridge::{Budgets, LspBridge};
 pub use config::{SemanticConfig, ServerReadiness};
+
+pub(crate) use client::kill_live_servers;

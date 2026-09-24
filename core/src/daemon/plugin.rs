@@ -788,7 +788,8 @@ impl PluginState {
             bail!(hint);
         }
 
-        let mut child = Command::new(&manifest.command)
+        let mut command = Command::new(&manifest.command);
+        command
             .args(&manifest.args)
             .arg(project_root)
             // The manifest core read, so the plugin reads the same one - see
@@ -804,11 +805,11 @@ impl PluginState {
             // programmatically - so forwarding to the daemon's own stderr
             // is simplest; it still shows up wherever the daemon's stderr
             // goes (or /dev/null in tests that don't care).
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!("failed to spawn {} plugin ({})", manifest.language, manifest.command.display())
-            })?;
+            .stderr(Stdio::inherit());
+        // Under the process-wide spawn lock - see `process::spawn_serialized`.
+        let mut child = crate::process::spawn_serialized(&mut command).with_context(|| {
+            format!("failed to spawn {} plugin ({})", manifest.language, manifest.command.display())
+        })?;
 
         let stdout = child.stdout.take().context("plugin child process has no stdout")?;
         let stdin = child.stdin.take().context("plugin child process has no stdin")?;

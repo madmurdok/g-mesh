@@ -345,7 +345,7 @@ func TestRunControlLoopEndToEnd(t *testing.T) {
 	}))
 
 	var out bytes.Buffer
-	runControlLoop(root, &in, &out)
+	runControlLoop(root, &in, &out, nil)
 
 	frames := readFrames(t, bufio.NewReader(&out))
 	if len(frames) != 2 {
@@ -419,7 +419,7 @@ func containerOf(t *testing.T, diff fileChangeDiff, qualifiedName string) string
 func TestRunControlLoopStopsCleanlyOnAFramingError(t *testing.T) {
 	in := bytes.NewReader([]byte("Content-Length: nope\r\n\r\n{}"))
 	var out bytes.Buffer
-	runControlLoop(t.TempDir(), in, &out)
+	runControlLoop(t.TempDir(), in, &out, nil)
 
 	frames := readFrames(t, bufio.NewReader(&out))
 	if len(frames) != 1 {
@@ -444,7 +444,7 @@ func TestRunControlLoopSkipsAMalformedJSONBodyAndContinues(t *testing.T) {
 	}))
 
 	var out bytes.Buffer
-	runControlLoop(root, &in, &out)
+	runControlLoop(root, &in, &out, nil)
 
 	frames := readFrames(t, bufio.NewReader(&out))
 	if len(frames) != 2 {

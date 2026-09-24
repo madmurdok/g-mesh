@@ -49,9 +49,11 @@
 //! `hasSyntaxErrors` records it (see [`FileGraph::mark_syntax_errors`]) and
 //! the graph is committed like any other.
 
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use g_mesh_wire::{FileChangeDiff, Handshake, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
 
@@ -70,6 +72,19 @@ use crate::path::RelPath;
 /// Selects one-shot bulk-index mode. Must stay in sync with core's
 /// `daemon::bulk_index::BULK_INDEX_FLAG`.
 const BULK_INDEX_FLAG: &str = "--bulk-index";
+
+/// Set to `1` by core on every bulk spawn: stdin is then a pipe core holds
+/// open and never writes, and its EOF means core is gone (GM-397). Must stay
+/// in sync with core's `daemon::bulk_index::BULK_STDIN_LIFELINE_ENV`. Without
+/// it the bulk walk leaves stdin alone, so an older core or a hand run with
+/// `< /dev/null` is not read as "exit before walking".
+const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
+
+/// How long the control-plane reader gives the main loop to take the graceful
+/// path after core closed stdin, before it ends the process itself - see
+/// [`read_control_stream`]. Long enough for an idle loop's own shutdown, short
+/// enough that a plugin busy on a request is gone well within seconds.
+const LIFELINE_GRACE: Duration = Duration::from_secs(1);
 
 /// Runs the plugin. Does not return: both modes end in [`std::process::exit`].
 ///
@@ -97,6 +112,9 @@ pub fn run<E: Extractor>(extractor: E, spec: PluginSpec, semantic: Option<Semant
     let code = match args.iter().position(|arg| arg == BULK_INDEX_FLAG) {
         Some(flag) => {
             let root = args.get(flag + 1).map(PathBuf::from).unwrap_or_else(current_dir);
+            if std::env::var_os(BULK_STDIN_LIFELINE_ENV).is_some_and(|value| value == "1") {
+                watch_bulk_lifeline(&resolved.language);
+            }
             bulk_index(&extractor, &resolved, &root)
         }
         None => {
@@ -112,6 +130,36 @@ fn current_dir() -> PathBuf {
 }
 
 // --- bulk index -------------------------------------------------------------
+
+/// Starts the bulk walk's lifeline watcher (GM-397): a thread that reads and
+/// discards stdin, and ends the process the moment it reaches EOF.
+///
+/// The walk itself never touches stdin, and a walk can go a long time without
+/// writing - the project load, or any stretch that fits in the output buffer -
+/// so without this a killed core goes unnoticed until the next write fails,
+/// or never, if the walk finishes first. A read error counts as EOF: with the
+/// variable set, core promised a pipe, and a stdin that cannot be read is not
+/// one core is still holding.
+///
+/// Exits with 1, not 0: whatever core is left to read this stream, it did not
+/// get a complete one.
+fn watch_bulk_lifeline(language: &str) {
+    let language = language.to_string();
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        eprintln!("[{language}] core closed the bulk stream's lifeline - exiting");
+        std::process::exit(1);
+    });
+}
 
 /// Walks `root` and streams it. Returns the process exit code.
 fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> i32 {
@@ -204,10 +252,13 @@ fn control_plane<E: Extractor>(
     };
     session.load_project();
 
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let inbound = read_control_stream(&spec.language);
     loop {
-        match read_frame(&mut reader) {
+        // A closed channel means the reader is gone without saying why,
+        // which only a panic on its thread can do - the stream is as good as
+        // closed.
+        let next = inbound.recv().unwrap_or(Ok(None));
+        match next {
             // Core ends a plugin by closing its stdin
             // (`daemon::plugin::shutdown`), so this is the whole shutdown
             // path. The engine's own child process, if it has one, goes with
@@ -237,6 +288,60 @@ fn control_plane<E: Extractor>(
             }
         }
     }
+}
+
+/// Reads the control stream on its own thread and hands each frame to the
+/// main loop through a channel (GM-397).
+///
+/// Reading used to happen on the main loop itself, between requests - so a
+/// plugin busy on a long `semanticPass` did not notice core's death until the
+/// pass ended, up to core's 20-minute ceiling, with its language server
+/// running alongside. Here stdin is read continuously, whatever the main loop
+/// is doing:
+///
+/// - Frames and a framing error are passed on in order; the channel is
+///   unbounded, so a busy main loop never stops this thread reading.
+/// - On EOF the reader posts `Ok(None)`, which an idle main loop answers with
+///   the graceful path it always took (`LspClient`'s shutdown on drop). If the
+///   process is still alive [`LIFELINE_GRACE`] later, the main loop is stuck
+///   in a request, so this thread kills the language servers itself -
+///   `process::exit` skips `LspClient::drop` - and ends the process.
+///
+/// A framing error is passed on as well, and then the reader only drains
+/// stdin to its EOF: the main loop returns on the error as soon as it takes
+/// it, but it may be mid-request until then.
+fn read_control_stream(language: &str) -> Receiver<anyhow::Result<Option<Vec<u8>>>> {
+    let (sender, inbound) = mpsc::channel();
+    let language = language.to_string();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(io::stdin().lock());
+        loop {
+            match read_frame(&mut reader) {
+                Ok(Some(body)) => {
+                    if sender.send(Ok(Some(body))).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(Ok(None));
+                    break;
+                }
+                Err(err) => {
+                    // The stream is desynchronized and no further frame can
+                    // be trusted, but the main loop may still be mid-request
+                    // when it gets here: keep watching for EOF regardless.
+                    let _ = sender.send(Err(err));
+                    let _ = io::copy(&mut reader, &mut io::sink());
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(LIFELINE_GRACE);
+        crate::lsp::kill_live_servers();
+        eprintln!("[{language}] core closed the control stream mid-request - exiting");
+        std::process::exit(1);
+    });
+    inbound
 }
 
 struct Session<'a, E: Extractor> {

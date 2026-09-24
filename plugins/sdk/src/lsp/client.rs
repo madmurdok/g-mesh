@@ -49,12 +49,18 @@
 //! `Drop`: core ends a plugin by closing its stdin, so a server left running
 //! when the plugin exits is an orphan holding a workspace open with nothing
 //! reading its pipes.
+//!
+//! `Drop` does not run on `process::exit`, which is how the plugin ends when
+//! core dies while it is busy on a request (GM-397, `run::read_control_stream`).
+//! For that path every running server's `Child` is also registered in
+//! [`LIVE_SERVERS`], and [`kill_live_servers`] ends them from any thread.
 
 use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -92,10 +98,40 @@ pub(crate) enum Poll {
     Closed,
 }
 
+/// Every language server this process has started and not yet reaped, for
+/// [`kill_live_servers`]. Weak, so the registry never keeps a client's
+/// `Child` alive past the client itself.
+static LIVE_SERVERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+/// Kills and reaps every language server still running, from whatever thread
+/// is about to call `process::exit` (GM-397). The only caller is the
+/// control-plane reader's lifeline path, which ends the process while the main
+/// thread may be deep in a request holding the clients - so the kill goes
+/// through the shared `Child` handles rather than through `LspClient`.
+pub(crate) fn kill_live_servers() {
+    let servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for server in servers.iter().filter_map(Weak::upgrade) {
+        let mut child = lock(&server);
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A server's `Child`, taken even if a panicking thread poisoned it: the
+/// handle itself is always in a usable state.
+fn lock(child: &Mutex<Child>) -> MutexGuard<'_, Child> {
+    child.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// One running language server, and everything this process knows about it.
 pub(crate) struct LspClient {
     language: String,
-    child: Child,
+    /// Shared with [`LIVE_SERVERS`], so [`kill_live_servers`] can reach it
+    /// from another thread. Locked only for a single non-blocking call (or a
+    /// `wait` straight after a `kill`), so neither side holds it long.
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     incoming: Receiver<Value>,
     next_id: i64,
@@ -185,6 +221,13 @@ impl LspClient {
         let label = language.to_string();
         let server = config.engine.clone();
         std::thread::spawn(move || drain_stderr(&label, &server, stderr));
+
+        let child = Arc::new(Mutex::new(child));
+        {
+            let mut servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            servers.retain(|server| server.strong_count() > 0);
+            servers.push(Arc::downgrade(&child));
+        }
 
         let mut client = Self {
             language: language.to_string(),
@@ -333,7 +376,7 @@ impl LspClient {
     /// is what a send failure leaves behind, where nothing may ever be read
     /// again to notice the closed pipe).
     pub(crate) fn gone(&mut self) -> bool {
-        self.closed || matches!(self.child.try_wait(), Ok(Some(_)))
+        self.closed || matches!(lock(&self.child).try_wait(), Ok(Some(_)))
     }
 
     /// Sends a request and returns the id its answer will carry.
@@ -513,14 +556,16 @@ impl LspClient {
 
         let until = Instant::now() + grace;
         loop {
-            match self.child.try_wait() {
+            let exited = lock(&self.child).try_wait();
+            match exited {
                 Ok(Some(_)) => return,
                 Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
                 _ => break,
             }
         }
-        if self.child.kill().is_ok() {
-            let _ = self.child.wait();
+        let mut child = lock(&self.child);
+        if child.kill().is_ok() {
+            let _ = child.wait();
             eprintln!("[{}] the language server did not exit when asked - killed it", self.language);
         }
     }
