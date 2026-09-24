@@ -686,9 +686,9 @@ pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option
 ///
 /// Triggered by the path shape both bundled cargo-workspace plugins declare
 /// today (`plugins/python/plugin.toml`, `plugins/rust/plugin.toml`:
-/// `../../target/debug/g-mesh-plugin-<language>`, resolved by
-/// `daemon::manifest::resolve_path_entry` against the manifest's own
-/// directory) rather than by name, so a future third plugin that joins the
+/// `${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, resolved by
+/// `daemon::manifest::resolve_command` against the running g-mesh
+/// executable's own `target/<profile>/` directory since GM-404) rather than by name, so a future third plugin that joins the
 /// cargo workspace the same way is covered without this function learning
 /// its name - the same "generic over the mechanism, not the specific
 /// plugin" choice `missing_node_entry_hint`'s own doc comment makes for node.
@@ -703,7 +703,10 @@ pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option
 /// languages the project being indexed actually contains (see that module's
 /// own doc comment), so a checkout missing even one workspace-built plugin's
 /// binary needs the whole-workspace build to get unstuck, not just the one
-/// crate the failure happened to name.
+/// crate the failure happened to name. Adds `--release` when the missing
+/// binary is under `target/release/` (GM-404): that is where a release
+/// g-mesh looks for its plugins, and a plain `cargo build --workspace` would
+/// only fill `target/debug/`, leaving the error exactly where it was.
 ///
 /// # Which spelling the message names
 ///
@@ -746,16 +749,17 @@ fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Op
 
     let named =
         crate::daemon::manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
+    let build =
+        if profile == "release" { "cargo build --workspace --release" } else { "cargo build --workspace" };
 
     Some(match workspace_root {
         Some(root) => format!(
-            "the plugin binary {} does not exist - it has not been built yet. Run `cargo build --workspace` in {}",
+            "the plugin binary {} does not exist - it has not been built yet. Run `{build}` in {}",
             named.display(),
             root.display()
         ),
         None => format!(
-            "the plugin binary {} does not exist - it has not been built yet (run `cargo build --workspace` in \
-             the repository root)",
+            "the plugin binary {} does not exist - it has not been built yet (run `{build}` in the repository root)",
             named.display()
         ),
     })
@@ -1633,7 +1637,18 @@ mod tests {
         let binary = workspace.path().join("target").join("release").join("g-mesh-plugin-rust");
         let hint =
             missing_workspace_binary_hint(&binary).expect("a missing target/release binary must get a hint");
-        assert!(hint.contains("cargo build --workspace"), "{hint}");
+        assert!(hint.contains("cargo build --workspace --release"), "{hint}");
+    }
+
+    /// GM-404: a debug build is told to run the plain build, never `--release`.
+    #[test]
+    fn missing_workspace_binary_hint_names_no_release_flag_for_the_debug_profile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-rust");
+        let hint =
+            missing_workspace_binary_hint(&binary).expect("a missing target/debug binary must get a hint");
+        assert!(hint.contains("`cargo build --workspace`"), "{hint}");
+        assert!(!hint.contains("--release"), "{hint}");
     }
 
     /// A binary that exists gets no hint at all - the common case, and the

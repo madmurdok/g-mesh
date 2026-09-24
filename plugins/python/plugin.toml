@@ -4,8 +4,10 @@
 # rules it must satisfy. `language` must equal this directory's own name
 # ("python"), the same rule every other bundled plugin's manifest follows.
 #
-# `command` is a dev-time path into the workspace's own `target/` (relative
-# to this manifest's directory, `plugins/python/`), not a packaged layout -
+# `command` is a dev-time path into the workspace's own `target/<profile>/`
+# (`${G_MESH_BIN_DIR}` expands to the directory of the running g-mesh
+# executable, so a release g-mesh spawns the release plugin - GM-404), not a
+# packaged layout -
 # the same dev-checkout contract `plugins/rust/plugin.toml` documents for
 # itself, and for the same reason: this plugin is an ordinary member of the
 # repository's cargo workspace, built by `cargo build` like `core` itself,
@@ -39,7 +41,7 @@ protocol_version = 2
 plugin_version = "3.12.0"
 
 [plugin.spawn]
-command = "../../target/debug/g-mesh-plugin-python"
+command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
 
 [plugin.languages]
 # `.pyi` stubs are claimed too, so an edit to one reaches this plugin and
