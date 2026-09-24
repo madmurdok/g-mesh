@@ -352,6 +352,9 @@ pub(crate) fn run(
             &mut summary,
             Some(registry.embedding().as_ref()),
             None,
+            // No baselines from a one-language re-walk: see this module's
+            // own doc comment on why it leaves `indexed_files` alone.
+            None,
         )
         .with_context(|| format!("failed to re-walk {} after {changed_file} changed", manifest.language))?;
 

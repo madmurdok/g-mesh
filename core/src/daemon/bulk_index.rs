@@ -31,6 +31,7 @@
 //! touch, so threading the registry's lazy-spawn machinery through here would
 //! add a concept this code has no use for.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -48,6 +49,7 @@ use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
+use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
 /// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
@@ -58,6 +60,9 @@ pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 /// before a single row is written; one per item would mean a transaction per
 /// row. A few thousand keeps both bounded without tuning.
 const BATCH_ITEMS: usize = 2_000;
+
+/// `NodeKind::File`'s storage spelling (`watcher::apply::to_node_record`).
+const FILE_NODE_KIND: &str = "File";
 
 /// Holds a finished walk open for this many milliseconds before [`run`]
 /// returns, so the daemon has not yet recorded the walk as complete.
@@ -224,11 +229,24 @@ pub fn run_with_progress(
     if let Some(progress) = progress {
         progress.start_walk_progress(u32::try_from(manifests.len()).unwrap_or(u32::MAX));
     }
+    // Taken before the first plugin is spawned, so no plugin can have read a
+    // file before it - see `staleness::record_walk_baselines` for why that
+    // ordering is what makes the baselines below honest.
+    let walk_started = std::time::SystemTime::now();
+    let mut walked_files = BTreeSet::new();
     for manifest in manifests {
         if let Some(progress) = progress {
             progress.mark_language_started(&manifest.language);
         }
-        walk_one_language(project_root, manifest, conn, &mut summary, embedding, progress)?;
+        walk_one_language(
+            project_root,
+            manifest,
+            conn,
+            &mut summary,
+            embedding,
+            progress,
+            Some(&mut walked_files),
+        )?;
         if let Some(progress) = progress {
             progress.mark_language_done();
         }
@@ -246,6 +264,37 @@ pub fn run_with_progress(
         summary.linked_symbols = symbol_links::link_all(&mut conn)
             .context("failed to link the walk's cross-file symbol usages")?
             .linked_edges;
+    }
+
+    // GM-401: a staleness baseline for every file the walk indexed, so the
+    // first query of a file nobody has touched since takes
+    // `staleness::ensure_fresh`'s fast path instead of a synchronous reindex
+    // (a `fileChanged` round trip plus a per-file semantic pass - over a
+    // minute on a cold rust-analyzer). After linking, so a row is only ever
+    // written for a graph that is complete; before the walk is reported
+    // done, so no query can race it. Best-effort: a walk whose baselines
+    // could not be written is still a complete walk - its files reindex on
+    // first touch, exactly as before.
+    match staleness::record_walk_baselines(
+        conn,
+        project_root,
+        walked_files.iter().map(String::as_str),
+        walk_started,
+    ) {
+        Ok(baselines) => {
+            if baselines.skipped > 0 {
+                eprintln!(
+                    "g-mesh: {} of {} walked files got no staleness baseline (modified during or just \
+                     before the walk) - each reindexes on its first query",
+                    baselines.skipped,
+                    walked_files.len()
+                );
+            }
+        }
+        Err(err) => eprintln!(
+            "g-mesh: could not record the walk's staleness baselines - every file reindexes on its first \
+             query: {err:#}"
+        ),
     }
 
     hold_the_walk_open_for_tests();
@@ -275,6 +324,7 @@ pub(crate) fn walk_one_language(
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
+    walked_files: Option<&mut BTreeSet<String>>,
 ) -> Result<()> {
     // Same check `daemon::plugin::PluginState::spawn` makes before spawning
     // the interactive process - see `plugin::missing_plugin_binary_hint`'s
@@ -311,7 +361,7 @@ pub(crate) fn walk_one_language(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress, walked_files) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -396,6 +446,7 @@ pub(crate) fn ingest<R: BufRead>(
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
+    mut walked_files: Option<&mut BTreeSet<String>>,
 ) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
@@ -403,7 +454,17 @@ pub(crate) fn ingest<R: BufRead>(
     for item in NdjsonReader::new(reader) {
         match item {
             Ok(BulkItem::Node(node)) => {
-                batch.upsert_nodes.push(to_node_record(*node));
+                let record = to_node_record(*node);
+                // A `File` node is the plugin saying it parsed that file -
+                // the one statement `run`'s baselines may rest on. Other
+                // kinds' `filePath` is not used: a placeholder's need not be
+                // a file this walk read.
+                if record.kind == FILE_NODE_KIND {
+                    if let Some(walked) = walked_files.as_deref_mut() {
+                        walked.insert(record.file_path.clone());
+                    }
+                }
+                batch.upsert_nodes.push(record);
                 summary.nodes += 1;
             }
             Ok(BulkItem::Edge(edge)) => {
@@ -599,7 +660,7 @@ mod tests {
 
     fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
-        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None)?;
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None, None)?;
         Ok(summary)
     }
 

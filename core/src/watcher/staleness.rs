@@ -56,6 +56,14 @@
 //! The baseline is only written *after* `apply_file_change` succeeds, never
 //! before - if the reindex fails, no false "this file is now fresh" record
 //! is left behind.
+//!
+//! # Baselines from the bulk walk (GM-401)
+//!
+//! A cold-start walk (`daemon::bulk_index::run`) records a baseline for each
+//! file it indexed, via [`record_walk_baselines`], so the first query of an
+//! untouched file after a walk takes the fast path above rather than a
+//! synchronous reindex. That function's doc comment has the argument for why
+//! such a row never vouches for bytes the walk did not see.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -295,6 +303,118 @@ fn upsert_indexed_file(
     )
     .context("failed to upsert indexed_files row")?;
     Ok(())
+}
+
+/// How much older than the walk's start a file's mtime must be before
+/// [`record_walk_baselines`] trusts that the walk read its current content.
+/// Covers the coarsest mtime granularity in common use (FAT's 2 s; HFS+ and
+/// some network filesystems record whole seconds): a write made at or after
+/// the walk's start can be stamped up to one granule *earlier* than the
+/// instant it happened, so "mtime before the start" alone would not rule it
+/// out.
+pub(crate) const WALK_BASELINE_MTIME_MARGIN: Duration = Duration::from_secs(2);
+
+/// What [`record_walk_baselines`] did with the files a walk reported.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WalkBaselines {
+    /// Files that got an `indexed_files` row.
+    pub recorded: usize,
+    /// Files left without one - modified too close to (or after) the walk's
+    /// start, changed while being hashed, or unreadable. Each of these pays
+    /// the query-time reindex on its first touch, exactly as every file did
+    /// before GM-401.
+    pub skipped: usize,
+}
+
+/// Records an `indexed_files` baseline for each of `files` (project-relative)
+/// that a bulk walk started at `walk_started` indexed - GM-401. Without it the
+/// first query of *any* file after a fresh walk finds no row, reads the file
+/// as never indexed, and pays a synchronous reindex (a `fileChanged` round
+/// trip plus a per-file semantic pass, which on a cold language server ran
+/// for over a minute) before it answers.
+///
+/// # Why a row written here never claims content the index did not see
+///
+/// A baseline is a promise: "the graph was built from exactly these bytes".
+/// The walk's plugin read each file at some unknown instant after
+/// `walk_started` (the caller takes it before spawning the first plugin), and
+/// this runs after every plugin has exited. The daemon never sees the bytes
+/// the plugin read, so the promise is established from mtimes instead:
+///
+/// 1. `stat` the file. Its mtime must be earlier than `walk_started` by at
+///    least [`WALK_BASELINE_MTIME_MARGIN`]. A write at or after the walk's
+///    start - so possibly after the plugin's read - stamps an mtime no
+///    earlier than `walk_started` minus one granule, so this rules every
+///    such write out. The file's bytes have therefore been the same from
+///    before the plugin could have read them until this `stat`.
+/// 2. Hash the file, then `stat` it again. A different mtime means it was
+///    written while being hashed: the hash may not be of the bytes the walk
+///    saw, so the file is skipped.
+///
+/// A skipped file is simply left without a row, which is the state every
+/// file was in before this existed - its first query reindexes it. Nothing
+/// here can make a stale file look fresh except a write that lies about its
+/// own mtime (a backdating `touch -d`, `tar -x`, `rsync -t` landing *during*
+/// the walk), the same trust in mtimes `ensure_fresh`'s own fast path
+/// already places. In the daemon the watcher is registered before the walk,
+/// so even that write is queued and reparsed once the watcher's consumer
+/// starts.
+///
+/// Best-effort per file: a file that cannot be read is skipped, not fatal.
+/// Only the insert itself can fail this call. The rows are written in one
+/// transaction; `conn` is locked only for that transaction, never while
+/// hashing.
+pub(crate) fn record_walk_baselines<'a>(
+    conn: &Mutex<Connection>,
+    project_root: &Path,
+    files: impl IntoIterator<Item = &'a str>,
+    walk_started: std::time::SystemTime,
+) -> Result<WalkBaselines> {
+    let started_millis = walk_started
+        .checked_sub(WALK_BASELINE_MTIME_MARGIN)
+        .and_then(|cutoff| cutoff.duration_since(UNIX_EPOCH).ok())
+        .map(|cutoff| cutoff.as_millis() as i64);
+    let mut summary = WalkBaselines::default();
+    let Some(cutoff_millis) = started_millis else {
+        // A clock this close to the epoch cannot order anything.
+        summary.skipped = files.into_iter().count();
+        return Ok(summary);
+    };
+
+    let mut rows: Vec<(&str, i64, String)> = Vec::new();
+    for file_path in files {
+        match walk_baseline_for(project_root, file_path, cutoff_millis) {
+            Some((mtime, hash)) => rows.push((file_path, mtime, hash)),
+            None => summary.skipped += 1,
+        }
+    }
+
+    let mut guard = conn.lock().unwrap();
+    let tx = guard.transaction().context("failed to start the walk-baseline transaction")?;
+    for (file_path, mtime, hash) in &rows {
+        upsert_indexed_file(&tx, file_path, *mtime, hash)?;
+    }
+    tx.commit().context("failed to commit the walk's indexed_files baselines")?;
+    summary.recorded = rows.len();
+    Ok(summary)
+}
+
+/// One file's half of [`record_walk_baselines`]: its `(mtime, hash)` if the
+/// procedure in that function's doc comment proves the walk saw its current
+/// bytes, `None` otherwise.
+fn walk_baseline_for(project_root: &Path, file_path: &str, cutoff_millis: i64) -> Option<(i64, String)> {
+    let full_path = project_root.join(file_path);
+    let before = fs::metadata(&full_path).ok().filter(|metadata| metadata.is_file())?;
+    let mtime = mtime_millis(&before).ok()?;
+    if mtime >= cutoff_millis {
+        return None;
+    }
+    let hash = hash_file(&full_path).ok()?;
+    let after = fs::metadata(&full_path).ok()?;
+    if mtime_millis(&after).ok()? != mtime || after.len() != before.len() {
+        return None;
+    }
+    Some((mtime, hash))
 }
 
 /// Milliseconds since the Unix epoch, per `metadata.modified()`. Kept as a
@@ -774,5 +894,72 @@ mod tests {
             })
             .unwrap();
         assert!(mtime_after > mtime_before, "mtime baseline must be refreshed even without a reindex");
+    }
+
+    /// Sets `path`'s mtime to `when`, so a test can place a file firmly
+    /// before (or after) a walk's start without sleeping.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn baseline_row(conn: &Mutex<Connection>, file_path: &str) -> Option<(i64, String)> {
+        conn.lock()
+            .unwrap()
+            .query_row(
+                "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = ?1",
+                params![file_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// GM-401: a file last written well before the walk started gets a
+    /// baseline equal to what `decide` would compute for it - so the very
+    /// next `ensure_fresh` takes the fast path - while a file written at or
+    /// after the walk's start (the walk may have read it before that write)
+    /// gets none, and neither does a path that is gone or not a file.
+    ///
+    /// Control: drop the `mtime >= cutoff_millis` check in
+    /// `walk_baseline_for` - `fresh.rs` gets a row and the `None` assertion
+    /// fails.
+    #[test]
+    fn walk_baselines_vouch_only_for_files_untouched_since_the_walk_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let walk_started = std::time::SystemTime::now();
+
+        fs::write(tmp.path().join("old.rs"), b"fn old() {}").unwrap();
+        set_mtime(&tmp.path().join("old.rs"), walk_started - Duration::from_secs(3600));
+        // Written "during the walk": after its start.
+        fs::write(tmp.path().join("fresh.rs"), b"fn fresh() {}").unwrap();
+        set_mtime(&tmp.path().join("fresh.rs"), walk_started + Duration::from_millis(1));
+        // Written just before the start, within one coarse mtime granule of it.
+        fs::write(tmp.path().join("edge.rs"), b"fn edge() {}").unwrap();
+        set_mtime(&tmp.path().join("edge.rs"), walk_started - Duration::from_millis(500));
+        fs::create_dir(tmp.path().join("dir.rs")).unwrap();
+
+        let conn = Mutex::new(setup_conn());
+        let summary = record_walk_baselines(
+            &conn,
+            tmp.path(),
+            ["old.rs", "fresh.rs", "edge.rs", "gone.rs", "dir.rs"],
+            walk_started,
+        )
+        .unwrap();
+
+        assert_eq!(summary, WalkBaselines { recorded: 1, skipped: 4 });
+        let (mtime, hash) = baseline_row(&conn, "old.rs").expect("old.rs must be baselined");
+        assert_eq!(mtime, mtime_millis(&fs::metadata(tmp.path().join("old.rs")).unwrap()).unwrap());
+        assert_eq!(hash, hash_file(&tmp.path().join("old.rs")).unwrap());
+        assert_eq!(baseline_row(&conn, "fresh.rs"), None, "a file written after the walk started");
+        assert_eq!(baseline_row(&conn, "edge.rs"), None, "a file within the mtime margin of the start");
+        assert_eq!(baseline_row(&conn, "gone.rs"), None);
+        assert_eq!(baseline_row(&conn, "dir.rs"), None);
+
+        // What the baseline buys: no reindex on the first check.
+        assert!(!is_stale(&conn.lock().unwrap(), tmp.path(), "old.rs").unwrap());
+        // And what it must not cost: an edit after the walk is still stale.
+        fs::write(tmp.path().join("old.rs"), b"fn old_and_edited() {}").unwrap();
+        assert!(is_stale(&conn.lock().unwrap(), tmp.path(), "old.rs").unwrap());
     }
 }
