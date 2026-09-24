@@ -215,9 +215,14 @@ impl ActivationCtx {
         // embedding is the backfill pass's job (`activate`). A tool call
         // issued while this runs waits for it (`mcp::GMeshMcpServer::prepare`)
         // rather than being answered off a half-built graph.
-        let summary =
-            bulk_index::run(&self.canonical_root, &self.conn, None, &self.discovered_for_bulk_index)
-                .context("failed to build the project's initial index")?;
+        let summary = bulk_index::run_with_progress(
+            &self.canonical_root,
+            &self.conn,
+            None,
+            &self.discovered_for_bulk_index,
+            Some(&self.indexing),
+        )
+        .context("failed to build the project's initial index")?;
 
         // Flipped *before* the completion marker is written. The phase
         // governs what this process answers; `bulkIndexedAt` governs whether

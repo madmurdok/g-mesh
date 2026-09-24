@@ -137,7 +137,7 @@
 //! surfaced while comparing kungfu" subsection for the fuller writeup this
 //! decision closes out.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -290,12 +290,13 @@ struct Inner {
     /// notification ("indexing for 42s") to report against; nothing in this
     /// slice reads it back yet.
     phase_since: Mutex<Instant>,
-    // --- Progress counters (D3 in docs/architecture/lazy-indexing.md). ---
-    // Nothing in this slice consumes these yet - the progress notifications
-    // that would read them are GM-395's slice 3 (D6) - but the type and its
-    // setters exist now, as part of the phase machine's full API, so that
-    // slice has somewhere to write and read rather than growing this struct
-    // again later.
+    // --- Progress counters (D3/D6 in docs/architecture/lazy-indexing.md). ---
+    // Written by the walk (`daemon::bulk_index::run_with_progress`) and the
+    // embedding backfill pass (`embedding::backfill::run`); read only by
+    // [`IndexingStatus::progress_message`], which renders them for a waiting
+    // tool call's progress notifications and its "still indexing" error.
+    // Relaxed throughout: each is an independent display value, and nothing
+    // decides anything off a combination of them.
     items_ingested: std::sync::atomic::AtomicU64,
     languages_done: std::sync::atomic::AtomicU32,
     languages_total: std::sync::atomic::AtomicU32,
@@ -564,8 +565,19 @@ impl IndexingStatus {
         activation.requested = false;
     }
 
-    // --- Progress counters - see `Inner`'s own doc comment on why these are
-    // unused within this crate for now. ---
+    // --- Progress counters - see `Inner`'s own comment on them. ---
+
+    /// Resets the walk's counters for a walk over `languages_total`
+    /// languages. Called at the start of every walk rather than relying on
+    /// the counters' initial zeroes, because a failed walk is retried on the
+    /// same status (`Phase::Failed`), and a retry that inherited the failed
+    /// attempt's counts would report more languages done than exist.
+    pub fn start_walk_progress(&self, languages_total: u32) {
+        self.0.items_ingested.store(0, Ordering::Relaxed);
+        self.0.languages_done.store(0, Ordering::Relaxed);
+        self.0.languages_total.store(languages_total, Ordering::Relaxed);
+        *self.0.current_language.lock().unwrap() = None;
+    }
 
     pub fn add_items_ingested(&self, count: u64) {
         self.0.items_ingested.fetch_add(count, Ordering::Relaxed);
@@ -573,10 +585,6 @@ impl IndexingStatus {
 
     pub fn items_ingested(&self) -> u64 {
         self.0.items_ingested.load(Ordering::Relaxed)
-    }
-
-    pub fn set_languages_total(&self, total: u32) {
-        self.0.languages_total.store(total, Ordering::Relaxed);
     }
 
     pub fn mark_language_started(&self, language: &str) {
@@ -595,7 +603,10 @@ impl IndexingStatus {
         )
     }
 
+    /// Starts a backfill pass's progress: `done` restarts at zero, so a later
+    /// pass never reports the counts of an earlier one.
     pub fn set_embed_total(&self, total: u64) {
+        self.0.embed_done.store(0, Ordering::Relaxed);
         self.0.embed_total.store(total, Ordering::Relaxed);
     }
 
@@ -606,6 +617,60 @@ impl IndexingStatus {
     pub fn embed_progress(&self) -> (u64, u64) {
         (self.0.embed_done.load(Ordering::Relaxed), self.0.embed_total.load(Ordering::Relaxed))
     }
+
+    /// The counters rendered for a person, prefixed with the project root:
+    /// `"indexing /abs/root: walking rust (2/4 languages done), 48,210 nodes
+    /// and edges so far"`. What a waiting tool call puts in each progress
+    /// notification's `message` and in its "still indexing" error (D6, D7).
+    ///
+    /// Only the numbers that are real are shown: the file total is unknown
+    /// while walking (the plugin enumerates files itself, and counting them
+    /// first would be a second walk), and linking has no counter at all, so
+    /// that stage is named rather than measured.
+    pub fn progress_message(&self, root: &Path) -> String {
+        format!("indexing {}: {}", root.display(), self.progress_detail())
+    }
+
+    /// [`progress_message`](Self::progress_message) without the root prefix.
+    pub fn progress_detail(&self) -> String {
+        match self.phase() {
+            Phase::Unindexed => "starting".to_string(),
+            Phase::Walking => {
+                let (done, total, current) = self.language_progress();
+                let items = group_thousands(self.items_ingested());
+                if total > 0 && done >= total {
+                    format!("linking imports and symbols ({items} nodes and edges walked)")
+                } else if total > 0 {
+                    let current = current.unwrap_or_else(|| "the first language".to_string());
+                    format!(
+                        "walking {current} ({done}/{total} languages done), {items} nodes and edges so far"
+                    )
+                } else {
+                    format!("walking, {items} nodes and edges so far")
+                }
+            }
+            Phase::Structural => "structural index built, embedding pass not started yet".to_string(),
+            Phase::Embedding => match self.embed_progress() {
+                (_, 0) => "embeddings: counting what needs embedding".to_string(),
+                (done, total) => format!("embeddings {}/{}", group_thousands(done), group_thousands(total)),
+            },
+            Phase::Ready => "ready".to_string(),
+            Phase::Failed(message) => format!("failed: {message}"),
+        }
+    }
+}
+
+/// `48210` as `"48,210"`.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -819,5 +884,48 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::Satisfied);
+    }
+
+    #[test]
+    fn group_thousands_groups_by_three_from_the_right() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(48_210), "48,210");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
+
+    /// D6's message, stage by stage: the counters that exist are shown, and
+    /// a restarted walk does not inherit the previous attempt's counts.
+    #[test]
+    fn progress_message_renders_the_real_counters_per_stage() {
+        let root = Path::new("/abs/root");
+        let status = IndexingStatus::walking();
+        status.start_walk_progress(4);
+        status.mark_language_done();
+        status.mark_language_done();
+        status.mark_language_started("rust");
+        status.add_items_ingested(48_210);
+        assert_eq!(
+            status.progress_message(root),
+            "indexing /abs/root: walking rust (2/4 languages done), 48,210 nodes and edges so far"
+        );
+
+        status.mark_language_done();
+        status.mark_language_done();
+        assert_eq!(status.progress_detail(), "linking imports and symbols (48,210 nodes and edges walked)");
+
+        status.start_walk_progress(1);
+        status.mark_language_started("typescript");
+        assert_eq!(
+            status.progress_detail(),
+            "walking typescript (0/1 languages done), 0 nodes and edges so far"
+        );
+
+        status.set_phase(Phase::Embedding);
+        assert_eq!(status.progress_detail(), "embeddings: counting what needs embedding");
+        status.set_embed_total(40_113);
+        status.add_embed_done(12_400);
+        assert_eq!(status.progress_message(root), "indexing /abs/root: embeddings 12,400/40,113");
     }
 }

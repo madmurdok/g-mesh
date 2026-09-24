@@ -39,6 +39,7 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
@@ -141,6 +142,22 @@ pub fn run(
     embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
 ) -> Result<BulkIndexSummary> {
+    run_with_progress(project_root, conn, embedding, discovered, None)
+}
+
+/// [`run`], also reporting how far it has got through `progress`'s walk
+/// counters - languages done out of total, the language being walked, and
+/// nodes plus edges ingested so far (GM-395 D6). Only the daemon's
+/// activation passes `Some`: a waiting tool call renders those counters into
+/// its progress notifications. The CLI's in-process walks have nobody to
+/// report to and call [`run`].
+pub fn run_with_progress(
+    project_root: &Path,
+    conn: &Mutex<Connection>,
+    embedding: Option<&EmbeddingPipeline>,
+    discovered: &DiscoveredPlugins,
+    progress: Option<&IndexingStatus>,
+) -> Result<BulkIndexSummary> {
     let mut summary = BulkIndexSummary::default();
 
     // Sorted so a run over N languages walks them - and, if one fails, names
@@ -204,8 +221,17 @@ pub fn run(
     // shipped with it (`scripts/bundle-rust-plugin.sh` and its
     // not-yet-written Python counterpart), so a real end user with no
     // interest in Python never has a `target/debug/` path to be missing.
+    if let Some(progress) = progress {
+        progress.start_walk_progress(u32::try_from(manifests.len()).unwrap_or(u32::MAX));
+    }
     for manifest in manifests {
-        walk_one_language(project_root, manifest, conn, &mut summary, embedding)?;
+        if let Some(progress) = progress {
+            progress.mark_language_started(&manifest.language);
+        }
+        walk_one_language(project_root, manifest, conn, &mut summary, embedding, progress)?;
+        if let Some(progress) = progress {
+            progress.mark_language_done();
+        }
     }
 
     // Only now, with every language's stream over: an import can only be
@@ -248,6 +274,7 @@ pub(crate) fn walk_one_language(
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     // Same check `daemon::plugin::PluginState::spawn` makes before spawning
     // the interactive process - see `plugin::missing_plugin_binary_hint`'s
@@ -284,7 +311,7 @@ pub(crate) fn walk_one_language(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding) {
+    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -368,6 +395,7 @@ pub(crate) fn ingest<R: BufRead>(
     conn: &Mutex<Connection>,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
 ) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
@@ -396,6 +424,9 @@ pub(crate) fn ingest<R: BufRead>(
             }
         }
 
+        if let Some(progress) = progress {
+            progress.add_items_ingested(1);
+        }
         batched += 1;
         if batched >= BATCH_ITEMS {
             commit(conn, &mut batch, embedding)?;
@@ -568,7 +599,7 @@ mod tests {
 
     fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
-        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None)?;
+        ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None)?;
         Ok(summary)
     }
 
