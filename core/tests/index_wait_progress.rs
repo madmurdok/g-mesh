@@ -279,10 +279,22 @@ async fn a_waiting_call_with_a_token_gets_a_heartbeat_then_the_full_answer() {
         log.contains("prepare: entered tool=get_file_outline") && log.contains("progressToken=present"),
         "the trace must record the request's progressToken as present:\n{log}"
     );
-    assert!(
-        log.contains("outcome=satisfied") && log.contains(&format!("progress_sent={}", seen.len())),
-        "the trace must record the wait's outcome and how many notifications it sent ({}):\n{log}",
-        seen.len()
+    // Two heartbeats can serve one call since GM-401: the indexing wait's,
+    // then `ensure_file_fresh`'s while it reindexes `src/index.ts` (written
+    // just before the walk, so the walk leaves it without a baseline). Under
+    // load that reindex can outlast a 200 ms tick, so the notifications the
+    // client saw are the two traced counts together.
+    let sent_by = |prefix: &str| -> usize {
+        log.lines()
+            .filter(|line| line.contains(prefix))
+            .filter_map(|line| line.rsplit("progress_sent=").next()?.trim().parse::<usize>().ok())
+            .sum()
+    };
+    assert!(log.contains("outcome=satisfied"), "the trace must record the wait's outcome:\n{log}");
+    assert_eq!(
+        sent_by("prepare: wait over tool=get_file_outline") + sent_by("ensure_fresh: tool=get_file_outline"),
+        seen.len(),
+        "the trace must record how many notifications were sent:\n{log}"
     );
 
     client.cancel().await.expect("failed to shut the client down");

@@ -218,8 +218,11 @@ pub struct IndexStatus {
     /// against a recorded baseline that no longer matches the file on disk.
     ///
     /// A bulk-indexed file with no `indexed_files` row is *not* counted:
-    /// `daemon::bulk_index` records nodes without baselines, so a missing
-    /// baseline means "walked, never edited since", not "stale".
+    /// `daemon::bulk_index` leaves a walked file without a baseline when it
+    /// cannot prove the walk saw its current bytes (GM-401,
+    /// `watcher::staleness::record_walk_baselines`), and an index built
+    /// before GM-401 has none at all - so a missing baseline means "walked,
+    /// not yet checked since", not "stale".
     pub dirty: usize,
     /// Project-relative paths of files the plugin flagged as only partially
     /// parseable, sorted.
