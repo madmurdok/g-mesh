@@ -99,6 +99,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::daemon::candidates::Detection;
 use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 
 /// Working ceiling this module renders under - see this module's doc comment
@@ -634,6 +635,83 @@ pub fn present_languages(
             PresentLanguage { language, capabilities, semantic_pass_done }
         })
         .collect()
+}
+
+/// How a front counts its projects: `N`, or `N+` when the walk stopped at a
+/// limit and more may exist.
+pub(crate) fn project_count(count: usize, truncated: bool) -> String {
+    if truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
+}
+
+/// The front's sentence (D12), with `subject` naming the folder: either the
+/// root path (`"<root> is a folder of"`) or the no-path fallback (`"This
+/// folder holds"`). Worded to stay true after a session switch (D11 step 5):
+/// it says "before any other tool", never "nothing is selected".
+fn front_sentence(subject: &str, count: &str) -> String {
+    format!(
+        "{subject} {count} projects; g-mesh serves one at a time and has indexed none of them. \
+         Before any other g-mesh tool, call select_project with the one you are working on (ask the \
+         user if unclear). Its result names the project this session then serves and carries that \
+         project's guidance; call it again to switch, or to re-read that guidance. Projects: "
+    )
+}
+
+/// `head` followed by as many of `names` as fit under
+/// [`INSTRUCTIONS_BYTE_CEILING`], then either `.` (all listed) or the `(+K
+/// more ...)` pointer, with how many names made it. `None` when not even the
+/// head and its ending fit.
+fn front_with_names(head: &str, names: &[&str]) -> Option<(String, usize)> {
+    let ending = |listed: usize| {
+        if listed == names.len() {
+            ".".to_string()
+        } else {
+            format!(
+                " (+{} more - call select_project with no argument for the full list).",
+                names.len() - listed
+            )
+        }
+    };
+    let mut listed = 0;
+    let mut body = String::new();
+    while listed < names.len() {
+        let separator = if listed == 0 { "" } else { ", " };
+        let next = format!("{body}{separator}{}", names[listed]);
+        if head.len() + next.len() + ending(listed + 1).len() > INSTRUCTIONS_BYTE_CEILING {
+            break;
+        }
+        body = next;
+        listed += 1;
+    }
+    let rendered = format!("{head}{body}{}", ending(listed));
+    (rendered.len() <= INSTRUCTIONS_BYTE_CEILING).then_some((rendered, listed))
+}
+
+/// `get_info`'s instructions for a front (D12 in
+/// `docs/architecture/lazy-indexing.md`, GM-399): [`P1`] (true before and
+/// after a switch), then the folder sentence and as many candidate
+/// `rel_path`s as fit under [`INSTRUCTIONS_BYTE_CEILING`]. The language
+/// paragraphs are left out: no language is known yet, and the selected
+/// project's own guidance arrives in the `select_project` result.
+///
+/// When the root path would cost the list its first name (or break the
+/// ceiling outright), the path is dropped - the same fallback [`cold_start`]
+/// uses.
+pub fn build_front(root: &Path, detection: &Detection) -> String {
+    let names: Vec<&str> = detection.candidates.iter().map(|c| c.rel_path.as_str()).collect();
+    let count = project_count(names.len(), detection.truncated);
+    let with_path =
+        format!("{P1}\n\n{}", front_sentence(&format!("{} is a folder of", root.display()), &count));
+    if let Some((rendered, listed)) = front_with_names(&with_path, &names) {
+        if listed > 0 || names.is_empty() {
+            return rendered;
+        }
+    }
+    let without_path = format!("{P1}\n\n{}", front_sentence("This folder holds", &count));
+    front_with_names(&without_path, &names).map(|(rendered, _)| rendered).unwrap_or(without_path)
 }
 
 #[cfg(test)]
@@ -1297,5 +1375,58 @@ results instead of paging.";
             rendered.starts_with("Not indexed yet"),
             "the fallback line replaces the whole prefix, not just the path: {rendered}"
         );
+    }
+
+    fn front_detection(names: &[String], truncated: bool) -> Detection {
+        use crate::daemon::candidates::{Candidate, Mode};
+        Detection {
+            mode: Mode::Multi,
+            candidates: names
+                .iter()
+                .map(|name| Candidate {
+                    rel_path: name.clone(),
+                    abs_path: std::path::PathBuf::from("/x").join(name),
+                    markers: vec![".git"],
+                    is_worktree: false,
+                })
+                .collect(),
+            entries_read: names.len(),
+            elapsed: std::time::Duration::ZERO,
+            truncated,
+            walked: true,
+        }
+    }
+
+    /// GM-399 slice 4 test 3 (D12): the worst case the design names - 64
+    /// candidates with 60-byte names under a 103-byte root - fits under the
+    /// ceiling, still lists at least one name, and points at the rest.
+    #[test]
+    fn build_front_with_64_long_names_under_a_103_byte_root_fits_the_ceiling() {
+        let root = root_of_byte_len(103);
+        let names: Vec<String> = (0..64).map(|n| format!("{n:02}{}", "n".repeat(58))).collect();
+        assert!(names.iter().all(|name| name.len() == 60));
+        let rendered = build_front(&root, &front_detection(&names, false));
+        println!("front (64 x 60-byte names, 103-byte root) bytes: {}", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+        assert!(rendered.contains(&names[0]), "at least one name must be listed: {rendered}");
+        assert!(rendered.contains(" (+"), "the names that did not fit must be pointed at: {rendered}");
+        assert!(rendered.contains(" more - call select_project with no argument"));
+        assert!(rendered.contains(&root.display().to_string()), "a 103-byte root still fits: {rendered}");
+        assert!(rendered.contains("is a folder of 64 projects"));
+    }
+
+    /// D12's no-path fallback: a root too long for the ceiling is dropped
+    /// from the text rather than truncated or allowed to overflow.
+    #[test]
+    fn build_front_drops_a_root_too_long_for_the_ceiling() {
+        // 1,400 bytes rather than `cold_start`'s 600: the front's text has
+        // no language paragraphs, so a 600-byte root still fits beside it.
+        let root = root_of_byte_len(1400);
+        let names = vec!["a".to_string(), "b".to_string()];
+        let rendered = build_front(&root, &front_detection(&names, true));
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+        assert!(!rendered.contains("/rrrr"), "the root must not appear: {rendered}");
+        assert!(rendered.contains("This folder holds 2+ projects"), "{rendered}");
+        assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
     }
 }

@@ -253,7 +253,7 @@ impl IdleTimeouts {
 /// `None` for a configured zero (the timer is off), the default for anything
 /// unparseable - a typo in a setting must not silently turn a timer off, and
 /// must not stop the daemon from starting either.
-fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) -> Option<Duration> {
+pub(crate) fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) -> Option<Duration> {
     let Some(raw) = raw else { return Some(default) };
     match raw.trim().parse::<u64>() {
         Ok(0) => None,

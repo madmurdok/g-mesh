@@ -500,6 +500,10 @@ New module `core/src/daemon/candidates.rs`:
   rel_path, abs_path, markers: Vec<&'static str>, is_worktree: bool }>,
   entries_read, elapsed, truncated }`, sorted by `rel_path`. `abs_path` is
   canonical (the shim compares it against its own canonical root, D11 step 3).
+  *As built (slice 4):* `Mode::Single` carries which rule settled it, and
+  `Detection.walked` says whether the walk ran; the walk itself is also
+  exposed alone as `candidates::walk`, which `select_project` and `g-mesh
+  status` use to re-list a folder already known to be a front.
 - **Where it runs:** in `daemon::run` (`daemon/mod.rs:370`), after the
   singleton lock (`:383`) and the build stamp (`:396-403`), and **before
   plugin discovery** (`:426`) and `connection::open` (`:429`).
@@ -516,7 +520,9 @@ New module `core/src/daemon/candidates.rs`:
 - A hidden CLI, `g-mesh debug-candidates [DIR] [--json]` (`#[command(hide =
   true)]`, as `cli/mod.rs:101` already does for another subcommand), prints
   `Detection` including `entries_read` and `elapsed`. It exists for M4 and for
-  support.
+  support. *As built:* when rule 1 or 2 settled the mode without a walk, it
+  runs the walk anyway (and says so, `walkNeeded: false`), so M4 can measure
+  folders that already have an index.
 
 ### D11. Multi-project roots: a front daemon plus a session switch in the shim
 
@@ -741,7 +747,9 @@ Options considered:
   - The language paragraphs (`P2`-`P5`) are omitted: no language is known
     yet, and they arrive in the `select_project` result.
   - If the root path alone would break the ceiling, drop it (`"This folder
-    holds N projects; ..."`), the same fallback `cold_start` uses.
+    holds N projects; ..."`), the same fallback `cold_start` uses. *As
+    built:* the path is also dropped when keeping it would leave no room for
+    even the first project name.
   - A test asserts the result is ≤ ceiling for 64 candidates with 60-byte
     names under a 103-byte root (the same worst-case root as the existing
     `cold_start` test), and that at least one name is listed.
@@ -1141,8 +1149,10 @@ builds each control in its own worktree and reports any that does not fail.*
    - 64 candidates with 60-byte names under a 103-byte root: ≤ ceiling, at
      least one name, and the `(+K more` suffix. *Control:* list every name
      with no ceiling check.
-   - A 600-byte root: ≤ ceiling and no root path in the text. *Control:*
-     remove the no-path fallback.
+   - A 1,400-byte root: ≤ ceiling and no root path in the text. *Control:*
+     remove the no-path fallback. (*Changed from 600 bytes in slice 4:* the
+     front's text has no language paragraphs, so a 600-byte root still fits
+     beside it and would never reach the fallback.)
 4. `tests/cli_status.rs`: `g-mesh status` in a front-served root prints the
    front line and no coverage line. *Control:* remove the `Some("front")`
    arm. `tests/cli_clean.rs`: `clean` and `clean orphaned` on a front state

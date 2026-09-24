@@ -73,6 +73,7 @@ pub(crate) mod find_callers_callees;
 pub(crate) mod find_definition;
 pub(crate) mod find_implementations;
 pub(crate) mod find_references;
+pub mod front;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
 mod instructions;
