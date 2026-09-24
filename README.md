@@ -179,7 +179,9 @@ cargo build -p g-mesh-plugin-python
 
 Build order doesn't matter, but all four are required — a dev checkout's
 daemon discovers every bundled plugin unconditionally and refuses to start
-(hard failure) if it can't spawn one of them.
+(hard failure) if it can't spawn one of them. The Rust and Python plugins are
+looked up next to the running `g-mesh` binary, so a `target/release/g-mesh`
+needs them built with `--release` too (`cargo build --workspace --release`).
 
 ### 5. Embedding model (optional — only `search_code` needs it)
 
