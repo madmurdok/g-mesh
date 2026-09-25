@@ -147,6 +147,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
+use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
@@ -300,6 +301,16 @@ impl SemanticPassRun {
 /// recorded as the language's reason ([`NOT_RUN_REASON`]), so status says why
 /// the language is owed rather than "never completed".
 pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) -> SemanticPassRun {
+    run_with_registry_and_progress(registry, conn, None)
+}
+
+/// [`run_with_registry`], counting each owed language's pass on `progress`
+/// as it starts and ends, so `cli::status` can say which language is running.
+pub fn run_with_registry_and_progress(
+    registry: &PluginRegistry,
+    conn: &Mutex<Connection>,
+    progress: Option<&IndexingStatus>,
+) -> SemanticPassRun {
     let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let owed = {
         let guard = conn.lock().unwrap();
@@ -312,8 +323,14 @@ pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) ->
         }
     };
 
+    if let Some(progress) = progress {
+        progress.start_semantic_progress(u32::try_from(owed.len()).unwrap_or(u32::MAX));
+    }
     let mut run = SemanticPassRun::default();
     for language in owed {
+        if let Some(progress) = progress {
+            progress.mark_semantic_language_started(&language);
+        }
         let file_count = indexed_file_count(conn, &language);
         let outcome = registry
             .get_or_spawn(&language)
@@ -326,6 +343,9 @@ pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) ->
             // why rather than "never completed".
             Ok(false) => record_not_run(conn, &language),
             Err(err) => run.record_failure(conn, language, err),
+        }
+        if let Some(progress) = progress {
+            progress.mark_semantic_language_done();
         }
     }
 
@@ -589,7 +609,7 @@ mod tests {
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         let (owed, failures) = crate::cli::status::semantic_pass_state(&guard, &capable).unwrap();
         let completed = schema::semantic_pass_completed(&guard).unwrap();
-        crate::cli::status::semantic_pass_lines(completed, &owed, &failures)
+        crate::cli::status::semantic_pass_lines(completed, &owed, &failures, None)
     }
 
     fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {

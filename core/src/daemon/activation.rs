@@ -141,7 +141,8 @@ impl ActivationCtx {
             eprintln!(
                 "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
             );
-            semantic::run_with_registry(&self.registry, &self.conn).log("the previously-interrupted index");
+            semantic::run_with_registry_and_progress(&self.registry, &self.conn, Some(&self.indexing))
+                .log("the previously-interrupted index");
             self.needs_semantic_pass_retry = false;
         }
 
@@ -263,7 +264,8 @@ impl ActivationCtx {
         // Running it before the watcher's consumer starts (`activate`) keeps
         // it strictly first. Which plugins it asks is `daemon::semantic`'s to
         // say (GM-270).
-        semantic::run_with_registry(&self.registry, &self.conn).log("the freshly built index");
+        semantic::run_with_registry_and_progress(&self.registry, &self.conn, Some(&self.indexing))
+            .log("the freshly built index");
         Ok(())
     }
 }

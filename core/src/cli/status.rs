@@ -48,6 +48,9 @@
 //!   `unindexed` under a live, idle daemon for as long as nothing has asked,
 //!   which the old "`daemon_alive` implies a walk is under way" reasoning
 //!   could not tell apart from an actual walk in progress.
+//! - **Index progress**: the counters the same daemon publishes to
+//!   `index.progress` (`daemon::read_progress_in`), shown per stage only
+//!   while the pid they carry is the live daemon's ([`live_progress`]).
 //! - **Dirty files / index coverage**: a gitignore-aware walk of the project,
 //!   cross-referenced against the `File` nodes and `indexed_files` baselines
 //!   in the index. See [`IndexStatus`] for exactly what each number counts.
@@ -66,6 +69,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
+use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
@@ -268,6 +272,10 @@ pub struct Report {
     /// its whole-folder file walk is exactly the cost a front exists to
     /// avoid.
     pub front: Option<FrontSummary>,
+    /// The progress counters last published to `index.progress`, whichever
+    /// daemon wrote them - [`render`] shows them only while their `pid` is
+    /// the live daemon's (see [`live_progress`]).
+    pub progress: Option<ProgressSnapshot>,
 }
 
 /// What `g-mesh status` says about a front: how many projects, and whether
@@ -334,6 +342,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         index,
         phase,
         front,
+        progress: daemon::read_progress_in(&state_dir),
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -519,15 +528,19 @@ pub(crate) fn semantic_pass_state(
 
 /// The report's semantic-pass lines: one per language whose last pass
 /// failed, with its reason, and the "never completed" advice only while some
-/// owed language has no recorded failure to explain it.
+/// owed language has no recorded failure to explain it and no live daemon is
+/// working on the index. `in_progress` is what to say instead while one is.
 pub(crate) fn semantic_pass_lines(
     completed: bool,
     owed: &[String],
     failures: &[(String, String)],
+    in_progress: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     if completed {
         lines.push("  semantic pass:   complete".to_string());
+    } else if let Some(in_progress) = in_progress {
+        lines.push(format!("  semantic pass:   {in_progress}"));
     } else {
         let unexplained = owed.iter().any(|language| !failures.iter().any(|(failed, _)| failed == language));
         if unexplained || failures.is_empty() {
@@ -723,23 +736,12 @@ pub fn render(report: &Report) -> String {
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
 
     let index = &report.index;
-    // A daemon in its cold-start walk binds its socket and answers "still
-    // indexing" per call (task 105) well before `bulk_indexed` flips - so
-    // `!bulk_indexed` alone no longer means "nothing is happening about this".
-    // Cross-referencing `report.core` is what tells "a walk is under way right
-    // now" apart from "no daemon is doing anything about this at all", which
-    // is the only case that still means "still owed".
+    // A phase word or progress file whose daemon is not running was left
+    // behind by one killed before it could remove them, so neither is read
+    // as what is happening now.
     let daemon_alive = !matches!(report.core, CoreState::NotRunning);
-    // D13 in `docs/architecture/lazy-indexing.md`: `report.phase` is the
-    // running daemon's own word for where it stands, read off `index.phase`
-    // rather than inferred from `bulk_indexed`/`core` alone - the fact GM-395's
-    // lazy activation needs and the pre-existing fields cannot give on their
-    // own, since a project can now sit `unindexed` for as long as nothing has
-    // asked, indistinguishable from "about to be walked" under the old
-    // `daemon_alive && !bulk_indexed` reasoning. `structural` and `ready` get
-    // no line here, same as the pre-GM-395 "say nothing once the walk is
-    // done" behaviour - `phase` is `None` whenever no daemon is running, which
-    // falls through to the same two messages this reported before D13.
+    let phase = if daemon_alive { report.phase.as_deref() } else { None };
+    let progress = live_progress(report);
     if let Some(front) = report.front {
         // A front has no index: no coverage, no dirty files, nothing to
         // repair. A session picks one of the projects, which is then served
@@ -752,33 +754,16 @@ pub fn render(report: &Report) -> String {
         );
         return out;
     }
-    match report.phase.as_deref() {
-        Some("unindexed") => {
-            let _ = writeln!(out, "  index:           not indexed yet - builds on the first tool call");
-        }
-        Some("walking") => {
-            let _ = writeln!(out, "  index:           building now");
-        }
-        Some("embedding") => {
-            let _ = writeln!(out, "  index:           structural index ready; embeddings being computed");
-        }
-        Some("failed") => {
-            let _ = writeln!(
-                out,
-                "  index:           last build failed - see daemon log; retried on the next tool call"
-            );
-        }
-        _ if !index.bulk_indexed => {
-            if daemon_alive {
-                let _ = writeln!(
-                    out,
-                    "  index:           building now - first walk in progress, nothing to restart"
-                );
-            } else {
-                let _ = writeln!(out, "  index:           never fully walked - a cold start is still owed");
-            }
-        }
-        _ => {}
+    let _ = writeln!(
+        out,
+        "  index:           {}",
+        describe_index(phase, progress, index.bulk_indexed, daemon_alive)
+    );
+    if let Some(estimate) = phase.and_then(|phase| overall_estimate(phase, progress?)) {
+        let _ = writeln!(
+            out,
+            "  overall:         ~{estimate:.0}% (estimate: walk 40%, semantic pass 20%, embeddings 40% of the work)"
+        );
     }
     let _ = writeln!(
         out,
@@ -787,7 +772,7 @@ pub fn render(report: &Report) -> String {
         index.indexed,
         index.discovered
     );
-    if !index.bulk_indexed && report.phase.as_deref() == Some("walking") {
+    if !index.bulk_indexed && phase == Some("walking") {
         let _ = writeln!(out, "  dirty files:     {} awaiting the walk already in progress", index.dirty);
     } else {
         let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
@@ -803,10 +788,17 @@ pub fn render(report: &Report) -> String {
     // nothing else in this report would ever call it out - see task
     // 62cc2d0f / `daemon::semantic`'s module doc.
     if index.bulk_indexed {
+        let in_progress = match phase {
+            Some("unindexed" | "walking" | "structural" | "embedding") => {
+                Some(semantic_in_progress(progress))
+            }
+            _ => None,
+        };
         for line in semantic_pass_lines(
             index.semantic_pass_completed,
             &index.semantic_pass_owed,
             &index.semantic_pass_failures,
+            in_progress.as_deref(),
         ) {
             let _ = writeln!(out, "{line}");
         }
@@ -821,6 +813,129 @@ pub fn render(report: &Report) -> String {
         }
     }
     out
+}
+
+/// `report.progress`, only when the daemon serving the project right now is
+/// the one that wrote it. A running daemon replaces the file with its own pid
+/// as soon as it starts, so a snapshot with any other pid - or with no daemon
+/// running at all - was left by a daemon that died without removing it.
+/// The pid is corroborated by the socket (`CoreState::Running`), so a
+/// recycled pid alone does not make a leftover snapshot look live.
+pub(crate) fn live_progress(report: &Report) -> Option<&ProgressSnapshot> {
+    match report.core {
+        CoreState::Running { pid } => report.progress.as_ref().filter(|progress| progress.pid == pid),
+        _ => None,
+    }
+}
+
+/// The `index:` line's text. `phase` is `None` when no daemon is running or
+/// the running one published no phase.
+fn describe_index(
+    phase: Option<&str>,
+    progress: Option<&ProgressSnapshot>,
+    bulk_indexed: bool,
+    daemon_alive: bool,
+) -> String {
+    match phase {
+        Some("unindexed") => "not indexed yet - builds on the first tool call".to_string(),
+        Some("walking") => match progress {
+            Some(progress) => format!("building now - {}", describe_walk(progress)),
+            None => "building now".to_string(),
+        },
+        Some("structural") => match progress.and_then(describe_semantic_running) {
+            Some(running) => format!("structural index ready; semantic pass running - {running}"),
+            None => "structural index ready; embedding pass not started yet".to_string(),
+        },
+        Some("embedding") => match progress.map(|progress| &progress.embeddings) {
+            Some(embeddings) if embeddings.total == 0 => {
+                "structural index ready; embeddings being computed - counting what needs embedding"
+                    .to_string()
+            }
+            Some(embeddings) => format!(
+                "structural index ready; embeddings being computed - {}/{} ({:.1}%)",
+                group_thousands(embeddings.done),
+                group_thousands(embeddings.total),
+                percent(embeddings.done, embeddings.total)
+            ),
+            None => "structural index ready; embeddings being computed".to_string(),
+        },
+        Some("ready") => "ready - every tool answers".to_string(),
+        Some("failed") => "last build failed - see daemon log; retried on the next tool call".to_string(),
+        _ if !bulk_indexed && daemon_alive => {
+            "building now - first walk in progress, nothing to restart".to_string()
+        }
+        _ if !bulk_indexed => "never fully walked - a cold start is still owed".to_string(),
+        _ if daemon_alive => "built".to_string(),
+        _ => "built - no daemon is serving it right now".to_string(),
+    }
+}
+
+fn describe_walk(progress: &ProgressSnapshot) -> String {
+    let walk = &progress.walk;
+    let items = group_thousands(walk.items);
+    if walk.languages_total > 0 && walk.languages_done >= walk.languages_total {
+        format!("linking imports and symbols ({items} nodes and edges walked)")
+    } else if walk.languages_total > 0 {
+        let current = walk.current_language.as_deref().unwrap_or("the first language");
+        format!(
+            "walking {current} ({}/{} languages done), {items} nodes and edges so far",
+            walk.languages_done, walk.languages_total
+        )
+    } else {
+        format!("walking, {items} nodes and edges so far")
+    }
+}
+
+/// `"typescript (0/2 languages done)"` while a language's pass is running.
+fn describe_semantic_running(progress: &ProgressSnapshot) -> Option<String> {
+    let semantic = &progress.semantic;
+    let current = semantic.current_language.as_deref()?;
+    Some(format!("{current} ({}/{} languages done)", semantic.languages_done, semantic.languages_total))
+}
+
+/// What the semantic-pass line says instead of repair advice while a live
+/// daemon is still working through the index.
+fn semantic_in_progress(progress: Option<&ProgressSnapshot>) -> String {
+    match progress.and_then(describe_semantic_running) {
+        Some(running) => format!("running - {running}"),
+        None => "not completed yet - the running daemon is still indexing; nothing to repair".to_string(),
+    }
+}
+
+/// A rough whole-index percentage while a stage is actively running, by
+/// fixed stage weights (walk 40%, semantic pass 20%, embeddings 40%) - only
+/// the numbers within a stage are measured. `None` when nothing is running.
+fn overall_estimate(phase: &str, progress: &ProgressSnapshot) -> Option<f64> {
+    const WALK: f64 = 40.0;
+    const SEMANTIC: f64 = 20.0;
+    const EMBEDDINGS: f64 = 40.0;
+    let fraction =
+        |done: u64, total: u64| if total == 0 { 0.0 } else { (done.min(total) as f64) / (total as f64) };
+    match phase {
+        "walking" => {
+            let walk = &progress.walk;
+            Some(WALK * fraction(u64::from(walk.languages_done), u64::from(walk.languages_total)))
+        }
+        "structural" => {
+            progress.semantic.current_language.as_ref()?;
+            let semantic = &progress.semantic;
+            Some(
+                WALK + SEMANTIC
+                    * fraction(u64::from(semantic.languages_done), u64::from(semantic.languages_total)),
+            )
+        }
+        "embedding" => {
+            Some(WALK + SEMANTIC + EMBEDDINGS * fraction(progress.embeddings.done, progress.embeddings.total))
+        }
+        _ => None,
+    }
+}
+
+fn percent(done: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    done as f64 * 100.0 / total as f64
 }
 
 fn describe_core(core: CoreState) -> String {

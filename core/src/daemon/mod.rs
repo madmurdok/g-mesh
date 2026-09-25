@@ -88,6 +88,14 @@ const DAEMON_SERVING_FILE: &str = "daemon.serving";
 /// everything else it reports.
 const PHASE_FILE: &str = "index.phase";
 
+/// The running daemon's progress counters, as JSON
+/// ([`indexing_status::ProgressSnapshot`]), next to [`PHASE_FILE`]. Written
+/// atomically and throttled by [`indexing_status::IndexingStatus`], removed
+/// on the way out like [`PHASE_FILE`]. A daemon killed without that cleanup
+/// leaves it behind, so it carries the writer's pid and a reader must check
+/// that pid against the live daemon before treating the counters as current.
+const PROGRESS_FILE: &str = "index.progress";
+
 /// How long the watcher thread waits, after the most recent raw filesystem
 /// event for a given path, before treating that path's burst as settled and
 /// asking the plugin to reparse it - the window
@@ -198,6 +206,19 @@ pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
 /// rather than reconstructing a project root.
 pub fn phase_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(PHASE_FILE)
+}
+
+/// Where [`PROGRESS_FILE`] lives for a given state directory.
+pub fn progress_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(PROGRESS_FILE)
+}
+
+/// The progress snapshot a daemon last published for this state directory,
+/// whoever wrote it: `None` for a missing or unparseable file. The snapshot's
+/// `pid` says which daemon wrote it; this does not check that it is alive.
+pub fn read_progress_in(state_dir: &Path) -> Option<indexing_status::ProgressSnapshot> {
+    let contents = fs::read_to_string(progress_path_in(state_dir)).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 /// The current phase word [`indexing_status::IndexingStatus::attach_phase_file`]
@@ -533,6 +554,7 @@ pub fn run(root: &Path) -> Result<()> {
     // observe its absence as meaningful, never merely "eventually" true.
     let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
     indexing.attach_phase_file(phase_path_in(&dir));
+    indexing.attach_progress_file(progress_path_in(&dir));
     // Attached before the accept loop can hand `indexing` to any session, so
     // no tool call ever finds it with nothing to trigger.
     let activation_trigger = indexing.attach_activation();
