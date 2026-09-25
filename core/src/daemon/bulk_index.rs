@@ -575,25 +575,7 @@ fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: Option<&Embeddi
     Ok(())
 }
 
-/// Path whose *deletion* releases a batch commit that is holding `conn`'s
-/// lock open, for tests that need to prove something behaves correctly while
-/// that lock is actually held - not merely while `daemon::indexing_status::
-/// IndexingStatus` reads as indexing, which [`WALK_HOLD_FILE_ENV`] already
-/// controls without ever touching the lock at all (that hold runs after
-/// every batch has committed and released it - see [`run`]'s call to
-/// [`hold_the_walk_open_for_tests`]).
-///
-/// GM-394's own regression needs exactly this distinction. The bug it found
-/// was never "the walk takes a while" - `IndexingStatus` already told every
-/// caller that, honestly, since task 105 - it was "a batch commit holds the
-/// mutex every MCP handler shares for as long as its embedding inference
-/// takes". Reproducing that deterministically, on a machine that has not
-/// necessarily fetched the real ONNX weights `EmbeddingPipeline` would
-/// otherwise need, means holding the *lock* open on purpose, independent of
-/// whatever this build's embedding pipeline does - which is what this knob
-/// is for: a no-op unless set, and when set, held from directly inside the
-/// locked section of [`commit`] until the named file is removed.
-pub const HOLD_LOCK_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_LOCK_FILE";
+pub use crate::storage::index_store::HOLD_LOCK_FILE_ENV;
 
 /// Honors [`HOLD_LOCK_FILE_ENV`]. A no-op unless it is set, which is every
 /// real run - same shape as [`hold_the_walk_open_for_tests`], polled rather

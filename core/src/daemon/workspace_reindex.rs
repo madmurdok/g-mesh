@@ -234,7 +234,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::lifecycle::PluginSupervisor;
@@ -242,69 +242,7 @@ use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::graph::{imports, symbol_links};
 use crate::storage::schema;
-
-/// Deletes every row `language` owns - see this module's doc comment
-/// ("Decision 1") for exactly what that means and why, and ("Decision: ...")
-/// for why this is targeted SQL rather than a `storage::write::Diff`.
-///
-/// One transaction: a failure partway through must not leave, say, edges
-/// deleted but their nodes still present (which would surface as a live node
-/// with dangling incoming-edge gaps elsewhere in the graph) - the same
-/// "nothing partial is ever committed" guarantee `storage::write::apply_diff`
-/// gives its own diffs.
-///
-/// Order matters only under a connection that enforces foreign keys (the
-/// daemon's real connection does not - `storage::connection::open` switches
-/// them off - but most of this module's own tests run with them on,
-/// deliberately, the same reason `storage::write`'s tests do): edges before
-/// nodes (`edges.fromId`/`toId`
-/// reference `nodes(id)` with no `ON DELETE CASCADE`), and every node-keyed
-/// child table (`vectors`, `declarations`, `placeholder_targets`,
-/// `containers`) before `nodes` itself.
-pub(crate) fn delete_language_rows(conn: &mut Connection, language: &str) -> Result<()> {
-    let tx = conn.transaction().context("failed to start the per-language delete transaction")?;
-
-    tx.execute(
-        "DELETE FROM edges WHERE fromId IN (SELECT id FROM nodes WHERE language = ?1) \
-            OR toId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's edges")?;
-    tx.execute(
-        "DELETE FROM vectors WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's vectors")?;
-    tx.execute(
-        "DELETE FROM declarations WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's declarations")?;
-    tx.execute(
-        "DELETE FROM placeholder_targets WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's placeholder targets")?;
-    // Every container of this language becomes empty the instant every node
-    // naming it as a member is gone (below) - see this module's doc comment
-    // on why that makes a plain `WHERE language = ?` the correct delete
-    // rather than an approximation of `containers::attach`'s own recount.
-    tx.execute("DELETE FROM containers WHERE language = ?1", params![language])
-        .context("failed to delete a language's containers")?;
-    // Member declarations and container nodes alike - see this module's doc
-    // comment ("Decision 1: Nodes") for why one predicate covers both.
-    tx.execute("DELETE FROM nodes WHERE language = ?1", params![language])
-        .context("failed to delete a language's nodes")?;
-    // The whole row, not just the two timestamp columns: `pluginFingerprint`
-    // goes with it too, and is re-recorded by `walk_one_language`'s own
-    // `schema::record_language_bulk_indexed` call the moment the re-walk
-    // lands - there is nothing worth preserving across a delete that is
-    // about to be superseded within the same reindex.
-    tx.execute("DELETE FROM language_state WHERE language = ?1", params![language])
-        .context("failed to reset a language's language_state row")?;
-
-    tx.commit().context("failed to commit the per-language delete transaction")
-}
+use crate::storage::write::delete_language_rows;
 
 /// Runs `language`'s whole per-language reindex against `registry`/
 /// `supervisor`, in response to a settled edit of `changed_file` (one of that
@@ -420,6 +358,8 @@ pub(crate) fn run(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    use rusqlite::params;
 
     use super::*;
     use crate::daemon::manifest::discover;

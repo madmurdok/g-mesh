@@ -77,6 +77,7 @@ use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::types::RequestId;
+use crate::storage::write::upsert_indexed_file;
 use crate::watcher::apply::apply_file_change;
 
 /// What [`ensure_fresh`] did to bring a file's index up to date. All three
@@ -285,24 +286,6 @@ fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<Inde
     )
     .optional()
     .context("failed to query indexed_files")
-}
-
-fn upsert_indexed_file(
-    conn: &Connection,
-    file_path: &str,
-    mtime_millis: i64,
-    content_hash: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO indexed_files (filePath, mtimeMillis, contentHash)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(filePath) DO UPDATE SET
-            mtimeMillis = excluded.mtimeMillis,
-            contentHash = excluded.contentHash",
-        params![file_path, mtime_millis, content_hash],
-    )
-    .context("failed to upsert indexed_files row")?;
-    Ok(())
 }
 
 /// How much older than the walk's start a file's mtime must be before
