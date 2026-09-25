@@ -98,7 +98,13 @@ fn spawn_stub_plugin(
         }
         write_message(
             &mut writer,
-            &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result, incomplete: false },
+            &FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id,
+                result,
+                incomplete: false,
+                incomplete_reason: None,
+            },
         )
         .unwrap();
     })
@@ -269,6 +275,7 @@ fn file_change_diff_is_committed_to_sqlite() {
     let canned_response = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -356,6 +363,7 @@ fn diff_with_deletes_removes_rows() {
     let canned_response = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() },
     };
@@ -398,6 +406,7 @@ fn mismatched_response_id_is_rejected() {
     let wrong_id_response = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: RequestId::Number(999), // deliberately does not match the request
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -442,6 +451,7 @@ fn empty_diff_response_is_a_safe_no_op() {
     let empty_response = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff::default(),
     };
@@ -484,6 +494,7 @@ fn spawn_semantic_stub(
     expected_file_paths: Vec<String>,
     result: FileChangeDiff,
     incomplete: bool,
+    incomplete_reason: Option<&'static str>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf_reader = BufReader::new(&mut reader);
@@ -497,7 +508,13 @@ fn spawn_semantic_stub(
         }
         write_message(
             &mut writer,
-            &FileChangeResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result, incomplete },
+            &FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id,
+                result,
+                incomplete,
+                incomplete_reason: incomplete_reason.map(str::to_string),
+            },
         )
         .unwrap();
     })
@@ -540,6 +557,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
         vec!["src/lib.rs".to_string()],
         FileChangeDiff { upsert_edges: vec![upgraded], ..Default::default() },
         false,
+        None,
     );
 
     let mut buf_reader = BufReader::new(core_reader);
@@ -583,6 +601,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
     let structural = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -641,6 +660,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
     let structural = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -694,6 +714,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
     let structural = FileChangeResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
+        incomplete_reason: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -733,7 +754,7 @@ fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
     let conn = Mutex::new(setup_conn());
 
     let plugin =
-        spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false);
+        spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false, None);
 
     let mut buf_reader = BufReader::new(core_reader);
     apply_semantic_pass(
@@ -769,6 +790,7 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
         Vec::new(),
         FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
         true,
+        Some("the language server exited during the pass"),
     );
 
     let mut buf_reader = BufReader::new(core_reader);
@@ -786,6 +808,10 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
 
     let err = outcome.expect_err("an incomplete pass must not be reported as a completed one");
     assert!(format!("{err:#}").contains("incomplete"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("the language server exited during the pass"),
+        "the plugin's own reason is what the error carries: {err:#}"
+    );
     assert_eq!(
         count(&conn, "nodes"),
         1,
@@ -808,6 +834,7 @@ fn an_incomplete_per_file_pass_is_not_an_error() {
         vec!["src/lib.rs".to_string()],
         FileChangeDiff::default(),
         true,
+        None,
     );
 
     let mut buf_reader = BufReader::new(core_reader);

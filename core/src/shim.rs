@@ -55,24 +55,26 @@ const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
 /// 192.
 pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 
-/// Path to append the bootstrapped daemon's stderr to, instead of discarding
-/// it. Unset in every normal run, which is the only reason the daemon's stderr
-/// can go to `/dev/null` at all: nobody is on the other end of a detached
-/// process's console.
-///
-/// That default is what makes a daemon that starts and then stalls
-/// undiagnosable from the outside - the shim can say "it never began
-/// answering", and nothing can say why. Pointing this at a file gives the one
-/// missing channel back, and costs nothing when it is unset. It captures the
-/// plugin processes' stderr too, since they are spawned with
-/// `Stdio::inherit()` (`daemon::bulk_index::walk_one_language`,
+/// Path to append the bootstrapped daemon's stderr to, instead of the
+/// project's own [`DAEMON_LOG_FILE`]. The daemon's stderr carries the plugin
+/// processes' stderr too, since they are spawned with `Stdio::inherit()`
+/// (`daemon::bulk_index::walk_one_language`,
 /// `daemon::plugin::PluginProcess::spawn`).
 ///
-/// Appended to, never truncated, so several daemons - or several runs - can
-/// share one file without erasing each other; a path that cannot be opened
-/// falls back to `/dev/null` rather than failing the bootstrap, because a
-/// diagnostic aid must never be the reason a daemon does not start.
+/// Appended to, never truncated or rotated, so several daemons - or several
+/// runs - can share one file without erasing each other; a path that cannot
+/// be opened falls back to `/dev/null` rather than failing the bootstrap,
+/// because a diagnostic aid must never be the reason a daemon does not start.
 pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
+
+/// The file in the project's state directory a shim-bootstrapped daemon's
+/// stderr is appended to when [`DAEMON_LOG_ENV`] is unset.
+pub const DAEMON_LOG_FILE: &str = "daemon.log";
+
+/// Size past which [`DAEMON_LOG_FILE`] is rotated when the next daemon is
+/// spawned: renamed to `daemon.log.1`, replacing the previous one, so a
+/// project keeps at most this plus one running daemon's output.
+const DAEMON_LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Stdio<->daemon proxy. Project identity - the only thing the shim needs -
 /// comes from `CLAUDE_PROJECT_DIR` when the client set it, or the shim's own
@@ -467,33 +469,68 @@ fn spawn_detached_daemon(root: &Path) -> Result<()> {
         .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(daemon_stderr());
+        .stderr(daemon_stderr(root));
     process::detach(&mut command)
         .spawn()
         .with_context(|| format!("failed to spawn a daemon via {}", exe.display()))?;
     Ok(())
 }
 
-/// `/dev/null` unless [`DAEMON_LOG_ENV`] names a file that can be appended to.
+/// The file [`DAEMON_LOG_ENV`] names, or else the project's own
+/// [`DAEMON_LOG_FILE`] (rotated first, see [`DAEMON_LOG_ROTATE_BYTES`]);
+/// `/dev/null` only if neither can be opened.
 ///
 /// Never a pipe, whatever the setting: the shim drops the `Child` without
 /// waiting, so nothing would ever drain it, and the first daemon (or plugin)
 /// to fill the pipe buffer would block forever on a write it does not know is
 /// unread. A file and `/dev/null` both absorb writes unconditionally, which is
 /// the property the detached daemon's stderr has to keep.
-fn daemon_stderr() -> Stdio {
-    let Some(path) = std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) else {
-        return Stdio::null();
+fn daemon_stderr(root: &Path) -> Stdio {
+    let path = match std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => match project_daemon_log(root) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!(
+                    "g-mesh mcp-shim: no daemon log for {} ({err:#}), discarding its stderr",
+                    root.display()
+                );
+                return Stdio::null();
+            }
+        },
     };
     match fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => Stdio::from(file),
         Err(err) => {
             eprintln!(
-                "g-mesh mcp-shim: could not open {} ({DAEMON_LOG_ENV}) for the daemon's stderr, discarding it instead: {err}",
-                Path::new(&path).display()
+                "g-mesh mcp-shim: could not open {} for the daemon's stderr, discarding it instead: {err}",
+                path.display()
             );
             Stdio::null()
         }
+    }
+}
+
+/// `<state dir>/daemon.log`, after moving it to `daemon.log.1` if it has grown
+/// past [`DAEMON_LOG_ROTATE_BYTES`]. Called only while the bootstrap lock is
+/// held and no daemon serves the project, so nothing is writing to it.
+fn project_daemon_log(root: &Path) -> Result<PathBuf> {
+    let path = ensure_project_dir(root)?.join(DAEMON_LOG_FILE);
+    rotate_if_over(&path, DAEMON_LOG_ROTATE_BYTES);
+    Ok(path)
+}
+
+/// Renames `path` to `<path>.1` when it is larger than `limit` bytes. Best
+/// effort: a failed rename leaves the file to be appended to.
+fn rotate_if_over(path: &Path, limit: u64) {
+    let Ok(metadata) = fs::metadata(path) else { return };
+    if metadata.len() <= limit {
+        return;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    if let Err(err) = fs::rename(path, &rotated) {
+        eprintln!("g-mesh mcp-shim: could not rotate {} ({err}), appending to it", path.display());
     }
 }
 
@@ -517,6 +554,35 @@ mod tests {
     use super::*;
     use crate::daemon::identity::read_project_root;
     use crate::storage::connection::project_dir;
+
+    /// A log past its limit moves aside to `.1`, replacing the previous one;
+    /// one at or under it is left to be appended to.
+    #[test]
+    fn the_daemon_log_is_rotated_only_past_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(DAEMON_LOG_FILE);
+        let rotated = dir.path().join(format!("{DAEMON_LOG_FILE}.1"));
+        fs::write(&rotated, "older").unwrap();
+
+        fs::write(&log, "12345").unwrap();
+        rotate_if_over(&log, 5);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "12345", "at the limit it stays");
+
+        fs::write(&log, "123456").unwrap();
+        rotate_if_over(&log, 5);
+        assert!(!log.exists(), "past the limit it moves aside");
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), "123456", "and replaces the previous rotation");
+    }
+
+    /// With no override, the daemon's stderr goes to the project's own state
+    /// directory, never to `/dev/null`.
+    #[test]
+    fn the_default_daemon_log_lives_in_the_projects_state_directory() {
+        let root = tempfile::tempdir().expect("failed to create a temp project root");
+        let path = project_daemon_log(root.path()).unwrap();
+        assert_eq!(path, project_dir(root.path()).unwrap().join(DAEMON_LOG_FILE));
+        let _ = fs::remove_dir_all(project_dir(root.path()).unwrap());
+    }
 
     /// GM-255, at the level the fix actually operates on.
     ///

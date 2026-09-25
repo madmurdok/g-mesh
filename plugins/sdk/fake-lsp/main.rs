@@ -203,10 +203,20 @@ struct Script {
     /// requests - a crash mid-pass.
     #[serde(default)]
     crash_after_requests: Option<u32>,
+    /// With `crashAfterRequests`: close stdin before the last answer goes
+    /// out, so the client, having read that answer, finds its next question
+    /// meets a broken pipe rather than a closed stdout.
+    #[serde(default)]
+    close_input_before_crash: bool,
     /// Stop answering (without exiting) from the nth request on - a server
     /// that hangs rather than dies.
     #[serde(default)]
     silent_from: Option<u32>,
+    /// Close stdin right after `initialized` and stay alive with stdout open:
+    /// a server the client can no longer write to, but which has not exited,
+    /// so the next question fails to *send* rather than going unanswered.
+    #[serde(default)]
+    close_input_after_initialized: bool,
     /// Where to append a line per request received, for a test that wants to
     /// count what was asked.
     #[serde(default)]
@@ -289,6 +299,12 @@ fn main() {
                         }),
                     );
                 }
+                if script.close_input_after_initialized {
+                    close_stdin();
+                    loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
             }
             "shutdown" => respond(&mut stdout, id, Value::Null),
             "exit" => return,
@@ -306,6 +322,10 @@ fn main() {
                 // the server is busy" a deterministic test rather than a race.
                 if script.reindex.as_ref().is_some_and(|reindex| reindex.at_request == asked) {
                     begin_reindex(&script, Arc::clone(&indexing));
+                }
+                let crashing = script.crash_after_requests.is_some_and(|after| asked >= after);
+                if crashing && script.close_input_before_crash {
+                    close_stdin();
                 }
                 let key = position_of(&params);
                 let answer = script.answers.iter().find(|answer| {
@@ -337,7 +357,7 @@ fn main() {
                     }
                     None => respond(&mut stdout, id, Value::Null),
                 }
-                if script.crash_after_requests.is_some_and(|after| asked >= after) {
+                if crashing {
                     // Not an `exit`: the point is a server that goes away
                     // without saying anything, which is what a crash is.
                     std::process::exit(101);
@@ -500,6 +520,25 @@ fn begin_reindex_on_change(script: &Script, indexing: Arc<AtomicBool>, revealed:
             json!({ "token": "reindex-on-change", "value": { "kind": "end" } }),
         );
     });
+}
+
+/// Closes this process's end of its stdin pipe, so the client's next write
+/// fails. Nothing reads stdin afterwards.
+#[cfg(unix)]
+fn close_stdin() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: fd 0 is owned by this process and nothing reads it again.
+    drop(unsafe { OwnedFd::from_raw_fd(std::io::stdin().as_raw_fd()) });
+}
+
+/// Closes this process's end of its stdin pipe, so the client's next write
+/// fails. Nothing reads stdin afterwards.
+#[cfg(windows)]
+fn close_stdin() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    // SAFETY: the stdin handle is owned by this process and nothing reads it
+    // again.
+    drop(unsafe { OwnedHandle::from_raw_handle(std::io::stdin().as_raw_handle()) });
 }
 
 fn log(script: &Script, method: &str) {

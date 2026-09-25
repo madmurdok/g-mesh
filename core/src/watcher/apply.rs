@@ -184,10 +184,8 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     // `apply_file_change` log the same thing twice.
     if outcome.incomplete {
         if whole_project {
-            bail!(
-                "the plugin reported an incomplete whole-project semantic pass - its diff is committed, \
-                 but the pass is not recorded as done"
-            );
+            let reason = outcome.incomplete_reason.as_deref().unwrap_or("the plugin gave no reason");
+            bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
         }
         eprintln!(
             "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
@@ -198,14 +196,11 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
 }
 
 /// What one round trip reported about itself, beyond the diff it already
-/// committed - today only [`FileChangeResponse::incomplete`], which is
-/// meaningless for a `fileChanged` and load-bearing for a `semanticPass`.
-///
-/// A struct rather than a bare `bool` so that the one thing [`round_trip`]
-/// returns keeps a name at both call sites: `let _ = round_trip(...)` reads
-/// as "nothing to say", where a discarded bare `bool` reads as a bug.
+/// committed - [`FileChangeResponse::incomplete`] and the plugin's reason for
+/// it, meaningless for a `fileChanged` and load-bearing for a `semanticPass`.
 struct RoundTrip {
     incomplete: bool,
+    incomplete_reason: Option<String>,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -356,7 +351,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         let guard = conn.lock().unwrap();
         embedding.store(&guard, &computed);
     }
-    Ok(RoundTrip { incomplete: response.incomplete })
+    Ok(RoundTrip { incomplete: response.incomplete, incomplete_reason: response.incomplete_reason })
 }
 
 /// Test-only: holds this round trip open, with `conn`'s lock already

@@ -200,6 +200,12 @@ pub struct IndexStatus {
     /// `bulk_indexed` true and this `false`. That combination is the one
     /// [`render`] calls out by name - see task 62cc2d0f.
     pub semantic_pass_completed: bool,
+    /// Semantic-pass-capable languages present in the index whose pass has
+    /// not completed (`language_state.semanticPassAt` unset), sorted.
+    pub semantic_pass_owed: Vec<String>,
+    /// `(language, reason)` for every language whose last whole-project
+    /// semantic pass failed (`language_state.semanticPassError`), sorted.
+    pub semantic_pass_failures: Vec<(String, String)>,
     /// Source files found on disk now - the denominator of coverage.
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
@@ -303,6 +309,8 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -440,6 +448,8 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
         return Ok(IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: discovered.len(),
             indexed: 0,
             dirty: discovered.len(),
@@ -474,16 +484,70 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
         }
     }
 
+    let capable: HashSet<String> =
+        manifest::semantic_pass_capable_languages(&plugins.manifests).into_iter().collect();
+    let (semantic_pass_owed, semantic_pass_failures) = semantic_pass_state(&conn, &capable)?;
     Ok(IndexStatus {
         bulk_indexed: crate::storage::schema::bulk_index_completed(&conn)
             .context("failed to read whether the project has been fully walked")?,
         semantic_pass_completed: crate::storage::schema::semantic_pass_completed(&conn)
             .context("failed to read whether the project's semantic pass has completed")?,
+        semantic_pass_owed,
+        semantic_pass_failures,
         discovered: discovered.len(),
         indexed,
         dirty,
         syntax_error_files: syntax_error_files(&conn)?,
     })
+}
+
+/// `(language, reason)` per language whose last semantic pass failed.
+type SemanticPassFailures = Vec<(String, String)>;
+
+/// The languages still owed a semantic pass, and the recorded failures -
+/// what [`semantic_pass_lines`] reports.
+pub(crate) fn semantic_pass_state(
+    conn: &Connection,
+    capable: &HashSet<String>,
+) -> Result<(Vec<String>, SemanticPassFailures)> {
+    let owed = crate::storage::schema::owed_semantic_pass_languages(conn, capable)
+        .context("failed to read which languages still owe a semantic pass")?;
+    let failures = crate::storage::schema::semantic_pass_failures(conn)
+        .context("failed to read the recorded semantic-pass failures")?;
+    Ok((owed, failures))
+}
+
+/// The report's semantic-pass lines: one per language whose last pass
+/// failed, with its reason, and the "never completed" advice only while some
+/// owed language has no recorded failure to explain it.
+pub(crate) fn semantic_pass_lines(
+    completed: bool,
+    owed: &[String],
+    failures: &[(String, String)],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if completed {
+        lines.push("  semantic pass:   complete".to_string());
+    } else {
+        let unexplained = owed.iter().any(|language| !failures.iter().any(|(failed, _)| failed == language));
+        if unexplained || failures.is_empty() {
+            lines.push("  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string());
+        }
+    }
+    for (language, reason) in failures {
+        // A pass deferred because its plugin was asleep has not failed: it is
+        // still owed and will be asked again.
+        if reason == daemon::semantic::NOT_RUN_REASON {
+            lines.push(format!(
+                "  semantic pass:   {language} pending - its plugin was asleep or memory-suspended; \
+                 the next daemon start or `g-mesh reindex` asks again"
+            ));
+            continue;
+        }
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(format!("  semantic pass:   {language} failed - {reason}"));
+    }
+    lines
 }
 
 struct SourceFile {
@@ -739,10 +803,12 @@ pub fn render(report: &Report) -> String {
     // nothing else in this report would ever call it out - see task
     // 62cc2d0f / `daemon::semantic`'s module doc.
     if index.bulk_indexed {
-        if index.semantic_pass_completed {
-            let _ = writeln!(out, "  semantic pass:   complete");
-        } else {
-            let _ = writeln!(out, "  semantic pass:   never completed - run `g-mesh reindex` to repair it");
+        for line in semantic_pass_lines(
+            index.semantic_pass_completed,
+            &index.semantic_pass_owed,
+            &index.semantic_pass_failures,
+        ) {
+            let _ = writeln!(out, "{line}");
         }
     }
 

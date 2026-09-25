@@ -962,9 +962,10 @@ temp-directory fixtures, so they care about the environment they run in:
   (default 90s) on a machine slow enough to need it. If it does not help, the
   walk is not slow — something is wrong.
 - `G_MESH_DAEMON_LOG=<file>` makes a shim-bootstrapped daemon append its
-  stderr (and its plugins') to that file instead of discarding it. Detached
-  daemons have no console, so this is the only way to see what one is doing
-  during a test run; unset, nothing changes.
+  stderr (and its plugins') to that file instead of the project's own
+  `daemon.log` in its state directory (`g-mesh status` prints the state
+  directory). That default file is moved to `daemon.log.1` when a daemon is
+  spawned and it is over 8 MiB; the override is never rotated.
 
 ### What CI runs, and what is still only local
 
