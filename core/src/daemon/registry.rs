@@ -32,27 +32,14 @@
 //!
 //! # Lock order, and why nothing waits behind a spawn
 //!
-//! `supervisors` is the *outermost* lock in the daemon. It is released before
-//! any caller touches the supervisor it got back, so the existing order
-//! `daemon::lifecycle` documents (supervisor lock first, SQLite connection
-//! inside it) continues below this one and nothing ever reaches back up:
-//! a supervisor knows nothing about the registry that owns it.
+//! `supervisors` is the outermost lock in the daemon (the whole order is in
+//! `storage::index_store`'s module doc). It is released before any caller
+//! touches the supervisor it got back, and it is only ever held for a map
+//! lookup or a single insert/remove - never across a spawn, which would
+//! stall every other caller of the map, including the `has_pending` check
+//! every MCP tool call makes.
 //!
-//! Since task 164 it is also only ever held for a map lookup or a single
-//! insert/remove - never across a spawn.
-//! [`get_or_spawn`](PluginRegistry::get_or_spawn) used to hold it for the
-//! whole process launch plus handshake, deliberately (task 154), because a
-//! get-or-insert under one lock is the simplest thing that cannot
-//! double-spawn a language. What that
-//! overlooked is that `std::sync::Mutex` has no reader/writer distinction, so
-//! *every* other caller of this map paid for it - including
-//! [`active_supervisors`](PluginRegistry::active_supervisors), which only
-//! wants to clone it, and through it [`has_pending`](PluginRegistry::has_pending),
-//! which every MCP tool call asks before it answers. One language's spawn
-//! stalled queries about every other language, and queries that needed no
-//! plugin at all (measured: 270-494ms, see `core/tests/cold_start_grace_wait.rs`).
-//!
-//! [`SupervisorSlot`] is what replaces it: a language being spawned right now
+//! [`SupervisorSlot`] makes that possible: a language being spawned right now
 //! has a `Spawning` marker in the map from before the lock is released until
 //! after the spawn ends, so the get-or-insert that rules out a double spawn is
 //! still one short critical section, and the spawn itself happens with no lock
@@ -114,7 +101,7 @@ use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
-use crate::storage::index_store::IndexStore;
+use crate::storage::index_store::{self, IndexStore};
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -801,6 +788,7 @@ impl PluginRegistry {
     /// behavioural difference from the serialized version - and the honest
     /// one: they asked while it was in flight, so it is their answer too.
     pub fn get_or_spawn(&self, language: &str) -> Result<Arc<PluginSupervisor>> {
+        index_store::assert_not_held();
         let mut supervisors = self.supervisors.lock().unwrap();
         // Cloned out of the map so the decision below can act with the guard
         // dropped - both arms leave the map lock before doing anything that
@@ -1200,11 +1188,8 @@ impl PluginRegistry {
             return Ok(None);
         };
 
-        {
-            let guard = conn.lock().unwrap();
-            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
-                return Ok(Some(StalenessOutcome::AlreadyFresh));
-            }
+        if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
+            return Ok(Some(StalenessOutcome::AlreadyFresh));
         }
 
         let supervisor = self.get_or_spawn(&language)?;

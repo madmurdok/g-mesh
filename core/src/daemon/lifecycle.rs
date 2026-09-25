@@ -35,11 +35,8 @@
 //!
 //! # Lock order
 //!
-//! Two mutexes are involved in a replay: the supervisor's own, and the
-//! daemon's single SQLite `Connection`. The plugin lock is always taken
-//! *first* and the connection lock inside it, never the other way round - the
-//! MCP handlers that trigger a replay finish with their `lastUsed` write and
-//! release the connection before asking the supervisor for anything.
+//! The supervisor's lock is taken before the store, never under it: see
+//! `storage::index_store`'s module doc.
 //!
 //! # A third thing riding the plugin's idle-check tick (task GM-274)
 //!
@@ -143,7 +140,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -153,7 +150,7 @@ use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::jsonrpc::is_timeout;
-use crate::storage::index_store::IndexStore;
+use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
@@ -392,6 +389,12 @@ pub struct PluginSupervisor {
 }
 
 impl PluginSupervisor {
+    /// The supervised plugin. Taken before the store, never under it.
+    fn inner(&self) -> MutexGuard<'_, SupervisedPlugin> {
+        index_store::assert_not_held();
+        self.inner.lock().unwrap()
+    }
+
     /// Spawns `manifest`'s plugin and records its pid.
     ///
     /// The manifest is taken by value and kept: it is what every later spawn
@@ -459,7 +462,7 @@ impl PluginSupervisor {
     /// serving from, and the only way anything outside this module can tell a
     /// recovered plugin from an untouched one.
     pub fn pid(&self) -> Option<u32> {
-        self.inner.lock().unwrap().process.as_ref().map(PluginProcess::pid)
+        self.inner().process.as_ref().map(PluginProcess::pid)
     }
 
     /// Hands the running plugin process a new round-trip budget - see
@@ -470,7 +473,7 @@ impl PluginSupervisor {
     /// and the next wake spawns one that reads the env override afresh.
     #[cfg(test)]
     pub(crate) fn set_round_trip_timeouts(&self, timeouts: crate::daemon::plugin::RoundTripTimeouts) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if let Some(process) = inner.process.as_mut() {
             process.set_round_trip_timeouts(timeouts);
         }
@@ -489,7 +492,7 @@ impl PluginSupervisor {
     /// its own read of the queue, so this is a snapshot, not a promise that
     /// the count will still be true by the time it is printed.
     pub fn pending_len(&self) -> usize {
-        self.inner.lock().unwrap().dirty.len()
+        self.inner().dirty.len()
     }
 
     /// The watcher thread's entry point: reindex `file_path` now if the plugin
@@ -499,7 +502,7 @@ impl PluginSupervisor {
     /// `daemon::run`'s watcher loop already did with them: one file the plugin
     /// could not reparse must not take the watcher thread down with it.
     pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let Some(process) = inner.process.as_ref() else {
             inner.dirty.push(file_path);
             self.pending.store(true, Ordering::SeqCst);
@@ -550,7 +553,7 @@ impl PluginSupervisor {
     /// queue is asking about a graph that is already current, and respawning a
     /// tsserver to tell it so would defeat the point of ever sleeping.
     pub fn replay_pending(&self, conn: &IndexStore) -> Result<usize> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if inner.dirty.is_empty() {
             self.pending.store(false, Ordering::SeqCst);
             return Ok(0);
@@ -638,7 +641,7 @@ impl PluginSupervisor {
         if self.is_semantic_suspended() {
             return Ok(false);
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         let Some(process) = inner.process.as_ref() else { return Ok(false) };
         self.touch();
         process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
@@ -661,10 +664,8 @@ impl PluginSupervisor {
     /// method is what lets that whole sequence share the *one* lock
     /// `file_changed` already contends on, instead of inventing a second,
     /// parallel lock a caller could take in the wrong order against this
-    /// one - see this module's own doc comment ("Lock order") for the rule
-    /// `f` itself must keep honoring if it goes on to touch the connection:
-    /// this lock first, the connection's inside it, never the other way
-    /// round.
+    /// one. `f` may use the store (this lock first, the store inside it) but
+    /// must not take this lock again.
     ///
     /// `f` is handed the live process, if the plugin is currently awake, so
     /// it can send that process something (GM-272's `workspaceChanged`
@@ -678,7 +679,7 @@ impl PluginSupervisor {
     /// always its own process), and the reindex is what actually needs the
     /// language up to date - not this notification.
     pub fn with_exclusive_access<T>(&self, f: impl FnOnce(Option<&PluginProcess>) -> T) -> T {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         self.touch();
         f(inner.process.as_ref())
     }
@@ -711,14 +712,11 @@ impl PluginSupervisor {
     /// touches the plugin lock, matching the two-tier design
     /// `watcher::staleness` itself documents.
     pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
-        {
-            let guard = conn.lock().unwrap();
-            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
-                return Ok(StalenessOutcome::AlreadyFresh);
-            }
+        if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
+            return Ok(StalenessOutcome::AlreadyFresh);
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| {
@@ -746,7 +744,7 @@ impl PluginSupervisor {
         if self.idle_for() < timeout {
             return false;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         // ...and again inside it, because the round trip this tick just waited
         // on is exactly the activity that should call the sleep off.
         if self.idle_for() < timeout {
@@ -761,7 +759,7 @@ impl PluginSupervisor {
     /// its way out, so the plugin is reaped deliberately rather than left to
     /// notice its parent's pipes closing.
     pub fn sleep_now(&self, reason: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let Some(process) = inner.process.take() else { return };
         self.put_to_sleep(process, reason);
     }
@@ -877,7 +875,7 @@ impl PluginSupervisor {
     /// module's tests already do - see that test's doc comment.
     pub(crate) fn check_memory_limit_sampled_by(&self, sample: impl Fn(u32) -> Option<u64>) {
         let Some(limit_mb) = self.memory_limit_mb else { return };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let Some(process) = inner.process.as_ref() else { return };
         let pid = process.pid();
 
