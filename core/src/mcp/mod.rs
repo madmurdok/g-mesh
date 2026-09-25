@@ -689,13 +689,8 @@ pub struct FindDefinitionParams {
     pub include_source: Option<bool>,
 }
 
-/// find_references/find_callers/find_callees/find_implementations differ only
-/// in which edges they walk, never in what the caller has to supply - so they
-/// share one parameter shape instead of four identical ones.
-///
-/// `Default` is for the tests that construct this by hand: with two
-/// alternative addressing fields plus two paging ones, spelling all four out
-/// at every call site is noise that hides which one the test is about.
+// Shared by find_references/find_callers/find_callees: they differ only in
+// which edges they walk, never in what the caller supplies.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
@@ -713,20 +708,9 @@ pub struct SymbolQueryParams {
     pub file_paths: Option<Vec<String>>,
 }
 
-/// `find_implementations`'s own params, not folded into `SymbolQueryParams`:
-/// the three fields below (`transitive`/`max_depth`/`resume_token`) name a
-/// transitive-walk concept `find_references`/`find_callers`/`find_callees`
-/// have no equivalent of, and adding them to the shared struct would put a
-/// `resume_token` field in front of three tools that can never populate or
-/// consume one.
-///
-/// The first five fields are a deliberate duplicate of `SymbolQueryParams`'s
-/// own - `find_implementations::dispatch` builds a `SymbolQueryParams` from
-/// them to reuse the existing single-hop `handle` unchanged, so their names,
-/// types and semantics must stay identical to that struct's.
-///
-/// `Default` is for the tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
+// The first five fields must stay identical in name, type and semantics to
+// `SymbolQueryParams`'s: `find_implementations::dispatch` builds a
+// `SymbolQueryParams` from them to run the single-hop `handle`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
@@ -758,8 +742,6 @@ pub struct FindImplementationsParams {
     pub resume_token: Option<String>,
 }
 
-/// `Default` is for tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetFileOutlineParams {
     /// Project-relative path of the file to outline.
@@ -792,8 +774,6 @@ pub struct GetDependenciesParams {
     pub resume_token: Option<String>,
 }
 
-/// `Default` is for tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchCodeParams {
     /// What you're looking for, in free text (e.g. "parses a config file").
