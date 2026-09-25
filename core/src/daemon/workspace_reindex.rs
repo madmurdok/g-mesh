@@ -378,21 +378,24 @@ pub(crate) fn run(
         let file_count = semantic::indexed_file_count(conn, &manifest.language);
         match supervisor.semantic_pass(conn, Vec::new(), file_count) {
             Ok(true) => {
-                let guard = conn.lock().unwrap();
-                if let Err(err) = schema::record_language_semantic_pass(&guard, &manifest.language) {
+                let recorded =
+                    schema::record_language_semantic_pass(&conn.lock().unwrap(), &manifest.language);
+                if let Err(err) = recorded {
                     eprintln!(
                         "g-mesh daemon: failed to record {}'s semantic pass after a workspace \
                          reindex ({err:#})",
                         manifest.language
                     );
+                    semantic::record_failure(conn, &manifest.language, &err);
                 }
             }
             // The supervisor was asleep and deliberately left that way - see
-            // `PluginSupervisor::semantic_pass`'s own doc comment. Nothing
-            // to record: the language stays owed for whoever next asks
+            // `PluginSupervisor::semantic_pass`'s own doc comment. The
+            // language stays owed for whoever next asks
             // (`daemon::semantic::run_with_registry`, on a future daemon
-            // start, or a later reindex of this same language).
-            Ok(false) => {}
+            // start, or a later reindex of this same language); status shows
+            // why.
+            Ok(false) => semantic::record_not_run(conn, &manifest.language),
             Err(err) => {
                 eprintln!(
                     "g-mesh daemon: the {} semantic pass after a workspace reindex failed ({err:#}) - \
@@ -883,6 +886,61 @@ mod tests {
             semantic_pass_at.is_some(),
             "a semantic_pass-capable language's reindex must record its own semantic pass"
         );
+        drop(guard);
+        assert!(
+            test_plugin::requests(&alpha_dir).iter().any(|line| line.starts_with("semanticPass")),
+            "the plugin must actually have been asked for a semantic pass: {:?}",
+            test_plugin::requests(&alpha_dir)
+        );
+    }
+
+    /// A semantic pass that fails after a workspace reindex leaves its reason
+    /// in `language_state` for status, and the language stays owed.
+    #[test]
+    fn a_failed_semantic_pass_after_a_workspace_reindex_records_its_reason() {
+        const REASON: &str = "the language server did not answer a question about src/a.alpha-src within 10s";
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let alpha_dir = test_plugin::install_with_workspace_semantic_pass_capable(
+            plugins.path(),
+            "alpha",
+            &[".alpha-src"],
+            &["go.mod"],
+            &[],
+        );
+        test_plugin::answer_first_semantic_pass_incomplete(&alpha_dir, "alpha", Some(REASON));
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+        let conn = test_plugin::empty_index();
+        {
+            let guard = conn.lock().unwrap();
+            schema::ensure_current(&guard, "test-generation").unwrap();
+        }
+
+        registry.route_settled_path(&conn, "go.mod".to_string());
+
+        let guard = conn.lock().unwrap();
+        let failures = schema::semantic_pass_failures(&guard).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].0, "alpha");
+        assert!(failures[0].1.contains(REASON), "the plugin's reason is recorded: {failures:?}");
+        let semantic_pass_at: Option<String> = guard
+            .query_row("SELECT semanticPassAt FROM language_state WHERE language = 'alpha'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(semantic_pass_at.is_none(), "a failed pass leaves the language owed");
         drop(guard);
         assert!(
             test_plugin::requests(&alpha_dir).iter().any(|line| line.starts_with("semanticPass")),

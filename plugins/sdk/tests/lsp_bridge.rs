@@ -1086,6 +1086,59 @@ fn a_question_that_is_never_answered_makes_the_pass_incomplete() {
     );
 }
 
+/// A pass that runs out of its whole budget with a question still waiting is
+/// incomplete and says so, even though no single request reached its own
+/// timeout.
+#[test]
+fn a_pass_that_runs_out_of_its_budget_is_incomplete_and_says_why() {
+    let scratch = Scratch::new("budget");
+    let (index, _) = fixture(&scratch);
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["silent"] = json!(true);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+    let mut budgets = budgets();
+    // The pass budget ends long before the request's own would.
+    budgets.request = Duration::from_secs(60);
+    budgets.project_floor = Duration::from_secs(2);
+    budgets.per_file = Duration::from_millis(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the pass budget ended the wait, not the request's: {:?}",
+        started.elapsed()
+    );
+    assert!(!answer.complete, "a question cut off by the pass budget is not an answer of 'nothing'");
+    assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
+    assert!(answer.diff.upsert_edges.is_empty());
+}
+
+/// A server that can no longer be written to cannot be asked anything: the
+/// pass is incomplete and its reason says the question could not be sent.
+#[test]
+fn a_server_that_cannot_be_asked_makes_the_pass_incomplete_and_says_why() {
+    let scratch = Scratch::new("unwritable");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "closeInputAfterInitialized": true,
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a question that was never sent is not an answer of 'nothing'");
+    assert!(reason(&answer).contains("could not ask the language server"), "{}", reason(&answer));
+    assert!(answer.diff.upsert_edges.is_empty());
+}
+
 /// A server that answers a question with an error has not answered it: the
 /// pass is incomplete, and its reason carries the server's own message.
 #[test]
