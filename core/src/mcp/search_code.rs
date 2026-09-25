@@ -140,7 +140,7 @@ pub(super) fn search(
 }
 
 pub(super) fn handle(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     params: SearchCodeParams,
 ) -> Result<CallToolResult, ErrorData> {
@@ -152,7 +152,7 @@ pub(super) fn handle(
         );
     };
 
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
     let page_size = pagination::resolve_page_size(params.limit);
     let page = search(&conn, &query_vector, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to search code", e))?;

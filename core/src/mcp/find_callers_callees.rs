@@ -333,12 +333,12 @@ struct CalleePage {
 }
 
 pub(crate) fn handle_callers(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
@@ -395,12 +395,12 @@ pub(crate) fn handle_callers(
 }
 
 pub(crate) fn handle_callees(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,

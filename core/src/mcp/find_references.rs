@@ -162,12 +162,12 @@ fn list_references(
 }
 
 pub(crate) fn handle(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,

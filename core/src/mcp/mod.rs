@@ -11,8 +11,8 @@
 //! Why `rmcp` (and therefore tokio) only here: the rest of the daemon - SQLite,
 //! the plugin bridge, the watcher - is plainly synchronous and has no reason
 //! not to be. `daemon::run` enters a small runtime for its accept loop alone,
-//! so async stops at this module's front door; handlers below hold the same
-//! plain `Mutex` guards the synchronous code always has.
+//! so async stops at this module's front door; handlers below take the same
+//! synchronous `IndexStore` read guard as the rest of the daemon.
 //!
 //! # Why the parameter doc comments below are terse
 //!
@@ -176,18 +176,18 @@ fn human_duration(elapsed: Duration) -> String {
 /// `indexing` is consulted per *call*, not per connection, which is what
 /// makes a session opened during the cold-start walk recover on its own: a
 /// tool call issued on a connection made mid-walk simply waits
-/// (`GMeshMcpServer::still_indexing`, GM-394) and gets the real answer once
+/// (`GMeshMcpServer::wait_for_index`) and gets the real answer once
 /// the walk finishes, on the very same session - nothing to reconnect and
 /// nothing to re-initialize.
 pub async fn serve_connection(
     stream: AsyncStream,
-    conn: Arc<IndexStore>,
+    store: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, registry, core_activity, indexing, embedding)
+    let service = GMeshMcpServer::new(store, registry, core_activity, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -198,17 +198,16 @@ pub async fn serve_connection(
 /// The structural query surface, backed by the project's index and the
 /// language plugins.
 ///
-/// Every handler answers out of `conn` alone. `registry` is not there to be
+/// Every handler answers out of `store` alone. `registry` is not there to be
 /// queried - no tool asks a language server a question - but to be *woken*:
 /// while a language's plugin sleeps on its idle timeout the core queues the
 /// files that changed, and a tool call is the moment that queue has to be
-/// replayed before the index is read (see `daemon::lifecycle`). Since task
-/// 155 this is a `PluginRegistry` rather than one `Arc<PluginSupervisor>`,
-/// because a tool call has no way to know ahead of time which language(s)
-/// its answer might touch.
+/// replayed before the index is read (see `daemon::lifecycle`). It is the
+/// whole `PluginRegistry` because a tool call has no way to know ahead of
+/// time which language(s) its answer might touch.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
-    conn: Arc<IndexStore>,
+    store: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
@@ -219,13 +218,13 @@ pub struct GMeshMcpServer {
 #[tool_router]
 impl GMeshMcpServer {
     pub fn new(
-        conn: Arc<IndexStore>,
+        store: Arc<IndexStore>,
         registry: Arc<PluginRegistry>,
         core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        Self { conn, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
+        Self { store, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -255,8 +254,8 @@ impl GMeshMcpServer {
     ///    needs is the D7 cap, which answers nothing at all - see
     ///    [`wait_for_index`](Self::wait_for_index)'s own doc comment.
     /// 2. [`mark_used`](Self::mark_used) next: it takes and releases the
-    ///    SQLite mutex on its own, and it must not be nested inside the plugin
-    ///    lock the replay below holds (see `daemon::lifecycle`'s lock order).
+    ///    store on its own, and it must not be nested inside the plugin lock
+    ///    the replay below holds (see `storage::index_store`'s lock order).
     /// 3. The replay last, so the rows this call is about to read already
     ///    include every change made while the plugin was asleep.
     async fn prepare(
@@ -339,9 +338,9 @@ impl GMeshMcpServer {
         }
         let summary = self.registry.pending_summary();
         let registry = Arc::clone(&self.registry);
-        let conn = Arc::clone(&self.conn);
+        let store = Arc::clone(&self.store);
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&conn));
+        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&store));
         tokio::pin!(task);
 
         let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
@@ -461,11 +460,11 @@ impl GMeshMcpServer {
         file_path: &str,
     ) {
         let registry = Arc::clone(&self.registry);
-        let conn = Arc::clone(&self.conn);
+        let store = Arc::clone(&self.store);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path));
+        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&store, &task_path));
         tokio::pin!(task);
 
         let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
@@ -583,10 +582,10 @@ impl GMeshMcpServer {
     /// [`instructions`](Self::instructions)'s own doc comment.
     ///
     /// [`prepare`](Self::prepare) calls this as its *first* step, ahead of
-    /// [`mark_used`](Self::mark_used): that one takes the daemon's single
-    /// SQLite mutex, which the walk holds for the length of each batch
-    /// commit, and asking it to record usage while that mutex might still be
-    /// held would defeat the point of waiting here first.
+    /// [`mark_used`](Self::mark_used): that one takes the index store, which
+    /// the walk holds for the length of each batch commit, and asking it to
+    /// record usage while the store might still be held would defeat the
+    /// point of waiting here first.
     ///
     /// The fast path - `need` was already satisfied - never suspends: a
     /// project that owes no walk, or one whose walk finished before this call
@@ -713,50 +712,48 @@ impl GMeshMcpServer {
     ///
     /// Best-effort on purpose - a failure is reported and dropped. Bookkeeping
     /// for a cleanup command that only ever prints warnings has no business
-    /// turning an answerable query into a tool error. The guard is taken and
-    /// released here, before the handler takes its own.
+    /// turning an answerable query into a tool error. The store is taken and
+    /// released here, before the handler takes its own read guard.
     fn mark_used(&self) {
         self.core_activity.request();
-        if let Err(err) = last_used::touch(&self.conn.lock().unwrap()) {
+        if let Err(err) = self.store.with(last_used::touch) {
             eprintln!("g-mesh daemon: failed to record lastUsed: {err:#}");
         }
     }
 
-    /// `get_info`'s `with_instructions` string (GM-262), assembled fresh for
-    /// each session by [`instructions::build`] from the languages actually
-    /// present in this project's index and their capabilities - see that
-    /// module's own doc comment for the full design (why the receiver-call
-    /// gap sentence has to vary per language, the byte budget it renders
-    /// under, and the two fallbacks below).
+    /// `get_info`'s `with_instructions` string, assembled fresh for each
+    /// session by [`instructions::build`] from the languages actually present
+    /// in this project's index and their capabilities - see that module's own
+    /// doc comment for the design (why the receiver-call gap sentence varies
+    /// per language, the byte budget it renders under, and the two fallbacks
+    /// below).
     ///
-    /// # GM-394: never takes the lock a bulk-index batch may be holding
+    /// # Never takes the store while a bulk-index batch may be holding it
     ///
     /// `get_info` is called during MCP `initialize`, before a client has
     /// asked a single tool question - unlike every tool handler above, which
     /// waits out the cold-start walk via [`prepare`](Self::prepare) before it
-    /// ever reaches for `self.conn`, this method cannot afford to wait on
-    /// anything: blocking the handshake itself is indistinguishable from the
-    /// whole server hanging, which is exactly the bug GM-394 traced (a batch
-    /// commit's embedding inference holding the same mutex this method used
-    /// to lock unconditionally - see `daemon::bulk_index::commit` and
-    /// `daemon::indexing_status`'s own "GM-394" doc section).
+    /// ever reaches for `self.store`, this method cannot afford to wait on
+    /// anything: blocking the handshake is indistinguishable from the whole
+    /// server hanging, and a batch commit holds the store through its
+    /// embedding inference (see `daemon::bulk_index::commit` and
+    /// `daemon::indexing_status`).
     ///
     /// So [`self.indexing.phase()`](IndexingStatus::phase) - a lock-free
     /// atomic read - is checked *first*, and only a caller that finds it past
-    /// [`Phase::Walking`] ever takes `self.conn`'s mutex at all. A caller in
+    /// [`Phase::Walking`] ever takes `self.store` at all. A caller in
     /// [`Phase::Unindexed`] or [`Phase::Walking`] skips the query entirely
     /// and gets capabilities-only instructions (the same shape the `Err`
-    /// fallback below already produces, for the same "if the index isn't
-    /// open yet, fall back to capabilities only" reason), through
-    /// [`instructions::cold_start`] - GM-395's D12 - so the one fact that is
-    /// true only for this moment (the project's own root, and whether its
-    /// walk has started or is still owed) is stated rather than left for a
-    /// caller to infer from an unusually generic paragraph. `Phase::Failed`
-    /// is deliberately not included here: nothing holds `self.conn`'s mutex
-    /// once a walk has failed and returned, so there is no GM-394 hazard in
-    /// taking it, and this method's ordinary query-then-render path already
-    /// handles a project with nothing indexed yet (`present` comes back
-    /// empty, and [`build`](instructions::build) renders the same
+    /// fallback below produces, for the same "if the index isn't open yet,
+    /// fall back to capabilities only" reason), through
+    /// [`instructions::cold_start`], so the one fact that is true only for
+    /// this moment (the project's own root, and whether its walk has started
+    /// or is still owed) is stated rather than left for a caller to infer
+    /// from an unusually generic paragraph. `Phase::Failed` is not included
+    /// here: nothing holds the store once a walk has failed and returned, so
+    /// taking it cannot block, and this method's ordinary query-then-render
+    /// path already handles a project with nothing indexed yet (`present`
+    /// comes back empty, and [`build`](instructions::build) renders the same
     /// unqualified paragraph a fresh project always has).
     ///
     /// Two independent data sources feed the builder once the index is open,
@@ -766,15 +763,14 @@ impl GMeshMcpServer {
     ///   `DiscoveredPlugins`, an in-memory value read once at daemon startup
     ///   (see `PluginRegistry`'s own doc comment) - infallible.
     /// - `storage::schema::present_languages_with_semantic_state` is a real
-    ///   query against `self.conn`, which - unlike every tool handler above -
+    ///   query against `self.store`, which - unlike every tool handler above -
     ///   this method cannot refuse to answer around: there is no error
     ///   response to return here, only better or worse instructions text.
     ///   `Err` here (a corrupt schema, a locked or otherwise unreadable DB -
     ///   not the ordinary "cold start, zero File nodes yet" case, which is
     ///   `Ok(vec![])` and handled by [`instructions::build`] itself) falls
     ///   back to every *discovered* manifest's capabilities with
-    ///   `semantic_pass_done: false` for all of them - GM-262's own scope
-    ///   note: "if the index isn't open yet, fall back to capabilities only".
+    ///   `semantic_pass_done: false` for all of them.
     ///   Forcing `semantic_pass_done` to `false` is what makes that fallback
     ///   honest under this uncertainty: without a real `language_state` read
     ///   there is no fact to claim a semantic pass has completed, so only
@@ -793,7 +789,7 @@ impl GMeshMcpServer {
         }
 
         let present = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.store.read();
             crate::storage::schema::present_languages_with_semantic_state(&conn)
         };
         let present = match present {
@@ -825,7 +821,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        find_definition::handle(&self.conn, self.registry.project_root(), &self.embedding, params.0)
+        find_definition::handle(&self.store, self.registry.project_root(), &self.embedding, params.0)
     }
 
     #[tool(
@@ -841,7 +837,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_references::handle(&self.conn, &self.embedding, &capabilities, params.0)
+        find_references::handle(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -854,7 +850,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_callers_callees::handle_callers(&self.conn, &self.embedding, &capabilities, params.0)
+        find_callers_callees::handle_callers(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -867,7 +863,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_callers_callees::handle_callees(&self.conn, &self.embedding, &capabilities, params.0)
+        find_callers_callees::handle_callees(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(
@@ -883,7 +879,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_implementations::dispatch(&self.conn, &self.embedding, &capabilities, params.0)
+        find_implementations::dispatch(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(
@@ -900,7 +896,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.conn, params.0)
+        get_file_outline::handle(&self.store, params.0)
     }
 
     #[tool(
@@ -928,7 +924,7 @@ impl GMeshMcpServer {
         // there is nothing a cache would save beyond what the borrow checker
         // already makes free.
         let entry_points = self.registry.entry_points();
-        get_dependencies::handle(&self.conn, &entry_points, params.0)
+        get_dependencies::handle(&self.store, &entry_points, params.0)
     }
 
     #[tool(
@@ -943,7 +939,7 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "search_code", Need::Embeddings).await? {
             return Ok(early);
         }
-        search_code::handle(&self.conn, &self.embedding, params.0)
+        search_code::handle(&self.store, &self.embedding, params.0)
     }
 }
 

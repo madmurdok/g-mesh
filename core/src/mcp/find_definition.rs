@@ -750,12 +750,12 @@ fn by_name(
 }
 
 pub(crate) fn handle(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     project_root: &Path,
     embedding: &EmbeddingPipeline,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
     // Defaults to on. The snippet is the point of the field - a caller who
     // wants coordinates alone has to say so, rather than every caller having
     // to ask for the thing that saves them a round trip.

@@ -752,11 +752,11 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// changes while a daemon runs (see `daemon::manifest::discover`'s own
 /// contract) - there is nothing this function would gain by asking twice.
 pub(crate) fn handle(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     entry_points: &[String],
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
     let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
         params;
     let shape = WalkShape { direction, max_depth, max_fanout };

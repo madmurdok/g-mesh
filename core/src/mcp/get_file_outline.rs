@@ -105,10 +105,10 @@ fn list_outline(
 }
 
 pub(super) fn handle(
-    conn: &Arc<IndexStore>,
+    store: &Arc<IndexStore>,
     params: GetFileOutlineParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let file_node = queries::find_file_node(&conn, &params.file_path)
         .map_err(|e| internal_error("failed to look up file", e))?;
