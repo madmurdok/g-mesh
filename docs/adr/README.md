@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0003`). Use this
+zero-padded, incrementing — the next free number is `0006`). Use this
 template:
 
 ```markdown

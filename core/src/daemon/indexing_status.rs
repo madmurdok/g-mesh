@@ -598,11 +598,8 @@ mod tests {
         assert_eq!(status.phase(), Phase::Walking);
     }
 
-    /// The fast path task 96/99 left intact: a restart against an
-    /// already-walked index starts satisfying `Need::Structural` from its
-    /// first instant, with no wait ever observed by a structural caller.
-    /// GM-395 slice 2's lazy startup: a project that owes its walk sits at
-    /// `Unindexed` until something asks, and nothing is satisfied there.
+    /// Lazy startup: a project that owes its walk sits at `Unindexed` until
+    /// something asks, and nothing is satisfied there.
     #[tokio::test]
     async fn an_unindexed_project_satisfies_no_need() {
         let status = IndexingStatus::unindexed();
@@ -763,11 +760,8 @@ mod tests {
         );
     }
 
-    /// The huge-project case task 105 exists for, now expressed against a
-    /// deadline rather than an unconditional wait: nothing ever satisfies the
-    /// need, so the wait must give up once `deadline` passes rather than hang
-    /// - the shape a future progress-notification loop (GM-395 slice 3) will
-    /// poll this in.
+    /// A huge project: nothing ever satisfies the need, so the wait must give
+    /// up once `deadline` passes rather than hang.
     #[tokio::test]
     async fn a_deadline_returns_timed_out_once_it_passes_with_nothing_satisfied() {
         let status = IndexingStatus::walking();

@@ -374,6 +374,7 @@ pub fn run(root: &Path) -> Result<()> {
     // project gets it from activation, right before its walk. A walked one gets
     // it now, and its consumer too unless a semantic-pass retry is owed, which
     // must run before any incremental pass (activation starts it after that).
+    // A watcher failure here is fatal: this is startup, with no session to lose.
     let pending_watcher = if needs_bulk_index {
         None
     } else {
@@ -598,7 +599,10 @@ pub enum DaemonLock {
 }
 
 /// Diagnoses [`DaemonLock`] for `root`: the socket first (an answer means
-/// healthy), then the lock, probed by taking and dropping it.
+/// healthy), then the lock, probed by taking and dropping it. A daemon racing
+/// for the lock does not notice the probe only because it retries for
+/// [`SINGLETON_LOCK_RETRY_BUDGET`], orders of magnitude longer than the probe
+/// holds it.
 pub fn inspect_daemon_lock(root: &Path) -> Result<DaemonLock> {
     let listening = is_listening(root)?;
     inspect_daemon_lock_in(&project_dir(root)?, listening)
