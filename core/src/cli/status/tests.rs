@@ -413,6 +413,27 @@ fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
     );
 }
 
+/// While a live daemon works, a deferred pass carries no repair advice: the
+/// running daemon is the one that asks again.
+#[test]
+fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string()],
+        &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        Some("running - go (0/2 languages done)"),
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "  semantic pass:   running - go (0/2 languages done)".to_string(),
+            "  semantic pass:   python pending - its plugin was asleep or memory-suspended; \
+             the running daemon asks again"
+                .to_string(),
+        ]
+    );
+}
+
 /// Task 108: a daemon mid-cold-start-walk (task 105 already made it
 /// reachable and answering, not merely running) must not be reported next
 /// to a line implying nothing is happening or that a restart is owed - the

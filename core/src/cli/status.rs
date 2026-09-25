@@ -550,10 +550,16 @@ pub(crate) fn semantic_pass_lines(
     for (language, reason) in failures {
         // A pass deferred because its plugin was asleep has not failed: it is
         // still owed and will be asked again.
+        // While a live daemon is working, it is the one that asks again, so
+        // the line carries no repair advice.
         if reason == daemon::semantic::NOT_RUN_REASON {
+            let asks_again = if in_progress.is_some() {
+                "the running daemon asks again"
+            } else {
+                "the next daemon start or `g-mesh reindex` asks again"
+            };
             lines.push(format!(
-                "  semantic pass:   {language} pending - its plugin was asleep or memory-suspended; \
-                 the next daemon start or `g-mesh reindex` asks again"
+                "  semantic pass:   {language} pending - its plugin was asleep or memory-suspended; {asks_again}"
             ));
             continue;
         }
