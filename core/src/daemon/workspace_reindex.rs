@@ -234,7 +234,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 
-use crate::daemon::bulk_index::{self, BulkIndexSummary};
+use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
@@ -276,19 +276,13 @@ pub(crate) fn run(
             .delete_language(&manifest.language)
             .with_context(|| format!("failed to delete {}'s rows before reindexing it", manifest.language))?;
 
-        let mut summary = BulkIndexSummary::default();
-        bulk_index::walk_one_language(
-            registry.project_root(),
-            &manifest,
-            store,
-            &mut summary,
-            Some(registry.embedding().as_ref()),
-            None,
-            // No baselines from a one-language re-walk: see this module's
-            // own doc comment on why it leaves `indexed_files` alone.
-            None,
-        )
-        .with_context(|| format!("failed to re-walk {} after {changed_file} changed", manifest.language))?;
+        // No `walked_files`, so no baselines from a one-language re-walk: see
+        // this module's own doc comment on why it leaves `indexed_files` alone.
+        let mut ctx =
+            WalkContext { embedding: Some(registry.embedding().as_ref()), ..WalkContext::new(store) };
+        bulk_index::walk_one_language(registry.project_root(), &manifest, &mut ctx).with_context(|| {
+            format!("failed to re-walk {} after {changed_file} changed", manifest.language)
+        })?;
 
         store.relink_after_language_reindex()?;
         Ok(())
