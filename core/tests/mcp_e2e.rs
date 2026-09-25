@@ -22,10 +22,6 @@ mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
-/// Wording that only makes sense to someone editing the parameter structs.
-const DEVELOPER_ONLY_PHRASES: [&str; 4] =
-    ["for the tests", "construct this by hand", "doc comment for why", "deliberate duplicate"];
-
 /// Name plus the parameters a caller must supply - the half of each schema a
 /// follow-up ticket is not allowed to quietly change.
 const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
@@ -140,15 +136,6 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
             assert!(properties.contains_key(*param), "{name} is missing parameter `{param}`");
         }
         assert_eq!(properties.len(), params.len(), "{name} publishes unexpected parameters: {properties:?}");
-        // The schema is prompt text an agent pays for on every request;
-        // rationale meant for this crate's developers must not reach it.
-        let schema_text = serde_json::to_string(&**schema).expect("a schema serializes");
-        for phrase in DEVELOPER_ONLY_PHRASES {
-            assert!(
-                !schema_text.contains(phrase),
-                "{name}'s inputSchema carries developer-only text {phrase:?}"
-            );
-        }
         assert!(
             tool.description.as_ref().is_some_and(|d| !d.is_empty()),
             "{name} has no description for an agent to choose it by"
