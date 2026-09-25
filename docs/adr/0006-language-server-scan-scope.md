@@ -1,9 +1,12 @@
-# 0006. Language server scan scope: pyright gets the walker's include and exclude
+# 0006. Language server scan scope: pyright gets the walker's exclude
 
 ## Status
-Proposed (2026-09-25, GM-416). Measured in GM-416/S1 and GM-416/S5;
-implementation is GM-416/S6 in `plugins/sdk/src/walk.rs` (the scope) and
-`plugins/python/src/semantic.rs` (the settings).
+Accepted (2026-09-25, GM-416); the owner reviewed the proposal and accepted
+it with two changes: only `exclude` is sent, never `include` (decision 5),
+and the task's acceptance criterion for a slow first answer was restated as
+the scope tests below. Measured in GM-416/S1 and GM-416/S5; implemented in
+`plugins/sdk/src/walk.rs` (the scope) and `plugins/python/src/semantic.rs`
+(the settings).
 
 ## Context
 GM-415/S5 recorded the Python semantic pass failing on a cold index of
@@ -71,8 +74,9 @@ Other facts S5 established:
 
 ## Decision
 We will hand pyright the walker's view of the project as
-`python.analysis.include` and `python.analysis.exclude`, answered through
-`workspace/configuration`. Nothing is written into the user's project.
+`python.analysis.exclude`, answered through `workspace/configuration`.
+`python.analysis.include` is never sent. Nothing is written into the user's
+project.
 
 1. **Computed in the SDK, from the same walk.** A new
    `walk_scope(root, extensions, exclude_dirs) -> WalkScope` in
@@ -80,46 +84,40 @@ We will hand pyright the walker's view of the project as
    `.gitignore` layering, same `BASELINE_EXCLUDED_DIRS`, same manifest
    `exclude_dirs`), so the scope cannot drift from what we index. It
    returns:
-   - `include`: the top-most directories that contain a claimed file (a
-     directory is dropped when an ancestor is already listed, since pyright
-     recurses), plus each claimed file directly in the root as a file entry.
-     Paths are relative, `/`-separated.
    - `pruned`: every directory the walk declined to enter because of
-     `.gitignore`, relative to the root, top-most only (nothing under an
-     already pruned directory is listed). The walk yields each directory it
-     enters; a child of an entered directory that is a real directory (not a
-     symlink), was not itself entered, and is not one of the named excludes
-     is pruned.
+     `.gitignore`, relative to the root, `/`-separated, top-most only
+     (nothing under an already pruned directory is listed). The walk yields
+     each directory it enters; a child of an entered directory that is a
+     real directory (not a symlink), was not itself entered, and is not one
+     of the named excludes is pruned.
    - `exclude_dirs`: the named excludes (baseline plus manifest), which
      are sent as `**/<name>` patterns, so they cost one entry each however
      often they occur.
-2. **Mapped to pyright's keys in the Python plugin.** In
+2. **Mapped to pyright's key in the Python plugin.** In
    `plugins/python/src/semantic.rs`, at the same place that adds
    `pythonPath`, and by the same merge into the `python` section:
-   `analysis.exclude = pruned ++ ["**/<name>" for exclude_dirs]` and
-   `analysis.include = include`. When the walk finds no Python file,
-   `include` is omitted (an empty `include` makes pyright assume the root
-   anyway). The manifest's own `[plugin.semantic.settings.python.analysis]`
-   keys are kept; if the manifest ever sets `include`/`exclude` itself, the
-   manifest wins and the plugin logs that it did not overwrite them.
+   `analysis.exclude = pruned ++ ["**/<name>" for exclude_dirs]`. The
+   manifest's own `[plugin.semantic.settings.python.analysis]` keys are
+   kept; if the manifest ever sets `exclude` itself, the manifest wins and
+   the plugin logs that it did not overwrite it.
 3. **Bounded.** `exclude` carries at most 1,000 entries, the shallowest
    first (the big ones, such as `target/` and `dist/`, are near the root).
    The remainder is dropped with one log line naming the count. The worst
    case is today's behaviour for the dropped directories.
 4. **Computed once per server.** The scope is taken when the engine is
    built, and the server keeps it for its lifetime. A directory that appears
-   later only costs speed: pyright may scan it, and a new Python directory
-   outside `include` is not tracked. Neither affects answers, because the
-   bridge opens every file it asks about and imports resolve outside the
-   scope. Refreshing it through `didChangeConfiguration` is possible (pyright
-   re-pulls) but is not part of this decision.
-5. **`include` is sent, although it measured no gain here.** On g-mesh,
-   `exclude` alone does all the work (medians 0.77s against 0.72s, within
-   noise), because what pyright walks outside the Python directories is
-   small once `target/` is gone. `include` pays off in a project with large
-   non-ignored, non-Python trees (vendored assets, data), costs nothing to
-   compute because the walk already happened, and the import check above
-   shows it does not narrow resolution.
+   later only costs speed: pyright may scan it. That does not affect
+   answers, because the bridge opens every file it asks about and imports
+   resolve outside the scope. Refreshing it through `didChangeConfiguration`
+   is possible (pyright re-pulls) but is not part of this decision.
+5. **`include` is not sent.** It measured no gain: 0.70-0.80s with
+   `include` + `exclude` against 0.70-0.82s with `exclude` alone, within
+   noise, because what pyright walks outside the Python directories is small
+   once the ignored trees are gone. And since the scope is taken once per
+   server, an `include` list would go stale: a Python directory created
+   after start-up would sit outside it and not be tracked until the server
+   restarts. `exclude` fails safe in the same situation (a new ignored
+   directory is only scanned), `include` does not.
 
 **No first-answer budget.** The residual warm-up is 0.70-0.85s, more than
 10 times inside `Budgets::request` (10s), and S1's no-`target/` runs never
@@ -167,26 +165,25 @@ an answer wrong, only a scan shorter.
 - **TypeScript** hands its compiler the file list its own semantic pass
   walks; there is no server-side scan to scope.
 
+
 ## Consequences
 - The cold-start failure is removed at its cause: on g-mesh the first
   answer falls from about 5s at load 3-4 (up to 8.6s under load in S1) to
   about 0.75s.
 - `WalkScope` is generic; another plugin maps it to its own server's keys.
 - Task acceptance criterion 3 ("a fake LSP that answers late on the first
-  request") belonged to the dropped budget. It needs to be restated as the
-  scope tests below; that is the owner's call before S6.
-- Tests S6 must add, each with its control (the code is reverted, never the
-  test):
+  request") belonged to the dropped budget; it is restated as the scope
+  tests below.
+- Tests, each with its control (the code is reverted, never the test):
   1. **`walk_scope` matches the walk** (`plugins/sdk/src/walk.rs` unit
      tests, with the existing `Tree` helper): a tree with a gitignored
      `build/` holding claimed files, a nested gitignored `src/gen/`, a
-     manifest-excluded `vendor/` at depth 2, a root-level claimed file and
-     two claimed directories under one parent. Assert `pruned == ["build",
-     "src/gen"]` (no `vendor`, nothing under `build`), `include` is the
-     root file plus the top-most directories, and the union of files under
-     `include` equals `walk_project`'s output. Control: have `walk_scope`
-     skip the `.gitignore` layering; `pruned` comes back empty and the
-     assertion fails.
+     manifest-excluded `vendor/` at depth 2 and claimed files elsewhere.
+     Assert `pruned == ["build", "src/gen"]` (no `vendor`, nothing under
+     `build`), and that every claimed file on disk is either in
+     `walk_project`'s output or under a pruned or named-excluded directory,
+     never both. Control: have `walk_scope` skip the `.gitignore` layering;
+     `pruned` comes back empty and the assertion fails.
   2. **The cap** keeps the shallowest 1,000 entries: a tree with 1,005
      gitignored leaf directories at depth 2 and one at depth 1; the depth-1
      entry survives. Control: remove the depth sort; it is dropped.
@@ -194,23 +191,23 @@ an answer wrong, only a scan shorter.
      test, next to the `set_python_path` test): after the scope is added,
      the `python` section still holds the manifest's `typeCheckingMode` and
      `pythonPath`, `analysis.exclude` has the pruned paths and
-     `**/<name>` for each manifest excluded directory, and a manifest-set
-     `exclude` is not overwritten. Control: insert instead of merge; the
-     manifest key is lost.
+     `**/<name>` for each manifest excluded directory, `include` is absent,
+     and a manifest-set `exclude` is not overwritten. Control: insert
+     instead of merge; the manifest key is lost.
   4. **The engine is built with the scope** (`plugins/python/src/semantic.rs`
      test on the function that builds the engine's `SemanticConfig` for a
      root): a temporary project with a gitignored `junk/` and a claimed
      `app/`; the `python` section carries `analysis.exclude` containing
-     `junk` and `analysis.include == ["app"]`. The client already answers
-     `workspace/configuration` with this section verbatim (existing
-     `client.rs` tests). Control: skip the scope step; neither key is
-     present.
+     `junk`. The client already answers `workspace/configuration` with this
+     section verbatim (existing `client.rs` tests). Control: skip the scope
+     step; the key is absent.
   5. **Real pyright ignores a pruned tree** (an ignored-by-default
      integration test, run where pyright is available): a temporary project
      with a gitignored `junk/` holding a `.py` module and a claimed
-     `app/main.py`. `workspace/symbol` for the junk module's function
-     returns nothing, and `definition` from `app/main.py` into an import of
-     a module outside `include` still lands there. Control: send no scope;
-     the junk symbol is found.
+     `app/main.py` that imports a module from a gitignored, excluded
+     directory. `workspace/symbol` for the junk module's function returns
+     nothing, and `definition` from `app/main.py` into the import in the
+     excluded directory still lands there. Control: send no scope; the junk
+     symbol is found.
 - S8 measures 3 cold daemon starts of g-mesh with `target/` present and
   records the first-answer latency against S1's 6.57-7.33s.
