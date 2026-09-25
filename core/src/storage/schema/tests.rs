@@ -726,3 +726,27 @@ fn a_language_with_no_present_files_is_not_part_of_the_roll_up() {
     record_bulk_index(&conn).unwrap();
     assert!(bulk_index_completed(&conn).unwrap());
 }
+
+/// A failed pass's reason is recorded per language, replaced by a later
+/// failure, and cleared by a later success - without the failure ever
+/// marking the language's pass done.
+#[test]
+fn a_semantic_pass_failure_is_recorded_until_a_pass_succeeds() {
+    let conn = setup();
+    ensure_current(&conn, GENERATION).unwrap();
+    seed_file(&conn, "f1", "python");
+    seed_file(&conn, "f2", "go");
+    let capable = HashSet::from(["python".to_string(), "go".to_string()]);
+
+    record_language_semantic_pass_failure(&conn, "python", "the server exited").unwrap();
+    record_language_semantic_pass_failure(&conn, "python", "a request timed out").unwrap();
+    assert_eq!(
+        semantic_pass_failures(&conn).unwrap(),
+        vec![("python".to_string(), "a request timed out".to_string())]
+    );
+    assert!(!language_semantic_pass_done(&conn, "python").unwrap(), "a failure is not a completed pass");
+    assert_eq!(owed_semantic_pass_languages(&conn, &capable).unwrap(), vec!["go", "python"]);
+
+    record_semantic_pass(&conn, "python", &capable).unwrap();
+    assert!(semantic_pass_failures(&conn).unwrap().is_empty(), "a completed pass clears the reason");
+}

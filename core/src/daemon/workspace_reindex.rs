@@ -393,11 +393,14 @@ pub(crate) fn run(
             // (`daemon::semantic::run_with_registry`, on a future daemon
             // start, or a later reindex of this same language).
             Ok(false) => {}
-            Err(err) => eprintln!(
-                "g-mesh daemon: the {} semantic pass after a workspace reindex failed ({err:#}) - \
-                 its edges keep whatever the structural pass resolved",
-                manifest.language
-            ),
+            Err(err) => {
+                eprintln!(
+                    "g-mesh daemon: the {} semantic pass after a workspace reindex failed ({err:#}) - \
+                     its edges keep whatever the structural pass resolved",
+                    manifest.language
+                );
+                semantic::record_failure(conn, &manifest.language, &err);
+            }
         }
 
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();

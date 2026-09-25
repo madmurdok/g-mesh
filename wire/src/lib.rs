@@ -430,11 +430,16 @@ pub struct FileChangeResponse {
     /// `incomplete: true`), and any third-party one that has not adopted it -
     /// keeps answering exactly as it did: a pass that answers at all is a
     /// pass that finished. That is also why this is not an enum: the only
-    /// thing core branches on is "was this pass complete", and the reason it
-    /// was not is the plugin's own to log, in words, where there is room for
-    /// it.
+    /// thing core branches on is "was this pass complete"; the reason it was
+    /// not travels separately, in words, as [`Self::incomplete_reason`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub incomplete: bool,
+    /// **`semanticPass` only, and only beside `incomplete: true`:** why the
+    /// pass did not cover everything, in words, for core to record per
+    /// language and show in `g-mesh status`. Optional on the wire: absent
+    /// means the plugin gave no reason, and core records a generic one.
+    #[serde(rename = "incompleteReason", default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 /// `skip_serializing_if` for a `bool` that is absent-means-false on the wire.
@@ -854,6 +859,7 @@ mod tests {
             id: RequestId::Number(42),
             result: FileChangeDiff::default(),
             incomplete: false,
+            incomplete_reason: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -878,6 +884,13 @@ mod tests {
         let parsed: FileChangeResponse = serde_json::from_str(with).unwrap();
         assert!(parsed.incomplete);
         assert!(serde_json::to_string(&parsed).unwrap().contains("\"incomplete\":true"));
+        assert_eq!(parsed.incomplete_reason, None);
+
+        let reasoned =
+            r#"{"jsonrpc":"2.0","id":7,"result":{},"incomplete":true,"incompleteReason":"server exited"}"#;
+        let parsed: FileChangeResponse = serde_json::from_str(reasoned).unwrap();
+        assert_eq!(parsed.incomplete_reason.as_deref(), Some("server exited"));
+        assert!(serde_json::to_string(&parsed).unwrap().contains("\"incompleteReason\":\"server exited\""));
     }
 
     #[test]

@@ -180,16 +180,16 @@ fn an_ordinary_symbol_in_the_same_walk_costs_no_declaration_rows() {
 }
 
 #[test]
-fn a_freshly_built_index_reads_schema_version_8() {
+fn a_freshly_built_index_reads_schema_version_9() {
     let project = Project::new();
     let conn = project.walk();
 
     let version: String =
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "8" is GM-264's containers /
-    // placeholder_targets / language_state / source-tier bump.
-    assert_eq!(version, "8");
+    // has to update this line by hand. "9" adds
+    // `language_state.semanticPassError`.
+    assert_eq!(version, "9");
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
 

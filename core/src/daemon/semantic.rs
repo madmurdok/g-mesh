@@ -220,9 +220,11 @@ pub struct SemanticPassRun {
     /// `language_state.semanticPassAt` recorded by this call.
     pub completed: Vec<String>,
     /// Languages that were asked and did not finish - `(language, error)`,
-    /// kept for the caller's own log line. Left unset in `language_state`, so
-    /// the next call (a later daemon start, a later `init`/`reindex` retry)
-    /// tries again - see this module's doc comment on `Err` vs "left unset".
+    /// kept for the caller's own log line. `language_state.semanticPassAt`
+    /// stays unset, so the next call (a later daemon start, a later
+    /// `init`/`reindex` retry) tries again - see this module's doc comment on
+    /// `Err` vs "left unset" - and the error is recorded as that language's
+    /// `semanticPassError` for `g-mesh status`.
     pub failed: Vec<(String, anyhow::Error)>,
 }
 
@@ -233,6 +235,21 @@ impl SemanticPassRun {
     /// used to carry directly.
     pub fn any_ran(&self) -> bool {
         !self.completed.is_empty()
+    }
+
+    /// Records `language`'s completed pass, which also clears any failure
+    /// recorded for it earlier.
+    fn record_success(&mut self, conn: &Mutex<Connection>, language: String) {
+        match schema::record_language_semantic_pass(&conn.lock().unwrap(), &language) {
+            Ok(()) => self.completed.push(language),
+            Err(err) => self.failed.push((language, err)),
+        }
+    }
+
+    /// Records `language`'s failed pass and its reason in `language_state`.
+    fn record_failure(&mut self, conn: &Mutex<Connection>, language: String, err: anyhow::Error) {
+        record_failure(conn, &language, &err);
+        self.failed.push((language, err));
     }
 
     /// Logs one line per language this run touched - a completion for every
@@ -297,15 +314,14 @@ pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) ->
             .get_or_spawn(&language)
             .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new(), file_count));
         match outcome {
-            Ok(true) => match schema::record_language_semantic_pass(&conn.lock().unwrap(), &language) {
-                Ok(()) => run.completed.push(language),
-                Err(err) => run.failed.push((language, err)),
-            },
-            // The supervisor was asleep and deliberately left that way - see
-            // this function's own doc comment. Not recorded either way: the
-            // language stays owed for the next caller.
-            Ok(false) => {}
-            Err(err) => run.failed.push((language, err)),
+            Ok(true) => run.record_success(conn, language),
+            // The supervisor was asleep or suspended and deliberately left
+            // that way - see this function's own doc comment. Not a failure:
+            // the language stays owed for the next caller.
+            Ok(false) => {
+                eprintln!("g-mesh daemon: the {language} semantic pass was not run - its plugin is asleep or suspended")
+            }
+            Err(err) => run.record_failure(conn, language, err),
         }
     }
 
@@ -363,7 +379,7 @@ pub fn run_once(
             Ok(process) => process,
             Err(err) => {
                 let context = format!("failed to start the {language} plugin");
-                run.failed.push((language, err.context(context)));
+                run.record_failure(conn, language, err.context(context));
                 continue;
             }
         };
@@ -386,11 +402,8 @@ pub fn run_once(
         let _ = std::fs::remove_file(&pid_file);
 
         match outcome {
-            Ok(()) => match schema::record_language_semantic_pass(&conn.lock().unwrap(), &language) {
-                Ok(()) => run.completed.push(language.clone()),
-                Err(err) => run.failed.push((language.clone(), err)),
-            },
-            Err(err) => run.failed.push((language.clone(), err)),
+            Ok(()) => run.record_success(conn, language.clone()),
+            Err(err) => run.record_failure(conn, language.clone(), err),
         }
         if let Err(err) = shutdown {
             eprintln!("g-mesh: the {language} plugin did not shut down cleanly ({err:#})");
@@ -399,6 +412,18 @@ pub fn run_once(
 
     reconcile_rollup(conn, &capable);
     run
+}
+
+/// Persists `err` as `language`'s `semanticPassError`. A failure to write it
+/// is logged, never propagated: the pass has already failed, and the index
+/// stays serviceable.
+pub(crate) fn record_failure(conn: &Mutex<Connection>, language: &str, err: &anyhow::Error) {
+    let reason = format!("{err:#}");
+    if let Err(write_err) =
+        schema::record_language_semantic_pass_failure(&conn.lock().unwrap(), language, &reason)
+    {
+        eprintln!("g-mesh: failed to record why the {language} semantic pass failed ({write_err:#})");
+    }
 }
 
 /// Shared tail of [`run_with_registry`]/[`run_once`]: re-checks the project-
@@ -538,6 +563,16 @@ mod tests {
         (project, plugins, first_dir, second_dir, conn, registry)
     }
 
+    /// What `g-mesh status` prints about the semantic pass for this index,
+    /// through the same two functions its report is built with.
+    fn status_lines(conn: &Mutex<Connection>, registry: &PluginRegistry) -> Vec<String> {
+        let guard = conn.lock().unwrap();
+        let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
+        let (owed, failures) = crate::cli::status::semantic_pass_state(&guard, &capable).unwrap();
+        let completed = schema::semantic_pass_completed(&guard).unwrap();
+        crate::cli::status::semantic_pass_lines(completed, &owed, &failures)
+    }
+
     fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {
         conn.query_row(
             "SELECT semanticPassAt FROM language_state WHERE language = ?1",
@@ -660,7 +695,24 @@ mod tests {
                 "alpha's row must stay unset after a failure"
             );
             assert!(semantic_pass_at(&guard, "beta").is_some(), "beta's row must already be set");
+            let failures = schema::semantic_pass_failures(&guard).unwrap();
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].0, "alpha");
+            assert!(
+                failures[0].1.contains("semanticPass"),
+                "the timeout is recorded as the reason: {failures:?}"
+            );
         }
+        let lines = status_lines(&conn, &registry);
+        assert!(
+            lines.iter().any(|line| line.starts_with("  semantic pass:   alpha failed - ")
+                && line.contains("semanticPass")),
+            "status names the language and the reason: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("never completed")),
+            "a recorded failure replaces the generic advice: {lines:?}"
+        );
         assert_eq!(
             test_plugin::spawns(&beta_dir).len(),
             1,
@@ -691,5 +743,44 @@ mod tests {
             schema::semantic_pass_completed(&conn.lock().unwrap()).unwrap(),
             "both languages have now completed - the project-wide roll-up must fire"
         );
+        assert!(
+            schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().is_empty(),
+            "the successful retry clears alpha's recorded failure"
+        );
+        assert_eq!(status_lines(&conn, &registry), vec!["  semantic pass:   complete".to_string()]);
+    }
+
+    /// A plugin whose language server errored answers the pass `incomplete`
+    /// with a reason. The reason is recorded for that language and status
+    /// shows it; the next pass that completes clears it.
+    #[test]
+    fn an_incomplete_pass_records_the_plugins_reason_until_a_pass_completes() {
+        const REASON: &str = "the language server refused a question about src/a.alpha-src (internal error)";
+        let (_project, plugins, _alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry("alpha", true, false, "beta", false, false);
+        test_plugin::install_incomplete_once(plugins.path(), "alpha", &[".alpha-src"], REASON);
+
+        let first_run = run_with_registry(&registry, &conn);
+        assert!(first_run.completed.is_empty(), "{:?}", first_run.completed);
+        assert_eq!(
+            first_run.failed.iter().map(|(language, _)| language.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        {
+            let guard = conn.lock().unwrap();
+            assert!(semantic_pass_at(&guard, "alpha").is_none(), "an incomplete pass is not a completed one");
+            let failures = schema::semantic_pass_failures(&guard).unwrap();
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert!(failures[0].1.contains(REASON), "the plugin's own reason is recorded: {failures:?}");
+        }
+        let lines = status_lines(&conn, &registry);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("  semantic pass:   alpha failed - "), "{lines:?}");
+        assert!(lines[0].contains(REASON), "{lines:?}");
+
+        let second_run = run_with_registry(&registry, &conn);
+        assert_eq!(second_run.completed, vec!["alpha".to_string()], "{:?}", second_run.failed);
+        assert!(schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().is_empty());
+        assert_eq!(status_lines(&conn, &registry), vec!["  semantic pass:   complete".to_string()]);
     }
 }

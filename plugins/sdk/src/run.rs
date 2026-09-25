@@ -610,12 +610,17 @@ fn pass_response(
     whole_project: bool,
     answer: crate::semantic::SemanticAnswer,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let incomplete = whole_project && !answer.complete;
+    let mut response = serde_json::json!({
         "jsonrpc": JSONRPC_VERSION,
         "id": id,
         "result": answer.diff,
-        "incomplete": whole_project && !answer.complete,
-    })
+        "incomplete": incomplete,
+    });
+    if let (true, Some(reason)) = (incomplete, answer.reason) {
+        response["incompleteReason"] = serde_json::Value::String(reason);
+    }
+    response
 }
 
 // --- shared helpers ---------------------------------------------------------
@@ -700,6 +705,21 @@ mod tests {
             "a per-file pass has no completion flag to protect"
         );
         assert_eq!(pass_response(id, false, complete)["incomplete"], serde_json::json!(false));
+    }
+
+    /// An incomplete whole-project pass carries the engine's reason for core
+    /// to record; a per-file one does not, for the same reason it carries no
+    /// flag.
+    #[test]
+    fn an_incomplete_whole_project_pass_says_why() {
+        let id = serde_json::json!(7);
+        let answer = SemanticAnswer::incomplete_because(FileChangeDiff::default(), "the server exited");
+
+        let response = pass_response(id.clone(), true, answer.clone());
+        assert_eq!(response["incompleteReason"], serde_json::json!("the server exited"));
+        assert!(pass_response(id.clone(), false, answer).get("incompleteReason").is_none());
+        let complete = SemanticAnswer::complete(FileChangeDiff::default());
+        assert!(pass_response(id, true, complete).get("incompleteReason").is_none());
     }
 
     /// The diff an incomplete pass did manage travels with it - core commits

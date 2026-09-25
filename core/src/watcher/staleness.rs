@@ -541,6 +541,7 @@ mod tests {
                     id,
                     result: FileChangeDiff::default(),
                     incomplete: false,
+                    incomplete_reason: None,
                 },
             )
             .unwrap();
@@ -558,6 +559,7 @@ mod tests {
                 delete_edge_ids: vec![],
             },
             incomplete: false,
+            incomplete_reason: None,
         }
     }
 

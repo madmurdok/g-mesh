@@ -272,6 +272,11 @@ fn pass(bridge: &mut LspBridge, index: &SdkIndex) -> SemanticAnswer {
     bridge.answer(&[], index).expect("the bridge answers rather than failing")
 }
 
+/// The reason an incomplete pass gave, which core records per language.
+fn reason(answer: &SemanticAnswer) -> &str {
+    answer.reason.as_deref().expect("an incomplete pass says why")
+}
+
 fn semantic_edges(answer: &SemanticAnswer) -> Vec<&WireEdge> {
     answer.diff.upsert_edges.iter().filter(|edge| edge.source == SourceTier::Semantic).collect()
 }
@@ -416,6 +421,7 @@ fn a_server_that_never_becomes_ready_reports_an_incomplete_pass() {
 
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "a pass that asked nothing has not completed");
+    assert!(reason(&answer).contains("still indexing"), "{}", reason(&answer));
     assert!(answer.diff.upsert_edges.is_empty());
     assert!(answer.diff.delete_edge_ids.is_empty(), "nothing is retracted on the strength of no answers");
 }
@@ -1072,11 +1078,33 @@ fn a_question_that_is_never_answered_makes_the_pass_incomplete() {
     let started = std::time::Instant::now();
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "an unanswered question is not an answer of 'nothing'");
+    assert!(reason(&answer).contains("did not answer a question about src/b.toy"), "{}", reason(&answer));
     assert!(answer.diff.upsert_edges.is_empty());
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "the per-request budget bounded the wait, not the pass budget"
     );
+}
+
+/// A server that answers a question with an error has not answered it: the
+/// pass is incomplete, and its reason carries the server's own message.
+#[test]
+fn a_question_the_server_answers_with_an_error_makes_the_pass_incomplete_and_says_why() {
+    let scratch = Scratch::new("error");
+    let (index, _) = fixture(&scratch);
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("pyright: internal error resolving the import");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a refused question is not an answer of 'nothing'");
+    assert!(reason(&answer).contains("pyright: internal error resolving the import"), "{}", reason(&answer));
+    assert!(answer.diff.upsert_edges.is_empty());
 }
 
 /// The acceptance case: the server dies mid-pass. The plugin survives, the
@@ -1118,6 +1146,7 @@ fn a_server_that_crashes_mid_pass_keeps_its_answers_and_the_bridge_recovers() {
 
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "questions were left unasked when the server went away");
+    assert!(reason(&answer).contains("exited during the pass"), "{}", reason(&answer));
     assert_eq!(semantic_edges(&answer).len(), 1, "the one answer that arrived is kept: {:#?}", answer.diff);
 
     // The process is still standing and still usable: a second pass starts a
@@ -1193,6 +1222,7 @@ fn a_missing_server_binary_degrades_to_structural_and_reports_incomplete() {
     for _ in 0..3 {
         let answer = pass(&mut bridge, &index);
         assert!(!answer.complete);
+        assert!(reason(&answer).contains("could not be started"), "{}", reason(&answer));
         assert!(answer.diff.upsert_edges.is_empty());
     }
 }
@@ -1214,6 +1244,7 @@ fn the_site_budget_cuts_a_pass_short_and_reports_it() {
 
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "a budget that asked nothing has covered nothing");
+    assert!(reason(&answer).contains("max_sites"), "{}", reason(&answer));
     assert!(answer.diff.upsert_edges.is_empty());
 }
 

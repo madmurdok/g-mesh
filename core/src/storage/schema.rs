@@ -61,7 +61,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// bump every schema change here has taken, and every existing index pays
 /// the one-time wipe-and-reindex the design doc's Constraints section
 /// accepts for this release.
-pub const CURRENT_SCHEMA_VERSION: &str = "8";
+///
+/// Bumped to "9" when `language_state.semanticPassError` was added: the
+/// reason a language's last whole-project semantic pass failed, which
+/// `g-mesh status` shows. Nullable and reset by a wipe like its neighbours.
+pub const CURRENT_SCHEMA_VERSION: &str = "9";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -371,11 +375,16 @@ CREATE INDEX IF NOT EXISTS idx_targets_scope ON placeholder_targets(scopeKind, s
 -- actually triggers a reindex today - but it is the natural place a future
 -- per-language staleness check would look, so it is captured now rather than
 -- thrown away at the one site that has it for free.
+--
+-- `semanticPassError` is why this language's most recent whole-project
+-- semantic pass failed, NULL when it has not failed since its last success:
+-- a completed pass clears it, a failed one overwrites it.
 CREATE TABLE IF NOT EXISTS language_state (
     language          TEXT PRIMARY KEY,
     bulkIndexedAt     TEXT,
     semanticPassAt    TEXT,
-    pluginFingerprint TEXT
+    pluginFingerprint TEXT,
+    semanticPassError TEXT
 );
 
 -- bulkIndexedAt is NULL until a full project walk has completed at least
@@ -752,11 +761,41 @@ pub fn semantic_pass_completed(conn: &Connection) -> Result<bool> {
 pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO language_state (language, semanticPassAt) VALUES (?1, CURRENT_TIMESTAMP)
-         ON CONFLICT(language) DO UPDATE SET semanticPassAt = excluded.semanticPassAt",
+         ON CONFLICT(language) DO UPDATE SET semanticPassAt = excluded.semanticPassAt,
+             semanticPassError = NULL",
         params![language],
     )
     .with_context(|| format!("failed to record that {language}'s semantic pass completed"))?;
     Ok(())
+}
+
+/// Records why `language`'s whole-project semantic pass failed, replacing any
+/// earlier reason. `semanticPassAt` is left as it was: a language still owed
+/// its pass stays owed, and the next [`record_language_semantic_pass`] clears
+/// the reason.
+pub fn record_language_semantic_pass_failure(conn: &Connection, language: &str, reason: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO language_state (language, semanticPassError) VALUES (?1, ?2)
+         ON CONFLICT(language) DO UPDATE SET semanticPassError = excluded.semanticPassError",
+        params![language, reason],
+    )
+    .with_context(|| format!("failed to record that {language}'s semantic pass failed"))?;
+    Ok(())
+}
+
+/// Every language whose last whole-project semantic pass failed, with the
+/// recorded reason, sorted by language.
+pub fn semantic_pass_failures(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT language, semanticPassError FROM language_state
+             WHERE semanticPassError IS NOT NULL ORDER BY language",
+        )
+        .context("failed to prepare the semantic-pass failure read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("failed to read semantic-pass failures")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read semantic-pass failures")
 }
 
 /// Whether every *present and semantic-pass-capable* language has recorded

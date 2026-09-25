@@ -268,6 +268,8 @@ fn a_report_renders_every_field_it_was_asked_for() {
         index: IndexStatus {
             bulk_indexed: true,
             semantic_pass_completed: true,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -307,6 +309,8 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         index: IndexStatus {
             bulk_indexed: true,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -322,6 +326,67 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         rendered.contains("semantic pass:   never completed - run `g-mesh reindex` to repair it"),
         "an interrupted semantic pass must be surfaced explicitly, not silently folded into \
          a healthy-looking report:\n{rendered}"
+    );
+}
+
+/// A language whose last semantic pass failed is named with its recorded
+/// reason, read from the index itself, and the generic "never completed"
+/// advice is left out for it.
+#[test]
+fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_generic_advice() {
+    let fixture = Fixture::new(&[("src/a.ts", "export const a = 1;\n")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "src/a.ts", false);
+    schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+    schema::record_bulk_index(&conn).unwrap();
+    schema::record_language_semantic_pass_failure(
+        &conn,
+        "typescript",
+        "the plugin reported an incomplete whole-project semantic pass: the language server exited during the pass",
+    )
+    .unwrap();
+
+    let index = fixture.status();
+    assert_eq!(index.semantic_pass_owed, vec!["typescript".to_string()]);
+    let rendered = render(&Report {
+        project_root: fixture.root().to_path_buf(),
+        project_id: "a1b2c3d4e5f6a7b8".to_string(),
+        state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+        core: CoreState::NotRunning,
+        build: BuildState::NotRunning,
+        plugins: Vec::new(),
+        suspended_languages: Vec::new(),
+        last_used: None,
+        index,
+        phase: None,
+        front: None,
+    });
+
+    assert!(
+        rendered.contains(
+            "  semantic pass:   typescript failed - the plugin reported an incomplete whole-project semantic \
+             pass: the language server exited during the pass\n"
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("never completed"), "{rendered}");
+}
+
+/// The advice stays for an owed language with no recorded failure, beside
+/// the line for one that has one.
+#[test]
+fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string(), "rust".to_string()],
+        &[("python".to_string(), "the server exited".to_string())],
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string(),
+            "  semantic pass:   python failed - the server exited".to_string(),
+        ]
     );
 }
 
@@ -347,6 +412,8 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         index: IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -386,6 +453,8 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         index: IndexStatus {
             bulk_indexed,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -472,6 +541,8 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         index: IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -559,6 +630,8 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         index: IndexStatus {
             bulk_indexed: true,
             semantic_pass_completed: true,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -766,6 +839,8 @@ fn a_project_with_no_suspension_marker_reports_none() {
         index: IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
