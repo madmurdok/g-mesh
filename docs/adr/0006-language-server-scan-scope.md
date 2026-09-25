@@ -79,7 +79,7 @@ We will hand pyright the walker's view of the project as
 project.
 
 1. **Computed in the SDK, from the same walk.** A new
-   `walk_scope(root, extensions, exclude_dirs) -> WalkScope` in
+   `walk_scope(root, exclude_dirs) -> WalkScope` in
    `plugins/sdk/src/walk.rs` shares `walk_project`'s builder (same
    `.gitignore` layering, same `BASELINE_EXCLUDED_DIRS`, same manifest
    `exclude_dirs`), so the scope cannot drift from what we index. It

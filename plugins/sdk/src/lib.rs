@@ -99,7 +99,7 @@ pub use semantic::{
     write_semantic_engine_marker, SemanticAnswer, SemanticEngine, SemanticEngineFactory, MARKER_DIR_ENV,
     SEMANTIC_ENGINE_MARKER,
 };
-pub use walk::{walk_project, BASELINE_EXCLUDED_DIRS};
+pub use walk::{walk_project, walk_scope, WalkScope, BASELINE_EXCLUDED_DIRS, MAX_SCOPE_ENTRIES};
 
 /// The wire protocol, re-exported so a plugin needs one dependency rather
 /// than two and can never end up compiling a second, different copy of these
