@@ -182,10 +182,8 @@ fn the_walk_skips_exactly_what_the_plugins_walk_skips() {
     assert_eq!(found, vec!["keep.mjs", "keep.ts"]);
 }
 
-/// GM-412: the walk used to know only the TS plugin's extensions, so a
-/// Rust or Python file never reached the denominator (g-mesh itself read
-/// "42/42" while its index held 311 files). Every discovered language's
-/// files count, in coverage and in the dirty queue alike.
+/// Every discovered language's files count, in coverage and in the dirty
+/// queue alike - not only the extensions of the TS plugin.
 #[test]
 fn rust_and_python_files_count_toward_coverage_and_the_dirty_queue() {
     let fixture = Fixture::new(&[

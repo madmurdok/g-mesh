@@ -310,8 +310,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         }
     } else {
         // The same discovery the daemon runs at startup, so the files counted
-        // here are the files the discovered plugins index - every language,
-        // not only JS/TS (GM-412).
+        // here are the files the discovered plugins index, in every language.
         let plugins =
             manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
         index_status(project_root, &state_dir.join("index.db"), &plugins)?
