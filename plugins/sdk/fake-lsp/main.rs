@@ -203,6 +203,11 @@ struct Script {
     /// requests - a crash mid-pass.
     #[serde(default)]
     crash_after_requests: Option<u32>,
+    /// With `crashAfterRequests`: close stdin before the last answer goes
+    /// out, so the client, having read that answer, finds its next question
+    /// meets a broken pipe rather than a closed stdout.
+    #[serde(default)]
+    close_input_before_crash: bool,
     /// Stop answering (without exiting) from the nth request on - a server
     /// that hangs rather than dies.
     #[serde(default)]
@@ -318,6 +323,10 @@ fn main() {
                 if script.reindex.as_ref().is_some_and(|reindex| reindex.at_request == asked) {
                     begin_reindex(&script, Arc::clone(&indexing));
                 }
+                let crashing = script.crash_after_requests.is_some_and(|after| asked >= after);
+                if crashing && script.close_input_before_crash {
+                    close_stdin();
+                }
                 let key = position_of(&params);
                 let answer = script.answers.iter().find(|answer| {
                     (answer.uri.as_str(), answer.line, answer.character) == (key.0.as_str(), key.1, key.2)
@@ -348,7 +357,7 @@ fn main() {
                     }
                     None => respond(&mut stdout, id, Value::Null),
                 }
-                if script.crash_after_requests.is_some_and(|after| asked >= after) {
+                if crashing {
                     // Not an `exit`: the point is a server that goes away
                     // without saying anything, which is what a crash is.
                     std::process::exit(101);

@@ -1089,12 +1089,23 @@ fn a_question_that_is_never_answered_makes_the_pass_incomplete() {
 /// A pass that runs out of its whole budget with a question still waiting is
 /// incomplete and says so, even though no single request reached its own
 /// timeout.
+///
+/// The server is started and made ready by a per-file pass first, under its
+/// own generous budget, so the short whole-project budget is spent on asking
+/// alone: however slow the machine is to start a process, the pass that runs
+/// out is the one asking a question that is never answered.
 #[test]
 fn a_pass_that_runs_out_of_its_budget_is_incomplete_and_says_why() {
-    let scratch = Scratch::new("budget");
-    let (index, _) = fixture(&scratch);
+    let scratch = Scratch::new("pass-budget");
+    let (mut index, _) = fixture(&scratch);
+    crowd_file(&scratch, &mut index, "src/c.toy", 1);
     let mut answers = answers_the_site(&scratch);
-    answers[0]["silent"] = json!(true);
+    answers.as_array_mut().expect("a list").push(json!({
+        "uri": scratch.uri("src/c.toy"),
+        "line": 0,
+        "character": 5,
+        "silent": true,
+    }));
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
@@ -1103,9 +1114,12 @@ fn a_pass_that_runs_out_of_its_budget_is_incomplete_and_says_why() {
     let mut budgets = budgets();
     // The pass budget ends long before the request's own would.
     budgets.request = Duration::from_secs(60);
-    budgets.project_floor = Duration::from_secs(2);
+    budgets.project_floor = Duration::from_millis(300);
     budgets.per_file = Duration::from_millis(1);
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let warm = bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
+    assert!(warm.complete, "the per-file pass was answered: {:?}", warm.reason);
 
     let started = std::time::Instant::now();
     let answer = pass(&mut bridge, &index);
@@ -1116,7 +1130,6 @@ fn a_pass_that_runs_out_of_its_budget_is_incomplete_and_says_why() {
     );
     assert!(!answer.complete, "a question cut off by the pass budget is not an answer of 'nothing'");
     assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
-    assert!(answer.diff.upsert_edges.is_empty());
 }
 
 /// A server that can no longer be written to cannot be asked anything: the
@@ -1200,6 +1213,11 @@ fn a_server_that_crashes_mid_pass_keeps_its_answers_and_the_bridge_recovers() {
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "questions were left unasked when the server went away");
     assert!(reason(&answer).contains("exited during the pass"), "{}", reason(&answer));
+    assert!(
+        reason(&answer).contains("101"),
+        "how the server ended is part of the reason: {}",
+        reason(&answer)
+    );
     assert_eq!(semantic_edges(&answer).len(), 1, "the one answer that arrived is kept: {:#?}", answer.diff);
 
     // The process is still standing and still usable: a second pass starts a
@@ -1207,6 +1225,50 @@ fn a_server_that_crashes_mid_pass_keeps_its_answers_and_the_bridge_recovers() {
     // bridge tried rather than giving up.
     let second = pass(&mut bridge, &index);
     assert_eq!(semantic_edges(&second).len(), 1, "a fresh server answered again: {:#?}", second.diff);
+}
+
+/// A server that dies between answering one question and being asked the
+/// next is reported as having exited, with how it ended - not as a broken
+/// pipe, which is only how its death first showed.
+#[test]
+fn a_server_that_dies_before_the_next_question_is_reported_as_exited_not_as_a_broken_pipe() {
+    let scratch = Scratch::new("crash-epipe");
+    let (mut index, caller) = fixture(&scratch);
+    let b = RelPath::new("src/b.toy");
+    let (source, mut graph) = {
+        let entry = index.entry(&b).expect("the fixture has it");
+        (entry.source.clone(), entry.graph.clone())
+    };
+    graph.open_sites.push(OpenSite {
+        from_id: caller,
+        position: Position { line: 1, col: 12 },
+        name: "add".to_string(),
+        kind: OpenSiteKind::ReceiverCall,
+        edge_kind: EdgeKind::Calls,
+        from_container: Some("pkg".to_string()),
+        replaces: None,
+    });
+    index.insert(b, source, graph);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "crashAfterRequests": 1,
+        "closeInputBeforeCrash": true,
+    }));
+    let mut budgets = budgets();
+    budgets.concurrency = 1;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("exited during the pass"), "{}", reason(&answer));
+    assert!(
+        reason(&answer).contains("101"),
+        "how the server ended is part of the reason: {}",
+        reason(&answer)
+    );
+    assert_eq!(semantic_edges(&answer).len(), 1, "the one answer that arrived is kept: {:#?}", answer.diff);
 }
 
 /// An answer pointing at something this index does not have - another

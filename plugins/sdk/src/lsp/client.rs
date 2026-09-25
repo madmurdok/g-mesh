@@ -58,7 +58,7 @@
 use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -377,6 +377,24 @@ impl LspClient {
     /// again to notice the closed pipe).
     pub(crate) fn gone(&mut self) -> bool {
         self.closed || matches!(lock(&self.child).try_wait(), Ok(Some(_)))
+    }
+
+    /// How the server process ended, waiting up to `grace` for it to finish
+    /// exiting; `None` if it is still running then.
+    ///
+    /// A server that dies mid-conversation shows it first as a broken pipe or
+    /// a closed stdout, a moment before the process can be reaped, so an
+    /// immediate check would miss the exit it is looking for.
+    pub(crate) fn exit_status(&mut self, grace: Duration) -> Option<ExitStatus> {
+        let until = Instant::now() + grace;
+        loop {
+            let exited = lock(&self.child).try_wait();
+            match exited {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => return None,
+            }
+        }
     }
 
     /// Sends a request and returns the id its answer will carry.

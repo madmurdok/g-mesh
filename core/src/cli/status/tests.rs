@@ -390,6 +390,23 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
     );
 }
 
+/// A pass that was not run because its plugin was asleep is still owed, not
+/// failed: status says it is pending and why.
+#[test]
+fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string()],
+        &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+    );
+    assert_eq!(
+        lines,
+        vec!["  semantic pass:   python pending - its plugin was asleep or memory-suspended; \
+             the next daemon start or `g-mesh reindex` asks again"
+            .to_string(),]
+    );
+}
+
 /// Task 108: a daemon mid-cold-start-walk (task 105 already made it
 /// reachable and answering, not merely running) must not be reported next
 /// to a line implying nothing is happening or that a restart is owed - the

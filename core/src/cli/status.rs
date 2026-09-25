@@ -535,6 +535,15 @@ pub(crate) fn semantic_pass_lines(
         }
     }
     for (language, reason) in failures {
+        // A pass deferred because its plugin was asleep has not failed: it is
+        // still owed and will be asked again.
+        if reason == daemon::semantic::NOT_RUN_REASON {
+            lines.push(format!(
+                "  semantic pass:   {language} pending - its plugin was asleep or memory-suspended; \
+                 the next daemon start or `g-mesh reindex` asks again"
+            ));
+            continue;
+        }
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         lines.push(format!("  semantic pass:   {language} failed - {reason}"));
     }

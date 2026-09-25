@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -1097,6 +1098,18 @@ fn node_at<'i>(
     is_addressable(node).then_some((path, node))
 }
 
+/// How long a server whose pipe broke or whose stdout closed is given to
+/// finish exiting before the pass stops waiting to learn how it ended.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// The reason a pass gives when its server died under it.
+fn exited(status: Option<ExitStatus>) -> String {
+    match status {
+        Some(status) => format!("the language server exited during the pass ({status})"),
+        None => "the language server exited during the pass".to_string(),
+    }
+}
+
 /// Runs the question list against a live server.
 ///
 /// Written as a free function rather than a method so that the client can be
@@ -1162,9 +1175,19 @@ fn run_pass(
                     in_flight.insert(id, (question, Instant::now()));
                 }
                 Err(err) => {
-                    eprintln!("[{language}] could not ask the language server ({err:#})");
                     failed_files.insert(question.file.clone());
-                    fail(format!("could not ask the language server: {err:#}"));
+                    // A pipe broken by a server that has died is its death,
+                    // not a failure to write.
+                    match client.exit_status(EXIT_GRACE) {
+                        Some(status) => {
+                            eprintln!("[{language}] the language server exited during the pass ({status})");
+                            fail(exited(Some(status)));
+                        }
+                        None => {
+                            eprintln!("[{language}] could not ask the language server ({err:#})");
+                            fail(format!("could not ask the language server: {err:#}"));
+                        }
+                    }
                     queue.clear();
                     break;
                 }
@@ -1204,7 +1227,7 @@ fn run_pass(
                 for question in deferred.drain(..) {
                     failed_files.insert(question.file);
                 }
-                fail("the language server exited during the pass".to_string());
+                fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
             }
             continue;
@@ -1256,7 +1279,7 @@ fn run_pass(
                 for question in queue.drain(..) {
                     failed_files.insert(question.file);
                 }
-                fail("the language server exited during the pass".to_string());
+                fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
             }
             Poll::Noise => continue,

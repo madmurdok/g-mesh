@@ -948,4 +948,83 @@ mod tests {
             test_plugin::requests(&alpha_dir)
         );
     }
+
+    /// A registry with one `semantic_pass`-capable language, `alpha`, over an
+    /// empty current-schema index.
+    fn alpha_registry() -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry, Mutex<Connection>) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        test_plugin::install_with_workspace_semantic_pass_capable(
+            plugins.path(),
+            "alpha",
+            &[".alpha-src"],
+            &["go.mod"],
+            &[],
+        );
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+        let conn = test_plugin::empty_index();
+        schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
+        (project, plugins, registry, conn)
+    }
+
+    /// A reindex whose plugin is asleep when its semantic pass comes up does
+    /// not wake it: the pass is recorded as not run, and the language stays
+    /// owed.
+    #[test]
+    fn a_semantic_pass_not_run_after_a_workspace_reindex_records_why() {
+        let (_project, _plugins, registry, conn) = alpha_registry();
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        supervisor.sleep_now("the test put it to sleep");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the reindex itself succeeds");
+
+        let guard = conn.lock().unwrap();
+        let failures = schema::semantic_pass_failures(&guard).unwrap();
+        assert_eq!(failures, vec![("alpha".to_string(), semantic::NOT_RUN_REASON.to_string())]);
+        let semantic_pass_at: Option<String> = guard
+            .query_row("SELECT semanticPassAt FROM language_state WHERE language = 'alpha'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(semantic_pass_at.is_none(), "a pass that did not run leaves the language owed");
+    }
+
+    /// A pass that ran but whose completion could not be written after a
+    /// workspace reindex is recorded as a failure with the write's error.
+    #[test]
+    fn a_completion_that_cannot_be_written_after_a_workspace_reindex_records_the_error() {
+        let (_project, _plugins, registry, conn) = alpha_registry();
+        // Refuses exactly the write that sets `semanticPassAt`; the failure's
+        // own write sets only `semanticPassError`.
+        conn.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_completion_insert BEFORE INSERT ON language_state
+                 WHEN NEW.semanticPassAt IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;
+                 CREATE TRIGGER refuse_completion_update BEFORE UPDATE OF semanticPassAt ON language_state
+                 WHEN NEW.semanticPassAt IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+            )
+            .unwrap();
+
+        registry.route_settled_path(&conn, "go.mod".to_string());
+
+        let failures = schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].0, "alpha");
+        assert!(failures[0].1.contains("the disk is full"), "{failures:?}");
+    }
 }

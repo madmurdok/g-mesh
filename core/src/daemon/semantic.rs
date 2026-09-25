@@ -842,7 +842,10 @@ mod tests {
         }
         let lines = status_lines(&conn, &registry);
         assert!(!lines.iter().any(|line| line.contains("never completed")), "{lines:?}");
-        assert!(lines.iter().any(|line| line.contains("asleep or memory-suspended")), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.starts_with("  semantic pass:   alpha pending - ")),
+            "{lines:?}"
+        );
     }
 
     /// A pass that ran but whose completion could not be written is recorded
