@@ -1,61 +1,32 @@
 //! `g-mesh status`: what the current project's daemon, plugin and index are
 //! actually doing.
 //!
-//! Everything here is answered from outside the daemon - the recorded pids,
-//! the socket, the project's own `index.db`, and the phase word a running
-//! daemon publishes to `index.phase` (D13 in
-//! `docs/architecture/lazy-indexing.md`) - and never by asking the daemon a
-//! question. That is deliberate: the single most useful moment to
-//! run `status` is when the daemon is *not* well, and a report that needs a
-//! healthy daemon to be produced would go quiet exactly then.
+//! Everything is answered from outside the daemon (the recorded pids, the
+//! socket, `index.db`, and the phase word a running daemon publishes to
+//! `index.phase`, D13 in `docs/architecture/lazy-indexing.md`), never by
+//! asking the daemon: `status` matters most when the daemon is not well.
 //!
-//! # How each field is established
-//!
-//! - **Daemon core**: the pid in `daemon.pid` plus whether anything is
-//!   accepting connections on the socket. Both, because either alone lies in
-//!   a way the other catches - a recycled pid looks alive, and a socket file
-//!   outlives the process that bound it. Note that "running" no longer
-//!   implies "ready to answer at once": since task 105 the socket is bound
-//!   before the cold-start walk, so a daemon can be running and listening
-//!   while its first tool call is still waiting on that walk to finish
-//!   (GM-394 - it waits rather than erroring, so "answering" is no longer the
-//!   binary this note used to describe, just "answering slowly") - which is
-//!   what the `index:` line below reports on.
-//! - **Daemon build**: the stamp a live daemon publishes about the executable
-//!   it started from (`daemon::build_stamp`), compared with this command's
-//!   own. A daemon that outlived an upgrade answers every query correctly
-//!   *for the build it is*, so nothing else in this report can show it up -
-//!   which is precisely why it gets a line of its own.
-//! - **Plugins**: every `plugin-<language>.pid` file present in the state
-//!   directory (`daemon::registry::discovered_pid_files`), checked the same
-//!   way as the core's own pid and then read against the core's state - one
-//!   line per language, since `daemon::registry::PluginRegistry` gives each
-//!   language its own pid file rather than the single one a pre-registry
-//!   daemon wrote. A language with no pid file at all is not reported by
-//!   name: under the registry's lazy-spawn model that is the ordinary state
-//!   for a language nothing has touched yet *and* for one that was spawned
-//!   and has since gone idle (`daemon::lifecycle`'s two-tier sleep model
-//!   removes the pid file on every sleep, same as before) - the two are
-//!   indistinguishable from outside a running daemon, so this reports what it
-//!   can honestly tell apart: "active" for a live pid, "orphaned" for one
-//!   whose core is gone, and a single summary line when no language has a pid
-//!   file at all.
-//! - **Index phase**: the word a running daemon last published to
-//!   `index.phase` (`daemon::read_phase_in`, D13) - `unindexed`, `walking`,
-//!   `structural`, `embedding`, `ready` or `failed`. GM-395's lazy activation
-//!   is what makes this its own field rather than something `bulk_indexed`
-//!   and `core` could keep implying together: a project can now sit
-//!   `unindexed` under a live, idle daemon for as long as nothing has asked,
-//!   which the old "`daemon_alive` implies a walk is under way" reasoning
-//!   could not tell apart from an actual walk in progress.
-//! - **Index progress**: the counters the same daemon publishes to
-//!   `index.progress` (`daemon::read_progress_in`), shown per stage only
-//!   while the pid they carry is the live daemon's ([`live_progress`]).
-//! - **Dirty files / index coverage**: a gitignore-aware walk of the project,
-//!   cross-referenced against the `File` nodes and `indexed_files` baselines
-//!   in the index. See [`IndexStatus`] for exactly what each number counts.
-//! - **Files with syntax errors**: the `hasSyntaxErrors` flag the plugin sets
-//!   on a file it could only partially parse.
+//! - **Daemon core**: the pid in `daemon.pid` plus whether the socket accepts
+//!   connections; either alone lies (a recycled pid looks alive, a socket file
+//!   outlives its process). The socket is bound before the cold-start walk,
+//!   so "running" does not mean "ready": the `index:` line reports that.
+//! - **Daemon build**: the stamp a live daemon publishes about its executable
+//!   (`daemon::build_stamp`), compared with this command's own; nothing else
+//!   in the report can show up a daemon that outlived an upgrade.
+//! - **Plugins**: one line per `plugin-<language>.pid` file
+//!   (`daemon::registry::discovered_pid_files`). A language with no pid file
+//!   is not reported by name: "never touched" and "spawned, now asleep" are
+//!   indistinguishable from outside the daemon, so only "active", "orphaned"
+//!   and one summary line when there are none are reported.
+//! - **Index phase**: the word in `index.phase` (`daemon::read_phase_in`):
+//!   `unindexed`, `walking`, `structural`, `embedding`, `ready` or `failed`.
+//!   A project can sit `unindexed` under a live, idle daemon, so a live
+//!   daemon does not imply a walk.
+//! - **Index progress**: `index.progress` counters, shown only while their
+//!   pid is the live daemon's ([`live_progress`]).
+//! - **Dirty files / index coverage**: a gitignore-aware walk cross-referenced
+//!   against `File` nodes and `indexed_files` baselines (see [`IndexStatus`]).
+//! - **Files with syntax errors**: the plugin's `hasSyntaxErrors` flag.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -81,26 +52,18 @@ use crate::watcher::BASELINE_EXCLUDED_DIRS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreState {
     /// Its pid is alive and its socket is bound. Says nothing about whether
-    /// the index behind it is complete - a daemon in its cold-start walk
-    /// binds first and answers its handshake immediately, but a tool call
-    /// waits for the walk to finish before it answers (task 105, later
-    /// GM-394). `render` cross-references this with `IndexStatus::
-    /// bulk_indexed` (task 108) so a walk in progress reads as exactly that,
-    /// not as a stuck daemon next to an unrelated-looking "cold start still
-    /// owed" line.
+    /// the index is complete: the socket is bound before the cold-start walk,
+    /// and a tool call waits for the walk. `render` reads this with the phase
+    /// and `IndexStatus::bulk_indexed`, so a walk in progress reads as one.
     Running { pid: u32 },
-    /// Its pid is alive but nothing answers on the socket. Since the bind
-    /// moved ahead of the cold-start walk this no longer covers a daemon that
-    /// is merely busy indexing - it means one that died without clearing its
-    /// pid file, or a wedged one.
+    /// Its pid is alive but nothing answers on the socket: a daemon that died
+    /// without clearing its pid file, or a wedged one (not one busy indexing,
+    /// since the bind precedes the walk).
     NotAccepting { pid: u32 },
-    /// Nothing in `daemon.pid`, but a live process is still holding this
-    /// project's singleton lock after having served it - so no other daemon
-    /// can take the project over, and nothing can reach this one either
-    /// (task 184). Kept apart from `NotAccepting`, which describes a daemon
-    /// that still has a pid file: what makes this one worth its own variant is
-    /// precisely that every check keyed off `daemon.pid` reports it as nothing
-    /// running at all.
+    /// Nothing in `daemon.pid`, but a live process still holds this project's
+    /// singleton lock: no other daemon can take the project over and nothing
+    /// can reach this one. Its own variant because every `daemon.pid`-keyed
+    /// check reports it as nothing running.
     Wedged { pid: u32 },
     /// No live daemon, whatever `daemon.pid` may still say.
     NotRunning,
@@ -124,28 +87,17 @@ pub enum BuildState {
     /// from `Outdated` because "your core binary is old" would be false here,
     /// and would send someone looking in the wrong place.
     PluginChanged,
-    /// Running, but nothing usable is on record about its build - the shape
-    /// every daemon that predates this check has. Reported rather than
-    /// silently called current, because "we did not compare" and "we compared
-    /// and it matched" are different answers.
+    /// Running, but nothing usable is on record about its build. Reported
+    /// rather than called current: "not compared" is not "matched".
     Unknown,
 }
 
-/// Whether one language's plugin process is up - reported per language, in
-/// [`PluginReport`], rather than once for "the" plugin: since
-/// `daemon::registry::PluginRegistry` replaced the daemon's single
-/// `Arc<PluginSupervisor>`, there can be any number of these at once.
-///
-/// No `Asleep`/`NotRunning` variant here, unlike the pre-registry version of
-/// this type: those meant "a live core with no plugin pid on record has
-/// exactly one explanation" - true when the daemon spawned its one plugin
-/// unconditionally at startup, but no longer true under lazy per-language
-/// spawning, where "no pid file for this language" now covers two states
-/// this command cannot tell apart from outside a running daemon: a language
-/// nothing has touched yet, and one that was spawned and has since gone
-/// idle. [`plugin_reports`] only ever constructs a [`PluginReport`] for a
-/// language that *does* have a pid file, and [`render`] prints a single
-/// summary line, not a per-language guess, when none do.
+/// Whether one language's plugin process is up, reported per language in
+/// [`PluginReport`]. There is no asleep/not-running variant: "no pid file"
+/// covers both "never touched" and "spawned, now idle", which this command
+/// cannot tell apart, so [`plugin_reports`] only builds a report for a
+/// language with a pid file and [`render`] prints one summary line when none
+/// has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginState {
     /// Running under a live core.
@@ -155,39 +107,25 @@ pub enum PluginState {
     Orphaned { pid: u32 },
 }
 
-/// One language's plugin, as `status` reports it - `daemon::registry
-/// ::PluginRegistry` gives each language its own pid file, so there is one of
-/// these per `plugin-<language>.pid` file found, not one per daemon.
+/// One language's plugin, as `status` reports it: one per
+/// `plugin-<language>.pid` file found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginReport {
     pub language: String,
     pub state: PluginState,
 }
 
-/// One language whose semantic passes are suspended right now (task GM-274's
-/// own acceptance criterion: "`g-mesh status` shows suspension per
-/// language") - written by a running daemon's `daemon::lifecycle
-/// ::PluginSupervisor::check_memory_limit` the instant `[plugin]
-/// memoryLimitMb` catches that language's process tree over the limit (see
-/// the architecture doc's "Plugin memory limit" section), and read here the
-/// same way every other runtime fact this command reports is: off disk,
-/// never by asking a live daemon a question (see this module's own doc
-/// comment).
-///
-/// Deliberately its own listing rather than a field on [`PluginReport`]
-/// above: a plugin `check_memory_limit` just suspended has *no* pid file by
-/// the time anyone runs `status` - the same `sleep_now` path idle-sleep
-/// already uses removes it (`PluginSupervisor::put_to_sleep`) - so it is
-/// invisible to [`plugin_reports`] regardless, and a suspension marker is the
-/// only thing that survives to describe it. See
-/// `daemon::registry::discovered_suspended_markers`, this field's source.
+/// One language whose semantic passes are suspended right now: written by a
+/// running daemon's `PluginSupervisor::check_memory_limit` when `[plugin]
+/// memoryLimitMb` catches its process tree over the limit, and read here off
+/// disk (`daemon::registry::discovered_suspended_markers`). A listing of its
+/// own, not a field on [`PluginReport`]: a suspended plugin has no pid file
+/// (suspension removes it, like idle sleep), so the marker is the only trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuspendedLanguage {
     pub language: String,
-    /// The human-readable reason `PluginSupervisor::check_memory_limit`
-    /// recorded when it suspended this language (naming the configured limit
-    /// and the measured figure) - persisted verbatim, because nothing else
-    /// about *why* survives outside the daemon process that decided it.
+    /// The reason `check_memory_limit` recorded (the configured limit and the
+    /// measured figure), verbatim: nothing else about why survives the daemon.
     pub reason: String,
 }
 
@@ -196,13 +134,11 @@ pub struct SuspendedLanguage {
 pub struct IndexStatus {
     /// Whether a full project walk has ever finished (`meta.bulkIndexedAt`).
     pub bulk_indexed: bool,
-    /// Whether the whole-project semantic pass that follows a walk has ever
-    /// finished (`meta.semanticPassAt`) - independent of `bulk_indexed`,
-    /// deliberately: every walk records `bulkIndexedAt` before asking for
-    /// this pass (see `daemon::semantic`'s module doc), so a pass
-    /// interrupted afterwards (a killed plugin, a crash, a timeout) leaves
-    /// `bulk_indexed` true and this `false`. That combination is the one
-    /// [`render`] calls out by name - see task 62cc2d0f.
+    /// Whether the whole-project semantic pass after a walk has ever finished
+    /// (`meta.semanticPassAt`). Independent of `bulk_indexed`: every walk
+    /// records `bulkIndexedAt` before asking for this pass, so an interrupted
+    /// pass leaves `bulk_indexed` true and this false, the combination
+    /// [`render`] calls out (see `daemon::semantic`'s module doc).
     pub semantic_pass_completed: bool,
     /// Semantic-pass-capable languages present in the index whose pass has
     /// not completed (`language_state.semanticPassAt` unset), sorted.
@@ -214,15 +150,14 @@ pub struct IndexStatus {
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
     pub indexed: usize,
-    /// Files the index still owes work for: never indexed at all, or indexed
-    /// against a recorded baseline that no longer matches the file on disk.
+    /// Files the index still owes work for: never indexed, or indexed against
+    /// a recorded baseline that no longer matches the file on disk.
     ///
-    /// A bulk-indexed file with no `indexed_files` row is *not* counted:
-    /// `daemon::bulk_index` leaves a walked file without a baseline when it
-    /// cannot prove the walk saw its current bytes (GM-401,
-    /// `watcher::staleness::record_walk_baselines`), and an index built
-    /// before GM-401 has none at all - so a missing baseline means "walked,
-    /// not yet checked since", not "stale".
+    /// A bulk-indexed file with no `indexed_files` row is *not* counted: the
+    /// walk leaves no baseline when it cannot prove it saw the current bytes
+    /// (`watcher::staleness::record_walk_baselines`), and older indexes have
+    /// none at all, so a missing baseline means "not checked since", not
+    /// "stale".
     pub dirty: usize,
     /// Project-relative paths of files the plugin flagged as only partially
     /// parseable, sorted.
@@ -248,29 +183,22 @@ pub struct Report {
     pub state_dir: PathBuf,
     pub core: CoreState,
     pub build: BuildState,
-    /// Every language with a pid file on disk right now, sorted by language -
-    /// see [`PluginState`]'s doc comment for what "no pid file" now means
-    /// under lazy per-language spawning.
+    /// Every language with a pid file on disk right now, sorted (see
+    /// [`PluginState`] for what "no pid file" means).
     pub plugins: Vec<PluginReport>,
-    /// Every language currently suspended by `[plugin] memoryLimitMb`, sorted
-    /// by language - see [`SuspendedLanguage`]'s own doc comment for why this
-    /// is independent of `plugins` above.
+    /// Every language suspended by `[plugin] memoryLimitMb`, sorted;
+    /// independent of `plugins` (see [`SuspendedLanguage`]).
     pub suspended_languages: Vec<SuspendedLanguage>,
     pub last_used: Option<LastUsed>,
     pub index: IndexStatus,
-    /// The word a running daemon last published to `index.phase` (D13 in
-    /// `docs/architecture/lazy-indexing.md`) - `None` when no daemon is
-    /// serving this project right now, since `daemon::lifecycle::
-    /// release_state_files` removes the file on the way out. This is what
-    /// [`render`] uses to tell "idle, never indexed" (`unindexed`) apart from
-    /// "building right now" (`walking`) - a distinction `IndexStatus::
-    /// bulk_indexed` alone cannot make under GM-395's lazy activation, since
-    /// a project can sit unwalked for as long as nothing has asked.
+    /// The word a running daemon last published to `index.phase` (D13);
+    /// `None` when no daemon serves the project (`release_state_files`
+    /// removes it). It tells "idle, never indexed" (`unindexed`) from
+    /// "building now" (`walking`), which `bulk_indexed` alone cannot.
     pub phase: Option<String>,
-    /// Set when `phase` reads `front` (GM-399, D11): the folder's projects as
-    /// a fresh bounded walk counts them. `index` is then left empty, since
-    /// its whole-folder file walk is exactly the cost a front exists to
-    /// avoid.
+    /// Set when `phase` reads `front` (D11): the folder's projects as a fresh
+    /// bounded walk counts them. `index` is then left empty: a whole-folder
+    /// file walk is the cost a front exists to avoid.
     pub front: Option<FrontSummary>,
     /// The progress counters last published to `index.progress`, whichever
     /// daemon wrote them - [`render`] shows them only while their `pid` is
@@ -286,14 +214,10 @@ pub struct FrontSummary {
     pub truncated: bool,
 }
 
-/// Reports on the project the current directory belongs to.
-///
-/// Also prints the GC idle-project warning (`gc::warning`) after the report,
-/// if `cleanup.enabled` and any project is past `cleanup.idleThresholdDays` -
-/// `status` is a command a human runs and reads at a terminal, exactly the
-/// audience that warning is for. It is never printed here for `mcp-shim` or
-/// `daemon`, whose stdout is protocol traffic read by an MCP client, not a
-/// person.
+/// Reports on the project the current directory belongs to, then prints the
+/// GC idle-project warning (`gc::warning`) when it applies. That warning is
+/// printed for this human-facing command only, never for `mcp-shim` or
+/// `daemon`, whose stdout is protocol traffic.
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     print!("{}", render(&collect(&cwd)?));
@@ -352,14 +276,10 @@ fn core_state(project_root: &Path) -> Result<CoreState> {
     let recorded =
         daemon::read_pid_file(&daemon::pid_path(project_root)?).filter(|&pid| daemon::is_process_alive(pid));
     let Some(pid) = recorded else {
-        // No pid file, or one left behind by a daemon that crashed or was
-        // killed - which used to end the enquiry. It no longer can: a daemon
-        // that removed its own pid file on the way out and then failed to
-        // actually exit is still holding the project's singleton lock, and
-        // reporting that as "not running" is what let it wedge the project
-        // unnoticed. The lock is asked because it is the same fact
-        // `daemon::acquire_singleton_lock` acts on, so this report and the
-        // next bootstrap cannot disagree.
+        // No live pid file does not end the enquiry: a daemon that removed its
+        // pid file and failed to exit still holds the singleton lock. The lock
+        // is what `daemon::acquire_singleton_lock` acts on, so this report and
+        // the next bootstrap cannot disagree.
         return Ok(match daemon::inspect_daemon_lock(project_root)? {
             daemon::DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
             _ => CoreState::NotRunning,
@@ -373,17 +293,10 @@ fn core_state(project_root: &Path) -> Result<CoreState> {
 }
 
 /// Compares the running daemon's published build with this command's own.
-///
-/// `NotAccepting` is compared like `Running` rather than skipped: the stamp is
-/// published before the socket is bound (see `daemon::run`), so even a daemon
-/// that has not got as far as binding has already said which build it is - and
-/// a daemon that is up but not answering is exactly when someone is most
-/// likely to be asking why an upgrade has not taken effect.
-///
-/// Infallible, unlike its neighbours: every failure along the way - no
-/// executable to stat, no stamp on disk, an unreadable one - is the same
-/// answer, `Unknown`, and none of them is a reason for `status` to refuse to
-/// print the rest of the report.
+/// `NotAccepting` is compared too: the stamp is published before the socket
+/// is bound (`daemon::run`). Infallible: every failure (no executable to
+/// stat, a missing or unreadable stamp) is `Unknown`, never a reason to skip
+/// the rest of the report.
 fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     if matches!(core, CoreState::NotRunning) {
         return BuildState::NotRunning;
@@ -400,11 +313,9 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     }
 }
 
-/// Every language with a live pid file in `state_dir` right now, sorted by
-/// language (`daemon::registry::discovered_pid_files` already sorts, so this
-/// just carries that order through). A pid file naming a dead process is
-/// dropped rather than reported - same "unreadable/stale means nothing
-/// recorded" convention every pid-file read in this daemon uses.
+/// Every language with a live pid file in `state_dir`, sorted by language
+/// (the order `discovered_pid_files` returns). A pid file naming a dead
+/// process is dropped, as in every pid-file read in this daemon.
 fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
     crate::daemon::registry::discovered_pid_files(state_dir)
         .into_iter()
@@ -415,13 +326,9 @@ fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
         .collect()
 }
 
-/// Every `plugin-<language>.suspended` marker in `state_dir`, as
-/// [`SuspendedLanguage`] rows - a thin wrapper over
-/// `daemon::registry::discovered_suspended_markers`, unconditional on `core`
-/// unlike [`plugin_reports`]: a suspension is a fact about this project's
-/// state directory, not about whether a daemon happens to be running to read
-/// it back right now (the marker is what makes that possible in the first
-/// place - see [`SuspendedLanguage`]'s own doc comment).
+/// Every `plugin-<language>.suspended` marker in `state_dir`. Unlike
+/// [`plugin_reports`] it does not depend on `core`: a suspension is a fact
+/// about the state directory, not about a running daemon.
 fn suspended_language_reports(state_dir: &Path) -> Vec<SuspendedLanguage> {
     crate::daemon::registry::discovered_suspended_markers(state_dir)
         .into_iter()
@@ -434,20 +341,16 @@ fn suspended_language_reports(state_dir: &Path) -> Vec<SuspendedLanguage> {
 /// dead core to go with it) for every row.
 fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
     match core {
-        // A wedged core counts as gone for the plugin's purposes: it is not
-        // answering anything, so a plugin still alive under it is as orphaned
-        // as one whose core has actually exited, and `g-mesh stop` clears
-        // both together.
+        // A wedged core counts as gone: a plugin alive under it is as orphaned
+        // as one whose core exited, and `g-mesh stop` clears both.
         CoreState::NotRunning | CoreState::Wedged { .. } => PluginState::Orphaned { pid },
         CoreState::Running { .. } | CoreState::NotAccepting { .. } => PluginState::Active { pid },
     }
 }
 
 /// Cross-references what is on disk against what the index knows about it.
-///
-/// Split out from [`collect`] - and given the database path explicitly -
-/// because this is the part with real logic in it, and it should be testable
-/// against a hand-built index rather than only through a live daemon.
+/// Takes the database path explicitly so it can be tested against a
+/// hand-built index.
 pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlugins) -> Result<IndexStatus> {
     let discovered = discover_source_files(project_root, plugins)?;
 
@@ -577,21 +480,13 @@ struct SourceFile {
 }
 
 /// Walks `project_root` for files some discovered plugin would index,
-/// honoring `.gitignore`, [`BASELINE_EXCLUDED_DIRS`], and each language's own
-/// `[plugin.workspace] exclude_dirs` - the file-level decision is
-/// [`DiscoveredPlugins::indexing_language`], the same filter the watcher
-/// routes changes through.
-///
-/// Core cannot literally reuse the bulk walk: each plugin walks the project
-/// itself, in its own process (the TS plugin's `ignorePolicy.ts`, the Go
-/// plugin's `walk.go`, the SDK's `walk_project` for Rust and Python). What they
-/// share, and what this mirrors, is the manifest: extensions claimed, the
-/// directories excluded per language, and the baseline pair.
-///
-/// Deliberate divergences from those walks, all in the direction of doing
-/// less: symlinks are not followed (the TS plugin follows them under a cycle
-/// guard), and a file whose metadata cannot be read is skipped rather than
-/// failing the report. Neither can make a broken index look healthy.
+/// honoring `.gitignore`, [`BASELINE_EXCLUDED_DIRS`] and each language's
+/// `[plugin.workspace] exclude_dirs`; the per-file decision is
+/// [`DiscoveredPlugins::indexing_language`], the watcher's filter. Each
+/// plugin walks in its own process, so this mirrors their shared manifest
+/// rules rather than reusing a walk. It diverges only toward doing less (no
+/// symlinks followed, unreadable metadata skipped), which cannot make a
+/// broken index look healthy.
 fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Result<Vec<SourceFile>> {
     // Pruned outright: the baseline, plus any directory *every* discovered
     // language excludes. A directory only some languages exclude is still
@@ -784,15 +679,10 @@ pub fn render(report: &Report) -> String {
         let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
     }
 
-    // Only meaningful once a walk has actually landed - before that,
-    // `index:` above already says a cold start (or the walk in progress) is
-    // what is owed, and a semantic pass has nowhere to run yet regardless.
-    // Once `bulk_indexed` is true, `semantic_pass_completed` is the fact
-    // `bulk_indexed` alone cannot tell apart from a genuinely finished index:
-    // a pass interrupted after the walk was already recorded (a killed
-    // plugin, a crash, a timeout) leaves exactly this combination, and
-    // nothing else in this report would ever call it out - see task
-    // 62cc2d0f / `daemon::semantic`'s module doc.
+    // Only once a walk has landed: before that `index:` already says what is
+    // owed. After it, `semantic_pass_completed` is what tells an interrupted
+    // semantic pass (a killed plugin, a crash, a timeout) from a finished
+    // index (see `daemon::semantic`'s module doc).
     if index.bulk_indexed {
         let in_progress = match phase {
             Some("unindexed" | "walking" | "structural" | "embedding") => {
@@ -821,12 +711,10 @@ pub fn render(report: &Report) -> String {
     out
 }
 
-/// `report.progress`, only when the daemon serving the project right now is
-/// the one that wrote it. A running daemon replaces the file with its own pid
-/// as soon as it starts, so a snapshot with any other pid - or with no daemon
-/// running at all - was left by a daemon that died without removing it.
-/// The pid is corroborated by the socket (`CoreState::Running`), so a
-/// recycled pid alone does not make a leftover snapshot look live.
+/// `report.progress`, only when the live daemon wrote it: a running daemon
+/// rewrites the file with its own pid at start, so any other pid is a
+/// leftover. The pid is corroborated by the socket (`CoreState::Running`), so
+/// a recycled pid alone does not make a leftover look live.
 pub(crate) fn live_progress(report: &Report) -> Option<&ProgressSnapshot> {
     match report.core {
         CoreState::Running { pid } => report.progress.as_ref().filter(|progress| progress.pid == pid),
@@ -958,13 +846,10 @@ fn describe_core(core: CoreState) -> String {
     }
 }
 
-/// `None` for a project with nothing running, whose report has no room for a
-/// line about a build that does not exist.
-///
-/// The two unhealthy states both name `g-mesh stop` even though a shim now
-/// replaces an outdated daemon on its own: someone running `status` is asking
-/// *now*, and telling them the next MCP call would have sorted it out is not
-/// an answer to that. Running it is harmless if the shim got there first.
+/// `None` when nothing is running. Both unhealthy states name `g-mesh stop`
+/// even though a shim replaces an outdated daemon on its own: someone running
+/// `status` is asking now, and stopping is harmless if the shim got there
+/// first.
 fn describe_build(build: BuildState) -> Option<&'static str> {
     match build {
         BuildState::NotRunning => None,
