@@ -23,16 +23,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::{imports, symbol_links};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
     SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
-use crate::storage::index_store::IndexStore;
-use crate::storage::write::{
-    apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord,
-};
+use crate::storage::index_store::{IndexStore, Unit, Writer};
+use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -87,7 +84,37 @@ use crate::storage::write::{
 pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &IndexStore,
+    store: &IndexStore,
+    file_path: impl Into<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    semantic_pass_timeout: Duration,
+    semantic_pass_capable: bool,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    store.unit(Unit::WatcherApply, |store| {
+        apply_file_change_in(
+            reader,
+            writer,
+            store,
+            file_path,
+            request_id,
+            embedding,
+            file_changed_timeout,
+            semantic_pass_timeout,
+            semantic_pass_capable,
+            on_timeout,
+        )
+    })
+}
+
+/// [`apply_file_change`] for a caller already inside a unit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &mut Writer<'_>,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -103,7 +130,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     let _structural = round_trip(
         reader,
         writer,
-        conn,
+        store,
         ControlMessage::FileChanged { file_path: file_path.clone() },
         request_id.clone(),
         embedding,
@@ -115,10 +142,10 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
         return Ok(());
     }
 
-    if let Err(err) = apply_semantic_pass(
+    if let Err(err) = apply_semantic_pass_in(
         reader,
         writer,
-        conn,
+        store,
         vec![file_path.clone()],
         semantic_pass_id(&request_id),
         embedding,
@@ -150,7 +177,24 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &IndexStore,
+    store: &IndexStore,
+    file_paths: Vec<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    store.unit(Unit::WatcherApply, |store| {
+        apply_semantic_pass_in(reader, writer, store, file_paths, request_id, embedding, timeout, on_timeout)
+    })
+}
+
+/// [`apply_semantic_pass`] inside an open unit.
+#[allow(clippy::too_many_arguments)]
+fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &mut Writer<'_>,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -161,7 +205,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     let outcome = round_trip(
         reader,
         writer,
-        conn,
+        store,
         ControlMessage::SemanticPass { file_paths },
         request_id,
         embedding,
@@ -252,48 +296,23 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
 /// silent" means - only the caller that owns the transport does (for a real
 /// plugin, `daemon::plugin::PluginProcess` kills the child).
 ///
-/// # GM-396: embedding inference runs with the connection lock released
+/// # Lock holds
 ///
-/// `conn` is a `Mutex`, not an already-locked `&mut Connection`, so this
-/// function can choose exactly when to hold it - the same seam
-/// `daemon::bulk_index::commit` already uses for a bulk batch (see that
-/// function's own "GM-394" doc section). It is locked once for `apply_diff`
-/// and the two linking passes - ordinary SQLite writes, bounded by the size
-/// of one file's diff - then released before
-/// [`EmbeddingPipeline::compute`](crate::embedding::EmbeddingPipeline::compute)
-/// runs the model over whatever that diff upserted, and locked again only for
-/// [`EmbeddingPipeline::store`](crate::embedding::EmbeddingPipeline::store).
+/// Two steps of the caller's [`Unit::WatcherApply`]: one commits and links
+/// the diff, the other stores its vectors. Embedding inference runs between
+/// them, so under that unit's per-step policy no other store user waits on
+/// it. The plugin round trip itself stays serialized by
+/// `daemon::plugin::PluginProcess`'s own `state` lock.
 ///
-/// Before this, every caller of this function held `conn`'s lock (taken by
-/// `daemon::plugin::PluginProcess::send_one`/`ensure_fresh`/`semantic_pass`,
-/// once, around the whole round trip) for as long as inference took -
-/// GM-393 bounds one node's embedding input to
-/// [`DEFAULT_MAX_SEQUENCE_LENGTH`](crate::embedding::model::DEFAULT_MAX_SEQUENCE_LENGTH)
-/// tokens, but a diff from one large file can still upsert many embeddable
-/// nodes, and every one of them ran with every other connection - a tool
-/// call, the MCP handshake - locked out for however long that took. Nothing
-/// about the *plugin* round trip changes here: `daemon::plugin::PluginProcess`
-/// still serializes every call through this file's own `self.state` lock
-/// exactly as before (see `daemon::lifecycle`'s "Lock order" section), so two
-/// incremental reparses for the same language still never interleave on the
-/// wire - only `conn`'s lock, the one other connections actually wait on, is
-/// narrowed.
-///
-/// The lock-free gap this opens is a window in which some other writer (a
-/// second reparse of the same file replayed after a relaunch, a bulk walk, a
-/// workspace-triggered per-language re-walk) can commit its own diff for a
-/// node this round trip is about to write a vector for.
-/// [`EmbeddingPipeline::store`]'s own doc comment ("GM-396") is what actually
-/// closes that: it re-checks each node's current content before writing, so
-/// only a node still present with the exact text this embedding was computed
-/// from gets its vector stored - a node that changed or disappeared in the
-/// meantime is left alone, safely, for whatever wrote its newer content to
-/// re-embed.
+/// In the gap, another writer can commit newer content for a node this
+/// round trip is about to store a vector for. [`EmbeddingPipeline::store`]
+/// re-checks each node's current content before writing, so only a node
+/// still holding the exact text the embedding was computed from gets it.
 #[allow(clippy::too_many_arguments)]
 fn round_trip<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &IndexStore,
+    store: &mut Writer<'_>,
     message: ControlMessage,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -318,55 +337,24 @@ fn round_trip<R: BufRead + Send, W: Write>(
     }
 
     let diff = to_storage_diff(response.result);
-    {
-        let mut guard = conn.lock().unwrap();
-        apply_diff(&mut guard, &diff).with_context(|| format!("failed to apply the {method} diff"))?;
-        // After the commit, never before: linking points edges at `File`
-        // nodes, and the ones this diff brought with it have to be in the
-        // index first.
-        imports::link_diff(&mut guard, &diff).context("failed to link the file's resolved imports")?;
-        // Symbols second, and for the same reason: a usage edge can only be
-        // repointed at an export that is already committed - including the
-        // ones this very diff added, which other files may have been waiting
-        // for.
-        symbol_links::link_diff(&mut guard, &diff)
-            .context("failed to link the file's cross-file symbol usages")?;
-    } // GM-396: released here - see this function's own doc section.
+    store.apply_diff_linked(&diff, method)?;
 
-    // Test-only hook, honored between the lock release above and the
-    // re-lock below - see `HOLD_COMPUTE_FILE_ENV`'s own doc comment.
     hold_compute_open_for_tests();
 
-    // Runs with no lock held at all - see this function's own "GM-396" doc
-    // section.
+    // Runs between the unit's steps - see "Lock holds" above.
     let computed = embedding.compute(&diff);
 
-    // Embedding is best-effort and reported rather than propagated
-    // (`EmbeddingPipeline::store`'s own doc comment), for the same reason a
-    // failed semantic pass does not fail this round trip: a diff that is
-    // already committed and linked must not be undone by an optional layer
-    // on top of it.
-    {
-        let guard = conn.lock().unwrap();
-        embedding.store(&guard, &computed);
-    }
+    // Best-effort, like a failed semantic pass: a diff that is already
+    // committed and linked is not undone by an optional layer on top of it.
+    store.store_vectors(embedding, &computed);
     Ok(RoundTrip { incomplete: response.incomplete, incomplete_reason: response.incomplete_reason })
 }
 
-/// Test-only: holds this round trip open, with `conn`'s lock already
-/// released, for as long as the file named by
-/// [`HOLD_COMPUTE_FILE_ENV`] exists - GM-396's counterpart to
-/// `daemon::bulk_index::HOLD_LOCK_FILE_ENV`/`hold_the_lock_open_for_tests`,
-/// which proves the opposite property (a lock genuinely *held* across a
-/// batch's embedding step). This one sits exactly where a real
-/// `EmbeddingPipeline::compute`'s inference would run - after `apply_diff`/
-/// the two linking passes have released `conn` and before `store` reacquires
-/// it - so a test can prove a concurrent connection user is never blocked on
-/// an incremental reparse's embedding step, without needing real model
-/// weights on the machine running it (this hook fires regardless of whether
-/// `compute` goes on to find a model loaded at all).
-///
-/// A no-op unless [`HOLD_COMPUTE_FILE_ENV`] is set, which is every real run.
+/// Test-only: holds this round trip open between its commit step and its
+/// vector-store step, where embedding inference runs, for as long as the
+/// file named by [`HOLD_COMPUTE_FILE_ENV`] exists. Lets a test prove a
+/// concurrent store user is not blocked on an incremental reparse's
+/// embedding step without real model weights. A no-op unless set.
 fn hold_compute_open_for_tests() {
     let Some(path) = std::env::var_os(HOLD_COMPUTE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
     let path = std::path::PathBuf::from(path);
@@ -375,10 +363,8 @@ fn hold_compute_open_for_tests() {
          ({HOLD_COMPUTE_FILE_ENV})",
         path.display()
     );
-    // Bounded the same way `daemon::bulk_index`'s own test-only holds are:
-    // this is scaffolding for a test that deletes the file itself, and a test
-    // that forgets to must fail as a timeout rather than wedge the daemon
-    // forever.
+    // Bounded, so a test that forgets to delete the file fails as a timeout
+    // instead of wedging the daemon.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while path.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -522,7 +508,7 @@ pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
     // `EdgeRecord::new`'s legacy-string inference (`storage::write::
     // normalize_legacy_source`) sets `.engine` to a copy of the tier string
     // passed above, which is only ever right for a v1 caller with no real
-    // engine to report. A `WireEdge` always has a real one - GM-263's legacy
+    // engine to report. A `WireEdge` always has a real one - the protocol's legacy
     // normalization already synthesizes `"tree-sitter"`/`"ts-compiler"` for a
     // v1 sender, so `edge.engine` is populated regardless of which protocol
     // version produced this edge - so it overwrites the guess here, the same

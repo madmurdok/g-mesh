@@ -5,6 +5,7 @@ use crate::protocol::types::{
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
+use crate::storage::write::apply_diff;
 use rusqlite::Connection;
 use std::io::BufReader;
 
