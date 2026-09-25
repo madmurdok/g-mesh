@@ -69,7 +69,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use super::checks::is_placeholder;
-use crate::daemon::bulk_index::{self, BulkIndexSummary, BULK_INDEX_FLAG};
+use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
@@ -536,8 +536,7 @@ pub(crate) fn open_index() -> Result<Arc<IndexStore>> {
 /// Commits one bulk stream through the daemon's own batching and links it
 /// project-wide, exactly as `bulk_index::run` does after its walk.
 pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
-    let mut summary = BulkIndexSummary::default();
-    bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None, None)?;
+    bulk_index::ingest(Cursor::new(bytes.to_vec()), &mut WalkContext::new(conn))?;
     conn.link_all()?;
     Ok(())
 }
