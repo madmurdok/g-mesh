@@ -601,7 +601,7 @@ pub enum DaemonLock {
 /// Diagnoses [`DaemonLock`] for `root`: the socket first (an answer means
 /// healthy), then the lock, probed by taking and dropping it. A daemon racing
 /// for the lock does not notice the probe only because it retries for
-/// [`SINGLETON_LOCK_RETRY_BUDGET`], orders of magnitude longer than the probe
+/// `SINGLETON_LOCK_RETRY_BUDGET`, orders of magnitude longer than the probe
 /// holds it.
 pub fn inspect_daemon_lock(root: &Path) -> Result<DaemonLock> {
     let listening = is_listening(root)?;
