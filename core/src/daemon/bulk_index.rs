@@ -42,11 +42,10 @@ use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
-use crate::storage::index_store::IndexStore;
+use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff};
+use crate::storage::write::Diff;
 use crate::watcher::apply::{to_edge_record, to_node_record};
 use crate::watcher::staleness;
 
@@ -97,21 +96,11 @@ pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
 /// the moment of completion to be an event they cause rather than a duration
 /// they hope for.
 ///
-/// [`WALK_DELAY_ENV`] turns "the walk is about to finish" into a knob, and for
-/// most tests that is enough. It was not enough for the grace-window
-/// assertions GM-245 fixed and GM-394 later removed entirely (`mcp::mod::
-/// GMeshMcpServer::still_indexing` no longer gives a call a bounded wait
-/// before refusing - it waits, unconditionally, for the walk to actually
-/// finish - see that method's own doc comment), because the knob is a `sleep`
-/// in the *daemon*: a loaded machine can stretch a 400ms hold to 700, which
-/// only mattered when a test's whole point was landing inside a window
-/// narrower than that slop. It is kept for the property that outlives that
-/// history: a test can create the file, let the walk reach it, dispatch its
-/// own call, and only then delete the file - so completion happens *after*
-/// the call is already in flight by construction, not by arithmetic on two
-/// sleeps. See [`HOLD_LOCK_FILE_ENV`] for the sibling knob GM-394 added to
-/// hold the batch-commit *lock* itself open the same way, for assertions
-/// about that lock specifically rather than about the walk's completion.
+/// Unlike [`WALK_DELAY_ENV`], a `sleep` a loaded machine can stretch, this
+/// lets a test create the file, let the walk reach it, dispatch its own call,
+/// and only then delete the file - so completion happens *after* the call is
+/// in flight by construction. [`HOLD_LOCK_FILE_ENV`] is the sibling knob that
+/// holds the batch-commit lock itself open.
 pub const WALK_HOLD_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_FILE";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -161,7 +150,7 @@ pub fn run(
 
 /// [`run`], also reporting how far it has got through `progress`'s walk
 /// counters - languages done out of total, the language being walked, and
-/// nodes plus edges ingested so far (GM-395 D6). Only the daemon's
+/// nodes plus edges ingested so far. Only the daemon's
 /// activation passes `Some`: a waiting tool call renders those counters into
 /// its progress notifications. The CLI's in-process walks have nobody to
 /// report to and call [`run`].
@@ -266,16 +255,11 @@ pub fn run_with_progress(
     // can only be linked once every language that might define it has had its
     // own chance to run - so this runs once, project-wide, after every
     // language's ingest loop, not per language.
-    {
-        let mut conn = conn.lock().unwrap();
-        summary.linked_imports =
-            imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?.linked_edges;
-        summary.linked_symbols = symbol_links::link_all(&mut conn)
-            .context("failed to link the walk's cross-file symbol usages")?
-            .linked_edges;
-    }
+    let links = conn.link_all()?;
+    summary.linked_imports = links.imports;
+    summary.linked_symbols = links.symbols;
 
-    // GM-401: a staleness baseline for every file the walk indexed, so the
+    // A staleness baseline for every file the walk indexed, so the
     // first query of a file nobody has touched since takes
     // `staleness::ensure_fresh`'s fast path instead of a synchronous reindex
     // (a `fileChanged` round trip plus a per-file semantic pass - over a
@@ -318,18 +302,30 @@ pub fn run_with_progress(
 /// walk (an unreadable line, a spawn failure, a nonzero exit) can name that
 /// language directly.
 ///
-/// `pub(crate)` rather than private since GM-272: `daemon::workspace_reindex`
-/// reuses this exact function, unchanged, to re-walk a *single* language
-/// after its rows were deleted - the same one-shot `--bulk-index` process
-/// this module already spawns for the cold-start walk, just invoked for one
-/// manifest instead of iterated over every discovered one. Nothing about the
-/// batching/commit contract above changes for that caller: a per-language
-/// reindex is still safe to cut anywhere, for the same reason a cold-start
-/// walk is (see this module's own doc comment above [`run`]).
+/// `daemon::workspace_reindex` also calls this to re-walk a single language
+/// after deleting its rows; the batching/commit contract above holds for
+/// that caller too.
+///
+/// Runs as one [`Unit::BulkWalk`]: its batch commits and its bookkeeping row
+/// are the unit's steps.
 pub(crate) fn walk_one_language(
     project_root: &Path,
     manifest: &PluginManifest,
-    conn: &IndexStore,
+    store: &IndexStore,
+    summary: &mut BulkIndexSummary,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
+    walked_files: Option<&mut BTreeSet<String>>,
+) -> Result<()> {
+    store.unit(Unit::BulkWalk, |store| {
+        walk_one_language_in(project_root, manifest, store, summary, embedding, progress, walked_files)
+    })
+}
+
+fn walk_one_language_in(
+    project_root: &Path,
+    manifest: &PluginManifest,
+    store: &mut Writer<'_>,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
@@ -342,10 +338,7 @@ pub(crate) fn walk_one_language(
     // `Command::spawn` below with a bare `No such file or directory (os
     // error 2)`, wrapped only in "failed to spawn the {language} plugin's
     // bulk index ({command})" - naming neither cargo nor the fact that this
-    // is a build output at all. That is the exact message traced while
-    // verifying GM-301 (GM-316): the daemon's cold-start walk failing this
-    // way names every test waiting on the plugin it starves, not the plugin
-    // that was never built.
+    // is a build output at all.
     if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
         bail!("failed to spawn the {} plugin's bulk index: {hint}", manifest.language);
     }
@@ -355,7 +348,7 @@ pub(crate) fn walk_one_language(
         .args(&manifest.args)
         .arg(BULK_INDEX_FLAG)
         .arg(project_root)
-        // The lifeline (GM-397): a pipe this process never writes to. It
+        // The lifeline: a pipe this process never writes to. It
         // stays inside `child` - never taken, never dropped early - so the
         // plugin sees EOF exactly when this process's end closes, which the
         // kernel does even on SIGKILL. `Child::wait` below closes it before
@@ -378,7 +371,7 @@ pub(crate) fn walk_one_language(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest(BufReader::new(stdout), conn, summary, embedding, progress, walked_files) {
+    if let Err(err) = ingest_in(BufReader::new(stdout), store, summary, embedding, progress, walked_files) {
         // Nobody is going to read the rest of this walk: a plugin left
         // writing into a pipe no one drains would otherwise outlive a failure
         // it knows nothing about.
@@ -400,21 +393,17 @@ pub(crate) fn walk_one_language(
     // it to `run`'s caller - which only ever asks for the roll-up as a whole,
     // once, after every language in this loop is done.
     //
-    // `plugin::fingerprint(manifest)` is "readily available at the write
-    // site" in exactly the sense this task scopes populating
-    // `pluginFingerprint` to: `manifest` is already in hand here, and
-    // `daemon::registry::indexer_version` already computes the very same
-    // digest over every discovered plugin at daemon startup - so recomputing
-    // it for this one language costs nothing this walk was not already going
-    // to pay for elsewhere in spirit, and it is the one write site this
-    // column has today (see `language_state`'s own DDL comment on who else,
-    // if anyone, would fill it).
-    schema::record_language_bulk_indexed(
-        &conn.lock().unwrap(),
-        &manifest.language,
-        Some(&plugin::fingerprint(manifest)),
-    )
-    .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
+    // This is the one write site of `pluginFingerprint`, the same digest
+    // `daemon::registry::indexer_version` computes per plugin.
+    store
+        .step(|conn| {
+            schema::record_language_bulk_indexed(
+                conn,
+                &manifest.language,
+                Some(&plugin::fingerprint(manifest)),
+            )
+        })
+        .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
 
     Ok(())
 }
@@ -459,7 +448,18 @@ fn hold_the_walk_open_for_tests() {
 /// [`run`]'s doc comment for why).
 pub(crate) fn ingest<R: BufRead>(
     reader: R,
-    conn: &IndexStore,
+    store: &IndexStore,
+    summary: &mut BulkIndexSummary,
+    embedding: Option<&EmbeddingPipeline>,
+    progress: Option<&IndexingStatus>,
+    walked_files: Option<&mut BTreeSet<String>>,
+) -> Result<()> {
+    store.unit(Unit::BulkWalk, |store| ingest_in(reader, store, summary, embedding, progress, walked_files))
+}
+
+fn ingest_in<R: BufRead>(
+    reader: R,
+    store: &mut Writer<'_>,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
@@ -507,92 +507,35 @@ pub(crate) fn ingest<R: BufRead>(
         }
         batched += 1;
         if batched >= BATCH_ITEMS {
-            commit(conn, &mut batch, embedding)?;
+            commit(store, &mut batch, embedding)?;
             batched = 0;
         }
     }
 
-    commit(conn, &mut batch, embedding)?;
+    commit(store, &mut batch, embedding)?;
     Ok(())
 }
 
-/// Commits one batch and empties it, holding the connection only for as long
-/// as the transaction (and the embedding rows it stores) take - the walk
-/// itself must not keep other readers out.
+/// Commits one batch and empties it. Embedding inference runs first, outside
+/// the store; the commit and the vector store are then one step of the
+/// walk's unit, so nothing inside the hold scales with inference.
 ///
-/// # GM-394: embedding inference runs before the lock is taken
-///
-/// This used to call `EmbeddingPipeline::apply` - inference and storage in
-/// one step - while still holding `conn`'s guard, which meant a batch's whole
-/// embedding step (`EmbeddingModel::embed`, an ONNX forward pass per
-/// embeddable node, plus a one-time synchronous model load on its very first
-/// call - see `embedding::pipeline`'s "Where the model lives" section) ran
-/// with every other connection locked out of the daemon's one SQLite handle.
-/// `mcp::mod::GMeshMcpServer::get_info` is one of them: it is called during
-/// MCP `initialize`, so a client's handshake blocked for as long as that
-/// inference took - minutes, on a project big enough to matter, which is
-/// exactly the hang GM-394 traced.
-///
-/// `EmbeddingPipeline::compute` touches no database at all, so it runs here
-/// first, with no lock held - the fix's contained half; `get_info` no longer
-/// taking this lock while indexing at all (`daemon::indexing_status`'s own
-/// "GM-394" doc section) is the other, and the one that actually closes the
-/// bug regardless of how long this function's own lock-free window turns out
-/// to be. The lock is then taken once, for `apply_diff` and
-/// `EmbeddingPipeline::store` together - both are ordinary SQLite writes, not
-/// inference, so there is nothing left inside it that scales with batch size
-/// the way inference did.
-///
-/// # GM-395: `embedding: None` for the cold-start walk
-///
-/// Since GM-395's slice 1, the cold-start walk (`run`'s only caller through
-/// `daemon::mod::run`, `cli::init`, `cli::reindex`) passes `None` here: the
-/// walk is structural-only now, and embedding moved out to its own pass
-/// (`embedding::backfill::run`), run once, project-wide, after every
-/// language's walk is linked - see that module's own doc comment. `None`
-/// skips both `compute` and `store` outright, which is strictly cheaper than
-/// calling them against a disabled pipeline (no model lookup, no per-node
-/// loop over an empty `Vec`). `daemon::workspace_reindex`'s per-language
-/// re-walk is the one caller that still passes `Some` - it is a full re-walk
-/// of one language, not the initial cold start, so its own embeddings still
-/// belong inline with it rather than waiting for the next backfill pass.
-fn commit(conn: &IndexStore, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
+/// `embedding` is `None` for the cold-start walk, which is structural-only
+/// (`embedding::backfill` fills the vectors afterwards), and `Some` for
+/// `daemon::workspace_reindex`'s per-language re-walk.
+fn commit(store: &mut Writer<'_>, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
     let computed = embedding.map(|embedding| embedding.compute(batch)).unwrap_or_default();
-    let mut conn = conn.lock().unwrap();
-    apply_diff(&mut conn, batch).context("failed to commit a bulk-index batch")?;
-    hold_the_lock_open_for_tests();
-    // Best-effort, like every other embedding call - see
-    // `watcher::apply::round_trip`'s identical handling for why a failure
-    // here must not undo (or fail) a batch that is already durable.
-    if let Some(embedding) = embedding {
-        embedding.store(&conn, &computed);
-    }
+    store.commit_batch(batch, embedding.map(|embedding| (embedding, computed.as_slice())))?;
     *batch = Diff::default();
     Ok(())
 }
 
+/// Path whose deletion releases a batch commit holding the store open; the
+/// hook fires inside [`IndexStore::commit_batch`]'s hold.
 pub use crate::storage::index_store::HOLD_LOCK_FILE_ENV;
-
-/// Honors [`HOLD_LOCK_FILE_ENV`]. A no-op unless it is set, which is every
-/// real run - same shape as [`hold_the_walk_open_for_tests`], polled rather
-/// than watched for the identical reason (test-only scaffolding, a
-/// millisecond-scale wait, bounded so a test that forgets to release it fails
-/// as a timeout rather than wedging the daemon forever).
-fn hold_the_lock_open_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_LOCK_FILE_ENV).filter(|p| !p.is_empty()) else { return };
-    let path = std::path::PathBuf::from(path);
-    eprintln!(
-        "g-mesh daemon: holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
-        path.display()
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
 
 #[cfg(test)]
 mod tests {
