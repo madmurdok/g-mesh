@@ -594,12 +594,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -611,6 +610,7 @@ use crate::mcp::{
     find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
     FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
 };
+use crate::storage::index_store::IndexStore;
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture
 /// that only cares about, say, `[[callers]]` never has to spell out the
@@ -792,7 +792,7 @@ pub(crate) fn parse(path: &Path) -> Result<ExpectFile> {
 /// required argument of the real handler), and the manifest's own declared
 /// entry points (`get_dependencies`' miss-path fallback).
 pub(crate) struct EvalContext<'a> {
-    pub(crate) conn: &'a Arc<Mutex<Connection>>,
+    pub(crate) conn: &'a Arc<IndexStore>,
     pub(crate) embedding: &'a EmbeddingPipeline,
     pub(crate) project_root: &'a Path,
     pub(crate) entry_points: &'a [String],

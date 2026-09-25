@@ -39,7 +39,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -48,6 +48,7 @@ use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{manifest, registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
 
 /// What a `reindex` actually did.
@@ -97,7 +98,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let canonical_root = project_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
     // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
     // for a cold start - a reindex is that same walk, run early.
     let project_config = crate::config::read_project_config(project_root)

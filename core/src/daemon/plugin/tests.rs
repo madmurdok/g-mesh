@@ -1,4 +1,6 @@
 use super::*;
+use crate::storage::index_store::IndexStore;
+use rusqlite::Connection;
 
 /// GM-271 review round: the floor must win for a project too small for
 /// the per-file budget to matter - see `RoundTripTimeouts`'s doc comment
@@ -444,14 +446,14 @@ const GREET_GROWN: &str = "export function greet(): string {\n  const a = 1;\n  
 /// daemon's connection was silently in before GM-293/GM-294, and the
 /// most direct way to make a live plugin's perfectly ordinary diff be
 /// refused by storage.
-fn index_enforcing_foreign_keys() -> Mutex<Connection> {
+fn index_enforcing_foreign_keys() -> IndexStore {
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     crate::storage::schema::apply(&conn).unwrap();
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
-fn greet_end_line(conn: &Mutex<Connection>) -> i64 {
+fn greet_end_line(conn: &IndexStore) -> i64 {
     conn.lock()
         .unwrap()
         .query_row("SELECT endLine FROM nodes WHERE filePath = 'lib.ts' AND name = 'greet'", [], |row| {
@@ -534,7 +536,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
     let file = project.path().join("lib.ts");
     fs::write(&file, GREET).unwrap();
     let conn = index_enforcing_foreign_keys();
-    let baseline = |conn: &Mutex<Connection>| -> (i64, String) {
+    let baseline = |conn: &IndexStore| -> (i64, String) {
         conn.lock()
             .unwrap()
             .query_row(

@@ -4,7 +4,7 @@
 //! lookup -> incoming usage edges -> usage-site JSON" wiring around it.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context;
 use rmcp::model::CallToolResult;
@@ -16,6 +16,7 @@ use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::storage::index_store::IndexStore;
 
 use super::tool_result::{internal_error, success};
 use super::{anchor, provenance, SymbolQueryParams};
@@ -161,7 +162,7 @@ fn list_references(
 }
 
 pub(crate) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
@@ -269,9 +270,13 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result =
-            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap();
+        let result = handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
     }
@@ -378,7 +383,7 @@ mod tests {
             .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "target", "CALLS", "tree-sitter", true))
             .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let callers = json_body(
             &super::super::find_callers_callees::handle_callers(
@@ -446,7 +451,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle(
@@ -495,7 +500,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle(
@@ -534,7 +539,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle(
@@ -573,7 +578,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle(
@@ -650,7 +655,7 @@ mod tests {
             EdgeRecord::new("e_caller", "caller", "target", "REFERENCES", "tree-sitter", true),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle(
@@ -797,7 +802,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let params = SymbolQueryParams {
             symbol_id: Some("target".to_string()),
@@ -868,7 +873,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
         let params = SymbolQueryParams {
             symbol_id: Some("target".to_string()),
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
@@ -908,7 +913,7 @@ mod tests {
             EdgeRecord::new("e_b", "out_of_scope", "target", "REFERENCES", "tree-sitter", true),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let params = SymbolQueryParams {
             symbol_id: Some("target".to_string()),
@@ -944,7 +949,7 @@ mod tests {
             EdgeRecord::new("e_b", "caller_b", "target", "REFERENCES", "tree-sitter", true),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let omitted = json_body(
             &handle(
@@ -982,9 +987,13 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result =
-            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap();
+        let result = handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -1018,8 +1027,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap(),
+            &handle(
+                &Arc::new(IndexStore::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
         assert_eq!(body["allUnresolved"], true, "every row unresolved must set the response-level marker");
@@ -1057,8 +1071,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap(),
+            &handle(
+                &Arc::new(IndexStore::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
         assert_eq!(
@@ -1086,8 +1105,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap(),
+            &handle(
+                &Arc::new(IndexStore::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert_eq!(body["anchor"]["id"], "target");
         assert_eq!(body["anchor"]["qualifiedName"], "pkg::run");
@@ -1111,7 +1135,7 @@ mod tests {
             EdgeRecord::new("e_a", "caller_a", "target", "REFERENCES", "tree-sitter", true),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let by_id = json_body(
             &handle(
@@ -1154,9 +1178,13 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
-        let result =
-            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap();
+        let result = handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1165,9 +1193,13 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result =
-            handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap();
+        let result = handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
 
@@ -1194,7 +1226,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
         let body =
@@ -1222,8 +1254,13 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-                .unwrap(),
+            &handle(
+                &Arc::new(IndexStore::new(conn)),
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         assert!(
             body.get("hint").is_none(),
@@ -1257,7 +1294,7 @@ mod tests {
             EdgeRecord::new("e_c", "caller_c", "target", "REFERENCES", "tree-sitter", true),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;

@@ -18,11 +18,9 @@
 //! `jsonrpc.rs`'s own pipe-based tests do.
 
 use std::io::{BufRead, Write};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
 
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
@@ -31,6 +29,7 @@ use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
     SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::{
     apply_diff, DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord,
 };
@@ -88,7 +87,7 @@ use crate::storage::write::{
 pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -151,7 +150,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -294,7 +293,7 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
 fn round_trip<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     message: ControlMessage,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,

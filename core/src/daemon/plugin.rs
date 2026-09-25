@@ -45,7 +45,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
@@ -55,6 +54,7 @@ use crate::protocol::jsonrpc::{is_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, RequestId, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
+use crate::storage::index_store::IndexStore;
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -1077,7 +1077,7 @@ impl PluginProcess {
     /// threaded in here rather than read off `self`.
     pub fn apply_file_change(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: impl Into<String>,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
@@ -1190,7 +1190,7 @@ impl PluginProcess {
     /// off.
     fn replay_pending(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
     ) -> Result<()> {
@@ -1253,7 +1253,7 @@ impl PluginProcess {
     /// that method's doc comment.
     pub fn ensure_fresh(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
@@ -1345,7 +1345,7 @@ impl PluginProcess {
     /// wrong for anything past a small project.
     pub fn semantic_pass(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
         embedding: &EmbeddingPipeline,
@@ -1448,7 +1448,7 @@ impl PluginProcess {
     /// the empty diff GM-292 hid behind.
     fn send_one(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,

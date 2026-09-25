@@ -3,7 +3,9 @@ use crate::protocol::jsonrpc::read_message;
 use crate::protocol::types::{
     EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
+use rusqlite::Connection;
 use std::io::BufReader;
 
 /// A timeout no test below is meant to hit - every stub plugin in this
@@ -27,7 +29,7 @@ fn setup_conn() -> Connection {
     conn
 }
 
-fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+fn count(conn: &IndexStore, table: &str) -> i64 {
     conn.lock().unwrap().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
 }
 
@@ -128,7 +130,7 @@ fn unresolved_edge(id: &str, from: &str, to: &str) -> WireEdge {
 /// (`"syntactic"`/`"semantic"`) `edges.source`'s CHECK now enforces,
 /// `engine` its own new column (`storage::schema`'s DDL comment on
 /// `edges`).
-fn edge_source_and_resolved(conn: &Mutex<Connection>, id: &str) -> (String, String, bool) {
+fn edge_source_and_resolved(conn: &IndexStore, id: &str) -> (String, String, bool) {
     conn.lock()
         .unwrap()
         .query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
@@ -269,7 +271,7 @@ fn to_edge_record_carries_the_wires_own_engine_rather_than_guessing_one_from_the
 fn file_change_diff_is_committed_to_sqlite() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(1);
     let canned_response = FileChangeResponse {
@@ -354,7 +356,7 @@ fn diff_with_deletes_removes_rows() {
         },
     )
     .unwrap();
-    let conn = Mutex::new(raw_conn);
+    let conn = IndexStore::new(raw_conn);
 
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -400,7 +402,7 @@ fn diff_with_deletes_removes_rows() {
 fn mismatched_response_id_is_rejected() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(10);
     let wrong_id_response = FileChangeResponse {
@@ -445,7 +447,7 @@ fn mismatched_response_id_is_rejected() {
 fn empty_diff_response_is_a_safe_no_op() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(3);
     let empty_response = FileChangeResponse {
@@ -541,7 +543,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
         },
     )
     .unwrap();
-    let conn = Mutex::new(raw_conn);
+    let conn = IndexStore::new(raw_conn);
 
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -595,7 +597,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
 fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(4);
     let structural = FileChangeResponse {
@@ -654,7 +656,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
 fn a_failing_semantic_pass_does_not_fail_the_reparse() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(5);
     let structural = FileChangeResponse {
@@ -708,7 +710,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
 fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let request_id = RequestId::Number(6);
     let structural = FileChangeResponse {
@@ -751,7 +753,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
 fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let plugin =
         spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false, None);
@@ -782,7 +784,7 @@ fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
 fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let plugin = spawn_semantic_stub(
         plugin_reader,
@@ -826,7 +828,7 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
 fn an_incomplete_per_file_pass_is_not_an_error() {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
-    let conn = Mutex::new(setup_conn());
+    let conn = IndexStore::new(setup_conn());
 
     let plugin = spawn_semantic_stub(
         plugin_reader,

@@ -35,10 +35,8 @@ use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
@@ -46,6 +44,7 @@ use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff};
 use crate::watcher::apply::{to_edge_record, to_node_record};
@@ -153,7 +152,7 @@ pub struct BulkIndexSummary {
 /// exactly once, project-wide, rather than once per language.
 pub fn run(
     project_root: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
 ) -> Result<BulkIndexSummary> {
@@ -168,7 +167,7 @@ pub fn run(
 /// report to and call [`run`].
 pub fn run_with_progress(
     project_root: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
     progress: Option<&IndexingStatus>,
@@ -330,7 +329,7 @@ pub fn run_with_progress(
 pub(crate) fn walk_one_language(
     project_root: &Path,
     manifest: &PluginManifest,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
@@ -460,7 +459,7 @@ fn hold_the_walk_open_for_tests() {
 /// [`run`]'s doc comment for why).
 pub(crate) fn ingest<R: BufRead>(
     reader: R,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     summary: &mut BulkIndexSummary,
     embedding: Option<&EmbeddingPipeline>,
     progress: Option<&IndexingStatus>,
@@ -557,7 +556,7 @@ pub(crate) fn ingest<R: BufRead>(
 /// re-walk is the one caller that still passes `Some` - it is a full re-walk
 /// of one language, not the initial cold start, so its own embeddings still
 /// belong inline with it rather than waiting for the next backfill pass.
-fn commit(conn: &Mutex<Connection>, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
+fn commit(conn: &IndexStore, batch: &mut Diff, embedding: Option<&EmbeddingPipeline>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -602,9 +601,10 @@ mod tests {
         EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
     };
     use crate::storage::schema;
+    use rusqlite::Connection;
     use std::io::Cursor;
 
-    fn setup_conn() -> Mutex<Connection> {
+    fn setup_conn() -> IndexStore {
         let conn = Connection::open_in_memory().unwrap();
         // Foreign keys on, unlike the daemon's own connection: the point of
         // several of these tests is that batching never presents SQLite with
@@ -612,10 +612,10 @@ mod tests {
         // constraint is actually enforced.
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         schema::apply(&conn).unwrap();
-        Mutex::new(conn)
+        IndexStore::new(conn)
     }
 
-    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+    fn count(conn: &IndexStore, table: &str) -> i64 {
         conn.lock()
             .unwrap()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -658,7 +658,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ingest_str(stream: &str, conn: &Mutex<Connection>) -> Result<BulkIndexSummary> {
+    fn ingest_str(stream: &str, conn: &IndexStore) -> Result<BulkIndexSummary> {
         let mut summary = BulkIndexSummary::default();
         ingest(Cursor::new(stream.as_bytes().to_vec()), conn, &mut summary, None, None, None)?;
         Ok(summary)

@@ -171,6 +171,13 @@ impl IndexStore {
         }
     }
 
+    /// Test support: the connection back, with `Mutex::into_inner`'s
+    /// poisoning.
+    #[doc(hidden)]
+    pub fn into_inner(self) -> LockResult<Connection> {
+        self.conn.into_inner()
+    }
+
     fn acquire(&self) -> StoreGuard<'_> {
         self.lock().unwrap()
     }

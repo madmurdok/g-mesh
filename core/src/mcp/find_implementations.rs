@@ -18,7 +18,7 @@
 //! [`dispatch`] and [`from_root`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context;
 use rmcp::model::CallToolResult;
@@ -32,6 +32,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
@@ -151,7 +152,7 @@ fn list_implementations(
 }
 
 pub(super) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
@@ -457,7 +458,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// byte-identical to what it was before this file gained a `transitive`
 /// concept, by construction rather than by parallel maintenance.
 pub(crate) fn dispatch(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,

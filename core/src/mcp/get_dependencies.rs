@@ -7,7 +7,7 @@
 //! result is the caller's business.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
@@ -19,6 +19,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
@@ -751,7 +752,7 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 /// changes while a daemon runs (see `daemon::manifest::discover`'s own
 /// contract) - there is nothing this function would gain by asking twice.
 pub(crate) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     entry_points: &[String],
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {

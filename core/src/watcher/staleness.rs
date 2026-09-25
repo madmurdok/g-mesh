@@ -68,7 +68,6 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -77,6 +76,7 @@ use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::types::RequestId;
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::upsert_indexed_file;
 use crate::watcher::apply::apply_file_change;
 
@@ -155,7 +155,7 @@ impl std::fmt::Display for ReindexFailed {
 pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     project_root: &Path,
     file_path: &str,
     request_id: RequestId,
@@ -348,7 +348,7 @@ pub struct WalkBaselines {
 /// transaction; `conn` is locked only for that transaction, never while
 /// hashing.
 pub(crate) fn record_walk_baselines<'a>(
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     project_root: &Path,
     files: impl IntoIterator<Item = &'a str>,
     walk_started: std::time::SystemTime,
@@ -451,7 +451,7 @@ mod tests {
         conn
     }
 
-    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+    fn count(conn: &IndexStore, table: &str) -> i64 {
         conn.lock()
             .unwrap()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -552,7 +552,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         let file_path_on_disk = tmp.path().join("src/lib.rs");
         fs::write(&file_path_on_disk, b"fn foo() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -603,7 +603,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn old() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // --- initial index ---
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -697,7 +697,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn foo() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // First call: no prior record, must reindex.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -786,7 +786,7 @@ mod tests {
         let file_on_disk = tmp.path().join("lib.rs");
         let content = b"fn stable() {}";
         fs::write(&file_on_disk, content).unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // Initial index.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -887,7 +887,7 @@ mod tests {
         fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
     }
 
-    fn baseline_row(conn: &Mutex<Connection>, file_path: &str) -> Option<(i64, String)> {
+    fn baseline_row(conn: &IndexStore, file_path: &str) -> Option<(i64, String)> {
         conn.lock()
             .unwrap()
             .query_row(
@@ -923,7 +923,7 @@ mod tests {
         set_mtime(&tmp.path().join("edge.rs"), walk_started - Duration::from_millis(500));
         fs::create_dir(tmp.path().join("dir.rs")).unwrap();
 
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
         let summary = record_walk_baselines(
             &conn,
             tmp.path(),

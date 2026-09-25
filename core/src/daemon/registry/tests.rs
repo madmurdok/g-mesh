@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::Connection;
 
 use crate::daemon::manifest::discover;
 use crate::daemon::test_plugin;

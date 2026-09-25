@@ -36,11 +36,10 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 use crate::daemon::bulk_index;
 use crate::daemon::indexing_status::{IndexingStatus, Phase};
@@ -49,12 +48,13 @@ use crate::daemon::manifest::DiscoveredPlugins;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::ProjectWatcher;
 
 /// Everything the activation thread needs, handed over once by `daemon::run`.
 pub(super) struct ActivationCtx {
-    pub conn: Arc<Mutex<Connection>>,
+    pub conn: Arc<IndexStore>,
     pub registry: Arc<PluginRegistry>,
     pub embedding: Arc<EmbeddingPipeline>,
     /// The bulk walk's own copy of discovery - see `daemon::run`'s comment

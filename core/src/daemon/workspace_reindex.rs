@@ -231,16 +231,15 @@
 //! requires.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::graph::{imports, symbol_links};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::delete_language_rows;
 
@@ -254,7 +253,7 @@ use crate::storage::write::delete_language_rows;
 pub(crate) fn run(
     registry: &PluginRegistry,
     supervisor: &PluginSupervisor,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     changed_file: &str,
 ) -> Result<()> {
     let manifest = supervisor.manifest().clone();
@@ -356,6 +355,7 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -891,7 +891,7 @@ mod tests {
 
     /// A registry with one `semantic_pass`-capable language, `alpha`, over an
     /// empty current-schema index.
-    fn alpha_registry() -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry, Mutex<Connection>) {
+    fn alpha_registry() -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
         test_plugin::install_with_workspace_semantic_pass_capable(

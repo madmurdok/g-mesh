@@ -1,11 +1,11 @@
 use std::io::{BufReader, Cursor};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::protocol::conformance::{check_bulk_output, check_control_plane_output};
 use g_mesh::protocol::jsonrpc::read_message;
 use g_mesh::protocol::types::{ControlEnvelope, ControlMessage, RequestId};
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use g_mesh::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
 use g_mesh::watcher::apply::apply_semantic_pass;
@@ -131,7 +131,7 @@ fn seeded_index() -> Connection {
 
 /// `(source, engine, resolved)` - `source` is the GM-264 tier
 /// (`"syntactic"`/`"semantic"`), `engine` its own column.
-fn edge(conn: &Mutex<Connection>, id: &str) -> (String, String, bool) {
+fn edge(conn: &IndexStore, id: &str) -> (String, String, bool) {
     conn.lock()
         .unwrap()
         .query_row("SELECT source, engine, resolved FROM edges WHERE id = ?1", [id], |row| {
@@ -152,7 +152,7 @@ fn edge(conn: &Mutex<Connection>, id: &str) -> (String, String, bool) {
 /// ordinary reparse runs.
 #[test]
 fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
-    let conn = Mutex::new(seeded_index());
+    let conn = IndexStore::new(seeded_index());
     assert_eq!(edge(&conn, "e1"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
     assert_eq!(edge(&conn, "e2"), ("syntactic".to_string(), "tree-sitter".to_string(), false));
 

@@ -46,12 +46,11 @@
 //! whose weights simply had not been fetched yet) gets embedded on the next
 //! restart that finds one, with no reindex required.
 
-use std::sync::Mutex;
-
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::{Diff, NodeRecord};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
@@ -105,11 +104,7 @@ pub struct BackfillSummary {
 /// weights, and an early return for "no model" would make the hold
 /// unreachable on exactly the machines (CI, a fresh checkout) that need it
 /// most.
-pub fn run(
-    conn: &Mutex<Connection>,
-    embedding: &EmbeddingPipeline,
-    progress: &IndexingStatus,
-) -> BackfillSummary {
+pub fn run(conn: &IndexStore, embedding: &EmbeddingPipeline, progress: &IndexingStatus) -> BackfillSummary {
     hold_before_first_batch_for_tests();
     panic_before_first_batch_for_tests();
 
@@ -368,7 +363,7 @@ mod tests {
             },
         )
         .unwrap();
-        let conn = Mutex::new(conn);
+        let conn = IndexStore::new(conn);
         let embedding = EmbeddingPipeline::disabled();
         let progress = IndexingStatus::structural();
 

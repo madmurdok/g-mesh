@@ -108,13 +108,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -860,7 +860,7 @@ impl PluginRegistry {
     /// language's reindex failing must not skip another's, the same
     /// "failures are reported and dropped, never propagated" contract every
     /// other watcher-thread entry point in this module already has.
-    pub fn route_settled_path(&self, conn: &Mutex<Connection>, file_path: String) {
+    pub fn route_settled_path(&self, conn: &IndexStore, file_path: String) {
         let workspace_languages = self.workspace_language_matches(&file_path);
         if workspace_languages.is_empty() {
             self.file_changed(conn, file_path);
@@ -898,7 +898,7 @@ impl PluginRegistry {
     /// that says not to route this one instance of it, which is exactly as
     /// ordinary and expected as `.gitignore` already is at the filesystem-
     /// watch layer.
-    pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
+    pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
         if self.language_for(&file_path).is_none() {
             if let Some(notice) = self.unroutable_notice(&file_path) {
                 eprintln!("{notice}");
@@ -927,7 +927,7 @@ impl PluginRegistry {
     /// kind - the workspace-routing counterpart to
     /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
     /// with the same "failures are reported and dropped" contract.
-    fn workspace_file_changed(&self, conn: &Mutex<Connection>, language: &str, changed_file: &str) {
+    fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
                 if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
@@ -1159,7 +1159,7 @@ impl PluginRegistry {
     /// replay from running. Returns how many files were replayed in total,
     /// across every language, for a caller that only cares whether anything
     /// happened.
-    pub fn replay_pending(&self, conn: &Mutex<Connection>) -> usize {
+    pub fn replay_pending(&self, conn: &IndexStore) -> usize {
         let mut replayed = 0;
         for supervisor in self.active_supervisors() {
             match supervisor.replay_pending(conn) {
@@ -1195,11 +1195,7 @@ impl PluginRegistry {
     /// have caught for it, the same "skip, do not fail" contract
     /// [`file_changed`](Self::file_changed) already has for an unroutable
     /// file.
-    pub fn ensure_fresh(
-        &self,
-        conn: &Mutex<Connection>,
-        file_path: &str,
-    ) -> Result<Option<StalenessOutcome>> {
+    pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<Option<StalenessOutcome>> {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };

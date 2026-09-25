@@ -81,6 +81,7 @@ use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
     WireNode,
 };
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::apply::{apply_file_change, apply_semantic_pass};
 
@@ -522,26 +523,19 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
 /// plugin, the shape every user edit has, was never sent. The
 /// declaration-edit step (`id-stability.declaration-edit-applies`) now is.
 ///
-/// `Arc<Mutex<Connection>>`, not a bare `Mutex<Connection>`: GM-277's
-/// expectations call the MCP tools' own handler functions
-/// (`mcp::find_callers_callees::handle_callers` and its four siblings), and
-/// every one of them is declared over `&Arc<Mutex<Connection>>` - the exact
-/// type `mcp::mod`'s `#[tool]` methods hold `self.conn` as. Every existing
-/// caller in this module keeps taking a plain `&Mutex<Connection>`
-/// unchanged: `&Arc<Mutex<Connection>>` coerces to `&Mutex<Connection>` at
-/// each of those call sites for free (`Arc`'s `Deref`), so this is the only
-/// line that needed to change for both kinds of caller to share one
-/// connection.
-pub(crate) fn open_index() -> Result<Arc<Mutex<Connection>>> {
+/// An `Arc<IndexStore>`: the expectations call the MCP tools' own handler
+/// functions, which take the same `&Arc<IndexStore>` `mcp::mod` holds, and
+/// every other caller here borrows it as `&IndexStore`.
+pub(crate) fn open_index() -> Result<Arc<IndexStore>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(Arc::new(IndexStore::new(conn)))
 }
 
 /// Commits one bulk stream through the daemon's own batching and links it
 /// project-wide, exactly as `bulk_index::run` does after its walk.
-pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<()> {
+pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
     let mut summary = BulkIndexSummary::default();
     bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None, None)?;
     let mut conn = conn.lock().unwrap();
@@ -559,7 +553,7 @@ pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<
 /// `graph::imports` drops a `resolved_module` placeholder once it has
 /// repointed its edge onto the real file. Comparing raw bulk output against
 /// the index would report every linked import as a missing id.
-pub(crate) fn file_node_ids(conn: &Mutex<Connection>, file: &str) -> Result<BTreeSet<String>> {
+pub(crate) fn file_node_ids(conn: &IndexStore, file: &str) -> Result<BTreeSet<String>> {
     let conn = conn.lock().unwrap();
     let mut statement = conn.prepare("SELECT id FROM nodes WHERE filePath = ?1")?;
     let ids = statement.query_map([file], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
@@ -574,10 +568,7 @@ pub(crate) type StoredRange = (i64, i64, i64, i64);
 /// bulk run 3 of the edited tree was committed and linked into, for
 /// `id-stability.declaration-edit-applies`. Index against index for the same
 /// reason [`file_node_ids`] is.
-pub(crate) fn file_node_ranges(
-    conn: &Mutex<Connection>,
-    file: &str,
-) -> Result<BTreeMap<String, StoredRange>> {
+pub(crate) fn file_node_ranges(conn: &IndexStore, file: &str) -> Result<BTreeMap<String, StoredRange>> {
     let conn = conn.lock().unwrap();
     let mut statement =
         conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
@@ -905,7 +896,7 @@ struct Driver<'a> {
     /// The plugin's own stderr, quoted into `session.failure` by
     /// [`Driver::finish`] - see [`StderrCapture`].
     stderr: StderrCapture,
-    conn: &'a Mutex<Connection>,
+    conn: &'a IndexStore,
     timeouts: RoundTripTimeouts,
     next_id: i64,
     session: Session,
@@ -932,7 +923,7 @@ struct Driver<'a> {
 pub(crate) fn run_session(
     manifest: &PluginManifest,
     scratch: &Scratch,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     target: &EditTarget,
     timeouts: RoundTripTimeouts,
     whole_project_timeout: Duration,

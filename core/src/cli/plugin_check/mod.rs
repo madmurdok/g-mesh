@@ -45,16 +45,16 @@ pub(crate) mod session;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use rusqlite::Connection;
 
 use crate::daemon::manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::ndjson::BulkItem;
+use crate::storage::index_store::IndexStore;
 pub use report::{CheckResult, Outcome, Report, Section};
 pub use session::{MARKER_DIR_ENV, SEMANTIC_ENGINE_MARKER};
 
@@ -310,7 +310,7 @@ pub fn check(
 fn expectations_section(
     expect_path: &Path,
     manifest: &PluginManifest,
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     scratch: &session::Scratch,
     bulk1_complete: bool,
     session: Option<&session::Session>,

@@ -3,7 +3,7 @@
 //! "name or position -> node(s)" decision lives.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::similarity;
@@ -749,7 +750,7 @@ fn by_name(
 }
 
 pub(crate) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     project_root: &Path,
     embedding: &EmbeddingPipeline,
     params: FindDefinitionParams,

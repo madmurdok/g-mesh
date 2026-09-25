@@ -147,13 +147,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
 
 use crate::config::ProjectConfig;
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::jsonrpc::is_timeout;
+use crate::storage::index_store::IndexStore;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s documented default: long enough to survive
@@ -498,7 +498,7 @@ impl PluginSupervisor {
     /// Failures are reported and dropped rather than propagated, which is what
     /// `daemon::run`'s watcher loop already did with them: one file the plugin
     /// could not reparse must not take the watcher thread down with it.
-    pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
+    pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
         let mut inner = self.inner.lock().unwrap();
         let Some(process) = inner.process.as_ref() else {
             inner.dirty.push(file_path);
@@ -549,7 +549,7 @@ impl PluginSupervisor {
     /// "needs it" is deliberately narrow: a request that arrives with an empty
     /// queue is asking about a graph that is already current, and respawning a
     /// tsserver to tell it so would defeat the point of ever sleeping.
-    pub fn replay_pending(&self, conn: &Mutex<Connection>) -> Result<usize> {
+    pub fn replay_pending(&self, conn: &IndexStore) -> Result<usize> {
         let mut inner = self.inner.lock().unwrap();
         if inner.dirty.is_empty() {
             self.pending.store(false, Ordering::SeqCst);
@@ -631,7 +631,7 @@ impl PluginSupervisor {
     /// itself.
     pub fn semantic_pass(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
     ) -> Result<bool> {
@@ -710,7 +710,7 @@ impl PluginSupervisor {
     /// changed) resolves off the `indexed_files` table alone and never
     /// touches the plugin lock, matching the two-tier design
     /// `watcher::staleness` itself documents.
-    pub fn ensure_fresh(&self, conn: &Mutex<Connection>, file_path: &str) -> Result<StalenessOutcome> {
+    pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
         {
             let guard = conn.lock().unwrap();
             if !staleness::is_stale(&guard, &self.project_root, file_path)? {

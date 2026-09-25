@@ -37,7 +37,7 @@
 //! `get_info`'s `instructions` (sent once per session, not once per tool).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -48,7 +48,6 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
-use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -61,6 +60,7 @@ use crate::gc::last_used;
 use crate::graph::pagination::Direction;
 use crate::ipc::AsyncStream;
 use crate::protocol::types::Position;
+use crate::storage::index_store::IndexStore;
 
 mod anchor;
 // `pub(crate)` on these five - not `mod` - so `cli::plugin_check::expectations`
@@ -181,7 +181,7 @@ fn human_duration(elapsed: Duration) -> String {
 /// nothing to re-initialize.
 pub async fn serve_connection(
     stream: AsyncStream,
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
@@ -208,7 +208,7 @@ pub async fn serve_connection(
 /// its answer might touch.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
@@ -219,7 +219,7 @@ pub struct GMeshMcpServer {
 #[tool_router]
 impl GMeshMcpServer {
     pub fn new(
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<IndexStore>,
         registry: Arc<PluginRegistry>,
         core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,

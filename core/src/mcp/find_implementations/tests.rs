@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::{EdgeRecord, NodeRecord};
 
@@ -65,7 +66,7 @@ fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
     let conn = setup_chain();
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap();
     let body = json_body(&result);
     let results = body["results"].as_array().unwrap();
@@ -135,7 +136,7 @@ fn zero_implementations_is_an_empty_page_not_an_error() {
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap();
     let body = json_body(&result);
     assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -157,7 +158,7 @@ fn a_page_where_every_implementor_is_unresolved_is_flagged_all_unresolved() {
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap(),
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 1);
@@ -187,7 +188,7 @@ fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved()
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap(),
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -200,7 +201,7 @@ fn the_single_hop_response_echoes_the_resolved_anchor() {
     let conn = setup_chain();
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap(),
     );
     assert_eq!(body["anchor"]["id"], "interface");
@@ -215,7 +216,7 @@ fn the_single_hop_response_echoes_the_resolved_anchor() {
 /// `a_resumed_transitive_walk_does_not_repeat_the_anchor` below.
 #[test]
 fn a_fresh_transitive_walk_echoes_the_resolved_anchor() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
     let params = FindImplementationsParams {
         symbol_id: Some("interface".to_string()),
         transitive: Some(true),
@@ -239,7 +240,7 @@ fn a_fresh_transitive_walk_echoes_the_resolved_anchor() {
 /// well if `from_root` hardcoded a value.
 #[test]
 fn a_transitive_walk_reports_the_rung_that_reached_its_anchor() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
     let params = FindImplementationsParams {
         symbol_name: Some("pkg::Iface".to_string()),
         transitive: Some(true),
@@ -306,7 +307,7 @@ fn a_resumed_transitive_walk_does_not_repeat_the_anchor() {
 /// interface, whose one direct implementor is `class_a`.
 #[test]
 fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
 
     let by_id = json_body(
         &handle(
@@ -349,7 +350,7 @@ fn unknown_symbol_id_is_a_tool_level_error() {
     let conn = setup();
     let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap();
     assert!(error_text(&result).contains("does_not_exist"));
 }
@@ -412,7 +413,7 @@ fn an_implementor_both_tiers_found_is_one_row_not_two() {
 
     let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap();
     let body = json_body(&result);
     let mut ids: Vec<&str> = body["results"]
@@ -480,7 +481,7 @@ fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
         )
         .unwrap();
     }
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params =
         SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
@@ -508,7 +509,7 @@ fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies() {
         ),
     )
     .unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
     let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
@@ -534,7 +535,7 @@ fn a_normal_symbol_anchor_never_carries_a_hint_field() {
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
+        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
             .unwrap(),
     );
     assert!(
@@ -557,7 +558,7 @@ fn handle_paginates_across_cursor_continuation() {
         .unwrap();
     upsert_edge(&mut conn, EdgeRecord::new("e_c", "impl_c", "target", "SUPERTYPE_OF", "tree-sitter", true))
         .unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
@@ -592,7 +593,7 @@ fn handle_paginates_across_cursor_continuation() {
 /// into it.
 #[test]
 fn dispatch_without_transitive_answers_byte_identically_to_the_unmodified_single_hop_handle() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
 
     let via_handle = json_body(
         &handle(
@@ -629,7 +630,7 @@ fn dispatch_without_transitive_answers_byte_identically_to_the_unmodified_single
 /// implementor, exactly like today.
 #[test]
 fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_single_hop() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
 
     let absent = json_body(
         &dispatch(
@@ -714,7 +715,7 @@ fn setup_deep_chain() -> Connection {
 /// contract `get_dependencies`'s own depth-cut test proves.
 #[test]
 fn a_max_depth_cut_reports_frontier_nodes_to_re_root_on() {
-    let conn = Arc::new(Mutex::new(setup_deep_chain()));
+    let conn = Arc::new(IndexStore::new(setup_deep_chain()));
     let params = FindImplementationsParams {
         symbol_id: Some("interface".to_string()),
         transitive: Some(true),
@@ -864,7 +865,7 @@ fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_impl
 /// applies to `resume_token` alongside `file_path`/`module_id`.
 #[test]
 fn resume_token_alongside_an_anchor_or_transitive_is_a_tool_level_error() {
-    let conn = Arc::new(Mutex::new(setup_chain()));
+    let conn = Arc::new(IndexStore::new(setup_chain()));
 
     let with_symbol_id = dispatch(
         &conn,
@@ -926,7 +927,7 @@ fn a_file_anchor_hint_still_fires_in_transitive_mode() {
         ),
     )
     .unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params = FindImplementationsParams {
         symbol_id: Some("file".to_string()),
