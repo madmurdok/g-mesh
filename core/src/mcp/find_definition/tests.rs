@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::EdgeRecord;
 
@@ -195,7 +196,8 @@ fn ambiguous_bare_name_returns_both_as_ranked_candidates() {
         include_source: None,
     };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap();
+        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap();
     let body = json_body(&result);
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
@@ -229,7 +231,8 @@ fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
         include_source: None,
     };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap(),
+        &handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
     assert_eq!(body["filePath"], "target.ts");
@@ -256,7 +259,8 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
         include_source: None,
     };
     let body = json_body(
-        &handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap(),
+        &handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null);
     assert_eq!(body["id"], "n1");
@@ -277,7 +281,8 @@ fn file_and_position_query_returns_a_single_node_not_a_list() {
         include_source: None,
     };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap();
+        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n1");
     assert_eq!(body["qualifiedName"], "pkg_a::run");
@@ -301,7 +306,8 @@ fn qualified_name_requery_returns_the_exact_node() {
         include_source: None,
     };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap();
+        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n2");
     assert_eq!(body["qualifiedName"], "pkg_b::run");
@@ -318,7 +324,8 @@ fn no_match_is_a_tool_level_error() {
         include_source: None,
     };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap();
+        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap();
     assert!(error_text(&result).contains("does_not_exist"));
 }
 
@@ -333,7 +340,8 @@ fn neither_name_nor_position_is_a_tool_level_error() {
         include_source: None,
     };
     let result =
-        handle(&Arc::new(Mutex::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params).unwrap();
+        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
+            .unwrap();
     assert!(error_text(&result).contains("symbol_name"));
 }
 
@@ -349,7 +357,7 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
         upsert_node(&mut conn, node_with_span(&id, "run", &format!("pkg{i}::run"), "a/lib.rs", (5, 0)))
             .unwrap();
     }
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let first_params = FindDefinitionParams {
         symbol_name: Some("run".to_string()),
@@ -785,7 +793,7 @@ fn include_source_false_leaves_the_response_exactly_as_it_was() {
     let mut node = node_with_span("n1", "run", "pkg::run", "a/lib.rs", (2, 0));
     node.start_line = 0;
     upsert_node(&mut conn, node).unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params = |include| FindDefinitionParams {
         symbol_name: Some("run".to_string()),

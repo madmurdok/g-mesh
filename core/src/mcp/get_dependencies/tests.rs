@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
 
@@ -17,7 +18,7 @@ fn ts_entry_points() -> Vec<String> {
 /// see [`ts_entry_points`]. A test exercising a different declared set
 /// (a fake Rust manifest, an empty one) calls `super::handle` directly
 /// instead of this wrapper.
-fn handle(conn: &Arc<Mutex<Connection>>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+fn handle(conn: &Arc<IndexStore>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
     super::handle(conn, &ts_entry_points(), params)
 }
 
@@ -115,7 +116,7 @@ fn reached(body: &serde_json::Value) -> Vec<(String, u64)> {
 fn an_import_chain_comes_back_transitively_with_the_hop_count_per_node() {
     let conn = import_chain();
 
-    let result = handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap();
+    let result = handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap();
     let body = json_body(&result);
 
     assert_eq!(reached(&body), vec![("b.rs".to_string(), 1), ("c.rs".to_string(), 2)]);
@@ -129,7 +130,7 @@ fn an_import_chain_comes_back_transitively_with_the_hop_count_per_node() {
 /// reaches the importers, and the two directions must not agree.
 #[test]
 fn incoming_walks_the_importers_and_outgoing_the_imports() {
-    let conn = Arc::new(Mutex::new(import_chain()));
+    let conn = Arc::new(IndexStore::new(import_chain()));
 
     let upstream = json_body(&handle(&conn, anchored_at("c.rs", Direction::Incoming)).unwrap());
     assert_eq!(reached(&upstream), vec![("b.rs".to_string(), 1), ("a.rs".to_string(), 2)]);
@@ -144,8 +145,9 @@ fn incoming_walks_the_importers_and_outgoing_the_imports() {
 #[test]
 fn the_anchor_itself_is_not_reported_as_its_own_dependency() {
     let conn = import_chain();
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+    );
 
     let ids: Vec<&str> =
         body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
@@ -161,8 +163,9 @@ fn an_unresolved_import_is_reported_without_a_file_path_of_its_own() {
     upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
     imports(&mut conn, "a.rs", "mod_zod");
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+    );
     let rows = body["results"].as_array().unwrap();
 
     let module = rows.iter().find(|r| r["kind"] == "Module").expect("the placeholder is still a dependency");
@@ -186,8 +189,9 @@ fn a_file_kind_row_omits_qualified_name_a_module_row_keeps_it() {
     upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
     imports(&mut conn, "a.rs", "mod_zod");
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+    );
     let rows = body["results"].as_array().unwrap();
 
     let files: Vec<&serde_json::Value> = rows.iter().filter(|r| r["kind"] == "File").collect();
@@ -213,8 +217,9 @@ fn no_row_carries_a_name_field() {
     upsert_node(&mut conn, unresolved_import("a.rs", "zod")).unwrap();
     imports(&mut conn, "a.rs", "mod_zod");
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+    );
     let rows = body["results"].as_array().unwrap();
     assert!(!rows.is_empty());
     for row in rows {
@@ -228,8 +233,9 @@ fn only_import_edges_are_walked() {
     upsert_node(&mut conn, file("d.rs")).unwrap();
     upsert_edge(&mut conn, EdgeRecord::new("e_call", "a.rs", "d.rs", "CALLS", "tree-sitter", true)).unwrap();
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("a.rs", Direction::Outgoing)).unwrap(),
+    );
 
     let ids: Vec<&str> =
         body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
@@ -248,13 +254,13 @@ fn a_module_id_anchors_the_walk_without_a_path_lookup() {
         resume_token: None,
     };
 
-    let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+    let body = json_body(&handle(&Arc::new(IndexStore::new(conn)), params).unwrap());
     assert_eq!(reached(&body), vec![("b.rs".to_string(), 1), ("c.rs".to_string(), 2)]);
 }
 
 #[test]
 fn an_unknown_anchor_is_a_tool_level_error_rather_than_an_empty_walk() {
-    let conn = Arc::new(Mutex::new(import_chain()));
+    let conn = Arc::new(IndexStore::new(import_chain()));
 
     let by_path = handle(&conn, anchored_at("does/not/exist.rs", Direction::Outgoing)).unwrap();
     assert!(error_text(&by_path).contains("does/not/exist.rs"));
@@ -272,7 +278,7 @@ fn an_unknown_anchor_is_a_tool_level_error_rather_than_an_empty_walk() {
 
 #[test]
 fn every_bad_anchor_combination_is_its_own_tool_level_error() {
-    let conn = Arc::new(Mutex::new(import_chain()));
+    let conn = Arc::new(IndexStore::new(import_chain()));
     let base = || GetDependenciesParams {
         file_path: None,
         module_id: None,
@@ -313,7 +319,7 @@ fn a_depth_cut_reports_max_depth_and_hands_back_only_the_frontier() {
     imports(&mut conn, "c.rs", "d.rs");
 
     let params = GetDependenciesParams { max_depth: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
-    let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+    let body = json_body(&handle(&Arc::new(IndexStore::new(conn)), params).unwrap());
 
     assert_eq!(reached(&body), vec![("b.rs".to_string(), 1)]);
     assert_eq!(body["truncated"], true);
@@ -335,7 +341,7 @@ fn a_fanout_cut_reports_max_fanout_and_hands_back_no_continuation_field() {
     }
 
     let params = GetDependenciesParams { max_fanout: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
-    let body = json_body(&handle(&Arc::new(Mutex::new(conn)), params).unwrap());
+    let body = json_body(&handle(&Arc::new(IndexStore::new(conn)), params).unwrap());
 
     assert_eq!(body["results"].as_array().unwrap().len(), 1, "one of the three imports, and a warning");
     assert_eq!(body["truncated"], true);
@@ -385,7 +391,7 @@ fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_everything
         diff.upsert_nodes.push(file(&path));
     }
     write::apply_diff(&mut conn, &diff).unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params =
         GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at("a.rs", Direction::Outgoing) };
@@ -460,7 +466,7 @@ fn a_wide_fan_in_too_big_for_one_response_truncates_with_a_resume_token_instead_
         diff.upsert_nodes.push(file(&path));
     }
     write::apply_diff(&mut conn, &diff).unwrap();
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let params = GetDependenciesParams { max_fanout: Some(10_000), ..anchored_at(core, Direction::Incoming) };
     let body = json_body(&handle(&conn, params).unwrap());
@@ -506,7 +512,7 @@ fn omitting_max_depth_uses_this_tools_own_default_not_the_walk_engines() {
     for pair in chain.windows(2) {
         imports(&mut conn, pair[0], pair[1]);
     }
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     let defaulted = json_body(&handle(&conn, anchored_at("a.rs", Direction::Outgoing)).unwrap());
     assert_eq!(
@@ -840,8 +846,9 @@ fn outgoing_from_a_file_lists_a_container_alongside_files() {
     let container_id = materialize_container(&mut conn, "go", "github.com/x/pkg");
     imports_container(&mut conn, "main.go", &container_id);
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap(),
+    );
     let rows = body["results"].as_array().unwrap();
 
     let container_row =
@@ -936,8 +943,9 @@ fn two_containers_imported_by_the_same_file_are_two_separate_rows() {
     imports_container(&mut conn, "main.go", &a);
     imports_container(&mut conn, "main.go", &b);
 
-    let body =
-        json_body(&handle(&Arc::new(Mutex::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap());
+    let body = json_body(
+        &handle(&Arc::new(IndexStore::new(conn)), anchored_at("main.go", Direction::Outgoing)).unwrap(),
+    );
     let ids: Vec<&str> =
         body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
 

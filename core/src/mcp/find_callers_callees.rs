@@ -7,7 +7,7 @@
 //! `get_dependencies`, not here.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context;
 use rmcp::model::CallToolResult;
@@ -19,6 +19,7 @@ use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{internal_error, success};
@@ -332,12 +333,12 @@ struct CalleePage {
 }
 
 pub(crate) fn handle_callers(
-    conn: &Arc<Mutex<Connection>>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
@@ -394,12 +395,12 @@ pub(crate) fn handle_callers(
 }
 
 pub(crate) fn handle_callees(
-    conn: &Arc<Mutex<Connection>>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
         Ok(resolved) => resolved,
@@ -517,7 +518,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &rust_with_a_semantic_tier(),
             params,
@@ -549,7 +550,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &rust_with_a_semantic_tier(),
             params,
@@ -575,7 +576,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
         let result = handle_callees(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &rust_with_a_semantic_tier(),
             params,
@@ -608,7 +609,7 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -625,7 +626,7 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
         let result = handle_callees(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -663,7 +664,7 @@ mod tests {
             .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_caller", "caller", "target", "CALLS", "tree-sitter", true))
             .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
             &handle_callers(
@@ -712,7 +713,7 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("a".to_string()), ..Default::default() };
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -746,7 +747,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
             &handle_callers(
-                &Arc::new(Mutex::new(conn)),
+                &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
                 params,
@@ -779,7 +780,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
             &handle_callers(
-                &Arc::new(Mutex::new(conn)),
+                &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
                 params,
@@ -834,7 +835,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
             &handle_callers(
-                &Arc::new(Mutex::new(conn)),
+                &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
                 params,
@@ -871,7 +872,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
             &handle_callees(
-                &Arc::new(Mutex::new(conn)),
+                &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
                 params,
@@ -897,7 +898,7 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -935,7 +936,7 @@ mod tests {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
             &handle_callers(
-                &Arc::new(Mutex::new(conn)),
+                &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
                 params,
@@ -954,7 +955,7 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("c".to_string()), ..Default::default() };
         let result = handle_callees(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -970,7 +971,7 @@ mod tests {
     /// builds its own response struct, so this has to be proven per tool.
     #[test]
     fn both_directions_echo_the_resolved_anchor() {
-        let conn = Arc::new(Mutex::new(setup_chain()));
+        let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
             &handle_callers(
@@ -1003,7 +1004,7 @@ mod tests {
     /// shared, but the two handlers call it separately.
     #[test]
     fn an_unambiguous_symbol_name_anchors_both_directions_without_a_symbol_id() {
-        let conn = Arc::new(Mutex::new(setup_chain()));
+        let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
             &handle_callers(
@@ -1051,7 +1052,7 @@ mod tests {
             .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true))
             .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let ambiguous = json_body(
             &handle_callers(
@@ -1107,7 +1108,7 @@ mod tests {
             .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_b", "caller_b", "run_b", "CALLS", "tree-sitter", true))
             .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
         let ambiguous = json_body(
@@ -1147,7 +1148,7 @@ mod tests {
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callers(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -1162,7 +1163,7 @@ mod tests {
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
         let result = handle_callees(
-            &Arc::new(Mutex::new(conn)),
+            &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
             params,
@@ -1254,7 +1255,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
         let params = SymbolQueryParams {
             symbol_id: Some("target".to_string()),
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
@@ -1279,7 +1280,7 @@ mod tests {
     /// already uses for "no filter".
     #[test]
     fn omitting_file_paths_and_an_explicit_empty_array_both_behave_like_no_scope_for_callers() {
-        let conn = Arc::new(Mutex::new(setup_chain()));
+        let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let omitted = json_body(
             &handle_callers(
@@ -1331,7 +1332,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let params = SymbolQueryParams {
             symbol_id: Some("target".to_string()),
@@ -1370,7 +1371,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let callers = json_body(
             &handle_callers(
@@ -1409,7 +1410,7 @@ mod tests {
     /// `hint` field at all, not even as `null`.
     #[test]
     fn a_normal_symbol_anchor_never_carries_a_hint_field() {
-        let conn = Arc::new(Mutex::new(setup_chain()));
+        let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
             &handle_callers(
@@ -1451,7 +1452,7 @@ mod tests {
             .unwrap();
         upsert_edge(&mut conn, EdgeRecord::new("e_c", "target", "callee_c", "CALLS", "tree-sitter", true))
             .unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;

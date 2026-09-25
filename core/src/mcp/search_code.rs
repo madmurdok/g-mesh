@@ -9,7 +9,7 @@
 //! to resolve before searching and no `still_indexing`-style staleness check
 //! beyond the shared one `prepare` already runs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
+use crate::storage::index_store::IndexStore;
 use crate::storage::vectors::pack;
 
 use super::similarity;
@@ -139,7 +140,7 @@ pub(super) fn search(
 }
 
 pub(super) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     params: SearchCodeParams,
 ) -> Result<CallToolResult, ErrorData> {
@@ -151,7 +152,7 @@ pub(super) fn handle(
         );
     };
 
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
     let page_size = pagination::resolve_page_size(params.limit);
     let page = search(&conn, &query_vector, page_size, params.cursor.as_deref())
         .map_err(|e| internal_error("failed to search code", e))?;
@@ -287,7 +288,7 @@ mod tests {
     /// wait gives for never answering a tool call "not ready" instead).
     #[test]
     fn handle_reports_a_tool_error_when_no_embedding_model_is_loaded() {
-        let conn = Arc::new(Mutex::new(setup()));
+        let conn = Arc::new(IndexStore::new(setup()));
         let embedding = EmbeddingPipeline::disabled();
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
@@ -303,7 +304,7 @@ mod tests {
     #[test]
     fn handle_reports_a_tool_error_when_the_configured_model_is_unavailable() {
         std::env::set_var(MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
-        let conn = Arc::new(Mutex::new(setup()));
+        let conn = Arc::new(IndexStore::new(setup()));
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
@@ -458,7 +459,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
         let params = SearchCodeParams {
             query: "load the contents of a file from the filesystem".to_string(),

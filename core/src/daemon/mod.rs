@@ -22,12 +22,11 @@ pub mod workspace_reindex;
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
@@ -36,6 +35,7 @@ use crate::gc::last_used;
 use crate::ipc;
 use crate::mcp;
 use crate::storage::connection::{self, ensure_project_dir, project_dir};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
@@ -496,7 +496,7 @@ pub fn run(root: &Path) -> Result<()> {
     let needs_semantic_pass_retry = !needs_bulk_index
         && !schema::semantic_pass_completed(&conn)
             .context("failed to check whether the project's semantic pass has completed")?;
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
 
     // ProjectWatcher reports canonicalized absolute paths (see its own doc
     // comment on FSEvents' /var -> /private/var behavior); canonicalizing
@@ -764,7 +764,7 @@ fn stand_down(root: &Path) -> Result<()> {
 /// no structural walk or whole-project semantic pass can still race it.
 fn spawn_watch_consumer(
     watcher: ProjectWatcher,
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     root: PathBuf,
 ) {
@@ -789,7 +789,7 @@ fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
     root: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     registry: &PluginRegistry,
 ) {
     if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
@@ -843,7 +843,7 @@ fn watch_and_route_once(
 /// found idle.
 fn serve_forever(
     listener: ipc::Listener,
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,

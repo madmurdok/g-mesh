@@ -30,6 +30,7 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
     assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
 }
 use super::*;
+use crate::storage::index_store::IndexStore;
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -282,7 +283,7 @@ fn drain_startup_noise(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
     root: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     registry: &PluginRegistry,
 ) {
     for _ in 0..2 {
@@ -299,7 +300,7 @@ fn pump_until_settled(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
     root: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     registry: &PluginRegistry,
 ) {
     let deadline = std::time::Instant::now() + DEBOUNCE_WINDOW * 3;

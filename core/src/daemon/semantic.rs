@@ -33,7 +33,7 @@
 //! alone is what closes that: the three paths above now produce the same graph,
 //! which is the only property any of them was ever meant to have.
 //!
-//! # Per-language, not one hardcoded plugin (GM-270)
+//! # Per-language, not one hardcoded plugin
 //!
 //! Before this task, [`run_with_registry`]/[`run_once`] asked exactly one
 //! plugin - `plugin::BUNDLED_LANGUAGE` - because that was the only plugin
@@ -142,16 +142,14 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
-
-use rusqlite::Connection;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 
 /// How long a one-shot plugin gets to exit on its own before it is killed -
@@ -181,17 +179,16 @@ const PLUGIN_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// here than this whole best-effort pass failing outright over a `COUNT(*)`
 /// that could not run.
 ///
-/// `pub(crate)` since GM-272: `daemon::workspace_reindex` needs the exact
-/// same per-language file count to scale its own single-language semantic
-/// pass's timeout, for the exact same reason - there is no second
-/// implementation to keep in sync with this one, just a second caller.
-pub(crate) fn indexed_file_count(conn: &Mutex<Connection>, language: &str) -> usize {
-    let guard = conn.lock().unwrap();
-    let result: rusqlite::Result<i64> = guard.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND language = ?1",
-        [language],
-        |row| row.get(0),
-    );
+/// `daemon::workspace_reindex` uses the same count to scale its
+/// single-language pass's timeout.
+pub(crate) fn indexed_file_count(conn: &IndexStore, language: &str) -> usize {
+    let result: rusqlite::Result<i64> = conn.with(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND language = ?1",
+            [language],
+            |row| row.get(0),
+        )
+    });
     match result {
         Ok(count) => count.max(0) as usize,
         Err(err) => {
@@ -240,8 +237,8 @@ impl SemanticPassRun {
 
     /// Records `language`'s completed pass, which also clears any failure
     /// recorded for it earlier.
-    fn record_success(&mut self, conn: &Mutex<Connection>, language: String) {
-        let recorded = schema::record_language_semantic_pass(&conn.lock().unwrap(), &language);
+    fn record_success(&mut self, conn: &IndexStore, language: String) {
+        let recorded = conn.with(|conn| schema::record_language_semantic_pass(conn, &language));
         match recorded {
             Ok(()) => self.completed.push(language),
             // The pass ran, but the index does not say so: the language stays
@@ -251,7 +248,7 @@ impl SemanticPassRun {
     }
 
     /// Records `language`'s failed pass and its reason in `language_state`.
-    fn record_failure(&mut self, conn: &Mutex<Connection>, language: String, err: anyhow::Error) {
+    fn record_failure(&mut self, conn: &IndexStore, language: String, err: anyhow::Error) {
         record_failure(conn, &language, &err);
         self.failed.push((language, err));
     }
@@ -300,7 +297,7 @@ impl SemanticPassRun {
 /// site in practice, not a case worth surfacing as an error. It is still
 /// recorded as the language's reason ([`NOT_RUN_REASON`]), so status says why
 /// the language is owed rather than "never completed".
-pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) -> SemanticPassRun {
+pub fn run_with_registry(registry: &PluginRegistry, conn: &IndexStore) -> SemanticPassRun {
     run_with_registry_and_progress(registry, conn, None)
 }
 
@@ -308,18 +305,15 @@ pub fn run_with_registry(registry: &PluginRegistry, conn: &Mutex<Connection>) ->
 /// as it starts and ends, so `cli::status` can say which language is running.
 pub fn run_with_registry_and_progress(
     registry: &PluginRegistry,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     progress: Option<&IndexingStatus>,
 ) -> SemanticPassRun {
     let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
-    let owed = {
-        let guard = conn.lock().unwrap();
-        match schema::owed_semantic_pass_languages(&guard, &capable) {
-            Ok(owed) => owed,
-            Err(err) => {
-                eprintln!("g-mesh daemon: failed to determine which languages owe a semantic pass ({err:#})");
-                Vec::new()
-            }
+    let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
+        Ok(owed) => owed,
+        Err(err) => {
+            eprintln!("g-mesh daemon: failed to determine which languages owe a semantic pass ({err:#})");
+            Vec::new()
         }
     };
 
@@ -376,20 +370,17 @@ pub fn run_with_registry_and_progress(
 pub fn run_once(
     canonical_root: &Path,
     state_dir: &Path,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     discovered: &DiscoveredPlugins,
     embedding: &EmbeddingPipeline,
 ) -> SemanticPassRun {
     let capable: HashSet<String> =
         manifest::semantic_pass_capable_languages(&discovered.manifests).into_iter().collect();
-    let owed = {
-        let guard = conn.lock().unwrap();
-        match schema::owed_semantic_pass_languages(&guard, &capable) {
-            Ok(owed) => owed,
-            Err(err) => {
-                eprintln!("g-mesh: failed to determine which languages owe a semantic pass ({err:#})");
-                Vec::new()
-            }
+    let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
+        Ok(owed) => owed,
+        Err(err) => {
+            eprintln!("g-mesh: failed to determine which languages owe a semantic pass ({err:#})");
+            Vec::new()
         }
     };
 
@@ -441,7 +432,7 @@ pub fn run_once(
 /// Persists `err` as `language`'s `semanticPassError`. A failure to write it
 /// is logged, never propagated: the pass has already failed, and the index
 /// stays serviceable.
-pub(crate) fn record_failure(conn: &Mutex<Connection>, language: &str, err: &anyhow::Error) {
+pub(crate) fn record_failure(conn: &IndexStore, language: &str, err: &anyhow::Error) {
     record_reason(conn, language, &format!("{err:#}"));
 }
 
@@ -452,14 +443,14 @@ pub(crate) const NOT_RUN_REASON: &str = "not run - its plugin was asleep or memo
 
 /// Logs and records that `language`'s pass was not run because its plugin was
 /// asleep or memory-suspended. The language stays owed.
-pub(crate) fn record_not_run(conn: &Mutex<Connection>, language: &str) {
+pub(crate) fn record_not_run(conn: &IndexStore, language: &str) {
     eprintln!("g-mesh daemon: the {language} semantic pass was not run - its plugin is asleep or suspended");
     record_reason(conn, language, NOT_RUN_REASON);
 }
 
-fn record_reason(conn: &Mutex<Connection>, language: &str, reason: &str) {
+fn record_reason(conn: &IndexStore, language: &str, reason: &str) {
     if let Err(write_err) =
-        schema::record_language_semantic_pass_failure(&conn.lock().unwrap(), language, reason)
+        conn.with(|conn| schema::record_language_semantic_pass_failure(conn, language, reason))
     {
         eprintln!("g-mesh: failed to record why the {language} semantic pass failed ({write_err:#})");
     }
@@ -476,14 +467,15 @@ fn record_reason(conn: &Mutex<Connection>, language: &str, reason: &str) {
 /// still owed" by `daemon::mod`'s cold-start retry on every single daemon
 /// start, forever - see `storage::schema::reconcile_semantic_pass_rollup`'s
 /// own doc comment.
-fn reconcile_rollup(conn: &Mutex<Connection>, capable: &HashSet<String>) {
-    if let Err(err) = schema::reconcile_semantic_pass_rollup(&conn.lock().unwrap(), capable) {
+fn reconcile_rollup(conn: &IndexStore, capable: &HashSet<String>) {
+    if let Err(err) = conn.with(|conn| schema::reconcile_semantic_pass_rollup(conn, capable)) {
         eprintln!("g-mesh: failed to update the project-wide semantic-pass roll-up ({err:#})");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -561,7 +553,7 @@ mod tests {
         second: &str,
         second_capable: bool,
         second_stalling: bool,
-    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, Mutex<Connection>, PluginRegistry) {
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -604,7 +596,7 @@ mod tests {
 
     /// What `g-mesh status` prints about the semantic pass for this index,
     /// through the same two functions its report is built with.
-    fn status_lines(conn: &Mutex<Connection>, registry: &PluginRegistry) -> Vec<String> {
+    fn status_lines(conn: &IndexStore, registry: &PluginRegistry) -> Vec<String> {
         let guard = conn.lock().unwrap();
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         let (owed, failures) = crate::cli::status::semantic_pass_state(&guard, &capable).unwrap();

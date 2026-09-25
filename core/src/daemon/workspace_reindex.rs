@@ -1,4 +1,4 @@
-//! GM-272: the per-language reindex a settled edit to one of a manifest's
+//! The per-language reindex a settled edit to one of a manifest's
 //! `[plugin.workspace] watch_files` triggers (`go.mod`, `Cargo.toml`,
 //! `*.csproj`...) - `docs/architecture/multi-language-plugins.md`'s "Editing
 //! a Go file" data-flow paragraph, verbatim: "`watch_files` ->
@@ -221,7 +221,7 @@
 //! currently unresolved, in whichever language they belong to, and a
 //! placeholder this reindex did not touch simply finds nothing new to link
 //! against. The semantic phase reuses `daemon::semantic`'s per-language
-//! primitives (GM-270's `PluginSupervisor::semantic_pass`,
+//! primitives (`PluginSupervisor::semantic_pass`,
 //! `daemon::semantic::indexed_file_count`, `storage::schema::
 //! record_language_semantic_pass`/`reconcile_semantic_pass_rollup`) rather
 //! than `daemon::semantic::run_with_registry` itself, because that entry
@@ -231,80 +231,15 @@
 //! requires.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
 
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
-use crate::graph::{imports, symbol_links};
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-
-/// Deletes every row `language` owns - see this module's doc comment
-/// ("Decision 1") for exactly what that means and why, and ("Decision: ...")
-/// for why this is targeted SQL rather than a `storage::write::Diff`.
-///
-/// One transaction: a failure partway through must not leave, say, edges
-/// deleted but their nodes still present (which would surface as a live node
-/// with dangling incoming-edge gaps elsewhere in the graph) - the same
-/// "nothing partial is ever committed" guarantee `storage::write::apply_diff`
-/// gives its own diffs.
-///
-/// Order matters only under a connection that enforces foreign keys (the
-/// daemon's real connection does not - `storage::connection::open` switches
-/// them off - but most of this module's own tests run with them on,
-/// deliberately, the same reason `storage::write`'s tests do): edges before
-/// nodes (`edges.fromId`/`toId`
-/// reference `nodes(id)` with no `ON DELETE CASCADE`), and every node-keyed
-/// child table (`vectors`, `declarations`, `placeholder_targets`,
-/// `containers`) before `nodes` itself.
-pub(crate) fn delete_language_rows(conn: &mut Connection, language: &str) -> Result<()> {
-    let tx = conn.transaction().context("failed to start the per-language delete transaction")?;
-
-    tx.execute(
-        "DELETE FROM edges WHERE fromId IN (SELECT id FROM nodes WHERE language = ?1) \
-            OR toId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's edges")?;
-    tx.execute(
-        "DELETE FROM vectors WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's vectors")?;
-    tx.execute(
-        "DELETE FROM declarations WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's declarations")?;
-    tx.execute(
-        "DELETE FROM placeholder_targets WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's placeholder targets")?;
-    // Every container of this language becomes empty the instant every node
-    // naming it as a member is gone (below) - see this module's doc comment
-    // on why that makes a plain `WHERE language = ?` the correct delete
-    // rather than an approximation of `containers::attach`'s own recount.
-    tx.execute("DELETE FROM containers WHERE language = ?1", params![language])
-        .context("failed to delete a language's containers")?;
-    // Member declarations and container nodes alike - see this module's doc
-    // comment ("Decision 1: Nodes") for why one predicate covers both.
-    tx.execute("DELETE FROM nodes WHERE language = ?1", params![language])
-        .context("failed to delete a language's nodes")?;
-    // The whole row, not just the two timestamp columns: `pluginFingerprint`
-    // goes with it too, and is re-recorded by `walk_one_language`'s own
-    // `schema::record_language_bulk_indexed` call the moment the re-walk
-    // lands - there is nothing worth preserving across a delete that is
-    // about to be superseded within the same reindex.
-    tx.execute("DELETE FROM language_state WHERE language = ?1", params![language])
-        .context("failed to reset a language's language_state row")?;
-
-    tx.commit().context("failed to commit the per-language delete transaction")
-}
 
 /// Runs `language`'s whole per-language reindex against `registry`/
 /// `supervisor`, in response to a settled edit of `changed_file` (one of that
@@ -316,7 +251,7 @@ pub(crate) fn delete_language_rows(conn: &mut Connection, language: &str) -> Res
 pub(crate) fn run(
     registry: &PluginRegistry,
     supervisor: &PluginSupervisor,
-    conn: &Mutex<Connection>,
+    store: &IndexStore,
     changed_file: &str,
 ) -> Result<()> {
     let manifest = supervisor.manifest().clone();
@@ -337,18 +272,15 @@ pub(crate) fn run(
             }
         }
 
-        {
-            let mut guard = conn.lock().unwrap();
-            delete_language_rows(&mut guard, &manifest.language).with_context(|| {
-                format!("failed to delete {}'s rows before reindexing it", manifest.language)
-            })?;
-        }
+        store
+            .delete_language(&manifest.language)
+            .with_context(|| format!("failed to delete {}'s rows before reindexing it", manifest.language))?;
 
         let mut summary = BulkIndexSummary::default();
         bulk_index::walk_one_language(
             registry.project_root(),
             &manifest,
-            conn,
+            store,
             &mut summary,
             Some(registry.embedding().as_ref()),
             None,
@@ -358,35 +290,28 @@ pub(crate) fn run(
         )
         .with_context(|| format!("failed to re-walk {} after {changed_file} changed", manifest.language))?;
 
-        {
-            let mut guard = conn.lock().unwrap();
-            imports::link_all(&mut guard).context("failed to link imports after a per-language reindex")?;
-            symbol_links::link_all(&mut guard)
-                .context("failed to link symbols after a per-language reindex")?;
-            schema::record_bulk_index(&guard)
-                .context("failed to update the project-wide bulk-index roll-up")?;
-        }
+        store.relink_after_language_reindex()?;
         Ok(())
     })?;
 
     // The unlocked phase: the semantic pass, restricted to this one language
     // - see this module's doc comment ("Decision 6") for why this calls
-    // GM-270's per-language primitives directly rather than
+    // the per-language primitives directly rather than
     // `daemon::semantic::run_with_registry`, which would ask every currently-
     // owed language, not just this one.
     if manifest.capabilities.semantic_pass {
-        let file_count = semantic::indexed_file_count(conn, &manifest.language);
-        match supervisor.semantic_pass(conn, Vec::new(), file_count) {
+        let file_count = semantic::indexed_file_count(store, &manifest.language);
+        match supervisor.semantic_pass(store, Vec::new(), file_count) {
             Ok(true) => {
                 let recorded =
-                    schema::record_language_semantic_pass(&conn.lock().unwrap(), &manifest.language);
+                    store.with(|conn| schema::record_language_semantic_pass(conn, &manifest.language));
                 if let Err(err) = recorded {
                     eprintln!(
                         "g-mesh daemon: failed to record {}'s semantic pass after a workspace \
                          reindex ({err:#})",
                         manifest.language
                     );
-                    semantic::record_failure(conn, &manifest.language, &err);
+                    semantic::record_failure(store, &manifest.language, &err);
                 }
             }
             // The supervisor was asleep and deliberately left that way - see
@@ -395,20 +320,19 @@ pub(crate) fn run(
             // (`daemon::semantic::run_with_registry`, on a future daemon
             // start, or a later reindex of this same language); status shows
             // why.
-            Ok(false) => semantic::record_not_run(conn, &manifest.language),
+            Ok(false) => semantic::record_not_run(store, &manifest.language),
             Err(err) => {
                 eprintln!(
                     "g-mesh daemon: the {} semantic pass after a workspace reindex failed ({err:#}) - \
                      its edges keep whatever the structural pass resolved",
                     manifest.language
                 );
-                semantic::record_failure(conn, &manifest.language, &err);
+                semantic::record_failure(store, &manifest.language, &err);
             }
         }
 
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
-        let guard = conn.lock().unwrap();
-        if let Err(err) = schema::reconcile_semantic_pass_rollup(&guard, &capable) {
+        if let Err(err) = store.with(|conn| schema::reconcile_semantic_pass_rollup(conn, &capable)) {
             eprintln!("g-mesh daemon: failed to update the project-wide semantic-pass roll-up ({err:#})");
         }
     }
@@ -418,8 +342,13 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    use rusqlite::params;
+
+    use crate::storage::write::delete_language_rows;
 
     use super::*;
     use crate::daemon::manifest::discover;
@@ -951,7 +880,7 @@ mod tests {
 
     /// A registry with one `semantic_pass`-capable language, `alpha`, over an
     /// empty current-schema index.
-    fn alpha_registry() -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry, Mutex<Connection>) {
+    fn alpha_registry() -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
         test_plugin::install_with_workspace_semantic_pass_capable(

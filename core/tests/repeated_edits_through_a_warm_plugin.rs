@@ -41,13 +41,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::daemon::plugin::{bundled_manifest, PluginProcess};
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::{self, project_dir};
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -167,10 +167,10 @@ const GREET_SHIFTED_WITH_FAREWELL: &str = "// one\n// two\n// three\n\
      export function greet(): string {\n  const a = 1;\n  const b = 2;\n  return \"hello\";\n}\n\
      \nexport function farewell(): string {\n  return \"bye\";\n}\n";
 
-fn open_production_index(project: &Project) -> Mutex<Connection> {
+fn open_production_index(project: &Project) -> IndexStore {
     let conn = connection::open(project.root()).expect("failed to open the project's index");
     schema::apply(&conn).expect("failed to apply the schema");
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
 fn spawn_plugin(project: &Project) -> PluginProcess {
@@ -180,7 +180,7 @@ fn spawn_plugin(project: &Project) -> PluginProcess {
 
 /// One reparse, gated the way `PluginSupervisor::file_changed` gates it for a
 /// language whose semantic pass is not suspended (GM-274).
-fn apply(plugin: &PluginProcess, conn: &Mutex<Connection>, file_path: &str) {
+fn apply(plugin: &PluginProcess, conn: &IndexStore, file_path: &str) {
     plugin
         .apply_file_change(conn, file_path, &EmbeddingPipeline::disabled(), false)
         .unwrap_or_else(|err| panic!("applying a change to {file_path} failed: {err:#}"));

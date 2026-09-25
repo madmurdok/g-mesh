@@ -22,13 +22,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
 use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
 use g_mesh::embedding::{default_model_dir, EmbeddingModel, EmbeddingPipeline};
 use g_mesh::storage::connection::{open, project_dir};
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
@@ -89,7 +89,7 @@ impl Project {
         let conn = open(self.root()).expect("failed to open the project index");
         schema::ensure_current(&conn, "embedding-generation-pipeline-test")
             .expect("failed to prepare the index");
-        let conn = Mutex::new(conn);
+        let conn = IndexStore::new(conn);
         let discovered = only_the_bundled_plugin();
         let summary =
             bulk_index::run(self.root(), &conn, Some(embedding), &discovered).expect("the bulk walk failed");
@@ -110,7 +110,7 @@ impl Project {
         let conn = open(self.root()).expect("failed to open the project index");
         schema::ensure_current(&conn, "embedding-generation-pipeline-test")
             .expect("failed to prepare the index");
-        let conn = Mutex::new(conn);
+        let conn = IndexStore::new(conn);
         let discovered = only_the_bundled_plugin();
         let summary =
             bulk_index::run(self.root(), &conn, None, &discovered).expect("the structural walk failed");

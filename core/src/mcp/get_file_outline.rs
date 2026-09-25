@@ -5,7 +5,7 @@
 //! ordered by source position (`graph::pagination::paginate_defines`)
 //! instead of the resolved/locality rule the symbol-anchored tools use.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::tool_result::{error, internal_error, success};
@@ -104,10 +105,10 @@ fn list_outline(
 }
 
 pub(super) fn handle(
-    conn: &Arc<Mutex<Connection>>,
+    store: &Arc<IndexStore>,
     params: GetFileOutlineParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = conn.lock().unwrap();
+    let conn = store.read();
 
     let file_node = queries::find_file_node(&conn, &params.file_path)
         .map_err(|e| internal_error("failed to look up file", e))?;
@@ -181,7 +182,7 @@ mod tests {
         .unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         let names: Vec<&str> = results.iter().map(|r| r["name"].as_str().unwrap()).collect();
@@ -194,7 +195,7 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -205,7 +206,7 @@ mod tests {
         let conn = setup();
         let params =
             GetFileOutlineParams { file_path: "does/not/exist.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("does/not/exist.rs"));
     }
 
@@ -219,7 +220,7 @@ mod tests {
             .unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         assert!(error_text(&result).contains("a.rs"));
     }
 
@@ -236,7 +237,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(IndexStore::new(conn));
 
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
@@ -284,7 +285,7 @@ mod tests {
 
         let params =
             GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(30), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 30, "30 symbols must fit in a single page once limit covers them all");
@@ -309,7 +310,7 @@ mod tests {
         }
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(
@@ -342,7 +343,7 @@ mod tests {
 
         let params =
             GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(10_000), ..Default::default() };
-        let result = handle(&Arc::new(Mutex::new(conn)), params).unwrap();
+        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(

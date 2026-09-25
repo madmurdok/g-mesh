@@ -483,6 +483,73 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     Ok(())
 }
 
+/// Records a file's `indexed_files` staleness baseline.
+pub(crate) fn upsert_indexed_file(
+    conn: &Connection,
+    file_path: &str,
+    mtime_millis: i64,
+    content_hash: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO indexed_files (filePath, mtimeMillis, contentHash)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(filePath) DO UPDATE SET
+            mtimeMillis = excluded.mtimeMillis,
+            contentHash = excluded.contentHash",
+        params![file_path, mtime_millis, content_hash],
+    )
+    .context("failed to upsert indexed_files row")?;
+    Ok(())
+}
+
+/// Deletes every row `language` owns (see `daemon::workspace_reindex`'s
+/// module doc for exactly which rows), in one transaction: a failure partway
+/// through must not leave edges deleted while their nodes remain.
+///
+/// Order matters only under a connection that enforces foreign keys (the
+/// daemon's does not; most tests do): edges before nodes (`edges.fromId`/
+/// `toId` reference `nodes(id)` with no `ON DELETE CASCADE`), and every
+/// node-keyed child table (`vectors`, `declarations`, `placeholder_targets`,
+/// `containers`) before `nodes` itself.
+pub(crate) fn delete_language_rows(conn: &mut Connection, language: &str) -> Result<()> {
+    let tx = conn.transaction().context("failed to start the per-language delete transaction")?;
+
+    tx.execute(
+        "DELETE FROM edges WHERE fromId IN (SELECT id FROM nodes WHERE language = ?1) \
+            OR toId IN (SELECT id FROM nodes WHERE language = ?1)",
+        params![language],
+    )
+    .context("failed to delete a language's edges")?;
+    tx.execute(
+        "DELETE FROM vectors WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
+        params![language],
+    )
+    .context("failed to delete a language's vectors")?;
+    tx.execute(
+        "DELETE FROM declarations WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
+        params![language],
+    )
+    .context("failed to delete a language's declarations")?;
+    tx.execute(
+        "DELETE FROM placeholder_targets WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
+        params![language],
+    )
+    .context("failed to delete a language's placeholder targets")?;
+    // Every container of this language is empty once its member nodes are
+    // gone (below), so a plain `WHERE language = ?` is the exact delete.
+    tx.execute("DELETE FROM containers WHERE language = ?1", params![language])
+        .context("failed to delete a language's containers")?;
+    // Member declarations and container nodes alike carry the language.
+    tx.execute("DELETE FROM nodes WHERE language = ?1", params![language])
+        .context("failed to delete a language's nodes")?;
+    // The whole row, `pluginFingerprint` included: the re-walk records it
+    // again.
+    tx.execute("DELETE FROM language_state WHERE language = ?1", params![language])
+        .context("failed to reset a language's language_state row")?;
+
+    tx.commit().context("failed to commit the per-language delete transaction")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

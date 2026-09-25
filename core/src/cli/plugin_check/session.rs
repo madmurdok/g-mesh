@@ -11,7 +11,8 @@
 //! / `apply_semantic_pass` - including the `semantic_pass` capability gate
 //! `apply_file_change` applies itself - so the diffs land through the real
 //! `storage::write::apply_diff`, container maintenance, and `link_diff`.
-//! GM-277's expectations will query exactly the linked state this builds.
+//! `cli::plugin_check::expectations` queries exactly the linked state this
+//! builds.
 //!
 //! Four things differ from `daemon::plugin::PluginProcess` /
 //! `daemon::bulk_index::walk_one_language`, each on purpose:
@@ -72,7 +73,6 @@ use crate::daemon::bulk_index::{self, BulkIndexSummary, BULK_INDEX_FLAG};
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::{imports, symbol_links};
 use crate::paths;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout};
@@ -81,6 +81,7 @@ use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
     WireNode,
 };
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::apply::{apply_file_change, apply_semantic_pass};
 
@@ -356,8 +357,8 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         // see `daemon::manifest::MANIFEST_PATH_ENV`. Checking a plugin against
         // a manifest it cannot see is checking something else.
         .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
-        // The daemon's lifeline, exactly as `walk_one_language` sets it up
-        // (GM-397): a stdin pipe kept inside `child` and never written, plus
+        // The daemon's lifeline, exactly as `walk_one_language` sets it up:
+        // a stdin pipe kept inside `child` and never written, plus
         // the variable that arms the plugin's watcher on it. Checking a
         // plugin under a different stdin than the daemon gives it would be
         // checking something else.
@@ -375,7 +376,7 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
     // it, a fresh worktree's unbuilt `target/debug/g-mesh-plugin-{python,rust}`
     // fails `Command::spawn` below with a bare `No such file or directory
     // (os error 2)`, which blames the plugin for a build step nothing in
-    // this kit's own path runs (GM-375): `core/build.rs` builds the
+    // this kit's own path runs: `core/build.rs` builds the
     // typescript and go plugins as a side effect of `cargo build`, but the
     // two cargo-workspace plugins are ordinary workspace members with no
     // such step, so `cargo build --workspace` is the one command that
@@ -522,31 +523,22 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
 /// plugin, the shape every user edit has, was never sent. The
 /// declaration-edit step (`id-stability.declaration-edit-applies`) now is.
 ///
-/// `Arc<Mutex<Connection>>`, not a bare `Mutex<Connection>`: GM-277's
-/// expectations call the MCP tools' own handler functions
-/// (`mcp::find_callers_callees::handle_callers` and its four siblings), and
-/// every one of them is declared over `&Arc<Mutex<Connection>>` - the exact
-/// type `mcp::mod`'s `#[tool]` methods hold `self.conn` as. Every existing
-/// caller in this module keeps taking a plain `&Mutex<Connection>`
-/// unchanged: `&Arc<Mutex<Connection>>` coerces to `&Mutex<Connection>` at
-/// each of those call sites for free (`Arc`'s `Deref`), so this is the only
-/// line that needed to change for both kinds of caller to share one
-/// connection.
-pub(crate) fn open_index() -> Result<Arc<Mutex<Connection>>> {
+/// An `Arc<IndexStore>`: the expectations call the MCP tools' own handler
+/// functions, which take the same `&Arc<IndexStore>` `mcp::mod` holds, and
+/// every other caller here borrows it as `&IndexStore`.
+pub(crate) fn open_index() -> Result<Arc<IndexStore>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(Arc::new(IndexStore::new(conn)))
 }
 
 /// Commits one bulk stream through the daemon's own batching and links it
 /// project-wide, exactly as `bulk_index::run` does after its walk.
-pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<()> {
+pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
     let mut summary = BulkIndexSummary::default();
     bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None, None)?;
-    let mut conn = conn.lock().unwrap();
-    imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?;
-    symbol_links::link_all(&mut conn).context("failed to link the walk's cross-file symbol usages")?;
+    conn.link_all()?;
     Ok(())
 }
 
@@ -559,8 +551,8 @@ pub(crate) fn ingest_and_link(conn: &Mutex<Connection>, bytes: &[u8]) -> Result<
 /// `graph::imports` drops a `resolved_module` placeholder once it has
 /// repointed its edge onto the real file. Comparing raw bulk output against
 /// the index would report every linked import as a missing id.
-pub(crate) fn file_node_ids(conn: &Mutex<Connection>, file: &str) -> Result<BTreeSet<String>> {
-    let conn = conn.lock().unwrap();
+pub(crate) fn file_node_ids(store: &IndexStore, file: &str) -> Result<BTreeSet<String>> {
+    let conn = store.read();
     let mut statement = conn.prepare("SELECT id FROM nodes WHERE filePath = ?1")?;
     let ids = statement.query_map([file], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
     Ok(ids)
@@ -574,11 +566,8 @@ pub(crate) type StoredRange = (i64, i64, i64, i64);
 /// bulk run 3 of the edited tree was committed and linked into, for
 /// `id-stability.declaration-edit-applies`. Index against index for the same
 /// reason [`file_node_ids`] is.
-pub(crate) fn file_node_ranges(
-    conn: &Mutex<Connection>,
-    file: &str,
-) -> Result<BTreeMap<String, StoredRange>> {
-    let conn = conn.lock().unwrap();
+pub(crate) fn file_node_ranges(store: &IndexStore, file: &str) -> Result<BTreeMap<String, StoredRange>> {
+    let conn = store.read();
     let mut statement =
         conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
     let rows = statement
@@ -905,7 +894,7 @@ struct Driver<'a> {
     /// The plugin's own stderr, quoted into `session.failure` by
     /// [`Driver::finish`] - see [`StderrCapture`].
     stderr: StderrCapture,
-    conn: &'a Mutex<Connection>,
+    conn: &'a IndexStore,
     timeouts: RoundTripTimeouts,
     next_id: i64,
     session: Session,
@@ -932,7 +921,7 @@ struct Driver<'a> {
 pub(crate) fn run_session(
     manifest: &PluginManifest,
     scratch: &Scratch,
-    conn: &Mutex<Connection>,
+    conn: &IndexStore,
     target: &EditTarget,
     timeouts: RoundTripTimeouts,
     whole_project_timeout: Duration,
@@ -950,7 +939,7 @@ pub(crate) fn run_session(
     scratch.isolate(&mut command);
 
     // As in `run_bulk` above - see `daemon::plugin::missing_workspace_binary_hint`'s
-    // doc comment and GM-375. `missing_workspace_binary_hint` alone, not the
+    // doc comment. `missing_workspace_binary_hint` alone, not the
     // combined `missing_plugin_binary_hint`, for the same reason given there:
     // the typescript plugin's own spawn failure here is already honest and
     // must stay untouched.
@@ -1061,9 +1050,9 @@ pub(crate) fn run_session(
         if !driver.step("semanticPass #1 (whole project)", file, &operation) {
             return driver.finish();
         }
-        // The half of a completed whole-project pass the kit used to leave
-        // out (GM-382). `daemon::semantic` records this the moment the same
-        // `apply_semantic_pass` call returns `Ok` - it is what makes
+        // Marks the whole-project pass completed. `daemon::semantic`
+        // records this the moment the same `apply_semantic_pass` call
+        // returns `Ok` - it is what makes
         // `language_state.semanticPassAt` mean "this language's semantic
         // tier has run", and the index the expectations are then evaluated
         // against is supposed to be the index a daemon would have left
@@ -1074,7 +1063,7 @@ pub(crate) fn run_session(
         // a response claiming the semantic tier was absent in the one arm
         // that had just driven it successfully.
         if let Err(err) =
-            schema::record_language_semantic_pass(&driver.conn.lock().unwrap(), &manifest.language)
+            driver.conn.with(|conn| schema::record_language_semantic_pass(conn, &manifest.language))
         {
             driver.session.failure =
                 Some(format!("recording {}'s completed semantic pass: {err:#}", manifest.language));
@@ -1120,9 +1109,8 @@ impl Driver<'_> {
             let mut kill = || {
                 let _ = child.kill();
             };
-            // `conn` (not a pre-locked guard): GM-396 has both functions
-            // below take the `Mutex` itself and lock it only for as long as
-            // each of their own steps needs it.
+            // `conn` is the store, not a held guard: both functions below
+            // take it only for as long as each of their own steps needs it.
             match operation {
                 Operation::FileChanged { semantic_pass_capable } => apply_file_change(
                     reader,

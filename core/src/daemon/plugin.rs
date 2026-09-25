@@ -41,11 +41,10 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
@@ -55,6 +54,7 @@ use crate::protocol::jsonrpc::{is_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, RequestId, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
+use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -912,6 +912,18 @@ pub struct PluginProcess {
 }
 
 impl PluginProcess {
+    /// The plugin's stdin/stdout pair. Taken before the store, never under it.
+    fn state(&self) -> MutexGuard<'_, PluginState> {
+        index_store::assert_not_held();
+        self.state.lock().unwrap()
+    }
+
+    /// The plugin's pending-file queue. Taken before the store, never under it.
+    fn pending(&self) -> MutexGuard<'_, Vec<String>> {
+        index_store::assert_not_held();
+        self.pending.lock().unwrap()
+    }
+
     /// Spawns `manifest`'s plugin for `project_root` - see
     /// [`PluginState::spawn`]. `pid_file` is where [`Self::relaunch`] records
     /// a crash-recovery respawn's fresh pid; the *first* pid (this call's own)
@@ -965,7 +977,7 @@ impl PluginProcess {
     /// `relaunch` keeps the on-disk pid file in step with it for the same
     /// reason.
     pub fn pid(&self) -> u32 {
-        self.state.lock().unwrap().child.id()
+        self.state().child.id()
     }
 
     /// Ends this plugin process and waits for it to be gone, consuming the
@@ -1077,7 +1089,7 @@ impl PluginProcess {
     /// threaded in here rather than read off `self`.
     pub fn apply_file_change(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: impl Into<String>,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
@@ -1169,7 +1181,7 @@ impl PluginProcess {
     /// repeated crashes must not grow the queue without bound, and there is
     /// nothing to gain from sending the same path to the plugin twice.
     fn enqueue_pending(&self, file_path: &str) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending();
         if !pending.iter().any(|f| f == file_path) {
             pending.push(file_path.to_string());
         }
@@ -1178,7 +1190,7 @@ impl PluginProcess {
     /// Drops `file_path` from the pending queue - its diff has committed, so
     /// there is nothing left to replay it for.
     fn remove_pending(&self, file_path: &str) {
-        self.pending.lock().unwrap().retain(|f| f != file_path);
+        self.pending().retain(|f| f != file_path);
     }
 
     /// Sends every file still queued to the plugin, in the order they were
@@ -1190,12 +1202,12 @@ impl PluginProcess {
     /// off.
     fn replay_pending(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
     ) -> Result<()> {
         loop {
-            let next = { self.pending.lock().unwrap().first().cloned() };
+            let next = { self.pending().first().cloned() };
             let Some(file_path) = next else { return Ok(()) };
             self.send_one(conn, &file_path, embedding, semantic_suspended).1?;
             self.remove_pending(&file_path);
@@ -1253,29 +1265,23 @@ impl PluginProcess {
     /// that method's doc comment.
     pub fn ensure_fresh(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
     ) -> Result<StalenessOutcome> {
-        {
-            let guard = conn.lock().unwrap();
-            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
-                return Ok(StalenessOutcome::AlreadyFresh);
-            }
+        if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
+            return Ok(StalenessOutcome::AlreadyFresh);
         }
 
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let (result, asked) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state();
             let asked = state.child.id();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
             let mut on_timeout = self.kill_on_timeout(child);
-            // `conn` is handed through as the `Mutex` it is, not pre-locked -
-            // GM-396: `staleness::ensure_fresh`/`apply_file_change` take it
-            // only for as long as each of their own steps needs it, so a
-            // reindex's embedding step never holds it for the round trip's
-            // whole duration.
+            // The store is handed through unlocked: the reindex's unit decides
+            // how long each of its steps holds it.
             let result = staleness::ensure_fresh(
                 reader,
                 writer,
@@ -1345,7 +1351,7 @@ impl PluginProcess {
     /// wrong for anything past a small project.
     pub fn semantic_pass(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
         embedding: &EmbeddingPipeline,
@@ -1353,7 +1359,7 @@ impl PluginProcess {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let timeout = self.timeouts.semantic_pass_project_timeout(file_count);
         let result = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state();
             let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
             let mut on_timeout = self.kill_on_timeout(child);
             // See `Self::ensure_fresh`'s identical comment: `conn` is handed
@@ -1399,7 +1405,7 @@ impl PluginProcess {
     /// correctness, since the reindex rebuilds the plugin's on-disk-derived
     /// state from scratch regardless of whether this arrived.
     pub fn notify_workspace_changed(&self, file_path: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
@@ -1448,7 +1454,7 @@ impl PluginProcess {
     /// the empty diff GM-292 hid behind.
     fn send_one(
         &self,
-        conn: &Mutex<Connection>,
+        conn: &IndexStore,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
@@ -1459,7 +1465,7 @@ impl PluginProcess {
         // Left untouched across a relaunch: the fresh process has never seen
         // any of these ids either, so there is nothing to collide with.
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         let sent_to = state.child.id();
         // Split into disjoint field borrows up front - borrowing `child` and
         // the reader/writer as three separate `&mut` borrows doesn't
@@ -1522,7 +1528,7 @@ impl PluginProcess {
     fn process_has_exited(&self) -> bool {
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
-            if matches!(self.state.lock().unwrap().child.try_wait(), Ok(Some(_))) {
+            if matches!(self.state().child.try_wait(), Ok(Some(_))) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -1559,7 +1565,7 @@ impl PluginProcess {
         eprintln!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
-        let replaced = std::mem::replace(&mut *self.state.lock().unwrap(), fresh);
+        let replaced = std::mem::replace(&mut *self.state(), fresh);
         super::write_pid_file(&self.pid_file, pid);
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.

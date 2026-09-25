@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0001`). Use this
+zero-padded, incrementing — the next free number is `0002`). Use this
 template:
 
 ```markdown
@@ -65,9 +65,8 @@ place — read the doc itself for that detail.
 
 ### New ADRs (`docs/adr/NNNN-<slug>.md`)
 
-None yet. The next decision made from here on gets its own file, added as a
-row here.
+Each decision made from here on gets its own file, added as a row here.
 
 | # | Title | Status |
 |---|-------|--------|
-| — | — | — |
+| 0001 | [IndexStore: one owner for the SQLite connection and its lock policy](0001-index-store.md) | Accepted |

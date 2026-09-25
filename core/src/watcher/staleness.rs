@@ -57,7 +57,7 @@
 //! before - if the reindex fails, no false "this file is now fresh" record
 //! is left behind.
 //!
-//! # Baselines from the bulk walk (GM-401)
+//! # Baselines from the bulk walk
 //!
 //! A cold-start walk (`daemon::bulk_index::run`) records a baseline for each
 //! file it indexed, via [`record_walk_baselines`], so the first query of an
@@ -68,7 +68,6 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -77,7 +76,9 @@ use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::types::RequestId;
-use crate::watcher::apply::apply_file_change;
+use crate::storage::index_store::{IndexStore, Unit};
+use crate::storage::write::upsert_indexed_file;
+use crate::watcher::apply::apply_file_change_in;
 
 /// What [`ensure_fresh`] did to bring a file's index up to date. All three
 /// non-fresh variants imply `apply_file_change` was actually invoked
@@ -114,7 +115,7 @@ impl StalenessOutcome {
 /// A type rather than only a message so that a caller can ask
 /// `err.downcast_ref::<ReindexFailed>()` instead of matching text:
 /// `daemon::plugin::PluginProcess::ensure_fresh` relaunches its plugin on
-/// this failure and on nothing else around it (GM-293, ported by GM-294),
+/// this failure and on nothing else around it,
 /// because only this one can leave the plugin's cached copy of the file ahead
 /// of the index. A timeout wears this context too - it is a failed round
 /// trip - so that caller also rules out `protocol::jsonrpc::is_timeout`,
@@ -154,7 +155,7 @@ impl std::fmt::Display for ReindexFailed {
 pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    conn: &Mutex<Connection>,
+    store: &IndexStore,
     project_root: &Path,
     file_path: &str,
     request_id: RequestId,
@@ -164,45 +165,44 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<StalenessOutcome> {
-    let decision = {
-        let guard = conn.lock().unwrap();
-        decide(&guard, project_root, file_path)?
-    };
-    match decision {
-        Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
-        Decision::ContentUnchanged { mtime, hash } => {
-            // Content is unchanged (e.g. a touch, or a byte-identical
-            // rewrite) - just refresh the mtime baseline so the next check
-            // hits the fast path again. No reindex.
-            upsert_indexed_file(&conn.lock().unwrap(), file_path, mtime, &hash)?;
-            Ok(StalenessOutcome::MtimeMismatchContentUnchanged)
+    store.unit(Unit::QueryTimeReindex, |store| {
+        match store.step(|conn| decide(conn, project_root, file_path))? {
+            Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
+            Decision::ContentUnchanged { mtime, hash } => {
+                // Content is unchanged (e.g. a touch, or a byte-identical
+                // rewrite) - just refresh the mtime baseline so the next check
+                // hits the fast path again. No reindex.
+                store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
+                Ok(StalenessOutcome::MtimeMismatchContentUnchanged)
+            }
+            Decision::NeedsReindex { mtime, hash, had_prior_record } => {
+                // Genuinely stale (or never indexed) - synchronously reindex
+                // before recording the new baseline.
+                store
+                    .unit(Unit::WatcherApply, |store| {
+                        apply_file_change_in(
+                            reader,
+                            writer,
+                            store,
+                            file_path,
+                            request_id,
+                            embedding,
+                            file_changed_timeout,
+                            semantic_pass_timeout,
+                            semantic_pass_capable,
+                            on_timeout,
+                        )
+                    })
+                    .context(ReindexFailed)?;
+                store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
+                Ok(if had_prior_record {
+                    StalenessOutcome::ReindexedViaHashMismatch
+                } else {
+                    StalenessOutcome::ReindexedNoPriorRecord
+                })
+            }
         }
-        Decision::NeedsReindex { mtime, hash, had_prior_record } => {
-            // Genuinely stale (or never indexed) - synchronously reindex
-            // before recording the new baseline. `apply_file_change` locks
-            // `conn` itself, only for as long as each of its steps actually
-            // needs it (GM-396) - it is never held across this call.
-            apply_file_change(
-                reader,
-                writer,
-                conn,
-                file_path,
-                request_id,
-                embedding,
-                file_changed_timeout,
-                semantic_pass_timeout,
-                semantic_pass_capable,
-                on_timeout,
-            )
-            .context(ReindexFailed)?;
-            upsert_indexed_file(&conn.lock().unwrap(), file_path, mtime, &hash)?;
-            Ok(if had_prior_record {
-                StalenessOutcome::ReindexedViaHashMismatch
-            } else {
-                StalenessOutcome::ReindexedNoPriorRecord
-            })
-        }
-    }
+    })
 }
 
 /// Whether [`ensure_fresh`] would need to reindex `file_path` right now -
@@ -287,24 +287,6 @@ fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<Inde
     .context("failed to query indexed_files")
 }
 
-fn upsert_indexed_file(
-    conn: &Connection,
-    file_path: &str,
-    mtime_millis: i64,
-    content_hash: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO indexed_files (filePath, mtimeMillis, contentHash)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(filePath) DO UPDATE SET
-            mtimeMillis = excluded.mtimeMillis,
-            contentHash = excluded.contentHash",
-        params![file_path, mtime_millis, content_hash],
-    )
-    .context("failed to upsert indexed_files row")?;
-    Ok(())
-}
-
 /// How much older than the walk's start a file's mtime must be before
 /// [`record_walk_baselines`] trusts that the walk read its current content.
 /// Covers the coarsest mtime granularity in common use (FAT's 2 s; HFS+ and
@@ -321,13 +303,12 @@ pub struct WalkBaselines {
     pub recorded: usize,
     /// Files left without one - modified too close to (or after) the walk's
     /// start, changed while being hashed, or unreadable. Each of these pays
-    /// the query-time reindex on its first touch, exactly as every file did
-    /// before GM-401.
+    /// the query-time reindex on its first touch.
     pub skipped: usize,
 }
 
 /// Records an `indexed_files` baseline for each of `files` (project-relative)
-/// that a bulk walk started at `walk_started` indexed - GM-401. Without it the
+/// that a bulk walk started at `walk_started` indexed. Without it the
 /// first query of *any* file after a fresh walk finds no row, reads the file
 /// as never indexed, and pays a synchronous reindex (a `fileChanged` round
 /// trip plus a per-file semantic pass, which on a cold language server ran
@@ -362,10 +343,9 @@ pub struct WalkBaselines {
 ///
 /// Best-effort per file: a file that cannot be read is skipped, not fatal.
 /// Only the insert itself can fail this call. The rows are written in one
-/// transaction; `conn` is locked only for that transaction, never while
-/// hashing.
+/// transaction, under one store hold that excludes the hashing.
 pub(crate) fn record_walk_baselines<'a>(
-    conn: &Mutex<Connection>,
+    store: &IndexStore,
     project_root: &Path,
     files: impl IntoIterator<Item = &'a str>,
     walk_started: std::time::SystemTime,
@@ -389,12 +369,7 @@ pub(crate) fn record_walk_baselines<'a>(
         }
     }
 
-    let mut guard = conn.lock().unwrap();
-    let tx = guard.transaction().context("failed to start the walk-baseline transaction")?;
-    for (file_path, mtime, hash) in &rows {
-        upsert_indexed_file(&tx, file_path, *mtime, hash)?;
-    }
-    tx.commit().context("failed to commit the walk's indexed_files baselines")?;
+    store.record_walk_baselines(&rows)?;
     summary.recorded = rows.len();
     Ok(summary)
 }
@@ -468,7 +443,7 @@ mod tests {
         conn
     }
 
-    fn count(conn: &Mutex<Connection>, table: &str) -> i64 {
+    fn count(conn: &IndexStore, table: &str) -> i64 {
         conn.lock()
             .unwrap()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -569,7 +544,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         let file_path_on_disk = tmp.path().join("src/lib.rs");
         fs::write(&file_path_on_disk, b"fn foo() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
         let (core_reader, plugin_writer) = std::io::pipe().unwrap();
@@ -620,7 +595,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn old() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // --- initial index ---
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -714,7 +689,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file_on_disk = tmp.path().join("lib.rs");
         fs::write(&file_on_disk, b"fn foo() {}").unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // First call: no prior record, must reindex.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -803,7 +778,7 @@ mod tests {
         let file_on_disk = tmp.path().join("lib.rs");
         let content = b"fn stable() {}";
         fs::write(&file_on_disk, content).unwrap();
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
 
         // Initial index.
         let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
@@ -904,7 +879,7 @@ mod tests {
         fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
     }
 
-    fn baseline_row(conn: &Mutex<Connection>, file_path: &str) -> Option<(i64, String)> {
+    fn baseline_row(conn: &IndexStore, file_path: &str) -> Option<(i64, String)> {
         conn.lock()
             .unwrap()
             .query_row(
@@ -940,7 +915,7 @@ mod tests {
         set_mtime(&tmp.path().join("edge.rs"), walk_started - Duration::from_millis(500));
         fs::create_dir(tmp.path().join("dir.rs")).unwrap();
 
-        let conn = Mutex::new(setup_conn());
+        let conn = IndexStore::new(setup_conn());
         let summary = record_walk_baselines(
             &conn,
             tmp.path(),

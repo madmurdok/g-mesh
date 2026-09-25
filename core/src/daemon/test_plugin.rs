@@ -64,11 +64,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use rusqlite::Connection;
 
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 
 /// The file each fake plugin process appends its pid to on startup.
@@ -376,11 +376,11 @@ pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
 /// commit. Shared by every caller of this module, because none of them cares
 /// what is in it - only that the commit path a real file change takes is the
 /// one being exercised.
-pub(crate) fn empty_index() -> Mutex<Connection> {
+pub(crate) fn empty_index() -> IndexStore {
     let conn = Connection::open_in_memory().expect("failed to open an in-memory index");
     conn.pragma_update(None, "foreign_keys", "ON").expect("failed to enable foreign keys");
     schema::apply(&conn).expect("failed to apply the schema");
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
 /// `semantic_pass` controls whether the manifest carries a

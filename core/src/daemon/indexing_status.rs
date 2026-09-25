@@ -106,10 +106,10 @@
 //!   wired in here at all - see `daemon::run`'s own comment on the watcher
 //!   thread for why.
 //! - **It cannot be answered with a torn or half-built graph.**
-//!   `apply_file_change` holds the *same* `Arc<Mutex<Connection>>` every MCP
-//!   handler locks to answer a query, for the entire reparse-plus-commit, and
-//!   `storage::write::apply_diff` is one transaction. A query that arrives
-//!   while a commit is in flight simply blocks on that mutex until it
+//!   `apply_file_change` commits through the *same* `IndexStore` every MCP
+//!   handler reads from, and `storage::write::apply_diff` is one
+//!   transaction. A query that arrives while a commit is in flight simply
+//!   blocks on the store until it
 //!   finishes and then reads the post-edit graph; only a query that arrives
 //!   *before* the watcher thread has pulled the change off its channel reads
 //!   pre-edit data - stale, but internally consistent. That is a strictly

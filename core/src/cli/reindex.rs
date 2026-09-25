@@ -39,7 +39,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -48,6 +48,7 @@ use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{manifest, registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
 
 /// What a `reindex` actually did.
@@ -97,23 +98,22 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let canonical_root = project_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-    let conn = Arc::new(Mutex::new(conn));
+    let conn = Arc::new(IndexStore::new(conn));
     // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
     // for a cold start - a reindex is that same walk, run early.
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
     let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-    // `embedding: None` - GM-395: this walk is structural-only now, matching
+    // `embedding: None` - this walk is structural-only, matching
     // `daemon::run`'s own cold start; the pipeline above is used by the
     // semantic pass and the backfill pass below instead.
     let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
         .context("failed to rebuild the project's index")?;
-    schema::record_bulk_index(&conn.lock().unwrap())
-        .context("failed to record that the project was fully reindexed")?;
+    conn.with(schema::record_bulk_index).context("failed to record that the project was fully reindexed")?;
 
     let state_dir =
         connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
-    // Per language now (GM-270): `run_once` asks every currently-owed
+    // Per language now: `run_once` asks every currently-owed
     // language and records `language_state.semanticPassAt` (and the
     // project-wide roll-up) itself - see that function's own doc comment. A
     // wipe (`schema::reset` above) already cleared every language's previous
@@ -123,7 +123,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     run.log("the rebuilt index");
     let semantic_pass_ran = run.any_ran();
 
-    // GM-395: the embedding backfill pass, in the foreground, same as
+    // The embedding backfill pass, in the foreground, same as
     // `daemon::run`'s own cold start and `cli::init` - a rebuild that stopped
     // at the structural walk plus the semantic pass would hand back an index
     // missing every embedding `search_code` needs, which is exactly the

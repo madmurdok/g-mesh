@@ -32,27 +32,14 @@
 //!
 //! # Lock order, and why nothing waits behind a spawn
 //!
-//! `supervisors` is the *outermost* lock in the daemon. It is released before
-//! any caller touches the supervisor it got back, so the existing order
-//! `daemon::lifecycle` documents (supervisor lock first, SQLite connection
-//! inside it) continues below this one and nothing ever reaches back up:
-//! a supervisor knows nothing about the registry that owns it.
+//! `supervisors` is the outermost lock in the daemon (the whole order is in
+//! `storage::index_store`'s module doc). It is released before any caller
+//! touches the supervisor it got back, and it is only ever held for a map
+//! lookup or a single insert/remove - never across a spawn, which would
+//! stall every other caller of the map, including the `has_pending` check
+//! every MCP tool call makes.
 //!
-//! Since task 164 it is also only ever held for a map lookup or a single
-//! insert/remove - never across a spawn.
-//! [`get_or_spawn`](PluginRegistry::get_or_spawn) used to hold it for the
-//! whole process launch plus handshake, deliberately (task 154), because a
-//! get-or-insert under one lock is the simplest thing that cannot
-//! double-spawn a language. What that
-//! overlooked is that `std::sync::Mutex` has no reader/writer distinction, so
-//! *every* other caller of this map paid for it - including
-//! [`active_supervisors`](PluginRegistry::active_supervisors), which only
-//! wants to clone it, and through it [`has_pending`](PluginRegistry::has_pending),
-//! which every MCP tool call asks before it answers. One language's spawn
-//! stalled queries about every other language, and queries that needed no
-//! plugin at all (measured: 270-494ms, see `core/tests/cold_start_grace_wait.rs`).
-//!
-//! [`SupervisorSlot`] is what replaces it: a language being spawned right now
+//! [`SupervisorSlot`] makes that possible: a language being spawned right now
 //! has a `Spawning` marker in the map from before the lock is released until
 //! after the spawn ends, so the get-or-insert that rules out a double spawn is
 //! still one short critical section, and the spawn itself happens with no lock
@@ -108,13 +95,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::{self, IndexStore};
 use crate::storage::schema::CURRENT_INDEXER_VERSION;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -801,6 +788,7 @@ impl PluginRegistry {
     /// behavioural difference from the serialized version - and the honest
     /// one: they asked while it was in flight, so it is their answer too.
     pub fn get_or_spawn(&self, language: &str) -> Result<Arc<PluginSupervisor>> {
+        index_store::assert_not_held();
         let mut supervisors = self.supervisors.lock().unwrap();
         // Cloned out of the map so the decision below can act with the guard
         // dropped - both arms leave the map lock before doing anything that
@@ -860,7 +848,7 @@ impl PluginRegistry {
     /// language's reindex failing must not skip another's, the same
     /// "failures are reported and dropped, never propagated" contract every
     /// other watcher-thread entry point in this module already has.
-    pub fn route_settled_path(&self, conn: &Mutex<Connection>, file_path: String) {
+    pub fn route_settled_path(&self, conn: &IndexStore, file_path: String) {
         let workspace_languages = self.workspace_language_matches(&file_path);
         if workspace_languages.is_empty() {
             self.file_changed(conn, file_path);
@@ -898,7 +886,7 @@ impl PluginRegistry {
     /// that says not to route this one instance of it, which is exactly as
     /// ordinary and expected as `.gitignore` already is at the filesystem-
     /// watch layer.
-    pub fn file_changed(&self, conn: &Mutex<Connection>, file_path: String) {
+    pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
         if self.language_for(&file_path).is_none() {
             if let Some(notice) = self.unroutable_notice(&file_path) {
                 eprintln!("{notice}");
@@ -927,7 +915,7 @@ impl PluginRegistry {
     /// kind - the workspace-routing counterpart to
     /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
     /// with the same "failures are reported and dropped" contract.
-    fn workspace_file_changed(&self, conn: &Mutex<Connection>, language: &str, changed_file: &str) {
+    fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
                 if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
@@ -1159,7 +1147,7 @@ impl PluginRegistry {
     /// replay from running. Returns how many files were replayed in total,
     /// across every language, for a caller that only cares whether anything
     /// happened.
-    pub fn replay_pending(&self, conn: &Mutex<Connection>) -> usize {
+    pub fn replay_pending(&self, conn: &IndexStore) -> usize {
         let mut replayed = 0;
         for supervisor in self.active_supervisors() {
             match supervisor.replay_pending(conn) {
@@ -1195,20 +1183,13 @@ impl PluginRegistry {
     /// have caught for it, the same "skip, do not fail" contract
     /// [`file_changed`](Self::file_changed) already has for an unroutable
     /// file.
-    pub fn ensure_fresh(
-        &self,
-        conn: &Mutex<Connection>,
-        file_path: &str,
-    ) -> Result<Option<StalenessOutcome>> {
+    pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<Option<StalenessOutcome>> {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };
 
-        {
-            let guard = conn.lock().unwrap();
-            if !staleness::is_stale(&guard, &self.project_root, file_path)? {
-                return Ok(Some(StalenessOutcome::AlreadyFresh));
-            }
+        if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
+            return Ok(Some(StalenessOutcome::AlreadyFresh));
         }
 
         let supervisor = self.get_or_spawn(&language)?;
