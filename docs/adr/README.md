@@ -69,4 +69,4 @@ Each decision made from here on gets its own file, added as a row here.
 
 | # | Title | Status |
 |---|-------|--------|
-| 0001 | [IndexStore: one owner for the SQLite connection and its lock policy](0001-index-store.md) | Proposed |
+| 0001 | [IndexStore: one owner for the SQLite connection and its lock policy](0001-index-store.md) | Accepted |

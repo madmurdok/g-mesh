@@ -1,7 +1,7 @@
 # 0001. IndexStore: one owner for the SQLite connection and its lock policy
 
 ## Status
-Proposed (GM-407, design slice S1). Owner review required before S2.
+Accepted (2026-09-25).
 
 ## Context
 
@@ -329,26 +329,16 @@ staleness decision and baseline write. That is the pre-GM-396 behaviour.
 6. **Test shim misuse.** Production code could call `IndexStore::lock()`. S4
    greps for it (decision 3).
 
-### Open decisions for the owner
+### Resolved decisions
 
-1. **Named ops or closures for bookkeeping.** About 12 one-statement
-   `schema::*`, `staleness` and `backfill` calls go through
-   `with()`/`step()` (proposed), not a forwarding method each. Forwarding
-   methods would guarantee that no caller code runs under the lock, at the
-   cost of about 12 thin methods and SQL moving into `storage/`.
-2. **Inversion tripwire.** Add `assert_not_held()` at the plugin-lock
-   acquisitions (proposed, debug only), or rely on the stated invariant
-   alone.
-3. **Test access and the six assert lines.** Keep a `#[doc(hidden)] pub fn
-   lock()` so those lines stay byte-identical (proposed; `core/tests/` needs
-   `pub`, and the crate has no test-support feature). The alternative is to
-   rewrite them to `store.read()`, which changes the text of an assertion but
-   not its meaning.
-4. **Which "before" counts for S5.** The minimal replay today is 2 files, not
-   the 5 GM-396 took. Should the before/after claim be 2→1 (minimal) or
-   4+2→1 (GM-396-shaped)? Decide before S5 runs.
-5. **Composition root in S2.** It moves into S2 step 2, not S3. The slice
-   briefs need that edit, and `cli/init.rs`, `cli/reindex.rs` and
-   `daemon/activation.rs` need adding to GM-407's `file_paths`.
-6. **Accept the `storage ↔ embedding` module cycle** for `store_vectors`, or
-   have `Writer::store_vectors` take a closure.
+1. Bookkeeping goes through `with()`/`step()` closures, not ~12 forwarding
+   methods; the inversion check backs the "single statement" convention.
+2. `assert_not_held()` is added at the plugin-lock acquisitions (debug only).
+3. `IndexStore::lock()` stays `#[doc(hidden)] pub` for tests, so the six
+   assert lines stay byte-identical; S4 greps that production code does not
+   call it.
+4. S5 reports the minimal replay, 2 files -> 1, and records the
+   GM-396-shaped 4 src + 2 test files as context.
+5. The composition root moves in S2 step 2; `cli/init.rs`, `cli/reindex.rs`
+   and `daemon/activation.rs` are in scope.
+6. The `storage <-> embedding` module cycle for `store_vectors` is accepted.
