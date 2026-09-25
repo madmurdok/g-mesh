@@ -153,7 +153,7 @@ impl ActivationCtx {
         // between - it has only queued in the watcher's channel.
         //
         // Before the embedding backfill pass, though: that pass can run for
-        // minutes, it does not hold `conn`'s mutex between its own batches
+        // minutes, it does not hold the store between its own batches
         // (see `embedding::backfill::run`), and an edit made during it
         // should still be applied rather than left queued until it returns.
         if let Some(watcher) = self.watcher.take() {

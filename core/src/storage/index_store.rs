@@ -155,8 +155,9 @@ impl IndexStore {
         Self { conn: Mutex::new(conn) }
     }
 
-    /// The raw guard. Test support: production code uses the operations
-    /// below. Keeps `Mutex::lock`'s shape and poisoning.
+    /// The raw guard, for tests only: no production code outside `storage/`
+    /// calls it; it uses the operations below. Keeps `Mutex::lock`'s shape
+    /// and poisoning, so a test's `store.lock().unwrap()` reads as before.
     #[doc(hidden)]
     pub fn lock(&self) -> LockResult<StoreGuard<'_>> {
         if HELD.with(Cell::get) {
