@@ -81,8 +81,11 @@ project.
 1. **Computed in the SDK, from the same walk.** A new
    `walk_scope(root, exclude_dirs) -> WalkScope` in
    `plugins/sdk/src/walk.rs` shares `walk_project`'s builder (same
-   `.gitignore` layering, same `BASELINE_EXCLUDED_DIRS`, same manifest
-   `exclude_dirs`), so the scope cannot drift from what we index. It
+   `.gitignore` layering, same `BASELINE_EXCLUDED_DIRS`), and is given the
+   same named excludes the Python plugin's own walk uses,
+   `project::EXCLUDE_DIRS`, so the scope cannot drift from what the plugin
+   indexes. That constant is the authoritative list here; the manifest's
+   `exclude_dirs` currently repeats it and is not read by this path. It
    returns:
    - `pruned`: every directory the walk declined to enter because of
      `.gitignore`, relative to the root, `/`-separated, top-most only
@@ -90,7 +93,7 @@ project.
      each directory it enters; a child of an entered directory that is a
      real directory (not a symlink), was not itself entered, and is not one
      of the named excludes is pruned.
-   - `exclude_dirs`: the named excludes (baseline plus manifest), which
+   - `exclude_dirs`: the named excludes (baseline plus `EXCLUDE_DIRS`), which
      are sent as `**/<name>` patterns, so they cost one entry each however
      often they occur.
 2. **Mapped to pyright's key in the Python plugin.** In
