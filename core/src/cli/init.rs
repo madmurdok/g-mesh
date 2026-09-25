@@ -8,7 +8,7 @@
 //! directory and writes the same schema - but walks nothing itself. That
 //! daemon starts idle, and the first *index-needing* tool call against it is
 //! what triggers the same walk this command runs eagerly
-//! (`daemon::activation`, GM-395's lazy activation -
+//! (`daemon::activation`, lazy activation -
 //! `docs/architecture/lazy-indexing.md`), waiting for it before answering.
 //! `init` exists for someone who would rather pay that cost - a possibly-large
 //! bulk walk - on their own schedule from a terminal, and see it finish, than
@@ -207,14 +207,14 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
             let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-            // Per language now (GM-270): `run_once` asks every currently-owed
+            // Per language now: `run_once` asks every currently-owed
             // language and records `language_state.semanticPassAt` (and the
             // roll-up) itself - see that function's own doc comment.
             let run =
                 semantic::run_once(&canonical_root, &state_dir, &conn, &discovered, &embedding_pipeline);
             run.log("the already-indexed project");
             semantic_pass_ran = run.any_ran();
-            // GM-395: this project's own walk may predate the embedding
+            // This project's own walk may predate the embedding
             // backfill pass splitting out of it (an index built before this
             // slice already embedded everything inline), or its embedding
             // model may not have been available at the time - either way,
@@ -239,13 +239,12 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
         // directly rather than a `PluginRegistry`. `embedding: None` -
-        // GM-395: this walk is structural-only now, matching `daemon::run`'s
+        // this walk is structural-only, matching `daemon::run`'s
         // own cold start; the pipeline above is used by the semantic pass and
         // the backfill pass below instead.
         let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
             .context("failed to build the project's initial index")?;
-        schema::record_bulk_index(&conn.lock().unwrap())
-            .context("failed to record that the project was indexed")?;
+        conn.with(schema::record_bulk_index).context("failed to record that the project was indexed")?;
         // The walk is only the structural half of a complete index, and the
         // record just written is what stops any later daemon start from
         // finishing the rest - see `daemon::semantic` and

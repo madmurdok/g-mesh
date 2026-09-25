@@ -1,4 +1,4 @@
-//! Lazy activation (GM-395 slice 2, D2 and D8 in
+//! Lazy activation (D2 and D8 in
 //! `docs/architecture/lazy-indexing.md`): everything `daemon::run` used to do
 //! eagerly after binding its socket - register the watcher, walk, record
 //! `bulkIndexedAt`, run the semantic pass (or its owed retry), start the
@@ -168,7 +168,7 @@ impl ActivationCtx {
         // Runs on every activation, not only after a walk: "the structural
         // graph is complete" says nothing about whether every embeddable node
         // has a `vectors` row yet (a previous start with no model available,
-        // an interrupted pass, GM-396's staleness skip on an incremental
+        // an interrupted pass, the staleness skip on an incremental
         // edit). On a project with nothing left to embed it is one `COUNT(*)`.
         // A panic here must not reach `run`'s catch_unwind: that would turn a
         // complete structural index into `Failed`, so every structural tool
@@ -207,12 +207,12 @@ impl ActivationCtx {
         // channel, so from this line on every event queues up whether or
         // not anyone is reading. Without it, an edit made between the walk's
         // enumeration and the watcher's existence had no observer at all and
-        // was lost (GM-250). Kept across a failed attempt: a retry reuses it.
+        // was lost. Kept across a failed attempt: a retry reuses it.
         if self.watcher.is_none() {
             self.watcher = Some(ProjectWatcher::new(&self.root).context("failed to start the file watcher")?);
         }
 
-        // `embedding: None` - GM-395's slice 1: the walk is structural-only;
+        // `embedding: None` - the walk is structural-only;
         // embedding is the backfill pass's job (`activate`). A tool call
         // issued while this runs waits for it (`mcp::GMeshMcpServer::prepare`)
         // rather than being answered off a half-built graph.
@@ -231,8 +231,7 @@ impl ActivationCtx {
         // outside observer of it (`cli::status`, the integration tests) only
         // ever sees it once structural answers are already being given.
         self.indexing.set_phase(Phase::Structural);
-        schema::record_bulk_index(&self.conn.lock().unwrap())
-            .context("failed to record that the project was indexed")?;
+        self.conn.with(schema::record_bulk_index).context("failed to record that the project was indexed")?;
         self.needs_walk = false;
         // A walk that took minutes is minutes the core spent working - the
         // same reasoning `last_used::touch` applies to a GC scan, applied to
@@ -263,7 +262,7 @@ impl ActivationCtx {
         // incremental one can overwrite its fresher edges with stale ones.
         // Running it before the watcher's consumer starts (`activate`) keeps
         // it strictly first. Which plugins it asks is `daemon::semantic`'s to
-        // say (GM-270).
+        // say.
         semantic::run_with_registry_and_progress(&self.registry, &self.conn, Some(&self.indexing))
             .log("the freshly built index");
         Ok(())

@@ -72,7 +72,6 @@ use crate::daemon::bulk_index::{self, BulkIndexSummary, BULK_INDEX_FLAG};
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::{imports, symbol_links};
 use crate::paths;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout};
@@ -538,9 +537,7 @@ pub(crate) fn open_index() -> Result<Arc<IndexStore>> {
 pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
     let mut summary = BulkIndexSummary::default();
     bulk_index::ingest(Cursor::new(bytes.to_vec()), conn, &mut summary, None, None, None)?;
-    let mut conn = conn.lock().unwrap();
-    imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?;
-    symbol_links::link_all(&mut conn).context("failed to link the walk's cross-file symbol usages")?;
+    conn.link_all()?;
     Ok(())
 }
 
@@ -1065,7 +1062,7 @@ pub(crate) fn run_session(
         // a response claiming the semantic tier was absent in the one arm
         // that had just driven it successfully.
         if let Err(err) =
-            schema::record_language_semantic_pass(&driver.conn.lock().unwrap(), &manifest.language)
+            driver.conn.with(|conn| schema::record_language_semantic_pass(conn, &manifest.language))
         {
             driver.session.failure =
                 Some(format!("recording {}'s completed semantic pass: {err:#}", manifest.language));
