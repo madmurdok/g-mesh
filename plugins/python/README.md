@@ -324,7 +324,7 @@ Five smaller ones, for completeness:
 ## Running it
 
 ```bash
-npm install pyright --prefix plugins/python   # a test dependency, gitignored
+scripts/test-deps.sh pyright                  # a test dependency, pinned there, gitignored
 cargo build -p g-mesh --bin g-mesh            # the kit needs core's binary
 cargo test -p g-mesh-plugin-python            # unit tests, plus the conformance kit
 g-mesh plugins check plugins/python \

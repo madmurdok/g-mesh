@@ -918,11 +918,21 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 ## Run tests
 
 ```bash
+scripts/test-deps.sh             # once per clone/worktree: the test dependencies CI installs
 cargo test                       # every crate: core, wire, plugins/sdk, plugins/rust, plugins/python
 cargo test -p g-mesh             # core alone
 cd plugins/typescript && npm run build && npm test
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
+
+`scripts/test-deps.sh` installs what the suite drives for real and cargo
+cannot fetch: the JS/TS plugin's `npm ci` (`build.rs` builds it),
+rust-analyzer (`plugins/rust`'s semantic tier) and pyright
+(`plugins/python`'s, into its gitignored `node_modules`, at the version
+pinned in the script and used by CI's own "Install pyright" step). Without
+it the suite does not skip: `plugins/python`'s tests fail naming the missing
+pyright and the command above. `scripts/test-deps.sh pyright` (or
+`typescript`, `rust-analyzer`) installs just one.
 
 `scripts/check.sh` is the one place those two gates are spelled out:
 `.github/workflows/ci.yml` calls it rather than repeating the commands, so a

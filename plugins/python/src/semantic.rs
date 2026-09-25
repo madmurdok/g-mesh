@@ -898,7 +898,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Where `npm install pyright`, run in `plugins/python`, puts its bins.
+    /// Where `scripts/test-deps.sh pyright` (an `npm install` into
+    /// `plugins/python`) puts its bins.
     ///
     /// Deliberately not a `None` that turns into a skip - the same rule
     /// `plugins/rust/tests/conformance.rs` states for rust-analyzer: a check
@@ -910,7 +911,8 @@ mod tests {
             Ok(_) => dir.to_path_buf(),
             Err(err) => panic!(
                 "these tests drive a real pyright and there is none in {}: {err:#}. Install it with \
-                 `npm install pyright` run in plugins/python (it is gitignored there).",
+                 `scripts/test-deps.sh pyright` from the repository root (the pinned version CI \
+                 uses; node_modules/ is gitignored in plugins/python).",
                 dir.display()
             ),
         }

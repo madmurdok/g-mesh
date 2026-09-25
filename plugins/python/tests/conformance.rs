@@ -307,8 +307,9 @@ fn pyright_langserver() -> PathBuf {
     }
     panic!(
         "these tests drive a real pyright and there is none that works: tried {tried:?} through \
-         their `pyright --version` twin. Install it with `npm install pyright` run in \
-         plugins/python (node_modules/ is gitignored there). Note that `pyright-langserver \
+         their `pyright --version` twin. Install it with `scripts/test-deps.sh pyright` from \
+         the repository root (the pinned version CI uses; node_modules/ is gitignored in \
+         plugins/python). Note that `pyright-langserver \
          --version` is NOT a way to check - it has no such flag and always exits 1."
     )
 }
