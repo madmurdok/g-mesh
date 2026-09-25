@@ -174,6 +174,7 @@ impl IndexStore {
     /// Test support: the connection back, with `Mutex::into_inner`'s
     /// poisoning.
     #[doc(hidden)]
+    #[allow(clippy::result_large_err)]
     pub fn into_inner(self) -> LockResult<Connection> {
         self.conn.into_inner()
     }
