@@ -74,4 +74,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0003 | [MCP prompt text: instructions rendered from the index's languages, terse tool schemas](0003-mcp-instructions-rendering.md) | Accepted |
 | 0004 | [Daemon lifecycle: startup order, the singleton lock, two idle timers and the orphan exit](0004-daemon-lifecycle.md) | Accepted |
 | 0005 | [Plugin manifest: read once, fail hard, resolve paths at read time](0005-plugin-manifest.md) | Accepted |
-| 0006 | [Language server warm-up: a one-time first-answer budget per server](0006-language-server-warm-up-budget.md) | Proposed |
+| 0006 | [Language server scan scope: pyright gets the walker's include and exclude](0006-language-server-scan-scope.md) | Proposed |
