@@ -143,6 +143,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 /// One step of the cold-start machine a project's index moves through, once,
@@ -303,6 +304,13 @@ struct Inner {
     current_language: Mutex<Option<String>>,
     embed_done: std::sync::atomic::AtomicU64,
     embed_total: std::sync::atomic::AtomicU64,
+    semantic_done: std::sync::atomic::AtomicU32,
+    semantic_total: std::sync::atomic::AtomicU32,
+    current_semantic_language: Mutex<Option<String>>,
+    /// Where the counters are published for outside readers
+    /// (`daemon::progress_path_in`), and when they last were. `None` until
+    /// [`IndexingStatus::attach_progress_file`], exactly like `phase_file`.
+    progress_file: Mutex<ProgressFile>,
     /// Lazy activation's trigger - see
     /// [`request_activation`](IndexingStatus::request_activation). A `Mutex`
     /// rather than an atomic flag because "is an activation already
@@ -317,6 +325,63 @@ struct Inner {
     /// status with no daemon behind it (the CLI's in-process walks, unit
     /// tests) writes nothing.
     phase_file: Mutex<Option<PathBuf>>,
+}
+
+/// The attached progress file and the time of its last write, under one lock
+/// so two counters updated at once never both decide to write.
+#[derive(Default)]
+struct ProgressFile {
+    path: Option<PathBuf>,
+    interval: Duration,
+    last_write: Option<Instant>,
+}
+
+/// The least time between two progress-file writes caused by counter
+/// updates. Phase transitions and stage boundaries write regardless.
+const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The progress counters as `daemon::progress_path_in`'s file holds them -
+/// what `cli::status` renders per stage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressSnapshot {
+    /// The daemon that wrote this. A reader treats the snapshot as live only
+    /// while this is the pid of the daemon serving the project right now.
+    pub pid: u32,
+    /// Milliseconds since the Unix epoch at the time of the write.
+    pub updated_at_ms: u64,
+    /// The phase word at the time of the write (same words as `index.phase`).
+    pub phase: String,
+    pub walk: WalkProgress,
+    pub semantic: SemanticProgress,
+    pub embeddings: EmbedProgress,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkProgress {
+    pub languages_done: u32,
+    pub languages_total: u32,
+    pub current_language: Option<String>,
+    /// Nodes and edges ingested so far.
+    pub items: u64,
+}
+
+/// The whole-project semantic pass, one language at a time.
+/// `current_language` is set only while a language's pass is running.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticProgress {
+    pub languages_done: u32,
+    pub languages_total: u32,
+    pub current_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedProgress {
+    pub done: u64,
+    pub total: u64,
 }
 
 /// The sending half of `daemon::activation`'s trigger channel, and whether
@@ -347,6 +412,10 @@ impl IndexingStatus {
             current_language: Mutex::new(None),
             embed_done: std::sync::atomic::AtomicU64::new(0),
             embed_total: std::sync::atomic::AtomicU64::new(0),
+            semantic_done: std::sync::atomic::AtomicU32::new(0),
+            semantic_total: std::sync::atomic::AtomicU32::new(0),
+            current_semantic_language: Mutex::new(None),
+            progress_file: Mutex::new(ProgressFile::default()),
             activation: Mutex::new(Activation::default()),
             phase_file: Mutex::new(None),
         }))
@@ -410,6 +479,7 @@ impl IndexingStatus {
         *self.0.phase_since.lock().unwrap() = Instant::now();
         self.0.notify.notify_waiters();
         self.publish_phase_file(phase.word());
+        self.publish_progress(true);
     }
 
     /// Writes `word` to the attached phase file, if one has been
@@ -514,6 +584,71 @@ impl IndexingStatus {
         self.publish_phase_file(self.phase().word());
     }
 
+    /// Connects this status to a progress file at `path`
+    /// (`daemon::progress_path_in`) and publishes the current counters to it
+    /// immediately, so a file left by an earlier daemon is replaced by one
+    /// carrying this process's pid as soon as it starts.
+    pub fn attach_progress_file(&self, path: PathBuf) {
+        self.attach_progress_file_every(path, PROGRESS_WRITE_INTERVAL);
+    }
+
+    /// [`attach_progress_file`](Self::attach_progress_file) with `interval`
+    /// in place of [`PROGRESS_WRITE_INTERVAL`] between throttled writes.
+    pub(crate) fn attach_progress_file_every(&self, path: PathBuf, interval: Duration) {
+        {
+            let mut file = self.0.progress_file.lock().unwrap();
+            file.path = Some(path);
+            file.interval = interval;
+        }
+        self.publish_progress(true);
+    }
+
+    /// The counters as they stand now.
+    pub fn progress_snapshot(&self) -> ProgressSnapshot {
+        let (languages_done, languages_total, current_language) = self.language_progress();
+        let (done, total) = self.embed_progress();
+        let updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        ProgressSnapshot {
+            pid: std::process::id(),
+            updated_at_ms,
+            phase: self.phase().word().to_string(),
+            walk: WalkProgress {
+                languages_done,
+                languages_total,
+                current_language,
+                items: self.items_ingested(),
+            },
+            semantic: SemanticProgress {
+                languages_done: self.0.semantic_done.load(Ordering::Relaxed),
+                languages_total: self.0.semantic_total.load(Ordering::Relaxed),
+                current_language: self.0.current_semantic_language.lock().unwrap().clone(),
+            },
+            embeddings: EmbedProgress { done, total },
+        }
+    }
+
+    /// Writes [`progress_snapshot`](Self::progress_snapshot) to the attached
+    /// progress file, if any. Unless `force`d, skipped when the last write was
+    /// less than the attached interval ([`PROGRESS_WRITE_INTERVAL`]) ago - so a throttled counter's
+    /// final value is only guaranteed on disk after the next forced write,
+    /// which every phase transition is.
+    fn publish_progress(&self, force: bool) {
+        let mut file = self.0.progress_file.lock().unwrap();
+        let Some(path) = file.path.clone() else { return };
+        let now = Instant::now();
+        if !force && file.last_write.is_some_and(|last| now.duration_since(last) < file.interval) {
+            return;
+        }
+        match serde_json::to_string(&self.progress_snapshot()) {
+            Ok(json) => super::write_state_file_atomic(&path, &json, "progress file"),
+            Err(err) => eprintln!("g-mesh daemon: failed to serialize indexing progress: {err}"),
+        }
+        file.last_write = Some(now);
+    }
+
     /// Asks the activation thread to do whatever this project still owes -
     /// the walk, the semantic pass (or its owed retry), and the embedding
     /// backfill pass (D2 in `docs/architecture/lazy-indexing.md`). Called at
@@ -577,10 +712,12 @@ impl IndexingStatus {
         self.0.languages_done.store(0, Ordering::Relaxed);
         self.0.languages_total.store(languages_total, Ordering::Relaxed);
         *self.0.current_language.lock().unwrap() = None;
+        self.publish_progress(true);
     }
 
     pub fn add_items_ingested(&self, count: u64) {
         self.0.items_ingested.fetch_add(count, Ordering::Relaxed);
+        self.publish_progress(false);
     }
 
     pub fn items_ingested(&self) -> u64 {
@@ -589,10 +726,12 @@ impl IndexingStatus {
 
     pub fn mark_language_started(&self, language: &str) {
         *self.0.current_language.lock().unwrap() = Some(language.to_string());
+        self.publish_progress(true);
     }
 
     pub fn mark_language_done(&self) {
         self.0.languages_done.fetch_add(1, Ordering::Relaxed);
+        self.publish_progress(true);
     }
 
     pub fn language_progress(&self) -> (u32, u32, Option<String>) {
@@ -608,14 +747,36 @@ impl IndexingStatus {
     pub fn set_embed_total(&self, total: u64) {
         self.0.embed_done.store(0, Ordering::Relaxed);
         self.0.embed_total.store(total, Ordering::Relaxed);
+        self.publish_progress(true);
     }
 
     pub fn add_embed_done(&self, count: u64) {
         self.0.embed_done.fetch_add(count, Ordering::Relaxed);
+        self.publish_progress(false);
     }
 
     pub fn embed_progress(&self) -> (u64, u64) {
         (self.0.embed_done.load(Ordering::Relaxed), self.0.embed_total.load(Ordering::Relaxed))
+    }
+
+    /// Starts a whole-project semantic pass over `languages_total` languages.
+    pub fn start_semantic_progress(&self, languages_total: u32) {
+        self.0.semantic_done.store(0, Ordering::Relaxed);
+        self.0.semantic_total.store(languages_total, Ordering::Relaxed);
+        *self.0.current_semantic_language.lock().unwrap() = None;
+        self.publish_progress(true);
+    }
+
+    pub fn mark_semantic_language_started(&self, language: &str) {
+        *self.0.current_semantic_language.lock().unwrap() = Some(language.to_string());
+        self.publish_progress(true);
+    }
+
+    /// Counts the running language's pass as over, whatever its outcome.
+    pub fn mark_semantic_language_done(&self) {
+        self.0.semantic_done.fetch_add(1, Ordering::Relaxed);
+        *self.0.current_semantic_language.lock().unwrap() = None;
+        self.publish_progress(true);
     }
 
     /// The counters rendered for a person, prefixed with the project root:
@@ -661,7 +822,7 @@ impl IndexingStatus {
 }
 
 /// `48210` as `"48,210"`.
-fn group_thousands(n: u64) -> String {
+pub(crate) fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, digit) in digits.chars().enumerate() {
@@ -884,6 +1045,44 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(status.wait_for(Need::Structural, Some(deadline)).await, WaitOutcome::Satisfied);
+    }
+
+    #[test]
+    fn the_progress_file_throttles_counter_updates_and_every_phase_change_flushes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.progress");
+        let read = || -> ProgressSnapshot {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        let status = IndexingStatus::structural();
+        status.attach_progress_file_every(path.clone(), Duration::from_secs(3600));
+        assert_eq!(read().pid, std::process::id());
+        assert_eq!(read().phase, "structural");
+
+        status.set_phase(Phase::Embedding);
+        status.set_embed_total(200);
+        assert_eq!(read().embeddings, EmbedProgress { done: 0, total: 200 });
+        status.add_embed_done(50);
+        assert_eq!(read().embeddings.done, 0, "a counter update inside the interval must not write");
+
+        status.set_phase(Phase::Ready);
+        let snapshot = read();
+        assert_eq!(snapshot.phase, "ready");
+        assert_eq!(snapshot.embeddings, EmbedProgress { done: 50, total: 200 });
+    }
+
+    #[test]
+    fn the_semantic_pass_counts_languages_and_names_only_the_running_one() {
+        let status = IndexingStatus::structural();
+        status.start_semantic_progress(2);
+        status.mark_semantic_language_started("python");
+        let running = status.progress_snapshot().semantic;
+        assert_eq!(running.current_language.as_deref(), Some("python"));
+        assert_eq!((running.languages_done, running.languages_total), (0, 2));
+        status.mark_semantic_language_done();
+        let between = status.progress_snapshot().semantic;
+        assert_eq!(between.current_language, None);
+        assert_eq!(between.languages_done, 1);
     }
 
     #[test]

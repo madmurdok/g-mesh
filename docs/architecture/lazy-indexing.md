@@ -778,6 +778,27 @@ Options considered:
   - A root served in front mode (`index.phase` = `front`, D11 step 1) shows
     "folder of N projects - no index; a session selects one", and skips the
     coverage walk (slice 4).
+  - Next to it the daemon writes `index.progress`: its progress counters as
+    JSON (`pid`, `updatedAtMs`, `phase`, `walk`, `semantic`, `embeddings`),
+    atomically, on every phase change and stage boundary and at most every
+    500 ms for counter updates, and removes it on exit. Status adds the
+    numbers per stage (walk languages done/total and nodes so far; the
+    semantic pass's running language; embeddings done/total with a
+    percentage), an `overall:` line labelled as an estimate (fixed stage
+    weights: walk 40%, semantic pass 20%, embeddings 40%), and an index line
+    for `structural` and `ready` too.
+  - Liveness: the progress file is shown only when its `pid` is the pid of
+    the daemon status finds running (pid alive and socket accepting). A
+    daemon killed without cleanup leaves the file with its own pid, which no
+    longer matches; a new daemon replaces the file with its pid as it
+    starts. A pid check rather than a heartbeat age, because an embedding
+    batch or a semantic pass can legitimately go longer than any fixed age
+    without a counter changing. A phase word is likewise ignored when no
+    daemon is running.
+  - While a live daemon is in `unindexed|walking|structural|embedding`, an
+    unfinished semantic pass reads as its work in progress, not as
+    "never completed - run `g-mesh reindex`"; that advice needs no daemon
+    working, or phase `ready`/`failed`.
 - `cli/agent_instructions.rs:55`: keep the sentence, and add "Launched from a
   folder of several projects, g-mesh asks you to pick one with
   `select_project` first."

@@ -1,4 +1,5 @@
 use super::*;
+use crate::daemon::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
 use crate::storage::schema;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
@@ -277,6 +278,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
         },
         phase: None,
         front: None,
+        progress: None,
     };
 
     let rendered = render(&report);
@@ -318,6 +320,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         },
         phase: None,
         front: None,
+        progress: None,
     };
 
     let rendered = render(&report);
@@ -360,6 +363,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         index,
         phase: None,
         front: None,
+        progress: None,
     });
 
     assert!(
@@ -380,6 +384,7 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
         false,
         &["python".to_string(), "rust".to_string()],
         &[("python".to_string(), "the server exited".to_string())],
+        None,
     );
     assert_eq!(
         lines,
@@ -398,12 +403,34 @@ fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        None,
     );
     assert_eq!(
         lines,
         vec!["  semantic pass:   python pending - its plugin was asleep or memory-suspended; \
              the next daemon start or `g-mesh reindex` asks again"
             .to_string(),]
+    );
+}
+
+/// While a live daemon works, a deferred pass carries no repair advice: the
+/// running daemon is the one that asks again.
+#[test]
+fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string()],
+        &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        Some("running - go (0/2 languages done)"),
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "  semantic pass:   running - go (0/2 languages done)".to_string(),
+            "  semantic pass:   python pending - its plugin was asleep or memory-suspended; \
+             the running daemon asks again"
+                .to_string(),
+        ]
     );
 }
 
@@ -438,6 +465,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         },
         phase: Some("walking".to_string()),
         front: None,
+        progress: None,
     };
 
     let rendered = render(&report);
@@ -479,6 +507,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         },
         phase: phase.map(str::to_string),
         front: None,
+        progress: None,
     }
 }
 
@@ -525,20 +554,169 @@ fn failed_phase_reports_the_last_build_failed_and_will_be_retried() {
     );
 }
 
-/// `structural` and `ready` are deliberately silent on this line (D13
-/// names messages only for `unindexed`, `walking`, `embedding` and
-/// `failed`) - once the walk itself is done, `status` has nothing left to
-/// add here that the coverage/dirty lines below do not already say.
+/// Every phase, and each no-phase state, prints its own `index:` line.
 #[test]
-fn structural_and_ready_phases_print_no_index_line() {
-    for phase in ["structural", "ready"] {
-        let rendered = render(&phase_fixture(true, Some(phase)));
+fn every_phase_prints_an_accurate_index_line() {
+    let cases = [
+        (true, Some("unindexed"), "not indexed yet - builds on the first tool call"),
+        (false, Some("walking"), "building now"),
+        (true, Some("structural"), "structural index ready; embedding pass not started yet"),
+        (true, Some("embedding"), "structural index ready; embeddings being computed"),
+        (true, Some("ready"), "ready - every tool answers"),
+        (false, Some("failed"), "last build failed - see daemon log; retried on the next tool call"),
+        (true, None, "built"),
+        (false, None, "building now - first walk in progress, nothing to restart"),
+    ];
+    for (bulk_indexed, phase, expected) in cases {
+        let rendered = render(&phase_fixture(bulk_indexed, phase));
         assert!(
-            !rendered.contains("index:"),
-            "phase {phase:?} must not print an \"index:\" line (\"index coverage:\" is a different \
-             line and is unaffected):\n{rendered}"
+            rendered.contains(&format!("  index:           {expected}\n")),
+            "phase {phase:?}:\n{rendered}"
         );
     }
+}
+
+/// A snapshot as the live daemon of [`phase_fixture`] (pid 4242) wrote it.
+fn live_snapshot(phase: &str) -> ProgressSnapshot {
+    ProgressSnapshot { pid: 4242, phase: phase.to_string(), ..ProgressSnapshot::default() }
+}
+
+#[test]
+fn a_live_walk_shows_languages_done_and_nodes_so_far_with_an_overall_estimate() {
+    let mut report = phase_fixture(false, Some("walking"));
+    let mut progress = live_snapshot("walking");
+    progress.walk = WalkProgress {
+        languages_done: 1,
+        languages_total: 4,
+        current_language: Some("rust".to_string()),
+        items: 48_210,
+    };
+    report.progress = Some(progress);
+
+    let rendered = render(&report);
+
+    assert!(
+        rendered.contains(
+            "  index:           building now - walking rust (1/4 languages done), 48,210 nodes and edges so far\n"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  overall:         ~10% (estimate:"), "{rendered}");
+}
+
+#[test]
+fn a_running_semantic_pass_is_named_per_language_instead_of_the_repair_advice() {
+    let mut report = phase_fixture(true, Some("structural"));
+    report.index.semantic_pass_owed = vec!["python".to_string(), "typescript".to_string()];
+    let mut progress = live_snapshot("structural");
+    progress.semantic = SemanticProgress {
+        languages_done: 1,
+        languages_total: 2,
+        current_language: Some("typescript".to_string()),
+    };
+    report.progress = Some(progress);
+
+    let rendered = render(&report);
+
+    assert!(
+        rendered.contains(
+            "  index:           structural index ready; semantic pass running - typescript (1/2 languages done)\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("  semantic pass:   running - typescript (1/2 languages done)\n"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  overall:         ~50% (estimate:"), "{rendered}");
+    assert!(!rendered.contains("g-mesh reindex"), "{rendered}");
+}
+
+/// While a live daemon is still working through the index, the owed pass is
+/// its job, so no repair is advised; once it is done (or gone) the advice is
+/// back.
+#[test]
+fn the_repair_advice_is_shown_only_when_no_live_daemon_is_working() {
+    let advice = "run `g-mesh reindex` to repair it";
+    for phase in ["unindexed", "walking", "structural", "embedding"] {
+        let mut report = phase_fixture(true, Some(phase));
+        report.index.semantic_pass_owed = vec!["typescript".to_string()];
+        let rendered = render(&report);
+        assert!(!rendered.contains(advice), "phase {phase:?}:\n{rendered}");
+        assert!(
+            rendered.contains("  semantic pass:   not completed yet - the running daemon is still indexing"),
+            "phase {phase:?}:\n{rendered}"
+        );
+    }
+    for (core, phase) in [
+        (CoreState::Running { pid: 4242 }, Some("ready")),
+        (CoreState::Running { pid: 4242 }, Some("failed")),
+        (CoreState::NotRunning, Some("embedding")),
+        (CoreState::NotRunning, None),
+    ] {
+        let mut report = phase_fixture(true, phase);
+        report.core = core;
+        report.index.semantic_pass_owed = vec!["typescript".to_string()];
+        let rendered = render(&report);
+        assert!(rendered.contains(advice), "{core:?} {phase:?}:\n{rendered}");
+    }
+}
+
+/// The percentage is computed from the counters the daemon itself wrote to
+/// its progress file, read back the way `collect` reads them.
+#[test]
+fn embedding_progress_shows_the_daemons_own_done_and_total_as_a_percentage() {
+    let dir = tempfile::tempdir().unwrap();
+    let indexing = crate::daemon::indexing_status::IndexingStatus::structural();
+    indexing.attach_progress_file_every(daemon::progress_path_in(dir.path()), Duration::ZERO);
+    indexing.set_phase(crate::daemon::indexing_status::Phase::Embedding);
+    indexing.set_embed_total(1_200);
+    indexing.add_embed_done(300);
+
+    let mut report = phase_fixture(true, Some("embedding"));
+    report.core = CoreState::Running { pid: std::process::id() };
+    report.progress = daemon::read_progress_in(dir.path());
+    let rendered = render(&report);
+
+    assert_eq!(indexing.embed_progress(), (300, 1_200));
+    assert!(
+        rendered.contains(
+            "  index:           structural index ready; embeddings being computed - 300/1,200 (25.0%)\n"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  overall:         ~70% (estimate:"), "{rendered}");
+}
+
+/// A progress file whose writer is not the daemon serving the project now -
+/// no daemon at all, or a different pid - is not shown as live progress.
+#[test]
+fn a_progress_file_left_by_a_dead_daemon_is_not_rendered_as_live() {
+    let mut stale = live_snapshot("embedding");
+    stale.embeddings = EmbedProgress { done: 50, total: 200 };
+
+    let mut no_daemon = phase_fixture(true, Some("embedding"));
+    no_daemon.core = CoreState::NotRunning;
+    no_daemon.progress = Some(stale.clone());
+    let rendered = render(&no_daemon);
+    assert!(!rendered.contains("50/200"), "{rendered}");
+    assert!(!rendered.contains("embeddings being computed"), "{rendered}");
+    assert!(!rendered.contains("overall:"), "{rendered}");
+    assert!(
+        rendered.contains("  index:           built - no daemon is serving it right now\n"),
+        "{rendered}"
+    );
+
+    let mut other_daemon = phase_fixture(true, Some("embedding"));
+    other_daemon.core = CoreState::Running { pid: 5151 };
+    other_daemon.progress = Some(stale);
+    let rendered = render(&other_daemon);
+    assert!(!rendered.contains("50/200"), "{rendered}");
+    assert!(!rendered.contains("overall:"), "{rendered}");
+    assert!(
+        rendered.contains("  index:           structural index ready; embeddings being computed\n"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -567,6 +745,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         },
         phase: None,
         front: None,
+        progress: None,
     };
 
     let rendered = render(&report);
@@ -656,6 +835,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         },
         phase: None,
         front: None,
+        progress: None,
     };
 
     let rendered = render(&report);
@@ -865,6 +1045,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
         },
         phase: None,
         front: None,
+        progress: None,
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");

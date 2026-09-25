@@ -1251,6 +1251,7 @@ fn release_state_files(state_dir: &Path) {
     // stale word left by a daemon that has since exited for a live one's
     // current phase.
     let _ = fs::remove_file(super::phase_path_in(state_dir));
+    let _ = fs::remove_file(super::progress_path_in(state_dir));
     // Derived through the parent module rather than spelled out again here:
     // what a daemon binds and what it releases have to be the same endpoint by
     // construction. On Windows this is a no-op, because a pipe name is

@@ -267,6 +267,33 @@ fn status_on_a_project_that_was_never_indexed_reports_an_empty_state() {
     assert_contains(&status, "syntax errors:   none");
 }
 
+/// A daemon killed before it could clean up leaves its pid, phase and
+/// progress files behind; none of them may read as work still under way.
+#[test]
+fn status_does_not_show_a_dead_daemons_leftover_phase_and_progress_as_live() {
+    let project = Project::new();
+    let state_dir = project.state_dir();
+    std::fs::create_dir_all(&state_dir).expect("failed to create the state directory");
+    let mut exited = Command::new(BIN).arg("--version").spawn().expect("failed to run a short-lived process");
+    let dead_pid = exited.id();
+    exited.wait().expect("failed to wait for the short-lived process");
+    daemon::write_pid_file(&project.pid_file(), dead_pid);
+    std::fs::write(daemon::phase_path_in(&state_dir), "embedding\n").expect("failed to write index.phase");
+    let progress = format!(
+        r#"{{"pid":{dead_pid},"updatedAtMs":0,"phase":"embedding","walk":{{"languagesDone":1,"languagesTotal":1,"currentLanguage":null,"items":10}},"semantic":{{"languagesDone":1,"languagesTotal":1,"currentLanguage":null}},"embeddings":{{"done":50,"total":200}}}}"#
+    );
+    std::fs::write(daemon::progress_path_in(&state_dir), progress).expect("failed to write index.progress");
+    assert!(daemon::read_progress_in(&state_dir).is_some(), "the fixture must parse as a progress snapshot");
+
+    let status = project.status();
+
+    assert_contains(&status, "daemon core:     not running");
+    assert_contains(&status, "index:           never fully walked - a cold start is still owed");
+    assert!(!status.contains("50/200"), "{status}");
+    assert!(!status.contains("embeddings being computed"), "{status}");
+    assert!(!status.contains("overall:"), "{status}");
+}
+
 /// Task #62's acceptance criterion: a project whose `lastUsed` is older
 /// than `cleanup.idleThresholdDays` makes `g-mesh status` print the GC
 /// warning naming it, when `cleanup.enabled` is on.
