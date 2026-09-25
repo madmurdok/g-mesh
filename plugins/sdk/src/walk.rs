@@ -45,7 +45,9 @@
 //! come up. A plugin that needs links followed should say so, and get the
 //! guard rather than a flag.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
@@ -75,13 +77,109 @@ pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
 /// between two runs of the same tree makes every "these two runs agree"
 /// failure unreproducible.
 pub fn walk_project(root: &Path, extensions: &[String], exclude_dirs: &[String]) -> Vec<RelPath> {
-    let excluded: Vec<String> = BASELINE_EXCLUDED_DIRS
-        .iter()
-        .map(|dir| (*dir).to_string())
-        .chain(exclude_dirs.iter().cloned())
-        .collect();
     let claimed: Vec<String> = extensions.iter().map(|ext| ext.to_lowercase()).collect();
 
+    let mut files = Vec::new();
+    for entry in walker(root, exclude_dirs).build() {
+        // An unreadable directory contributes nothing rather than failing the
+        // walk: a project with one permission-denied subdirectory still has an
+        // index worth having, and the alternative is no index at all.
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let Some(path) = RelPath::relative_to(root, entry.path()) else { continue };
+        if path.extension().is_some_and(|extension| claimed.contains(&extension)) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// The most entries [`walk_scope`] returns, [`WalkScope::pruned`] and
+/// [`WalkScope::exclude_dirs`] together.
+pub const MAX_SCOPE_ENTRIES: usize = 1_000;
+
+/// What [`walk_project`] leaves out of a project, in a form a language server
+/// can be told as its own exclude list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkScope {
+    /// Directories the walk did not enter because `.gitignore` ignores them,
+    /// top-most only: nothing under a listed directory is listed. Shallowest
+    /// first, then by path.
+    pub pruned: Vec<RelPath>,
+    /// The named excludes, [`BASELINE_EXCLUDED_DIRS`] then the caller's, as
+    /// bare directory names that apply at any depth.
+    pub exclude_dirs: Vec<String>,
+    /// How many pruned directories were left out to stay within
+    /// [`MAX_SCOPE_ENTRIES`]; the deepest are the ones left out.
+    pub dropped: usize,
+}
+
+/// The directories [`walk_project`] with the same `root` and `exclude_dirs`
+/// declines to enter.
+///
+/// Built from the same walker as [`walk_project`], so the two agree on every
+/// `.gitignore` rule. A symlink is never listed (the walk does not follow
+/// one), and neither is a directory skipped by name, which is reported once
+/// in `exclude_dirs` instead.
+pub fn walk_scope(root: &Path, exclude_dirs: &[String]) -> WalkScope {
+    let excluded = excluded_names(exclude_dirs);
+
+    let entered: HashSet<PathBuf> = walker(root, exclude_dirs)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.depth() == 0 || entry.file_type().is_some_and(|file_type| file_type.is_dir()))
+        .map(|entry| entry.into_path())
+        .collect();
+
+    let mut pruned = Vec::new();
+    for dir in &entered {
+        let Ok(children) = fs::read_dir(dir) else { continue };
+        for child in children.filter_map(Result::ok) {
+            // `DirEntry::file_type` does not follow a symlink, so a link to a
+            // directory is not a directory here.
+            if !child.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            if excluded.iter().any(|name| child.file_name() == name.as_str()) {
+                continue;
+            }
+            let path = child.path();
+            if entered.contains(&path) {
+                continue;
+            }
+            if let Some(relative) = RelPath::relative_to(root, &path) {
+                pruned.push(relative);
+            }
+        }
+    }
+    pruned.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
+
+    let room = MAX_SCOPE_ENTRIES.saturating_sub(excluded.len());
+    let dropped = pruned.len().saturating_sub(room);
+    pruned.truncate(room);
+    WalkScope { pruned, exclude_dirs: excluded, dropped }
+}
+
+fn depth(path: &RelPath) -> usize {
+    path.as_str().split('/').count()
+}
+
+fn excluded_names(exclude_dirs: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = BASELINE_EXCLUDED_DIRS.iter().map(|dir| (*dir).to_string()).collect();
+    for dir in exclude_dirs {
+        if !names.contains(dir) {
+            names.push(dir.clone());
+        }
+    }
+    names
+}
+
+/// The walker both [`walk_project`] and [`walk_scope`] run: the policy in this
+/// module's doc, and nothing else.
+fn walker(root: &Path, exclude_dirs: &[String]) -> WalkBuilder {
+    let excluded = excluded_names(exclude_dirs);
     let mut walker = WalkBuilder::new(root);
     walker
         .hidden(false)
@@ -100,28 +198,12 @@ pub fn walk_project(root: &Path, extensions: &[String], exclude_dirs: &[String])
         let is_dir = entry.file_type().is_some_and(|file_type| file_type.is_dir());
         !is_dir || !excluded.iter().any(|name| entry.file_name() == name.as_str())
     });
-
-    let mut files = Vec::new();
-    for entry in walker.build() {
-        // An unreadable directory contributes nothing rather than failing the
-        // walk: a project with one permission-denied subdirectory still has an
-        // index worth having, and the alternative is no index at all.
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
-            continue;
-        }
-        let Some(path) = RelPath::relative_to(root, entry.path()) else { continue };
-        if path.extension().is_some_and(|extension| claimed.contains(&extension)) {
-            files.push(path);
-        }
-    }
-    files
+    walker
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     /// A scratch tree, removed on drop. `tempfile` is not a dependency of
     /// this crate for the reason `testing`'s own `Scratch` gives.
@@ -215,5 +297,76 @@ mod tests {
         let once = tree.walk(&[]);
         assert_eq!(once, vec!["a.toy", "m/a.toy", "m/n.toy", "z.toy"]);
         assert_eq!(once, tree.walk(&[]));
+    }
+
+    fn scope(tree: &Tree, exclude: &[&str]) -> WalkScope {
+        let exclude: Vec<String> = exclude.iter().map(|dir| (*dir).to_string()).collect();
+        walk_scope(&tree.0, &exclude)
+    }
+
+    /// Every `.toy` file on disk, relative and `/`-separated, found without
+    /// the walker.
+    fn every_claimed_file(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for child in fs::read_dir(dir).unwrap().map(Result::unwrap) {
+            let path = child.path();
+            if child.file_type().unwrap().is_dir() {
+                every_claimed_file(root, &path, out);
+            } else if path.extension().is_some_and(|extension| extension == "toy") {
+                out.push(RelPath::relative_to(root, &path).unwrap().as_str().to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn the_scope_lists_exactly_what_the_walk_leaves_out() {
+        let tree = Tree::new("scope");
+        tree.write(".gitignore", "build/\n");
+        tree.write("build/a.toy", "");
+        tree.write("build/sub/b.toy", "");
+        tree.write("src/.gitignore", "gen/\n");
+        tree.write("src/gen/c.toy", "");
+        tree.write("src/d.toy", "");
+        tree.write("lib/vendor/e.toy", "");
+        tree.write("pkg/one/f.toy", "");
+        tree.write("pkg/two/g.toy", "");
+        tree.write("top.toy", "");
+        tree.write(".git/h.toy", "");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tree.0.join("pkg"), tree.0.join("link")).unwrap();
+
+        let scope = scope(&tree, &["vendor"]);
+        let pruned: Vec<&str> = scope.pruned.iter().map(RelPath::as_str).collect();
+        assert_eq!(pruned, vec!["build", "src/gen"]);
+        assert_eq!(scope.exclude_dirs, vec![".git", ".claude", "vendor"]);
+        assert_eq!(scope.dropped, 0);
+
+        let walked = tree.walk(&["vendor"]);
+        let mut on_disk = Vec::new();
+        every_claimed_file(&tree.0, &tree.0, &mut on_disk);
+        for file in on_disk {
+            let under_pruned = pruned.iter().any(|dir| file.starts_with(&format!("{dir}/")));
+            let under_named = file
+                .split('/')
+                .rev()
+                .skip(1)
+                .any(|segment| scope.exclude_dirs.iter().any(|name| name == segment));
+            let excluded = under_pruned || under_named;
+            assert_ne!(walked.contains(&file), excluded, "{file}: walked and excluded must disagree");
+        }
+    }
+
+    #[test]
+    fn the_scope_keeps_the_shallowest_entries_within_the_cap() {
+        let tree = Tree::new("scope-cap");
+        tree.write(".gitignore", "ign*/\n");
+        fs::create_dir_all(tree.0.join("ignroot")).unwrap();
+        for index in 0..1_005 {
+            fs::create_dir_all(tree.0.join(format!("a/ign{index:04}"))).unwrap();
+        }
+
+        let scope = scope(&tree, &[]);
+        assert_eq!(scope.pruned.len() + scope.exclude_dirs.len(), MAX_SCOPE_ENTRIES);
+        assert_eq!(scope.dropped, 1_006 - (MAX_SCOPE_ENTRIES - BASELINE_EXCLUDED_DIRS.len()));
+        assert_eq!(scope.pruned[0].as_str(), "ignroot", "the depth-1 directory is kept, and first");
     }
 }

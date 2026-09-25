@@ -487,6 +487,30 @@ function bufferSizeFor(sourceText: string): number {
   return Math.max(32 * 1024, (sourceText.length + 1) * 2);
 }
 
+// The JS/TS grammars' lexers (tree-sitter-typescript 0.23.2 and
+// tree-sitter-javascript up to 0.25.0 alike) read a U+0000 lookahead as end of
+// input: their string, template, comment, regex and JSX-text rules all exclude
+// it, so a raw NUL inside a literal - legal to tsc, and common as a field
+// separator - yields ERROR nodes and a spurious `hasSyntaxErrors` (GM-413).
+// U+0001 is one UTF-16 unit and one UTF-8 byte, like NUL, so every position
+// and byte offset stays put (and so do incremental edits); inside those
+// literals the grammars accept it, and outside them it is an error exactly as
+// a stray NUL is, so a genuinely broken file is still flagged.
+const NUL = "\u0000";
+const NUL_STAND_IN = "\u0001";
+
+function parseSource(parser: Parser, sourceText: string, oldTree?: Parser.Tree): Parser.Tree {
+  const options = { bufferSize: bufferSizeFor(sourceText) };
+  if (!sourceText.includes(NUL)) return parser.parse(sourceText, oldTree, options);
+
+  const tree = parser.parse(sourceText.replaceAll(NUL, NUL_STAND_IN), oldTree, options);
+  // `node.text` slices the string the tree was parsed from (node-tree-sitter's
+  // `tree.input`); point it back at the real source so extracted names and
+  // specifiers keep their NULs.
+  (tree as Parser.Tree & { input: string }).input = sourceText;
+  return tree;
+}
+
 function hash(input: string): string {
   return createHash("sha256").update(input, "utf8").digest("hex").slice(0, 32);
 }
@@ -594,9 +618,7 @@ export function extractIncremental(
   const choice = grammarFor(filePath);
   if (!choice) throw new UnsupportedFileError(filePath);
 
-  const tree = parserFor(choice).parse(sourceText, oldTree, {
-    bufferSize: bufferSizeFor(sourceText),
-  });
+  const tree = parseSource(parserFor(choice), sourceText, oldTree);
 
   const result = new Extractor(
     filePath,

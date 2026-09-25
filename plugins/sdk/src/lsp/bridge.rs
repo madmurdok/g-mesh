@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -371,6 +372,9 @@ pub struct LspBridge {
     /// that does not exist once per pass would log the same line forever.
     unavailable: bool,
     starts: u32,
+    /// Why the last attempt to start the server failed - the reason a pass
+    /// with no server reports.
+    start_failure: Option<String>,
     /// Documents the server has been told about, with the version it last saw
     /// and a hash of the text it was sent. The hash rather than the text: the
     /// SDK's index already holds every file's source, and a second copy of a
@@ -415,6 +419,7 @@ impl LspBridge {
             client: None,
             unavailable: false,
             starts: 0,
+            start_failure: None,
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
         }
@@ -441,12 +446,20 @@ impl LspBridge {
                 return None;
             }
             if self.starts >= MAX_SERVER_STARTS {
+                self.start_failure = Some(format!(
+                    "the language server was started {MAX_SERVER_STARTS} times and is not started again \
+                     in this process"
+                ));
                 return None;
             }
             self.starts += 1;
             match LspClient::start(&self.language, &self.config, &self.root, deadline) {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
+                    self.start_failure = Some(format!(
+                        "the language server {} could not be started: {err:#}",
+                        self.config.command.display()
+                    ));
                     if missing_binary(&err) {
                         self.unavailable = true;
                         eprintln!(
@@ -551,25 +564,30 @@ impl LspBridge {
     ///
     /// [`LspClient::settle`] is what turns the quiet period from a per-pass
     /// cost into a per-server one.
-    fn wait_ready(client: &mut LspClient, budgets: &Budgets, deadline: Instant, language: &str) -> bool {
+    fn wait_ready(
+        client: &mut LspClient,
+        budgets: &Budgets,
+        deadline: Instant,
+        language: &str,
+    ) -> Result<(), String> {
         let started = Instant::now();
         let until = deadline.min(started + budgets.readiness);
         loop {
             client.drain();
             if client.settle(budgets.settle) {
-                return true;
+                return Ok(());
             }
             let now = Instant::now();
             if now >= until {
+                let waited = now.saturating_duration_since(started);
                 eprintln!(
-                    "[{language}] the language server was still indexing after {:?} - this pass asks \
-                     nothing rather than recording its empty answers as real",
-                    now.saturating_duration_since(started)
+                    "[{language}] the language server was still indexing after {waited:?} - this pass asks \
+                     nothing rather than recording its empty answers as real"
                 );
-                return false;
+                return Err(format!("the language server was still indexing after {waited:?}"));
             }
             match client.poll(Duration::from_millis(25)) {
-                Poll::Closed => return false,
+                Poll::Closed => return Err("the language server exited before it became ready".to_string()),
                 _ => continue,
             }
         }
@@ -1080,6 +1098,18 @@ fn node_at<'i>(
     is_addressable(node).then_some((path, node))
 }
 
+/// How long a server whose pipe broke or whose stdout closed is given to
+/// finish exiting before the pass stops waiting to learn how it ended.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// The reason a pass gives when its server died under it.
+fn exited(status: Option<ExitStatus>) -> String {
+    match status {
+        Some(status) => format!("the language server exited during the pass ({status})"),
+        None => "the language server exited during the pass".to_string(),
+    }
+}
+
 /// Runs the question list against a live server.
 ///
 /// Written as a free function rather than a method so that the client can be
@@ -1096,7 +1126,7 @@ fn run_pass(
     asking: Vec<Question>,
     budgets: &Budgets,
     deadline: Instant,
-) -> (Answers, BTreeSet<RelPath>, bool) {
+) -> (Answers, BTreeSet<RelPath>, Option<String>) {
     let mut answers = Answers::new(language, engine);
     let mut queue: Vec<Question> = asking.into_iter().rev().collect();
     // Questions whose empty answer arrived while the server was indexing. They
@@ -1110,7 +1140,12 @@ fn run_pass(
     let mut in_flight: BTreeMap<i64, (Question, Instant)> = BTreeMap::new();
     let mut failed_files: BTreeSet<RelPath> = BTreeSet::new();
     let mut touched_files: BTreeSet<RelPath> = BTreeSet::new();
-    let mut complete = true;
+    // The first reason the pass fell short, if it did: `None` is a complete
+    // pass.
+    let mut failure: Option<String> = None;
+    let mut fail = |reason: String| {
+        failure.get_or_insert(reason);
+    };
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -1140,9 +1175,19 @@ fn run_pass(
                     in_flight.insert(id, (question, Instant::now()));
                 }
                 Err(err) => {
-                    eprintln!("[{language}] could not ask the language server ({err:#})");
                     failed_files.insert(question.file.clone());
-                    complete = false;
+                    // A pipe broken by a server that has died is its death,
+                    // not a failure to write.
+                    match client.exit_status(EXIT_GRACE) {
+                        Some(status) => {
+                            eprintln!("[{language}] the language server exited during the pass ({status})");
+                            fail(exited(Some(status)));
+                        }
+                        None => {
+                            eprintln!("[{language}] could not ask the language server ({err:#})");
+                            fail(format!("could not ask the language server: {err:#}"));
+                        }
+                    }
                     queue.clear();
                     break;
                 }
@@ -1160,6 +1205,11 @@ fn run_pass(
                 in_flight.len(),
                 queue.len() + deferred.len()
             );
+            fail(format!(
+                "the pass ran out of its budget with {} question(s) outstanding and {} unasked",
+                in_flight.len(),
+                queue.len() + deferred.len()
+            ));
             for (id, (question, _)) in std::mem::take(&mut in_flight) {
                 client.cancel(id);
                 failed_files.insert(question.file);
@@ -1167,7 +1217,6 @@ fn run_pass(
             for question in queue.drain(..).chain(deferred.drain(..)) {
                 failed_files.insert(question.file);
             }
-            complete = false;
             break;
         }
 
@@ -1178,7 +1227,7 @@ fn run_pass(
                 for question in deferred.drain(..) {
                     failed_files.insert(question.file);
                 }
-                complete = false;
+                fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
             }
             continue;
@@ -1215,8 +1264,8 @@ fn run_pass(
                 // one bad position is not a reason to drop the other nine
                 // thousand answers.
                 eprintln!("[{language}] the server refused a question about {} ({message})", question.file);
+                fail(format!("the language server refused a question about {} ({message})", question.file));
                 failed_files.insert(question.file);
-                complete = false;
             }
             Poll::Closed => {
                 eprintln!(
@@ -1230,7 +1279,7 @@ fn run_pass(
                 for question in queue.drain(..) {
                     failed_files.insert(question.file);
                 }
-                complete = false;
+                fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
             }
             Poll::Noise => continue,
@@ -1251,15 +1300,18 @@ fn run_pass(
                         "[{language}] the server did not answer a question about {} within {:?}",
                         question.file, budgets.request
                     );
+                    fail(format!(
+                        "the language server did not answer a question about {} within {:?}",
+                        question.file, budgets.request
+                    ));
                     failed_files.insert(question.file);
-                    complete = false;
                 }
             }
         }
     }
 
     let covered = touched_files.difference(&failed_files).cloned().collect();
-    (answers, covered, complete)
+    (answers, covered, failure)
 }
 
 /// Turns one server answer into whatever it is evidence for, and into
@@ -1444,7 +1496,10 @@ impl SemanticEngine for LspBridge {
                 // every file in scope on the strength of a list it had refused
                 // to build (GM-319). An unasked site is not a site that went
                 // away.
-                return Ok(SemanticAnswer::incomplete(FileChangeDiff::default()));
+                return Ok(SemanticAnswer::incomplete_because(
+                    FileChangeDiff::default(),
+                    "the open-site ceiling (max_sites) admitted no site",
+                ));
             }
             // Nothing to ask means nothing to start a compiler for. The files
             // in scope are still *covered*, so an earlier pass's answers about
@@ -1471,12 +1526,12 @@ impl SemanticEngine for LspBridge {
             // The client is borrowed for the whole pass, so everything else
             // this needs was cloned or moved out of `self` above.
             match self.ensure_client(deadline) {
-                None => None,
+                None => Err(None),
                 Some(client) => {
                     client.drain();
                     Self::sync_documents(client, &mut opened, &root, index, &asked_about, &language);
-                    if Self::wait_ready(client, &budgets, deadline, &language) {
-                        Some(run_pass(
+                    match Self::wait_ready(client, &budgets, deadline, &language) {
+                        Ok(()) => Ok(run_pass(
                             client,
                             &language,
                             &engine,
@@ -1485,20 +1540,25 @@ impl SemanticEngine for LspBridge {
                             plan.asking,
                             &budgets,
                             deadline,
-                        ))
-                    } else {
-                        None
+                        )),
+                        Err(reason) => Err(Some(reason)),
                     }
                 }
             }
         };
         self.opened = opened;
 
-        let Some((mut answers, covered, complete)) = outcome else {
+        let (mut answers, covered, failure) = match outcome {
+            Ok(outcome) => outcome,
             // No server, or one that never became ready: no answers, and -
             // crucially - nothing recorded as "no target", which is what the
             // readiness rule exists to prevent.
-            return Ok(SemanticAnswer::incomplete(FileChangeDiff::default()));
+            Err(reason) => {
+                let reason = reason
+                    .or_else(|| self.start_failure.clone())
+                    .unwrap_or_else(|| "the language server is not running".to_string());
+                return Ok(SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason));
+            }
         };
 
         let produced = answers.by_file.clone();
@@ -1533,9 +1593,12 @@ impl SemanticEngine for LspBridge {
             diff.upsert_edges.len(),
             diff.delete_edge_ids.len(),
             started.elapsed(),
-            if complete && !plan.truncated { "" } else { " (incomplete)" }
+            if failure.is_none() && !plan.truncated { "" } else { " (incomplete)" }
         );
-        Ok(SemanticAnswer { diff, complete: complete && !plan.truncated })
+        let failure = failure.or_else(|| {
+            plan.truncated.then(|| "the open-site ceiling (max_sites) left sites unasked".to_string())
+        });
+        Ok(SemanticAnswer { diff, complete: failure.is_none(), reason: failure })
     }
 }
 

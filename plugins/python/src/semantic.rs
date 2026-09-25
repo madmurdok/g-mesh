@@ -156,7 +156,7 @@
 //! `initialized`, and reads its settings from nowhere else.
 //!
 //! That is why GM-299 added [`SemanticConfig::settings`] to the SDK. What this
-//! module puts in it is two things:
+//! module puts in it is three things:
 //!
 //! - `python.analysis.typeCheckingMode = "basic"`, from the manifest. It
 //!   changes only which diagnostics pyright computes - which this bridge never
@@ -167,6 +167,11 @@
 //! - `python.pythonPath`, from [`interpreter`], when the project has a venv.
 //!   This one cannot come from the manifest: it is a path inside the project
 //!   being indexed, and the manifest ships beside the plugin binary.
+//! - `python.analysis.exclude`, from the SDK's `walk_scope`: the directories
+//!   the walk leaves out, so pyright does not scan a gitignored build tree
+//!   before its first answer. Only `exclude`, never `include`, and taken once
+//!   per server - see
+//!   [ADR 0006](../../../docs/adr/0006-language-server-scan-scope.md).
 //!
 //! # Decision 4: no implementation sweep, because pyright has no such request
 //!
@@ -219,7 +224,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
-use g_mesh_plugin_sdk::SemanticEngine;
+use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "python";
@@ -296,7 +301,13 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
                  server to run - see plugins/python/plugin.toml"
             )
         })?;
+    prepare(&mut config, root)?;
+    Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
+}
 
+/// Turns the manifest's `config` into the one the server for `root` runs
+/// with: the resolved command and its args, then [`add_project_settings`].
+fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
     let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
@@ -308,16 +319,31 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     );
     config.command = resolved.command;
     config.args = args;
+    add_project_settings(config, root);
+    Ok(())
+}
 
+/// Adds the settings that depend on the project at `root` rather than on the
+/// manifest: its interpreter, when it has one, and the walk's exclude list.
+fn add_project_settings(config: &mut SemanticConfig, root: &Path) {
     // A project with no venv is the ordinary case and not a warning: pyright
     // then finds an interpreter itself and says which one it assumed in its
     // own log, which the bridge forwards.
     if let Some(python) = interpreter(root) {
         eprintln!("[{LANGUAGE}] semantic tier: python.pythonPath = {}", python.display());
-        set_python_path(&mut config, &python);
+        set_python_path(config, &python);
     }
 
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
+    let exclude: Vec<String> = crate::project::EXCLUDE_DIRS.iter().map(|dir| (*dir).to_string()).collect();
+    let scope = walk_scope(root, &exclude);
+    if scope.dropped > 0 {
+        eprintln!(
+            "[{LANGUAGE}] semantic tier: {} ignored directories left out of python.analysis.exclude \
+             (the deepest); pyright may scan them",
+            scope.dropped
+        );
+    }
+    set_scope(config, &scope);
 }
 
 /// One spelling of "run pyright's language server", and how to prove it is
@@ -575,13 +601,42 @@ fn interpreter(root: &Path) -> Option<PathBuf> {
 /// different keys of one section, and a plain insert would drop whichever was
 /// written second.
 fn set_python_path(config: &mut SemanticConfig, python: &Path) {
-    let section = config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({}));
-    if !section.is_object() {
-        *section = serde_json::json!({});
+    let section =
+        as_object(config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({})));
+    section.insert("pythonPath".to_string(), serde_json::json!(python.to_string_lossy()));
+}
+
+/// Adds `analysis.exclude` to the `python` section of `config.settings`: the
+/// pruned directories, then `**/<name>` for each named exclude.
+///
+/// Merged like [`set_python_path`], and an `exclude` the manifest already set
+/// is left as it is: the manifest wins.
+fn set_scope(config: &mut SemanticConfig, scope: &WalkScope) {
+    let section =
+        as_object(config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({})));
+    let analysis = as_object(section.entry("analysis").or_insert_with(|| serde_json::json!({})));
+    if analysis.contains_key("exclude") {
+        eprintln!(
+            "[{LANGUAGE}] semantic tier: the manifest sets python.analysis.exclude, so the walk's \
+             exclude list is not sent"
+        );
+        return;
     }
-    if let Some(object) = section.as_object_mut() {
-        object.insert("pythonPath".to_string(), serde_json::json!(python.to_string_lossy()));
+    let exclude: Vec<String> = scope
+        .pruned
+        .iter()
+        .map(|dir| dir.as_str().to_string())
+        .chain(scope.exclude_dirs.iter().map(|name| format!("**/{name}")))
+        .collect();
+    analysis.insert("exclude".to_string(), serde_json::json!(exclude));
+}
+
+/// `value` as an object, replacing it with an empty one when it is not one.
+fn as_object(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    if !value.is_object() {
+        *value = serde_json::json!({});
     }
+    value.as_object_mut().expect("just made an object")
 }
 
 #[cfg(test)]
@@ -894,6 +949,294 @@ mod tests {
                 "pythonPath": "/p/.venv/bin/python",
             })
         );
+    }
+
+    fn scope_of(pruned: &[&str], exclude_dirs: &[&str]) -> WalkScope {
+        WalkScope {
+            pruned: pruned.iter().map(|dir| g_mesh_plugin_sdk::RelPath::from(*dir)).collect(),
+            exclude_dirs: exclude_dirs.iter().map(|dir| (*dir).to_string()).collect(),
+            dropped: 0,
+        }
+    }
+
+    /// The exclude list joins the manifest's own `python` section, and an
+    /// `exclude` the manifest set itself is kept.
+    #[test]
+    fn the_scope_is_merged_into_the_python_section_and_the_manifest_wins() {
+        let mut config = SemanticConfig::new(SERVER_BIN);
+        config
+            .settings
+            .insert("python".to_string(), serde_json::json!({ "analysis": { "typeCheckingMode": "basic" } }));
+        set_python_path(&mut config, Path::new("/p/.venv/bin/python"));
+        set_scope(&mut config, &scope_of(&["build", "src/gen"], &[".git", ".venv"]));
+        assert_eq!(
+            config.settings["python"],
+            serde_json::json!({
+                "analysis": {
+                    "typeCheckingMode": "basic",
+                    "exclude": ["build", "src/gen", "**/.git", "**/.venv"],
+                },
+                "pythonPath": "/p/.venv/bin/python",
+            })
+        );
+
+        let mut config = SemanticConfig::new(SERVER_BIN);
+        config.settings.insert(
+            "python".to_string(),
+            serde_json::json!({ "analysis": { "typeCheckingMode": "basic", "exclude": ["mine"] } }),
+        );
+        set_scope(&mut config, &scope_of(&["build"], &[".git"]));
+        assert_eq!(
+            config.settings["python"],
+            serde_json::json!({ "analysis": { "typeCheckingMode": "basic", "exclude": ["mine"] } })
+        );
+    }
+
+    /// A scratch Python project: `app/main.py` imports from the gitignored
+    /// `genpkg/`, and the gitignored `junk/` holds a module nothing imports.
+    fn scoped_project(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("g-mesh-py-scope-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, contents) in [
+            (".gitignore", "junk/\ngenpkg/\n"),
+            ("app/main.py", "from genpkg.gen import gen_fn\n\ngen_fn()\n"),
+            ("genpkg/__init__.py", ""),
+            ("genpkg/gen.py", "def gen_fn():\n    return 1\n"),
+            ("junk/junkmod.py", "def gm_junk_only_fn():\n    return 2\n"),
+        ] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        root.canonicalize().unwrap()
+    }
+
+    fn shipped_config() -> SemanticConfig {
+        let manifest = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        SemanticConfig::from_manifest_at(manifest).unwrap().expect("the manifest has [plugin.semantic]")
+    }
+
+    /// The config the engine runs with carries the walk's exclude list, and
+    /// no `include`.
+    #[test]
+    fn the_engine_config_carries_the_walks_exclude_list() {
+        let root = scoped_project("config");
+        let mut config = shipped_config();
+        add_project_settings(&mut config, &root);
+        let analysis = &config.settings["python"]["analysis"];
+        let exclude: Vec<&str> = analysis["exclude"]
+            .as_array()
+            .expect("an exclude list")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(exclude.contains(&"junk") && exclude.contains(&"genpkg"), "{exclude:?}");
+        assert!(exclude.contains(&"**/.venv") && exclude.contains(&"**/.git"), "{exclude:?}");
+        assert!(!exclude.iter().any(|entry| entry.starts_with("app")), "{exclude:?}");
+        assert!(analysis.get("include").is_none(), "include is never sent: {analysis}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real pyright, handed the config [`prepare`] builds, does not track
+    /// the pruned `junk/` and still resolves an import into the pruned
+    /// `genpkg/`. Ignored by default because it needs pyright (locally or
+    /// through `npx`): `cargo test -p g-mesh-plugin-python -- --ignored`.
+    #[test]
+    #[ignore = "needs pyright, locally installed or through npx"]
+    fn real_pyright_skips_a_pruned_tree_and_still_resolves_imports_into_one() {
+        let root = scoped_project("pyright");
+        let mut config = shipped_config();
+        prepare(&mut config, &root).expect("a pyright to run");
+        let mut session = lsp::Session::start(&root, &config);
+
+        let main = root.join("app/main.py");
+        let uri = lsp::uri(&main);
+        session.notify(
+            "textDocument/didOpen",
+            serde_json::json!({ "textDocument": {
+                "uri": uri, "languageId": LANGUAGE, "version": 1,
+                "text": std::fs::read_to_string(&main).unwrap(),
+            }}),
+        );
+        let definition = session.request(
+            "textDocument/definition",
+            serde_json::json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 1 } }),
+        );
+        assert!(
+            definition.to_string().contains("genpkg/gen.py"),
+            "the import into the excluded genpkg/ resolves: {definition}"
+        );
+
+        let symbols = session.request("workspace/symbol", serde_json::json!({ "query": "gm_junk_only_fn" }));
+        let found: Vec<&serde_json::Value> = symbols
+            .as_array()
+            .map(|symbols| symbols.iter().filter(|symbol| symbol["name"] == "gm_junk_only_fn").collect())
+            .unwrap_or_default();
+        assert!(found.is_empty(), "the pruned junk/ is not tracked: {symbols}");
+
+        drop(session);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Just enough of an LSP client over stdio for the real-pyright test.
+    mod lsp {
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::path::Path;
+        use std::process::{Child, ChildStdin, Command, Stdio};
+        use std::sync::mpsc::{channel, Receiver};
+        use std::time::{Duration, Instant};
+
+        use g_mesh_plugin_sdk::lsp::SemanticConfig;
+        use serde_json::{json, Value};
+
+        /// How long one request may take, `npx` download included.
+        const ANSWER_BUDGET: Duration = Duration::from_secs(180);
+
+        pub fn uri(path: &Path) -> String {
+            format!("file://{}", path.display())
+        }
+
+        pub struct Session {
+            child: Child,
+            stdin: Option<ChildStdin>,
+            incoming: Receiver<Value>,
+            settings: BTreeMap<String, Value>,
+            next_id: i64,
+        }
+
+        impl Session {
+            pub fn start(root: &Path, config: &SemanticConfig) -> Self {
+                let mut child = Command::new(&config.command)
+                    .args(&config.args)
+                    .envs(&config.env)
+                    .current_dir(root)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("pyright starts");
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take().unwrap();
+                let (sender, incoming) = channel();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stdout);
+                    loop {
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                break;
+                            }
+                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0; length];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let Ok(message) = serde_json::from_slice(&body) else { continue };
+                        if sender.send(message).is_err() {
+                            return;
+                        }
+                    }
+                });
+                let mut session =
+                    Self { child, stdin, incoming, settings: config.settings.clone(), next_id: 0 };
+                let root_uri = uri(root);
+                session.request(
+                    "initialize",
+                    json!({
+                        "processId": std::process::id(),
+                        "rootUri": root_uri,
+                        "workspaceFolders": [{ "uri": root_uri, "name": "scope" }],
+                        "capabilities": { "workspace": { "configuration": true, "workspaceFolders": true } },
+                    }),
+                );
+                session.notify("initialized", json!({}));
+                session
+            }
+
+            fn send(&mut self, message: &Value) {
+                let body = message.to_string();
+                let stdin = self.stdin.as_mut().expect("the session is open");
+                write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+                stdin.flush().unwrap();
+            }
+
+            pub fn notify(&mut self, method: &str, params: Value) {
+                self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+            }
+
+            /// The `result` of `method`, answering the server's own requests
+            /// while it waits.
+            pub fn request(&mut self, method: &str, params: Value) -> Value {
+                self.next_id += 1;
+                let id = self.next_id;
+                self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+                let deadline = Instant::now() + ANSWER_BUDGET;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let message = self.incoming.recv_timeout(left).unwrap_or_else(|err| {
+                        panic!("no answer to {method} within {ANSWER_BUDGET:?}: {err}")
+                    });
+                    if let Some(server_method) = message.get("method").and_then(Value::as_str) {
+                        if let Some(server_id) = message.get("id") {
+                            let result = self.reply(server_method, message.get("params"));
+                            self.send(&json!({ "jsonrpc": "2.0", "id": server_id, "result": result }));
+                        }
+                    } else if message.get("id") == Some(&json!(id)) {
+                        assert!(message.get("error").is_none(), "{method} failed: {message}");
+                        return message.get("result").cloned().unwrap_or(Value::Null);
+                    }
+                }
+            }
+
+            fn reply(&self, method: &str, params: Option<&Value>) -> Value {
+                if method != "workspace/configuration" {
+                    return Value::Null;
+                }
+                let items = params.and_then(|params| params["items"].as_array().cloned()).unwrap_or_default();
+                Value::Array(
+                    items
+                        .iter()
+                        .map(|item| {
+                            item["section"]
+                                .as_str()
+                                .and_then(|section| self.settings.get(section))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect(),
+                )
+            }
+        }
+
+        impl Drop for Session {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.send(&json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" }));
+                        self.notify("exit", Value::Null);
+                    }));
+                }
+                self.stdin = None;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    if let Ok(Some(_)) = self.child.try_wait() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
     }
 
     /// The shipped manifest is read by this module at run time and by nothing

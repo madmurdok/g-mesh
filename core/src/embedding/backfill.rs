@@ -2,7 +2,7 @@
 //! graph is missing one for, as its own bounded scan rather than as part of
 //! the walk that wrote those nodes in the first place.
 //!
-//! # Why this exists (GM-395, slice 1)
+//! # Why this exists
 //!
 //! Before this, `daemon::bulk_index::commit` computed and stored a batch's
 //! embeddings inline, as part of the cold-start walk - so a project's
@@ -46,12 +46,11 @@
 //! whose weights simply had not been fetched yet) gets embedded on the next
 //! restart that finds one, with no reindex required.
 
-use std::sync::Mutex;
-
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
@@ -105,11 +104,7 @@ pub struct BackfillSummary {
 /// weights, and an early return for "no model" would make the hold
 /// unreachable on exactly the machines (CI, a fresh checkout) that need it
 /// most.
-pub fn run(
-    conn: &Mutex<Connection>,
-    embedding: &EmbeddingPipeline,
-    progress: &IndexingStatus,
-) -> BackfillSummary {
+pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &IndexingStatus) -> BackfillSummary {
     hold_before_first_batch_for_tests();
     panic_before_first_batch_for_tests();
 
@@ -117,24 +112,23 @@ pub fn run(
         return BackfillSummary::default();
     }
 
-    let candidates = match count_candidates(&conn.lock().unwrap()) {
-        Ok(count) => count,
-        Err(err) => {
-            eprintln!(
-                "g-mesh daemon: failed to count nodes owed an embedding, skipping the backfill pass ({err:#})"
-            );
-            return BackfillSummary::default();
-        }
-    };
-    progress.set_embed_total(candidates.max(0) as u64);
+    store.unit(Unit::Backfill, |store| {
+        let candidates = match store.step(|conn| count_candidates(conn)) {
+            Ok(count) => count,
+            Err(err) => {
+                eprintln!(
+                    "g-mesh daemon: failed to count nodes owed an embedding, skipping the backfill pass ({err:#})"
+                );
+                return BackfillSummary::default();
+            }
+        };
+        progress.set_embed_total(candidates.max(0) as u64);
 
-    let mut summary = BackfillSummary { candidates: candidates.max(0) as usize, embedded: 0 };
-    let mut after_id: Option<String> = None;
+        let mut summary = BackfillSummary { candidates: candidates.max(0) as usize, embedded: 0 };
+        let mut after_id: Option<String> = None;
 
-    loop {
-        let page = {
-            let guard = conn.lock().unwrap();
-            match fetch_candidate_page(&guard, after_id.as_deref(), PAGE_SIZE) {
+        loop {
+            let page = match store.step(|conn| fetch_candidate_page(conn, after_id.as_deref(), PAGE_SIZE)) {
                 Ok(page) => page,
                 Err(err) => {
                     eprintln!(
@@ -143,26 +137,24 @@ pub fn run(
                     );
                     break;
                 }
+            };
+            if page.is_empty() {
+                break;
             }
-        };
-        if page.is_empty() {
-            break;
-        }
-        after_id = Some(page.last().expect("just checked non-empty").0.clone());
-        let page_len = page.len() as u64;
+            after_id = Some(page.last().expect("just checked non-empty").0.clone());
+            let page_len = page.len() as u64;
 
-        let diff =
-            Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
-        let computed = embedding.compute(&diff);
-        summary.embedded += computed.len();
-        {
-            let guard = conn.lock().unwrap();
-            embedding.store(&guard, &computed);
+            let diff =
+                Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
+            // Inference runs between the unit's steps.
+            let computed = embedding.compute(&diff);
+            summary.embedded += computed.len();
+            store.store_vectors(embedding, &computed);
+            progress.add_embed_done(page_len);
         }
-        progress.add_embed_done(page_len);
-    }
 
-    summary
+        summary
+    })
 }
 
 /// One candidate row: a node's id plus the two columns
@@ -174,8 +166,7 @@ type Candidate = (String, Option<String>, Option<String>);
 /// `signature`) - every other field is irrelevant here, because this
 /// `Diff` is never handed to [`crate::storage::write::apply_diff`]; it only
 /// exists as `compute`'s input shape. `EmbeddingPipeline::store` re-reads a
-/// node's *real*, current row before writing anything (GM-396's staleness
-/// check), so a filler kind/name/qualifiedName/filePath/language here can
+/// node's *real*, current row before writing anything, so a filler kind/name/qualifiedName/filePath/language here can
 /// never leak into a stored answer.
 fn to_node_record((id, doc_comment, signature): Candidate) -> NodeRecord {
     let mut node = NodeRecord::new(id, "", "", "", "", "");
@@ -368,7 +359,7 @@ mod tests {
             },
         )
         .unwrap();
-        let conn = Mutex::new(conn);
+        let conn = IndexStore::new(conn);
         let embedding = EmbeddingPipeline::disabled();
         let progress = IndexingStatus::structural();
 

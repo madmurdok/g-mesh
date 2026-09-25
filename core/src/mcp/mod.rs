@@ -1,43 +1,15 @@
-//! The MCP server the daemon exposes on its AF_UNIX socket: the structural
-//! tool surface an agent sees, plus the plumbing that binds one accepted
-//! connection to one `rmcp` session.
+//! The MCP server on the daemon's socket: the structural tool surface, and
+//! one `rmcp` session per accepted connection. Async stops here: handlers
+//! take the same synchronous `IndexStore` read guard as the rest of the daemon.
 //!
-//! Every tool is registered with its real name, description and parameter
-//! schema, and each one's answer lives in a module of its own next to this
-//! one - the schemas were registered up front, before the handlers existed,
-//! so a client could be wired against the finished surface rather than watch
-//! tools appear one by one; this file has stayed pure router wiring since.
-//!
-//! Why `rmcp` (and therefore tokio) only here: the rest of the daemon - SQLite,
-//! the plugin bridge, the watcher - is plainly synchronous and has no reason
-//! not to be. `daemon::run` enters a small runtime for its accept loop alone,
-//! so async stops at this module's front door; handlers below hold the same
-//! plain `Mutex` guards the synchronous code always has.
-//!
-//! # Why the parameter doc comments below are terse
-//!
-//! Every `///` on a parameter struct in this file is compiled by `schemars`
-//! into that tool's JSON Schema `description`, and the whole `tools/list`
-//! response sits in the model's cached prompt prefix - so it is re-read, and
-//! re-billed as `cacheReadTokens`, on *every* request of *every* conversation,
-//! not once. A sentence of rationale here therefore costs far more over a
-//! session than the same sentence in a `//` comment, which never reaches the
-//! wire at all.
-//!
-//! Measured (task f05b320f, against serena's 5-tool surface as a reference
-//! point): the eight schemas were 11,722 bytes, 62% of it description text,
-//! with `file_paths`/`symbol_name`/`limit`/`symbol_id`/`cursor` each repeated
-//! near-verbatim across three to six tools. Compressing that prose - without
-//! dropping a single fact a caller acts on - took the surface to 9,845 bytes,
-//! roughly 600 fewer prompt tokens on every request.
-//!
-//! So: state defaults, caps, mutual exclusions and the ambiguity protocol,
-//! because a caller's behaviour changes on them. Put the *why* in a `//`
-//! comment or this module doc instead, and keep guidance that spans tools in
-//! `get_info`'s `instructions` (sent once per session, not once per tool).
+//! Every `///` on a parameter struct below becomes that tool's JSON Schema,
+//! re-read from the model's cached prompt on every request: state only what
+//! changes a caller's behaviour (defaults, caps, exclusions, the ambiguity
+//! protocol); the why goes in a `//` comment, cross-tool guidance in
+//! `get_info`'s instructions (`docs/adr/0003-mcp-instructions-rendering.md`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -48,7 +20,6 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
-use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -61,14 +32,11 @@ use crate::gc::last_used;
 use crate::graph::pagination::Direction;
 use crate::ipc::AsyncStream;
 use crate::protocol::types::Position;
+use crate::storage::index_store::IndexStore;
 
 mod anchor;
-// `pub(crate)` on these five - not `mod` - so `cli::plugin_check::expectations`
-// (GM-277) can call the exact handler functions these modules' own tool
-// methods below call, rather than re-implementing the queries. Every other
-// submodule here stays private to this one: nothing outside `mcp` needs
-// `get_file_outline`/`instructions`/`search_code`/`source`/`tool_result`, and
-// widening them would just be surface nothing uses.
+// `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
+// functions as the tools below; every other submodule stays private.
 pub(crate) mod find_callers_callees;
 pub(crate) mod find_definition;
 pub(crate) mod find_implementations;
@@ -83,34 +51,17 @@ mod similarity;
 mod source;
 mod tool_result;
 
-/// Names a step of request handling in the daemon's log, when
-/// [`TRACE_CALLS_ENV`] is set.
-///
-/// Every tool call funnels through `prepare`, so tracing its entry and exit
-/// splits a hang three ways with one line of output: nothing logged means the
-/// request never reached the daemon, an entry without a matching exit means it
-/// hung inside `prepare`, and both means it hung in the handler or on the way
-/// back. Windows currently hangs somewhere in there and the log is the only
-/// window into a detached daemon (GM-246).
-///
-/// Off unless asked for: a line per call would bury the log's real content on
-/// a busy daemon.
-///
-/// GM-395 slice 3 widened what `prepare` traces, because M1 in
-/// `docs/architecture/lazy-indexing.md` reads its results off these lines:
-/// entry names the tool, the request id and whether the request carried a
-/// `progressToken` (the one fact about a client's behaviour the daemon can
-/// see and M1 cannot otherwise observe), and the end of the wait names its
-/// outcome, how long it waited and how many progress notifications it sent.
-/// The shapes, one line each:
+/// Logs a step of request handling when [`TRACE_CALLS_ENV`] is set. Every
+/// tool call goes through `prepare`, so its lines split a hang three ways:
+/// none (never reached the daemon), entry without exit (hung in `prepare`),
+/// both (hung later). M1 in `docs/architecture/lazy-indexing.md` reads its
+/// results off these lines (`outcome`: `satisfied`, `failed`, `timed_out`):
 ///
 /// ```text
 /// g-mesh daemon: prepare: entered tool=get_file_outline request=3 progressToken=present
 /// g-mesh daemon: prepare: wait over tool=get_file_outline request=3 outcome=satisfied waited_ms=4212 progress_sent=21
 /// g-mesh daemon: prepare: cancelled tool=get_file_outline request=3 waited_ms=900 progress_sent=4
 /// ```
-///
-/// `outcome` is `satisfied`, `failed` or `timed_out` (the D7 cap).
 fn trace_call(what: std::fmt::Arguments<'_>) {
     if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
         eprintln!("g-mesh daemon: {what}");
@@ -142,9 +93,8 @@ pub const INDEX_WAIT_CAP_ENV: &str = "G_MESH_INDEX_WAIT_CAP_MS";
 pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
 
 /// Reads a millisecond-valued env var, falling back to `default` when it is
-/// unset, empty or not a number. Read per call, not once per process: it is a
-/// few nanoseconds, and a knob that only took effect on the next daemon would
-/// be one more thing to get wrong in a test.
+/// unset, empty or not a number. Read per call, so a test can change it
+/// without starting a new daemon.
 fn env_millis(name: &str, default: Duration) -> Duration {
     std::env::var(name)
         .ok()
@@ -166,28 +116,18 @@ fn human_duration(elapsed: Duration) -> String {
 }
 
 /// Serves one accepted connection as an MCP session until the peer
-/// disconnects. One session per connection, and the shim opens exactly one
-/// connection per MCP client, so a client's session dies with its shim.
-///
-/// `stream` is whatever `crate::ipc` accepted - a `tokio::net::UnixStream` on
-/// Unix, a connected named-pipe instance on Windows. Neither is named here:
-/// `rmcp` only ever needed `AsyncRead + AsyncWrite`.
-///
-/// `indexing` is consulted per *call*, not per connection, which is what
-/// makes a session opened during the cold-start walk recover on its own: a
-/// tool call issued on a connection made mid-walk simply waits
-/// (`GMeshMcpServer::still_indexing`, GM-394) and gets the real answer once
-/// the walk finishes, on the very same session - nothing to reconnect and
-/// nothing to re-initialize.
+/// disconnects; the shim opens one connection per client, so a session dies
+/// with its shim. `indexing` is consulted per call, so a session opened
+/// mid-walk needs no reconnect: its calls wait and get the real answer.
 pub async fn serve_connection(
     stream: AsyncStream,
-    conn: Arc<Mutex<Connection>>,
+    store: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(conn, registry, core_activity, indexing, embedding)
+    let service = GMeshMcpServer::new(store, registry, core_activity, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -195,20 +135,13 @@ pub async fn serve_connection(
     Ok(())
 }
 
-/// The structural query surface, backed by the project's index and the
-/// language plugins.
-///
-/// Every handler answers out of `conn` alone. `registry` is not there to be
-/// queried - no tool asks a language server a question - but to be *woken*:
-/// while a language's plugin sleeps on its idle timeout the core queues the
-/// files that changed, and a tool call is the moment that queue has to be
-/// replayed before the index is read (see `daemon::lifecycle`). Since task
-/// 155 this is a `PluginRegistry` rather than one `Arc<PluginSupervisor>`,
-/// because a tool call has no way to know ahead of time which language(s)
-/// its answer might touch.
+/// The structural query surface. Every handler answers out of `store` alone;
+/// `registry` is there to be woken, not queried: a tool call replays the files
+/// queued while a plugin slept before the index is read (see
+/// `daemon::lifecycle`), and it cannot know ahead which languages it touches.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
-    conn: Arc<Mutex<Connection>>,
+    store: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
@@ -219,57 +152,34 @@ pub struct GMeshMcpServer {
 #[tool_router]
 impl GMeshMcpServer {
     pub fn new(
-        conn: Arc<Mutex<Connection>>,
+        store: Arc<IndexStore>,
         registry: Arc<PluginRegistry>,
         core_activity: Arc<CoreActivity>,
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        Self { conn, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
+        Self { store, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
     }
 
     /// Everything every handler owes before it reads the index, in the one
-    /// order they may happen in.
-    ///
-    /// `Ok(Some)` is a finished tool result the handler returns as is: a
-    /// failed walk ([`Phase::Failed`]), reported as a tool error carrying the
-    /// failure's message, or a wait that reached the D7 cap ("still
-    /// indexing, call again"). `Err` means the client cancelled the request
-    /// (or its session ended) while it waited - see
-    /// [`wait_for_index`](Self::wait_for_index). `tool` only names the call
-    /// in [`trace_call`]'s lines.
-    ///
-    /// The order is not arbitrary:
-    ///
-    /// 0. [`IndexingStatus::request_activation`] before anything else
-    ///    (GM-395 slice 2): the daemon builds nothing until a tool call
-    ///    needs it, so this is what starts the walk, the semantic pass and
-    ///    the embedding backfill pass - once, however many calls ask. It
-    ///    returns at once; the work runs on `daemon::activation`'s thread,
-    ///    independently of this call.
-    /// 1. [`wait_for_index`](Self::wait_for_index) next: a project that has
-    ///    not yet reached `need`'s phase has no graph (or no complete-enough
-    ///    graph) to bring up to date, so every step after this one may assume
-    ///    it does rather than each having to ask again. It never answers
-    ///    off a half-built graph; the one way it ends without the phase it
-    ///    needs is the D7 cap, which answers nothing at all - see
-    ///    [`wait_for_index`](Self::wait_for_index)'s own doc comment.
-    /// 2. [`mark_used`](Self::mark_used) next: it takes and releases the
-    ///    SQLite mutex on its own, and it must not be nested inside the plugin
-    ///    lock the replay below holds (see `daemon::lifecycle`'s lock order).
-    /// 3. The replay last, so the rows this call is about to read already
-    ///    include every change made while the plugin was asleep.
+    /// order allowed. `Ok(Some)` is a finished tool result (a failed walk, or
+    /// the D7 cap); `Err` means the request was cancelled while it waited.
+    /// 0. [`IndexingStatus::request_activation`]: starts the walk, semantic
+    ///    pass and embedding backfill once, however many calls ask.
+    /// 1. [`wait_for_index`](Self::wait_for_index): later steps may assume
+    ///    `need`'s phase; nothing is answered off a half-built graph.
+    /// 2. [`mark_used`](Self::mark_used): must not be nested inside the
+    ///    plugin lock the replay holds (`storage::index_store`'s lock order).
+    /// 3. The replay last, so the rows read include every change made while a
+    ///    plugin slept.
     async fn prepare(
         &self,
         ctx: &RequestContext<RoleServer>,
         tool: &str,
         need: Need,
     ) -> Result<Option<CallToolResult>, ErrorData> {
-        // Taken before anything below runs, including the indexing wait, so
-        // that if the replay at the bottom also has to heartbeat (GM-403) its
-        // `progress` values pick up exactly where the wait's own left off -
-        // the same reason `ensure_file_fresh`'s caller takes its own
-        // `call_started` ahead of `prepare` (see that method's doc comment).
+        // Taken before the indexing wait, so the replay's heartbeat continues
+        // the wait's `progress` values and stays strictly increasing.
         let call_started = Instant::now();
         let token = ctx.meta.get_progress_token();
         trace_call(format_args!(
@@ -288,46 +198,14 @@ impl GMeshMcpServer {
         Ok(None)
     }
 
-    /// Brings the index up to date with whatever changed while any language's
-    /// plugin was asleep, and does nothing at all - not even a lock - when
-    /// nothing did, which is every call on a daemon whose active plugins are
-    /// all awake.
-    ///
-    /// On the blocking thread pool rather than inline: waking a plugin means
-    /// spawning a process (for the bundled one, Node plus warming tree-sitter),
-    /// and the accept loop's runtime has two worker threads (see
-    /// `daemon::serve_forever`), so doing it on one of them would stall every
-    /// other session for the length of a process spawn.
-    ///
-    /// Failures are logged inside `PluginRegistry::replay_pending`, one per
-    /// language, not returned here. The caller asked a structural question the
-    /// index can already answer; refusing it because a *later* edit could not
-    /// be replayed would turn one unreadable file into a dead tool surface,
-    /// and each language's queue is left intact for the next call to retry.
-    ///
-    /// # GM-403: heartbeats while a replay runs
-    ///
-    /// A replay is a `fileChanged` round trip (plus a per-file semantic pass)
-    /// for every queued file, sent to whichever language's plugin was asleep
-    /// - on a cold language server that is the same tens-of-seconds cost
-    /// [`ensure_file_fresh`](Self::ensure_file_fresh) already heartbeats for
-    /// GM-401, just paid for a whole queue instead of one file. Without a
-    /// ticker of its own this step was the one silent gap GM-401 left: the
-    /// indexing wait's heartbeat had already ended by the time `prepare`
-    /// reaches here.
-    ///
-    /// The same rules as both of those tickers: only for a request that
-    /// carried a `progressToken`, one interval in, a failed send logged and
-    /// ignored. `message` names the language(s) and how many files each owes
-    /// ([`PluginRegistry::pending_summary`]), read once before the replay
-    /// starts draining the queue it describes, not on every tick - a ticker
-    /// that re-asked mid-replay would watch the count fall to zero and call
-    /// that news. `progress` is `call_started.elapsed()` - taken by
-    /// [`prepare`](Self::prepare) before the indexing wait, so it keeps
-    /// strictly increasing whether or not that wait also heartbeated.
-    ///
-    /// Not cancellable, as before: the replay runs on the blocking pool and
-    /// finishes whether or not anyone is still listening.
+    /// Replays whatever changed while a plugin was asleep; takes no lock when
+    /// nothing did. On the blocking pool: waking a plugin spawns a process,
+    /// and the accept loop's runtime has only two workers. Failures are logged
+    /// in `PluginRegistry::replay_pending`, never returned (the queue stays for
+    /// the next call to retry). Heartbeats like
+    /// [`ensure_file_fresh`](Self::ensure_file_fresh), with a
+    /// [`PluginRegistry::pending_summary`] read once before the queue drains.
+    /// Not cancellable.
     async fn replay_queued_changes(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -339,9 +217,9 @@ impl GMeshMcpServer {
         }
         let summary = self.registry.pending_summary();
         let registry = Arc::clone(&self.registry);
-        let conn = Arc::clone(&self.conn);
+        let store = Arc::clone(&self.store);
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&conn));
+        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&store));
         tokio::pin!(task);
 
         let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
@@ -393,66 +271,25 @@ impl GMeshMcpServer {
     }
 
     /// Every discovered plugin's declared `[plugin.capabilities]`, which the
-    /// four edge-walking tools hand to `provenance::resolve` so it can tell a
-    /// plugin that declares a semantic tier from one that does not.
-    ///
-    /// Read fresh per call, and cloned, for exactly the reason
-    /// `get_dependencies`' own `entry_points` is: it is a map walk over data
-    /// that cannot change while this daemon runs
-    /// (`daemon::manifest::discover`'s contract), so a cache on `self` would
-    /// save nothing that holding the borrow does not already give away, and
-    /// four tools reaching through `self.registry` inline would say this
-    /// once each instead of once.
+    /// four edge-walking tools hand to `provenance::resolve`. Read fresh per
+    /// call: it never changes while the daemon runs
+    /// (`daemon::manifest::discover`), so a cache would save nothing.
     fn capabilities(&self) -> HashMap<String, Capabilities> {
         self.registry.receiver_call_capabilities()
     }
 
-    /// Query-time staleness safety net (`watcher::staleness::ensure_fresh`,
-    /// wired via `daemon::lifecycle::PluginSupervisor::ensure_fresh`) for the
-    /// three tools that anchor their answer on one specific file:
-    /// `find_definition`, `get_file_outline`, `get_dependencies`. Closes a
-    /// gap [`replay_queued_changes`](Self::replay_queued_changes) does not:
-    /// that one catches up on changes the watcher *did* see while the plugin
-    /// slept, but a change the watcher never saw at all - because this
-    /// project's daemon was not running when it happened, or because the
-    /// watcher backend missed the filesystem event outright - never enters
-    /// that queue in the first place. See `watcher::staleness`'s module doc
-    /// for the full mtime/hash procedure this runs, and
-    /// `PluginSupervisor::ensure_fresh`'s doc for why this is a different gap
-    /// from the one `daemon::indexing_status` documents leaving open.
+    /// Query-time staleness check (`watcher::staleness::ensure_fresh`) for the
+    /// three tools anchored on one file (`find_definition`, `get_file_outline`,
+    /// `get_dependencies`): catches changes the watcher never saw, which never
+    /// enter the replay queue. The symbol-anchored tools skip it: their files
+    /// are known only after the query runs.
     ///
-    /// Not called for the four symbol-anchored tools (`find_references`,
-    /// `find_callers`, `find_callees`, `find_implementations`): resolving
-    /// which file(s) their answer even touches requires running the query
-    /// itself, so there is no single file to check ahead of it without
-    /// paying to read and hash every file the query *might* touch - exactly
-    /// the cost `watcher::staleness`'s own docs rule out.
-    ///
-    /// On the blocking thread pool for the same reason
-    /// [`replay_queued_changes`](Self::replay_queued_changes) is: the rare
-    /// case where this actually reindexes means a synchronous round trip to
-    /// the plugin process. Best-effort like that method too - a failure here
-    /// must not turn an otherwise-answerable query into a tool error, so it
-    /// is logged and the handler proceeds with whatever the index currently
-    /// holds.
-    ///
-    /// # GM-401: heartbeats while a reindex runs
-    ///
-    /// A reindex here is a `fileChanged` round trip plus a per-file semantic
-    /// pass, and the latter waits on the language server: over a minute on a
-    /// cold rust-analyzer. [`wait_for_index`](Self::wait_for_index)'s
-    /// heartbeat has ended by then, so without one of its own the client
-    /// heard nothing for that whole stretch and its idle timer, not this
-    /// daemon, decided when the call ended. The same ticker runs here, under
-    /// the same rules: only for a request that carried a `progressToken`, one
-    /// interval in (the fast path sends nothing), and a failed send is logged
-    /// and ignored. `progress` is seconds since `call_started`, which the
-    /// handler takes *before* [`prepare`](Self::prepare) - earlier than the
-    /// indexing wait's own start - so it keeps strictly increasing across
-    /// both heartbeats of one call.
-    ///
-    /// Not cancellable, as before: the reindex runs on the blocking pool and
-    /// finishes whether or not anyone is still listening.
+    /// Blocking pool and best-effort: a failure is logged and the handler
+    /// answers from the current index. A reindex can take over a minute on a
+    /// cold rust-analyzer, so it heartbeats (only with a `progressToken`, first
+    /// tick one interval in, failed sends ignored); `progress` counts from
+    /// `call_started`, taken before [`prepare`](Self::prepare), so it keeps
+    /// increasing across both heartbeats of one call. Not cancellable.
     async fn ensure_file_fresh(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -461,11 +298,11 @@ impl GMeshMcpServer {
         file_path: &str,
     ) {
         let registry = Arc::clone(&self.registry);
-        let conn = Arc::clone(&self.conn);
+        let store = Arc::clone(&self.store);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&conn, &task_path));
+        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&store, &task_path));
         tokio::pin!(task);
 
         let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
@@ -522,79 +359,21 @@ impl GMeshMcpServer {
         }
     }
 
-    /// Waits until the index has reached the phase `need` requires, if it has
-    /// not already.
+    /// Waits until the index reaches the phase `need` requires. A tool call is
+    /// never answered "not ready" or from a partial index (D2, D4, D6, D7 in
+    /// `docs/architecture/lazy-indexing.md`). Raced in one `select!`:
+    /// - **Progress** (only with a `progressToken`): every
+    ///   [`PROGRESS_INTERVAL_ENV`]; `progress` is seconds waited, the one
+    ///   strictly increasing value; a failed send is logged and ignored.
+    /// - **The cap** ([`INDEX_WAIT_CAP_ENV`]): a retryable tool error that
+    ///   answers no part of the question, before the client's idle window.
+    /// - **Cancellation** (`ctx.ct`): an error at once; indexing continues.
     ///
-    /// # GM-394: a tool call is never answered "not ready"
-    ///
-    /// Task 105 answered a call landing mid-walk with an immediate
-    /// `STILL_INDEXING` tool error, and task 107 gave a call landing a few
-    /// milliseconds before completion a short grace wait before committing to
-    /// that refusal. Both are gone: GM-394's owner decision is that no tool
-    /// call may ever be answered "not ready" or partially while the index is
-    /// being built - a caller retrying an error is strictly worse than a
-    /// caller that simply waits a little longer for the truth - so this now
-    /// waits - bounded only by the D7 cap below - for `need` to be satisfied
-    /// (`daemon::indexing_status::IndexingStatus::wait_for`) and lets the
-    /// handler serve the real answer.
-    ///
-    /// # GM-395 slice 3: progress, the wait cap and cancellation (D6, D7)
-    ///
-    /// Three things can end the wait besides the phase being reached, raced
-    /// in one `select!`:
-    ///
-    /// - **Progress.** While it waits, and only if the request carried a
-    ///   `progressToken` (the spec ties progress to a requester's token), a
-    ///   ticker sends `notifications/progress` every
-    ///   [`PROGRESS_INTERVAL_ENV`] (default 5 s). `progress` is the seconds
-    ///   waited so far - strictly increasing as the spec requires, which no
-    ///   work counter is (they stall while linking and during the one-time
-    ///   model load) - and `message` carries the real counters
-    ///   (`IndexingStatus::progress_message`). A send failure is logged and
-    ///   ignored: the client may already be gone, and the cancellation branch
-    ///   is what reacts to that.
-    /// - **The cap** ([`INDEX_WAIT_CAP_ENV`], default 25 min). On reaching
-    ///   it the call returns a tool error saying the index is still being
-    ///   built and no answer was computed. That does not break "never a
-    ///   partial answer": it answers no part of the question - no rows, no
-    ///   `hasMore` - it is an explicit, retryable precondition failure, and it
-    ///   only fires when a walk outlasts the cap. Without it a call with no
-    ///   progress token would outlive the client's own idle window and be
-    ///   killed with an error that says nothing about indexing.
-    /// - **Cancellation.** `ctx.ct` fires on `notifications/cancelled` for
-    ///   this request and when the session ends. The call returns an error at
-    ///   once (the client has stopped listening for it). Indexing itself runs
-    ///   on `daemon::activation`'s thread and does not notice (D2): the next
-    ///   call finds it running or finished.
-    ///
-    /// # GM-395: which phase `need` names is what makes structural tools stop
-    /// waiting on embeddings
-    ///
-    /// The seven structural tools pass [`Need::Structural`], satisfied the
-    /// moment the walk itself is linked - the embedding backfill pass
-    /// (`embedding::backfill::run`) may still be running, or not yet started,
-    /// and they do not care. `search_code` alone passes
-    /// [`Need::Embeddings`], satisfied only once that pass has finished.
-    ///
-    /// This is unrelated to why `get_info`/`instructions` never call this
-    /// method at all: those run during MCP `initialize`, before a session has
-    /// asked a single tool question, and must answer however long the walk's
-    /// batch-commit lock is held for rather than wait on it - see
-    /// [`instructions`](Self::instructions)'s own doc comment.
-    ///
-    /// [`prepare`](Self::prepare) calls this as its *first* step, ahead of
-    /// [`mark_used`](Self::mark_used): that one takes the daemon's single
-    /// SQLite mutex, which the walk holds for the length of each batch
-    /// commit, and asking it to record usage while that mutex might still be
-    /// held would defeat the point of waiting here first.
-    ///
-    /// The fast path - `need` was already satisfied - never suspends: a
-    /// project that owes no walk, or one whose walk finished before this call
-    /// arrived, resolves on the spot inside `wait_for`. Only a call that
-    /// actually lands before its phase is reached suspends, and it suspends
-    /// the task, not the worker thread it runs on (see
-    /// `daemon::serve_forever`'s two-worker runtime, and `IndexingStatus`'s
-    /// own doc comment for why a `Notify` rather than a blocking primitive).
+    /// Structural tools pass [`Need::Structural`]; only `search_code` passes
+    /// [`Need::Embeddings`]. `get_info` never calls this. It runs before
+    /// [`mark_used`](Self::mark_used), which takes the store the walk holds
+    /// during batch commits. The fast path never suspends; a slow one
+    /// suspends the task, not the worker thread.
     async fn wait_for_index(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -680,11 +459,9 @@ impl GMeshMcpServer {
                     human_duration(started.elapsed())
                 ))]))
             }
-            // GM-395 slice 2 (D2): a failed walk is a tool error carrying its
-            // message, not an answer read off an empty or partial graph -
-            // that would be confidently wrong, where this says why and that
-            // the next call retries (`IndexingStatus::request_activation`).
-            // Not "not ready" either: the wait is over, and it failed.
+            // A failed walk is a tool error carrying its message, never an
+            // answer read off an empty or partial graph; the next call retries
+            // (`IndexingStatus::request_activation`).
             WaitOutcome::Failed(message) => {
                 Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
                     "g-mesh could not build this project's index: {message}. The next tool call retries \
@@ -694,94 +471,29 @@ impl GMeshMcpServer {
         })
     }
 
-    /// Advances the project's `lastUsed` stamp, which a later GC scan reads
-    /// back off disk to decide how long a project has been idle
-    /// (`gc::last_used`), and the core's own in-memory idle clock, which
-    /// decides when this daemon has been unused long enough to exit
-    /// (`daemon::lifecycle::CoreActivity`).
-    ///
-    /// The two are separate on purpose and neither can stand in for the other:
-    /// `lastUsed` is a durable record about the *project*, read by a command
-    /// that may run days later on disk this daemon no longer owns, while the
-    /// idle clock is a fact about this *process* that means nothing once it
-    /// exits. They are advanced together because one thing advances both - a
-    /// tool call.
-    ///
-    /// Called by every tool handler rather than once per connection: a client
-    /// holds one session open for its whole lifetime, so per-connection would
-    /// stamp a week-long editor session exactly once, at the start.
-    ///
-    /// Best-effort on purpose - a failure is reported and dropped. Bookkeeping
-    /// for a cleanup command that only ever prints warnings has no business
-    /// turning an answerable query into a tool error. The guard is taken and
-    /// released here, before the handler takes its own.
+    /// Advances the project's durable `lastUsed` stamp (`gc::last_used`, read
+    /// by a later GC scan) and this process's in-memory idle clock
+    /// (`daemon::lifecycle::CoreActivity`); neither can stand in for the
+    /// other. Called per tool call, not per connection: a client holds one
+    /// session for its whole lifetime. Best-effort: a failure is logged, never
+    /// a tool error. The store is taken and released here, before the
+    /// handler's own read guard.
     fn mark_used(&self) {
         self.core_activity.request();
-        if let Err(err) = last_used::touch(&self.conn.lock().unwrap()) {
+        if let Err(err) = self.store.with(last_used::touch) {
             eprintln!("g-mesh daemon: failed to record lastUsed: {err:#}");
         }
     }
 
-    /// `get_info`'s `with_instructions` string (GM-262), assembled fresh for
-    /// each session by [`instructions::build`] from the languages actually
-    /// present in this project's index and their capabilities - see that
-    /// module's own doc comment for the full design (why the receiver-call
-    /// gap sentence has to vary per language, the byte budget it renders
-    /// under, and the two fallbacks below).
-    ///
-    /// # GM-394: never takes the lock a bulk-index batch may be holding
-    ///
-    /// `get_info` is called during MCP `initialize`, before a client has
-    /// asked a single tool question - unlike every tool handler above, which
-    /// waits out the cold-start walk via [`prepare`](Self::prepare) before it
-    /// ever reaches for `self.conn`, this method cannot afford to wait on
-    /// anything: blocking the handshake itself is indistinguishable from the
-    /// whole server hanging, which is exactly the bug GM-394 traced (a batch
-    /// commit's embedding inference holding the same mutex this method used
-    /// to lock unconditionally - see `daemon::bulk_index::commit` and
-    /// `daemon::indexing_status`'s own "GM-394" doc section).
-    ///
-    /// So [`self.indexing.phase()`](IndexingStatus::phase) - a lock-free
-    /// atomic read - is checked *first*, and only a caller that finds it past
-    /// [`Phase::Walking`] ever takes `self.conn`'s mutex at all. A caller in
-    /// [`Phase::Unindexed`] or [`Phase::Walking`] skips the query entirely
-    /// and gets capabilities-only instructions (the same shape the `Err`
-    /// fallback below already produces, for the same "if the index isn't
-    /// open yet, fall back to capabilities only" reason), through
-    /// [`instructions::cold_start`] - GM-395's D12 - so the one fact that is
-    /// true only for this moment (the project's own root, and whether its
-    /// walk has started or is still owed) is stated rather than left for a
-    /// caller to infer from an unusually generic paragraph. `Phase::Failed`
-    /// is deliberately not included here: nothing holds `self.conn`'s mutex
-    /// once a walk has failed and returned, so there is no GM-394 hazard in
-    /// taking it, and this method's ordinary query-then-render path already
-    /// handles a project with nothing indexed yet (`present` comes back
-    /// empty, and [`build`](instructions::build) renders the same
-    /// unqualified paragraph a fresh project always has).
-    ///
-    /// Two independent data sources feed the builder once the index is open,
-    /// and only one of them can fail in a way this method has to handle
-    /// itself:
-    /// - `self.registry.receiver_call_capabilities()` reads
-    ///   `DiscoveredPlugins`, an in-memory value read once at daemon startup
-    ///   (see `PluginRegistry`'s own doc comment) - infallible.
-    /// - `storage::schema::present_languages_with_semantic_state` is a real
-    ///   query against `self.conn`, which - unlike every tool handler above -
-    ///   this method cannot refuse to answer around: there is no error
-    ///   response to return here, only better or worse instructions text.
-    ///   `Err` here (a corrupt schema, a locked or otherwise unreadable DB -
-    ///   not the ordinary "cold start, zero File nodes yet" case, which is
-    ///   `Ok(vec![])` and handled by [`instructions::build`] itself) falls
-    ///   back to every *discovered* manifest's capabilities with
-    ///   `semantic_pass_done: false` for all of them - GM-262's own scope
-    ///   note: "if the index isn't open yet, fall back to capabilities only".
-    ///   Forcing `semantic_pass_done` to `false` is what makes that fallback
-    ///   honest under this uncertainty: without a real `language_state` read
-    ///   there is no fact to claim a semantic pass has completed, so only
-    ///   `receiver_calls_structural` (which needs no such fact) can close a
-    ///   language's gap here - see `instructions::has_open_receiver_gap`'s
-    ///   own doc comment for why that field alone is sufficient for a
-    ///   language like Go.
+    /// `get_info`'s `with_instructions` string, built per session by
+    /// [`instructions::build`]. Never takes the store while a bulk-index batch
+    /// may hold it (through embedding inference): a blocked `initialize` looks
+    /// like a hung server. So the lock-free [`phase`](IndexingStatus::phase)
+    /// comes first, and [`Phase::Unindexed`]/[`Phase::Walking`] render
+    /// capabilities-only text via [`instructions::cold_start`]; `Phase::Failed`
+    /// queries, since nothing holds the store after a failed walk. If the
+    /// present-languages query fails, every discovered manifest is used with
+    /// `semantic_pass_done: false`: nothing may claim a pass it did not read.
     fn instructions(&self) -> String {
         let capabilities = self.registry.receiver_call_capabilities();
 
@@ -793,7 +505,7 @@ impl GMeshMcpServer {
         }
 
         let present = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.store.read();
             crate::storage::schema::present_languages_with_semantic_state(&conn)
         };
         let present = match present {
@@ -825,7 +537,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        find_definition::handle(&self.conn, self.registry.project_root(), &self.embedding, params.0)
+        find_definition::handle(&self.store, self.registry.project_root(), &self.embedding, params.0)
     }
 
     #[tool(
@@ -841,7 +553,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_references::handle(&self.conn, &self.embedding, &capabilities, params.0)
+        find_references::handle(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -854,7 +566,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_callers_callees::handle_callers(&self.conn, &self.embedding, &capabilities, params.0)
+        find_callers_callees::handle_callers(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -867,7 +579,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_callers_callees::handle_callees(&self.conn, &self.embedding, &capabilities, params.0)
+        find_callers_callees::handle_callees(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(
@@ -883,7 +595,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_implementations::dispatch(&self.conn, &self.embedding, &capabilities, params.0)
+        find_implementations::dispatch(&self.store, &self.embedding, &capabilities, params.0)
     }
 
     #[tool(
@@ -900,7 +612,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.conn, params.0)
+        get_file_outline::handle(&self.store, params.0)
     }
 
     #[tool(
@@ -919,16 +631,12 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
-        // The union of every discovered plugin's declared entry points (GM-273)
-        // - see `PluginRegistry::entry_points` and
-        // `graph::queries::entry_point_rank_expr` for how a miss-path
-        // directory lookup uses it. Read fresh per call rather than cached on
-        // `self`: it is a cheap map walk over data that never changes while
-        // this daemon runs (`daemon::manifest::discover`'s own contract), so
-        // there is nothing a cache would save beyond what the borrow checker
-        // already makes free.
+        // The union of every plugin's declared entry points (see
+        // `PluginRegistry::entry_points` and
+        // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
+        // never changes while the daemon runs.
         let entry_points = self.registry.entry_points();
-        get_dependencies::handle(&self.conn, &entry_points, params.0)
+        get_dependencies::handle(&self.store, &entry_points, params.0)
     }
 
     #[tool(
@@ -943,7 +651,7 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "search_code", Need::Embeddings).await? {
             return Ok(early);
         }
-        search_code::handle(&self.conn, &self.embedding, params.0)
+        search_code::handle(&self.store, &self.embedding, params.0)
     }
 }
 
@@ -953,16 +661,11 @@ impl GMeshMcpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GMeshMcpServer {
     fn get_info(&self) -> ServerInfo {
-        // Claude Code truncates this field at 2KB (independent of, and not shared with,
-        // each tool's own 2KB description budget), and with tool search's default
-        // deferred loading this is the only trust signal a model sees before individual
-        // tool schemas even load - so the core anti-grep rule goes first, and the
-        // legitimate exceptions stay concrete rather than getting cut mid-sentence.
-        // `instructions::build` keeps the result under `instructions::
-        // INSTRUCTIONS_BYTE_CEILING` (~1900 bytes, a safety margin under the 2KB cut) for
-        // every language mix it can be asked to render - see that module's own doc
-        // comment (GM-262) for the receiver-call gap this text used to state as a fixed,
-        // TypeScript-only fact and now assembles per project.
+        // Claude Code truncates this field at 2KB, independently of each
+        // tool's description budget, and with deferred tool loading it is the
+        // only trust signal a model sees before schemas load: the anti-grep
+        // rule goes first and the exceptions stay concrete. `instructions`
+        // keeps every rendering under `INSTRUCTIONS_BYTE_CEILING`.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("g-mesh", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions())
@@ -986,13 +689,8 @@ pub struct FindDefinitionParams {
     pub include_source: Option<bool>,
 }
 
-/// find_references/find_callers/find_callees/find_implementations differ only
-/// in which edges they walk, never in what the caller has to supply - so they
-/// share one parameter shape instead of four identical ones.
-///
-/// `Default` is for the tests that construct this by hand: with two
-/// alternative addressing fields plus two paging ones, spelling all four out
-/// at every call site is noise that hides which one the test is about.
+// Shared by find_references/find_callers/find_callees: they differ only in
+// which edges they walk, never in what the caller supplies.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
@@ -1010,20 +708,9 @@ pub struct SymbolQueryParams {
     pub file_paths: Option<Vec<String>>,
 }
 
-/// `find_implementations`'s own params, not folded into `SymbolQueryParams`:
-/// the three fields below (`transitive`/`max_depth`/`resume_token`) name a
-/// transitive-walk concept `find_references`/`find_callers`/`find_callees`
-/// have no equivalent of, and adding them to the shared struct would put a
-/// `resume_token` field in front of three tools that can never populate or
-/// consume one.
-///
-/// The first five fields are a deliberate duplicate of `SymbolQueryParams`'s
-/// own - `find_implementations::dispatch` builds a `SymbolQueryParams` from
-/// them to reuse the existing single-hop `handle` unchanged, so their names,
-/// types and semantics must stay identical to that struct's.
-///
-/// `Default` is for the tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
+// The first five fields must stay identical in name, type and semantics to
+// `SymbolQueryParams`'s: `find_implementations::dispatch` builds a
+// `SymbolQueryParams` from them to run the single-hop `handle`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
@@ -1055,8 +742,6 @@ pub struct FindImplementationsParams {
     pub resume_token: Option<String>,
 }
 
-/// `Default` is for tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetFileOutlineParams {
     /// Project-relative path of the file to outline.
@@ -1089,8 +774,6 @@ pub struct GetDependenciesParams {
     pub resume_token: Option<String>,
 }
 
-/// `Default` is for tests that construct this by hand - see
-/// `SymbolQueryParams`'s doc comment for why.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchCodeParams {
     /// What you're looking for, in free text (e.g. "parses a config file").

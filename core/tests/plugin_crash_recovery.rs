@@ -13,22 +13,22 @@
 //! those requests, without racing a real `notify` filesystem watcher.
 
 use std::fs;
-use std::sync::Mutex;
 
 use g_mesh::daemon::is_process_alive;
 use g_mesh::daemon::plugin::{bundled_manifest, PluginProcess};
 use g_mesh::embedding::EmbeddingPipeline;
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
-fn setup_conn() -> Mutex<Connection> {
+fn setup_conn() -> IndexStore {
     let conn = Connection::open_in_memory().expect("failed to open an in-memory index");
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     schema::apply(&conn).expect("failed to apply the schema");
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
-fn node_named(conn: &Mutex<Connection>, name: &str) -> i64 {
+fn node_named(conn: &IndexStore, name: &str) -> i64 {
     conn.lock()
         .unwrap()
         .query_row("SELECT COUNT(*) FROM nodes WHERE name = ?1", [name], |row| row.get(0))

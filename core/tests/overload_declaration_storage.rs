@@ -20,12 +20,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
 use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
 use g_mesh::storage::connection::{open, project_dir};
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
@@ -83,7 +83,7 @@ impl Project {
         let conn = open(self.root()).expect("failed to open the project index");
         schema::ensure_current(&conn, "overload-declaration-storage-test")
             .expect("failed to prepare the index");
-        let conn = Mutex::new(conn);
+        let conn = IndexStore::new(conn);
         let discovered = only_the_bundled_plugin();
         let summary = bulk_index::run(self.root(), &conn, None, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
@@ -180,16 +180,16 @@ fn an_ordinary_symbol_in_the_same_walk_costs_no_declaration_rows() {
 }
 
 #[test]
-fn a_freshly_built_index_reads_schema_version_8() {
+fn a_freshly_built_index_reads_schema_version_9() {
     let project = Project::new();
     let conn = project.walk();
 
     let version: String =
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "8" is GM-264's containers /
-    // placeholder_targets / language_state / source-tier bump.
-    assert_eq!(version, "8");
+    // has to update this line by hand. "9" adds
+    // `language_state.semanticPassError`.
+    assert_eq!(version, "9");
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
 

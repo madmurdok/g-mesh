@@ -64,11 +64,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use rusqlite::Connection;
 
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
+use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 
 /// The file each fake plugin process appends its pid to on startup.
@@ -103,6 +103,11 @@ const NOTIFICATION_LOG: &str = "notifications.log";
 /// a crash-recovery relaunch, which is a fresh Node process with no memory of
 /// its predecessor's in-memory state, but the same directory on disk.
 const STALL_MARKER: &str = "stalled-once.marker";
+
+/// Marks that an [`install_incomplete_once`] plugin directory has already
+/// answered one `semanticPass` as incomplete - kept on disk for the same
+/// reason as [`STALL_MARKER`].
+const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
@@ -274,6 +279,32 @@ pub(crate) fn install_memory_hungry(root: &Path, language: &str, extensions: &[&
     install_inner(root, language, extensions, false, false, true, true, &[], &[])
 }
 
+/// [`install_semantic_pass_capable`], but the plugin answers the first
+/// `semanticPass` this directory ever receives with an empty diff marked
+/// `incomplete`, carrying `reason` as its `incompleteReason` - what an SDK
+/// plugin sends when its language server errored or never answered - or no
+/// `incompleteReason` at all when `reason` is `None`, as a plugin that
+/// predates the field does. Every later request is answered normally, so a
+/// retry completes.
+pub(crate) fn install_incomplete_once(
+    root: &Path,
+    language: &str,
+    extensions: &[&str],
+    reason: Option<&str>,
+) -> PathBuf {
+    let dir = install_inner(root, language, extensions, false, false, true, false, &[], &[]);
+    answer_first_semantic_pass_incomplete(&dir, language, reason);
+    dir
+}
+
+/// Rewrites an installed plugin directory's entry point so that it answers
+/// the first `semanticPass` as [`install_incomplete_once`] describes, keeping
+/// the manifest it was installed with.
+pub(crate) fn answer_first_semantic_pass_incomplete(dir: &Path, language: &str, reason: Option<&str>) {
+    fs::write(dir.join("plugin.js"), entry_point(language, false, false, false, true, reason))
+        .expect("failed to write the fake plugin's entry point");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_inner(
     root: &Path,
@@ -288,7 +319,7 @@ fn install_inner(
 ) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling, memory_hungry))
+    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling, memory_hungry, false, None))
         .expect("failed to write the fake plugin's entry point");
     fs::write(
         dir.join("plugin.toml"),
@@ -345,11 +376,11 @@ pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
 /// commit. Shared by every caller of this module, because none of them cares
 /// what is in it - only that the commit path a real file change takes is the
 /// one being exercised.
-pub(crate) fn empty_index() -> Mutex<Connection> {
+pub(crate) fn empty_index() -> IndexStore {
     let conn = Connection::open_in_memory().expect("failed to open an in-memory index");
     conn.pragma_update(None, "foreign_keys", "ON").expect("failed to enable foreign keys");
     schema::apply(&conn).expect("failed to apply the schema");
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
 /// `semantic_pass` controls whether the manifest carries a
@@ -416,7 +447,15 @@ extensions = [{extensions}]
 /// rest of the process's life so V8 cannot garbage-collect it out from under
 /// a test sampling this process's RSS - the wire behaviour (handshake,
 /// answering every framed request) is otherwise unchanged.
-fn entry_point(language: &str, gated: bool, stalling: bool, memory_hungry: bool) -> String {
+fn entry_point(
+    language: &str,
+    gated: bool,
+    stalling: bool,
+    memory_hungry: bool,
+    incomplete_once: bool,
+    incomplete_reason: Option<&str>,
+) -> String {
+    let incomplete_reason = serde_json::to_string(&incomplete_reason).expect("a string serializes");
     let memory_hog = if memory_hungry {
         "\n// GM-274 fixture (install_memory_hungry): held for this process's whole\n\
          // lifetime, not just allocated and dropped, so a test's sample actually\n\
@@ -527,9 +566,19 @@ process.stdin.on("data", (chunk) => {{
       // once" fact has to live in a file rather than a variable.
       const markerPath = path.join(__dirname, "{STALL_MARKER}");
       const shouldStall = {stalling} && !fs.existsSync(markerPath);
+      const incompleteOnce = {incomplete_once};
+      const incompleteReason = {incomplete_reason};
+      const incompletePath = path.join(__dirname, "{INCOMPLETE_MARKER}");
       if (shouldStall) {{
         fs.writeFileSync(markerPath, String(process.pid) + "\n");
         // Deliberately never answer this one request.
+      }} else if (incompleteOnce && request.method === "semanticPass" && !fs.existsSync(incompletePath)) {{
+        fs.writeFileSync(incompletePath, String(process.pid) + "\n");
+        const response = {{ jsonrpc: "2.0", id: request.id, result: {{}}, incomplete: true }};
+        if (incompleteReason !== null) {{
+          response.incompleteReason = incompleteReason;
+        }}
+        writeFrame(response);
       }} else {{
         writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
       }}

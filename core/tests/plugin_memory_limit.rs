@@ -94,7 +94,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,7 @@ use g_mesh::daemon::manifest::{read_manifest, DiscoveredPlugins, PluginManifest}
 use g_mesh::daemon::registry;
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::project_dir;
+use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
@@ -188,11 +189,11 @@ fn count_rust_files(root: &Path) -> usize {
     count
 }
 
-fn in_memory_index() -> Mutex<Connection> {
+fn in_memory_index() -> IndexStore {
     let conn = Connection::open_in_memory().expect("failed to open an in-memory index");
     conn.pragma_update(None, "foreign_keys", "ON").expect("failed to enable foreign keys");
     schema::apply(&conn).expect("failed to apply the schema");
-    Mutex::new(conn)
+    IndexStore::new(conn)
 }
 
 /// A real one-shot structural bulk index over `project_root`, through the
@@ -201,7 +202,7 @@ fn in_memory_index() -> Mutex<Connection> {
 /// also try (and, absent a built `dist/`, potentially fail) the bundled
 /// TypeScript/Go plugins the real `bundled_roots()` discovery would also
 /// find in this checkout.
-fn structural_bulk_index(project_root: &Path, conn: &Mutex<Connection>, manifest: &PluginManifest) {
+fn structural_bulk_index(project_root: &Path, conn: &IndexStore, manifest: &PluginManifest) {
     let discovered = DiscoveredPlugins {
         manifests: HashMap::from([("rust".to_string(), manifest.clone())]),
         routing: HashMap::from([(".rs".to_string(), "rust".to_string())]),
@@ -220,7 +221,7 @@ fn structural_bulk_index(project_root: &Path, conn: &Mutex<Connection>, manifest
 /// checked against the real generated instructions text separately, through
 /// the real MCP protocol, in
 /// `the_generated_mcp_instructions_reflect_a_real_suspended_rust`.
-fn semantic_pass_done_for_rust(conn: &Mutex<Connection>) -> bool {
+fn semantic_pass_done_for_rust(conn: &IndexStore) -> bool {
     let present = schema::present_languages_with_semantic_state(&conn.lock().unwrap())
         .expect("failed to read the present-language/semantic-state pairs");
     assert_eq!(present.len(), 1, "only rust is present in this fixture: {present:?}");
@@ -274,7 +275,7 @@ fn start_supervisor(
 /// house rule on diagnostics.
 fn race_pass_against_memory_check(
     supervisor: &Arc<PluginSupervisor>,
-    conn: &Arc<Mutex<Connection>>,
+    conn: &Arc<IndexStore>,
     file_count: usize,
 ) -> (Duration, anyhow::Result<bool>, Duration) {
     let start = Instant::now();

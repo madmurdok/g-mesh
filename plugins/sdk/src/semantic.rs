@@ -99,17 +99,26 @@ pub struct SemanticAnswer {
     /// about must not claim completeness. [`SemanticAnswer::complete`] is how
     /// an engine that always finishes says so.
     pub complete: bool,
+    /// Why an incomplete pass did not cover everything, in words - sent to
+    /// core beside the `incomplete` flag, which records it per language and
+    /// shows it in `g-mesh status`. `None` on a complete pass.
+    pub reason: Option<String>,
 }
 
 impl SemanticAnswer {
     /// A pass that covered everything it was asked about.
     pub fn complete(diff: FileChangeDiff) -> Self {
-        Self { diff, complete: true }
+        Self { diff, complete: true, reason: None }
     }
 
     /// A pass that did not - the diff is whatever it did manage.
     pub fn incomplete(diff: FileChangeDiff) -> Self {
-        Self { diff, complete: false }
+        Self { diff, complete: false, reason: None }
+    }
+
+    /// [`SemanticAnswer::incomplete`], saying why.
+    pub fn incomplete_because(diff: FileChangeDiff, reason: impl Into<String>) -> Self {
+        Self { diff, complete: false, reason: Some(reason.into()) }
     }
 }
 
@@ -169,11 +178,13 @@ pub(crate) struct LazyEngine {
     /// exactly the "semantic engine missing" failure mode the design
     /// describes.
     failed: bool,
+    /// Why the factory failed, reported as the reason of every pass after it.
+    start_failure: Option<String>,
 }
 
 impl LazyEngine {
     pub(crate) fn new(language: &str, factory: Option<SemanticEngineFactory>) -> Self {
-        Self { language: language.to_string(), factory, engine: None, failed: false }
+        Self { language: language.to_string(), factory, engine: None, failed: false, start_failure: None }
     }
 
     /// Answers a `semanticPass`, starting the engine if this is the first
@@ -211,6 +222,7 @@ impl LazyEngine {
                 Ok(engine) => self.engine = Some(engine),
                 Err(err) => {
                     self.failed = true;
+                    self.start_failure = Some(format!("the semantic engine could not be started: {err:#}"));
                     eprintln!(
                         "[{}] the semantic engine could not be started ({err:#}) - answering structurally \
                          only for the rest of this process's life",
@@ -221,7 +233,11 @@ impl LazyEngine {
         }
 
         let Some(engine) = self.engine.as_mut() else {
-            return SemanticAnswer::incomplete(FileChangeDiff::default());
+            let reason = self
+                .start_failure
+                .clone()
+                .unwrap_or_else(|| "the semantic engine could not be started".to_string());
+            return SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason);
         };
         match engine.answer(files, index) {
             Ok(answer) => answer,
@@ -230,7 +246,10 @@ impl LazyEngine {
                     "[{}] the semantic pass failed ({err:#}) - answering with an empty, incomplete diff",
                     self.language
                 );
-                SemanticAnswer::incomplete(FileChangeDiff::default())
+                SemanticAnswer::incomplete_because(
+                    FileChangeDiff::default(),
+                    format!("the semantic pass failed: {err:#}"),
+                )
             }
         }
     }
@@ -378,6 +397,8 @@ mod tests {
             let answer = lazy.answer(&[], &SdkIndex::new(), root());
             assert_eq!(answer.diff, FileChangeDiff::default());
             assert!(!answer.complete, "an engine that never started has not completed a pass");
+            let reason = answer.reason.expect("every pass after a failed start says why");
+            assert!(reason.contains("no language server on PATH"), "{reason}");
         }
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(lazy.started(), "a failed start still counts as started - it must not be retried");
@@ -398,5 +419,7 @@ mod tests {
         let answer = lazy.answer(&[], &SdkIndex::new(), root());
         assert_eq!(answer.diff, FileChangeDiff::default());
         assert!(!answer.complete);
+        let reason = answer.reason.expect("a failed pass says why");
+        assert!(reason.contains("the server timed out"), "{reason}");
     }
 }
