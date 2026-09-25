@@ -18,6 +18,15 @@ use notify::{Config, ErrorKind as NotifyErrorKind, PollWatcher, RecommendedWatch
 /// couldn't get a real watch, not the whole project.
 const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Directory names excluded whatever `.gitignore` says, in every language:
+/// git's object store and Claude Code's session directory (`.claude/worktrees/`
+/// holds whole copies of the project), neither of which is ever source. The
+/// same pair as `BASELINE_EXCLUDED_DIRS` in plugins/sdk/src/walk.rs, which the
+/// SDK-built plugins' bulk walks apply; everything language-specific
+/// (`node_modules`, `target`, `vendor`) is the plugin's own `[plugin.workspace]
+/// exclude_dirs`. Shared with `cli::status`'s coverage walk.
+pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
+
 /// Watches a project root for filesystem changes, filtering out anything
 /// `.gitignore` (plus `.git` and `.claude`, which `.gitignore` files don't
 /// normally list - they're special-cased the same way the JS/TS plugin's
@@ -66,8 +75,11 @@ impl ProjectWatcher {
         let root = root.as_path();
 
         let mut builder = GitignoreBuilder::new(root);
-        builder.add_line(None, ".git/").context("failed to add built-in .git exclusion")?;
-        builder.add_line(None, ".claude/").context("failed to add built-in .claude exclusion")?;
+        for dir in BASELINE_EXCLUDED_DIRS {
+            builder
+                .add_line(None, &format!("{dir}/"))
+                .with_context(|| format!("failed to add built-in {dir} exclusion"))?;
+        }
         // A missing .gitignore is the common case (no ignore rules yet),
         // not an error - only propagate genuine parse failures.
         if let Some(err) = builder.add(root.join(".gitignore")) {

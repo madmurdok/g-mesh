@@ -1,6 +1,16 @@
 use super::*;
 use crate::storage::schema;
 
+/// The plugins this checkout ships - their real `plugin.toml`s, read from
+/// `plugins/` beside `core/` exactly as `manifest::bundled_roots` finds them in
+/// a checkout. Discovery only parses the manifests, so no plugin needs to be
+/// built. Deliberately not `default_roots`, which would also read whatever
+/// the machine running the tests has under `~/.g-mesh/plugins/`.
+fn bundled_plugins() -> DiscoveredPlugins {
+    let checkout_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+    manifest::discover(&[checkout_root]).unwrap()
+}
+
 /// A project directory with the given files, and an index database
 /// alongside it that no daemon owns.
 struct Fixture {
@@ -63,7 +73,7 @@ impl Fixture {
     }
 
     fn status(&self) -> IndexStatus {
-        index_status(self.root(), &self.db_path()).unwrap()
+        index_status(self.root(), &self.db_path(), &bundled_plugins()).unwrap()
     }
 }
 
@@ -162,11 +172,69 @@ fn the_walk_skips_exactly_what_the_plugins_walk_skips() {
         (".claude/worktrees/copy/a.ts", ""),
     ]);
 
-    let mut found: Vec<String> =
-        discover_source_files(fixture.root()).unwrap().into_iter().map(|f| f.relative).collect();
+    let mut found: Vec<String> = discover_source_files(fixture.root(), &bundled_plugins())
+        .unwrap()
+        .into_iter()
+        .map(|f| f.relative)
+        .collect();
     found.sort();
 
     assert_eq!(found, vec!["keep.mjs", "keep.ts"]);
+}
+
+/// Every discovered language's files count, in coverage and in the dirty
+/// queue alike - not only the extensions of the TS plugin.
+#[test]
+fn rust_and_python_files_count_toward_coverage_and_the_dirty_queue() {
+    let fixture = Fixture::new(&[
+        ("src/lib.rs", "pub fn a() {}"),
+        ("src/edited.rs", "pub fn b() {}"),
+        ("app/main.py", "def main(): pass"),
+        ("app/new.py", "def new(): pass"),
+        ("web/index.ts", "export const a = 1;"),
+    ]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "src/lib.rs", false);
+    fixture.index_file(&conn, "src/edited.rs", false);
+    fixture.index_file(&conn, "app/main.py", false);
+    fixture.index_file(&conn, "web/index.ts", false);
+    // `app/new.py` has no node at all; `src/edited.rs`'s baseline predates
+    // its last write.
+    fixture.record_baseline(&conn, "src/edited.rs", fixture.current_mtime("src/edited.rs") - 10_000);
+
+    let status = fixture.status();
+
+    assert_eq!(status.discovered, 5, "every language's files are discovered, not only JS/TS");
+    assert_eq!(status.indexed, 4);
+    assert_eq!(status.dirty, 2, "the never-indexed .py and the stale .rs");
+}
+
+/// Each language's `[plugin.workspace] exclude_dirs` applies to that
+/// language's files only: Rust's `target/` and Python's `.venv/` are not
+/// counted, while a Python file under TypeScript's `dist/` and a TypeScript
+/// file under Rust's `target/` still are - the plugins that own them walk
+/// those directories.
+#[test]
+fn each_languages_excluded_dirs_hide_only_that_languages_files() {
+    let fixture = Fixture::new(&[
+        ("src/lib.rs", ""),
+        ("target/debug/build/out.rs", ""),
+        ("pkg/mod.py", ""),
+        (".venv/lib/site.py", ""),
+        ("pkg/__pycache__/cached.py", ""),
+        ("dist/tool.py", ""),
+        ("dist/bundle.js", ""),
+        ("target/generated.ts", ""),
+    ]);
+
+    let mut found: Vec<String> = discover_source_files(fixture.root(), &bundled_plugins())
+        .unwrap()
+        .into_iter()
+        .map(|f| f.relative)
+        .collect();
+    found.sort();
+
+    assert_eq!(found, vec!["dist/tool.py", "pkg/mod.py", "src/lib.rs", "target/generated.ts"]);
 }
 
 #[test]
