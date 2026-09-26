@@ -19,7 +19,7 @@ The design, and every decision either tier had to settle, is in
 ## Running it
 
 ```bash
-go build -o g-mesh-plugin-go .        # core/build.rs does this for you
+go build -buildvcs=false -o g-mesh-plugin-go .   # core/build.rs does this for you
 ./g-mesh-plugin-go --bulk-index <project-root>   # NDJSON on stdout
 ./g-mesh-plugin-go <project-root>                # framed JSON-RPC control loop
 ```
