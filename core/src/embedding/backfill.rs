@@ -88,10 +88,11 @@ pub struct BackfillSummary {
     /// necessarily how many it ended up embedding (a node can fail inference,
     /// or be deleted mid-pass by a concurrent edit).
     pub candidates: usize,
-    /// Nodes a vector was produced for and handed to the store, whether
-    /// computed by the model or served from the embedding cache.
+    /// Vectors the model computed: the embedding cache's misses, as
+    /// [`EmbedStats::embedded`] counts them.
     pub embedded: usize,
-    /// How many of `embedded` came from the embedding cache.
+    /// Vectors the embedding cache served instead. `embedded + cache_hits`
+    /// is every vector this pass handed to the store.
     pub cache_hits: usize,
 }
 
@@ -129,8 +130,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
 
         let started = std::time::Instant::now();
         let mut stats = EmbedStats::default();
-        let mut summary =
-            BackfillSummary { candidates: candidates.max(0) as usize, embedded: 0, cache_hits: 0 };
+        let candidates = candidates.max(0) as usize;
         let mut after_id: Option<String> = None;
 
         loop {
@@ -154,14 +154,12 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
             // Inference runs between the unit's steps.
             let computed = embedding.compute(&diff, &mut stats);
-            summary.embedded += computed.len();
             store.store_vectors(embedding, &computed);
             progress.add_embed_done(page_len);
         }
 
-        summary.cache_hits = stats.hits;
         embedding.finish_unit("backfill", &stats, started.elapsed());
-        summary
+        BackfillSummary { candidates, embedded: stats.embedded, cache_hits: stats.hits }
     })
 }
 
@@ -336,6 +334,41 @@ mod tests {
         let mut expected_sorted = expected;
         expected_sorted.sort_unstable();
         assert_eq!(seen, expected_sorted, "every candidate must be visited exactly once");
+    }
+
+    /// `embedded` counts what the model computed and `cache_hits` what the
+    /// cache served, as `EmbedStats` does: a second project over a warm
+    /// cache embeds nothing.
+    ///
+    /// *Control:* count `computed.len()` into `embedded` (hits included) and
+    /// the warm pass reports 3 embedded.
+    #[test]
+    fn embedded_counts_the_models_vectors_and_cache_hits_the_caches() {
+        use crate::embedding::pipeline::test_support::{cache_at, fake_model_dir, fake_pipeline, Counters};
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pass = || {
+            crate::storage::vectors::register_extension();
+            let mut conn = open_conn();
+            apply_diff(
+                &mut conn,
+                &Diff {
+                    upsert_nodes: (0..3)
+                        .map(|i| node(&format!("n{i}"), Some(&format!("does thing {i}")), None))
+                        .collect(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let pipeline = fake_pipeline(&model_dir, Some(cache_at(scratch.path())), &Counters::default());
+            run(&IndexStore::new(conn), &pipeline, &IndexingStatus::structural())
+        };
+
+        let cold = pass();
+        let warm = pass();
+
+        assert_eq!((cold.candidates, cold.embedded, cold.cache_hits), (3, 3, 0), "{cold:?}");
+        assert_eq!((warm.candidates, warm.embedded, warm.cache_hits), (3, 0, 3), "{warm:?}");
     }
 
     /// `is_available() == false` makes the pass return before it ever runs

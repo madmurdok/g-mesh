@@ -167,8 +167,8 @@ pub struct EmbedStats {
 /// produced them.
 ///
 /// The cache's mutex is the innermost lock: it is taken for one batch lookup
-/// or one batch insert, never across inference and never while taking
-/// another lock.
+/// or one batch insert, never across inference or the model's hashing and
+/// never while taking another lock.
 pub struct EmbeddingPipeline {
     config: EmbeddingConfig,
     /// `None`: `default_model_dir(config.model)`.
@@ -428,8 +428,9 @@ impl EmbeddingPipeline {
     /// The cached vector for each key, or `None` when no cache is active. A
     /// failed lookup is an all-miss batch.
     fn cache_lookup(&self, keys: &[Hash], stats: &mut EmbedStats) -> Option<Vec<Option<Vec<f32>>>> {
+        self.open_if_unopened();
         let mut slot = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        let active = self.active_cache(&mut slot)?;
+        let CacheSlot::Active(active) = &mut *slot else { return None };
         match active.cache.lookup(active.model_id, keys, cache::today()) {
             Ok(found) => Some(found),
             Err(err) => {
@@ -468,25 +469,29 @@ impl EmbeddingPipeline {
         }
     }
 
-    /// The open cache, opening it first if this is the first time it is
-    /// needed. `None` for no cache: switched off, no model files to
-    /// fingerprint, another process holding the file right now (tried again
-    /// on the next call), or unusable.
-    fn active_cache<'a>(&self, slot: &'a mut CacheSlot) -> Option<&'a mut ActiveCache> {
-        if let CacheSlot::Unopened(settings) = slot {
-            let settings = settings.take().or_else(CacheSettings::from_global_config);
-            *slot = match settings {
-                None => CacheSlot::Off,
-                Some(settings) => match self.open_cache(&settings) {
-                    Ok(Some(active)) => CacheSlot::Active(active),
-                    Ok(None) => CacheSlot::Off,
-                    Err(()) => CacheSlot::Unopened(Some(settings)),
-                },
-            };
-        }
-        match slot {
-            CacheSlot::Active(active) => Some(active),
-            _ => None,
+    /// Opens the cache if this is the first time it is needed. Opening
+    /// fingerprints the model, which hashes its weights on a cold memo, so it
+    /// runs without the cache's mutex held; the result is installed only if
+    /// no other thread installed one meanwhile. Afterwards the slot is
+    /// `Active`, `Off` (switched off, no model files to fingerprint, or
+    /// unusable), or still `Unopened` (another process held the file; tried
+    /// again on the next call).
+    fn open_if_unopened(&self) {
+        let settings = match &*self.cache.lock().unwrap_or_else(PoisonError::into_inner) {
+            CacheSlot::Unopened(settings) => settings.clone(),
+            _ => return,
+        };
+        let opened = match settings.or_else(CacheSettings::from_global_config) {
+            None => CacheSlot::Off,
+            Some(settings) => match self.open_cache(&settings) {
+                Ok(Some(active)) => CacheSlot::Active(active),
+                Ok(None) => CacheSlot::Off,
+                Err(()) => CacheSlot::Unopened(Some(settings)),
+            },
+        };
+        let mut slot = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*slot, CacheSlot::Unopened(_)) {
+            *slot = opened;
         }
     }
 
@@ -1216,10 +1221,13 @@ mod tests {
     }
 
     /// Another process holding the cache's writer drops this batch's
-    /// inserts and nothing else: indexing stores every vector.
+    /// inserts and nothing else: indexing stores every vector, and the cache
+    /// stays enabled for the batches after it.
     ///
     /// Control: propagate the busy insert (e.g. return no embeddings from
-    /// `compute` when `cache_insert` fails) and the vectors are missing.
+    /// `compute` when `cache_insert` fails) and the vectors are missing;
+    /// drop the busy guard at the top of `recover` (a busy insert then
+    /// switches the cache off) and the next batch inserts nothing.
     #[test]
     fn a_held_cache_writer_still_indexes_every_node() {
         let dir = tempfile::tempdir().unwrap();
@@ -1246,6 +1254,89 @@ mod tests {
         assert_eq!(vector_count(&conn), 4, "indexing must store every vector while the cache is held");
         assert_eq!(stats.cache_errors, 1, "the busy insert is counted");
         assert_eq!(stats.inserted, 0, "the busy batch's inserts are dropped");
+
+        let mut next = EmbedStats::default();
+        pipeline.compute(&diff, &mut next);
+        assert_eq!((next.inserted, next.cache_errors), (4, 0), "the next batch is stored");
+        let mut again = EmbedStats::default();
+        pipeline.compute(&diff, &mut again);
+        assert_eq!((again.hits, again.embedded), (4, 0), "and served from the cache after that");
+    }
+
+    /// A cache that cannot be opened even after moving the file aside (its
+    /// directory is a regular file) is switched off for the process: every
+    /// vector is still stored, and later batches never try the cache again,
+    /// so its notice is logged once.
+    ///
+    /// Control: panic or return nothing from `open_cache` on
+    /// `OpenError::Failed` and the vectors are missing; treat `Failed` like
+    /// `Busy` (leave the slot `Unopened`) and the second batch opens the
+    /// cache once the obstacle is gone.
+    #[test]
+    fn a_cache_that_cannot_be_created_is_off_for_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let settings = cache_at(dir.path());
+        let cache_dir = settings.path.parent().unwrap().to_path_buf();
+        std::fs::write(&cache_dir, "not a directory").unwrap();
+        let diff = diff_of(3);
+        let conn = index_with(&diff);
+
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, Some(settings.clone()), &counters);
+        let mut stats = EmbedStats::default();
+        let computed = pipeline.compute(&diff, &mut stats);
+        pipeline.store(&conn, &computed);
+
+        assert_eq!(vector_count(&conn), 3, "indexing must store every vector without a cache");
+        assert_eq!((stats.texts, stats.embedded, stats.inserted), (3, 3, 0));
+        assert!(
+            matches!(*pipeline.cache.lock().unwrap(), CacheSlot::Off),
+            "the cache is off for the process"
+        );
+
+        std::fs::remove_file(&cache_dir).unwrap();
+        let mut later = EmbedStats::default();
+        pipeline.compute(&diff, &mut later);
+        assert_eq!((later.embedded, later.inserted), (3, 0), "a disabled cache is never retried");
+        assert!(!settings.path.exists(), "no cache file is created after the cache was switched off");
+    }
+
+    /// Opening the cache fingerprints the model's files without holding the
+    /// cache's mutex: while the weights are being read, the mutex is free.
+    /// The weights are a FIFO, so the read blocks until this test writes
+    /// them, and opening the FIFO's write end returns only once the reader
+    /// has it open.
+    ///
+    /// Control: open the cache under the mutex (call `open_cache` from
+    /// inside the locked section of `open_if_unopened`) and `try_lock` fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_model_is_hashed_without_holding_the_cache_mutex() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "unused");
+        let onnx = model_dir.join(crate::embedding::model::ONNX_FILE_NAME);
+        std::fs::remove_file(&onnx).unwrap();
+        let status = std::process::Command::new("mkfifo").arg(&onnx).status().unwrap();
+        assert!(status.success(), "mkfifo failed");
+
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, Some(cache_at(dir.path())), &counters);
+        std::thread::scope(|scope| {
+            let computing = scope.spawn(|| {
+                let mut stats = EmbedStats::default();
+                pipeline.compute(&diff_of(2), &mut stats);
+                stats
+            });
+            let mut weights = std::fs::OpenOptions::new().write(true).open(&onnx).unwrap();
+            let free = pipeline.cache.try_lock().is_ok();
+            weights.write_all(b"weights v1").unwrap();
+            drop(weights);
+            let stats = computing.join().unwrap();
+            assert!(free, "the cache's mutex must be free while the model is being hashed");
+            assert_eq!(stats.inserted, 2, "the cache opened once the weights were read");
+        });
     }
 
     /// A cache held before this process first opens it: the open is retried

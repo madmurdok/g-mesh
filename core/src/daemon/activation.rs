@@ -181,8 +181,12 @@ impl ActivationCtx {
         }));
         match backfill {
             Ok(summary) if summary.candidates > 0 => eprintln!(
-                "g-mesh daemon: embedding backfill - {} of {} candidate nodes embedded, {} from the embedding cache",
-                summary.embedded, summary.candidates, summary.cache_hits
+                "g-mesh daemon: embedding backfill - {} of {} candidate nodes got a vector, {} from the embedding \
+                 cache, {} embedded",
+                summary.cache_hits + summary.embedded,
+                summary.candidates,
+                summary.cache_hits,
+                summary.embedded
             ),
             Ok(_) => {}
             Err(_) => eprintln!(

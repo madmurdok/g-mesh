@@ -170,7 +170,9 @@ fn load_real_pipeline() -> EmbeddingPipeline {
         weights_available(),
         "real model weights are required for this test; run `g-mesh model fetch` first"
     );
-    EmbeddingPipeline::load(&g_mesh::config::EmbeddingConfig::default())
+    // Without the machine-wide embedding cache: these tests count what the
+    // model computes, which a cache warmed by an earlier run would serve.
+    EmbeddingPipeline::load_with_cache(&g_mesh::config::EmbeddingConfig::default(), None)
 }
 
 /// A disabled pipeline (no model loaded, e.g. weights never fetched) must
@@ -432,7 +434,7 @@ fn cached_vectors_are_bit_identical_to_fresh_ones_and_rank_the_same() {
 
     let (warm_conn, warm) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
         .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
-    assert_eq!((warm.embedded, warm.cache_hits), (cold.embedded, cold.embedded), "every vector is a hit");
+    assert_eq!((warm.embedded, warm.cache_hits), (0, cold.embedded), "every vector is a hit");
 
     let uncached = EmbeddingPipeline::load_with_cache(&config, None);
     let (off_conn, off) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&uncached);

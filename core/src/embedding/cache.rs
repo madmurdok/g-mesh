@@ -697,6 +697,62 @@ mod tests {
         other.execute_batch("COMMIT").unwrap();
     }
 
+    /// Holds the writer of the cache at `path` from another connection for
+    /// `hold`, on its own thread. Returns once the writer is held.
+    fn hold_writer(path: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let path = path.to_path_buf();
+        let (held, is_held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        is_held.recv().unwrap();
+        holder
+    }
+
+    /// A writer held for less than the busy timeout: the insert waits for it
+    /// and succeeds.
+    ///
+    /// Control: set `BUSY_TIMEOUT` to zero (or `busy_timeout(Duration::ZERO)`
+    /// in `open_in_place`) and the insert fails with SQLITE_BUSY at once.
+    #[test]
+    fn an_insert_waits_out_a_writer_shorter_than_the_busy_timeout() {
+        let (dir, mut cache) = open_temp();
+        let model = cache.model_id(&[1; 32], 100).unwrap();
+        let holder = hold_writer(&dir.path().join(DIR_NAME).join(FILE_NAME), Duration::from_millis(50));
+
+        let inserted = cache.insert(model, &[(text_hash("fn a()"), &vector(1))], 100);
+
+        holder.join().unwrap();
+        assert_eq!(inserted.unwrap(), 1, "the insert must wait for a 50ms writer");
+    }
+
+    /// A writer held for far longer than the busy timeout: the insert gives
+    /// up after about 250ms, not after rusqlite's 5s default.
+    ///
+    /// Control: drop the `busy_timeout` call in `open_in_place` (rusqlite's
+    /// 5s default then applies) and the insert waits the holder out and
+    /// succeeds.
+    #[test]
+    fn an_insert_gives_up_on_a_writer_longer_than_the_busy_timeout() {
+        let (dir, mut cache) = open_temp();
+        let model = cache.model_id(&[1; 32], 100).unwrap();
+        let holder = hold_writer(&dir.path().join(DIR_NAME).join(FILE_NAME), Duration::from_millis(2500));
+
+        let started = std::time::Instant::now();
+        let inserted = cache.insert(model, &[(text_hash("fn a()"), &vector(1))], 100);
+        let waited = started.elapsed();
+
+        holder.join().unwrap();
+        let err = inserted.expect_err("the insert must give up while the writer is held");
+        assert!(is_busy(&err), "a held writer is contention, not failure: {err:#}");
+        assert!(waited >= BUSY_TIMEOUT / 2, "the insert must wait before giving up, waited {waited:?}");
+        assert!(waited < Duration::from_millis(1500), "the insert waited {waited:?}, past the busy timeout");
+    }
+
     /// Set in a child process to make [`concurrent_writer_child`] act as one
     /// of [`concurrent_writers_share_one_cache`]'s writers:
     /// `<cache path>|<go file>|<writer index>`.
@@ -757,9 +813,9 @@ mod tests {
     /// Four processes writing overlapping keys into one cache at once: none
     /// errors, every key is present exactly once, with its own bytes.
     ///
-    /// Control: drop `busy_timeout` in `open_in_place` (writers then fail
-    /// with SQLITE_BUSY) or `OR IGNORE` in `insert` (overlapping keys then
-    /// fail with a constraint error) and a writer exits non-zero.
+    /// Control: drop `OR IGNORE` in `insert` (overlapping keys then fail
+    /// with a constraint error) and a writer exits non-zero. The busy
+    /// timeout's own controls are the two tests above.
     #[test]
     fn concurrent_writers_share_one_cache() {
         let dir = tempfile::tempdir().unwrap();

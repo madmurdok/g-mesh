@@ -63,8 +63,8 @@ pub struct Outcome {
     /// the pass failed, which costs exactly the edges it was about and is
     /// reported on stderr rather than failing the rebuild.
     pub semantic_pass_ran: bool,
-    /// The embedding backfill pass's own summary: how many vectors it
-    /// produced, and how many of those the embedding cache served.
+    /// The embedding backfill pass's own summary: how many vectors the model
+    /// computed, and how many the embedding cache served instead.
     pub embeddings: backfill::BackfillSummary,
 }
 
@@ -161,8 +161,11 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
     if outcome.embeddings.candidates > 0 {
         let _ = writeln!(
             out,
-            "  embeddings: {} of {} nodes embedded, {} of them from the embedding cache",
-            outcome.embeddings.embedded, outcome.embeddings.candidates, outcome.embeddings.cache_hits,
+            "  embeddings: {} of {} nodes got a vector - {} from the embedding cache, {} embedded",
+            outcome.embeddings.cache_hits + outcome.embeddings.embedded,
+            outcome.embeddings.candidates,
+            outcome.embeddings.cache_hits,
+            outcome.embeddings.embedded,
         );
     }
     if outcome.semantic_pass_ran {
@@ -247,13 +250,13 @@ mod tests {
             daemon_was_running: false,
             summary: BulkIndexSummary::default(),
             semantic_pass_ran: false,
-            embeddings: backfill::BackfillSummary { candidates: 12, embedded: 12, cache_hits: 9 },
+            embeddings: backfill::BackfillSummary { candidates: 12, embedded: 3, cache_hits: 9 },
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
         assert!(
-            rendered.contains("12 of 12 nodes embedded, 9 of them from the embedding cache"),
+            rendered.contains("12 of 12 nodes got a vector - 9 from the embedding cache, 3 embedded"),
             "{rendered}"
         );
     }
