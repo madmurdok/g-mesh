@@ -76,4 +76,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0005 | [Plugin manifest: read once, fail hard, resolve paths at read time](0005-plugin-manifest.md) | Accepted |
 | 0006 | [Language server scan scope: pyright gets the walker's exclude](0006-language-server-scan-scope.md) | Accepted |
 | 0007 | [Embedding cache: machine-wide, keyed by the embedded text and the model's bytes](0007-embedding-cache.md) | Accepted |
-| 0008 | [Workspace reindex: walk into a staging index, swap in only the difference](0008-workspace-reindex-staging-swap.md) | Proposed |
+| 0008 | [Workspace reindex: walk into a staging index, swap in only the difference](0008-workspace-reindex-staging-swap.md) | Accepted |

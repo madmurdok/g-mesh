@@ -1,7 +1,8 @@
 # 0008. Workspace reindex: walk into a staging index, swap in only the difference
 
 ## Status
-Proposed (2026-09-26, GM-425/S1). The owner reviews it before S2.
+Accepted (2026-09-26, GM-425); the owner reviewed the proposal and accepted
+it with the answers recorded under "Owner's answers" at the end.
 
 ## Context
 A settled edit to a `watch_files` entry (`Cargo.toml`, `go.mod`) reindexes
@@ -267,18 +268,16 @@ start completes it. Control for the probe: the before build must show the
   asserts every table.
 - An `L` file edit still waits for the whole reindex, as today.
 
-## Open questions for the owner
-1. **Semantic pass into staging before the swap?** Recommend no: the
-   semantic-edge rule (section 3) already keeps the old semantic edges
-   serving through the pass, while running the pass into staging would keep
-   the exclusive lock (edits to `L` files wait) for the pass's whole
-   duration, or need edits queued (`daemon/lifecycle.rs:354`).
-2. **Worst-case swap hold** (crate rename, every id changes, ~1-3s): accept,
-   or split the swap into chunks and give up atomicity for that case?
-   *Recommend: accept; rare, and atomicity is the point.*
-3. **`pending_reindex` as a new table** (no schema bump) vs a
-   `language_state` column (schema bump, wipes every index on upgrade)?
-   *Recommend: the new table.*
-4. **Retry policy** for a reindex that keeps failing (e.g. an unbuilt
-   plugin): re-run on every start forever? *Recommend: re-run on each
-   start, report in status, no backoff; the live graph stays usable.*
+## Owner's answers
+1. The semantic pass is not run into staging; it runs after the swap, and
+   the semantic-edge rule (section 3) keeps the old semantic edges serving
+   until it replaces them.
+2. The worst-case swap hold (crate rename, ~1-3s) is accepted; atomicity is
+   kept.
+3. `pending_reindex` is a new table; no schema-version bump.
+4. A failed reindex is retried on each start with no backoff and reported
+   in `g-mesh status`; the live graph stays usable meanwhile.
+
+Follow-ups filed separately: telling callers which files' semantic edges
+are still pending after a swap, and measuring where a semantic pass's time
+goes.
