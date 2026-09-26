@@ -296,7 +296,7 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// into, beyond [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`] - virtual
 /// environments and their caches, never source in any Python project.
 ///
-/// `node_modules` joined the list in GM-299 and is the one entry that is not
+/// `node_modules` is the one entry that is not
 /// a Python artefact. A Python project may perfectly well have one - a web
 /// application with a JavaScript front end - and it is never that project's
 /// own Python source. What forced the question is that `crate::semantic`'s
@@ -307,7 +307,7 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// project. The same reasoning as `site-packages`, arriving through a
 /// different package manager.
 ///
-/// This constant is the one list in code (GM-418): `main.rs`'s
+/// This constant is the one list in code: `main.rs`'s
 /// [`g_mesh_plugin_sdk::PluginSpec::exclude_dirs`] fallback, the semantic
 /// tier's `walk_scope` and `tests/conformance.rs` all take it from here.
 /// The one copy that cannot be derived is `plugin.toml`'s
