@@ -44,12 +44,20 @@ Facts that shape the options:
   `multi-language-plugins.md`), so one language's graph links on its own.
 - A vector is a pure function of the embedded text and the model
   (ADR 0007 section 1).
-- The semantic pass writes no rows of its own: it answers with a diff whose
-  edges carry the ids the structural pass gave them, and `apply_diff`
-  upgrades each in place - `source` `syntactic` -> `semantic`, `resolved`
-  -> true, possibly a better `toId` (`watcher/apply.rs:171-175`). So a
-  structural walk emits the *downgraded* version of every edge the pass has
-  already upgraded in live.
+- The semantic pass answers with an ordinary diff (`watcher/apply.rs`
+  `apply_semantic_pass`), and what it holds depends on the tier. The
+  TypeScript tier re-sends a structural edge under its own id with
+  `source = 'semantic'`, an upgrade in place. The SDK's LSP bridge
+  (rust-analyzer, pyright; `plugins/sdk/src/lsp/bridge.rs` `Answers`) and
+  the Go tier (`plugins/go/semantic.go` `semanticDiff`) never do: they add
+  placeholder nodes and semantic edges onto them under ids no structural
+  walk emits, which linking then points at their targets, and they retract
+  (`deleteEdgeIds`) structural edges they contradict (Go: a conversion
+  mistaken for a call). Every tier retracts its own earlier edges only by
+  the ids it remembers emitting in its own process, so after a restart
+  nothing retracts them. A whole-project pass re-sends every edge it stands
+  behind, not a diff against that memory: the upserts are the full answer,
+  only the retractions are a diff.
 
 ### Swap cost, measured
 A copy of the g-mesh index (13,416 nodes; rust: 11,226 nodes, 28,823 edges,
@@ -81,9 +89,9 @@ We will stop deleting up front. A workspace reindex of language `L`:
 3. **Plans** (no live lock): the staging connection `ATTACH`es the live file
    read-only (WAL gives it a snapshot) and writes a plan into staging
    tables: live node/edge ids of `L` absent from staging (delete); staged
-   rows that are new or differ (upsert), **except an edge whose id is in
-   both and whose live row is `source = 'semantic'`: live's row is kept
-   (the semantic-edge rule, section 3)**; containers likewise;
+   rows that are new or differ (upsert), **except the outgoing edges of an
+   unchanged node, which come from live (the unchanged-node rule,
+   section 3)**; containers likewise;
    `declarations`/`placeholder_targets` replaced wholesale for every
    upserted or deleted node, as `apply_diff` does (`write.rs:321-325`).
 4. **Embeds only what changed** (no lock): upserted nodes whose embedded
@@ -109,7 +117,7 @@ swap time, not from the plan, so a vector it adds meanwhile is either kept
 
 The swap's hold scales with the change, not the language: a version bump
 with unchanged code writes `language_state` and the meta roll-ups only
-(the semantic-edge rule is what keeps that plan empty); a crate rename
+(the unchanged-node rule is what keeps that plan empty); a crate rename
 rewrites the crate (worst case the full swap, ~1-3s). S2 measures it via rusqlite, S4 on the probe.
 
 **Rejected**
@@ -144,24 +152,47 @@ unlinked placeholders are ordinary rows and go through the same diff.
   `watch_files` and never reaches this path). It still has to run even when
   the code did not change: a manifest edit can move where calls into
   dependencies resolve.
-- **Semantic-edge rule.** The swap never downgrades a live semantic edge
-  to its structural twin: for an edge id present in both, live's
-  `source = 'semantic'` row wins. Queries keep the previous pass's edges
-  until the new pass upgrades them in place, instead of seeing
-  structural-only edges for the pass's duration (~50-105s for rust on
-  g-mesh). What remains, by case:
-  - node deleted: its edges are deleted with it (their ids are absent
-    from staging);
-  - node new: structural edges only, until the pass reaches it;
-  - edge whose structural target changed: its id changes, so it is a
-    delete + insert and gets the structural edge until the pass;
-  - edge id unchanged but the semantic answer would now differ (e.g. a
-    dependency moved): live keeps the old semantic target until the pass
-    rewrites it - bounded by the pass, and only where the answer moved.
-- S2 checks whether a pass can also *add* edges with no structural twin.
-  If it can, those are live-only ids and the plan would delete them; the
-  rule then extends to "keep a live-only semantic edge whose endpoints both
-  survive", and test 8 covers it.
+- **Unchanged-node rule.** A node is *unchanged* when it is in both
+  indexes with every `nodes` column equal (`id`, `kind`, `name`,
+  `qualifiedName`, `filePath`, the four range columns, `signature`,
+  `visibility`, `visibilityContainer`, `docComment`, `language`,
+  `nativeKind`, `hasSyntaxErrors`, `container`) and its `declarations` and
+  `placeholder_targets` rows equal: exactly "in both and not upserted". An
+  unchanged node keeps **all** its live outgoing edges - structural,
+  semantic, and the pass's retractions (a staged structural edge from it
+  that live lacks is not inserted). Exception: a live edge whose target
+  does not exist after the swap is deleted, and the staged edges from that
+  node of the same kind, which live lacks or holds only with a vanished
+  target, are taken in its place. A changed or new node gets exactly
+  staging's outgoing edges; the pass after the swap refines them.
+  Why these columns: every edge a node emits describes a site inside its
+  range, so a different range, signature or container means different
+  sites or a different scope to resolve them in. A same-size body edit
+  leaves the row equal, but then the file's bytes differ from its
+  `indexed_files` baseline, which the swap does not touch, so the watcher
+  event waiting on the reindex lock or `ensure_fresh` reparses the file and
+  replaces its edges; the reindex does not own that correction. What
+  remains, by case:
+  - node deleted: its edges are deleted with it;
+  - node new or changed: structural edges only, until the pass reaches it;
+  - unchanged node whose live edge's target was deleted: that edge goes,
+    the walk's edge of the same kind replaces it, until the pass;
+  - unchanged node whose structural link would now resolve differently
+    (a dependency added or moved, same node rows): live keeps the old
+    answer until the pass, or a reparse of that file, rewrites it.
+- **Sweep.** After a *complete whole-project* semantic pass for a
+  language, core deletes that language's `source = 'semantic'` edges the
+  pass did not re-send (`watcher/apply.rs` `sweep_semantic_edges`): what
+  an earlier process emitted and no process retracted. An incomplete pass
+  (a partial answer) and a per-file pass (one file's answer) sweep
+  nothing. Placeholder nodes the swept edges pointed at stay, as every
+  linked-away placeholder does (`graph/symbol_links.rs`, "Why the
+  placeholder is kept"); `graph::queries` already hides them.
+  Caveat: the sweep trusts "complete". The TypeScript plugin never reports
+  a pass incomplete, so a pass whose checker failed part-way sweeps the
+  upgrades it did not repeat, and an upgraded edge is a structural edge:
+  it is gone, not downgraded, until that file is reparsed. The Go tier
+  reports incomplete only when every module fails to load.
 - Embeddings: before the swap only the changed texts are embedded (step 4),
   so with the cache off an unchanged tree embeds nothing (today: 5,818
   texts, 687s, GM-424 arm 2 control). `search_code` sees old vectors until the swap, then
@@ -190,9 +221,10 @@ Queries see the complete old graph of `L` or the complete new one: the
 switch is one transaction on the connection they read through. Removed
 symbols disappear at the swap; no duplicate is ever visible (staging is
 another file; the swap deletes before it upserts). Semantic edges of
-surviving nodes stay as they were until the pass replaces them; the only
-transient states are the per-case ones in section 3, limited to what
-changed.
+unchanged nodes stay as they were, the pass's retractions included, until
+the pass replaces them; the only transient states are the per-case ones in
+section 3, limited to what changed. Semantic edges no complete pass stands
+behind any more do not outlive the next complete whole-project pass.
 
 ### 6. Scope
 Fixed here: the workspace reindex, and the meta roll-ups (section 4).
@@ -237,12 +269,23 @@ and `:963`; the pause is `G_MESH_BULK_INDEX_HOLD_FILE`
 7. *Swap writes nothing for an unchanged tree*: `total_changes()` across
    the swap equals the `language_state`/`meta` rows only, with live's edges
    already upgraded by a semantic pass. Control: full swap -> thousands.
-8. *Semantic edges survive the swap*: index, run a (fake) semantic pass
-   that upgrades edge `e1` and retargets it; reindex with unchanged code
-   and hold before the new pass: `e1` is still `semantic` with the
-   retargeted `toId`. A node whose code changed gets its structural edge.
-   Control: drop the semantic-edge rule from the plan -> `e1` reads
-   `syntactic` while held.
+8. *Unchanged node keeps its live edges*: index, run a (fake) semantic
+   pass that rewrites `e1` onto another target, adds `sem` and retracts
+   the structural `r`, all from an unchanged node; reindex with unchanged
+   code and hold before the new pass: `e1` and `sem` read as the pass left
+   them, `r` stays absent. Control: leave the unchanged set empty -> `e1`
+   is structural again, `sem` gone, `r` back.
+9. *Changed node takes the walk's edges*: a node whose signature changed
+   gets its new structural edge and loses the pass's edges. Control: count
+   every node in both as unchanged -> the new edge is missing.
+10. *Edge into a dropped node is replaced*: an unchanged node's edge into a
+   node the walk dropped goes, and its new edge of the same kind comes in.
+   Control: drop the replacement branch -> the new edge is missing.
+11. *Sweep*: a complete whole-project pass deletes a semantic edge of its
+   language it did not re-send and keeps its structural edges and another
+   language's semantic ones; an incomplete whole-project pass and a
+   per-file pass delete nothing. Controls: remove the sweep -> the stale
+   edge survives; ignore `incomplete` or the scope -> it is gone.
 `delete_language_rows`' own tests (`:380`, `:472`) go with it if nothing
 else calls it; S2 says which.
 
@@ -267,16 +310,28 @@ start completes it. Control for the probe: the before build must show the
   list every `L`-keyed table (a table missed keeps stale rows), so test 2
   asserts every table.
 - An `L` file edit still waits for the whole reindex, as today.
+- Stale semantic edges from an earlier process last until the next complete
+  whole-project pass of their language, not forever; a pass's retracted
+  structural edges no longer come back at a swap.
+- A TypeScript pass that fails part-way without saying so costs the
+  upgraded edges it did not repeat (section 3, Sweep).
 
 ## Owner's answers
 1. The semantic pass is not run into staging; it runs after the swap, and
-   the semantic-edge rule (section 3) keeps the old semantic edges serving
+   the unchanged-node rule (section 3) keeps the old semantic edges serving
    until it replaces them.
 2. The worst-case swap hold (crate rename, ~1-3s) is accepted; atomicity is
    kept.
 3. `pending_reindex` is a new table; no schema-version bump.
 4. A failed reindex is retried on each start with no backoff and reported
    in `g-mesh status`; the live graph stays usable meanwhile.
+5. (2026-09-26, after S2 found that the LSP bridge and Go tiers add edges
+   rather than upgrade them) An unchanged node keeps all its live outgoing
+   edges, retractions included, except an edge into a vanished target,
+   which the walk's edge replaces; changed and new nodes take staging's.
+   A complete whole-project pass sweeps its language's semantic edges it
+   did not re-send. This replaces "keep a live semantic edge whose
+   endpoints both survive".
 
 Follow-ups filed separately: telling callers which files' semantic edges
 are still pending after a swap, and measuring where a semantic pass's time
