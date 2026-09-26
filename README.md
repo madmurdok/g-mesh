@@ -677,6 +677,17 @@ that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
 would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
 installer, not to the binary.
 
+Embedding vectors are also cached machine-wide, in
+`~/.g-mesh/embedding-cache/cache.sqlite` (it does follow `G_MESH_HOME`), keyed
+by the exact text embedded and a fingerprint of the model's files, so a
+reindex — of any project on the machine — embeds only text the cache has not
+seen. The global `config.toml` sets it with `[embeddingCache] enabled` and
+`maxSizeMb` (default 512; the least recently used vectors go first once it is
+exceeded), and `G_MESH_EMBEDDING_CACHE=off` bypasses it for one run. A cache
+file that turns out unreadable is moved aside to `cache.sqlite.corrupt-<time>`
+and replaced; it never fails indexing. Design and trade-offs:
+[`docs/adr/0007-embedding-cache.md`](docs/adr/0007-embedding-cache.md).
+
 One constraint comes with it: the daemon's socket lives under that root, and a
 Unix domain socket address holds at most 104 bytes of path on macOS (108 on
 Linux) — so a `G_MESH_HOME` nested deeply enough pushes
