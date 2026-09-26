@@ -238,6 +238,7 @@ use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
+use crate::embedding::EmbedStats;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 
@@ -260,7 +261,8 @@ pub(crate) fn run(
     // up the bulk-index fact - see this module's doc comment ("Decision 2")
     // for why this whole sequence shares `PluginSupervisor`'s own
     // serialization lock instead of a second one of its own.
-    supervisor.with_exclusive_access(|process| -> Result<()> {
+    let started = std::time::Instant::now();
+    let embed_stats = supervisor.with_exclusive_access(|process| -> Result<EmbedStats> {
         if let Some(process) = process {
             if let Err(err) = process.notify_workspace_changed(changed_file) {
                 eprintln!(
@@ -285,8 +287,14 @@ pub(crate) fn run(
         })?;
 
         store.relink_after_language_reindex()?;
-        Ok(())
+        Ok(ctx.embed_stats)
     })?;
+    // Outside the locked phase: it may trim the embedding cache.
+    registry.embedding().finish_unit(
+        &format!("workspace-reindex {}", manifest.language),
+        &embed_stats,
+        started.elapsed(),
+    );
 
     // The unlocked phase: the semantic pass, restricted to this one language
     // - see this module's doc comment ("Decision 6") for why this calls
@@ -337,10 +345,10 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use rusqlite::params;
+    use rusqlite::{params, OptionalExtension};
 
     use crate::storage::write::delete_language_rows;
 
@@ -949,5 +957,106 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].0, "alpha");
         assert!(failures[0].1.contains("the disk is full"), "{failures:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // The embedding cache through a real workspace reindex, over the fake
+    // model in `embedding::pipeline::test_support`.
+    // -----------------------------------------------------------------
+
+    use crate::embedding::pipeline::test_support::{
+        cache_at, fake_model_dir, fake_pipeline, fake_vector, Counters,
+    };
+
+    /// `alpha` over the fake model and a cache of its own; returns the
+    /// scratch directory holding both, which must outlive the registry.
+    fn alpha_registry_embedding(
+        counters: &Counters,
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let scratch = tempfile::tempdir().expect("failed to create a model and cache root");
+        test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pipeline = fake_pipeline(&model_dir, Some(cache_at(scratch.path())), counters);
+        let registry =
+            PluginRegistry::new(project.path(), state_dir, discovered, None, None, Arc::new(pipeline));
+        let conn = test_plugin::empty_index();
+        schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
+        (project, plugins, scratch, registry, conn)
+    }
+
+    fn give_text(project: &Path, node: &str, doc: &str) {
+        std::fs::write(project.join(format!(".{node}.doc")), doc).unwrap();
+        std::fs::write(project.join(format!(".{node}.sig")), format!("fn {node}()")).unwrap();
+    }
+
+    fn stored_vector(conn: &IndexStore, node_id: &str) -> Option<Vec<u8>> {
+        conn.lock()
+            .unwrap()
+            .query_row("SELECT embedding FROM vectors WHERE nodeId = ?1", [node_id], |row| row.get(0))
+            .optional()
+            .unwrap()
+    }
+
+    fn packed(vector: &[f32]) -> Vec<u8> {
+        vector.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    /// A workspace reindex that changes no text embeds nothing: the rows it
+    /// deletes and re-walks get their vectors back from the cache.
+    ///
+    /// Control: disable the lookup in `EmbeddingPipeline::compute` (treat
+    /// `cache_lookup` as always `None`) and the second reindex makes 2 calls.
+    #[test]
+    fn a_workspace_reindex_of_unchanged_symbols_embeds_nothing() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_registry_embedding(&counters);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        give_text(project.path(), "alpha-n2", "Does the second thing.");
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        assert_eq!(counters.embeds(), 2, "a cold cache embeds both nodes");
+        let before = (stored_vector(&conn, "alpha-n1"), stored_vector(&conn, "alpha-n2"));
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the second reindex succeeds");
+
+        assert_eq!(counters.embeds(), 2, "unchanged texts must all be cache hits");
+        let after = (stored_vector(&conn, "alpha-n1"), stored_vector(&conn, "alpha-n2"));
+        assert!(after.0.is_some() && after.1.is_some(), "both vectors are back after the re-walk");
+        assert_eq!(after, before, "a cached vector is the same bytes as the one it replaces");
+    }
+
+    /// Editing one doc comment re-embeds exactly that node, and its stored
+    /// vector is the fresh embed of the new text.
+    ///
+    /// Control: key the cache on the node id instead of the text (e.g. hash
+    /// `node.id` in `compute`) and the edit makes 0 calls and leaves the stale
+    /// vector.
+    #[test]
+    fn a_changed_doc_comment_is_the_only_text_embedded_again() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_registry_embedding(&counters);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        give_text(project.path(), "alpha-n2", "Does the second thing.");
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let old_n1 = stored_vector(&conn, "alpha-n1");
+        let old_n2 = stored_vector(&conn, "alpha-n2");
+
+        give_text(project.path(), "alpha-n1", "Does the first thing, differently.");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the second reindex succeeds");
+
+        assert_eq!(counters.embeds(), 3, "exactly one text changed, so exactly one more call");
+        let new_n1 = stored_vector(&conn, "alpha-n1").expect("the edited node has a vector");
+        assert_ne!(Some(new_n1.clone()), old_n1, "the edited node's vector changes");
+        assert_eq!(new_n1, packed(&fake_vector("Does the first thing, differently.\n\nfn alpha-n1()")));
+        assert_eq!(stored_vector(&conn, "alpha-n2"), old_n2, "the untouched node keeps its vector");
     }
 }

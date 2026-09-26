@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
 use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
-use g_mesh::embedding::{default_model_dir, EmbeddingModel, EmbeddingPipeline};
+use g_mesh::embedding::{default_model_dir, CacheSettings, EmbeddingModel, EmbeddingPipeline};
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -71,10 +71,15 @@ struct Project {
 
 impl Project {
     fn new() -> Self {
+        Self::with_source(FIXTURE)
+    }
+
+    /// A project whose `src/lib.ts` is `source`.
+    fn with_source(source: &str) -> Self {
         let project = Self { dir: tempfile::tempdir().expect("failed to create a temp project root") };
         let path = project.root().join("src/lib.ts");
         std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create the fixture directory");
-        std::fs::write(&path, FIXTURE).expect("failed to write the fixture");
+        std::fs::write(&path, source).expect("failed to write the fixture");
         project
     }
 
@@ -349,4 +354,97 @@ fn the_stored_vector_matches_embedding_the_doc_comment_and_signature_directly() 
     let stored: Vec<f32> = stored.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
 
     assert_eq!(stored, expected, "the stored vector must be exactly the model's output for doc+signature");
+}
+
+/// Twelve documented functions, for comparing whole indexes' vectors.
+const MANY_DOCUMENTED_FUNCTIONS: &str = r#"
+/** Reads a file from disk and returns its contents as a string. */
+export function readFile(path: string): string { return ""; }
+/** Writes a string to a file, replacing whatever was there. */
+export function writeFile(path: string, text: string): void {}
+/** Parses a JSON document into a plain object. */
+export function parseJson(text: string): unknown { return null; }
+/** Sums every number in a list. */
+export function sum(items: number[]): number { return 0; }
+/** Sorts users by their last login time, newest first. */
+export function sortUsersByLogin(users: string[]): string[] { return users; }
+/** Opens a TCP connection to the given host and port. */
+export function connect(host: string, port: number): void {}
+/** Retries an operation with exponential backoff. */
+export function retry(attempts: number): void {}
+/** Hashes a password with a random salt. */
+export function hashPassword(password: string): string { return ""; }
+/** Renders a date as an ISO-8601 string. */
+export function formatDate(date: Date): string { return ""; }
+/** Splits a path into its directory and file name. */
+export function splitPath(path: string): string[] { return []; }
+/** Counts the words in a paragraph of text. */
+export function countWords(text: string): number { return 0; }
+/** Removes duplicate entries from a list, keeping the first of each. */
+export function unique(items: string[]): string[] { return items; }
+"#;
+
+fn vectors_by_name(conn: &Connection) -> HashMap<String, Vec<u8>> {
+    let mut stmt = conn
+        .prepare("SELECT n.qualifiedName, v.embedding FROM vectors v JOIN nodes n ON n.id = v.nodeId")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The ten nearest nodes to `query`, ranked the way `search_code` ranks
+/// them (`1 - vec_distance_cosine`, highest first), with each score's bits.
+fn top_ten(conn: &Connection, query: &[f32]) -> Vec<(String, u64)> {
+    let packed: Vec<u8> = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.qualifiedName, (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
+             FROM vectors v JOIN nodes n ON n.id = v.nodeId ORDER BY score DESC, n.qualifiedName LIMIT 10",
+        )
+        .unwrap();
+    stmt.query_map([packed], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?.to_bits())))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The assumption the embedding cache rests on: a vector served from the
+/// cache is bit-for-bit the vector the model computes, so an index filled
+/// from a warm cache, one filled with the cache off and one filled cold are
+/// indistinguishable - down to `search_code`'s ranking and scores.
+///
+/// Control: flip one mantissa bit in `embedding::cache`'s decoder (e.g. XOR
+/// the decoded value's bits with 1) and the warm index's vectors differ.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn cached_vectors_are_bit_identical_to_fresh_ones_and_rank_the_same() {
+    assert!(weights_available(), "real model weights are required for this test");
+    let config = g_mesh::config::EmbeddingConfig::default();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = || Some(CacheSettings::new(cache_dir.path().join("cache.sqlite"), 512));
+
+    let (cold_conn, cold) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
+        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    assert_eq!(cold.cache_hits, 0, "a new cache has nothing to serve");
+    assert!(cold.embedded >= 12, "every documented function is embedded: {cold:?}");
+
+    let (warm_conn, warm) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
+        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    assert_eq!((warm.embedded, warm.cache_hits), (cold.embedded, cold.embedded), "every vector is a hit");
+
+    let uncached = EmbeddingPipeline::load_with_cache(&config, None);
+    let (off_conn, off) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&uncached);
+    assert_eq!((off.embedded, off.cache_hits), (cold.embedded, 0));
+
+    let fresh = vectors_by_name(&off_conn);
+    assert_eq!(fresh.len(), cold.embedded);
+    assert_eq!(vectors_by_name(&warm_conn), fresh, "cached vectors must be byte-identical to fresh ones");
+    assert_eq!(vectors_by_name(&cold_conn), fresh, "a cold-cache run stores what an uncached run stores");
+
+    let query = uncached.embed_query("read the contents of a file").expect("the model embeds the query");
+    let ranking = top_ten(&off_conn, &query);
+    assert_eq!(ranking.len(), 10);
+    assert_eq!(top_ten(&warm_conn, &query), ranking, "search ranks and scores must not depend on the cache");
 }

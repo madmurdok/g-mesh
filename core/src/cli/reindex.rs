@@ -63,6 +63,9 @@ pub struct Outcome {
     /// the pass failed, which costs exactly the edges it was about and is
     /// reported on stderr rather than failing the rebuild.
     pub semantic_pass_ran: bool,
+    /// The embedding backfill pass's own summary: how many vectors it
+    /// produced, and how many of those the embedding cache served.
+    pub embeddings: backfill::BackfillSummary,
 }
 
 /// Rebuilds the index for the project the current directory belongs to.
@@ -130,9 +133,14 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // "strictly worse than a zero-config cold start" outcome this module's
     // own doc comment already rules out for the semantic pass.
     let progress = IndexingStatus::structural();
-    backfill::run(&conn, &embedding_pipeline, &progress);
+    let embeddings = backfill::run(&conn, &embedding_pipeline, &progress);
 
-    Ok(Outcome { daemon_was_running: stop_outcome.stopped_anything(), summary, semantic_pass_ran })
+    Ok(Outcome {
+        daemon_was_running: stop_outcome.stopped_anything(),
+        summary,
+        semantic_pass_ran,
+        embeddings,
+    })
 }
 
 /// Renders an outcome as the text the command prints.
@@ -150,6 +158,13 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         outcome.summary.linked_imports,
         outcome.summary.linked_symbols,
     );
+    if outcome.embeddings.candidates > 0 {
+        let _ = writeln!(
+            out,
+            "  embeddings: {} of {} nodes embedded, {} of them from the embedding cache",
+            outcome.embeddings.embedded, outcome.embeddings.candidates, outcome.embeddings.cache_hits,
+        );
+    }
     if outcome.semantic_pass_ran {
         let _ = writeln!(out, "  semantic: pass complete over what the walk could not resolve");
     }
@@ -180,6 +195,7 @@ mod tests {
                 linked_symbols: 1,
             },
             semantic_pass_ran: true,
+            embeddings: backfill::BackfillSummary::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -195,6 +211,7 @@ mod tests {
             daemon_was_running: false,
             summary: BulkIndexSummary::default(),
             semantic_pass_ran: false,
+            embeddings: backfill::BackfillSummary::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
@@ -215,10 +232,29 @@ mod tests {
                 linked_symbols: 0,
             },
             semantic_pass_ran: false,
+            embeddings: backfill::BackfillSummary::default(),
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
 
         assert!(rendered.contains("3 unreadable line(s) were skipped"), "{rendered}");
+    }
+
+    /// Control: drop the embeddings line from `render` and this fails.
+    #[test]
+    fn the_embedding_pass_reports_how_many_vectors_came_from_the_cache() {
+        let outcome = Outcome {
+            daemon_was_running: false,
+            summary: BulkIndexSummary::default(),
+            semantic_pass_ran: false,
+            embeddings: backfill::BackfillSummary { candidates: 12, embedded: 12, cache_hits: 9 },
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(
+            rendered.contains("12 of 12 nodes embedded, 9 of them from the embedding cache"),
+            "{rendered}"
+        );
     }
 }

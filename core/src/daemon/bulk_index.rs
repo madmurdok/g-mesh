@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
@@ -89,6 +89,9 @@ pub(crate) struct WalkContext<'a> {
     /// fills the vectors afterwards); `Some` for
     /// `daemon::workspace_reindex`'s per-language re-walk.
     pub(crate) embedding: Option<&'a EmbeddingPipeline>,
+    /// What `embedding` did across every batch of this walk, for the caller
+    /// to report with `EmbeddingPipeline::finish_unit`.
+    pub(crate) embed_stats: EmbedStats,
     /// The daemon's walk counters; `None` when nobody is waiting on them.
     pub(crate) progress: Option<&'a IndexingStatus>,
     pub(crate) summary: BulkIndexSummary,
@@ -104,6 +107,7 @@ impl<'a> WalkContext<'a> {
         Self {
             store,
             embedding: None,
+            embed_stats: EmbedStats::default(),
             progress: None,
             summary: BulkIndexSummary::default(),
             walked_files: None,
@@ -154,6 +158,7 @@ pub fn run_with_progress(
     // Taken before the first plugin is spawned, so no plugin can have read a
     // file before it - `staleness::record_walk_baselines` relies on that.
     let walk_started = std::time::SystemTime::now();
+    let walk_clock = std::time::Instant::now();
     let mut ctx =
         WalkContext { embedding, progress, walked_files: Some(BTreeSet::new()), ..WalkContext::new(conn) };
     for manifest in manifests {
@@ -168,8 +173,11 @@ pub fn run_with_progress(
             progress.mark_language_done();
         }
     }
-    let WalkContext { mut summary, walked_files, .. } = ctx;
+    let WalkContext { mut summary, walked_files, embed_stats, .. } = ctx;
     let walked_files = walked_files.unwrap_or_default();
+    if let Some(embedding) = embedding {
+        embedding.finish_unit("bulk-walk", &embed_stats, walk_clock.elapsed());
+    }
 
     // Once, after every language's stream: an import links only to a file
     // that is already a node, and a cross-file usage only once every language
@@ -390,12 +398,13 @@ fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContex
 /// Commits one batch and empties it. Embedding inference runs first, outside
 /// the store; the commit and the vector store are then one step of the walk's
 /// unit, so nothing inside the hold scales with inference.
-fn commit(store: &mut Writer<'_>, batch: &mut Diff, ctx: &WalkContext<'_>) -> Result<()> {
+fn commit(store: &mut Writer<'_>, batch: &mut Diff, ctx: &mut WalkContext<'_>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
     let embedding = ctx.embedding;
-    let computed = embedding.map(|embedding| embedding.compute(batch)).unwrap_or_default();
+    let computed =
+        embedding.map(|embedding| embedding.compute(batch, &mut ctx.embed_stats)).unwrap_or_default();
     store.commit_batch(batch, embedding.map(|embedding| (embedding, computed.as_slice())))?;
     *batch = Diff::default();
     Ok(())

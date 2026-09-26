@@ -49,7 +49,7 @@
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
 
@@ -88,8 +88,11 @@ pub struct BackfillSummary {
     /// necessarily how many it ended up embedding (a node can fail inference,
     /// or be deleted mid-pass by a concurrent edit).
     pub candidates: usize,
-    /// Nodes an embedding was actually computed and stored for.
+    /// Nodes a vector was produced for and handed to the store, whether
+    /// computed by the model or served from the embedding cache.
     pub embedded: usize,
+    /// How many of `embedded` came from the embedding cache.
+    pub cache_hits: usize,
 }
 
 /// Fills in every `vectors` row this project's graph is currently missing.
@@ -124,7 +127,10 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         };
         progress.set_embed_total(candidates.max(0) as u64);
 
-        let mut summary = BackfillSummary { candidates: candidates.max(0) as usize, embedded: 0 };
+        let started = std::time::Instant::now();
+        let mut stats = EmbedStats::default();
+        let mut summary =
+            BackfillSummary { candidates: candidates.max(0) as usize, embedded: 0, cache_hits: 0 };
         let mut after_id: Option<String> = None;
 
         loop {
@@ -147,12 +153,14 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
             let diff =
                 Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
             // Inference runs between the unit's steps.
-            let computed = embedding.compute(&diff);
+            let computed = embedding.compute(&diff, &mut stats);
             summary.embedded += computed.len();
             store.store_vectors(embedding, &computed);
             progress.add_embed_done(page_len);
         }
 
+        summary.cache_hits = stats.hits;
+        embedding.finish_unit("backfill", &stats, started.elapsed());
         summary
     })
 }
