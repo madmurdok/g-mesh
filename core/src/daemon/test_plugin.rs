@@ -334,6 +334,16 @@ fn install_inner(
     dir
 }
 
+/// Adds `semantic_sweep = true` to a semantic-pass-capable plugin's
+/// `[plugin.capabilities]`. Takes effect at the next `discover`.
+pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest sweeps");
+    let swept = manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_sweep = true\n");
+    fs::write(&path, swept).expect("failed to write the fake plugin's manifest");
+}
+
 /// Every pid this plugin directory has ever been spawned as, oldest first.
 /// Empty (rather than a panic) before the first spawn - "never spawned" is a
 /// perfectly ordinary thing for a test to assert.

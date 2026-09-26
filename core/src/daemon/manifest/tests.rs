@@ -472,6 +472,7 @@ extensions = [".py"]
 
     assert_eq!(manifest.capabilities, Capabilities::default());
     assert!(!manifest.capabilities.semantic_pass);
+    assert!(!manifest.capabilities.semantic_sweep);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.workspace, WorkspaceConfig::default());
@@ -503,6 +504,7 @@ extensions = [".go"]
 
 [plugin.capabilities]
 semantic_pass = true
+semantic_sweep = true
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
 
@@ -518,6 +520,7 @@ entry_points = ["lib.rs", "main.rs", "mod.rs"]
     let manifest = read_manifest(&dir).unwrap();
 
     assert!(manifest.capabilities.semantic_pass);
+    assert!(manifest.capabilities.semantic_sweep);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Resolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
 
@@ -573,6 +576,8 @@ semantic_pass = true
     let manifest = read_manifest(&dir).unwrap();
 
     assert!(manifest.capabilities.semantic_pass);
+    // A plugin that runs a semantic pass is not swept unless it says so.
+    assert!(!manifest.capabilities.semantic_sweep);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
 }
@@ -976,6 +981,9 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     // carries the capabilities, not just the fields this test already
     // checked before this task.
     assert!(manifest.capabilities.semantic_pass);
+    // Its checker never reports a pass incomplete, so a sweep could delete
+    // upgraded structural edges a pass stopped short of.
+    assert!(!manifest.capabilities.semantic_sweep);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);

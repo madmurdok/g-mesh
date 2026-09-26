@@ -1368,7 +1368,7 @@ impl PluginProcess {
                 reader,
                 writer,
                 conn,
-                &self.manifest.language,
+                self.manifest.capabilities.semantic_sweep.then_some(self.manifest.language.as_str()),
                 file_paths,
                 id,
                 embedding,

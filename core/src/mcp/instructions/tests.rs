@@ -137,6 +137,7 @@ fn bridge_semantic_pre_pass(language: &str) -> PresentLanguage {
         language: language.to_string(),
         capabilities: Capabilities {
             semantic_pass: true,
+            semantic_sweep: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
         },
@@ -458,6 +459,7 @@ fn worst_case_present() -> Vec<PresentLanguage> {
             language: "go".to_string(),
             capabilities: Capabilities {
                 semantic_pass: true,
+                semantic_sweep: false,
                 receiver_calls: ReceiverCallResolution::Resolved,
                 receiver_calls_structural: ReceiverCallResolution::Unresolved,
             },

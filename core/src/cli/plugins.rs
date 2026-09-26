@@ -568,6 +568,7 @@ extensions = [".{language}"]
                 status: PluginStatus::Bundled,
                 capabilities: Capabilities {
                     semantic_pass: true,
+                    semantic_sweep: false,
                     receiver_calls: manifest::ReceiverCallResolution::Resolved,
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
                 },

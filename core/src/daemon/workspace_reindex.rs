@@ -918,17 +918,30 @@ mod tests {
         counters: &Counters,
         semantic_pass: bool,
     ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
+        alpha_staging_registry_with(counters, semantic_pass, false)
+    }
+
+    /// [`alpha_staging_registry`], and with `semantic_sweep` the semantic
+    /// pass's manifest also declares `semantic_sweep = true`.
+    fn alpha_staging_registry_with(
+        counters: &Counters,
+        semantic_pass: bool,
+        semantic_sweep: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
         let scratch = tempfile::tempdir().expect("failed to create a model root");
         if semantic_pass {
-            test_plugin::install_with_workspace_semantic_pass_capable(
+            let dir = test_plugin::install_with_workspace_semantic_pass_capable(
                 plugins.path(),
                 "alpha",
                 &[".alpha-src"],
                 &["go.mod"],
                 &[],
             );
+            if semantic_sweep {
+                test_plugin::declare_semantic_sweep(&dir);
+            }
         } else {
             test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
         }
@@ -1311,15 +1324,21 @@ mod tests {
 
     /// Test 7: reindexing an unchanged tree, whose edges a semantic pass has
     /// already upgraded, writes only the bookkeeping rows: `language_state`,
-    /// the two meta roll-ups and the `pending_reindex` delete.
+    /// the two meta roll-ups and the `pending_reindex` delete. `alpha-e2`
+    /// stays syntactic, so its staged twin is identical to live's.
     ///
-    /// Control: upsert every staged node, as a full swap would (make the
-    /// live side of the node plan's `EXCEPT` select nothing) -> more changes.
+    /// Controls: upsert every staged node, as a full swap would (make the
+    /// live side of the node plan's `EXCEPT` select nothing) -> more changes;
+    /// drop the `EXCEPT` from `plan_upsert_edges`' subquery, so the
+    /// syntactic-twin branch takes `alpha-e2` although it is identical ->
+    /// one more change.
     #[test]
     fn an_unchanged_tree_swaps_in_only_its_bookkeeping() {
         let counters = Counters::default();
         let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
-        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let mut stream = three_nodes();
+        stream.push(json(&wire_edge("alpha-e2", "alpha-n2", "alpha-n1")));
+        test_plugin::set_bulk_stream(project.path(), "alpha", &stream, 0);
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
         fake_semantic_pass(&conn);
@@ -1488,6 +1507,92 @@ mod tests {
         assert_eq!(
             edges_at_swap(&registry, &supervisor, &conn),
             vec![edge_row("alpha-e1", "semantic", "alpha-n3"), edge_row("alpha-e5", "syntactic", "alpha-n5")]
+        );
+    }
+
+    /// Test 12: an unchanged node's live syntactic edge whose staged twin
+    /// differs (a manifest edit moved where it links) is taken from staging,
+    /// while the node's semantic edges, the one a pass upgraded in place
+    /// included, and a structural edge the pass retracted stay as live has
+    /// them.
+    ///
+    /// Control: drop the syntactic-twin branch (`OR EXISTS (... t.source =
+    /// 'syntactic')`) of `plan_upsert_edges` -> `alpha-e2` still reads
+    /// `alpha-n2`.
+    #[test]
+    fn a_differing_staged_syntactic_twin_replaces_lives() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-e2", "alpha-n1", "alpha-n2")));
+        first.push(json(&wire_edge("alpha-retracted", "alpha-n1", "alpha-n2")));
+        let mut second = three_nodes();
+        second.push(json(&wire_edge("alpha-e2", "alpha-n1", "alpha-n3")));
+        second.push(json(&wire_edge("alpha-retracted", "alpha-n1", "alpha-n3")));
+        // alpha-e1 differs from its staged twin too, but only as the pass's
+        // upgrade: the walk emits it onto alpha-n2 in both streams.
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &["alpha-retracted"],
+            &second,
+        );
+
+        assert_eq!(
+            edges_at_swap(&registry, &supervisor, &conn),
+            vec![
+                edge_row("alpha-e1", "semantic", "alpha-n3"),
+                edge_row("alpha-e2", "syntactic", "alpha-n3"),
+                edge_row("alpha-sem", "semantic", "alpha-n2"),
+            ]
+        );
+    }
+
+    /// Indexes `three_nodes` for `alpha`, whose manifest declares
+    /// `semantic_sweep` or not, adds a semantic edge no pass will re-send,
+    /// then runs a complete whole-project pass (the fake plugin answers with
+    /// an empty diff) and returns every edge as `id|source|toId`.
+    fn edges_after_a_complete_pass(semantic_sweep: bool) -> Vec<String> {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) =
+            alpha_staging_registry_with(&counters, true, semantic_sweep);
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let upsert_edges = vec![semantic_edge("alpha-stale", "alpha-n2", "alpha-n3")];
+        apply_diff(&mut conn.lock().unwrap(), &Diff { upsert_edges, ..Default::default() }).unwrap();
+
+        assert!(supervisor.semantic_pass(&conn, Vec::new(), 0).expect("the pass succeeds"), "the pass ran");
+        let edges = rows(&conn.lock().unwrap(), "SELECT id, source, toId FROM edges ORDER BY id");
+        edges
+    }
+
+    /// Test 13: a language whose manifest declares `semantic_sweep` loses
+    /// the semantic edge a complete whole-project pass did not re-send.
+    ///
+    /// Control: pass `None` instead of the manifest's language to
+    /// `apply_semantic_pass` in `PluginProcess::semantic_pass` ->
+    /// `alpha-stale` survives.
+    #[test]
+    fn a_complete_pass_sweeps_a_language_that_declares_the_sweep() {
+        assert_eq!(edges_after_a_complete_pass(true), vec![edge_row("alpha-e1", "syntactic", "alpha-n2")]);
+    }
+
+    /// Test 13, the other arm: a language whose manifest leaves `semantic_sweep` off (as
+    /// TypeScript's does) keeps it.
+    ///
+    /// Control: pass `Some(&self.manifest.language)` unconditionally to
+    /// `apply_semantic_pass` in `PluginProcess::semantic_pass` ->
+    /// `alpha-stale` is gone.
+    #[test]
+    fn a_complete_pass_sweeps_nothing_for_a_language_that_does_not_declare_it() {
+        assert_eq!(
+            edges_after_a_complete_pass(false),
+            vec![
+                edge_row("alpha-e1", "syntactic", "alpha-n2"),
+                edge_row("alpha-stale", "semantic", "alpha-n3")
+            ]
         );
     }
 }

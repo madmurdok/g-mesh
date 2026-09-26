@@ -249,6 +249,7 @@ mod tests {
             language.to_string(),
             Capabilities {
                 semantic_pass: true,
+                semantic_sweep: false,
                 receiver_calls: ReceiverCallResolution::Resolved,
                 receiver_calls_structural: ReceiverCallResolution::Unresolved,
             },

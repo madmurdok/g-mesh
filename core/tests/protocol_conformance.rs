@@ -163,7 +163,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         &mut plugin_answer,
         &mut core_wrote,
         &conn,
-        "typescript",
+        None,
         vec!["src/a.ts".to_string()],
         // Matches the id both fixtures carry; a mismatch is refused outright.
         RequestId::Number(7),

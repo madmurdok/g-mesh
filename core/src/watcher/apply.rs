@@ -178,17 +178,17 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// edges and structural edges it contradicts. A plugin retracts only the ids
 /// it remembers emitting in its own process.
 ///
-/// A complete whole-project pass re-sends every semantic edge it stands
-/// behind, so after one `language`'s semantic edges that it did not send
-/// are deleted ([`sweep_semantic_edges`]): they are what an earlier process
-/// emitted and this one no longer does. An incomplete or per-file pass
-/// sweeps nothing.
+/// After a complete whole-project pass, `sweep_language`'s semantic edges
+/// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
+/// what an earlier process emitted and this one no longer does. `None` (a
+/// plugin whose manifest leaves `capabilities.semantic_sweep` off), an
+/// incomplete pass and a per-file pass sweep nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &IndexStore,
-    language: &str,
+    sweep_language: Option<&str>,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -200,7 +200,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
             reader,
             writer,
             store,
-            Some(language),
+            sweep_language,
             file_paths,
             request_id,
             embedding,
@@ -210,9 +210,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     })
 }
 
-/// [`apply_semantic_pass`] inside an open unit. `sweep_language` is the
-/// language whose unsent semantic edges a complete whole-project pass
-/// deletes; `None` sweeps nothing.
+/// [`apply_semantic_pass`] inside an open unit.
 #[allow(clippy::too_many_arguments)]
 fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     reader: &mut R,

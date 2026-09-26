@@ -14,12 +14,13 @@
 //! "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
 //! its live outgoing edges, whatever their `source`, and gets none of
 //! staging's, so the swap neither downgrades what a semantic pass wrote nor
-//! brings back a structural edge the pass retracted. The one exception: a
-//! live edge whose target does not exist after the swap is deleted, and the
-//! staged edges from that node of the same kind, which live lacks or holds
-//! only with a vanished target, are taken in its place. Every other node,
-//! changed or new, gets exactly staging's outgoing edges; the semantic pass
-//! that runs after the swap refines them.
+//! brings back a structural edge the pass retracted. Two exceptions: a live
+//! syntactic edge whose staged edge of the same id differs is replaced by
+//! it; and a live edge whose target does not exist after the swap is
+//! deleted, and the staged edges from that node of the same kind, which
+//! live lacks or holds only with a vanished target, are taken in its place.
+//! Every other node, changed or new, gets exactly staging's outgoing edges;
+//! the semantic pass that runs after the swap refines them.
 //!
 //! Neither half enables foreign keys or depends on them: the swap deletes
 //! edges before nodes and inserts nodes before edges, so it is also valid on
@@ -215,14 +216,16 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
         "the edges to delete",
     )?;
     // Staged edges that differ from live. One from an unchanged node is taken
-    // only in place of a live edge of the same kind whose target went away,
-    // and never over a live edge of its own id that is kept.
+    // over a live syntactic edge of its own id, or in place of a live edge of
+    // the same kind whose target went away, and never over any other live
+    // edge of its own id that is kept.
     let upsert_edges = run(
         &format!(
             "INSERT INTO plan_upsert_edges (id) SELECT s.id FROM (
                  SELECT {EDGE_COLUMNS} FROM main.edges
                  EXCEPT SELECT {EDGE_COLUMNS} FROM live.edges WHERE id IN (SELECT id FROM main.edges)) s
              WHERE s.fromId NOT IN (SELECT id FROM plan_unchanged_nodes)
+                OR EXISTS (SELECT 1 FROM live.edges t WHERE t.id = s.id AND t.source = 'syntactic')
                 OR (EXISTS (SELECT 1 FROM live.edges d
                             WHERE d.fromId = s.fromId AND d.kind = s.kind AND NOT {dropped_survives})
                     AND NOT EXISTS (SELECT 1 FROM live.edges l
