@@ -928,8 +928,9 @@ scripts/check.sh                 # the formatting and lint gates, as CI runs the
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
 cannot fetch: the JS/TS plugin's `npm ci` (`build.rs` builds it),
 rust-analyzer (`plugins/rust`'s semantic tier) and pyright
-(`plugins/python`'s, into its gitignored `node_modules`, at the version
-pinned in the script and used by CI's own "Install pyright" step). Without
+(`plugins/python`'s: an `npm ci` into its gitignored `node_modules`, at the
+exact version its committed `package.json` and `package-lock.json` pin, the
+same step CI's "Install pyright" runs). Without
 it the suite does not skip: `plugins/python`'s tests fail naming the missing
 pyright and the command above. `scripts/test-deps.sh pyright` (or
 `typescript`, `rust-analyzer`) installs just one.

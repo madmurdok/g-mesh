@@ -1,0 +1,8 @@
+{
+  "name": "@g-mesh/plugin-python-test-deps",
+  "private": true,
+  "description": "Pins pyright, the language server plugins/python's tests drive; installed with `npm ci` by scripts/test-deps.sh",
+  "devDependencies": {
+    "pyright": "1.1.414"
+  }
+}
