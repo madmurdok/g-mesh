@@ -10,7 +10,8 @@
 //!   root's hash - so this module does not invent a second way to find "the"
 //!   directory for a project, it reuses the one the index already lives in.
 //! - `~/.g-mesh/config.toml` - [`GlobalConfig`], settings that apply across
-//!   every project (currently just the GC warning switch and threshold).
+//!   every project: the GC warning switch and threshold, and the
+//!   machine-wide embedding cache's switch and size bound.
 //!
 //! Neither file is ever inside a project's own git repo - both live under
 //! the user's home directory, the same as the index itself - so there is
@@ -146,6 +147,26 @@ impl Default for EmbeddingConfig {
 #[serde(default)]
 pub struct GlobalConfig {
     pub cleanup: CleanupConfig,
+    #[serde(rename = "embeddingCache")]
+    pub embedding_cache: EmbeddingCacheConfig,
+}
+
+/// `[embeddingCache]`: the machine-wide embedding cache under
+/// `$G_MESH_HOME/embedding-cache/` (`embedding::cache`). The environment
+/// variable `G_MESH_EMBEDDING_CACHE=off` overrides `enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EmbeddingCacheConfig {
+    pub enabled: bool,
+    /// The size the cache file is trimmed back under, oldest entries first,
+    /// at the end of a reindex that added to it.
+    pub max_size_mb: u64,
+}
+
+impl Default for EmbeddingCacheConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_size_mb: 512 }
+    }
 }
 
 /// `[cleanup]`: the GC warning `cli::clean` and every other interactive
@@ -275,6 +296,19 @@ mod tests {
         assert_eq!(config, GlobalConfig::default());
         assert!(config.cleanup.enabled);
         assert_eq!(config.cleanup.idle_threshold_days, 90);
+        assert!(config.embedding_cache.enabled);
+        assert_eq!(config.embedding_cache.max_size_mb, 512);
+    }
+
+    #[test]
+    fn a_hand_written_embedding_cache_section_is_read_by_its_documented_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[embeddingCache]\nenabled = false\nmaxSizeMb = 100\n").unwrap();
+
+        let config: GlobalConfig = read_toml_or_default(&path).unwrap();
+        assert_eq!(config.embedding_cache, EmbeddingCacheConfig { enabled: false, max_size_mb: 100 });
+        assert_eq!(config.cleanup, CleanupConfig::default());
     }
 
     #[test]
@@ -324,7 +358,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        let config = GlobalConfig { cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 } };
+        let config = GlobalConfig {
+            cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 },
+            embedding_cache: EmbeddingCacheConfig { enabled: false, max_size_mb: 64 },
+        };
         write_toml(&path, &config).unwrap();
 
         let read_back: GlobalConfig = read_toml_or_default(&path).unwrap();
@@ -374,6 +411,8 @@ mod tests {
         write_toml(&global_path, &GlobalConfig::default()).unwrap();
         let global_contents = fs::read_to_string(&global_path).unwrap();
         assert!(global_contents.contains("idleThresholdDays"), "{global_contents}");
+        assert!(global_contents.contains("[embeddingCache]"), "{global_contents}");
+        assert!(global_contents.contains("maxSizeMb"), "{global_contents}");
     }
 
     /// [`project_config_path`] and [`global_config_path`] resolve without

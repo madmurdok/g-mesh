@@ -23,7 +23,10 @@
 //! same way the real bundled plugin does: a fixed, deterministic NDJSON
 //! stream of two nodes and the edge between them, named after this fake
 //! plugin's own language so a test summing two languages' output can tell
-//! whose contribution is whose.
+//! whose contribution is whose. Each node `<language>-nN` also carries a
+//! signature and a doc comment when the project root holds a
+//! `.<language>-nN.sig` / `.<language>-nN.doc` file, read at walk time, so an
+//! embedding test can give nodes text and change it between walks.
 //!
 //! Node, rather than a shell script, for the same reason the real plugin uses
 //! it: it is already a hard dependency of this crate's test suite
@@ -480,8 +483,17 @@ fs.appendFileSync(path.join(__dirname, "{SPAWN_LOG}"), process.pid + "\n");
 // both landed and summed, not just the first (or only) one's.
 if (process.argv[2] === "--bulk-index") {{
   const line = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+  const optional = (name) => {{
+    try {{
+      return fs.readFileSync(path.join(process.argv[3], name), "utf8");
+    }} catch (_) {{
+      return undefined;
+    }}
+  }};
   line({{
     id: "{language}-n1",
+    signature: optional(".{language}-n1.sig"),
+    docComment: optional(".{language}-n1.doc"),
     kind: "Function",
     name: "{language}-n1",
     qualifiedName: "{language}-n1",
@@ -492,6 +504,8 @@ if (process.argv[2] === "--bulk-index") {{
   }});
   line({{
     id: "{language}-n2",
+    signature: optional(".{language}-n2.sig"),
+    docComment: optional(".{language}-n2.doc"),
     kind: "Function",
     name: "{language}-n2",
     qualifiedName: "{language}-n2",

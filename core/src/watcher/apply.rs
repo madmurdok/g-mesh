@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
@@ -342,7 +342,10 @@ fn round_trip<R: BufRead + Send, W: Write>(
     hold_compute_open_for_tests();
 
     // Runs between the unit's steps - see "Lock holds" above.
-    let computed = embedding.compute(&diff);
+    let started = std::time::Instant::now();
+    let mut stats = EmbedStats::default();
+    let computed = embedding.compute(&diff, &mut stats);
+    embedding.finish_file_change(method, &stats, started.elapsed());
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
