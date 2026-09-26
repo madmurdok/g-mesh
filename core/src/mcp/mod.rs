@@ -51,6 +51,11 @@ mod similarity;
 mod source;
 mod tool_result;
 
+// The embedding eval (`cli::embed_eval`) scores against the same ranking and
+// the same shipped floors the tools use, not copies of them.
+pub(crate) use search_code::top_k_for_eval;
+pub(crate) use similarity::floor as shipped_similarity_floor;
+
 /// Logs a step of request handling when [`TRACE_CALLS_ENV`] is set. Every
 /// tool call goes through `prepare`, so its lines split a hang three ways:
 /// none (never reached the daemon), entry without exit (hung in `prepare`),

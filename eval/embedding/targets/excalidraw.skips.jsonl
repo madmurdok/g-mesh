@@ -1,0 +1,4 @@
+{"n": 19, "qualifiedName": "AppStateDelta.create", "reason": "trivial: one-line factory returning new AppStateDelta(delta)"}
+{"n": 20, "qualifiedName": "ORIG_ID", "reason": "trivial: a Symbol.for constant used in tests"}
+{"n": 33, "qualifiedName": "Vector", "reason": "trivial: type alias for any"}
+{"n": 50, "qualifiedName": "DEFAULT_FILENAME", "reason": "trivial: the constant \"Untitled\", no behaviour beyond its name"}

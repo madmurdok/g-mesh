@@ -86,6 +86,10 @@ pub(crate) const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
 const LAST_HIDDEN_STATE: &str = "last_hidden_state";
+/// Fed as all zeros, and only when [`EncoderSpec::token_type_ids`] says the
+/// graph declares it; a graph that declares it without the spec saying so
+/// still fails loudly at inference.
+const TOKEN_TYPE_IDS: &str = "token_type_ids";
 
 /// Width of a `jina-embeddings-v2-base-code` vector. Checked at inference time
 /// rather than trusted, so pointing g-mesh at a differently-shaped model is a
@@ -138,6 +142,47 @@ pub const DEFAULT_MAX_SEQUENCE_LENGTH: usize = 1024;
 /// home without a config file; ordinary runs never set it.
 pub const MODEL_DIR_ENV: &str = "G_MESH_MODEL_DIR";
 
+/// How the encoder's hidden states become one vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    /// Mean over the tokens the attention mask marks as real.
+    Mean,
+    /// The first position's hidden state (`[CLS]` / `<s>`).
+    Cls,
+}
+
+/// What an encoder needs to be run correctly beyond its two files: how its
+/// output is pooled, how wide its vectors are, how much input it is given,
+/// and whether its graph takes `token_type_ids`.
+///
+/// [`EncoderSpec::production`] is what the daemon runs; any other value is
+/// used only by the embedding eval (`cli::embed_eval`) to score candidate
+/// models through this same loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSpec {
+    pub pooling: Pooling,
+    /// Checked against the model's output shape on every call.
+    pub dimension: usize,
+    /// Tokenizer truncation length, special tokens included.
+    pub max_sequence_length: usize,
+    /// Feed an all-zero `token_type_ids` input (BERT-family exports).
+    pub token_type_ids: bool,
+}
+
+impl EncoderSpec {
+    /// The default model as the daemon runs it: mean pooling,
+    /// [`EMBEDDING_DIM`] wide, truncated to [`DEFAULT_MAX_SEQUENCE_LENGTH`],
+    /// no `token_type_ids`.
+    pub const fn production() -> Self {
+        Self {
+            pooling: Pooling::Mean,
+            dimension: EMBEDDING_DIM,
+            max_sequence_length: DEFAULT_MAX_SEQUENCE_LENGTH,
+            token_type_ids: false,
+        }
+    }
+}
+
 /// A loaded ONNX encoder plus its tokenizer.
 ///
 /// Loading is expensive (hundreds of MiB read and graph-optimized, ~1s), so a
@@ -148,6 +193,7 @@ pub const MODEL_DIR_ENV: &str = "G_MESH_MODEL_DIR";
 pub struct EmbeddingModel {
     session: Session,
     tokenizer: Tokenizer,
+    spec: EncoderSpec,
 }
 
 /// Hand-written rather than derived: the fields are a loaded ONNX graph and a
@@ -184,8 +230,18 @@ impl EmbeddingModel {
     /// otherwise model-agnostic - but going past a model's trained context
     /// degrades quality rather than erroring, so raise it only knowingly.
     pub fn load_with_max_sequence_length(model_dir: &Path, max_sequence_length: usize) -> Result<Self> {
+        Self::load_with_spec(model_dir, EncoderSpec { max_sequence_length, ..EncoderSpec::production() })
+    }
+
+    /// [`load`](Self::load) for an encoder described by `spec` rather than
+    /// the default model's [`EncoderSpec::production`].
+    pub fn load_with_spec(model_dir: &Path, spec: EncoderSpec) -> Result<Self> {
+        let max_sequence_length = spec.max_sequence_length;
         if max_sequence_length == 0 {
             bail!("max_sequence_length must be at least 1");
+        }
+        if spec.dimension == 0 {
+            bail!("the encoder's dimension must be at least 1");
         }
 
         let onnx_path = model_dir.join(ONNX_FILE_NAME);
@@ -212,6 +268,9 @@ impl EmbeddingModel {
         tokenizer
             .with_truncation(Some(TruncationParams { max_length: max_sequence_length, ..Default::default() }))
             .map_err(|err| anyhow!("failed to configure tokenizer truncation: {err}"))?;
+        // Some exported tokenizer.json files carry a padding config; a batch
+        // of one needs none, and pooling must see only the text's own tokens.
+        tokenizer.with_padding(None);
 
         let session = Session::builder()
             .context("failed to create ONNX session builder")?
@@ -224,19 +283,25 @@ impl EmbeddingModel {
             .commit_from_file(&onnx_path)
             .with_context(|| format!("failed to load ONNX model {}", onnx_path.display()))?;
 
-        Ok(Self { session, tokenizer })
+        Ok(Self { session, tokenizer, spec })
     }
 
-    /// Embeds `text` into a unit-length vector of [`EMBEDDING_DIM`] floats.
+    /// The spec this model was loaded with.
+    pub fn spec(&self) -> EncoderSpec {
+        self.spec
+    }
+
+    /// Embeds `text` into a unit-length vector of the spec's dimension
+    /// ([`EMBEDDING_DIM`] for the default model).
     ///
     /// Three steps, all of them fixed-order and therefore deterministic:
     ///
     /// 1. Tokenize (truncating to the configured maximum).
     /// 2. Run the encoder, giving one hidden vector per token.
-    /// 3. Mean-pool those vectors over the real (non-padding) tokens, then
-    ///    L2-normalize.
+    /// 3. Pool those vectors as the spec says (the default model: mean over
+    ///    the real, non-padding tokens), then L2-normalize.
     ///
-    /// Mean pooling is not a choice - it is what this model was trained with
+    /// Mean pooling is not a choice - it is what the default model was trained with
     /// (`1_Pooling/config.json`: `pooling_mode_mean_tokens`), and taking the
     /// `<s>` vector instead would produce vectors that simply do not match the
     /// training objective.
@@ -269,10 +334,18 @@ impl EmbeddingModel {
         let attention_mask = Tensor::from_array((input_shape, mask.clone()))
             .context("failed to build attention_mask tensor")?;
 
-        let outputs = self
-            .session
-            .run(ort::inputs![INPUT_IDS => input_ids, ATTENTION_MASK => attention_mask]?)
-            .context("ONNX inference failed")?;
+        let outputs = if self.spec.token_type_ids {
+            let token_type_ids = Tensor::from_array((input_shape, vec![0i64; sequence_length]))
+                .context("failed to build token_type_ids tensor")?;
+            self.session.run(ort::inputs![
+                INPUT_IDS => input_ids,
+                ATTENTION_MASK => attention_mask,
+                TOKEN_TYPE_IDS => token_type_ids
+            ]?)
+        } else {
+            self.session.run(ort::inputs![INPUT_IDS => input_ids, ATTENTION_MASK => attention_mask]?)
+        }
+        .context("ONNX inference failed")?;
         let hidden_state = outputs
             .get(LAST_HIDDEN_STATE)
             .ok_or_else(|| anyhow!("model produced no `{LAST_HIDDEN_STATE}` output"))?;
@@ -280,42 +353,55 @@ impl EmbeddingModel {
             .try_extract_raw_tensor::<f32>()
             .context("failed to read `last_hidden_state` as f32")?;
 
-        mean_pool(shape, values, &mask, sequence_length)
+        pool(self.spec.pooling, self.spec.dimension, shape, values, &mask, sequence_length)
     }
 }
 
-/// Mean-pools `[1, sequence_length, EMBEDDING_DIM]` hidden states over the
-/// tokens `mask` marks as real, then L2-normalizes.
+/// Pools `[1, sequence_length, dimension]` hidden states into one vector
+/// (mean over the tokens `mask` marks as real, or the first position), then
+/// L2-normalizes.
 ///
 /// Split out from [`EmbeddingModel::embed`] so the arithmetic that decides
 /// what a vector *means* can be tested without 610 MiB of weights on disk.
-fn mean_pool(shape: &[i64], values: &[f32], mask: &[i64], sequence_length: usize) -> Result<Vec<f32>> {
-    if shape != [1, sequence_length as i64, EMBEDDING_DIM as i64] {
+fn pool(
+    pooling: Pooling,
+    dimension: usize,
+    shape: &[i64],
+    values: &[f32],
+    mask: &[i64],
+    sequence_length: usize,
+) -> Result<Vec<f32>> {
+    if shape != [1, sequence_length as i64, dimension as i64] {
         bail!(
-            "unexpected `{LAST_HIDDEN_STATE}` shape {shape:?}; expected [1, {sequence_length}, {EMBEDDING_DIM}]. \
-             The model directory is probably not a {EMBEDDING_DIM}-dimensional BERT-style encoder."
+            "unexpected `{LAST_HIDDEN_STATE}` shape {shape:?}; expected [1, {sequence_length}, {dimension}]. \
+             The model directory is probably not a {dimension}-dimensional BERT-style encoder."
         );
     }
 
-    let mut pooled = vec![0f32; EMBEDDING_DIM];
-    let mut token_count = 0f32;
-    // Iterating positions in order (rather than, say, in parallel) is what
-    // keeps float addition associative-order-stable across runs.
-    for (position, &m) in mask.iter().enumerate().take(sequence_length) {
-        if m == 0 {
-            continue;
+    let mut pooled = vec![0f32; dimension];
+    match pooling {
+        Pooling::Mean => {
+            let mut token_count = 0f32;
+            // Iterating positions in order (rather than, say, in parallel) is
+            // what keeps float addition associative-order-stable across runs.
+            for (position, &m) in mask.iter().enumerate().take(sequence_length) {
+                if m == 0 {
+                    continue;
+                }
+                token_count += 1.0;
+                let row = &values[position * dimension..(position + 1) * dimension];
+                for (slot, &value) in pooled.iter_mut().zip(row) {
+                    *slot += value;
+                }
+            }
+            if token_count == 0.0 {
+                bail!("attention mask marked every token as padding, nothing to pool");
+            }
+            for slot in &mut pooled {
+                *slot /= token_count;
+            }
         }
-        token_count += 1.0;
-        let row = &values[position * EMBEDDING_DIM..(position + 1) * EMBEDDING_DIM];
-        for (slot, &value) in pooled.iter_mut().zip(row) {
-            *slot += value;
-        }
-    }
-    if token_count == 0.0 {
-        bail!("attention mask marked every token as padding, nothing to pool");
-    }
-    for slot in &mut pooled {
-        *slot /= token_count;
+        Pooling::Cls => pooled.copy_from_slice(&values[..dimension]),
     }
 
     let norm = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -451,7 +537,7 @@ mod tests {
         values[EMBEDDING_DIM] = 100.0;
         values[EMBEDDING_DIM + 1] = 100.0;
 
-        let pooled = mean_pool(&[1, 2, EMBEDDING_DIM as i64], &values, &[1, 0], 2).unwrap();
+        let pooled = pool(Pooling::Mean, EMBEDDING_DIM, &[1, 2, EMBEDDING_DIM as i64], &values, &[1, 0], 2).unwrap();
 
         assert!((pooled[0] - 1.0).abs() < 1e-6, "{}", pooled[0]);
         assert!(pooled[1].abs() < 1e-6, "{}", pooled[1]);
@@ -464,7 +550,7 @@ mod tests {
         values[1] = -3.0;
         values[2] = 6.0;
 
-        let pooled = mean_pool(&[1, 1, EMBEDDING_DIM as i64], &values, &[1], 1).unwrap();
+        let pooled = pool(Pooling::Mean, EMBEDDING_DIM, &[1, 1, EMBEDDING_DIM as i64], &values, &[1], 1).unwrap();
 
         let norm = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "{norm}");
@@ -475,8 +561,42 @@ mod tests {
     #[test]
     fn a_wrongly_shaped_model_output_is_rejected_rather_than_reinterpreted() {
         let values = vec![0f32; 16];
-        let err = mean_pool(&[1, 1, 16], &values, &[1], 1).unwrap_err().to_string();
+        let err = pool(Pooling::Mean, EMBEDDING_DIM, &[1, 1, 16], &values, &[1], 1).unwrap_err().to_string();
         assert!(err.contains("unexpected"), "{err}");
+    }
+
+    /// CLS pooling takes position 0 even when later positions are real
+    /// tokens, and still returns a unit vector.
+    #[test]
+    fn cls_pooling_takes_the_first_position_only() {
+        let dimension = 4;
+        let values = vec![3.0, 0.0, 4.0, 0.0, /* second token */ 100.0, 100.0, 100.0, 100.0];
+
+        let pooled = pool(Pooling::Cls, dimension, &[1, 2, dimension as i64], &values, &[1, 1], 2).unwrap();
+
+        assert_eq!(pooled.len(), dimension);
+        assert!((pooled[0] - 0.6).abs() < 1e-6, "{}", pooled[0]);
+        assert!(pooled[1].abs() < 1e-6, "{}", pooled[1]);
+        assert!((pooled[2] - 0.8).abs() < 1e-6, "{}", pooled[2]);
+    }
+
+    /// The width is the spec's, not the default model's: a 384-wide output
+    /// passes a 384 spec and fails the production one.
+    #[test]
+    fn pooling_checks_the_declared_dimension() {
+        let values = vec![1.0f32; 384];
+        assert_eq!(pool(Pooling::Mean, 384, &[1, 1, 384], &values, &[1], 1).unwrap().len(), 384);
+        assert!(pool(Pooling::Mean, EMBEDDING_DIM, &[1, 1, 384], &values, &[1], 1).is_err());
+    }
+
+    /// `load` and `load_with_max_sequence_length` run the default model
+    /// exactly as before the spec existed.
+    #[test]
+    fn the_production_spec_is_mean_pooling_768_wide_truncated_at_1024() {
+        assert_eq!(
+            EncoderSpec::production(),
+            EncoderSpec { pooling: Pooling::Mean, dimension: 768, max_sequence_length: 1024, token_type_ids: false }
+        );
     }
 
     #[test]

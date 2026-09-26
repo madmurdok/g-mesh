@@ -139,6 +139,14 @@ pub(super) fn search(
     })
 }
 
+/// The first `k` rows [`search`] returns for `query`, as (node id, score):
+/// exactly what `search_code` would rank. The embedding eval's harness-parity
+/// check (`cli::embed_eval`) compares its own ranking against this.
+pub(crate) fn top_k_for_eval(conn: &Connection, query: &[f32], k: usize) -> anyhow::Result<Vec<(String, f64)>> {
+    let page = search(conn, query, k, None)?;
+    Ok(page.results.into_iter().map(|row| (row.symbol_id, row.score)).collect())
+}
+
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,

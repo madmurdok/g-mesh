@@ -1,0 +1,31 @@
+{"n": 1, "qualifiedName": "flags::defs::<Generate as Flag>::doc_choices", "reason": "trivial: returns a constant list of the --generate choice strings"}
+{"n": 4, "qualifiedName": "flags::defs::<NoRequireGit as Flag>::name_negated", "reason": "trivial: returns the constant negated flag name"}
+{"n": 7, "qualifiedName": "flags::defs::<Engine as Flag>::doc_choices", "reason": "trivial: returns a constant list of engine names"}
+{"n": 11, "qualifiedName": "flags::defs::<NullData as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 12, "qualifiedName": "flags::defs::<Generate as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 13, "qualifiedName": "serde_impl::<GlobSetVisitor as Visitor>::Value", "reason": "trivial: associated type alias to GlobSet"}
+{"n": 14, "qualifiedName": "hyperlink::FormatBuilder::new", "reason": "trivial: constructs an empty builder"}
+{"n": 17, "qualifiedName": "<&'a M as Matcher>::new_captures", "reason": "boilerplate: forwards to the referenced matcher"}
+{"n": 21, "qualifiedName": "stats::Stats::bytes_printed", "reason": "trivial: field accessor"}
+{"n": 22, "qualifiedName": "flags::defs::<MaxFilesize as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 25, "qualifiedName": "ast::AstAnalysis::any_uppercase", "reason": "trivial: field accessor"}
+{"n": 27, "qualifiedName": "flags::defs::<IGlob as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 29, "qualifiedName": "MultiStrategyBuilder::new", "reason": "trivial: constructs an empty builder"}
+{"n": 30, "qualifiedName": "error", "reason": "trivial: bare `mod error;` declaration with no behaviour beyond its name"}
+{"n": 31, "qualifiedName": "flags::defs::<Files as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 32, "qualifiedName": "flags::defs::<Null as Flag>::is_switch", "reason": "trivial: returns a constant bool"}
+{"n": 34, "qualifiedName": "dir::Ignore::parent", "reason": "trivial: returns the parent matcher, an accessor"}
+{"n": 35, "qualifiedName": "flags::defs::<Color as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 41, "qualifiedName": "flags::defs::<Null as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 44, "qualifiedName": "flags::defs::<Glob as Flag>::is_switch", "reason": "trivial: returns a constant bool"}
+{"n": 51, "qualifiedName": "flags::defs::<NoPcre2Unicode as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 55, "qualifiedName": "flags::defs::<PCRE2Version as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 58, "qualifiedName": "color::<OutType as FromStr>::Err", "reason": "trivial: associated type alias to ColorError"}
+{"n": 61, "qualifiedName": "GlobSetMatchStrategy::matches_into", "reason": "boilerplate: forwards to the variant strategy by enum match"}
+{"n": 62, "qualifiedName": "util::Sunk::absolute_byte_offset", "reason": "trivial: field accessor"}
+{"n": 64, "qualifiedName": "<&'a M as Matcher>::find_at", "reason": "boilerplate: forwards to the referenced matcher"}
+{"n": 65, "qualifiedName": "flags::defs::<MaxDepth as Flag>::is_switch", "reason": "trivial: returns a constant bool"}
+{"n": 70, "qualifiedName": "flags::doc::help", "reason": "trivial: bare `pub(crate) mod help;` declaration"}
+{"n": 74, "qualifiedName": "flags::defs::<LineNumber as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 77, "qualifiedName": "flags::defs::<MaxFilesize as Flag>::doc_variable", "reason": "trivial: returns a constant placeholder name"}
+{"n": 80, "qualifiedName": "literal", "reason": "trivial: bare `mod literal;` declaration"}
