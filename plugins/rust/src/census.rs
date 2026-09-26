@@ -196,7 +196,8 @@ mod run {
         let root = PathBuf::from(std::env::var("GM314_CORPUS").expect("GM314_CORPUS"));
         let project = ProjectContext::load(&root).expect("load");
         // Exactly the manifest's own extensions and exclusions.
-        let files = walk_project(&root, &[".rs".to_string()], &["target".to_string()]);
+        let files =
+            walk_project(&root, &[".rs".to_string()], &crate::project::EXCLUDE_DIRS.map(String::from));
         enable();
 
         let mut extracted = 0u64;

@@ -677,6 +677,17 @@ that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
 would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
 installer, not to the binary.
 
+Embedding vectors are also cached machine-wide, in
+`~/.g-mesh/embedding-cache/cache.sqlite` (it does follow `G_MESH_HOME`), keyed
+by the exact text embedded and a fingerprint of the model's files, so a
+reindex — of any project on the machine — embeds only text the cache has not
+seen. The global `config.toml` sets it with `[embeddingCache] enabled` and
+`maxSizeMb` (default 512; the least recently used vectors go first once it is
+exceeded), and `G_MESH_EMBEDDING_CACHE=off` bypasses it for one run. A cache
+file that turns out unreadable is moved aside to `cache.sqlite.corrupt-<time>`
+and replaced; it never fails indexing. Design and trade-offs:
+[`docs/adr/0007-embedding-cache.md`](docs/adr/0007-embedding-cache.md).
+
 One constraint comes with it: the daemon's socket lives under that root, and a
 Unix domain socket address holds at most 104 bytes of path on macOS (108 on
 Linux) — so a `G_MESH_HOME` nested deeply enough pushes
@@ -918,11 +929,22 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 ## Run tests
 
 ```bash
+scripts/test-deps.sh             # once per clone/worktree: the test dependencies CI installs
 cargo test                       # every crate: core, wire, plugins/sdk, plugins/rust, plugins/python
 cargo test -p g-mesh             # core alone
 cd plugins/typescript && npm run build && npm test
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
+
+`scripts/test-deps.sh` installs what the suite drives for real and cargo
+cannot fetch: the JS/TS plugin's `npm ci` (`build.rs` builds it),
+rust-analyzer (`plugins/rust`'s semantic tier) and pyright
+(`plugins/python`'s: an `npm ci` into its gitignored `node_modules`, at the
+exact version its committed `package.json` and `package-lock.json` pin, the
+same step CI's "Install pyright" runs). Without
+it the suite does not skip: `plugins/python`'s tests fail naming the missing
+pyright and the command above. `scripts/test-deps.sh pyright` (or
+`typescript`, `rust-analyzer`) installs just one.
 
 `scripts/check.sh` is the one place those two gates are spelled out:
 `.github/workflows/ci.yml` calls it rather than repeating the commands, so a

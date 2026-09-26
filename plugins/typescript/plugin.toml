@@ -41,6 +41,10 @@ extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 # TypeScript's own checker is this plugin's semantic tier (src/semantic.ts) -
 # core may send it a semanticPass request.
 semantic_pass = true
+# Off: the checker's pass upgrades structural edges in place and never
+# reports itself incomplete, so a sweep after a pass that stopped part-way
+# would delete the upgraded edges it did not reach (ADR 0008, section 3).
+semantic_sweep = false
 # Both tiers leave receiver calls (`x.foo()`) unresolved: the structural pass
 # has no type information to know what `x` is, and the semantic pass
 # (src/semanticPass.ts) resolves imports/overloads/declaration targets but
@@ -65,7 +69,9 @@ watch_files = []
 # HARD_EXCLUDED_DIRS), minus `.git`/`.claude`, which are already excluded
 # at the baseline core level and are not specific to this language - the
 # same split the architecture doc's Go example makes (`vendor`/`testdata`,
-# not `.git`).
+# not `.git`). Must equal that set minus those two, order included: core
+# reads this file as data, so it cannot be derived, and a test in
+# test/ignorePolicy.test.ts pins the two.
 exclude_dirs = ["node_modules", "dist"]
 # A miss-path lookup treats a directory's `index` file as its container's
 # entry point - the Node/bundler convention this repo already indexes.

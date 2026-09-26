@@ -598,6 +598,7 @@ mod tests {
             "rust".to_string(),
             Capabilities {
                 semantic_pass: true,
+                semantic_sweep: false,
                 receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
                 receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
             },

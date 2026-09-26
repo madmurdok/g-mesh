@@ -6,11 +6,12 @@
 use g_mesh_plugin_sdk::{run, PluginSpec};
 
 use g_mesh_plugin_rust::extractor::RustExtractor;
+use g_mesh_plugin_rust::project;
 
 fn main() -> ! {
     run(
         RustExtractor,
-        PluginSpec::new("rust", env!("CARGO_PKG_VERSION"), &[".rs"]).exclude_dirs(&["target"]),
+        PluginSpec::new("rust", env!("CARGO_PKG_VERSION"), &[".rs"]).exclude_dirs(&project::EXCLUDE_DIRS),
         // The rust-analyzer tier (GM-290). A *factory*, not an engine: the SDK
         // calls this on the first `semanticPass` and never before, which is
         // what `capabilities.semantic-engine-lazy` checks and what keeps a

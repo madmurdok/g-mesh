@@ -35,19 +35,23 @@ import (
 	"strings"
 )
 
-// hardExcludedDirs mirrors plugin.toml's [plugin.workspace] exclude_dirs
-// (vendor, testdata) plus .git, which every plugin excludes unconditionally
-// regardless of the manifest. Kept here as a literal, hand-kept-in-sync
-// copy because this binary has no access to its own parsed manifest at
-// runtime (core resolves plugin.toml; this process only ever receives a
-// project root on argv) - the same split ignorePolicy.ts's
-// HARD_EXCLUDED_DIRS / plugin.toml's exclude_dirs keeps for the TS plugin,
-// down to the comment asking the two to be kept in sync by hand.
-var hardExcludedDirs = map[string]bool{
-	".git":     true,
-	"vendor":   true,
-	"testdata": true,
-}
+// manifestExcludeDirs is plugin.toml's [plugin.workspace] exclude_dirs, as
+// code. This binary has no access to its own parsed manifest at runtime
+// (core resolves plugin.toml; this process only ever receives a project root
+// on argv), and core reads plugin.toml as data, so neither can be derived
+// from the other: TestPluginTomlExcludeDirsEqualManifestExcludeDirs pins the
+// two equal, order included.
+var manifestExcludeDirs = []string{"vendor", "testdata"}
+
+// hardExcludedDirs is manifestExcludeDirs plus .git, which every plugin
+// excludes unconditionally regardless of the manifest.
+var hardExcludedDirs = func() map[string]bool {
+	dirs := map[string]bool{".git": true}
+	for _, dir := range manifestExcludeDirs {
+		dirs[dir] = true
+	}
+	return dirs
+}()
 
 // ignorePattern is one compiled line of a .gitignore.
 type ignorePattern struct {

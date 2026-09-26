@@ -38,7 +38,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.13.0"
+plugin_version = "3.14.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
@@ -60,6 +60,10 @@ extensions = [".py", ".pyi"]
 # `capabilities.semantic-engine-lazy`: the engine must not exist until the
 # first one arrives (see src/main.rs, which passes a factory).
 semantic_pass = true
+# Every complete whole-project pass re-sends each semantic edge it stands
+# behind, so core may delete this language's semantic edges one did not
+# re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+semantic_sweep = true
 # Receiver calls (`obj.m()`) are an open site the structural tier answers with
 # nothing and the semantic tier answers *when it can* - so the two fields
 # differ, which is the shape `core::mcp::instructions` reads to decide how
@@ -182,10 +186,11 @@ watch_files = ["pyproject.toml", "setup.cfg", "setup.py"]
 # own "a bare entry point matches the stem under any extension" rule, the
 # same one `typescript`'s `"index"` relies on.
 entry_points = ["__init__"]
-# Never real source - see `project`'s module doc for why these exact seven
-# names and why this list is duplicated (not shared as code) between this file
-# and `project::EXCLUDE_DIRS`. `node_modules` is the odd one out and was added
-# by GM-299: it is where a project-local pyright is installed - which
+# Never real source - see `project::EXCLUDE_DIRS` for why these exact seven
+# names. This list must equal that constant, order included: core reads this
+# file as data, so it cannot be derived, and a unit test
+# (`plugin_toml_exclude_dirs_equal_exclude_dirs`) pins the two.
+# `node_modules` is the odd one out: it is where a project-local pyright is installed - which
 # src/semantic.rs's second resolution branch actively invites - and pyright
 # bundles typeshed, so leaving it in the walk means indexing 5,205 `.pyi`
 # stubs as if they were the project's own declarations.

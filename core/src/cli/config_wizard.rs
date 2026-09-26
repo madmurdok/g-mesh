@@ -149,7 +149,7 @@ pub fn wizard_global<R: BufRead, W: Write>(
         existing.cleanup.idle_threshold_days,
     )?;
 
-    Ok(GlobalConfig { cleanup: CleanupConfig { enabled, idle_threshold_days } })
+    Ok(GlobalConfig { cleanup: CleanupConfig { enabled, idle_threshold_days }, ..existing.clone() })
 }
 
 /// Prompts once for a free-form string, returning `default` unchanged when
@@ -381,7 +381,10 @@ mod tests {
 
     #[test]
     fn accepting_every_default_leaves_the_global_config_unchanged() {
-        let existing = GlobalConfig { cleanup: CleanupConfig { enabled: true, idle_threshold_days: 90 } };
+        let existing = GlobalConfig {
+            cleanup: CleanupConfig { enabled: true, idle_threshold_days: 90 },
+            ..GlobalConfig::default()
+        };
 
         let (updated, _) = run_global_wizard(&existing, "\n\n");
 

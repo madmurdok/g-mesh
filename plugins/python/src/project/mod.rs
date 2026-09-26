@@ -296,7 +296,7 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// into, beyond [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`] - virtual
 /// environments and their caches, never source in any Python project.
 ///
-/// `node_modules` joined the list in GM-299 and is the one entry that is not
+/// `node_modules` is the one entry that is not
 /// a Python artefact. A Python project may perfectly well have one - a web
 /// application with a JavaScript front end - and it is never that project's
 /// own Python source. What forced the question is that `crate::semantic`'s
@@ -307,15 +307,15 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// project. The same reasoning as `site-packages`, arriving through a
 /// different package manager.
 ///
-/// Duplicated as a plain constant here, and again in `plugin.toml`'s
-/// `[plugin.workspace] exclude_dirs`, rather than shared as code: this
-/// module's own walk (root detection, run once per [`ProjectContext::load`])
-/// and the SDK's per-`extract` walk are two different call sites with no
-/// common caller to thread a slice through, and `plugins/sdk`'s own
-/// `manifest` module doc names this exact drift as accepted precedent
-/// (`ignorePolicy.ts`'s `HARD_EXCLUDED_DIRS` vs. `plugin.toml`, "the same
-/// list written twice, with a comment explaining how they relate").
-pub(crate) const EXCLUDE_DIRS: [&str; 7] =
+/// This constant is the one list in code: `main.rs`'s
+/// [`g_mesh_plugin_sdk::PluginSpec::exclude_dirs`] fallback, the semantic
+/// tier's `walk_scope` and `tests/conformance.rs` all take it from here.
+/// The one copy that cannot be derived is `plugin.toml`'s
+/// `[plugin.workspace] exclude_dirs`, which core, its watcher and `status`
+/// read before any plugin process exists; the test
+/// `plugin_toml_exclude_dirs_equal_exclude_dirs` below pins the two equal,
+/// so editing either one alone fails the build's tests.
+pub const EXCLUDE_DIRS: [&str; 7] =
     [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"];
 
 const PY_EXTENSION: &str = ".py";
@@ -984,6 +984,24 @@ mod tests {
     }
 
     // --- exclude_dirs ----------------------------------------------------------
+
+    /// `plugin.toml` cannot be derived from [`EXCLUDE_DIRS`] (core reads it
+    /// as data), so it is pinned here instead. Compared exactly, order
+    /// included: both are hand-written lists, "copy it verbatim" is the
+    /// simplest rule to follow, and an order-insensitive compare would buy
+    /// nothing but a second way to be equal.
+    #[test]
+    fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap();
+        let listed: Vec<&str> = manifest["plugin"]["workspace"]["exclude_dirs"]
+            .as_array()
+            .expect("plugin.toml declares [plugin.workspace] exclude_dirs")
+            .iter()
+            .map(|dir| dir.as_str().expect("every exclude_dirs entry is a string"))
+            .collect();
+        assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
+    }
 
     #[test]
     fn a_venv_directory_is_never_walked_into() {

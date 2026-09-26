@@ -48,8 +48,8 @@
 //! # pyright is a test dependency of this crate
 //!
 //! [`semantic`]'s arm needs one, and when there is none these tests fail
-//! naming `npm install pyright` rather than skipping. The repository already
-//! treats Node, Go and rust-analyzer that way, and the kit's own doctrine is
+//! naming `scripts/test-deps.sh pyright` rather than skipping. The repository
+//! already treats Node, Go and rust-analyzer that way, and the kit's own doctrine is
 //! that a conformance check which passes because it did not run is the failure
 //! this whole thing exists to remove.
 //!
@@ -208,7 +208,7 @@ fn base() -> PluginCheck {
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
     .extensions(&[".py", ".pyi"])
-    .exclude_dirs(&[".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"])
+    .exclude_dirs(&g_mesh_plugin_python::project::EXCLUDE_DIRS)
     .watch_files(&["pyproject.toml", "setup.cfg", "setup.py"])
     .entry_points(&["__init__"])
 }
@@ -307,8 +307,9 @@ fn pyright_langserver() -> PathBuf {
     }
     panic!(
         "these tests drive a real pyright and there is none that works: tried {tried:?} through \
-         their `pyright --version` twin. Install it with `npm install pyright` run in \
-         plugins/python (node_modules/ is gitignored there). Note that `pyright-langserver \
+         their `pyright --version` twin. Install it with `scripts/test-deps.sh pyright` from \
+         the repository root (`npm ci` of the version plugins/python/package.json pins, as CI \
+         does; node_modules/ is gitignored there). Note that `pyright-langserver \
          --version` is NOT a way to check - it has no such flag and always exits 1."
     )
 }

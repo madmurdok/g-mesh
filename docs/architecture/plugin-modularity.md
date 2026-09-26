@@ -244,10 +244,11 @@ ignore = ["node_modules"]    # optional; directory names skipped when
                               # baseline ignore list below
 
 [plugin.capabilities]        # optional; what the plugin's semantic tier can
-                              # promise - semantic_pass, receiver_calls,
-                              # receiver_calls_structural. Missing entirely or
-                              # per-field defaults conservatively ("says
-                              # nothing" => "can do the least").
+                              # promise - semantic_pass, semantic_sweep,
+                              # receiver_calls, receiver_calls_structural.
+                              # Missing entirely or per-field defaults
+                              # conservatively ("says nothing" => "can do
+                              # the least").
 
 [plugin.workspace]           # optional; which files outside its own claimed
                               # extensions this plugin cares about -

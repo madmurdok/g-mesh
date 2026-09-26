@@ -453,6 +453,17 @@ CREATE TABLE IF NOT EXISTS vectors (
     embedding       BLOB NOT NULL,
     embeddingVersion TEXT NOT NULL
 );
+
+-- One row per language whose workspace reindex has started and not yet
+-- swapped in (daemon::workspace_reindex). Removed in the swap's own
+-- transaction, so a row outliving its daemon means the reindex was
+-- interrupted: the next start runs it again. Added by `CREATE TABLE IF NOT
+-- EXISTS`, so an existing index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS pending_reindex (
+    language  TEXT PRIMARY KEY,
+    trigger   TEXT NOT NULL,
+    startedAt TEXT NOT NULL
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -721,12 +732,52 @@ pub fn record_language_bulk_indexed(
 /// calls this exactly once, after *every* language's own walk has already
 /// recorded its row - the fact this function writes is a property of the
 /// whole project, not of any one language, which is what "roll-up" means.
+///
+/// A reconciler, not only a setter: when some present language lacks the
+/// fact, `meta.bulkIndexedAt` is cleared, so a language row reset after the
+/// roll-up was written can never leave meta claiming a complete walk.
 pub fn record_bulk_index(conn: &Connection) -> Result<()> {
-    if every_present_language_has(conn, "bulkIndexedAt")? {
-        conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", [])
-            .context("failed to record bulkIndexedAt")?;
-    }
+    let sql = if every_present_language_has(conn, "bulkIndexedAt")? {
+        "UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1"
+    } else {
+        "UPDATE meta SET bulkIndexedAt = NULL WHERE id = 1 AND bulkIndexedAt IS NOT NULL"
+    };
+    conn.execute(sql, []).context("failed to record bulkIndexedAt")?;
     Ok(())
+}
+
+/// Marks `language`'s workspace reindex as started, replacing an older mark.
+pub fn mark_pending_reindex(conn: &Connection, language: &str, trigger: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_reindex (language, trigger, startedAt)
+         VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+        params![language, trigger],
+    )
+    .with_context(|| format!("failed to mark {language}'s workspace reindex as pending"))?;
+    Ok(())
+}
+
+/// Every `(language, trigger)` whose workspace reindex was started and never
+/// swapped in, sorted by language. Empty for an index that predates the
+/// table.
+pub fn pending_reindexes(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_reindex')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the pending_reindex table")?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare("SELECT language, trigger FROM pending_reindex ORDER BY language")
+        .context("failed to prepare the pending-reindex read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("failed to read the pending reindexes")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the pending reindexes")
 }
 
 /// Whether the whole-project semantic pass has ever finished for this index -
@@ -908,10 +959,14 @@ pub fn reconcile_semantic_pass_rollup(
     conn: &Connection,
     semantic_pass_languages: &HashSet<String>,
 ) -> Result<()> {
-    if every_present_semantic_language_has_passed(conn, semantic_pass_languages)? {
-        conn.execute("UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1", [])
-            .context("failed to record semanticPassAt")?;
-    }
+    // Clears as well as sets, like `record_bulk_index`: meta never claims a
+    // pass some present capable language no longer has.
+    let sql = if every_present_semantic_language_has_passed(conn, semantic_pass_languages)? {
+        "UPDATE meta SET semanticPassAt = CURRENT_TIMESTAMP WHERE id = 1"
+    } else {
+        "UPDATE meta SET semanticPassAt = NULL WHERE id = 1 AND semanticPassAt IS NOT NULL"
+    };
+    conn.execute(sql, []).context("failed to record semanticPassAt")?;
     Ok(())
 }
 
@@ -969,7 +1024,7 @@ fn wipe(conn: &Connection) -> Result<()> {
         "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
          DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
-         DROP TABLE IF EXISTS language_state;",
+         DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex;",
     )
     .context("failed to wipe schema")
 }

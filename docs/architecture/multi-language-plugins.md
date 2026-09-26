@@ -395,6 +395,9 @@ extensions = [".go"]
 # Core sends semanticPass (per file after a reparse, whole project after a walk)
 # only when true. false: core never sends it, and no empty-diff answer is required.
 semantic_pass = true
+# true: a complete whole-project pass re-sends every semantic edge it stands behind,
+# so core deletes this language's semantic edges it did not re-send. Default false.
+semantic_sweep = true
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"
@@ -3234,7 +3237,8 @@ sequenceDiagram
 → re-check the package → upgrade diff → `link_diff`.
 
 An edit to `go.mod` goes `watch_files` → `workspaceChanged` → per-language reindex:
-delete that language's rows, bulk, link, semantic.
+bulk and link into a staging index, swap only the difference into live, semantic
+([ADR 0008](../adr/0008-workspace-reindex-staging-swap.md)).
 
 ## Failure Modes & Edge Cases
 

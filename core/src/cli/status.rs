@@ -146,6 +146,10 @@ pub struct IndexStatus {
     /// `(language, reason)` for every language whose last whole-project
     /// semantic pass failed (`language_state.semanticPassError`), sorted.
     pub semantic_pass_failures: Vec<(String, String)>,
+    /// `(language, trigger)` for every workspace reindex that started and
+    /// never swapped in (`pending_reindex`), sorted: the previous graph of
+    /// the language still serves until it runs again.
+    pub pending_reindex: Vec<(String, String)>,
     /// Source files found on disk now - the denominator of coverage.
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
@@ -243,6 +247,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -362,6 +367,7 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: discovered.len(),
             indexed: 0,
             dirty: discovered.len(),
@@ -406,6 +412,8 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
             .context("failed to read whether the project's semantic pass has completed")?,
         semantic_pass_owed,
         semantic_pass_failures,
+        pending_reindex: crate::storage::schema::pending_reindexes(&conn)
+            .context("failed to read the interrupted workspace reindexes")?,
         discovered: discovered.len(),
         indexed,
         dirty,
@@ -698,6 +706,14 @@ pub fn render(report: &Report) -> String {
         ) {
             let _ = writeln!(out, "{line}");
         }
+    }
+
+    for (language, trigger) in &index.pending_reindex {
+        let _ = writeln!(
+            out,
+            "  pending reindex: {language} (after {trigger} changed) - interrupted; its previous graph \
+             serves until the daemon runs it again on its next start"
+        );
     }
 
     if index.syntax_error_files.is_empty() {

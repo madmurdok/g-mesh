@@ -6,8 +6,7 @@
 //! different question: instead of "what does this file look like now", it
 //! asks "what can your type checker now resolve that tree-sitter could
 //! only guess at". Its answer comes back in the same diff shape and goes
-//! through the same commit-and-link pipeline, because an upgraded edge is
-//! just that edge re-sent under its own id with a better `source`.
+//! through the same commit-and-link pipeline.
 //!
 //! This module is transport-agnostic on purpose - it only knows about
 //! `Read`/`Write` streams (the same abstraction `jsonrpc.rs` and
@@ -22,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::embedding::EmbeddingPipeline;
+use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
@@ -146,6 +145,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
+        None,
         vec![file_path.clone()],
         semantic_pass_id(&request_id),
         embedding,
@@ -168,16 +168,27 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// see `ControlMessage::SemanticPass` on why "empty" means everything
 /// rather than nothing.
 ///
-/// There is deliberately no new storage path here. The pass answers with a
-/// `FileChangeDiff` whose edges carry the ids the structural pass already
-/// gave them, so `apply_diff`'s `ON CONFLICT(id) DO UPDATE` upgrades each
-/// one in place - `source` `tree-sitter` -> `ts-compiler`, `resolved`
-/// `false` -> `true` - and touches nothing it was not sent.
+/// The answer is an ordinary `FileChangeDiff`, applied through
+/// `apply_diff`, whose edges have `source = 'semantic'`. What it holds
+/// depends on the plugin: an edge re-sent under a structural edge's own id
+/// overwrites that edge in place (the TypeScript tier's upgrades); an edge
+/// onto a placeholder the pass adds, under an id no structural walk emits,
+/// is a new row that linking then points at its target (the SDK's LSP bridge
+/// and the Go tier); `deleteEdgeIds` retracts both the pass's own earlier
+/// edges and structural edges it contradicts. A plugin retracts only the ids
+/// it remembers emitting in its own process.
+///
+/// After a complete whole-project pass, `sweep_language`'s semantic edges
+/// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
+/// what an earlier process emitted and this one no longer does. `None` (a
+/// plugin whose manifest leaves `capabilities.semantic_sweep` off), an
+/// incomplete pass and a per-file pass sweep nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &IndexStore,
+    sweep_language: Option<&str>,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -185,7 +196,17 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     store.unit(Unit::WatcherApply, |store| {
-        apply_semantic_pass_in(reader, writer, store, file_paths, request_id, embedding, timeout, on_timeout)
+        apply_semantic_pass_in(
+            reader,
+            writer,
+            store,
+            sweep_language,
+            file_paths,
+            request_id,
+            embedding,
+            timeout,
+            on_timeout,
+        )
     })
 }
 
@@ -195,6 +216,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &mut Writer<'_>,
+    sweep_language: Option<&str>,
     file_paths: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -234,8 +256,48 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
              this pass did resolve"
         );
+    } else if whole_project {
+        if let Some(language) = sweep_language {
+            let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
+            if swept > 0 {
+                eprintln!(
+                    "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
+                     semantic edge(s) - deleted"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
+/// `language` and whose id is not in `kept`, in one transaction, and returns
+/// how many went. Placeholder nodes the deleted edges pointed at stay, as
+/// every linked-away placeholder does (`graph::symbol_links`, "Why the
+/// placeholder is kept").
+pub(crate) fn sweep_semantic_edges(
+    conn: &mut rusqlite::Connection,
+    language: &str,
+    kept: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let tx = conn.transaction().context("failed to start the semantic-edge sweep")?;
+    let candidates: Vec<String> = tx
+        .prepare(
+            "SELECT e.id FROM edges e JOIN nodes n ON n.id = e.fromId
+             WHERE e.source = 'semantic' AND n.language = ?1",
+        )
+        .and_then(|mut statement| {
+            statement.query_map(rusqlite::params![language], |row| row.get(0))?.collect()
+        })
+        .context("failed to read the semantic edges to sweep")?;
+    let mut swept = 0;
+    for id in candidates.iter().filter(|id| !kept.contains(*id)) {
+        swept += tx
+            .execute("DELETE FROM edges WHERE id = ?1", rusqlite::params![id])
+            .context("failed to delete a semantic edge the pass no longer sends")?;
+    }
+    tx.commit().context("failed to commit the semantic-edge sweep")?;
+    Ok(swept)
 }
 
 /// What one round trip reported about itself, beyond the diff it already
@@ -244,6 +306,8 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
 struct RoundTrip {
     incomplete: bool,
     incomplete_reason: Option<String>,
+    /// The ids of every edge the diff upserted.
+    upserted_edges: std::collections::HashSet<String>,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -342,12 +406,19 @@ fn round_trip<R: BufRead + Send, W: Write>(
     hold_compute_open_for_tests();
 
     // Runs between the unit's steps - see "Lock holds" above.
-    let computed = embedding.compute(&diff);
+    let started = std::time::Instant::now();
+    let mut stats = EmbedStats::default();
+    let computed = embedding.compute(&diff, &mut stats);
+    embedding.finish_file_change(method, &stats, started.elapsed());
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
     store.store_vectors(embedding, &computed);
-    Ok(RoundTrip { incomplete: response.incomplete, incomplete_reason: response.incomplete_reason })
+    Ok(RoundTrip {
+        incomplete: response.incomplete,
+        incomplete_reason: response.incomplete_reason,
+        upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
+    })
 }
 
 /// Test-only: holds this round trip open between its commit step and its

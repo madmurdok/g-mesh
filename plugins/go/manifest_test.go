@@ -11,7 +11,9 @@ package main
 // file this small would not earn its place.
 
 import (
+	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -35,6 +37,19 @@ func manifestValue(t *testing.T, key string) string {
 	}
 	t.Fatalf("plugin.toml declares no %q", key)
 	return ""
+}
+
+// exclude_dirs is a single-line array of plain strings, which is also valid
+// JSON; any other shape fails the unmarshal rather than reading as empty.
+func TestPluginTomlExcludeDirsEqualManifestExcludeDirs(t *testing.T) {
+	raw := manifestValue(t, "exclude_dirs")
+	var listed []string
+	if err := json.Unmarshal([]byte(raw), &listed); err != nil {
+		t.Fatalf("plugin.toml's exclude_dirs %s is not a single-line string array: %v", raw, err)
+	}
+	if !slices.Equal(listed, manifestExcludeDirs) {
+		t.Fatalf("plugin.toml's exclude_dirs %q must equal manifestExcludeDirs %q", listed, manifestExcludeDirs)
+	}
 }
 
 // The handshake announces a version core reads and `g-mesh plugins list`

@@ -301,6 +301,7 @@ fn status_does_not_show_a_dead_daemons_leftover_phase_and_progress_as_live() {
 fn status_warns_about_a_project_idle_past_the_threshold() {
     let _config = GlobalConfigGuard::set(&GlobalConfig {
         cleanup: CleanupConfig { enabled: true, idle_threshold_days: 90 },
+        ..GlobalConfig::default()
     });
     let project = Project::new();
     project.backdate_last_used(100);
@@ -319,6 +320,7 @@ fn status_warns_about_a_project_idle_past_the_threshold() {
 fn status_prints_no_warning_when_cleanup_is_disabled() {
     let _config = GlobalConfigGuard::set(&GlobalConfig {
         cleanup: CleanupConfig { enabled: false, idle_threshold_days: 90 },
+        ..GlobalConfig::default()
     });
     let project = Project::new();
     project.backdate_last_used(100);

@@ -160,7 +160,9 @@ main() {
 	rm -rf "$stage"
 	mkdir -p "$stage"
 
-	(cd "$PLUGIN_DIR" && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO_BIN" build -o "$stage/$exe_name" .)
+	# -buildvcs=false: the same flags core/build.rs passes (core/go_plugin_build_flags.rs),
+	# so the binary depends on the plugin's source alone, not on the checkout's git state.
+	(cd "$PLUGIN_DIR" && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO_BIN" build -buildvcs=false -o "$stage/$exe_name" .)
 	[ -f "$stage/$exe_name" ] || die "expected binary not found: $stage/$exe_name"
 	chmod +x "$stage/$exe_name" 2>/dev/null || true
 

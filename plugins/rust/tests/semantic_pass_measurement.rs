@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use g_mesh_plugin_rust::extractor::RustExtractor;
-use g_mesh_plugin_rust::project::ProjectContext;
+use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig};
 use g_mesh_plugin_sdk::wire::SourceTier;
 use g_mesh_plugin_sdk::{walk_project, Extractor, OpenSiteKind, RelPath, SdkIndex, SemanticEngine};
@@ -53,7 +53,7 @@ fn manifest() -> PathBuf {
 /// one the extractor emitted.
 fn index_corpus(root: &Path) -> (SdkIndex, usize, usize) {
     let project = ProjectContext::load(root).expect("the corpus is a loadable Rust project");
-    let files = walk_project(root, &[".rs".to_string()], &["target".to_string()]);
+    let files = walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from));
     let mut index = SdkIndex::new();
     let mut questions = 0usize;
     let mut site_bytes = 0usize;

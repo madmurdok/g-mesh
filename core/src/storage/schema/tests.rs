@@ -35,6 +35,7 @@ fn creates_all_tables_and_indexes() {
             "language_state",
             "meta",
             "nodes",
+            "pending_reindex",
             "placeholder_targets",
             "vectors",
         ]
@@ -621,6 +622,53 @@ fn the_bulk_index_roll_up_waits_for_every_present_language() {
         })
         .unwrap();
     assert_eq!(rust_fingerprint, None, "a caller with no fingerprint to report must not invent one");
+}
+
+/// Both roll-ups reconcile: once a present language loses its fact (its
+/// `language_state` row reset, as a workspace reindex's swap resets
+/// `semanticPassAt`), the next reconcile clears meta instead of leaving it
+/// claiming a complete index.
+///
+/// Control: make either function only set (drop its clearing branch) -> the
+/// matching assertion after the reset fails.
+#[test]
+fn both_roll_ups_clear_when_a_present_language_loses_its_fact() {
+    let conn = setup();
+    ensure_current(&conn, GENERATION).unwrap();
+    seed_file(&conn, "f1", "rust");
+    let capable = HashSet::from(["rust".to_string()]);
+    record_language_bulk_indexed(&conn, "rust", None).unwrap();
+    record_bulk_index(&conn).unwrap();
+    record_semantic_pass(&conn, "rust", &capable).unwrap();
+    assert!(bulk_index_completed(&conn).unwrap() && semantic_pass_completed(&conn).unwrap());
+
+    conn.execute("UPDATE language_state SET bulkIndexedAt = NULL, semanticPassAt = NULL", []).unwrap();
+    record_bulk_index(&conn).unwrap();
+    reconcile_semantic_pass_rollup(&conn, &capable).unwrap();
+
+    assert!(!bulk_index_completed(&conn).unwrap(), "meta.bulkIndexedAt must be cleared");
+    assert!(!semantic_pass_completed(&conn).unwrap(), "meta.semanticPassAt must be cleared");
+}
+
+/// A pending reindex is listed until its row is removed, a later mark for
+/// the same language replaces the earlier one, and an index without the
+/// table reads as having none.
+#[test]
+fn pending_reindexes_are_listed_per_language() {
+    let conn = setup();
+    mark_pending_reindex(&conn, "rust", "Cargo.toml").unwrap();
+    mark_pending_reindex(&conn, "go", "go.mod").unwrap();
+    mark_pending_reindex(&conn, "rust", "crates/a/Cargo.toml").unwrap();
+    assert_eq!(
+        pending_reindexes(&conn).unwrap(),
+        vec![
+            ("go".to_string(), "go.mod".to_string()),
+            ("rust".to_string(), "crates/a/Cargo.toml".to_string())
+        ]
+    );
+
+    conn.execute_batch("DROP TABLE pending_reindex").unwrap();
+    assert!(pending_reindexes(&conn).unwrap().is_empty());
 }
 
 /// The same rule, for the semantic-pass roll-up - kept as its own test
