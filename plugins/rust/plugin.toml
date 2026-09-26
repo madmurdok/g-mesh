@@ -141,7 +141,10 @@ checkOnSave = false
 # `load_project` (see `ProjectContext::reload` / `Extractor::load_project`).
 watch_files = ["Cargo.toml"]
 # cargo's own build output - never source, and excluded from the walk the
-# same way `node_modules`/`dist` are for TypeScript.
+# same way `node_modules`/`dist` are for TypeScript. This list must equal
+# `project::EXCLUDE_DIRS`, order included: core reads this file as data, so it
+# cannot be derived, and a unit test
+# (`plugin_toml_exclude_dirs_equal_exclude_dirs`) pins the two.
 exclude_dirs = ["target"]
 # A miss-path lookup's container-entry-point names: `lib.rs`/`main.rs` are a
 # crate's own root file, `mod.rs` is a directory-module's.
