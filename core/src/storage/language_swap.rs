@@ -8,12 +8,18 @@
 //! `declarations`, `placeholder_targets`, `edges`, `containers` and
 //! `vectors`. A table missing from either keeps stale rows after a swap.
 //!
-//! The semantic-edge rule: a live edge whose `source` is `semantic` and whose
-//! two endpoints both survive the swap is kept as it is, whether staging has
-//! a structural edge under the same id or none at all. A semantic pass
-//! upgrades structural edges in place and adds edges of its own, and neither
-//! kind is in a structural walk; the pass that runs after the swap replaces
-//! them.
+//! The unchanged-node rule decides whose edges a node gets. A node is
+//! unchanged when it is in both indexes with every `nodes` column equal and
+//! its `declarations` and `placeholder_targets` rows equal, which is exactly
+//! "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
+//! its live outgoing edges, whatever their `source`, and gets none of
+//! staging's, so the swap neither downgrades what a semantic pass wrote nor
+//! brings back a structural edge the pass retracted. The one exception: a
+//! live edge whose target does not exist after the swap is deleted, and the
+//! staged edges from that node of the same kind, which live lacks or holds
+//! only with a vanished target, are taken in its place. Every other node,
+//! changed or new, gets exactly staging's outgoing edges; the semantic pass
+//! that runs after the swap refines them.
 //!
 //! Neither half enables foreign keys or depends on them: the swap deletes
 //! edges before nodes and inserts nodes before edges, so it is also valid on
@@ -38,10 +44,12 @@ const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
 /// The plan tables, created in the staging file. `plan_text_changed` holds
 /// the upserted nodes whose embedded text differs from live's, whose live
-/// vector is therefore stale.
+/// vector is therefore stale; `plan_unchanged_nodes` the nodes the
+/// unchanged-node rule (module doc) keeps live's outgoing edges for.
 const PLAN_DDL: &str = "
 DROP TABLE IF EXISTS plan_delete_nodes;
 DROP TABLE IF EXISTS plan_upsert_nodes;
+DROP TABLE IF EXISTS plan_unchanged_nodes;
 DROP TABLE IF EXISTS plan_text_changed;
 DROP TABLE IF EXISTS plan_delete_edges;
 DROP TABLE IF EXISTS plan_upsert_edges;
@@ -49,6 +57,7 @@ DROP TABLE IF EXISTS plan_delete_containers;
 DROP TABLE IF EXISTS plan_upsert_containers;
 CREATE TABLE plan_delete_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_nodes (id TEXT PRIMARY KEY);
+CREATE TABLE plan_unchanged_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_text_changed (id TEXT PRIMARY KEY);
 CREATE TABLE plan_delete_edges (id TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_edges (id TEXT PRIMARY KEY);
@@ -172,28 +181,54 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
     let upsert_nodes: usize =
         tx.query_row("SELECT COUNT(*) FROM plan_upsert_nodes", [], |row| row.get::<_, i64>(0))? as usize;
 
+    run(
+        "INSERT INTO plan_unchanged_nodes (id)
+         SELECT s.id FROM main.nodes s
+         WHERE s.id IN (SELECT id FROM live.nodes WHERE language = ?1)
+           AND s.id NOT IN (SELECT id FROM plan_upsert_nodes)",
+        "the unchanged nodes",
+    )?;
+
+    // Whether node `x` exists after the swap: it is staged, or it is a live
+    // node of another language, which the swap does not touch.
+    let survives = |x: &str| {
+        format!(
+            "({x} IN (SELECT id FROM main.nodes)
+              OR EXISTS (SELECT 1 FROM live.nodes o WHERE o.id = {x} AND o.language <> ?1))"
+        )
+    };
+
     // Live edges of the language: either endpoint is one of its live nodes.
+    // One from an unchanged node goes only when its target does; any other
+    // goes when staging lacks its id.
     let delete_edges = run(
-        "INSERT INTO plan_delete_edges (id)
-         SELECT e.id FROM live.edges e
-         WHERE (e.fromId IN (SELECT id FROM live.nodes WHERE language = ?1)
-                OR e.toId IN (SELECT id FROM live.nodes WHERE language = ?1))
-           AND e.id NOT IN (SELECT id FROM main.edges)
-           AND NOT (e.source = 'semantic'
-                    AND e.fromId IN (SELECT id FROM main.nodes)
-                    AND e.toId IN (SELECT id FROM main.nodes))",
+        &format!(
+            "INSERT INTO plan_delete_edges (id)
+             SELECT e.id FROM live.edges e
+             WHERE (e.fromId IN (SELECT id FROM live.nodes WHERE language = ?1)
+                    OR e.toId IN (SELECT id FROM live.nodes WHERE language = ?1))
+               AND CASE WHEN e.fromId IN (SELECT id FROM plan_unchanged_nodes)
+                        THEN NOT {target_survives}
+                        ELSE e.id NOT IN (SELECT id FROM main.edges) END",
+            target_survives = survives("e.toId"),
+        ),
         "the edges to delete",
     )?;
+    // Staged edges that differ from live. One from an unchanged node is taken
+    // only in place of a live edge of the same kind whose target went away,
+    // and never over a live edge of its own id that is kept.
     let upsert_edges = run(
         &format!(
             "INSERT INTO plan_upsert_edges (id) SELECT s.id FROM (
                  SELECT {EDGE_COLUMNS} FROM main.edges
                  EXCEPT SELECT {EDGE_COLUMNS} FROM live.edges WHERE id IN (SELECT id FROM main.edges)) s
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM live.edges l
-                 WHERE l.id = s.id AND l.source = 'semantic'
-                   AND l.fromId IN (SELECT id FROM main.nodes)
-                   AND l.toId IN (SELECT id FROM main.nodes))"
+             WHERE s.fromId NOT IN (SELECT id FROM plan_unchanged_nodes)
+                OR (EXISTS (SELECT 1 FROM live.edges d
+                            WHERE d.fromId = s.fromId AND d.kind = s.kind AND NOT {dropped_survives})
+                    AND NOT EXISTS (SELECT 1 FROM live.edges l
+                                    WHERE l.id = s.id AND {kept_survives}))",
+            dropped_survives = survives("d.toId"),
+            kept_survives = survives("l.toId"),
         ),
         "the edges to upsert",
     )?;

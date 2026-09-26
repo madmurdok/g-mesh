@@ -1287,18 +1287,15 @@ mod tests {
         );
     }
 
-    /// The fake semantic pass of tests 7 and 8: upgrades `alpha-e1` in place
-    /// and retargets it onto `alpha-n3`, and adds `alpha-sem`, an edge no
-    /// structural walk emits, the shape every bundled semantic tier writes.
-    fn fake_semantic_pass(conn: &IndexStore, extra: Vec<EdgeRecord>) {
-        let semantic = |id: &str, from: &str, to: &str| {
-            let mut edge = EdgeRecord::new(id, from, to, "CALLS", "semantic", true);
-            edge.engine = "fake-lsp".to_string();
-            edge
-        };
-        let mut upsert_edges =
-            vec![semantic("alpha-e1", "alpha-n1", "alpha-n3"), semantic("alpha-sem", "alpha-n2", "alpha-n3")];
-        upsert_edges.extend(extra);
+    /// The fake semantic pass of test 7: rewrites `alpha-e1` in place onto
+    /// `alpha-n3`, as the TypeScript tier upgrades an edge, and adds
+    /// `alpha-sem`, an edge no structural walk emits, as the LSP bridge and
+    /// the Go tier do.
+    fn fake_semantic_pass(conn: &IndexStore) {
+        let upsert_edges = vec![
+            semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+            semantic_edge("alpha-sem", "alpha-n2", "alpha-n3"),
+        ];
         apply_diff(&mut conn.lock().unwrap(), &Diff { upsert_edges, ..Default::default() }).unwrap();
     }
 
@@ -1325,7 +1322,7 @@ mod tests {
         test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
-        fake_semantic_pass(&conn, Vec::new());
+        fake_semantic_pass(&conn);
         let graph_before = digest_of(&conn, &GRAPH_TABLES);
 
         let total_changes = |conn: &IndexStore| count(&conn.lock().unwrap(), "SELECT total_changes()");
@@ -1341,61 +1338,156 @@ mod tests {
         assert_eq!(digest_of(&conn, &GRAPH_TABLES), graph_before, "no graph row changed");
     }
 
-    /// Test 8: the swap keeps a semantic pass's edges whose endpoints both
-    /// survive - one upgraded in place, one the pass added - until the next
-    /// pass; a node whose code changed gets its new structural edge; a
-    /// semantic edge into a node the walk dropped goes with that node.
-    ///
-    /// Controls: drop the `NOT EXISTS` clause of `plan_upsert_edges` ->
-    /// `alpha-e1` reads `syntactic` while held; drop the `NOT (e.source =
-    /// 'semantic' ...)` clause of `plan_delete_edges` -> `alpha-sem` is gone.
-    #[test]
-    fn semantic_edges_survive_the_swap_until_the_next_pass() {
+    /// Every edge as `id|source|toId`, read while
+    /// the reindex holds the swapped state (before its own semantic pass).
+    fn edges_at_swap(
+        registry: &PluginRegistry,
+        supervisor: &PluginSupervisor,
+        conn: &IndexStore,
+    ) -> Vec<String> {
+        let mut held = None;
+        run_with(registry, supervisor, conn, "go.mod", &mut |stage| {
+            if stage == Stage::Swapped {
+                held = Some(rows(&conn.lock().unwrap(), "SELECT id, source, toId FROM edges ORDER BY id"));
+            }
+        })
+        .expect("the reindex succeeds");
+        held.expect("the swap was reached")
+    }
+
+    fn edge_row(id: &str, source: &str, to: &str) -> String {
+        format!("Text(\"{id}\")|Text(\"{source}\")|Text(\"{to}\")")
+    }
+
+    /// A semantic edge as a pass writes it.
+    fn semantic_edge(id: &str, from: &str, to: &str) -> EdgeRecord {
+        let mut edge = EdgeRecord::new(id, from, to, "CALLS", "semantic", true);
+        edge.engine = "fake-lsp".to_string();
+        edge
+    }
+
+    /// Indexes `first`, applies a semantic pass that writes `semantic` and
+    /// retracts `retracted`, then points the walk at `second`.
+    fn after_a_pass(
+        first: &[String],
+        semantic: Vec<EdgeRecord>,
+        retracted: &[&str],
+        second: &[String],
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PluginRegistry,
+        IndexStore,
+        Arc<PluginSupervisor>,
+    ) {
         let counters = Counters::default();
-        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
-        let mut first = three_nodes();
-        first.push(json(&wire_node("alpha-n4", "src/a.alpha-src")));
-        test_plugin::set_bulk_stream(project.path(), "alpha", &first, 0);
+        let (project, plugins, scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        test_plugin::set_bulk_stream(project.path(), "alpha", first, 0);
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
-        let mut into_dropped =
-            EdgeRecord::new("alpha-sem-n4", "alpha-n1", "alpha-n4", "CALLS", "semantic", true);
-        into_dropped.engine = "fake-lsp".to_string();
-        fake_semantic_pass(&conn, vec![into_dropped]);
+        apply_diff(
+            &mut conn.lock().unwrap(),
+            &Diff {
+                upsert_edges: semantic,
+                delete_edge_ids: retracted.iter().map(|id| id.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        test_plugin::set_bulk_stream(project.path(), "alpha", second, 0);
+        (project, plugins, scratch, registry, conn, supervisor)
+    }
 
-        // alpha-n2's code changed: it now calls alpha-n1, a new structural
-        // edge; alpha-n4 is gone.
-        let mut second = three_nodes();
+    /// Test 8: a node whose row did not change keeps every outgoing edge it
+    /// has in live - the pass's edge upgraded in place and retargeted, the
+    /// edge the pass added - and a structural edge the pass retracted from it
+    /// stays absent, although the walk emits it again.
+    ///
+    /// Control: leave `plan_unchanged_nodes` empty (drop its `INSERT` in
+    /// `language_swap::plan_attached`) -> `alpha-e1` reads `syntactic` onto
+    /// `alpha-n2`, `alpha-sem` is gone and `alpha-retracted` is back.
+    #[test]
+    fn an_unchanged_node_keeps_its_live_edges_across_the_swap() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-retracted", "alpha-n1", "alpha-n3")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &["alpha-retracted"],
+            &first,
+        );
+
+        assert_eq!(
+            edges_at_swap(&registry, &supervisor, &conn),
+            vec![edge_row("alpha-e1", "semantic", "alpha-n3"), edge_row("alpha-sem", "semantic", "alpha-n2")]
+        );
+    }
+
+    /// A node whose row changed gets exactly the walk's outgoing edges: its
+    /// new structural edge, and neither the semantic edge a pass added from
+    /// it nor the pass's upgrade of its structural edge.
+    ///
+    /// Control: count every node present in both indexes as unchanged (drop
+    /// the `NOT IN plan_upsert_nodes` condition of `plan_unchanged_nodes`) ->
+    /// `alpha-e2` is missing and `alpha-sem` and the semantic `alpha-e3` stay.
+    #[test]
+    fn a_changed_node_takes_the_walks_edges() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-e3", "alpha-n2", "alpha-n3")));
+        // alpha-n2's code changed: it now also calls alpha-n1.
+        let mut second = first.clone();
         second[2] = json(&WireNode {
             signature: Some("fn alpha-n2(x)".to_string()),
             ..wire_node("alpha-n2", "src/a.alpha-src")
         });
         second.push(json(&wire_edge("alpha-e2", "alpha-n2", "alpha-n1")));
-        test_plugin::set_bulk_stream(project.path(), "alpha", &second, 0);
-        let edge = |conn: &IndexStore, id: &str| {
-            rows(&conn.lock().unwrap(), &format!("SELECT source, toId FROM edges WHERE id = '{id}'"))
-        };
-        let mut held = None;
-        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| {
-            if stage == Stage::Swapped {
-                held = Some((
-                    edge(&conn, "alpha-e1"),
-                    edge(&conn, "alpha-sem"),
-                    edge(&conn, "alpha-e2"),
-                    edge(&conn, "alpha-sem-n4"),
-                ));
-            }
-        })
-        .expect("the reindex succeeds");
-
-        let (e1, sem, e2, into_dropped) = held.expect("the swap was reached");
-        assert_eq!(e1, vec!["Text(\"semantic\")|Text(\"alpha-n3\")".to_string()], "upgraded in place, kept");
-        assert_eq!(sem, vec!["Text(\"semantic\")|Text(\"alpha-n3\")".to_string()], "added by the pass, kept");
-        assert_eq!(
-            e2,
-            vec!["Text(\"syntactic\")|Text(\"alpha-n1\")".to_string()],
-            "the changed node's new edge"
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-sem", "alpha-n2", "alpha-n1"),
+                semantic_edge("alpha-e3", "alpha-n2", "alpha-n1"),
+            ],
+            &[],
+            &second,
         );
-        assert!(into_dropped.is_empty(), "an edge into a dropped node goes with it");
+
+        assert_eq!(
+            edges_at_swap(&registry, &supervisor, &conn),
+            vec![
+                edge_row("alpha-e1", "syntactic", "alpha-n2"),
+                edge_row("alpha-e2", "syntactic", "alpha-n1"),
+                edge_row("alpha-e3", "syntactic", "alpha-n3"),
+            ]
+        );
+    }
+
+    /// An unchanged node's live edge into a node the walk dropped goes, and
+    /// the walk's edge of the same kind from that node, onto the node that
+    /// took its place, is taken; the node's other live edges stay as they
+    /// are.
+    ///
+    /// Controls: drop the `OR (EXISTS ...)` branch of `plan_upsert_edges` ->
+    /// `alpha-e5` is missing; make the unchanged branch of
+    /// `plan_delete_edges` delete nothing (`THEN 0`) -> the swap fails on
+    /// the foreign key into the deleted `alpha-n4`.
+    #[test]
+    fn an_edge_into_a_dropped_node_is_replaced_by_the_walks() {
+        let mut first = three_nodes();
+        first.push(json(&wire_node("alpha-n4", "src/a.alpha-src")));
+        first.push(json(&wire_edge("alpha-e4", "alpha-n1", "alpha-n4")));
+        let mut second = three_nodes();
+        second.push(json(&wire_node("alpha-n5", "src/a.alpha-src")));
+        second.push(json(&wire_edge("alpha-e5", "alpha-n1", "alpha-n5")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) =
+            after_a_pass(&first, vec![semantic_edge("alpha-e1", "alpha-n1", "alpha-n3")], &[], &second);
+
+        assert_eq!(
+            edges_at_swap(&registry, &supervisor, &conn),
+            vec![edge_row("alpha-e1", "semantic", "alpha-n3"), edge_row("alpha-e5", "syntactic", "alpha-n5")]
+        );
     }
 }
