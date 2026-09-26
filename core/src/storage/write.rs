@@ -301,13 +301,6 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         // gets a fresh one from `EmbeddingPipeline::apply`, which embeds every
         // upserted node.
         //
-        // Until GM-294 this loop did not delete vectors at all, and nothing
-        // noticed, because the connection this comment used to call
-        // foreign-key-free in fact enforced them (GM-292) and the cascade
-        // quietly did the work. `graph::containers::delete_container` and
-        // `daemon::workspace_reindex::delete_language_rows` already deleted
-        // vectors by hand.
-        //
         // Edges into the node are deliberately *not* touched. One the plugin
         // did not re-send because its id did not change (a file's `DEFINES`
         // into a symbol whose body grew) is valid again the moment the same
@@ -500,54 +493,6 @@ pub(crate) fn upsert_indexed_file(
     )
     .context("failed to upsert indexed_files row")?;
     Ok(())
-}
-
-/// Deletes every row `language` owns (see `daemon::workspace_reindex`'s
-/// module doc for exactly which rows), in one transaction: a failure partway
-/// through must not leave edges deleted while their nodes remain.
-///
-/// Order matters only under a connection that enforces foreign keys (the
-/// daemon's does not; most tests do): edges before nodes (`edges.fromId`/
-/// `toId` reference `nodes(id)` with no `ON DELETE CASCADE`), and every
-/// node-keyed child table (`vectors`, `declarations`, `placeholder_targets`,
-/// `containers`) before `nodes` itself.
-pub(crate) fn delete_language_rows(conn: &mut Connection, language: &str) -> Result<()> {
-    let tx = conn.transaction().context("failed to start the per-language delete transaction")?;
-
-    tx.execute(
-        "DELETE FROM edges WHERE fromId IN (SELECT id FROM nodes WHERE language = ?1) \
-            OR toId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's edges")?;
-    tx.execute(
-        "DELETE FROM vectors WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's vectors")?;
-    tx.execute(
-        "DELETE FROM declarations WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's declarations")?;
-    tx.execute(
-        "DELETE FROM placeholder_targets WHERE nodeId IN (SELECT id FROM nodes WHERE language = ?1)",
-        params![language],
-    )
-    .context("failed to delete a language's placeholder targets")?;
-    // Every container of this language is empty once its member nodes are
-    // gone (below), so a plain `WHERE language = ?` is the exact delete.
-    tx.execute("DELETE FROM containers WHERE language = ?1", params![language])
-        .context("failed to delete a language's containers")?;
-    // Member declarations and container nodes alike carry the language.
-    tx.execute("DELETE FROM nodes WHERE language = ?1", params![language])
-        .context("failed to delete a language's nodes")?;
-    // The whole row, `pluginFingerprint` included: the re-walk records it
-    // again.
-    tx.execute("DELETE FROM language_state WHERE language = ?1", params![language])
-        .context("failed to reset a language's language_state row")?;
-
-    tx.commit().context("failed to commit the per-language delete transaction")
 }
 
 #[cfg(test)]

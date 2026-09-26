@@ -84,7 +84,7 @@ pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
 /// Because nothing cascades, a delete from `nodes` owes its dependents an
 /// explicit delete of their own - `storage::write::apply_diff`,
 /// `graph::containers`' empty-container delete, `graph::imports`' placeholder
-/// drop and `daemon::workspace_reindex::delete_language_rows` all do this.
+/// drop and `storage::language_swap::swap` all do this.
 /// `ON DELETE CASCADE` in the DDL is still honoured where a connection turns
 /// enforcement on (many unit tests do, to catch an edge pointed at a node that
 /// was never written, or a delete made in the wrong order); it is not what
@@ -108,6 +108,22 @@ pub fn open(root: &Path) -> Result<Connection> {
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
+    Ok(conn)
+}
+
+/// Opens (creating) a throwaway index at `path` with the graph schema - the
+/// staging file a per-language reindex walks into before its swap
+/// (`daemon::workspace_reindex`). Foreign keys off, as in [`open`]; the
+/// rollback journal is kept in memory and nothing is synced, because the
+/// file is deleted rather than recovered after a crash.
+pub fn open_staging(path: &Path) -> Result<Connection> {
+    vectors::register_extension();
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open the staging index at {}", path.display()))?;
+    conn.pragma_update(None, "journal_mode", "MEMORY").context("failed to set the staging journal mode")?;
+    conn.pragma_update(None, "synchronous", "OFF").context("failed to set the staging sync mode")?;
+    conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
+    crate::storage::schema::apply(&conn)?;
     Ok(conn)
 }
 

@@ -27,6 +27,8 @@
 //! signature and a doc comment when the project root holds a
 //! `.<language>-nN.sig` / `.<language>-nN.doc` file, read at walk time, so an
 //! embedding test can give nodes text and change it between walks.
+//! [`set_bulk_stream`] replaces the whole stream, and can make the walk exit
+//! non-zero after it, for tests that need a different graph per walk.
 //!
 //! Node, rather than a shell script, for the same reason the real plugin uses
 //! it: it is already a hard dependency of this crate's test suite
@@ -332,6 +334,16 @@ fn install_inner(
     dir
 }
 
+/// Adds `semantic_sweep = true` to a semantic-pass-capable plugin's
+/// `[plugin.capabilities]`. Takes effect at the next `discover`.
+pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest sweeps");
+    let swept = manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_sweep = true\n");
+    fs::write(&path, swept).expect("failed to write the fake plugin's manifest");
+}
+
 /// Every pid this plugin directory has ever been spawned as, oldest first.
 /// Empty (rather than a panic) before the first spawn - "never spawned" is a
 /// perfectly ordinary thing for a test to assert.
@@ -373,6 +385,18 @@ pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
         .into_iter()
         .filter_map(|line| line.strip_prefix("fileChanged ").map(str::to_string))
         .collect()
+}
+
+/// Makes every later bulk walk of `language` over `project` emit `lines`
+/// (NDJSON, one item each) instead of its fixed stream, then exit with
+/// `exit_code`.
+pub(crate) fn set_bulk_stream(project: &Path, language: &str, lines: &[String], exit_code: i32) {
+    let mut stream = lines.join("\n");
+    stream.push('\n');
+    fs::write(project.join(format!(".{language}-bulk.ndjson")), stream)
+        .expect("failed to write the bulk stream");
+    fs::write(project.join(format!(".{language}-bulk.exit")), exit_code.to_string())
+        .expect("failed to write the bulk exit status");
 }
 
 /// A fresh in-memory index for the (empty) diffs a fake plugin's round trips
@@ -490,6 +514,13 @@ if (process.argv[2] === "--bulk-index") {{
       return undefined;
     }}
   }};
+  // A test-written stream replaces the fixed one; the exit file sets the
+  // exit status after it (see `set_bulk_stream`).
+  const stream = optional(".{language}-bulk.ndjson");
+  if (stream !== undefined) {{
+    process.stdout.write(stream, () => process.exit(Number(optional(".{language}-bulk.exit") || 0)));
+    return;
+  }}
   line({{
     id: "{language}-n1",
     signature: optional(".{language}-n1.sig"),

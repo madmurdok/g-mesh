@@ -1364,7 +1364,17 @@ impl PluginProcess {
             let mut on_timeout = self.kill_on_timeout(child);
             // See `Self::ensure_fresh`'s identical comment: `conn` is handed
             // through as the `Mutex` it is (GM-396).
-            apply_semantic_pass(reader, writer, conn, file_paths, id, embedding, timeout, &mut on_timeout)
+            apply_semantic_pass(
+                reader,
+                writer,
+                conn,
+                self.manifest.capabilities.semantic_sweep.then_some(self.manifest.language.as_str()),
+                file_paths,
+                id,
+                embedding,
+                timeout,
+                &mut on_timeout,
+            )
         };
         self.relaunch_after_timeout_if_needed(&result);
         result

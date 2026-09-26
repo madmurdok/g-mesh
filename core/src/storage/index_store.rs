@@ -34,8 +34,8 @@ use rusqlite::Connection;
 use crate::embedding::pipeline::ComputedEmbedding;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
-use crate::storage::schema;
-use crate::storage::write::{apply_diff, delete_language_rows, upsert_indexed_file, Diff};
+use crate::storage::language_swap::{self, SwapBookkeeping};
+use crate::storage::write::{apply_diff, upsert_indexed_file, Diff};
 
 thread_local! {
     static HELD: Cell<bool> = const { Cell::new(false) };
@@ -228,19 +228,22 @@ impl IndexStore {
         Ok(LinkCounts { imports, symbols })
     }
 
-    /// Links everything and updates the project-wide bulk-index roll-up in
-    /// one hold, so no reader sees a relinked graph without its roll-up.
-    pub fn relink_after_language_reindex(&self) -> Result<()> {
-        let mut conn = self.acquire();
-        imports::link_all(&mut conn).context("failed to link imports after a per-language reindex")?;
-        symbol_links::link_all(&mut conn).context("failed to link symbols after a per-language reindex")?;
-        schema::record_bulk_index(&conn).context("failed to update the project-wide bulk-index roll-up")?;
-        Ok(())
+    /// The file this store's connection writes, or `None` for an in-memory
+    /// index.
+    pub fn file_path(&self) -> Option<std::path::PathBuf> {
+        self.with(|conn| conn.path().filter(|path| !path.is_empty()).map(std::path::PathBuf::from))
     }
 
-    /// Deletes every row `language` owns, in one transaction.
-    pub fn delete_language(&self, language: &str) -> Result<()> {
-        delete_language_rows(&mut self.acquire(), language)
+    /// Applies a per-language reindex's plan from the staging file at
+    /// `staging_path`, with its vectors and bookkeeping, in one hold and one
+    /// transaction (`storage::language_swap::swap`).
+    pub fn swap_language(
+        &self,
+        staging_path: &std::path::Path,
+        vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
+        bookkeeping: &SwapBookkeeping<'_>,
+    ) -> Result<()> {
+        language_swap::swap(&mut self.acquire(), staging_path, vectors, bookkeeping)
     }
 
     /// Writes `(filePath, mtimeMillis, contentHash)` baselines in one
@@ -355,6 +358,7 @@ impl Deref for ReadGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::schema;
     use crate::storage::write::NodeRecord;
 
     fn store() -> IndexStore {
@@ -470,7 +474,5 @@ mod tests {
         };
         store.commit_batch(&diff, None).unwrap();
         assert_eq!(store.with(node_count), 1);
-        store.delete_language("rust").unwrap();
-        assert_eq!(store.with(node_count), 0);
     }
 }

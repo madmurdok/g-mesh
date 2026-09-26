@@ -265,6 +265,11 @@ impl EmbeddingPipeline {
             .as_deref()
     }
 
+    /// The `embeddingVersion` this pipeline tags every vector it stores with.
+    pub(crate) fn embedding_version(&self) -> &str {
+        &self.config.model
+    }
+
     /// Cheap check for whether the embedding backfill pass
     /// (`embedding::backfill::run`) has anything to do at all, *without*
     /// paying [`model`](Self::model)'s load cost to find out.
@@ -711,7 +716,7 @@ fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<St
 /// case: nothing to say about this symbol beyond what its name already
 /// carries, so no row is written at all rather than one embedding an empty
 /// or whitespace-only string.
-fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
+pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
     let doc_comment = doc_comment.map(str::trim).filter(|s| !s.is_empty());
     let signature = signature.map(str::trim).filter(|s| !s.is_empty());
 

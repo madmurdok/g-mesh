@@ -568,6 +568,12 @@ impl PluginRegistry {
         &self.embedding
     }
 
+    /// The project's state directory, where `daemon::workspace_reindex` puts
+    /// its staging index.
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// Builds a registry over `discovered`. Spawns nothing - see this
     /// module's doc comment.
     pub fn new(
@@ -915,16 +921,15 @@ impl PluginRegistry {
     /// kind - the workspace-routing counterpart to
     /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
     /// with the same "failures are reported and dropped" contract.
-    fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
+    pub(crate) fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
                 if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
                 {
                     eprintln!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
-                         {changed_file} changed: {err:#} - {language}'s index may now be partial \
-                         until the next successful reindex (the same best-effort contract a \
-                         failed cold-start bulk walk already has)"
+                         {changed_file} changed: {err:#} - {language}'s previous graph keeps \
+                         serving, and the reindex runs again on the next daemon start"
                     );
                 }
             }

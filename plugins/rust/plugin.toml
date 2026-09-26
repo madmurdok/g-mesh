@@ -54,6 +54,10 @@ extensions = [".rs"]
 # `capabilities.semantic-engine-lazy`: the engine must not exist until the
 # first one arrives (see src/main.rs, which passes a factory).
 semantic_pass = true
+# Every complete whole-project pass re-sends each semantic edge it stands
+# behind, so core may delete this language's semantic edges one did not
+# re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+semantic_sweep = true
 # Receiver calls (`x.m()`) are an open site the structural tier answers with
 # nothing and the semantic tier answers exactly - so the two fields differ,
 # which is the shape `core::mcp::instructions` reads to decide how long to

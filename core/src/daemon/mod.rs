@@ -263,6 +263,9 @@ pub fn run(root: &Path) -> Result<()> {
     let discovered =
         manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
 
+    // Before the index is opened and before any reindex can run: a staging
+    // file left here belongs to a reindex that died.
+    workspace_reindex::remove_stale_staging(&dir);
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     // The generation names every discovered plugin's build and core's
     // pipeline, so an index built by a since-rebuilt plugin is thrown away.

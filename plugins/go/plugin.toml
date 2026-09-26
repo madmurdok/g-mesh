@@ -56,6 +56,10 @@ extensions = [".go"]
 # a fileChanged, which is what `capabilities.semantic-engine-lazy` checks
 # through the marker that pass writes.
 semantic_pass = true
+# Every complete whole-project pass re-sends each semantic edge it stands
+# behind, so core may delete this language's semantic edges one did not
+# re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+semantic_sweep = true
 # `x.M()` needs to know the receiver's type, which only go/types can answer.
 # The two values therefore differ, and the difference is the whole point:
 #

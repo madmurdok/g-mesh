@@ -883,7 +883,7 @@ impl<W: Write> Write for TeeWriter<W> {
 
 enum Operation {
     FileChanged { semantic_pass_capable: bool },
-    WholeProjectSemanticPass { timeout: Duration },
+    WholeProjectSemanticPass { sweep_language: Option<String>, timeout: Duration },
 }
 
 struct Driver<'a> {
@@ -1045,7 +1045,10 @@ pub(crate) fn run_session(
     }
 
     if manifest.capabilities.semantic_pass {
-        let operation = Operation::WholeProjectSemanticPass { timeout: whole_project_timeout };
+        let operation = Operation::WholeProjectSemanticPass {
+            sweep_language: manifest.capabilities.semantic_sweep.then(|| manifest.language.clone()),
+            timeout: whole_project_timeout,
+        };
         if !driver.step("semanticPass #1 (whole project)", file, &operation) {
             return driver.finish();
         }
@@ -1123,9 +1126,17 @@ impl Driver<'_> {
                     *semantic_pass_capable,
                     &mut kill,
                 ),
-                Operation::WholeProjectSemanticPass { timeout } => {
-                    apply_semantic_pass(reader, writer, conn, Vec::new(), id, &embedding, *timeout, &mut kill)
-                }
+                Operation::WholeProjectSemanticPass { sweep_language, timeout } => apply_semantic_pass(
+                    reader,
+                    writer,
+                    conn,
+                    sweep_language.as_deref(),
+                    Vec::new(),
+                    id,
+                    &embedding,
+                    *timeout,
+                    &mut kill,
+                ),
             }
         };
         self.record(label, result)

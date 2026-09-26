@@ -125,6 +125,14 @@ pub struct Capabilities {
     /// a reparse, whole project after a walk). `false`: core never sends one and
     /// never requires an answer to one.
     pub semantic_pass: bool,
+    /// Whether a complete whole-project `semanticPass` re-sends every semantic
+    /// edge this plugin stands behind and says `incomplete` whenever it did
+    /// not. `true`: after such a pass core deletes this language's semantic
+    /// edges the pass did not re-send (`watcher::apply::sweep_semantic_edges`).
+    /// `false` (the default): core never sweeps this language, because a
+    /// pass that stops part-way without saying so would lose every edge it
+    /// did not reach.
+    pub semantic_sweep: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
     /// type, never its run-time type (`mcp::instructions`' `P4_STATIC_RECEIVER`

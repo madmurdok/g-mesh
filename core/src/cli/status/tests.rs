@@ -271,6 +271,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_completed: true,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -293,6 +294,41 @@ fn a_report_renders_every_field_it_was_asked_for() {
     assert!(rendered.contains("semantic pass:   complete"), "{rendered}");
 }
 
+/// An interrupted workspace reindex is named with its language and trigger.
+///
+/// Control: drop the `pending reindex:` loop from `render` -> not named.
+#[test]
+fn an_interrupted_workspace_reindex_is_named() {
+    let report = Report {
+        project_root: PathBuf::from("/tmp/project"),
+        project_id: "a1b2c3d4e5f6a7b8".to_string(),
+        state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+        core: CoreState::NotRunning,
+        build: BuildState::Current,
+        plugins: Vec::new(),
+        suspended_languages: Vec::new(),
+        last_used: None,
+        index: IndexStatus {
+            bulk_indexed: true,
+            semantic_pass_completed: true,
+            semantic_pass_owed: Vec::new(),
+            semantic_pass_failures: Vec::new(),
+            pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
+            discovered: 1,
+            indexed: 1,
+            dirty: 0,
+            syntax_error_files: Vec::new(),
+        },
+        phase: None,
+        front: None,
+        progress: None,
+    };
+
+    let rendered = render(&report);
+
+    assert!(rendered.contains("pending reindex: rust (after Cargo.toml changed)"), "{rendered}");
+}
+
 /// The gap task 62cc2d0f closes: a walked index whose semantic pass never
 /// finished must not read as fully healthy just because `bulk_indexed` is
 /// true - `status` is the explicit-surfacing half of the fix (the other
@@ -313,6 +349,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -458,6 +495,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -500,6 +538,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -738,6 +777,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -828,6 +868,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_completed: true,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1038,6 +1079,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
+            pending_reindex: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
