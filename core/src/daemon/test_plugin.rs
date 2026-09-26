@@ -27,6 +27,8 @@
 //! signature and a doc comment when the project root holds a
 //! `.<language>-nN.sig` / `.<language>-nN.doc` file, read at walk time, so an
 //! embedding test can give nodes text and change it between walks.
+//! [`set_bulk_stream`] replaces the whole stream, and can make the walk exit
+//! non-zero after it, for tests that need a different graph per walk.
 //!
 //! Node, rather than a shell script, for the same reason the real plugin uses
 //! it: it is already a hard dependency of this crate's test suite
@@ -375,6 +377,18 @@ pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Makes every later bulk walk of `language` over `project` emit `lines`
+/// (NDJSON, one item each) instead of its fixed stream, then exit with
+/// `exit_code`.
+pub(crate) fn set_bulk_stream(project: &Path, language: &str, lines: &[String], exit_code: i32) {
+    let mut stream = lines.join("\n");
+    stream.push('\n');
+    fs::write(project.join(format!(".{language}-bulk.ndjson")), stream)
+        .expect("failed to write the bulk stream");
+    fs::write(project.join(format!(".{language}-bulk.exit")), exit_code.to_string())
+        .expect("failed to write the bulk exit status");
+}
+
 /// A fresh in-memory index for the (empty) diffs a fake plugin's round trips
 /// commit. Shared by every caller of this module, because none of them cares
 /// what is in it - only that the commit path a real file change takes is the
@@ -490,6 +504,13 @@ if (process.argv[2] === "--bulk-index") {{
       return undefined;
     }}
   }};
+  // A test-written stream replaces the fixed one; the exit file sets the
+  // exit status after it (see `set_bulk_stream`).
+  const stream = optional(".{language}-bulk.ndjson");
+  if (stream !== undefined) {{
+    process.stdout.write(stream, () => process.exit(Number(optional(".{language}-bulk.exit") || 0)));
+    return;
+  }}
   line({{
     id: "{language}-n1",
     signature: optional(".{language}-n1.sig"),

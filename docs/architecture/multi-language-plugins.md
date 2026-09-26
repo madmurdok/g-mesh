@@ -3234,7 +3234,8 @@ sequenceDiagram
 → re-check the package → upgrade diff → `link_diff`.
 
 An edit to `go.mod` goes `watch_files` → `workspaceChanged` → per-language reindex:
-delete that language's rows, bulk, link, semantic.
+bulk and link into a staging index, swap only the difference into live, semantic
+([ADR 0008](../adr/0008-workspace-reindex-staging-swap.md)).
 
 ## Failure Modes & Edge Cases
 

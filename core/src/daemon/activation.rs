@@ -165,6 +165,11 @@ impl ActivationCtx {
             );
         }
 
+        // A workspace reindex a previous daemon started and never swapped in
+        // runs again here, with the watcher already draining; until it
+        // swaps, the old graph of its language keeps serving.
+        crate::daemon::workspace_reindex::resume_pending(&self.registry, &self.conn);
+
         // Runs on every activation, not only after a walk: "the structural
         // graph is complete" says nothing about whether every embeddable node
         // has a `vectors` row yet (a previous start with no model available,

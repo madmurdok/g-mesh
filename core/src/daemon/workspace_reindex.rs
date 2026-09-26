@@ -1,253 +1,156 @@
 //! The per-language reindex a settled edit to one of a manifest's
 //! `[plugin.workspace] watch_files` triggers (`go.mod`, `Cargo.toml`,
-//! `*.csproj`...) - `docs/architecture/multi-language-plugins.md`'s "Editing
-//! a Go file" data-flow paragraph, verbatim: "`watch_files` ->
-//! `workspaceChanged` -> per-language reindex: delete that language's rows,
-//! bulk, link, semantic." `daemon::registry::PluginRegistry::
+//! `*.csproj`...). `daemon::registry::PluginRegistry::
 //! workspace_language_matches` decides *whether* a settled path triggers
-//! this; this module is what actually runs it, once it has.
+//! this; this module runs it.
 //!
-//! # Why a workspace file needs a *reindex* and not a reparse
+//! A workspace file decides where module and crate boundaries are, which
+//! every other file's container key (`graph::containers`) and every
+//! placeholder's scope (`graph::symbol_links`, `graph::imports`) were
+//! computed against, so a single-file diff cannot correct it: the language
+//! is walked again from nothing, with the same one-shot `--bulk-index`
+//! machinery the cold start uses, restricted to one manifest.
 //!
-//! An ordinary `fileChanged` diffs one file against its own previous
-//! extraction - correct, because nothing about *other* files changed. A
-//! workspace file is different in kind: `go.mod`'s `module` line, or
-//! `Cargo.toml`'s `[lib] path`/workspace `members`, decides *where module and
-//! crate boundaries are*, which every other file's container key
-//! (`graph::containers`) and every placeholder's scope (`graph::symbol_links`,
-//! `graph::imports`) were computed against. A single-file diff cannot correct
-//! that - the plugin would have to re-derive every other file's container
-//! from scratch to answer honestly, which is exactly what a full walk of the
-//! language already does. So instead of asking the plugin to diff one file,
-//! core throws away everything it currently believes about this language and
-//! asks for it again from nothing - the same one-shot `--bulk-index` machinery
-//! the cold start already uses, restricted to one manifest.
+//! # Staging, plan, swap
 //!
-//! # Decision 1: what "that language's rows" means
+//! Design: [ADR 0008](../../../docs/adr/0008-workspace-reindex-staging-swap.md).
+//! [`run`] never deletes the language's rows up front. It marks the language
+//! in `pending_reindex`, walks and links it into a fresh staging file
+//! (`staging-<language>.db` in the project's state directory) through that
+//! file's own `IndexStore`, plans the difference against live
+//! (`storage::language_swap::plan`, live attached read-only, no live lock),
+//! embeds only the texts that changed, and applies the difference to live in
+//! one transaction (`storage::language_swap::swap`), which also writes the
+//! language's `language_state`, reconciles both meta roll-ups and removes the
+//! `pending_reindex` row. Queries see the complete old graph of the language
+//! until that transaction commits and the complete new one after it.
 //!
-//! Deleted, precisely, by [`delete_language_rows`]:
+//! A reindex that fails or is killed before the swap leaves live as it was,
+//! flags included, plus the `pending_reindex` row: [`resume_pending`] runs it
+//! again on the next activation, and [`remove_stale_staging`] deletes a
+//! staging file left behind at the next start.
 //!
-//!  - **Nodes**: every row of `nodes WHERE language = ?` - member
-//!    declarations and the container nodes `graph::containers` materialized
-//!    for this language alike (a container node's own `language` column is
-//!    always the language of its members - `graph::containers::ensure_container`
-//!    - so one `WHERE language = ?` sweeps both without a separate
-//!      `nativeKind = 'container'` branch).
-//!  - **Edges**: every edge with *either* endpoint among those nodes.
-//!    Cross-language edges do not exist today (the architecture doc's
-//!    Non-goals), so in practice this is every edge wholly inside the
-//!    language - but the query does not assume that, matching this task's
-//!    "still don't leave dangling ones" instruction: an edge is matched by
-//!    where its endpoints actually are, not by an assumption about what kind
-//!    of project this is.
-//!  - **`containers` rows**: every row `WHERE language = ?` - the
-//!    GM-265-handoff requirement, satisfied structurally rather than by a
-//!    special case: containers are unique per `(language, key)`, so deleting
-//!    *every* node of a language necessarily empties *every* container of
-//!    that language at once. There is no "some members deleted, container
-//!    survives" case to reason about here the way `graph::containers::attach`'s
-//!    incremental recount has to for an ordinary diff.
-//!  - **`declarations`/`vectors`/`placeholder_targets`**: every child row
-//!    keyed by a deleted node id. `storage::write::apply_diff`'s own
-//!    `delete_node_ids` loop explicitly deletes `declarations`,
-//!    `placeholder_targets` and `vectors` this same way (all three tables
-//!    carry `ON DELETE CASCADE`, but `storage::connection::open` switches
-//!    `foreign_keys` off on the daemon's real connection - see that
-//!    function's own doc). When this module was written `apply_diff` did not
-//!    yet delete `vectors`, a gap this delete closed for itself; GM-294 closed
-//!    it there too, once GM-292 showed the connection had in fact been
-//!    enforcing foreign keys all along, so the cascade had been hiding it.
-//!    Leaving a deleted node's embedding behind would hand it to whatever
-//!    content-derived id a rebuilt node happens to collide with, the exact
-//!    hazard `apply_diff`'s own comment warns about.
-//!  - **`indexed_files`**: deliberately **not** touched. That table is a
-//!    disk-truth baseline (`watcher::staleness`: "what's recorded... and, on
-//!    a mismatch, reindexes") - it says whether a file's *bytes on disk*
-//!    still match what core last saw, which has nothing to do with whether
-//!    core's *derived graph* for that file is about to be rebuilt. A
-//!    workspace-file edit does not touch any other file's bytes, so every
-//!    other file's `indexed_files` baseline is still true after this reindex
-//!    exactly as it was before it - deleting or re-stamping those rows would
-//!    cost a full-table scan (there is no index on `filePath` by extension)
-//!    for no correctness gain, and would actively be wrong: the next
-//!    unrelated edit to one of this language's files would see a missing
-//!    baseline and treat a file that never changed as needing a reparse it
-//!    does not need. (The changed workspace file itself - `go.mod` - is not
-//!    a plugin-indexed source file at all, so it was never one of
-//!    `indexed_files`' rows to begin with, extension routing being how a
-//!    file ever gets one in the first place.)
-//!  - **`language_state`**: the whole row is deleted (`bulkIndexedAt` and
-//!    `semanticPassAt` both go with it), then re-recorded from scratch as the
-//!    reindex actually completes each phase - `bulkIndexedAt` by
-//!    `daemon::bulk_index::walk_one_language` itself (unchanged; it already
-//!    calls `schema::record_language_bulk_indexed` once its walk lands),
-//!    `semanticPassAt` by [`run`] below, once the (possibly absent) semantic
-//!    phase actually finishes. A language whose reindex fails partway
-//!    through is left with no `language_state` row at all rather than a
-//!    stale one claiming a pass that no longer describes the rebuilt graph -
-//!    the same honesty `storage::schema`'s own module doc insists on
-//!    project-wide, applied per language.
-//!  - **Meta roll-ups**: [`run`] re-checks both `meta.bulkIndexedAt`
-//!    (`schema::record_bulk_index`) and `meta.semanticPassAt`
-//!    (`schema::reconcile_semantic_pass_rollup`) after its own phases land,
-//!    the same two calls `daemon::semantic::run_with_registry` already makes
-//!    per whole-project pass, run here per reindex instead.
+//! `indexed_files` is not touched: it records whether a file's bytes still
+//! match what core last read, which a workspace-file edit does not change for
+//! any other file.
 //!
-//! # Decision: targeted SQL, not a `storage::write::Diff` of every deleted id
+//! # Concurrency with the ordinary per-file stream
 //!
-//! GM-265's handoff on this task raised the alternative directly: route the
-//! delete through `apply_diff` as a `Diff` of `delete_node_ids`, so
-//! `graph::containers::detach`/`attach` run and maintain the invariant by the
-//! same path an ordinary edit does. [`delete_language_rows`] does not do
-//! that - it is seven `DELETE ... WHERE language = ?` (or `WHERE nodeId IN
-//! (SELECT id FROM nodes WHERE language = ?)`) statements in one transaction,
-//! and the reasoning is cost, exactly as GM-265 asked to see spelled out:
+//! Everything up to and including the swap runs inside
+//! `PluginSupervisor::with_exclusive_access`, the lock `file_changed`,
+//! `replay_pending`, `ensure_fresh` and `semantic_pass` take for their own
+//! round trips to this language's plugin. An edit to one of the language's
+//! files that arrives mid-reindex waits on that lock and applies to the
+//! post-swap graph, so no edit lands in live between the plan and the swap.
+//! Other languages never write this language's rows; the embedding backfill
+//! only adds vectors, and the swap deletes vectors by node id when it runs,
+//! not from the plan.
 //!
-//!  - **What the `Diff` route would cost.** `apply_diff`'s `delete_node_ids`
-//!    loop issues three `.execute()` calls per id (`declarations`,
-//!    `placeholder_targets`, `nodes`), and `containers::detach` issues one
-//!    more (`SELECT language, container, nativeKind FROM nodes WHERE id =
-//!    ?1`) per id *before* any of those - four individual prepared-statement
-//!    round trips per node, all through the Rust/SQLite FFI boundary, for
-//!    every one of a large language's nodes. At 100,000 nodes that is
-//!    400,000+ separate `execute`/`query_row` calls, each paying FFI
-//!    marshaling and (`prepare_cached` aside) statement-step overhead on top
-//!    of whatever work SQLite itself does - and `containers::attach`'s own
-//!    module doc already measures the *cheaper* half of this shape (one
-//!    `COUNT(*)` recount per touched container) at ~16ms for a 100,000-member
-//!    container, which is the cost of *one* of those four per-id operations,
-//!    run as a single set-based query instead of 100,000 individual ones.
-//!  - **What the targeted-SQL route costs instead.** A fixed **seven**
-//!    statements, each a single `DELETE` that SQLite's own query planner
-//!    executes as one pass over an index (`idx_edges_fromId`/
-//!    `idx_edges_toId` for the edge delete, `idx_nodes_container`'s
-//!    `(language, container)` prefix - or a full scan of `nodes`, bounded by
-//!    the language's own row count either way - for the rest), independent
-//!    of how many rows they touch. No Rust-side loop, no per-row FFI call,
-//!    no 999-bound-parameter ceiling to work around (`nodes.id` is never
-//!    passed as an `IN (?, ?, ...)` list of individual ids - every predicate
-//!    here is either `language = ?1` directly or a subquery on it).
-//!  - **Why the invariant still holds without the incremental machinery.**
-//!    `containers::detach`/`attach` exist to get an *ordinary* diff's
-//!    membership changes right when only *some* of a container's members
-//!    move - the hard case is "did this specific node's container change,
-//!    and does its old container now have zero members". A language-wide
-//!    delete never asks that question: **every** member of **every**
-//!    container of this language is leaving at once, so every one of that
-//!    language's containers becomes empty by construction, not by recount -
-//!    deleting `containers WHERE language = ?` *is* the correct answer, not
-//!    an approximation of one. The bulk walk that follows goes back through
-//!    the ordinary `apply_diff` -> `containers::detach`/`attach` path for
-//!    every batch it commits (`daemon::bulk_index::commit` is unchanged),
-//!    so every container this reindex ends with was built by the same
-//!    incremental machinery, with the same guarantees, as any other bulk
-//!    index - this module only has to get the *deletion* right, not
-//!    reimplement attachment too.
+//! The semantic pass runs after the lock is released, against live, through
+//! the ordinary `PluginSupervisor::semantic_pass` and the per-language
+//! primitives of `daemon::semantic` (not `run_with_registry`, which would ask
+//! every owed language, not only this one).
 //!
-//! `delete_language_rows_test_invariants_hold_after_reindex` (this module's
-//! own tests) is what actually checks the GM-265 handoff's acceptance
-//! criterion - `memberCount == DEFINES edges`, no zero-member container rows
-//! surviving - against a real post-reindex index, not just against this
-//! reasoning.
+//! # `workspaceChanged`
 //!
-//! # Decision 2: concurrency with the ordinary per-file stream
+//! Sent (`PluginProcess::notify_workspace_changed`) only when this language's
+//! supervisor is awake: nothing is woken just to be told to drop a cache it
+//! does not have. Only a language with a non-empty `watch_files` reaches this
+//! module, which excludes the bundled TS plugin (`watch_files = []`).
 //!
-//! [`run`] does its delete/walk/link phase inside
-//! `PluginSupervisor::with_exclusive_access` - the *same* lock
-//! `PluginSupervisor::file_changed`/`replay_pending`/`ensure_fresh`/
-//! `semantic_pass` already take for the duration of their own round trip to
-//! this language's plugin (see that method's own doc comment). No new lock is
-//! invented: an ordinary settled edit to one of this language's files that
-//! arrives mid-reindex blocks on the exact mutex it was always going to
-//! contend on, and only resumes once the delete/walk/link phase has
-//! committed, at which point it can neither commit a diff between the delete
-//! and the walk (which the walk's own re-populate would then silently
-//! overwrite or leave orphaned) nor slip in after the walk but describe a
-//! graph the delete is about to erase. The semantic phase runs *after* that
-//! lock is released,
-//! through the ordinary `PluginSupervisor::semantic_pass` (which takes the
-//! same lock itself, for its own single round trip) - safe to leave
-//! unserialized with the delete/walk/link phase specifically because, by the
-//! time it runs, this language's structural graph is already back to a
-//! normal, fully-linked, self-consistent state; a semantic pass overlapping
-//! an *ordinary* reparse of some other file in this language is exactly the
-//! everyday case `daemon::semantic::run_with_registry` already accepts.
+//! # Debounce
 //!
-//! # Decision 3: `workspaceChanged` and plugins that do not know it
-//!
-//! [`run`] sends the notification (`PluginProcess::notify_workspace_changed`)
-//! only when this language's supervisor is currently *awake* (nothing here
-//! wakes a sleeping one just to tell it something it has no cache to drop
-//! for), and only ever for a language `daemon::registry::PluginRegistry::
-//! workspace_language_matches` already required to have a non-empty
-//! `watch_files` - which by construction excludes the bundled TS plugin
-//! (`watch_files = []`) from ever reaching this module at all. Checked
-//! against `plugins/typescript/src/index.ts`'s `handleEnvelope`: its
-//! `switch (envelope.method)` has no `default` arm, so an unrecognized
-//! method (this notification, if it were ever sent to a plugin build that
-//! predates it) falls through doing nothing, and - because a notification
-//! carries no `id` - the trailing `if (envelope.id !== undefined)` also does
-//! nothing, so the frame is silently and safely ignored either way. That
-//! makes the "don't send it" rule belt-and-braces rather than load-bearing on
-//! its own for the one plugin in this repo, but it is still the documented
-//! contract for a third-party manifest whose plugin might not tolerate an
-//! unrecognized *request* the same way TS's notification-shaped no-op does.
-//!
-//! # Decision 4: debounce
-//!
-//! Not built here, because nothing needs to be: [`daemon::registry`]'s
-//! caller is `daemon::watch_and_route_once`, which already runs every settled
-//! path through `watcher::debounce::Debouncer` before it ever reaches
-//! `route_settled_path` - the exact same trailing-edge coalescing an ordinary
-//! source file's rapid re-saves already get (`daemon::DEBOUNCE_WINDOW`, task
-//! 129). A burst of saves to `go.mod` inside one debounce window collapses to
-//! one settled event for `"go.mod"`, which is one call into this module - no
-//! second coalescing layer is needed on top, because there is only ever one
-//! *path* here to begin with (`go.mod` is one file, not many), unlike
-//! `watcher::burst::BurstBatcher`'s job of coalescing *several different
-//! files'* diffs, which this reindex has no equivalent of.
-//!
-//! # Decision 6: where the walk and the semantic pass actually run
-//!
-//! The bulk walk reuses `daemon::bulk_index::walk_one_language` unchanged -
-//! the same one-shot `--bulk-index` process the cold start spawns per
-//! language, called here for a single manifest instead of iterated over
-//! every discovered one, so this module owns no second implementation of
-//! "spawn a plugin's bulk mode and ingest its NDJSON stream" to keep in sync
-//! with the first. Linking (`graph::imports::link_all`, `graph::symbol_links
-//! ::link_all`) reuses the exact calls `daemon::bulk_index::run` already
-//! makes, project-wide rather than scoped to one language - correct because
-//! neither function does anything but re-attempt whatever placeholders are
-//! currently unresolved, in whichever language they belong to, and a
-//! placeholder this reindex did not touch simply finds nothing new to link
-//! against. The semantic phase reuses `daemon::semantic`'s per-language
-//! primitives (`PluginSupervisor::semantic_pass`,
-//! `daemon::semantic::indexed_file_count`, `storage::schema::
-//! record_language_semantic_pass`/`reconcile_semantic_pass_rollup`) rather
-//! than `daemon::semantic::run_with_registry` itself, because that entry
-//! point asks *every currently-owed* language - which could include some
-//! other language whose pass was separately interrupted - where this reindex
-//! must ask about `language` alone, restricted exactly the way this task
-//! requires.
+//! None here: `daemon::watch_and_route_once` runs every settled path through
+//! `watcher::debounce::Debouncer` before it reaches `route_settled_path`, so a
+//! burst of saves to one workspace file is one call into this module.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::manifest::PluginManifest;
+use crate::daemon::plugin;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::EmbedStats;
+use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
+use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
+
+const STAGING_PREFIX: &str = "staging-";
+const STAGING_SUFFIX: &str = ".db";
+
+/// Where `language`'s staging index lives in the project's state directory.
+fn staging_path(state_dir: &Path, language: &str) -> PathBuf {
+    state_dir.join(format!("{STAGING_PREFIX}{language}{STAGING_SUFFIX}"))
+}
+
+/// Removes a staging file and the journal SQLite may have left beside it.
+/// Best-effort: a file that cannot be removed is replaced by the next reindex.
+fn remove_staging(path: &Path) {
+    let journal = PathBuf::from(format!("{}-journal", path.display()));
+    for file in [path, journal.as_path()] {
+        if let Err(err) = std::fs::remove_file(file) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("g-mesh daemon: could not remove the staging index {} ({err})", file.display());
+            }
+        }
+    }
+}
+
+/// Deletes every staging index in `state_dir`, all of them left by a
+/// reindex that did not finish. Called once at daemon start, before any
+/// reindex can run.
+pub(crate) fn remove_stale_staging(state_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(state_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX) {
+            remove_staging(&entry.path());
+        }
+    }
+}
+
+/// Runs again every workspace reindex that was started and never swapped in
+/// (`pending_reindex`), one language after another, each with the file that
+/// triggered it. Failures are reported and leave the row for the next start.
+pub(crate) fn resume_pending(registry: &PluginRegistry, store: &IndexStore) {
+    let pending = match store.with(schema::pending_reindexes) {
+        Ok(pending) => pending,
+        Err(err) => {
+            eprintln!("g-mesh daemon: could not read the interrupted workspace reindexes ({err:#})");
+            return;
+        }
+    };
+    for (language, trigger) in pending {
+        eprintln!(
+            "g-mesh daemon: the {language} workspace reindex after {trigger} was interrupted - rerunning it"
+        );
+        registry.workspace_file_changed(store, &language, &trigger);
+    }
+}
+
+/// A point inside [`run_with`] where a test can look at live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// The staging index is walked and linked; live is untouched.
+    Walked,
+    /// The plan is written and its vectors computed; the swap is next.
+    Planned,
+    /// The swap is committed and the lock released; the semantic pass is next.
+    Swapped,
+}
 
 /// Runs `language`'s whole per-language reindex against `registry`/
 /// `supervisor`, in response to a settled edit of `changed_file` (one of that
-/// language's own `[plugin.workspace] watch_files`) - see this module's doc
-/// comment for the full sequence and the reasoning behind each phase.
-/// `supervisor` must be `registry.get_or_spawn(language)`'s own supervisor
-/// for `language` - callers reach this exclusively through
+/// language's own `[plugin.workspace] watch_files`). `supervisor` must be
+/// `registry.get_or_spawn(language)`'s own supervisor for `language` -
+/// callers reach this exclusively through
 /// `PluginRegistry::workspace_file_changed`, which already guarantees that.
 pub(crate) fn run(
     registry: &PluginRegistry,
@@ -255,81 +158,71 @@ pub(crate) fn run(
     store: &IndexStore,
     changed_file: &str,
 ) -> Result<()> {
-    let manifest = supervisor.manifest().clone();
+    run_with(registry, supervisor, store, changed_file, &mut |_| {})
+}
 
-    // The locked phase: notify (best-effort), delete, re-walk, re-link, roll
-    // up the bulk-index fact - see this module's doc comment ("Decision 2")
-    // for why this whole sequence shares `PluginSupervisor`'s own
-    // serialization lock instead of a second one of its own.
+/// [`run`], calling `at` at each [`Stage`].
+pub(crate) fn run_with(
+    registry: &PluginRegistry,
+    supervisor: &PluginSupervisor,
+    store: &IndexStore,
+    changed_file: &str,
+    at: &mut dyn FnMut(Stage),
+) -> Result<()> {
+    let manifest = supervisor.manifest().clone();
+    let language = manifest.language.as_str();
+    let staging = staging_path(registry.state_dir(), language);
+
     let started = std::time::Instant::now();
     let embed_stats = supervisor.with_exclusive_access(|process| -> Result<EmbedStats> {
         if let Some(process) = process {
             if let Err(err) = process.notify_workspace_changed(changed_file) {
                 eprintln!(
-                    "g-mesh daemon: failed to notify the {} plugin that {changed_file} changed \
-                     ({err:#}) - it keeps whatever module/crate map it had cached, but the \
-                     reindex below rebuilds the graph from scratch regardless",
-                    manifest.language
+                    "g-mesh daemon: failed to notify the {language} plugin that {changed_file} changed \
+                     ({err:#}) - it keeps whatever module/crate map it had cached, but the reindex below \
+                     walks the language from scratch regardless"
                 );
             }
         }
-
         store
-            .delete_language(&manifest.language)
-            .with_context(|| format!("failed to delete {}'s rows before reindexing it", manifest.language))?;
-
-        // No `walked_files`, so no baselines from a one-language re-walk: see
-        // this module's own doc comment on why it leaves `indexed_files` alone.
-        let mut ctx =
-            WalkContext { embedding: Some(registry.embedding().as_ref()), ..WalkContext::new(store) };
-        bulk_index::walk_one_language(registry.project_root(), &manifest, &mut ctx).with_context(|| {
-            format!("failed to re-walk {} after {changed_file} changed", manifest.language)
-        })?;
-
-        store.relink_after_language_reindex()?;
-        Ok(ctx.embed_stats)
+            .with(|conn| schema::mark_pending_reindex(conn, language, changed_file))
+            .with_context(|| format!("failed to mark {language}'s reindex as pending"))?;
+        remove_staging(&staging);
+        let rebuilt = rebuild(registry, store, &manifest, &staging, at);
+        remove_staging(&staging);
+        rebuilt.with_context(|| format!("failed to reindex {language} after {changed_file} changed"))
     })?;
     // Outside the locked phase: it may trim the embedding cache.
     registry.embedding().finish_unit(
-        &format!("workspace-reindex {}", manifest.language),
+        &format!("workspace-reindex {language}"),
         &embed_stats,
         started.elapsed(),
     );
+    at(Stage::Swapped);
 
-    // The unlocked phase: the semantic pass, restricted to this one language
-    // - see this module's doc comment ("Decision 6") for why this calls
-    // the per-language primitives directly rather than
-    // `daemon::semantic::run_with_registry`, which would ask every currently-
-    // owed language, not just this one.
     if manifest.capabilities.semantic_pass {
-        let file_count = semantic::indexed_file_count(store, &manifest.language);
+        let file_count = semantic::indexed_file_count(store, language);
         match supervisor.semantic_pass(store, Vec::new(), file_count) {
             Ok(true) => {
-                let recorded =
-                    store.with(|conn| schema::record_language_semantic_pass(conn, &manifest.language));
+                let recorded = store.with(|conn| schema::record_language_semantic_pass(conn, language));
                 if let Err(err) = recorded {
                     eprintln!(
-                        "g-mesh daemon: failed to record {}'s semantic pass after a workspace \
-                         reindex ({err:#})",
-                        manifest.language
+                        "g-mesh daemon: failed to record {language}'s semantic pass after a workspace \
+                         reindex ({err:#})"
                     );
-                    semantic::record_failure(store, &manifest.language, &err);
+                    semantic::record_failure(store, language, &err);
                 }
             }
-            // The supervisor was asleep and deliberately left that way - see
-            // `PluginSupervisor::semantic_pass`'s own doc comment. The
-            // language stays owed for whoever next asks
-            // (`daemon::semantic::run_with_registry`, on a future daemon
-            // start, or a later reindex of this same language); status shows
-            // why.
-            Ok(false) => semantic::record_not_run(store, &manifest.language),
+            // The supervisor was asleep and deliberately left that way (see
+            // `PluginSupervisor::semantic_pass`). The language stays owed for
+            // whoever next asks; status shows why.
+            Ok(false) => semantic::record_not_run(store, language),
             Err(err) => {
                 eprintln!(
-                    "g-mesh daemon: the {} semantic pass after a workspace reindex failed ({err:#}) - \
-                     its edges keep whatever the structural pass resolved",
-                    manifest.language
+                    "g-mesh daemon: the {language} semantic pass after a workspace reindex failed ({err:#}) - \
+                     its edges keep whatever the structural pass resolved"
                 );
-                semantic::record_failure(store, &manifest.language, &err);
+                semantic::record_failure(store, language, &err);
             }
         }
 
@@ -342,21 +235,90 @@ pub(crate) fn run(
     Ok(())
 }
 
+/// Walks `manifest`'s language into the staging index at `staging`, plans the
+/// difference against live, computes the vectors it owes and swaps it in.
+fn rebuild(
+    registry: &PluginRegistry,
+    store: &IndexStore,
+    manifest: &PluginManifest,
+    staging: &Path,
+    at: &mut dyn FnMut(Stage),
+) -> Result<EmbedStats> {
+    let language = manifest.language.as_str();
+    let live_path = store.file_path().context("a workspace reindex needs a file-backed index")?;
+    let live_path = live_path.to_str().context("the index path is not valid UTF-8")?;
+
+    let staged = IndexStore::new(connection::open_staging(staging)?);
+    // No `walked_files`, so no baselines (see the module doc on
+    // `indexed_files`), and no embedding: only the texts the plan finds
+    // changed are embedded.
+    let mut ctx = WalkContext::new(&staged);
+    bulk_index::walk_one_language(registry.project_root(), manifest, &mut ctx)
+        .with_context(|| format!("failed to walk {language} into the staging index"))?;
+    staged.link_all().context("failed to link the staging index")?;
+    at(Stage::Walked);
+
+    let embedding = registry.embedding();
+    let mut staged = match staged.into_inner() {
+        Ok(conn) => conn,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let plan = language_swap::plan(&mut staged, live_path, language, embedding.embedding_version())?;
+    drop(staged);
+    let mut stats = EmbedStats::default();
+    let computed = embedding.compute(&plan.to_embed, &mut stats);
+    at(Stage::Planned);
+
+    let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
+    let fingerprint = plugin::fingerprint(manifest);
+    store.swap_language(
+        staging,
+        Some((embedding.as_ref(), computed.as_slice())),
+        &SwapBookkeeping {
+            language,
+            plugin_fingerprint: &fingerprint,
+            semantic_pass_languages: &semantic_pass_languages,
+        },
+    )?;
+    let counts = plan.counts;
+    eprintln!(
+        "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
+         {} texts owed a vector",
+        counts.delete_nodes,
+        counts.upsert_nodes,
+        counts.delete_edges,
+        counts.upsert_edges,
+        counts.delete_containers,
+        counts.upsert_containers,
+        plan.to_embed.upsert_nodes.len()
+    );
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use rusqlite::{params, OptionalExtension};
-
-    use crate::storage::write::delete_language_rows;
+    use rusqlite::OptionalExtension;
 
     use super::*;
     use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
     use crate::storage::write::{apply_diff, Diff, NodeRecord};
+
+    /// A file-backed index in `project`'s state directory, where the daemon
+    /// keeps it: the swap attaches the live index by its path. Foreign keys
+    /// on, unlike production, so an edge written before its node or a node
+    /// deleted before its edges fails the test.
+    fn live_index(project: &Path) -> IndexStore {
+        let conn = crate::storage::connection::open(project).expect("failed to open the live index");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        schema::ensure_current(&conn, "test-generation").unwrap();
+        IndexStore::new(conn)
+    }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
@@ -369,168 +331,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `delete_language_rows` on its own - no plugin, no registry. FK
-    // enforcement ON (unlike the daemon's real connection), matching
-    // `storage::write`'s own tests: it is what would actually catch a wrong
-    // delete order here, where `storage::connection::open`'s FK-off
-    // production connection would silently tolerate one.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn delete_language_rows_removes_only_the_named_languages_nodes_edges_and_containers() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        schema::apply(&conn).unwrap();
-
-        apply_diff(
-            &mut conn,
-            &Diff {
-                upsert_nodes: vec![
-                    node("a1", "alpha", "a.alpha", Some("pkg")),
-                    node("a2", "alpha", "a.alpha", Some("pkg")),
-                    node("b1", "beta", "b.beta", Some("mod")),
-                ],
-                upsert_edges: vec![crate::storage::write::EdgeRecord::new(
-                    "e-a1-a2",
-                    "a1",
-                    "a2",
-                    "CALLS",
-                    "tree-sitter",
-                    false,
-                )],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        schema::record_language_bulk_indexed(&conn, "alpha", Some("fp")).unwrap();
-        schema::record_language_semantic_pass(&conn, "alpha").unwrap();
-        schema::record_language_bulk_indexed(&conn, "beta", Some("fp")).unwrap();
-
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM containers WHERE language = 'alpha'"), 1);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM containers WHERE language = 'beta'"), 1);
-
-        delete_language_rows(&mut conn, "alpha").unwrap();
-
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"),
-            0,
-            "every alpha node, including its container node, must be gone"
-        );
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM containers WHERE language = 'alpha'"),
-            0,
-            "alpha's container row must be gone"
-        );
-        // Alpha's own CALLS edge (a1 -> a2) and its two DEFINES edges
-        // (container "pkg" -> a1, "pkg" -> a2) must all be gone; only beta's
-        // own DEFINES edge (container "mod" -> b1), untouched by an alpha
-        // delete, survives - proving the delete is scoped to alpha's edges
-        // specifically, not "every edge in the index".
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM edges"),
-            1,
-            "only beta's own DEFINES edge may survive an alpha-scoped delete"
-        );
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM edges WHERE fromId IN ('a1','a2') OR toId IN ('a1','a2')"),
-            0,
-            "no edge may still reference a deleted alpha node"
-        );
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM language_state WHERE language = 'alpha'"),
-            0,
-            "alpha's language_state row must be reset"
-        );
-
-        // b1 (the seeded member) plus the container node `attach` materialized
-        // for it - both carry `language = 'beta'`.
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM nodes WHERE language = 'beta'"),
-            2,
-            "beta's nodes must be untouched"
-        );
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM containers WHERE language = 'beta'"),
-            1,
-            "beta's container must be untouched"
-        );
-        assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM language_state WHERE language = 'beta'"),
-            1,
-            "beta's language_state row must be untouched"
-        );
-    }
-
-    /// The other pragma state, and the one production runs in (GM-294): with
-    /// foreign keys off nothing cascades from the `nodes` delete, so every
-    /// node-keyed child row of the language has to be deleted by hand or it
-    /// outlives its node. The test above cannot see that - its enforced
-    /// foreign keys cascade on the language's behalf. Every child table is
-    /// seeded for both languages, so a delete scoped wrongly (all rows, or
-    /// none) fails as clearly as a missing one.
-    #[test]
-    fn delete_language_rows_leaves_no_orphaned_child_rows_without_foreign_keys() {
-        use crate::storage::write::PlaceholderTargetRecord;
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        schema::apply(&conn).unwrap();
-
-        let placeholder = |id: &str, language: &str| {
-            let mut node = NodeRecord::new(id, "Module", id, id, format!("{id}.src"), language);
-            node.native_kind = Some("pending_symbol".to_string());
-            node.target = Some(PlaceholderTargetRecord {
-                scope_kind: "file".to_string(),
-                scope: "elsewhere.src".to_string(),
-                key_kind: "name".to_string(),
-                key: "thing".to_string(),
-                from_container: None,
-            });
-            node
-        };
-        apply_diff(
-            &mut conn,
-            &Diff {
-                upsert_nodes: vec![
-                    node("a1", "alpha", "a.alpha", Some("pkg")),
-                    placeholder("a-use", "alpha"),
-                    node("b1", "beta", "b.beta", Some("mod")),
-                    placeholder("b-use", "beta"),
-                ],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for id in ["a1", "b1"] {
-            conn.execute(
-                "INSERT INTO declarations (nodeId, ordinal, startLine, startCol, endLine, endCol, hasBody)
-                 VALUES (?1, 0, 0, 0, 0, 1, 0)",
-                params![id],
-            )
-            .unwrap();
-            crate::storage::vectors::insert(&conn, id, &[1.0, 0.0], "test-model").unwrap();
-        }
-
-        delete_language_rows(&mut conn, "alpha").unwrap();
-
-        for table in ["declarations", "vectors", "placeholder_targets", "containers"] {
-            assert_eq!(
-                count(
-                    &conn,
-                    &format!("SELECT COUNT(*) FROM {table} WHERE nodeId NOT IN (SELECT id FROM nodes)")
-                ),
-                0,
-                "{table}: an alpha row outlived its node"
-            );
-            assert_eq!(
-                count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
-                1,
-                "{table}: beta's own row must be untouched"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------
     // End-to-end, through the real registry and a real spawned fixture
     // plugin process - what actually proves discrimination between
     // languages and the routing decisions in `daemon::registry`.
@@ -538,7 +338,7 @@ mod tests {
 
     /// A registry over two fake languages: `alpha`, watching `go.mod` and
     /// excluding `vendor`, and `beta`, with no workspace configuration at
-    /// all (the ordinary, pre-GM-272 shape) - what every test below builds
+    /// all (the ordinary shape) - what every test below builds
     /// on to prove one language's workspace reindex leaves the other alone.
     fn two_language_registry() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
@@ -570,9 +370,7 @@ mod tests {
     }
 
     /// Every surviving container's `memberCount` equals its `DEFINES` edge
-    /// count, and none is zero - GM-265's handoff acceptance criterion for
-    /// this task, checked directly against the database rather than assumed
-    /// from the deletion strategy's own reasoning.
+    /// count, and none is zero, checked against the database.
     fn assert_container_invariants(conn: &Connection) {
         let mut stmt = conn.prepare("SELECT nodeId, memberCount FROM containers").unwrap();
         let rows: Vec<(String, i64)> = stmt
@@ -605,7 +403,7 @@ mod tests {
     #[test]
     fn touching_the_watched_file_reindexes_only_that_language() {
         let (_project, _plugins, alpha_dir, beta_dir, registry) = two_language_registry();
-        let conn = test_plugin::empty_index();
+        let conn = live_index(_project.path());
 
         {
             let mut guard = conn.lock().unwrap();
@@ -707,7 +505,7 @@ mod tests {
     #[test]
     fn a_watched_file_under_an_excluded_directory_is_not_routed() {
         let (_project, _plugins, alpha_dir, _beta_dir, registry) = two_language_registry();
-        let conn = test_plugin::empty_index();
+        let conn = live_index(_project.path());
         {
             let guard = conn.lock().unwrap();
             schema::ensure_current(&guard, "test-generation").unwrap();
@@ -751,7 +549,7 @@ mod tests {
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
-        let conn = test_plugin::empty_index();
+        let conn = live_index(project.path());
         {
             let guard = conn.lock().unwrap();
             schema::ensure_current(&guard, "test-generation").unwrap();
@@ -799,7 +597,7 @@ mod tests {
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
-        let conn = test_plugin::empty_index();
+        let conn = live_index(project.path());
         {
             let guard = conn.lock().unwrap();
             schema::ensure_current(&guard, "test-generation").unwrap();
@@ -853,7 +651,7 @@ mod tests {
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
-        let conn = test_plugin::empty_index();
+        let conn = live_index(project.path());
         {
             let guard = conn.lock().unwrap();
             schema::ensure_current(&guard, "test-generation").unwrap();
@@ -905,7 +703,7 @@ mod tests {
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
-        let conn = test_plugin::empty_index();
+        let conn = live_index(project.path());
         schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
         (project, plugins, registry, conn)
     }
@@ -986,7 +784,7 @@ mod tests {
         let pipeline = fake_pipeline(&model_dir, Some(cache_at(scratch.path())), counters);
         let registry =
             PluginRegistry::new(project.path(), state_dir, discovered, None, None, Arc::new(pipeline));
-        let conn = test_plugin::empty_index();
+        let conn = live_index(project.path());
         schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
         (project, plugins, scratch, registry, conn)
     }
@@ -1008,11 +806,12 @@ mod tests {
         vector.iter().flat_map(|value| value.to_le_bytes()).collect()
     }
 
-    /// A workspace reindex that changes no text embeds nothing: the rows it
-    /// deletes and re-walks get their vectors back from the cache.
+    /// A workspace reindex that changes no text embeds nothing, and keeps
+    /// the vectors it had, with the cache on as well.
     ///
-    /// Control: disable the lookup in `EmbeddingPipeline::compute` (treat
-    /// `cache_lookup` as always `None`) and the second reindex makes 2 calls.
+    /// Control: embed during the staging walk and disable the lookup in
+    /// `EmbeddingPipeline::compute` (treat `cache_lookup` as always `None`)
+    /// -> the second reindex makes 2 calls.
     #[test]
     fn a_workspace_reindex_of_unchanged_symbols_embeds_nothing() {
         let counters = Counters::default();
@@ -1058,5 +857,545 @@ mod tests {
         assert_ne!(Some(new_n1.clone()), old_n1, "the edited node's vector changes");
         assert_eq!(new_n1, packed(&fake_vector("Does the first thing, differently.\n\nfn alpha-n1()")));
         assert_eq!(stored_vector(&conn, "alpha-n2"), old_n2, "the untouched node keeps its vector");
+    }
+
+    // -----------------------------------------------------------------
+    // Staging, plan and swap (ADR 0008's tests), over walks whose streams
+    // the test writes (`test_plugin::set_bulk_stream`).
+    // -----------------------------------------------------------------
+
+    use crate::protocol::types::{
+        EdgeKind, NodeKind, PlaceholderTarget, Position, Range, SourceTier, TargetKey, TargetScope,
+        Visibility, WireDeclaration, WireEdge, WireNode,
+    };
+    use crate::storage::write::EdgeRecord;
+
+    fn wire_node(id: &str, file_path: &str) -> WireNode {
+        WireNode {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: file_path.to_string(),
+            range: Range { start: Position { line: 0, col: 0 }, end: Position { line: 1, col: 0 } },
+            signature: None,
+            visibility: Visibility::Public,
+            doc_comment: None,
+            language: "alpha".to_string(),
+            native_kind: None,
+            has_syntax_errors: false,
+            declarations: None,
+            container: None,
+            container_parent: None,
+            target: None,
+        }
+    }
+
+    fn file_node(file_path: &str) -> WireNode {
+        WireNode { kind: NodeKind::File, ..wire_node(&format!("file:{file_path}"), file_path) }
+    }
+
+    fn wire_edge(id: &str, from: &str, to: &str) -> WireEdge {
+        WireEdge {
+            id: id.to_string(),
+            from_id: from.to_string(),
+            to_id: to.to_string(),
+            kind: EdgeKind::Calls,
+            source: SourceTier::Syntactic,
+            engine: "tree-sitter".to_string(),
+            resolved: true,
+            to_declaration: None,
+        }
+    }
+
+    fn json<T: serde::Serialize>(item: &T) -> String {
+        serde_json::to_string(item).unwrap()
+    }
+
+    /// `alpha`, without a semantic pass, over the fake model with no cache,
+    /// and a file-backed live index. The counters count the model's embeds.
+    fn alpha_staging_registry(
+        counters: &Counters,
+        semantic_pass: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let scratch = tempfile::tempdir().expect("failed to create a model root");
+        if semantic_pass {
+            test_plugin::install_with_workspace_semantic_pass_capable(
+                plugins.path(),
+                "alpha",
+                &[".alpha-src"],
+                &["go.mod"],
+                &[],
+            );
+        } else {
+            test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
+        }
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pipeline = fake_pipeline(&model_dir, None, counters);
+        let registry =
+            PluginRegistry::new(project.path(), state_dir, discovered, None, None, Arc::new(pipeline));
+        let conn = live_index(project.path());
+        (project, plugins, scratch, registry, conn)
+    }
+
+    fn rows(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i).map(|value| format!("{value:?}")))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map(|values| values.join("|"))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    const GRAPH_TABLES: [&str; 6] = [
+        "SELECT * FROM nodes ORDER BY id",
+        "SELECT * FROM edges ORDER BY id",
+        "SELECT nodeId, hex(embedding), embeddingVersion FROM vectors ORDER BY nodeId",
+        "SELECT * FROM containers ORDER BY nodeId",
+        "SELECT * FROM declarations ORDER BY nodeId, ordinal",
+        "SELECT * FROM placeholder_targets ORDER BY nodeId",
+    ];
+    const FLAG_TABLES: [&str; 2] =
+        ["SELECT * FROM language_state ORDER BY language", "SELECT bulkIndexedAt, semanticPassAt FROM meta"];
+
+    fn digest_of(conn: &IndexStore, queries: &[&str]) -> Vec<String> {
+        let guard = conn.lock().unwrap();
+        queries.iter().flat_map(|sql| rows(&guard, sql)).collect()
+    }
+
+    /// Every row of every table a reindex may write, plus the flags.
+    fn digest(conn: &IndexStore) -> Vec<String> {
+        digest_of(conn, &[&GRAPH_TABLES[..], &FLAG_TABLES[..]].concat())
+    }
+
+    fn pending(conn: &IndexStore) -> Vec<(String, String)> {
+        conn.with(schema::pending_reindexes).unwrap()
+    }
+
+    /// Test 1: while the staging walk runs, live still answers for the
+    /// language, vectors included.
+    ///
+    /// Control: delete the language's rows from live before the walk (the
+    /// old `IndexStore::delete_language` call in `run_with`) -> not found.
+    #[test]
+    fn a_symbol_stays_findable_while_its_language_is_reindexed() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+
+        let mut seen = None;
+        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| {
+            if stage == Stage::Walked {
+                let guard = conn.lock().unwrap();
+                seen = Some((
+                    count(&guard, "SELECT COUNT(*) FROM nodes WHERE id = 'alpha-n1'"),
+                    count(&guard, "SELECT COUNT(*) FROM vectors WHERE nodeId = 'alpha-n1'"),
+                ));
+            }
+        })
+        .expect("the second reindex succeeds");
+
+        assert_eq!(seen, Some((1, 1)), "alpha-n1 and its vector are served mid-reindex");
+    }
+
+    /// Test 2: a symbol the new walk no longer emits is gone after the swap,
+    /// with every row keyed by it: its edges, declarations, placeholder
+    /// target, vector and emptied container.
+    ///
+    /// Control: skip the plan's `plan_delete_nodes` insert in
+    /// `language_swap::plan_attached` -> `alpha-n2` survives.
+    #[test]
+    fn a_symbol_the_new_walk_drops_is_gone_with_every_row_it_owned() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        let n1 =
+            WireNode { container: Some("pkg-a".to_string()), ..wire_node("alpha-n1", "src/a.alpha-src") };
+        let n2 = WireNode {
+            container: Some("pkg-b".to_string()),
+            doc_comment: Some("Does the second thing.".to_string()),
+            declarations: Some(vec![WireDeclaration {
+                ordinal: 0,
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+                signature: Some("fn alpha-n2()".to_string()),
+                has_body: true,
+            }]),
+            ..wire_node("alpha-n2", "src/b.alpha-src")
+        };
+        let placeholder = WireNode {
+            kind: NodeKind::Module,
+            native_kind: Some("pending_symbol".to_string()),
+            target: Some(PlaceholderTarget {
+                scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
+                key: TargetKey::Name("thing".to_string()),
+                from_container: None,
+            }),
+            ..wire_node("alpha-p2", "src/b.alpha-src")
+        };
+        let first = [
+            json(&file_node("src/a.alpha-src")),
+            json(&n1),
+            json(&file_node("src/b.alpha-src")),
+            json(&n2),
+            json(&placeholder),
+            json(&wire_edge("alpha-e1", "alpha-n1", "alpha-n2")),
+            json(&wire_edge("alpha-e2", "alpha-n2", "alpha-p2")),
+        ];
+        test_plugin::set_bulk_stream(project.path(), "alpha", &first, 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        {
+            let guard = conn.lock().unwrap();
+            for (table, column) in [
+                ("nodes", "id"),
+                ("declarations", "nodeId"),
+                ("placeholder_targets", "nodeId"),
+                ("vectors", "nodeId"),
+            ] {
+                assert!(
+                    count(
+                        &guard,
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {column} IN ('alpha-n2', 'alpha-p2')")
+                    ) > 0,
+                    "the first walk must have written {table} rows for alpha-n2"
+                );
+            }
+        }
+
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&file_node("src/a.alpha-src")), json(&n1)],
+            0,
+        );
+        run(&registry, &supervisor, &conn, "go.mod").expect("the second reindex succeeds");
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            count(
+                &guard,
+                "SELECT COUNT(*) FROM nodes WHERE id IN ('alpha-n2', 'alpha-p2', 'file:src/b.alpha-src')"
+            ),
+            0
+        );
+        assert_eq!(
+            count(&guard, "SELECT COUNT(*) FROM edges WHERE fromId NOT IN (SELECT id FROM nodes) OR toId NOT IN (SELECT id FROM nodes)"),
+            0,
+            "no edge may outlive an endpoint"
+        );
+        for table in ["declarations", "placeholder_targets", "vectors", "containers"] {
+            assert_eq!(
+                count(
+                    &guard,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE nodeId NOT IN (SELECT id FROM nodes)")
+                ),
+                0,
+                "{table}: a row outlived its node"
+            );
+        }
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM containers WHERE key = 'pkg-b'"), 0, "pkg-b emptied");
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM nodes WHERE id = 'alpha-n1'"), 1);
+        assert_container_invariants(&guard);
+    }
+
+    /// Test 3: a symbol whose id changes (moved to another file) is never
+    /// visible twice: the old row while the walk runs, the new one after.
+    ///
+    /// Control: walk into live instead of staging (`WalkContext::new(store)`
+    /// in `rebuild`) -> two rows while held.
+    #[test]
+    fn a_symbol_whose_id_changes_is_never_visible_twice() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        let named = |id: &str, file: &str| WireNode { name: "moved".to_string(), ..wire_node(id, file) };
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&named("alpha-old", "src/b.alpha-src"))],
+            0,
+        );
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&named("alpha-new", "src/c.alpha-src"))],
+            0,
+        );
+        let ids =
+            |conn: &IndexStore| rows(&conn.lock().unwrap(), "SELECT id FROM nodes WHERE name = 'moved'");
+        let mut held = None;
+        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| {
+            if stage == Stage::Walked {
+                held = Some(ids(&conn));
+            }
+        })
+        .expect("the second reindex succeeds");
+
+        assert_eq!(held, Some(vec!["Text(\"alpha-old\")".to_string()]), "only the old row while held");
+        assert_eq!(ids(&conn), vec!["Text(\"alpha-new\")".to_string()], "only the new row after");
+    }
+
+    /// Test 4: a walk that fails leaves live exactly as it was, flags
+    /// included, with the language marked pending; the next start's resume
+    /// runs it again and clears the mark.
+    ///
+    /// Controls: delete the language's rows before the walk -> the digest
+    /// differs; skip `schema::mark_pending_reindex` in `run_with` -> the
+    /// resume finds nothing and `alpha-n3` never appears.
+    #[test]
+    fn an_interrupted_reindex_leaves_live_untouched_and_is_resumed() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let before = digest(&conn);
+        assert!(conn.with(schema::bulk_index_completed).unwrap(), "the first reindex rolls meta up");
+
+        let partial = [json(&file_node("src/a.alpha-src")), json(&wire_node("alpha-n3", "src/a.alpha-src"))];
+        test_plugin::set_bulk_stream(project.path(), "alpha", &partial, 1);
+        let failed = run(&registry, &supervisor, &conn, "Cargo.toml");
+
+        assert!(failed.is_err(), "a plugin exiting non-zero fails the reindex");
+        assert_eq!(digest(&conn), before, "live, flags included, is exactly as before");
+        assert_eq!(pending(&conn), vec![("alpha".to_string(), "Cargo.toml".to_string())]);
+        assert!(
+            !staging_path(registry.state_dir(), "alpha").exists(),
+            "the staging file does not outlive the failed reindex"
+        );
+
+        test_plugin::set_bulk_stream(project.path(), "alpha", &partial, 0);
+        resume_pending(&registry, &conn);
+
+        assert!(pending(&conn).is_empty(), "the resumed reindex clears its mark");
+        let guard = conn.lock().unwrap();
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM nodes WHERE id = 'alpha-n3'"), 1);
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM nodes WHERE id = 'alpha-n1'"), 0);
+    }
+
+    /// A staging file left by a dead daemon is deleted at the next start;
+    /// the live index and anything else in the directory is not.
+    #[test]
+    fn stale_staging_files_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in
+            ["staging-rust.db", "staging-rust.db-journal", "staging-go.db", "index.db", "plugin-rust.pid"]
+        {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        remove_stale_staging(dir.path());
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["index.db".to_string(), "plugin-rust.pid".to_string()]);
+    }
+
+    /// Test 5: a semantic pass that fails after the swap leaves both the
+    /// language's and meta's `semanticPassAt` unset, although meta read
+    /// complete before the reindex.
+    ///
+    /// Control: make `reconcile_semantic_pass_rollup` only set (drop its
+    /// clearing branch) -> meta keeps the old timestamp.
+    #[test]
+    fn a_failed_pass_after_the_swap_leaves_no_flag_claiming_it() {
+        let counters = Counters::default();
+        let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        test_plugin::answer_first_semantic_pass_incomplete(
+            &plugins.path().join("alpha"),
+            "alpha",
+            Some("no answer"),
+        );
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&file_node("src/a.alpha-src")), json(&wire_node("alpha-n1", "src/a.alpha-src"))],
+            0,
+        );
+        {
+            let guard = conn.lock().unwrap();
+            schema::record_language_bulk_indexed(&guard, "alpha", Some("old")).unwrap();
+            schema::record_language_semantic_pass(&guard, "alpha").unwrap();
+            guard
+                .execute(
+                    "UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP, semanticPassAt = CURRENT_TIMESTAMP",
+                    [],
+                )
+                .unwrap();
+        }
+
+        registry.route_settled_path(&conn, "go.mod".to_string());
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM nodes WHERE id = 'alpha-n1'"), 1, "the swap landed");
+        assert_eq!(schema::semantic_pass_failures(&guard).unwrap().len(), 1, "and the pass failed");
+        assert_eq!(
+            rows(&guard, "SELECT semanticPassAt FROM language_state WHERE language = 'alpha'"),
+            vec!["Null".to_string()]
+        );
+        assert!(!schema::semantic_pass_completed(&guard).unwrap(), "meta must not claim the pass");
+    }
+
+    /// Test 6: with no embedding cache, an unchanged tree embeds nothing and
+    /// one edited doc comment embeds exactly one text.
+    ///
+    /// Control: embed during the staging walk (`WalkContext { embedding:
+    /// Some(..), .. }` in `rebuild`) -> the unchanged reindex embeds 2.
+    #[test]
+    fn only_changed_text_is_embedded_with_the_cache_off() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        give_text(project.path(), "alpha-n2", "Does the second thing.");
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        assert_eq!(counters.embeds(), 2, "a fresh language embeds both texts");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the unchanged reindex succeeds");
+        assert_eq!(counters.embeds(), 2, "an unchanged tree embeds nothing");
+
+        give_text(project.path(), "alpha-n1", "Does the first thing, differently.");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the edited reindex succeeds");
+        assert_eq!(counters.embeds(), 3, "one edited doc comment embeds one text");
+        assert_eq!(
+            stored_vector(&conn, "alpha-n1"),
+            Some(packed(&fake_vector("Does the first thing, differently.\n\nfn alpha-n1()")))
+        );
+        assert_eq!(
+            stored_vector(&conn, "alpha-n2"),
+            Some(packed(&fake_vector("Does the second thing.\n\nfn alpha-n2()")))
+        );
+    }
+
+    /// The fake semantic pass of tests 7 and 8: upgrades `alpha-e1` in place
+    /// and retargets it onto `alpha-n3`, and adds `alpha-sem`, an edge no
+    /// structural walk emits, the shape every bundled semantic tier writes.
+    fn fake_semantic_pass(conn: &IndexStore, extra: Vec<EdgeRecord>) {
+        let semantic = |id: &str, from: &str, to: &str| {
+            let mut edge = EdgeRecord::new(id, from, to, "CALLS", "semantic", true);
+            edge.engine = "fake-lsp".to_string();
+            edge
+        };
+        let mut upsert_edges =
+            vec![semantic("alpha-e1", "alpha-n1", "alpha-n3"), semantic("alpha-sem", "alpha-n2", "alpha-n3")];
+        upsert_edges.extend(extra);
+        apply_diff(&mut conn.lock().unwrap(), &Diff { upsert_edges, ..Default::default() }).unwrap();
+    }
+
+    fn three_nodes() -> Vec<String> {
+        vec![
+            json(&file_node("src/a.alpha-src")),
+            json(&wire_node("alpha-n1", "src/a.alpha-src")),
+            json(&wire_node("alpha-n2", "src/a.alpha-src")),
+            json(&wire_node("alpha-n3", "src/a.alpha-src")),
+            json(&wire_edge("alpha-e1", "alpha-n1", "alpha-n2")),
+        ]
+    }
+
+    /// Test 7: reindexing an unchanged tree, whose edges a semantic pass has
+    /// already upgraded, writes only the bookkeeping rows: `language_state`,
+    /// the two meta roll-ups and the `pending_reindex` delete.
+    ///
+    /// Control: upsert every staged node, as a full swap would (make the
+    /// live side of the node plan's `EXCEPT` select nothing) -> more changes.
+    #[test]
+    fn an_unchanged_tree_swaps_in_only_its_bookkeeping() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        fake_semantic_pass(&conn, Vec::new());
+        let graph_before = digest_of(&conn, &GRAPH_TABLES);
+
+        let total_changes = |conn: &IndexStore| count(&conn.lock().unwrap(), "SELECT total_changes()");
+        let (mut before, mut after) = (0, 0);
+        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| match stage {
+            Stage::Planned => before = total_changes(&conn),
+            Stage::Swapped => after = total_changes(&conn),
+            Stage::Walked => {}
+        })
+        .expect("the unchanged reindex succeeds");
+
+        assert_eq!(after - before, 4, "language_state, meta twice and pending_reindex, nothing else");
+        assert_eq!(digest_of(&conn, &GRAPH_TABLES), graph_before, "no graph row changed");
+    }
+
+    /// Test 8: the swap keeps a semantic pass's edges whose endpoints both
+    /// survive - one upgraded in place, one the pass added - until the next
+    /// pass; a node whose code changed gets its new structural edge; a
+    /// semantic edge into a node the walk dropped goes with that node.
+    ///
+    /// Controls: drop the `NOT EXISTS` clause of `plan_upsert_edges` ->
+    /// `alpha-e1` reads `syntactic` while held; drop the `NOT (e.source =
+    /// 'semantic' ...)` clause of `plan_delete_edges` -> `alpha-sem` is gone.
+    #[test]
+    fn semantic_edges_survive_the_swap_until_the_next_pass() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        let mut first = three_nodes();
+        first.push(json(&wire_node("alpha-n4", "src/a.alpha-src")));
+        test_plugin::set_bulk_stream(project.path(), "alpha", &first, 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let mut into_dropped =
+            EdgeRecord::new("alpha-sem-n4", "alpha-n1", "alpha-n4", "CALLS", "semantic", true);
+        into_dropped.engine = "fake-lsp".to_string();
+        fake_semantic_pass(&conn, vec![into_dropped]);
+
+        // alpha-n2's code changed: it now calls alpha-n1, a new structural
+        // edge; alpha-n4 is gone.
+        let mut second = three_nodes();
+        second[2] = json(&WireNode {
+            signature: Some("fn alpha-n2(x)".to_string()),
+            ..wire_node("alpha-n2", "src/a.alpha-src")
+        });
+        second.push(json(&wire_edge("alpha-e2", "alpha-n2", "alpha-n1")));
+        test_plugin::set_bulk_stream(project.path(), "alpha", &second, 0);
+        let edge = |conn: &IndexStore, id: &str| {
+            rows(&conn.lock().unwrap(), &format!("SELECT source, toId FROM edges WHERE id = '{id}'"))
+        };
+        let mut held = None;
+        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| {
+            if stage == Stage::Swapped {
+                held = Some((
+                    edge(&conn, "alpha-e1"),
+                    edge(&conn, "alpha-sem"),
+                    edge(&conn, "alpha-e2"),
+                    edge(&conn, "alpha-sem-n4"),
+                ));
+            }
+        })
+        .expect("the reindex succeeds");
+
+        let (e1, sem, e2, into_dropped) = held.expect("the swap was reached");
+        assert_eq!(e1, vec!["Text(\"semantic\")|Text(\"alpha-n3\")".to_string()], "upgraded in place, kept");
+        assert_eq!(sem, vec!["Text(\"semantic\")|Text(\"alpha-n3\")".to_string()], "added by the pass, kept");
+        assert_eq!(
+            e2,
+            vec!["Text(\"syntactic\")|Text(\"alpha-n1\")".to_string()],
+            "the changed node's new edge"
+        );
+        assert!(into_dropped.is_empty(), "an edge into a dropped node goes with it");
     }
 }
