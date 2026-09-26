@@ -69,6 +69,8 @@ const NPM: &str = "npm";
 /// handling here or in its manifest.
 const GO_PLUGIN_BINARY: &str = "g-mesh-plugin-go";
 
+include!("go_plugin_build_flags.rs");
+
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets this"));
 
@@ -136,6 +138,7 @@ fn build_go_plugin(manifest_dir: &Path) {
     let plugin_dir = manifest_dir.join("../plugins/go");
 
     println!("cargo:rerun-if-changed={}", plugin_dir.join("go.mod").display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("go_plugin_build_flags.rs").display());
     for entry in std::fs::read_dir(&plugin_dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "go") {
@@ -143,8 +146,12 @@ fn build_go_plugin(manifest_dir: &Path) {
         }
     }
 
-    let status =
-        Command::new("go").args(["build", "-o", GO_PLUGIN_BINARY, "."]).current_dir(&plugin_dir).status();
+    let status = Command::new("go")
+        .arg("build")
+        .args(GO_PLUGIN_BUILD_FLAGS)
+        .args(["-o", GO_PLUGIN_BINARY, "."])
+        .current_dir(&plugin_dir)
+        .status();
     match status {
         Ok(status) if status.success() => {}
         Ok(status) => println!(
