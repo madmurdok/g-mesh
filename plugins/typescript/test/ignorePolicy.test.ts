@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { createIndexabilityChecker, hasHardExcludedSegment } from "../src/ignorePolicy";
+import { createIndexabilityChecker, HARD_EXCLUDED_DIRS, hasHardExcludedSegment } from "../src/ignorePolicy";
 
 /** Builds a small real tree under a fresh tempdir; `files` maps
  * project-relative paths to their contents (same fixture shape as
@@ -144,4 +145,34 @@ test("a project with no .gitignore anywhere calls everything outside a hard-excl
   } finally {
     await cleanup(root);
   }
+});
+
+// --- plugin.toml's exclude_dirs ------------------------------------------
+
+/** The names core's walk already excludes for every language
+ * (`BASELINE_EXCLUDED_DIRS` in plugins/sdk/src/walk.rs), which plugin.toml
+ * therefore leaves out. */
+const BASELINE_EXCLUDED_DIRS = new Set([".git", ".claude"]);
+
+/** `[plugin.workspace] exclude_dirs` read from this plugin's own plugin.toml.
+ * A targeted parse of that one key rather than a TOML dependency: the key is
+ * a single-line array of plain strings, which is also valid JSON, and any
+ * other shape (a multi-line array, a moved section) makes this throw rather
+ * than quietly read nothing. */
+function pluginTomlExcludeDirs(): string[] {
+  // __dirname is dist/test at runtime: tsc compiles this file before it runs.
+  const toml = readFileSync(path.join(__dirname, "..", "..", "plugin.toml"), "utf8");
+  const section = /^\[plugin\.workspace\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m.exec(toml);
+  assert.ok(section, "plugin.toml has a [plugin.workspace] section");
+  const line = /^exclude_dirs\s*=\s*(\[.*\])\s*$/m.exec(section[1]);
+  assert.ok(line, "[plugin.workspace] declares exclude_dirs as a single-line array");
+  return JSON.parse(line[1]) as string[];
+}
+
+test("plugin.toml's exclude_dirs equals HARD_EXCLUDED_DIRS minus the baseline", () => {
+  // Core reads plugin.toml as data, so it cannot be derived from
+  // HARD_EXCLUDED_DIRS; this pins the two. Compared exactly, order included.
+  const own = [...HARD_EXCLUDED_DIRS].filter((dir) => !BASELINE_EXCLUDED_DIRS.has(dir));
+  assert.deepEqual(pluginTomlExcludeDirs(), own);
+  for (const dir of BASELINE_EXCLUDED_DIRS) assert.ok(HARD_EXCLUDED_DIRS.has(dir), `${dir} stays hard-excluded`);
 });
