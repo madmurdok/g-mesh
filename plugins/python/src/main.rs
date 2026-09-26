@@ -6,22 +6,13 @@
 use g_mesh_plugin_sdk::{run, PluginSpec};
 
 use g_mesh_plugin_python::extractor::PythonExtractor;
+use g_mesh_plugin_python::project;
 
 fn main() -> ! {
     run(
         PythonExtractor,
-        PluginSpec::new("python", env!("CARGO_PKG_VERSION"), &[".py", ".pyi"]).exclude_dirs(&[
-            ".venv",
-            "venv",
-            "__pycache__",
-            ".tox",
-            ".mypy_cache",
-            "site-packages",
-            // Never Python source, and since GM-299 the directory a
-            // project-local pyright lives in - along with the 5,205 typeshed
-            // stubs it bundles. See `project::EXCLUDE_DIRS` for the argument.
-            "node_modules",
-        ]),
+        PluginSpec::new("python", env!("CARGO_PKG_VERSION"), &[".py", ".pyi"])
+            .exclude_dirs(&project::EXCLUDE_DIRS),
         // The pyright tier (GM-299). A *factory*, not an engine: the SDK calls
         // this on the first `semanticPass` and never before, which is what
         // `capabilities.semantic-engine-lazy` checks and what keeps a

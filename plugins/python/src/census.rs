@@ -196,10 +196,7 @@ mod run {
         // walks the file set `--bulk-index` would.
         let extensions = [".py".to_string(), ".pyi".to_string()];
         let exclude: Vec<String> =
-            [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"]
-                .iter()
-                .map(|dir| (*dir).to_string())
-                .collect();
+            crate::project::EXCLUDE_DIRS.iter().map(|dir| (*dir).to_string()).collect();
         let files = walk_project(&root, &extensions, &exclude);
         enable();
 

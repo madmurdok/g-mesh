@@ -85,8 +85,8 @@ project.
    same named excludes the Python plugin's own walk uses,
    `project::EXCLUDE_DIRS`, so the scope cannot drift from what the plugin
    indexes. That constant is the authoritative list here; the manifest's
-   `exclude_dirs` currently repeats it and is not read by this path. It
-   returns:
+   `exclude_dirs` repeats it (pinned equal by a unit test since GM-418) and
+   is not read by this path. It returns:
    - `pruned`: every directory the walk declined to enter because of
      `.gitignore`, relative to the root, `/`-separated, top-most only
      (nothing under an already pruned directory is listed). The walk yields
