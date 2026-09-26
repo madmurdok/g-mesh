@@ -1,8 +1,8 @@
 # 0007. Embedding cache: machine-wide, keyed by the embedded text and the model's bytes
 
 ## Status
-Proposed (2026-09-26, GM-424/S2). Awaiting the owner's review before
-implementation; the open questions at the end need an answer first.
+Accepted (2026-09-26, GM-424); the owner reviewed the proposal and accepted
+it with the answers recorded under "Owner's answers" at the end.
 
 ## Context
 Every reindex path recomputes every vector, although a node's vector is a
@@ -194,14 +194,15 @@ calls; the byte-identity tests use the real model (`load_real_pipeline`,
   fails it.
 - Follow-up: delete-first in `workspace_reindex.rs:276` (above).
 
-## Open questions for the owner
-1. Default size bound: 512 MiB acceptable, or smaller?
-2. Include the `ort` version in the fingerprint (safe, invalidates on ONNX
-   Runtime bumps) or trust determinism across them?
-3. Hash `model.onnx` once per `(path, size, mtime)` (seconds, once), or
-   trust the pinned sha256 for the default directory to skip it?
-4. Should `g-mesh reindex` also use the cache, or bypass it by default as a
-   "recompute everything" command (with the env switch either way)?
-5. File the delete-first fix as its own task now?
-6. Should `g-mesh status` report cache size and hit rate, or are the log
-   lines enough?
+## Owner's answers
+1. Default size bound: 512 MiB.
+2. The `ort` version is part of the fingerprint: an ONNX Runtime bump refills
+   the cache instead of trusting determinism across runtimes.
+3. `model.onnx` is hashed, memoized by `(path, size, mtime_ns)`; the pinned
+   sha256 is not trusted in its place.
+4. `g-mesh reindex` uses the cache; `G_MESH_EMBEDDING_CACHE=off` is the way
+   to recompute everything. The byte-identity test guards against a cache
+   that would otherwise make a bad vector survive a reindex.
+5. Delete-first in workspace reindex is its own task in the same batch.
+6. `g-mesh status` does not report the cache; the per-unit log lines are
+   enough for now.
