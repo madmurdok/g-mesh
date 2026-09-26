@@ -43,6 +43,12 @@ Facts that shape the options:
   `multi-language-plugins.md`), so one language's graph links on its own.
 - A vector is a pure function of the embedded text and the model
   (ADR 0007 section 1).
+- The semantic pass writes no rows of its own: it answers with a diff whose
+  edges carry the ids the structural pass gave them, and `apply_diff`
+  upgrades each in place - `source` `syntactic` -> `semantic`, `resolved`
+  -> true, possibly a better `toId` (`watcher/apply.rs:171-175`). So a
+  structural walk emits the *downgraded* version of every edge the pass has
+  already upgraded in live.
 
 ### Swap cost, measured
 A copy of the g-mesh index (13,416 nodes; rust: 11,226 nodes, 28,823 edges,
@@ -74,7 +80,9 @@ We will stop deleting up front. A workspace reindex of language `L`:
 3. **Plans** (no live lock): the staging connection `ATTACH`es the live file
    read-only (WAL gives it a snapshot) and writes a plan into staging
    tables: live node/edge ids of `L` absent from staging (delete); staged
-   rows that are new or differ (upsert); containers likewise;
+   rows that are new or differ (upsert), **except an edge whose id is in
+   both and whose live row is `source = 'semantic'`: live's row is kept
+   (the semantic-edge rule, section 3)**; containers likewise;
    `declarations`/`placeholder_targets` replaced wholesale for every
    upserted or deleted node, as `apply_diff` does (`write.rs:321-325`).
 4. **Embeds only what changed** (no lock): upserted nodes whose embedded
@@ -99,8 +107,9 @@ swap time, not from the plan, so a vector it adds meanwhile is either kept
 (the node survives, same text) or removed with its node.
 
 The swap's hold scales with the change, not the language: a version bump
-writes `language_state` only; a crate rename rewrites the crate (worst
-case the full swap, ~1-3s). S2 measures it via rusqlite, S4 on the probe.
+with unchanged code writes `language_state` and the meta roll-ups only
+(the semantic-edge rule is what keeps that plan empty); a crate rename
+rewrites the crate (worst case the full swap, ~1-3s). S2 measures it via rusqlite, S4 on the probe.
 
 **Rejected**
 - *Full swap* (delete all `L`, copy all staged rows): simplest, but a 1-3s
@@ -129,11 +138,29 @@ unlinked placeholders are ordinary rows and go through the same diff.
 
 ### 3. Semantic pass and embeddings: ordering
 - The semantic pass runs **after** the swap, against live, as today
-  (`workspace_reindex.rs:304-339`). Between swap and its end (~58-62s for
-  rust) edges are structural-only, exactly today's post-walk state; the
-  swap reverts live's semantic-pass edges to the structural ones and the
-  pass restores them. No node is missing at any point. (Running it into
-  staging is open question 1.)
+  (`workspace_reindex.rs:304-339`), for every language with
+  `semantic_pass = true` (rust, go, python; typescript declares no
+  `watch_files` and never reaches this path). It still has to run even when
+  the code did not change: a manifest edit can move where calls into
+  dependencies resolve.
+- **Semantic-edge rule.** The swap never downgrades a live semantic edge
+  to its structural twin: for an edge id present in both, live's
+  `source = 'semantic'` row wins. Queries keep the previous pass's edges
+  until the new pass upgrades them in place, instead of seeing
+  structural-only edges for the pass's duration (~50-105s for rust on
+  g-mesh). What remains, by case:
+  - node deleted: its edges are deleted with it (their ids are absent
+    from staging);
+  - node new: structural edges only, until the pass reaches it;
+  - edge whose structural target changed: its id changes, so it is a
+    delete + insert and gets the structural edge until the pass;
+  - edge id unchanged but the semantic answer would now differ (e.g. a
+    dependency moved): live keeps the old semantic target until the pass
+    rewrites it - bounded by the pass, and only where the answer moved.
+- S2 checks whether a pass can also *add* edges with no structural twin.
+  If it can, those are live-only ids and the plan would delete them; the
+  rule then extends to "keep a live-only semantic edge whose endpoints both
+  survive", and test 8 covers it.
 - Embeddings: before the swap only the changed texts are embedded (step 4),
   so with the cache off an unchanged tree embeds nothing (today: 5,818
   texts, 687s, GM-424 arm 2 control). `search_code` sees old vectors until the swap, then
@@ -161,8 +188,10 @@ unlinked placeholders are ordinary rows and go through the same diff.
 Queries see the complete old graph of `L` or the complete new one: the
 switch is one transaction on the connection they read through. Removed
 symbols disappear at the swap; no duplicate is ever visible (staging is
-another file; the swap deletes before it upserts). The one transient gap is
-the structural-only edge set until the semantic pass lands (section 3).
+another file; the swap deletes before it upserts). Semantic edges of
+surviving nodes stay as they were until the pass replaces them; the only
+transient states are the per-case ones in section 3, limited to what
+changed.
 
 ### 6. Scope
 Fixed here: the workspace reindex, and the meta roll-ups (section 4).
@@ -205,8 +234,14 @@ and `:963`; the pause is `G_MESH_BULK_INDEX_HOLD_FILE`
    one edited doc comment embeds 1 (counters at `:1017`, `:1043`).
    Control: embed in the staging walk -> 2.
 7. *Swap writes nothing for an unchanged tree*: `total_changes()` across
-   the swap equals the `language_state`/`meta` rows only. Control: full
-   swap -> thousands.
+   the swap equals the `language_state`/`meta` rows only, with live's edges
+   already upgraded by a semantic pass. Control: full swap -> thousands.
+8. *Semantic edges survive the swap*: index, run a (fake) semantic pass
+   that upgrades edge `e1` and retargets it; reindex with unchanged code
+   and hold before the new pass: `e1` is still `semantic` with the
+   retargeted `toId`. A node whose code changed gets its structural edge.
+   Control: drop the semantic-edge rule from the plan -> `e1` reads
+   `syntactic` while held.
 `delete_language_rows`' own tests (`:380`, `:472`) go with it if nothing
 else calls it; S2 says which.
 
@@ -233,12 +268,11 @@ start completes it. Control for the probe: the before build must show the
 - An `L` file edit still waits for the whole reindex, as today.
 
 ## Open questions for the owner
-1. **Semantic pass into staging before the swap?** It would remove the
-   ~60s of structural-only edges, but the pass would have to run inside
-   the exclusive lock (it takes that lock itself, `daemon/lifecycle.rs:354`)
-   or edits would need queueing through the dirty queue. *Recommend: no,
-   not in this task; after the swap as today, revisit if S4 shows it
-   matters.*
+1. **Semantic pass into staging before the swap?** Recommend no: the
+   semantic-edge rule (section 3) already keeps the old semantic edges
+   serving through the pass, while running the pass into staging would keep
+   the exclusive lock (edits to `L` files wait) for the pass's whole
+   duration, or need edits queued (`daemon/lifecycle.rs:354`).
 2. **Worst-case swap hold** (crate rename, every id changes, ~1-3s): accept,
    or split the swap into chunks and give up atomicity for that case?
    *Recommend: accept; rare, and atomicity is the point.*
