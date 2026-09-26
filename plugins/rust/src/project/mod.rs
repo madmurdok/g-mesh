@@ -113,6 +113,19 @@ use g_mesh_plugin_sdk::RelPath;
 
 use cargo_manifest::{RawCargoToml, RawTarget};
 
+/// Directories the walk never descends into, beyond
+/// [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`]: cargo's own build output,
+/// never source.
+///
+/// This constant is the one list in code: `main.rs`'s
+/// [`g_mesh_plugin_sdk::PluginSpec::exclude_dirs`] fallback, the census and
+/// the tests all take it from here. The one copy that cannot be derived is
+/// `plugin.toml`'s `[plugin.workspace] exclude_dirs`, which core, its watcher
+/// and `status` read before any plugin process exists; the test
+/// `plugin_toml_exclude_dirs_equal_exclude_dirs` below pins the two equal, so
+/// editing either one alone fails the build's tests.
+pub const EXCLUDE_DIRS: [&str; 1] = ["target"];
+
 /// One compiled Rust crate this project model found - a package's library
 /// target, or one of its binaries. See this module's doc, "One package,
 /// several crates".
@@ -379,6 +392,23 @@ fn normalize_crate_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `plugin.toml` cannot be derived from [`EXCLUDE_DIRS`] (core reads it
+    /// as data), so it is pinned here instead. Compared exactly, order
+    /// included: both are hand-written lists, and "copy it verbatim" is the
+    /// simplest rule to follow.
+    #[test]
+    fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap();
+        let listed: Vec<&str> = manifest["plugin"]["workspace"]["exclude_dirs"]
+            .as_array()
+            .expect("plugin.toml declares [plugin.workspace] exclude_dirs")
+            .iter()
+            .map(|dir| dir.as_str().expect("every exclude_dirs entry is a string"))
+            .collect();
+        assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
+    }
 
     struct Tree(PathBuf);
 

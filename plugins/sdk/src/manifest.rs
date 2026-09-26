@@ -14,7 +14,7 @@
 //! Carrying a copy is what the TS plugin does, and it has the drift this
 //! crate can avoid: `ignorePolicy.ts`'s `HARD_EXCLUDED_DIRS` and
 //! `plugins/typescript/plugin.toml`'s `exclude_dirs` are the same list
-//! written twice, with a comment explaining how they relate. So the SDK reads
+//! written twice, held equal only by a test that compares them. So the SDK reads
 //! the manifest when it can find one, and falls back to the [`PluginSpec`]
 //! the plugin declared in code when it cannot.
 //!

@@ -90,6 +90,8 @@ watch_files = ["go.mod", "go.work"]
 # graph. `.git` is excluded unconditionally at the core level already, and
 # again by this plugin's own walk (walk.go) regardless of what this list
 # says, for a plugin run standalone (`--bulk-index`) with no core in front
-# of it to apply this list on its behalf.
+# of it to apply this list on its behalf. Must equal ignore.go's
+# `manifestExcludeDirs`, order included: core reads this file as data, so it
+# cannot be derived, and a test in manifest_test.go pins the two.
 exclude_dirs = ["vendor", "testdata"]
 entry_points = []

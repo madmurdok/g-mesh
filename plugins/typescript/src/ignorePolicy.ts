@@ -25,6 +25,11 @@ import ignore, { type Ignore } from "ignore";
  * parallel agent sessions) - real project source is never there, and a
  * project's own .gitignore has no reason to list it, so it needs the same
  * hard exclusion as `.git`.
+ *
+ * plugin.toml's `[plugin.workspace] exclude_dirs` is this set minus `.git` and
+ * `.claude` (core's baseline), order included; core reads that file as data,
+ * so it cannot be derived from here, and test/ignorePolicy.test.ts pins the
+ * two.
  */
 export const HARD_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", ".claude"]);
 

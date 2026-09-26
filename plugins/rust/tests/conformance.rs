@@ -206,7 +206,7 @@ fn base() -> PluginCheck {
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
     .extensions(&[".rs"])
-    .exclude_dirs(&["target"])
+    .exclude_dirs(&g_mesh_plugin_rust::project::EXCLUDE_DIRS)
     .watch_files(&["Cargo.toml"])
     .entry_points(&["lib.rs", "main.rs", "mod.rs"])
 }
