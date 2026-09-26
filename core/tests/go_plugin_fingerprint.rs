@@ -128,6 +128,7 @@ fn the_go_plugin_bundle_script_passes_the_same_build_flags() {
         "expected exactly one `go build` in {}: {build_lines:?}",
         script_path.display()
     );
+    assert!(GO_PLUGIN_BUILD_FLAGS.contains(&"-buildvcs=false"));
     for flag in GO_PLUGIN_BUILD_FLAGS {
         assert!(
             build_lines[0].contains(flag),
