@@ -395,6 +395,9 @@ extensions = [".go"]
 # Core sends semanticPass (per file after a reparse, whole project after a walk)
 # only when true. false: core never sends it, and no empty-diff answer is required.
 semantic_pass = true
+# true: a complete whole-project pass re-sends every semantic edge it stands behind,
+# so core deletes this language's semantic edges it did not re-send. Default false.
+semantic_sweep = true
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"

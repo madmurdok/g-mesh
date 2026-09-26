@@ -160,11 +160,15 @@ unlinked placeholders are ordinary rows and go through the same diff.
   `placeholder_targets` rows equal: exactly "in both and not upserted". An
   unchanged node keeps **all** its live outgoing edges - structural,
   semantic, and the pass's retractions (a staged structural edge from it
-  that live lacks is not inserted). Exception: a live edge whose target
-  does not exist after the swap is deleted, and the staged edges from that
-  node of the same kind, which live lacks or holds only with a vanished
-  target, are taken in its place. A changed or new node gets exactly
-  staging's outgoing edges; the pass after the swap refines them.
+  that live lacks is not inserted). Two exceptions: a live `syntactic`
+  edge whose staged edge of the same id differs is replaced by it (the
+  walk is the authority on structural edges; a live `semantic` edge, an
+  in-place upgrade included, is never replaced this way); and a live edge
+  whose target does not exist after the swap is deleted, and the staged
+  edges from that node of the same kind, which live lacks or holds only
+  with a vanished target, are taken in its place. A changed or new node
+  gets exactly staging's outgoing edges; the pass after the swap refines
+  them.
   Why these columns: every edge a node emits describes a site inside its
   range, so a different range, signature or container means different
   sites or a different scope to resolve them in. A same-size body edit
@@ -178,20 +182,25 @@ unlinked placeholders are ordinary rows and go through the same diff.
   - unchanged node whose live edge's target was deleted: that edge goes,
     the walk's edge of the same kind replaces it, until the pass;
   - unchanged node whose structural link would now resolve differently
-    (a dependency added or moved, same node rows): live keeps the old
+    (a dependency added or moved, same node rows): a still-`syntactic`
+    live edge takes the walk's answer; a `semantic` one keeps the old
     answer until the pass, or a reparse of that file, rewrites it.
 - **Sweep.** After a *complete whole-project* semantic pass for a
-  language, core deletes that language's `source = 'semantic'` edges the
+  language whose manifest declares `[plugin.capabilities] semantic_sweep =
+  true`, core deletes that language's `source = 'semantic'` edges the
   pass did not re-send (`watcher/apply.rs` `sweep_semantic_edges`): what
   an earlier process emitted and no process retracted. An incomplete pass
   (a partial answer) and a per-file pass (one file's answer) sweep
   nothing. Placeholder nodes the swept edges pointed at stay, as every
   linked-away placeholder does (`graph/symbol_links.rs`, "Why the
   placeholder is kept"); `graph::queries` already hides them.
-  Caveat: the sweep trusts "complete". The TypeScript plugin never reports
-  a pass incomplete, so a pass whose checker failed part-way sweeps the
-  upgrades it did not repeat, and an upgraded edge is a structural edge:
-  it is gone, not downgraded, until that file is reparsed. The Go tier
+  The sweep trusts "complete", so it is opt-in and absent means off
+  (ADR 0005's conservative default): a third-party plugin that never says
+  `incomplete` is not swept until it declares it can be. Rust, Go and
+  Python declare it. TypeScript declares `false`: its pass upgrades
+  structural edges in place and never reports incomplete, so a checker
+  failure part-way would sweep upgraded structural edges it did not
+  repeat (gone, not downgraded, until the file is reparsed). The Go tier
   reports incomplete only when every module fails to load.
 - Embeddings: before the swap only the changed texts are embedded (step 4),
   so with the cache off an unchanged tree embeds nothing (today: 5,818
@@ -286,6 +295,17 @@ and `:963`; the pause is `G_MESH_BULK_INDEX_HOLD_FILE`
    language's semantic ones; an incomplete whole-project pass and a
    per-file pass delete nothing. Controls: remove the sweep -> the stale
    edge survives; ignore `incomplete` or the scope -> it is gone.
+12. *Differing syntactic twin*: an unchanged node's live syntactic edge
+   whose staged twin links elsewhere is taken from staging; its semantic
+   edges (an in-place upgrade included) and a retracted edge stay as live
+   has them. Test 7 adds a live syntactic edge with an identical twin,
+   which must not be written. Controls: drop the twin branch -> the old
+   target stays; drop the plan's `EXCEPT` -> test 7 counts one more change.
+13. *Sweep is opt-in*: after a complete pass, a language declaring
+   `semantic_sweep` loses a semantic edge the pass did not re-send; one
+   that does not (as TypeScript) keeps it. Controls: never pass the
+   language to the sweep -> the first keeps it; always pass it -> the
+   second loses it.
 `delete_language_rows`' own tests (`:380`, `:472`) go with it if nothing
 else calls it; S2 says which.
 
@@ -313,8 +333,8 @@ start completes it. Control for the probe: the before build must show the
 - Stale semantic edges from an earlier process last until the next complete
   whole-project pass of their language, not forever; a pass's retracted
   structural edges no longer come back at a swap.
-- A TypeScript pass that fails part-way without saying so costs the
-  upgraded edges it did not repeat (section 3, Sweep).
+- TypeScript is not swept (section 3, Sweep): its stale semantic edges
+  from an earlier process last until their files are reparsed.
 
 ## Owner's answers
 1. The semantic pass is not run into staging; it runs after the swap, and
@@ -332,6 +352,10 @@ start completes it. Control for the probe: the before build must show the
    A complete whole-project pass sweeps its language's semantic edges it
    did not re-send. This replaces "keep a live semantic edge whose
    endpoints both survive".
+6. (2026-09-26, S5 review) The sweep is a manifest capability,
+   `semantic_sweep`, off unless declared; TypeScript stays off until its
+   pass can report incomplete (GM-430). An unchanged node's live syntactic
+   edge whose staged twin differs is taken from staging.
 
 Follow-ups filed separately: telling callers which files' semantic edges
 are still pending after a swap, and measuring where a semantic pass's time
