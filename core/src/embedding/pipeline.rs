@@ -1305,8 +1305,9 @@ mod tests {
     /// Opening the cache fingerprints the model's files without holding the
     /// cache's mutex: while the weights are being read, the mutex is free.
     /// The weights are a FIFO, so the read blocks until this test writes
-    /// them, and opening the FIFO's write end returns only once the reader
-    /// has it open.
+    /// them. The write end is opened non-blocking and retried until the
+    /// reader has the FIFO open, with a deadline, so a pipeline that never
+    /// reads the weights fails the test instead of hanging it.
     ///
     /// Control: open the cache under the mutex (call `open_cache` from
     /// inside the locked section of `open_if_unopened`) and `try_lock` fails.
@@ -1329,7 +1330,21 @@ mod tests {
                 pipeline.compute(&diff_of(2), &mut stats);
                 stats
             });
-            let mut weights = std::fs::OpenOptions::new().write(true).open(&onnx).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut weights = loop {
+                use std::os::unix::fs::OpenOptionsExt;
+                match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&onnx) {
+                    Ok(file) => break file,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the pipeline never opened the model's weights for reading"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("opening the FIFO's write end: {error}"),
+                }
+            };
             let free = pipeline.cache.try_lock().is_ok();
             weights.write_all(b"weights v1").unwrap();
             drop(weights);
