@@ -208,7 +208,7 @@ fn base() -> PluginCheck {
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
     .extensions(&[".py", ".pyi"])
-    .exclude_dirs(&[".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"])
+    .exclude_dirs(&g_mesh_plugin_python::project::EXCLUDE_DIRS)
     .watch_files(&["pyproject.toml", "setup.cfg", "setup.py"])
     .entry_points(&["__init__"])
 }
