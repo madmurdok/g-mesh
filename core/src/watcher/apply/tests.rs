@@ -568,6 +568,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "typescript",
         vec!["src/lib.rs".to_string()],
         RequestId::Number(9),
         &EmbeddingPipeline::disabled(),
@@ -764,6 +765,7 @@ fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "typescript",
         Vec::new(),
         RequestId::Number(1),
         &EmbeddingPipeline::disabled(),
@@ -801,6 +803,7 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "typescript",
         Vec::new(),
         RequestId::Number(1),
         &EmbeddingPipeline::disabled(),
@@ -845,6 +848,7 @@ fn an_incomplete_per_file_pass_is_not_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "typescript",
         vec!["src/lib.rs".to_string()],
         RequestId::Number(1),
         &EmbeddingPipeline::disabled(),
@@ -853,6 +857,125 @@ fn an_incomplete_per_file_pass_is_not_an_error() {
     )
     .expect("a per-file pass reports incompleteness without failing");
     plugin.join().unwrap();
+}
+
+/// A live index holding `rust`'s semantic edges `sem-stale` (n1 -> n2) and
+/// `sem-kept` (n1 -> n3), its structural `syn` (n2 -> n1), and `go-sem`, a
+/// semantic edge of another language.
+fn index_with_semantic_edges() -> IndexStore {
+    let semantic = |id: &str, from: &str, to: &str| {
+        let mut edge = EdgeRecord::new(id, from, to, "CALLS", "semantic", true);
+        edge.engine = "rust-analyzer".to_string();
+        edge
+    };
+    let mut raw_conn = setup_conn();
+    apply_diff(
+        &mut raw_conn,
+        &Diff {
+            upsert_nodes: vec![
+                NodeRecord::new("n1", "Function", "a", "m::a", "src/lib.rs", "rust"),
+                NodeRecord::new("n2", "Function", "b", "m::b", "src/lib.rs", "rust"),
+                NodeRecord::new("n3", "Function", "c", "m::c", "src/lib.rs", "rust"),
+                NodeRecord::new("g1", "Function", "g", "p.g", "main.go", "go"),
+                NodeRecord::new("g2", "Function", "h", "p.h", "main.go", "go"),
+            ],
+            upsert_edges: vec![
+                semantic("sem-stale", "n1", "n2"),
+                semantic("sem-kept", "n1", "n3"),
+                EdgeRecord::new("syn", "n2", "n1", "CALLS", "tree-sitter", true),
+                semantic("go-sem", "g1", "g2"),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    IndexStore::new(raw_conn)
+}
+
+/// Runs one `rust` semantic pass over `file_paths` against `conn`, whose
+/// answer re-sends only `sem-kept`, and returns the ids of the edges left.
+fn pass_resending_only_sem_kept(
+    conn: &IndexStore,
+    file_paths: Vec<String>,
+    incomplete: bool,
+) -> (Result<()>, Vec<String>) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let mut resent = unresolved_edge("sem-kept", "n1", "n3");
+    resent.source = SourceTier::Semantic;
+    resent.engine = "rust-analyzer".to_string();
+    let plugin = spawn_semantic_stub(
+        plugin_reader,
+        plugin_writer,
+        file_paths.clone(),
+        FileChangeDiff { upsert_edges: vec![resent], ..Default::default() },
+        incomplete,
+        None,
+    );
+    let mut buf_reader = BufReader::new(core_reader);
+    let outcome = apply_semantic_pass(
+        &mut buf_reader,
+        &mut core_writer,
+        conn,
+        "rust",
+        file_paths,
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    );
+    plugin.join().unwrap();
+    let ids = conn
+        .lock()
+        .unwrap()
+        .prepare("SELECT id FROM edges ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap();
+    (outcome, ids)
+}
+
+/// A complete whole-project pass deletes the language's semantic edges it
+/// did not re-send, and nothing else: not its structural edges, not another
+/// language's semantic ones.
+///
+/// Control: remove the `sweep_semantic_edges` call from
+/// `apply_semantic_pass_in` -> `sem-stale` survives.
+#[test]
+fn a_complete_whole_project_pass_sweeps_the_semantic_edges_it_did_not_resend() {
+    let conn = index_with_semantic_edges();
+    let (outcome, ids) = pass_resending_only_sem_kept(&conn, Vec::new(), false);
+    outcome.expect("a complete pass succeeds");
+    assert_eq!(ids, vec!["go-sem", "sem-kept", "syn"]);
+    assert_eq!(count(&conn, "nodes"), 5, "the sweep deletes edges only");
+}
+
+/// An incomplete whole-project pass is a partial answer: what it did not
+/// re-send may be what it never got to, so nothing is swept.
+///
+/// Control: sweep before the `outcome.incomplete` check (make the sweep's
+/// branch run whenever `whole_project` holds) -> `sem-stale` is gone.
+#[test]
+fn an_incomplete_whole_project_pass_sweeps_nothing() {
+    let conn = index_with_semantic_edges();
+    let (outcome, ids) = pass_resending_only_sem_kept(&conn, Vec::new(), true);
+    outcome.expect_err("an incomplete whole-project pass is still an error");
+    assert_eq!(ids, vec!["go-sem", "sem-kept", "sem-stale", "syn"]);
+}
+
+/// A per-file pass answers for one file, not the language, so nothing is
+/// swept.
+///
+/// Control: drop the `whole_project` condition from the sweep's branch ->
+/// `sem-stale` is gone.
+#[test]
+fn a_per_file_pass_sweeps_nothing() {
+    let conn = index_with_semantic_edges();
+    let (outcome, ids) = pass_resending_only_sem_kept(&conn, vec!["src/lib.rs".to_string()], false);
+    outcome.expect("a complete per-file pass succeeds");
+    assert_eq!(ids, vec!["go-sem", "sem-kept", "sem-stale", "syn"]);
 }
 
 /// The derived id has to be distinguishable from the file change it
