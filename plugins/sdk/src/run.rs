@@ -429,6 +429,9 @@ impl<E: Extractor> Session<'_, E> {
                 );
                 self.index.clear();
                 self.load_project();
+                // And a running semantic engine must not trust its server's
+                // earlier readiness for the pass that follows (GM-433).
+                self.engine.workspace_changed();
                 self.acknowledge(out, id)
             }
             // `reindex` is a no-op by design: a whole-project rebuild is an
@@ -783,6 +786,76 @@ mod tests {
         let fine = extract_caught(&Explodes, &(), &RelPath::new("good.boom"), "", "boom")
             .expect("the file after the panicking one is extracted normally");
         assert_eq!(fine.nodes.len(), 2);
+    }
+
+    /// GM-433: a `workspaceChanged` frame is forwarded to a started semantic
+    /// engine, so its server's earlier readiness is not trusted for the pass
+    /// that follows - and the frame is still acknowledged.
+    #[test]
+    fn a_workspace_changed_frame_reaches_the_started_engine() {
+        use crate::semantic::{SemanticEngine, SemanticEngineFactory};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Nothing;
+
+        impl crate::Extractor for Nothing {
+            const LANGUAGE: &'static str = "toy";
+            type Project = ();
+
+            fn load_project(&self, _root: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn extract(&self, _project: &(), path: &RelPath, _source: &str) -> FileGraph {
+                crate::graph::FileGraphBuilder::new("toy", "toy-parser", path).finish()
+            }
+        }
+
+        struct Watching {
+            changes: Arc<AtomicUsize>,
+        }
+
+        impl SemanticEngine for Watching {
+            fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
+                Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+            }
+
+            fn workspace_changed(&mut self) {
+                self.changes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let changes = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::clone(&changes);
+        let factory: SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(Watching { changes: Arc::clone(&changed) }) as Box<dyn SemanticEngine>)
+        });
+        let spec = ResolvedSpec::resolve_from(&PluginSpec::new("toy", "0.0.0", &[".toy"]), None);
+        let root = PathBuf::from("/projects/toy");
+        let mut session = Session {
+            extractor: &Nothing,
+            spec: &spec,
+            root: root.clone(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+        };
+        // Only a started engine has a readiness to forget.
+        session.engine.answer(&[], &SdkIndex::new(), &root);
+
+        let frame = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 3,
+            "method": "workspaceChanged",
+            "params": { "filePath": "Cargo.toml" },
+        });
+        let mut out = Vec::new();
+        session.handle(frame.to_string().as_bytes(), &mut out).unwrap();
+
+        assert_eq!(changes.load(Ordering::SeqCst), 1, "the started engine is told about the change");
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains(r#""acknowledged":true"#), "{written}");
     }
 
     #[test]
