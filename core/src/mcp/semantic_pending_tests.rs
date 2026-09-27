@@ -322,6 +322,36 @@ fn a_resumed_transitive_page_names_its_pending_files() {
     assert_eq!(pending_files(&resumed), serde_json::json!(["a.rs"]));
 }
 
+/// A resumed page whose pending files cannot be read stays silent rather
+/// than falling back to `absent`. Control: drop `continued`'s tier filter.
+#[test]
+fn a_resumed_transitive_page_stays_silent_when_pending_files_fail() {
+    let store = pending_index(
+        &many_implementors(120, 400, |i| if i < 20 { "c.rs".to_string() } else { "a.rs".to_string() }),
+        &["a.rs".to_string()],
+    );
+
+    let (first, _) = implementations(
+        &store,
+        FindImplementationsParams {
+            symbol_id: Some("iface".to_string()),
+            transitive: Some(true),
+            ..Default::default()
+        },
+    );
+    let token =
+        first["resumeToken"].as_str().unwrap_or_else(|| panic!("the walk is cut: {first}")).to_string();
+    store.with(|conn| conn.execute("DROP TABLE semantic_pending_files", [])).unwrap();
+    let (resumed, _) = implementations(
+        &store,
+        FindImplementationsParams { resume_token: Some(token), ..Default::default() },
+    );
+
+    let rows = resumed["results"].as_array().unwrap();
+    assert!(rows.iter().any(|row| row["filePath"] == "a.rs"), "the resumed rows reach a.rs: {resumed}");
+    assert!(resumed.get("provenance").is_none(), "{resumed}");
+}
+
 /// A resumed page of a language that is `absent`, not pending, stays silent:
 /// the fresh page already said so.
 #[test]

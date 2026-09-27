@@ -448,6 +448,7 @@ fn from_root(
 /// Its `provenance` is a `pending` block or nothing: the first of its rows'
 /// languages that is pending names the page's pending files. An `absent`
 /// block would only repeat what the fresh walk already said.
+/// A failed read of the pending files leaves the page silent too.
 fn continued(
     conn: &Connection,
     token: &str,
@@ -475,7 +476,9 @@ fn continued(
     let mut walk = bound_walk(result, max_depth, max_fanout, framing, prior_visited, prior_walked);
     if let Some((language, tier)) = pending {
         let touched = walk.results.iter().map(|row| row.file_path.as_str());
-        walk.provenance = tier.disclose(conn, &language, None, touched);
+        walk.provenance = tier
+            .disclose(conn, &language, None, touched)
+            .filter(|block| block.semantic_tier == provenance::SemanticTier::Pending);
     }
     success(&walk)
 }
