@@ -13,7 +13,7 @@ use g_mesh_wire::{
 };
 use serde_json::{json, Value};
 
-use super::client::{LspClient, Poll};
+use super::client::{LspClient, Poll, CONTENT_MODIFIED};
 use super::config::SemanticConfig;
 use super::position::{file_uri, line_text, path_from_uri, without_verbatim_prefix, PositionEncoding};
 use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
@@ -262,6 +262,18 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// later pass waits only for whatever is in flight now - otherwise the
 /// per-file pass that follows every edit would spend two of its ninety
 /// seconds proving a point that was already settled.
+///
+/// **Except after a project-model change** (GM-433). A `workspaceChanged`
+/// ([`SemanticEngine::workspace_changed`]) unlatches the settle, so the next
+/// pass - the whole-project one core runs after the reindex - waits for a
+/// full quiet period again. Measured on rust-analyzer after a version bump
+/// (GM-429 finding 1): a latched client returned ~13ms after "Building
+/// compile-time-deps" ended, while the server spent 3.4-4.5s more rebuilding
+/// its crate graph, and every question asked into that window was answered
+/// empty (and re-asked) or `ContentModified` (and, before GM-433, counted as
+/// a refusal that left the pass incomplete). A per-file `didChange` does not
+/// unlatch it; that stays [`LspClient::mark_edited`]'s narrower job. Nor
+/// does it for an on-demand server - see [`LspClient::unsettle`].
 ///
 /// **And a manifest may say the shape instead of waiting to be shown it**
 /// (GM-310). `[plugin.semantic] readiness = "on-demand"` -
@@ -1257,8 +1269,22 @@ fn run_pass(
                 // are still the server's warm working set.
                 queue.extend(again);
             }
-            Poll::Failed { id, message } => {
+            Poll::Failed { id, code, message } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                // `ContentModified` is not a refusal: the server's state moved
+                // under the question (rust-analyzer switching crate graphs,
+                // GM-433), so it is asked again once the server is quiet -
+                // the same deferral, under the same once-only `re_asked`
+                // rule, as an empty answer from a busy server. A second
+                // `ContentModified` for the same site falls through to the
+                // refusal below, so "again" cannot become "forever".
+                if code == Some(CONTENT_MODIFIED) {
+                    let key = (question.file.clone(), question.position.line, question.position.col);
+                    if re_asked.insert(key) {
+                        deferred.push(question);
+                        continue;
+                    }
+                }
                 // A server that refuses one question has not answered it, so
                 // the file it was in is not covered - but the pass goes on:
                 // one bad position is not a reason to drop the other nine
@@ -1467,6 +1493,17 @@ fn record_implementor(
 }
 
 impl SemanticEngine for LspBridge {
+    /// A project-model change makes the running server prove its readiness
+    /// again: the next pass waits for a full settle (GM-433) - see
+    /// [`LspClient::unsettle`] for why, and for why an on-demand server is
+    /// left as it is. No server running means nothing to do: the next one
+    /// starts unsettled anyway.
+    fn workspace_changed(&mut self) {
+        if let Some(client) = self.client.as_mut() {
+            client.unsettle();
+        }
+    }
+
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
         let scope: Vec<RelPath> = if whole_project {

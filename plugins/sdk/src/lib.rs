@@ -19,7 +19,8 @@
 //!   never before, with the conformance kit's marker written when it does;
 //! - a language-agnostic LSP bridge ([`lsp::LspBridge`]) for the languages
 //!   whose semantic tier is a language server;
-//! - `workspaceChanged` handling: the project model is rebuilt, nothing else.
+//! - `workspaceChanged` handling: the project model is rebuilt, and a running
+//!   semantic engine is told, so its next pass waits for the server to reload.
 //!
 //! # The shape of a plugin
 //!

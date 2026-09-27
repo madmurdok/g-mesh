@@ -429,6 +429,9 @@ impl<E: Extractor> Session<'_, E> {
                 );
                 self.index.clear();
                 self.load_project();
+                // And a running semantic engine must not trust its server's
+                // earlier readiness for the pass that follows (GM-433).
+                self.engine.workspace_changed();
                 self.acknowledge(out, id)
             }
             // `reindex` is a no-op by design: a whole-project rebuild is an
