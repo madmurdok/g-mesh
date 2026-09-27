@@ -46,7 +46,9 @@ const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 /// The plan tables, created in the staging file. `plan_text_changed` holds
 /// the upserted nodes whose embedded text differs from live's, whose live
 /// vector is therefore stale; `plan_unchanged_nodes` the nodes the
-/// unchanged-node rule (module doc) keeps live's outgoing edges for.
+/// unchanged-node rule (module doc) keeps live's outgoing edges for;
+/// `plan_pending_files` the files whose edges the swap leaves structural until
+/// the language's semantic pass refreshes them (ADR 0009).
 const PLAN_DDL: &str = "
 DROP TABLE IF EXISTS plan_delete_nodes;
 DROP TABLE IF EXISTS plan_upsert_nodes;
@@ -56,6 +58,7 @@ DROP TABLE IF EXISTS plan_delete_edges;
 DROP TABLE IF EXISTS plan_upsert_edges;
 DROP TABLE IF EXISTS plan_delete_containers;
 DROP TABLE IF EXISTS plan_upsert_containers;
+DROP TABLE IF EXISTS plan_pending_files;
 CREATE TABLE plan_delete_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_unchanged_nodes (id TEXT PRIMARY KEY);
@@ -64,6 +67,7 @@ CREATE TABLE plan_delete_edges (id TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_edges (id TEXT PRIMARY KEY);
 CREATE TABLE plan_delete_containers (nodeId TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_containers (nodeId TEXT PRIMARY KEY);
+CREATE TABLE plan_pending_files (filePath TEXT PRIMARY KEY);
 ";
 
 /// Row counts of one plan, for the reindex's log line and for tests.
@@ -75,6 +79,8 @@ pub struct PlanCounts {
     pub upsert_edges: usize,
     pub delete_containers: usize,
     pub upsert_containers: usize,
+    /// Files whose edges stay structural until the semantic pass.
+    pub pending_files: usize,
 }
 
 impl PlanCounts {
@@ -236,6 +242,22 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
         "the edges to upsert",
     )?;
 
+    // A staged node whose own row changed, or whose outgoing edges the swap
+    // changes, has edges only the semantic pass can make final. Only files
+    // the walk still has count: a path with no `File` node names nothing a
+    // response could show.
+    let pending_files = run(
+        "INSERT OR IGNORE INTO plan_pending_files (filePath)
+         SELECT n.filePath FROM main.nodes n
+         WHERE (n.id IN (SELECT id FROM plan_upsert_nodes)
+                OR n.id IN (SELECT e.fromId FROM main.edges e
+                            WHERE e.id IN (SELECT id FROM plan_upsert_edges))
+                OR n.id IN (SELECT e.fromId FROM live.edges e
+                            WHERE e.id IN (SELECT id FROM plan_delete_edges)))
+           AND n.filePath IN (SELECT filePath FROM main.nodes WHERE kind = 'File')",
+        "the files left pending",
+    )?;
+
     let delete_containers = run(
         "INSERT INTO plan_delete_containers (nodeId)
          SELECT nodeId FROM live.containers
@@ -262,6 +284,7 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
             upsert_edges,
             delete_containers,
             upsert_containers,
+            pending_files,
         },
         to_embed,
     })
@@ -326,8 +349,10 @@ pub struct SwapBookkeeping<'a> {
 /// transaction: the planned deletes, then the planned upserts copied from
 /// staging, the vectors of deleted nodes and of nodes whose text changed
 /// removed and `vectors` stored, `language_state` of the language written
-/// (walked now, semantic pass owed), both meta roll-ups reconciled and the
-/// language's `pending_reindex` row removed. A failure rolls all of it back.
+/// (walked now, semantic pass owed), both meta roll-ups reconciled, the
+/// language's `pending_reindex` row removed and, for a language with a
+/// semantic pass, its semantic-pending rows written. A failure rolls all of it
+/// back.
 pub fn swap(
     live: &mut Connection,
     staging_path: &Path,
@@ -441,6 +466,23 @@ fn swap_attached(
         params![language, plugin_fingerprint],
     )
     .with_context(|| format!("failed to record that {language} was reindexed"))?;
+    // Inside the swap's transaction: a committed swap always has its rows, a
+    // rolled-back one never does. The language row is written even with no
+    // files, since unchanged call sites still owe the pass.
+    if semantic_pass_languages.contains(*language) {
+        tx.execute(
+            "INSERT OR REPLACE INTO semantic_pending (language, since)
+             VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![language],
+        )
+        .with_context(|| format!("failed to record {language}'s pending semantic pass"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO semantic_pending_files (language, filePath)
+             SELECT ?1, filePath FROM staging.plan_pending_files",
+            params![language],
+        )
+        .with_context(|| format!("failed to record {language}'s pending files"))?;
+    }
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -456,7 +498,7 @@ mod tests {
 
     use super::*;
     use crate::storage::connection::open_staging;
-    use crate::storage::write::{apply_diff, NodeRecord};
+    use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord};
 
     #[test]
     fn a_path_becomes_a_read_only_uri_on_either_platform() {
@@ -529,5 +571,162 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(ids, vec!["go-1", "new", "same"]);
+    }
+
+    /// A rust node `id` in `file`, with `signature`.
+    fn node_in(id: &str, file: &str, signature: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Function", id, id, file, "rust");
+        node.signature = Some(signature.to_string());
+        node
+    }
+
+    fn file_node(file: &str) -> NodeRecord {
+        NodeRecord::new(format!("file-{file}"), "File", file, file, file, "rust")
+    }
+
+    fn column(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Live: `a` (its signature changes), `b` (unchanged, its edge's target
+    /// goes), `c` (unchanged), `d` (every node deleted). Staging adds a node
+    /// at a path with no `File` node, as a placeholder has. Returns the
+    /// directory, the live connection, the staging path and the plan.
+    fn planned_reindex() -> (tempfile::TempDir, Connection, std::path::PathBuf, Plan) {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+
+        let mut live = open_staging(&live_path).unwrap();
+        live.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        let files = ["a.rs", "b.rs", "c.rs", "d.rs"];
+        let mut upsert_nodes: Vec<NodeRecord> = files.iter().map(|f| file_node(f)).collect();
+        upsert_nodes.extend([
+            node_in("a1", "a.rs", "fn a()"),
+            node_in("b1", "b.rs", "fn b()"),
+            node_in("c1", "c.rs", "fn c()"),
+            node_in("d1", "d.rs", "fn d()"),
+        ]);
+        apply_diff(
+            &mut live,
+            &Diff {
+                upsert_nodes,
+                upsert_edges: vec![
+                    EdgeRecord::new("b1->d1", "b1", "d1", "CALLS", "semantic", true),
+                    EdgeRecord::new("c1->b1", "c1", "b1", "CALLS", "semantic", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut staging = open_staging(&staging_path).unwrap();
+        let mut upsert_nodes: Vec<NodeRecord> = files[..3].iter().map(|f| file_node(f)).collect();
+        upsert_nodes.extend([
+            node_in("a1", "a.rs", "fn a(x: u32)"),
+            node_in("b1", "b.rs", "fn b()"),
+            node_in("c1", "c.rs", "fn c()"),
+            NodeRecord::new("placeholder", "Function", "p", "p", "external/p.rs", "rust"),
+        ]);
+        apply_diff(
+            &mut staging,
+            &Diff {
+                upsert_nodes,
+                upsert_edges: vec![EdgeRecord::new("c1->b1", "c1", "b1", "CALLS", "tree-sitter", true)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model").unwrap();
+        (dir, live, staging_path, plan)
+    }
+
+    /// The plan names exactly the changed file and the file whose edges the
+    /// swap changed. Controls: drop the `plan_upsert_nodes` arm (`a.rs`
+    /// missing); drop the two edge arms (`b.rs` missing); drop the `File`
+    /// restriction (`external/p.rs` appears).
+    #[test]
+    fn the_plan_records_the_files_left_pending() {
+        let (_dir, _live, staging_path, plan) = planned_reindex();
+
+        let staging = open_staging(&staging_path).unwrap();
+        assert_eq!(
+            column(&staging, "SELECT filePath FROM plan_pending_files ORDER BY filePath"),
+            vec!["a.rs", "b.rs"]
+        );
+        assert_eq!(plan.counts.pending_files, 2);
+    }
+
+    fn bookkeeping<'a>(capable: &'a HashSet<String>) -> SwapBookkeeping<'a> {
+        SwapBookkeeping { language: "rust", plugin_fingerprint: "fp", semantic_pass_languages: capable }
+    }
+
+    /// A committed swap of a semantic-pass language writes its pending row
+    /// and files. Control: drop the capability gate (the non-capable swap in
+    /// the next test gets rows).
+    #[test]
+    fn a_swap_writes_the_pending_rows() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
+
+        assert_eq!(column(&live, "SELECT language FROM semantic_pending"), vec!["rust"]);
+        let since = column(&live, "SELECT since FROM semantic_pending").remove(0);
+        assert!(
+            since.len() == 20 && since.ends_with('Z') && since.as_bytes()[10] == b'T',
+            "RFC 3339 UTC: {since}"
+        );
+        assert_eq!(
+            column(
+                &live,
+                "SELECT filePath FROM semantic_pending_files WHERE language = 'rust' ORDER BY filePath"
+            ),
+            vec!["a.rs", "b.rs"]
+        );
+    }
+
+    /// A language with no semantic pass owes nothing: no rows.
+    #[test]
+    fn a_swap_of_a_language_without_a_semantic_pass_writes_no_pending_rows() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
+
+        assert!(column(&live, "SELECT language FROM semantic_pending").is_empty());
+        assert!(column(&live, "SELECT filePath FROM semantic_pending_files").is_empty());
+    }
+
+    /// A swap that fails after its pending rows are written rolls them back
+    /// with everything else. Control: write the rows outside the swap's
+    /// transaction (on `live` in [`swap`], before [`swap_attached`] opens
+    /// it) - they survive the failure.
+    #[test]
+    fn a_failed_swap_leaves_no_pending_rows() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        live.execute(
+            "INSERT INTO pending_reindex (language, trigger, startedAt) VALUES ('rust', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        live.execute_batch(
+            "CREATE TRIGGER fail_swap BEFORE DELETE ON pending_reindex BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+        )
+        .unwrap();
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).expect_err("the trigger fails the swap");
+
+        assert!(column(&live, "SELECT language FROM semantic_pending").is_empty());
+        assert!(column(&live, "SELECT filePath FROM semantic_pending_files").is_empty());
     }
 }

@@ -129,6 +129,17 @@ pub fn bound_page<T: Serialize>(
     bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES)
 }
 
+/// [`bound_page`] leaving `reserve` bytes of [`MAX_RESPONSE_BYTES`] free for
+/// response-level fields the caller attaches after the cut.
+pub fn bound_page_leaving<T: Serialize>(
+    rows: Vec<EdgeRow<T>>,
+    has_more: bool,
+    next_cursor: Option<String>,
+    reserve: usize,
+) -> Page<T> {
+    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - reserve)
+}
+
 /// [`bound_page`] with the byte budget spelled out, so a response that also
 /// carries a `files` tally can hold part of [`MAX_RESPONSE_BYTES`] back for
 /// it (see [`bound_page_reserving_tally`]) instead of the two sections
@@ -435,13 +446,15 @@ pub fn tally_is_worth_sending(row_count: usize, tally: &[FileTally], has_more: b
 /// [`bound_page`], but leaving [`FILE_TALLY_RESERVE`] bytes of the response
 /// budget free for a `files` tally the caller is about to attach. Rows are
 /// still what gets cut - a tally is bounded by [`MAX_FILE_TALLY`] and never
-/// grows without bound, while rows do.
+/// grows without bound, while rows do. `extra_reserve` is held back on top,
+/// for another bounded response-level field.
 pub fn bound_page_reserving_tally<T: Serialize>(
     rows: Vec<EdgeRow<T>>,
     has_more: bool,
     next_cursor: Option<String>,
+    extra_reserve: usize,
 ) -> Page<T> {
-    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - FILE_TALLY_RESERVE)
+    bound_page_leaving(rows, has_more, next_cursor, FILE_TALLY_RESERVE + extra_reserve)
 }
 
 /// [`bound_page_reserving_tally`] for a response that may carry *two* tallies:
@@ -449,29 +462,32 @@ pub fn bound_page_reserving_tally<T: Serialize>(
 /// same [`MAX_RESPONSE_BYTES`] ceiling, so the total a caller page can reach is
 /// unchanged from before the second tally existed - what shrinks is the share
 /// left for rows, which are the part that grows without bound and therefore the
-/// right part to cut.
+/// right part to cut. `extra_reserve` as in [`bound_page_reserving_tally`].
 pub fn bound_page_reserving_two_tallies<T: Serialize>(
     rows: Vec<EdgeRow<T>>,
     has_more: bool,
     next_cursor: Option<String>,
+    extra_reserve: usize,
 ) -> Page<T> {
-    bound_page_within(
+    bound_page_leaving(
         rows,
         has_more,
         next_cursor,
-        MAX_RESPONSE_BYTES - FILE_TALLY_RESERVE - EXCLUDED_TALLY_RESERVE,
+        FILE_TALLY_RESERVE + EXCLUDED_TALLY_RESERVE + extra_reserve,
     )
 }
 
 /// [`bound_page`] leaving room for an excluded-references tally alone - the
 /// callee side, which has no `files` tally of its own (see `CallerPage::files`
-/// for why that asymmetry is deliberate).
+/// for why that asymmetry is deliberate). `extra_reserve` as in
+/// [`bound_page_reserving_tally`].
 pub fn bound_page_reserving_excluded_tally<T: Serialize>(
     rows: Vec<EdgeRow<T>>,
     has_more: bool,
     next_cursor: Option<String>,
+    extra_reserve: usize,
 ) -> Page<T> {
-    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - EXCLUDED_TALLY_RESERVE)
+    bound_page_leaving(rows, has_more, next_cursor, EXCLUDED_TALLY_RESERVE + extra_reserve)
 }
 
 /// An edge alongside the `locality` [`paginate_edges`] already computed for

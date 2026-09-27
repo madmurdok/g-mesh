@@ -274,6 +274,9 @@ pub fn run(root: &Path) -> Result<()> {
     {
         eprintln!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
+    // Next to the staging cleanup above, once the tables exist: pending rows
+    // no pass will clear (a removed plugin, a clear that failed) go.
+    workspace_reindex::remove_stale_semantic_pending(&conn, &discovered.manifests);
     // Recorded at open, not once serving: a long cold walk must not read as
     // idleness to a concurrent GC scan.
     last_used::touch(&conn).context("failed to record that the project was used")?;

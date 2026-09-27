@@ -272,6 +272,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -314,6 +315,7 @@ fn an_interrupted_workspace_reindex_is_named() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
+            semantic_pending: Vec::new(),
             discovered: 1,
             indexed: 1,
             dirty: 0,
@@ -350,6 +352,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -496,6 +499,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -539,6 +543,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -778,6 +783,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -869,6 +875,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1080,6 +1087,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_owed: Vec::new(),
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
+            semantic_pending: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1091,4 +1099,55 @@ fn a_project_with_no_suspension_marker_reports_none() {
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
+}
+
+/// A report around `index`, with no daemon running.
+fn report_with(index: IndexStatus) -> Report {
+    Report {
+        project_root: PathBuf::from("/tmp/project"),
+        project_id: "a1b2c3d4e5f6a7b8".to_string(),
+        state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+        core: CoreState::NotRunning,
+        build: BuildState::NotRunning,
+        plugins: Vec::new(),
+        suspended_languages: Vec::new(),
+        last_used: None,
+        index,
+        phase: None,
+        front: None,
+        progress: None,
+    }
+}
+
+/// A language pending after a workspace reindex is named with its file
+/// count until its pass completes. Control: drop the `semantic pending:`
+/// loop from `render` -> not named.
+#[test]
+fn a_pending_semantic_pass_is_named_with_its_file_count_until_it_completes() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES ('typescript', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES ('typescript', 'a.ts'), ('typescript', 'b.ts');",
+    )
+    .unwrap();
+
+    let status = fixture.status();
+    assert_eq!(
+        status.semantic_pending,
+        vec![("typescript".to_string(), "2026-09-26T10:14:03Z".to_string(), 2)]
+    );
+    let rendered = render(&report_with(status));
+    assert!(
+        rendered.contains(
+            "semantic pending: typescript since 2026-09-26T10:14:03Z - 2 file(s) changed by the reindex have \
+             structural edges until its pass finishes; the next daemon start runs it"
+        ),
+        "{rendered}"
+    );
+
+    schema::record_language_semantic_pass(&conn, "typescript").unwrap();
+    let rendered = render(&report_with(fixture.status()));
+    assert!(!rendered.contains("semantic pending"), "{rendered}");
 }

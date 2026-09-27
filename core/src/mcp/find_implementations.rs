@@ -109,6 +109,7 @@ fn list_implementations(
     file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
+    reserve: usize,
 ) -> anyhow::Result<pagination::Page<ImplementationSite>> {
     let page = pagination::paginate_edges(
         conn,
@@ -148,7 +149,7 @@ fn list_implementations(
         });
     }
 
-    Ok(pagination::bound_page(rows, page.has_more, page.next_cursor))
+    Ok(pagination::bound_page_leaving(rows, page.has_more, page.next_cursor, reserve))
 }
 
 pub(super) fn handle(
@@ -172,6 +173,7 @@ pub(super) fn handle(
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let page = list_implementations(
         &conn,
         &anchor.id,
@@ -179,8 +181,11 @@ pub(super) fn handle(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
+        tier.page_reserve(),
     )
     .map_err(|e| internal_error("failed to find implementations", e))?;
+    let touched = page.results.iter().map(|row| row.file_path.as_str());
+    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
 
     success(&ImplementationPage {
         anchor: anchor_info,
@@ -189,7 +194,7 @@ pub(super) fn handle(
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
-        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
+        provenance,
     })
 }
 
@@ -265,12 +270,10 @@ struct TransitiveImplementationWalk {
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
     /// See `super::provenance`. Present on a fresh walk under exactly the
-    /// same condition the single-hop page carries it, and absent on a
-    /// *resumed* one for the same reason `anchor` above is - a resumed call
-    /// resolves no anchor, so it has no language to name, and the response
-    /// that handed out the token already carried the disclosure for this
-    /// walk. Recomputing it would mean re-reading a node purely to repeat
-    /// something already delivered.
+    /// same condition the single-hop page carries it. A *resumed* page
+    /// resolves no anchor and carries only a `pending` block, when its rows'
+    /// language is pending, so a later page naming a pending file is not
+    /// silent; an `absent` block was already delivered with the token.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
 }
@@ -305,16 +308,14 @@ fn wire_name(cause: TruncatedBy) -> &'static str {
 /// Everything a transitive page says about *itself* rather than about its
 /// rows, in one argument.
 ///
-/// The three travel together and are set together: a fresh walk
-/// ([`from_root`]) has all three to give, a resumed one ([`continued`]) has
-/// none of them, and no caller has ever wanted a different combination -
-/// which is exactly the shape a struct exists to make unspellable. Grouping
-/// them is also what keeps [`bound_walk`] under `clippy::too_many_arguments`
-/// without an `allow`, now that GM-382 added the third.
+/// They travel together: a fresh walk ([`from_root`]) has both to give, a
+/// resumed one ([`continued`]) has neither. `reserve` is the bytes the page
+/// holds back for the `provenance` block its caller attaches after the cut
+/// (`provenance::Resolved::page_reserve`).
 struct WalkFraming {
     anchor: Option<anchor::AnchorInfo>,
     hint: Option<&'static str>,
-    provenance: Option<provenance::Provenance>,
+    reserve: usize,
 }
 
 fn bound_walk(
@@ -325,7 +326,7 @@ fn bound_walk(
     prior_visited: Vec<VisitedNode>,
     prior_walked: Vec<String>,
 ) -> TransitiveImplementationWalk {
-    let WalkFraming { anchor, hint, provenance } = framing;
+    let WalkFraming { anchor, hint, reserve } = framing;
     // Present only on a fresh walk: a resumed call's `nodes` excludes
     // already-visited nodes (the anchor included), so `prior_visited` already
     // carries it forward instead.
@@ -338,7 +339,8 @@ fn bound_walk(
         }
     }
 
-    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
+    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES - reserve)
+    else {
         return TransitiveImplementationWalk {
             anchor,
             results: dtos,
@@ -347,7 +349,7 @@ fn bound_walk(
             frontier_nodes: result.frontier_nodes,
             resume_token: result.resume_token,
             hint,
-            provenance,
+            provenance: None,
         };
     };
 
@@ -385,7 +387,7 @@ fn bound_walk(
         frontier_nodes: Vec::new(),
         resume_token: Some(token),
         hint,
-        provenance,
+        provenance: None,
     }
 }
 
@@ -424,9 +426,12 @@ fn from_root(
 
     let result = traversal::traverse(conn, options)
         .map_err(|e| internal_error("failed to walk the implementation hierarchy", e))?;
-    let provenance = provenance::resolve(conn, capabilities, &anchor_node.language);
-    let framing = WalkFraming { anchor: Some(anchor_info), hint, provenance };
-    success(&bound_walk(result, max_depth, max_fanout, framing, Vec::new(), Vec::new()))
+    let tier = provenance::resolve(conn, capabilities, &anchor_node.language);
+    let framing = WalkFraming { anchor: Some(anchor_info), hint, reserve: tier.page_reserve() };
+    let mut walk = bound_walk(result, max_depth, max_fanout, framing, Vec::new(), Vec::new());
+    let touched = walk.results.iter().map(|row| row.file_path.as_str());
+    walk.provenance = tier.disclose(conn, &anchor_node.language, Some(&anchor_node.file_path), touched);
+    success(&walk)
 }
 
 /// Continues a transitive walk the exploration budget or a prior
@@ -439,15 +444,40 @@ fn from_root(
 /// for a `File`-kind anchor, and a `File` node has no incoming `SUPERTYPE_OF`
 /// edges to walk, so a walk that reached a truncation cause worth resuming
 /// could never have started from one - there is no real case this drops.
-fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData> {
+///
+/// Its `provenance` is a `pending` block or nothing: the first of its rows'
+/// languages that is pending names the page's pending files. An `absent`
+/// block would only repeat what the fresh walk already said.
+fn continued(
+    conn: &Connection,
+    token: &str,
+    capabilities: &HashMap<String, Capabilities>,
+) -> Result<CallToolResult, ErrorData> {
     let state =
         resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
     let ResumeState { max_depth, max_fanout, visited: prior_visited, walked: prior_walked, .. } = state;
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the implementation walk", e))?;
-    let framing = WalkFraming { anchor: None, hint: None, provenance: None };
-    success(&bound_walk(result, max_depth, max_fanout, framing, prior_visited, prior_walked))
+    let mut languages: Vec<&str> = Vec::new();
+    for node in result.nodes.iter().filter(|node| node.depth > 0) {
+        if !languages.contains(&node.node.language.as_str()) {
+            languages.push(node.node.language.as_str());
+        }
+    }
+    let pending =
+        languages.into_iter().find_map(|language| match provenance::resolve(conn, capabilities, language) {
+            tier @ provenance::Resolved::Pending { .. } => Some((language.to_string(), tier)),
+            provenance::Resolved::Silent | provenance::Resolved::Absent => None,
+        });
+    let reserve = pending.as_ref().map_or(0, |(_, tier)| tier.page_reserve());
+    let framing = WalkFraming { anchor: None, hint: None, reserve };
+    let mut walk = bound_walk(result, max_depth, max_fanout, framing, prior_visited, prior_walked);
+    if let Some((language, tier)) = pending {
+        let touched = walk.results.iter().map(|row| row.file_path.as_str());
+        walk.provenance = tier.disclose(conn, &language, None, touched);
+    }
+    success(&walk)
 }
 
 /// The entry point `mod.rs` calls. Dispatches on `transitive`/`resume_token`
@@ -485,7 +515,7 @@ pub(crate) fn dispatch(
             );
         }
         let conn = store.read();
-        return continued(&conn, &token);
+        return continued(&conn, &token, capabilities);
     }
 
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };

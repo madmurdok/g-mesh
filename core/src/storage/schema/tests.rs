@@ -37,6 +37,8 @@ fn creates_all_tables_and_indexes() {
             "nodes",
             "pending_reindex",
             "placeholder_targets",
+            "semantic_pending",
+            "semantic_pending_files",
             "vectors",
         ]
     );
@@ -797,4 +799,128 @@ fn a_semantic_pass_failure_is_recorded_until_a_pass_succeeds() {
 
     record_semantic_pass(&conn, "python", &capable).unwrap();
     assert!(semantic_pass_failures(&conn).unwrap().is_empty(), "a completed pass clears the reason");
+}
+
+/// `language` pending with `files`, as a workspace reindex swap leaves it.
+fn mark_semantic_pending(conn: &Connection, language: &str, files: &[&str]) {
+    conn.execute(
+        "INSERT INTO semantic_pending (language, since) VALUES (?1, '2026-09-26T10:14:03Z')",
+        params![language],
+    )
+    .unwrap();
+    for file in files {
+        conn.execute(
+            "INSERT INTO semantic_pending_files (language, filePath) VALUES (?1, ?2)",
+            params![language, file],
+        )
+        .unwrap();
+    }
+}
+
+/// `(language, filePath)` of every pending file row, sorted.
+fn semantic_pending_file_rows(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT language, filePath FROM semantic_pending_files ORDER BY language, filePath")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// A completed pass clears its own language's pending rows and no other's.
+/// Controls: remove the clear from `record_language_semantic_pass` (rust's
+/// rows remain); clear without the language filter (go's go too).
+#[test]
+fn a_completed_pass_clears_only_its_own_languages_pending_rows() {
+    let conn = setup();
+    mark_semantic_pending(&conn, "rust", &["a.rs"]);
+    mark_semantic_pending(&conn, "go", &["a.go"]);
+
+    record_language_semantic_pass(&conn, "rust").unwrap();
+
+    assert_eq!(semantic_pending_since(&conn, "rust").unwrap(), None);
+    assert_eq!(semantic_pending_since(&conn, "go").unwrap().as_deref(), Some("2026-09-26T10:14:03Z"));
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("go".to_string(), "a.go".to_string())]);
+}
+
+/// A recorded failure (incomplete or not run alike) clears the language's
+/// pending rows: no pass is working on them. Control: remove the clear from
+/// `record_language_semantic_pass_failure` (rows remain).
+#[test]
+fn a_recorded_failure_clears_the_languages_pending_rows() {
+    let conn = setup();
+    mark_semantic_pending(&conn, "rust", &["a.rs", "b.rs"]);
+    mark_semantic_pending(&conn, "go", &["a.go"]);
+
+    record_language_semantic_pass_failure(&conn, "rust", "the engine exited").unwrap();
+
+    assert_eq!(semantic_pending_since(&conn, "rust").unwrap(), None);
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("go".to_string(), "a.go".to_string())]);
+}
+
+/// The clear and the `language_state` write commit together, inside a
+/// caller's own transaction too.
+#[test]
+fn a_completion_recorded_inside_a_transaction_commits_with_it() {
+    let mut conn = setup();
+    mark_semantic_pending(&conn, "rust", &["a.rs"]);
+
+    let tx = conn.transaction().unwrap();
+    record_language_semantic_pass(&tx, "rust").unwrap();
+    tx.rollback().unwrap();
+
+    assert!(!language_semantic_pass_done(&conn, "rust").unwrap());
+    assert!(semantic_pending_since(&conn, "rust").unwrap().is_some(), "rolled back with the caller");
+}
+
+/// The startup cleanup removes rows of a language no capable plugin runs and
+/// of a language whose pass is recorded done, and keeps an owed capable one.
+#[test]
+fn stale_semantic_pending_rows_are_cleared_and_owed_ones_kept() {
+    let conn = setup();
+    mark_semantic_pending(&conn, "rust", &["a.rs"]);
+    mark_semantic_pending(&conn, "removed", &["a.x"]);
+    mark_semantic_pending(&conn, "go", &["a.go"]);
+    conn.execute(
+        "INSERT INTO language_state (language, semanticPassAt) VALUES ('go', CURRENT_TIMESTAMP)",
+        [],
+    )
+    .unwrap();
+    let capable: HashSet<String> = ["rust", "go"].into_iter().map(String::from).collect();
+
+    assert_eq!(clear_stale_semantic_pending(&conn, &capable).unwrap(), 2);
+
+    assert_eq!(
+        semantic_pending(&conn).unwrap(),
+        vec![("rust".to_string(), "2026-09-26T10:14:03Z".to_string(), 1)]
+    );
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("rust".to_string(), "a.rs".to_string())]);
+}
+
+/// A complete per-file pass clears its files, whatever their language, and
+/// leaves the language rows.
+#[test]
+fn clearing_pending_files_keeps_the_language_row() {
+    let conn = setup();
+    mark_semantic_pending(&conn, "rust", &["a.rs", "b.rs"]);
+
+    assert_eq!(clear_semantic_pending_files(&conn, &["a.rs".to_string()]).unwrap(), 1);
+
+    assert!(semantic_pending_since(&conn, "rust").unwrap().is_some());
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("rust".to_string(), "b.rs".to_string())]);
+}
+
+/// `reset` (version mismatch, `g-mesh reindex`) leaves both tables empty.
+/// Control: leave them out of `wipe`'s `DROP` list (rows survive, since the
+/// DDL only creates what is missing).
+#[test]
+fn a_reset_empties_the_semantic_pending_tables() {
+    let conn = setup();
+    record_version(&conn, GENERATION).unwrap();
+    mark_semantic_pending(&conn, "rust", &["a.rs"]);
+
+    reset(&conn, GENERATION).unwrap();
+
+    assert!(semantic_pending(&conn).unwrap().is_empty());
+    assert!(semantic_pending_file_rows(&conn).is_empty());
 }

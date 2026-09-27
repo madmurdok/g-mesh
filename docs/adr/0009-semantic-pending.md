@@ -1,8 +1,12 @@
 # 0009. Semantic pending: say which files a running post-swap semantic pass has not reached
 
 ## Status
-Proposed (2026-09-26, GM-428/S1); awaiting the owner's review before
-implementation.
+Accepted (owner review 2026-09-26). Proposed 2026-09-26 (GM-428/S1). The
+owner accepted the three open points as proposed: a failed, incomplete or
+not-run pass deletes the pending rows and the language falls back to
+`absent`; a resumed transitive `find_implementations` page carries the
+pending block, and only that block, when its rows' language is pending;
+MCP instructions do not change.
 
 ## Context
 After a workspace reindex swaps a language `L` in (ADR 0008), `L`'s
@@ -246,10 +250,13 @@ its test fail.
    arms -> `b` missing; drop the `File` restriction -> a placeholder path or
    `d` appears.
 2. *Swap writes rows atomically*: after a swap, one `semantic_pending` row
-   and `{a, b}`; a swap forced to fail (trigger on `language_state`, as
-   `workspace_reindex.rs` tests already do) leaves none. Controls: write
-   the rows after `commit` -> the failing swap leaves rows; drop the
-   capability gate -> a non-capable language gets rows.
+   and `{a, b}`; a swap forced to fail after the rows are written (a trigger
+   on the `pending_reindex` delete, the swap's last statement) leaves none.
+   Controls: write the rows outside the swap's transaction -> the failing
+   swap leaves rows; drop the capability gate -> a non-capable language
+   gets rows. (A failure at the `language_state` write, or rows written
+   after `commit`, would not tell the arms apart: neither arm reaches the
+   write.)
 3. *Unchanged tree still owes the language-level fact*: an unchanged
    reindex writes the `semantic_pending` row with zero files. Control: gate
    the row on a non-empty plan -> no row.
@@ -273,8 +280,11 @@ its test fail.
    `since`; done with a stale row -> `None`; non-capable with a row ->
    `None`; no row, not done -> `Absent`. Control: move the pending check
    before the done check -> the stale-row case discloses.
-9. *During a pass, per tool* (integration, the `Stage::Swapped` hook, which
-   runs after the swap and before the pass): for each of the four tools, a
+9. *During a pass, per tool* (integration: a real `language_swap` plan and
+   swap, then the four handlers before the pass is recorded - the state the
+   `Stage::Swapped` hook sees; the hook itself holds an `IndexStore` the
+   handlers' `Arc` cannot share, and tests 3, 5 and 7 cover the reindex
+   around it): for each of the four tools, a
    query whose response names `a` has `pendingFiles` naming `a`; a query
    touching only `c` has `semanticTier: "pending"`, `since`, and no
    `pendingFiles` key. After the pass: no `provenance` key. Controls: pass
