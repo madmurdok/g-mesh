@@ -256,9 +256,10 @@ tracker before filing anything new:
   filed as GM-440, depends on this eval.
 - **Lazy or prioritised embedding** (defer or rank nodes instead of a full
   eager pass): no existing task — filed as GM-441, depends on this eval.
-- **CodeRankEmbed**: not tried, and not filed as a follow-up — the owner
-  has not approved an ONNX export for it (see Method, above), so there is
-  nothing to run yet. Revisit once one exists.
+- **CodeRankEmbed**: not tried here. It has no published ONNX, and the
+  export was not needed for the verdict. It is recorded in GM-436 as an
+  alternative base model for the adapter/fine-tuning research, with the
+  same export and PyTorch-vs-ONNX parity control.
 - **Int8 quantization and shorter input** are already covered: GM-422 and
   GM-423, filed before this eval and unblocked by it.
 - Adapter/fine-tuning research is out of scope here and moves to GM-436;
