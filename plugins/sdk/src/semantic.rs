@@ -151,6 +151,15 @@ pub trait SemanticEngine: Send {
     /// whatever was resolved before the trouble over an `Err` that discards
     /// it; an `Err` is for "this pass produced nothing usable".
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer>;
+
+    /// Core sent `workspaceChanged`: the project model this engine's answers
+    /// were built against no longer applies, and core is about to reindex
+    /// and ask a whole-project pass. Called only on an engine that has
+    /// already been started - one that has not will start fresh anyway.
+    ///
+    /// The default does nothing. [`crate::lsp::LspBridge`] uses it to make
+    /// the next pass wait for its server to finish reloading (GM-433).
+    fn workspace_changed(&mut self) {}
 }
 
 /// Builds the semantic engine, called at most once and only on the first
@@ -254,6 +263,15 @@ impl LazyEngine {
         }
     }
 
+    /// Passes a `workspaceChanged` on to the engine, if one has started - see
+    /// [`SemanticEngine::workspace_changed`]. Never starts one: that stays
+    /// the first `semanticPass`'s job.
+    pub(crate) fn workspace_changed(&mut self) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.workspace_changed();
+        }
+    }
+
     /// Whether an engine has been started - for the startup log and for
     /// tests.
     pub(crate) fn started(&self) -> bool {
@@ -347,6 +365,43 @@ mod tests {
         lazy.answer(&[RelPath::new("a.toy")], &SdkIndex::new(), root());
         assert_eq!(starts.load(Ordering::SeqCst), 1, "the engine must be started once, not per pass");
         assert_eq!(answers.load(Ordering::SeqCst), 3);
+    }
+
+    struct Watching {
+        changes: Arc<AtomicUsize>,
+    }
+
+    impl SemanticEngine for Watching {
+        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<SemanticAnswer> {
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+
+        fn workspace_changed(&mut self) {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// GM-433: a `workspaceChanged` reaches a started engine, and neither
+    /// starts one nor is lost on one that has not started.
+    #[test]
+    fn a_workspace_change_reaches_a_started_engine_and_starts_none() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let changes = Arc::new(AtomicUsize::new(0));
+        let (started, changed) = (Arc::clone(&starts), Arc::clone(&changes));
+        let mut lazy = LazyEngine::new(
+            "toy",
+            Some(Box::new(move |_root| {
+                started.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Watching { changes: changed }) as Box<dyn SemanticEngine>)
+            })),
+        );
+
+        lazy.workspace_changed();
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "a workspace change must not start the engine");
+
+        lazy.answer(&[], &SdkIndex::new(), root());
+        lazy.workspace_changed();
+        assert_eq!(changes.load(Ordering::SeqCst), 1, "a started engine is told about the change");
     }
 
     /// The factory is handed the project root, so an engine that needs one

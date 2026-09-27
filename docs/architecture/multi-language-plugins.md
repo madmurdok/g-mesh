@@ -698,6 +698,24 @@ argument, including why the per-edge `source`/`engine` columns cannot answer
 this question and why the block is response-level rather than per-row (on
 excalidraw's `pointFrom` at `limit: 200`, 51 rows: 63 bytes against 2448).
 
+After a workspace reindex swaps a language in, its whole-project semantic
+pass runs against live, and until it finishes the block says `pending`
+instead of `absent` ([ADR 0009](../adr/0009-semantic-pending.md)):
+
+```json
+"provenance": { "language": "rust", "semanticTier": "pending",
+                "since": "2026-09-26T10:14:03Z", "pendingFiles": ["core/src/a.rs"] }
+```
+
+`pendingFiles` lists the files this response names (the anchor's first)
+whose edges the pass has not refreshed yet, at most 25, with
+`pendingFilesOmitted` counting the rest; it is absent when none are. The
+state lives in `semantic_pending`/`semantic_pending_files`, written in the
+swap's transaction and cleared by any recorded outcome of the pass: a
+failed, incomplete or not-run pass clears it too, and the language reads
+`absent` again. A complete per-file pass clears its own file. `g-mesh status`
+prints a `semantic pending:` line per such language.
+
 ### Plugin SDK (`plugins/sdk`, Rust crate)
 
 ```rust
