@@ -71,7 +71,7 @@ use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::PluginManifest;
+use crate::daemon::manifest::{self, PluginManifest};
 use crate::daemon::plugin;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
@@ -113,6 +113,24 @@ pub(crate) fn remove_stale_staging(state_dir: &Path) {
         if name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX) {
             remove_staging(&entry.path());
         }
+    }
+}
+
+/// Deletes the semantic-pending rows (ADR 0009) of languages no discovered
+/// plugin runs a semantic pass for, and of languages whose pass is recorded
+/// done. Called once at daemon start. Best-effort: readers ignore such rows
+/// anyway.
+pub(crate) fn remove_stale_semantic_pending(
+    conn: &rusqlite::Connection,
+    manifests: &std::collections::HashMap<String, PluginManifest>,
+) {
+    let capable: HashSet<String> = manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
+    match schema::clear_stale_semantic_pending(conn, &capable) {
+        Ok(0) => {}
+        Ok(cleared) => {
+            eprintln!("g-mesh daemon: cleared the stale semantic-pending rows of {cleared} language(s)")
+        }
+        Err(err) => eprintln!("g-mesh daemon: could not clear stale semantic-pending rows ({err:#})"),
     }
 }
 
@@ -283,14 +301,15 @@ fn rebuild(
     let counts = plan.counts;
     eprintln!(
         "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
-         {} texts owed a vector",
+         {} texts owed a vector, {} file(s) structural until the semantic pass",
         counts.delete_nodes,
         counts.upsert_nodes,
         counts.delete_edges,
         counts.upsert_edges,
         counts.delete_containers,
         counts.upsert_containers,
-        plan.to_embed.upsert_nodes.len()
+        plan.to_embed.upsert_nodes.len(),
+        counts.pending_files
     );
     Ok(stats)
 }
@@ -1594,5 +1613,133 @@ mod tests {
                 edge_row("alpha-stale", "semantic", "alpha-n3")
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Semantic-pending rows (ADR 0009) across the reindex's own pass.
+    // -----------------------------------------------------------------
+
+    /// `(language rows, file rows)` in `semantic_pending`.
+    fn semantic_pending_counts(conn: &Connection) -> (i64, i64) {
+        (
+            count(conn, "SELECT COUNT(*) FROM semantic_pending"),
+            count(conn, "SELECT COUNT(*) FROM semantic_pending_files"),
+        )
+    }
+
+    /// The pending counts at `Stage::Swapped` of one reindex, and after it.
+    fn semantic_pending_around_the_pass(
+        registry: &PluginRegistry,
+        supervisor: &PluginSupervisor,
+        conn: &IndexStore,
+    ) -> ((i64, i64), (i64, i64)) {
+        let mut at_swap = None;
+        run_with(registry, supervisor, conn, "go.mod", &mut |stage| {
+            if stage == Stage::Swapped {
+                at_swap = Some(semantic_pending_counts(&conn.lock().unwrap()));
+            }
+        })
+        .expect("the reindex succeeds");
+        (at_swap.expect("the swap was reached"), semantic_pending_counts(&conn.lock().unwrap()))
+    }
+
+    /// An unchanged tree still owes the pass for unchanged call sites whose
+    /// dependencies moved: the language row is written with no files, and
+    /// the completed pass clears it. Control: write the language row only
+    /// when the plan has pending files -> no row at the swap.
+    #[test]
+    fn an_unchanged_reindex_still_owes_the_language_level_fact() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+
+        let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
+
+        assert_eq!(at_swap, (1, 0), "one language row, no files");
+        assert_eq!(after, (0, 0), "the completed pass cleared it");
+    }
+
+    /// A pass not run (its plugin asleep) clears the rows the swap wrote: no
+    /// pass is working on them. Control: remove the clear from
+    /// `schema::record_language_semantic_pass_failure` -> rows remain.
+    #[test]
+    fn a_pass_not_run_after_the_swap_clears_the_pending_rows() {
+        let (_project, _plugins, registry, conn) = alpha_registry();
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        supervisor.sleep_now("the test put it to sleep");
+
+        let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
+
+        assert_eq!(at_swap.0, 1, "the swap wrote the language row");
+        assert_eq!(after, (0, 0));
+    }
+
+    /// An incomplete pass is recorded as a failure and clears the rows the
+    /// same way. Control: as above.
+    #[test]
+    fn an_incomplete_pass_after_the_swap_clears_the_pending_rows() {
+        let counters = Counters::default();
+        let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        test_plugin::answer_first_semantic_pass_incomplete(
+            &plugins.path().join("alpha"),
+            "alpha",
+            Some("no answer"),
+        );
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+
+        let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
+
+        assert_eq!(at_swap, (1, 1), "the new file is pending at the swap");
+        assert_eq!(after, (0, 0));
+        assert_eq!(schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().len(), 1);
+    }
+
+    /// A daemon killed during the pass: the rows survive the restart, the
+    /// startup cleanup removes those of a language no capable plugin runs
+    /// and of a language whose pass is done, and the activation retry's pass
+    /// clears the owed one. Control: make `remove_stale_semantic_pending` a
+    /// no-op -> the removed plugin's rows remain.
+    #[test]
+    fn pending_rows_survive_a_restart_until_the_retry_pass() {
+        let counters = Counters::default();
+        let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the reindex succeeds");
+        // The state a daemon killed between the swap and the pass's record
+        // leaves, plus rows of a removed plugin and of a done language.
+        conn.lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE language_state SET semanticPassAt = NULL WHERE language = 'alpha';
+                 UPDATE meta SET semanticPassAt = NULL;
+                 INSERT INTO semantic_pending (language, since) VALUES
+                     ('alpha', '2026-09-26T10:14:03Z'), ('gone', '2026-09-26T10:14:03Z'),
+                     ('beta', '2026-09-26T10:14:03Z');
+                 INSERT INTO semantic_pending_files (language, filePath) VALUES
+                     ('alpha', 'src/a.alpha-src'), ('gone', 'x.gone'), ('beta', 'b.beta');
+                 INSERT INTO language_state (language, semanticPassAt) VALUES ('beta', CURRENT_TIMESTAMP);",
+            )
+            .unwrap();
+        drop(conn);
+
+        let conn = live_index(project.path());
+        assert_eq!(semantic_pending_counts(&conn.lock().unwrap()), (3, 3), "the rows are on disk");
+        let discovered = discover(&[plugins.path().to_path_buf()]).unwrap();
+        remove_stale_semantic_pending(&conn.lock().unwrap(), &discovered.manifests);
+        assert_eq!(
+            rows(
+                &conn.lock().unwrap(),
+                "SELECT language FROM semantic_pending UNION ALL SELECT language FROM semantic_pending_files"
+            ),
+            vec!["Text(\"alpha\")".to_string(), "Text(\"alpha\")".to_string()]
+        );
+
+        semantic::run_with_registry(&registry, &conn);
+
+        assert_eq!(semantic_pending_counts(&conn.lock().unwrap()), (0, 0), "the retry pass cleared it");
     }
 }

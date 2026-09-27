@@ -988,3 +988,79 @@ fn the_semantic_pass_id_cannot_collide_with_the_request_it_follows() {
     assert_ne!(derived, RequestId::Number(4));
     assert_ne!(semantic_pass_id(&RequestId::String("3".to_string())), derived);
 }
+
+/// An index with `rust` pending and `a.rs`, `b.rs` pending files.
+fn index_with_pending_files() -> IndexStore {
+    let conn = setup_conn();
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES ('rust', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES ('rust', 'a.rs'), ('rust', 'b.rs');",
+    )
+    .unwrap();
+    IndexStore::new(conn)
+}
+
+fn per_file_pass_over_a(conn: &IndexStore, incomplete: bool) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let plugin = spawn_semantic_stub(
+        plugin_reader,
+        plugin_writer,
+        vec!["a.rs".to_string()],
+        FileChangeDiff::default(),
+        incomplete,
+        None,
+    );
+    let mut buf_reader = BufReader::new(core_reader);
+    apply_semantic_pass(
+        &mut buf_reader,
+        &mut core_writer,
+        conn,
+        None,
+        vec!["a.rs".to_string()],
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap();
+}
+
+fn pending_state(conn: &IndexStore) -> (usize, Vec<String>) {
+    conn.with(|conn| {
+        let languages: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_pending", [], |row| row.get(0)).unwrap();
+        let files = conn
+            .prepare("SELECT filePath FROM semantic_pending_files ORDER BY filePath")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (languages as usize, files)
+    })
+}
+
+/// A complete per-file pass over `a.rs` refreshes it: `a.rs` is no longer
+/// pending, `b.rs` and the language row are. Control: remove the clear from
+/// `apply_semantic_pass_in` -> `a.rs` remains.
+#[test]
+fn a_complete_per_file_pass_clears_only_its_file() {
+    let conn = index_with_pending_files();
+
+    per_file_pass_over_a(&conn, false);
+
+    assert_eq!(pending_state(&conn), (1, vec!["b.rs".to_string()]));
+}
+
+/// An incomplete per-file pass clears nothing. Control: clear regardless of
+/// `incomplete` -> `a.rs` is gone.
+#[test]
+fn an_incomplete_per_file_pass_clears_nothing() {
+    let conn = index_with_pending_files();
+
+    per_file_pass_over_a(&conn, true);
+
+    assert_eq!(pending_state(&conn), (1, vec!["a.rs".to_string(), "b.rs".to_string()]));
+}

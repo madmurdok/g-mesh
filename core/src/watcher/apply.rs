@@ -28,6 +28,7 @@ use crate::protocol::types::{
     SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::index_store::{IndexStore, Unit, Writer};
+use crate::storage::schema;
 use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
@@ -228,7 +229,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths },
+        ControlMessage::SemanticPass { file_paths: file_paths.clone() },
         request_id,
         embedding,
         timeout,
@@ -256,15 +257,20 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
              this pass did resolve"
         );
-    } else if whole_project {
-        if let Some(language) = sweep_language {
-            let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
-            if swept > 0 {
-                eprintln!(
-                    "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
-                     semantic edge(s) - deleted"
-                );
-            }
+    } else if !whole_project {
+        // A complete per-file pass has refreshed these files' edges, so they
+        // are no longer pending (ADR 0009). Best-effort: a row left behind
+        // only over-warns until the whole-project pass clears it.
+        if let Err(err) = store.step(|conn| schema::clear_semantic_pending_files(conn, &file_paths)) {
+            eprintln!("g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})");
+        }
+    } else if let Some(language) = sweep_language {
+        let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
+        if swept > 0 {
+            eprintln!(
+                "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
+                 semantic edge(s) - deleted"
+            );
         }
     }
     Ok(())

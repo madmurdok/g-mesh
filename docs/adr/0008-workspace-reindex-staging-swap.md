@@ -335,6 +335,8 @@ start completes it. Control for the probe: the before build must show the
   structural edges no longer come back at a swap.
 - TypeScript is not swept (section 3, Sweep): its stale semantic edges
   from an earlier process last until their files are reparsed.
+- Which files a post-swap semantic pass has not reached yet is disclosed per
+  response as `semanticTier: "pending"`: [ADR 0009](0009-semantic-pending.md).
 
 ## Owner's answers
 1. The semantic pass is not run into staging; it runs after the swap, and

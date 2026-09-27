@@ -47,6 +47,8 @@ mod get_file_outline;
 mod instructions;
 mod provenance;
 mod search_code;
+#[cfg(test)]
+mod semantic_pending_tests;
 mod similarity;
 mod source;
 mod tool_result;

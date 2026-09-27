@@ -119,6 +119,7 @@ fn list_references(
     file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
+    extra_reserve: usize,
 ) -> anyhow::Result<pagination::Page<ReferenceSite>> {
     let page = pagination::paginate_edges(
         conn,
@@ -158,7 +159,7 @@ fn list_references(
         });
     }
 
-    Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor))
+    Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor, extra_reserve))
 }
 
 pub(crate) fn handle(
@@ -182,6 +183,7 @@ pub(crate) fn handle(
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let page = list_references(
         &conn,
         &anchor.id,
@@ -189,6 +191,7 @@ pub(crate) fn handle(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
+        tier.page_reserve(),
     )
     .map_err(|e| internal_error("failed to find references", e))?;
 
@@ -198,6 +201,14 @@ pub(crate) fn handle(
     let files =
         pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
 
+    // Every file this response names: rows and the tally.
+    let touched = page
+        .results
+        .iter()
+        .map(|row| row.file_path.as_str())
+        .chain(files.iter().flatten().map(|tally| tally.path.as_str()));
+    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+
     success(&ReferencePage {
         anchor: anchor_info,
         results: page.results,
@@ -206,7 +217,7 @@ pub(crate) fn handle(
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
-        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
+        provenance,
     })
 }
 
@@ -313,7 +324,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.rs", &[], 1, cursor.as_deref()).unwrap();
+            let page = list_references(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {
@@ -613,7 +624,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_sub", "sub", "base", "SUPERTYPE_OF", "tree-sitter", true))
             .unwrap();
 
-        let page = list_references(&conn, "base", "base.ts", &[], 10, None).unwrap();
+        let page = list_references(&conn, "base", "base.ts", &[], 10, None, 0).unwrap();
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.results[0].referencing_symbol_id, "sub");
         assert_eq!(page.results[0].reference_kind, "SUPERTYPE_OF");
@@ -726,7 +737,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_exp", "file", "target", "EXPORTS", "tree-sitter", true))
             .unwrap();
 
-        let page = list_references(&conn, "target", "tasks.ts", &[], 10, None).unwrap();
+        let page = list_references(&conn, "target", "tasks.ts", &[], 10, None, 0).unwrap();
         assert!(page.results.is_empty(), "a symbol's own declaration site is not a reference to it");
     }
 
@@ -765,7 +776,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.ts", &[], 1, cursor.as_deref()).unwrap();
+            let page = list_references(&conn, "target", "target.ts", &[], 1, cursor.as_deref(), 0).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {

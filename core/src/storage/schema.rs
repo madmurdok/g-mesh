@@ -464,6 +464,26 @@ CREATE TABLE IF NOT EXISTS pending_reindex (
     trigger   TEXT NOT NULL,
     startedAt TEXT NOT NULL
 );
+
+-- One row per language whose whole-project semantic pass is owed after a
+-- workspace reindex swapped it in, and has neither completed nor recorded a
+-- failure since (ADR 0009). Written in the swap's own transaction; removed by
+-- `record_language_semantic_pass` and `record_language_semantic_pass_failure`
+-- in theirs. `since` is the swap's commit time, RFC 3339 UTC. Added by
+-- `CREATE TABLE IF NOT EXISTS`, so an existing index gains it without a
+-- schema-version bump.
+CREATE TABLE IF NOT EXISTS semantic_pending (
+    language TEXT PRIMARY KEY,
+    since    TEXT NOT NULL
+);
+
+-- The files of `language` whose edges that pass has not refreshed yet. A row
+-- here without its language's `semantic_pending` row is never read.
+CREATE TABLE IF NOT EXISTS semantic_pending_files (
+    language TEXT NOT NULL,
+    filePath TEXT NOT NULL,
+    PRIMARY KEY (language, filePath)
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -809,29 +829,172 @@ pub fn semantic_pass_completed(conn: &Connection) -> Result<bool> {
 /// `a_two_language_semantic_pass_roll_up_waits_for_the_slower_language`
 /// below for why that separation is what makes the roll-up rule testable at
 /// all.
+///
+/// Also removes `language`'s semantic-pending rows, in the same savepoint:
+/// a completed pass has refreshed every file it owed.
 pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO language_state (language, semanticPassAt) VALUES (?1, CURRENT_TIMESTAMP)
-         ON CONFLICT(language) DO UPDATE SET semanticPassAt = excluded.semanticPassAt,
-             semanticPassError = NULL",
-        params![language],
-    )
-    .with_context(|| format!("failed to record that {language}'s semantic pass completed"))?;
-    Ok(())
+    in_savepoint(conn, || {
+        conn.execute(
+            "INSERT INTO language_state (language, semanticPassAt) VALUES (?1, CURRENT_TIMESTAMP)
+             ON CONFLICT(language) DO UPDATE SET semanticPassAt = excluded.semanticPassAt,
+                 semanticPassError = NULL",
+            params![language],
+        )
+        .with_context(|| format!("failed to record that {language}'s semantic pass completed"))?;
+        clear_semantic_pending(conn, language)
+    })
 }
 
 /// Records why `language`'s whole-project semantic pass failed, replacing any
 /// earlier reason. `semanticPassAt` is left as it was: a language still owed
 /// its pass stays owed, and the next [`record_language_semantic_pass`] clears
 /// the reason.
+///
+/// Also removes `language`'s semantic-pending rows, in the same savepoint:
+/// no pass is working on those files any more, so the language reads as
+/// `absent` rather than `pending` (ADR 0009).
 pub fn record_language_semantic_pass_failure(conn: &Connection, language: &str, reason: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO language_state (language, semanticPassError) VALUES (?1, ?2)
-         ON CONFLICT(language) DO UPDATE SET semanticPassError = excluded.semanticPassError",
-        params![language, reason],
-    )
-    .with_context(|| format!("failed to record that {language}'s semantic pass failed"))?;
+    in_savepoint(conn, || {
+        conn.execute(
+            "INSERT INTO language_state (language, semanticPassError) VALUES (?1, ?2)
+             ON CONFLICT(language) DO UPDATE SET semanticPassError = excluded.semanticPassError",
+            params![language, reason],
+        )
+        .with_context(|| format!("failed to record that {language}'s semantic pass failed"))?;
+        clear_semantic_pending(conn, language)
+    })
+}
+
+/// Runs `body` inside a savepoint on `conn`, so its statements commit or roll
+/// back together whether or not the caller already holds a transaction.
+fn in_savepoint<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("SAVEPOINT schema_record").context("failed to open a savepoint")?;
+    match body() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE schema_record").context("failed to release a savepoint")?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback) = conn.execute_batch("ROLLBACK TO schema_record; RELEASE schema_record") {
+                eprintln!("g-mesh: failed to roll back a savepoint ({rollback:#})");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Deletes `language`'s rows from both semantic-pending tables.
+fn clear_semantic_pending(conn: &Connection, language: &str) -> Result<()> {
+    conn.execute("DELETE FROM semantic_pending WHERE language = ?1", params![language])
+        .and_then(|_| {
+            conn.execute("DELETE FROM semantic_pending_files WHERE language = ?1", params![language])
+        })
+        .with_context(|| format!("failed to clear {language}'s semantic-pending rows"))?;
     Ok(())
+}
+
+/// When `language`'s pending whole-project semantic pass became owed (the
+/// swap's commit time, RFC 3339 UTC), or `None` when no pass is pending for
+/// it. Says nothing about whether the pass has since completed: a caller
+/// checks [`language_semantic_pass_done`] first.
+pub fn semantic_pending_since(conn: &Connection, language: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT since FROM semantic_pending WHERE language = ?1", params![language], |row| {
+        row.get(0)
+    })
+    .optional()
+    .with_context(|| format!("failed to read {language}'s semantic-pending row"))
+}
+
+/// Which of `file_paths` are pending files of `language`, in no particular
+/// order.
+pub fn semantic_pending_files_among(
+    conn: &Connection,
+    language: &str,
+    file_paths: &[&str],
+) -> Result<Vec<String>> {
+    // Chunked well under SQLite's bound-parameter limit.
+    const CHUNK: usize = 500;
+    let mut pending = Vec::new();
+    for chunk in file_paths.chunks(CHUNK) {
+        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT filePath FROM semantic_pending_files WHERE language = ?1 AND filePath IN ({})",
+            placeholders.join(", ")
+        );
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&language];
+        sql_params.extend(chunk.iter().map(|path| path as &dyn rusqlite::ToSql));
+        let mut statement = conn.prepare(&sql).context("failed to prepare the pending-files read")?;
+        let rows = statement
+            .query_map(sql_params.as_slice(), |row| row.get::<_, String>(0))
+            .context("failed to read the pending files")?;
+        for row in rows {
+            pending.push(row.context("failed to read a pending file")?);
+        }
+    }
+    Ok(pending)
+}
+
+/// Deletes the semantic-pending file rows of `file_paths`, whatever their
+/// language (a file belongs to one), after a complete per-file semantic pass
+/// over them. The language rows stay: a per-file pass does not re-resolve
+/// unchanged call sites elsewhere.
+pub fn clear_semantic_pending_files(conn: &Connection, file_paths: &[String]) -> Result<usize> {
+    let mut cleared = 0;
+    for path in file_paths {
+        cleared += conn
+            .execute("DELETE FROM semantic_pending_files WHERE filePath = ?1", params![path])
+            .with_context(|| format!("failed to clear the pending file {path}"))?;
+    }
+    Ok(cleared)
+}
+
+/// Deletes the semantic-pending rows no pass will ever clear: those of a
+/// language not in `semantic_pass_languages` (its plugin is gone or declares
+/// no semantic tier) and those of a language whose pass is recorded done (a
+/// clear whose write failed). Returns how many languages were cleared.
+pub fn clear_stale_semantic_pending(
+    conn: &Connection,
+    semantic_pass_languages: &HashSet<String>,
+) -> Result<usize> {
+    let languages: Vec<String> = conn
+        .prepare("SELECT language FROM semantic_pending UNION SELECT language FROM semantic_pending_files")
+        .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+        .context("failed to read the semantic-pending languages")?;
+    let mut cleared = 0;
+    for language in languages {
+        if !semantic_pass_languages.contains(&language) || language_semantic_pass_done(conn, &language)? {
+            clear_semantic_pending(conn, &language)?;
+            cleared += 1;
+        }
+    }
+    Ok(cleared)
+}
+
+/// Every `(language, since, pending file count)` with a semantic-pending row,
+/// sorted by language. Empty for an index that predates the table. Includes
+/// stale rows; a reader filters them as `mcp::provenance` does.
+pub fn semantic_pending(conn: &Connection) -> Result<Vec<(String, String, usize)>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the semantic_pending table")?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT p.language, p.since,
+                    (SELECT COUNT(*) FROM semantic_pending_files f WHERE f.language = p.language)
+             FROM semantic_pending p ORDER BY p.language",
+        )
+        .context("failed to prepare the semantic-pending read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as usize)))
+        .context("failed to read the semantic-pending languages")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the semantic-pending languages")
 }
 
 /// Every language whose last whole-project semantic pass failed, with the
@@ -1024,7 +1187,8 @@ fn wipe(conn: &Connection) -> Result<()> {
         "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
          DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
-         DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex;",
+         DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
+         DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files;",
     )
     .context("failed to wipe schema")
 }
