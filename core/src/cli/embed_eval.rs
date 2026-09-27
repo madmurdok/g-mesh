@@ -829,6 +829,50 @@ fn bound_of(groups: &metrics::Groups, settings: &config::Settings) -> Option<Bou
     metrics::bootstrap(groups, settings.bootstrap_resamples, settings.bootstrap_seed)
 }
 
+/// Q5 (D9): the paired held-out false-alarm deltas `candidate - reference`,
+/// each arm judged at its own floors. Returns the per-language groups, the
+/// pooled bound the gate reads (NaN when nothing pairs), and the report
+/// fields: the pooled delta, and each language's delta with its own bound,
+/// reported rather than gated so the pooled gate can be read beside it.
+fn false_alarm_deltas(
+    reference: &[Outcome],
+    reference_floors: &Floors,
+    candidate: &[Outcome],
+    candidate_floors: &Floors,
+    settings: &config::Settings,
+) -> (metrics::Groups, Bound, serde_json::Value) {
+    let fa = metrics::paired_at_own_floors(
+        reference,
+        reference_floors,
+        candidate,
+        candidate_floors,
+        metrics::false_alarm_indicator,
+    );
+    let nan = Bound { point: f64::NAN, lower: f64::NAN, upper: f64::NAN };
+    let pooled = bound_of(&fa, settings).unwrap_or(nan);
+    let by_language: BTreeMap<String, serde_json::Value> = fa
+        .iter()
+        .map(|(l, v)| {
+            let one: metrics::Groups = BTreeMap::from([(l.clone(), v.clone())]);
+            let b = bound_of(&one, settings);
+            (
+                l.clone(),
+                json!({
+                    "n": v.len(),
+                    "point": b.as_ref().map(|b| b.point),
+                    "lower": b.as_ref().map(|b| b.lower),
+                    "upper": b.as_ref().map(|b| b.upper),
+                }),
+            )
+        })
+        .collect();
+    let report = json!({
+        "falseAlarmDeltaByLanguage": by_language,
+        "falseAlarmDelta": {"point": pooled.point, "lower": pooled.lower, "upper": pooled.upper},
+    });
+    (fa, pooled, report)
+}
+
 fn recall_groups(outcomes: &[Outcome], k: usize, keep: impl Fn(&Outcome) -> bool) -> metrics::Groups {
     metrics::group_by_language(outcomes, |o| metrics::is_scored_positive(o) && keep(o), |o| o.hit_at(k))
 }
@@ -1019,7 +1063,8 @@ fn report(args: &ReportArgs) -> Result<()> {
                 )
             };
             let cw = paired(metrics::confident_wrong);
-            let fa = paired(metrics::false_alarm_indicator);
+            let (fa, false_alarm_delta, false_alarm_report) =
+                false_alarm_deltas(&reference.outcomes, &ref_floors, &arm.outcomes, &floors, settings);
             let nan = Bound { point: f64::NAN, lower: f64::NAN, upper: f64::NAN };
             let recall_bound = bound_of(&recall, settings).context("no paired positives")?;
             let evidence = decision::QualityEvidence {
@@ -1030,7 +1075,7 @@ fn report(args: &ReportArgs) -> Result<()> {
                     .map(|(l, v)| (l.clone(), v.iter().sum::<f64>() / v.len() as f64))
                     .collect(),
                 confident_wrong_delta: bound_of(&cw, settings).unwrap_or(nan),
-                false_alarm_delta: bound_of(&fa, settings).unwrap_or(nan),
+                false_alarm_delta,
                 false_alarm_delta_by_language: fa
                     .iter()
                     .map(|(l, v)| (l.clone(), v.iter().sum::<f64>() / v.len() as f64))
@@ -1062,29 +1107,10 @@ fn report(args: &ReportArgs) -> Result<()> {
                 .map(|g| json!({"id": g.id, "passed": g.passed, "detail": g.detail}))
                 .collect::<Vec<_>>());
             entry["verdict"] = json!(format!("{verdict:?}"));
-            // Reported, not gated: each language's paired Q5 delta with its own
-            // bound, so the pooled gate can be read beside the per-language view.
-            entry["falseAlarmDeltaByLanguage"] = json!(fa
-                .iter()
-                .map(|(l, v)| {
-                    let one: metrics::Groups = BTreeMap::from([(l.clone(), v.clone())]);
-                    let b = bound_of(&one, settings);
-                    (
-                        l.clone(),
-                        json!({
-                            "n": v.len(),
-                            "point": b.as_ref().map(|b| b.point),
-                            "lower": b.as_ref().map(|b| b.lower),
-                            "upper": b.as_ref().map(|b| b.upper),
-                        }),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>());
-            entry["falseAlarmDelta"] = json!({
-                "point": evidence.false_alarm_delta.point,
-                "lower": evidence.false_alarm_delta.lower,
-                "upper": evidence.false_alarm_delta.upper,
-            });
+            // Reported, not gated: see `false_alarm_deltas`.
+            for key in ["falseAlarmDeltaByLanguage", "falseAlarmDelta"] {
+                entry[key] = false_alarm_report[key].clone();
+            }
             verdicts.push((arm.name.clone(), verdict));
         }
         arms_json.insert(arm.name.clone(), entry);
@@ -1314,5 +1340,81 @@ mod tests {
         assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
         assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
         assert_eq!(median(&[]), None);
+    }
+
+    /// Q5 report fields (`falseAlarmDelta`, `falseAlarmDeltaByLanguage`).
+    /// Floors 0.5 for both arms and languages; all queries held-out positives.
+    /// A rank-1 query is a false alarm (1) below the floor, else 0; a rank-2
+    /// query has no false-alarm value but is confident-wrong (1) above it.
+    ///   go   g1 R .7 -> C .4: fa +1      g2 R .7 -> C .7: fa 0
+    ///        g3 rank 2, R .4 -> C .7: cw +1, no fa
+    ///   rust r1..r3 R .4 -> C .7: fa -1 each
+    ///        r4 rank 2, R .7 -> C .4: cw -1, no fa
+    /// fa: go [1, 0] (n 2), rust [-1, -1, -1] (n 3).
+    /// go: point .5; a resample's mean is 0, .5 or 1 with p 1/4, 1/2, 1/4, so
+    ///   the 5th/95th percentiles are 0 and 1. rust: constant, all bounds -1.
+    /// pooled = mean of language means = (.5 + -1) / 2 = -.25; resamples are
+    ///   (m_go - 1) / 2 in {-.5, -.25, 0}, p 1/4 each at the ends: -.5 and 0.
+    /// Controls (each must fail this test):
+    /// (a) `metrics::false_alarm_indicator` -> `metrics::confident_wrong` in
+    ///     `false_alarm_deltas` (cw is go [0, 0, 1], rust [0, 0, 0, -1]).
+    /// (b) a wrong key: `l.clone()` -> `format!("{l}x")`, or keying each
+    ///     entry by the other language.
+    /// (c) the pooled bound from one language only
+    ///     (`bound_of(&BTreeMap::from([fa.first_key_value()...]))`), or each
+    ///     language's entry reporting `pooled` instead of its own `b`.
+    #[test]
+    fn false_alarm_report_gives_pooled_and_per_language_q5_bounds() {
+        let q = |id: &str, language: &str, rank: usize, score: f64| Outcome {
+            query_id: id.to_string(),
+            corpus: "c".to_string(),
+            language: language.to_string(),
+            positive: true,
+            mechanical: false,
+            overlap: false,
+            held_out: true,
+            first_expected_rank: Some(rank),
+            top_score: Some(score),
+            top_language: Some(language.to_string()),
+        };
+        let reference = vec![
+            q("g1", "go", 1, 0.7),
+            q("g2", "go", 1, 0.7),
+            q("g3", "go", 2, 0.4),
+            q("r1", "rust", 1, 0.4),
+            q("r2", "rust", 1, 0.4),
+            q("r3", "rust", 1, 0.4),
+            q("r4", "rust", 2, 0.7),
+        ];
+        let candidate = vec![
+            q("g1", "go", 1, 0.4),
+            q("g2", "go", 1, 0.7),
+            q("g3", "go", 2, 0.7),
+            q("r1", "rust", 1, 0.7),
+            q("r2", "rust", 1, 0.7),
+            q("r3", "rust", 1, 0.7),
+            q("r4", "rust", 2, 0.4),
+        ];
+        let floors: Floors = [("go".to_string(), 0.5), ("rust".to_string(), 0.5)].into();
+        let settings = config::Settings {
+            reference: "r".to_string(),
+            bootstrap_seed: 398,
+            bootstrap_resamples: 2000,
+            arm_seed: 1,
+        };
+        let (groups, pooled, report) =
+            false_alarm_deltas(&reference, &floors, &candidate, &floors, &settings);
+        let expected_groups: metrics::Groups =
+            [("go".to_string(), vec![1.0, 0.0]), ("rust".to_string(), vec![-1.0, -1.0, -1.0])].into();
+        assert_eq!(groups, expected_groups);
+        assert_eq!(pooled, Bound { point: -0.25, lower: -0.5, upper: 0.0 });
+        assert_eq!(report["falseAlarmDelta"], json!({"point": -0.25, "lower": -0.5, "upper": 0.0}));
+        assert_eq!(
+            report["falseAlarmDeltaByLanguage"],
+            json!({
+                "go": {"n": 2, "point": 0.5, "lower": 0.0, "upper": 1.0},
+                "rust": {"n": 3, "point": -1.0, "lower": -1.0, "upper": -1.0},
+            })
+        );
     }
 }
