@@ -368,6 +368,7 @@ mod tests {
             Capabilities {
                 semantic_pass: true,
                 semantic_sweep: false,
+                semantic_prepare: false,
                 receiver_calls: ReceiverCallResolution::Resolved,
                 receiver_calls_structural: ReceiverCallResolution::Unresolved,
             },

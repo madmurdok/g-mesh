@@ -201,6 +201,17 @@ pub(crate) fn run_with(
                      walks the language from scratch regardless"
                 );
             }
+            // The whole-project pass after the swap below is owed from here
+            // on; a plugin that asked to be told starts its engine while the
+            // language is re-walked.
+            if !supervisor.is_semantic_suspended() {
+                if let Err(err) = process.notify_prepare_semantic_pass() {
+                    eprintln!(
+                        "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
+                         - it starts its engine when the pass is asked instead"
+                    );
+                }
+            }
         }
         store
             .with(|conn| schema::mark_pending_reindex(conn, language, changed_file))
@@ -640,6 +651,98 @@ mod tests {
             "the plugin must actually have been asked for a semantic pass: {:?}",
             test_plugin::requests(&alpha_dir)
         );
+    }
+
+    /// A registry over one fake language `alpha` watching `go.mod`, installed
+    /// by `install` and then adjusted by `adjust` before discovery, and a
+    /// live index for its project.
+    fn one_language_registry(
+        install: impl FnOnce(&Path) -> PathBuf,
+        adjust: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PluginRegistry, IndexStore) {
+        let project = tempfile::tempdir().expect("failed to create a project root");
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let alpha_dir = install(plugins.path());
+        adjust(&alpha_dir);
+        let discovered =
+            discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
+        let state_dir = crate::storage::connection::project_dir(project.path())
+            .expect("failed to resolve the fixture project's state directory");
+        std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
+        let registry = PluginRegistry::new(
+            project.path(),
+            state_dir,
+            discovered,
+            None,
+            None,
+            Arc::new(EmbeddingPipeline::disabled()),
+        );
+        let conn = live_index(project.path());
+        (project, plugins, alpha_dir, registry, conn)
+    }
+
+    /// A plugin that declares `semantic_prepare` is told its pass is owed
+    /// right after `workspaceChanged`, before the re-walk and the pass that
+    /// follows it; one that does not is never sent the notification.
+    ///
+    /// Control: remove the `notify_prepare_semantic_pass` call from
+    /// `run_with` and the first half fails.
+    #[test]
+    fn a_workspace_reindex_tells_a_preparing_plugin_before_it_rewalks() {
+        let install = |root: &Path| {
+            test_plugin::install_with_workspace_semantic_pass_capable(
+                root,
+                "alpha",
+                &[".alpha-src"],
+                &["go.mod"],
+                &[],
+            )
+        };
+        let (_project, plugins, _alpha_dir, registry, conn) =
+            one_language_registry(install, test_plugin::declare_semantic_prepare);
+
+        registry.route_settled_path(&conn, "go.mod".to_string());
+
+        let frames = test_plugin::frames(plugins.path());
+        let at = |frame: &str| frames.iter().position(|line| line == frame);
+        let changed = at("alpha workspaceChanged").expect("workspaceChanged was sent");
+        let prepare = at("alpha prepareSemanticPass").unwrap_or_else(|| panic!("no prepare: {frames:?}"));
+        let pass = at("alpha semanticPass").unwrap_or_else(|| panic!("no pass: {frames:?}"));
+        assert!(changed < prepare && prepare < pass, "{frames:?}");
+
+        let (_project, plugins, _alpha_dir, registry, conn) = one_language_registry(install, |_| {});
+        registry.route_settled_path(&conn, "go.mod".to_string());
+        let frames = test_plugin::frames(plugins.path());
+        assert!(frames.iter().any(|line| line == "alpha semanticPass"), "{frames:?}");
+        assert!(
+            !frames.iter().any(|line| line.ends_with("prepareSemanticPass")),
+            "a plugin that did not declare semantic_prepare must never see it: {frames:?}"
+        );
+    }
+
+    /// `semantic_prepare` without `semantic_pass` means nothing: no pass is
+    /// owed, so the plugin is never told one is.
+    ///
+    /// Control: drop the `semantic_pass` half of the gate in
+    /// `PluginProcess::notify_prepare_semantic_pass` and this fails.
+    #[test]
+    fn semantic_prepare_without_semantic_pass_sends_nothing() {
+        let install = |root: &Path| {
+            test_plugin::install_with_workspace(root, "alpha", &[".alpha-src"], &["go.mod"], &[])
+        };
+        let adjust = |dir: &Path| {
+            let manifest_path = dir.join("plugin.toml");
+            let mut body = std::fs::read_to_string(&manifest_path).unwrap();
+            body.push_str("\n[plugin.capabilities]\nsemantic_prepare = true\n");
+            std::fs::write(&manifest_path, body).unwrap();
+        };
+        let (_project, plugins, _alpha_dir, registry, conn) = one_language_registry(install, adjust);
+
+        registry.route_settled_path(&conn, "go.mod".to_string());
+
+        let frames = test_plugin::frames(plugins.path());
+        assert!(frames.iter().any(|line| line == "alpha workspaceChanged"), "{frames:?}");
+        assert!(!frames.iter().any(|line| line.ends_with("prepareSemanticPass")), "{frames:?}");
     }
 
     /// A semantic pass that fails after a workspace reindex leaves its reason

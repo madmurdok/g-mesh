@@ -367,6 +367,21 @@ impl PluginSupervisor {
         Ok(true)
     }
 
+    /// Tells the plugin a whole-project pass is owed, so it can start its
+    /// engine before [`semantic_pass`](Self::semantic_pass) asks
+    /// (`PluginProcess::notify_prepare_semantic_pass`). Returns whether it was
+    /// told. Gated like `semantic_pass`: a suspended language, or a sleeping
+    /// plugin, is left alone.
+    pub fn prepare_semantic_pass(&self) -> Result<bool> {
+        if self.is_semantic_suspended() {
+            return Ok(false);
+        }
+        let inner = self.inner();
+        let Some(process) = inner.process.as_ref() else { return Ok(false) };
+        self.touch();
+        process.notify_prepare_semantic_pass()
+    }
+
     /// Runs `f` under this supervisor's serialization lock, the one every plugin
     /// round trip here takes. A workspace reindex must be atomic against a file
     /// change, or a `fileChanged` diff committed between its delete and its

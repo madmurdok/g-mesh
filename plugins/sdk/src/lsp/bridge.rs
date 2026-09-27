@@ -408,10 +408,9 @@ impl LspBridge {
     /// A bridge for the server `config` names, over `root`.
     ///
     /// Constructing one starts nothing: the server is spawned by the first
-    /// pass that has a question to ask, which is a stronger promise than the
-    /// lazy-engine contract requires (that one only forbids starting before
-    /// the first `semanticPass`) and costs nothing to keep - a pass over
-    /// files with no open sites has no reason to load a compiler.
+    /// pass that has a question to ask, or by [`SemanticEngine::prepare`]
+    /// when core says a whole-project pass is owed - never for structural
+    /// work, which is what the lazy-engine contract forbids.
     pub fn new(language: &str, root: &Path, config: SemanticConfig) -> Self {
         Self::with_budgets(language, root, config, Budgets::default())
     }
@@ -1502,6 +1501,18 @@ impl SemanticEngine for LspBridge {
         if let Some(client) = self.client.as_mut() {
             client.unsettle();
         }
+    }
+
+    /// A whole-project pass is owed: start the server now, so it indexes
+    /// while core is busy elsewhere. Through [`LspBridge::ensure_client`], so
+    /// the server is registered for `kill_live_servers`, counts against
+    /// `MAX_SERVER_STARTS` and a missing binary turns the tier off exactly as
+    /// a pass's start would. A running server is left as it is, settled or
+    /// not. Readiness stays the pass's question: what the server sends
+    /// meanwhile queues on the client's channel and is read by `wait_ready`.
+    fn prepare(&mut self) {
+        let deadline = Instant::now() + self.budgets.single_file;
+        self.ensure_client(deadline);
     }
 
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {

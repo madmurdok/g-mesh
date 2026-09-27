@@ -82,6 +82,13 @@
 //! `language_state` row), but that is a decision for whenever the memory
 //! cost is actually measured against a benefit, not assumed away today.
 //!
+//! The one overlap is a plugin whose manifest declares
+//! `capabilities.semantic_prepare`: it is told its pass is owed before the
+//! first pass of the run is asked ([`prepare_owed`]), so its engine loads
+//! while the languages sorted before it are answering. The passes stay
+//! sequential; holding that engine's memory alongside another language's
+//! pass is what declaring the capability opts into.
+//!
 //! # What `meta.bulkIndexedAt` still does not record
 //!
 //! That the pass ran. All three callers record the marker *before* asking for
@@ -317,6 +324,8 @@ pub fn run_with_registry_and_progress(
         }
     };
 
+    prepare_owed(registry, &owed);
+
     if let Some(progress) = progress {
         progress.start_semantic_progress(u32::try_from(owed.len()).unwrap_or(u32::MAX));
     }
@@ -345,6 +354,28 @@ pub fn run_with_registry_and_progress(
 
     reconcile_rollup(conn, &capable);
     run
+}
+
+/// Tells every language in `owed` whose manifest declares `semantic_prepare`
+/// that its pass is coming, spawning its plugin if nothing has yet, before
+/// the first pass of the run is asked. The passes themselves stay
+/// sequential; what overlaps them is only a slow engine's start-up (a cold
+/// `rust-analyzer` needs tens of seconds to become ready), which would
+/// otherwise wait for every language sorted before it.
+///
+/// Best-effort: a spawn or a write that fails here is logged, and the pass
+/// that follows tries the same spawn again and records its own failure.
+fn prepare_owed(registry: &PluginRegistry, owed: &[String]) {
+    for language in owed.iter().filter(|language| registry.wants_semantic_prepare(language)) {
+        let prepared =
+            registry.get_or_spawn(language).and_then(|supervisor| supervisor.prepare_semantic_pass());
+        if let Err(err) = prepared {
+            eprintln!(
+                "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
+                 it starts its engine when the pass is asked instead"
+            );
+        }
+    }
 }
 
 /// Runs the whole-project pass for every currently-owed language for a
@@ -554,11 +585,35 @@ mod tests {
         second_capable: bool,
         second_stalling: bool,
     ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
+        two_language_registry_adjusted(
+            first,
+            first_capable,
+            first_stalling,
+            second,
+            second_capable,
+            second_stalling,
+            |_, _| {},
+        )
+    }
+
+    /// [`two_language_registry`], calling `adjust` with both plugin
+    /// directories before discovery - where a test edits a manifest.
+    #[allow(clippy::too_many_arguments)]
+    fn two_language_registry_adjusted(
+        first: &str,
+        first_capable: bool,
+        first_stalling: bool,
+        second: &str,
+        second_capable: bool,
+        second_stalling: bool,
+        adjust: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
         let first_dir = install_language(plugins.path(), first, first_capable, first_stalling);
         let second_dir = install_language(plugins.path(), second, second_capable, second_stalling);
+        adjust(&first_dir, &second_dir);
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifests must discover cleanly");
@@ -650,6 +705,68 @@ mod tests {
             "a plugin with no semantic_pass capability must never receive the request: \
              {incapable_requests:?}"
         );
+    }
+
+    /// An owed language whose manifest declares `semantic_prepare` is told
+    /// before the *first* pass of the run - here before `alpha`'s, which is
+    /// sorted ahead of it - and its own pass still runs and completes.
+    ///
+    /// Control: remove the `prepare_owed` call from
+    /// `run_with_registry_and_progress` and the ordering assertion fails.
+    #[test]
+    fn an_owed_preparing_language_is_told_before_the_first_pass_of_the_run() {
+        let (_project, plugins, _alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry_adjusted("alpha", true, false, "beta", true, false, |_, beta| {
+                test_plugin::declare_semantic_prepare(beta)
+            });
+
+        let run = run_with_registry(&registry, &conn);
+        assert_eq!(run.completed, vec!["alpha".to_string(), "beta".to_string()], "{:?}", run.failed);
+
+        let frames = test_plugin::frames(plugins.path());
+        assert_eq!(
+            frames,
+            vec!["beta prepareSemanticPass", "alpha semanticPass", "beta semanticPass"],
+            "beta is told before alpha is asked, and nothing else changes"
+        );
+    }
+
+    /// A language whose pass already landed is not owed one, so a manifest
+    /// that declares `semantic_prepare` gets no notification - and no process.
+    ///
+    /// Control: hand `prepare_owed` every capable language instead of the
+    /// owed ones and `beta` is spawned and told.
+    #[test]
+    fn a_language_not_owed_a_pass_is_not_told_or_spawned() {
+        let (_project, plugins, _alpha_dir, beta_dir, conn, registry) =
+            two_language_registry_adjusted("alpha", true, false, "beta", true, false, |_, beta| {
+                test_plugin::declare_semantic_prepare(beta)
+            });
+        conn.with(|guard| schema::record_language_semantic_pass(guard, "beta")).unwrap();
+
+        let run = run_with_registry(&registry, &conn);
+        assert_eq!(run.completed, vec!["alpha".to_string()]);
+        assert!(test_plugin::spawns(&beta_dir).is_empty(), "nothing owed, nothing spawned");
+        assert_eq!(test_plugin::frames(plugins.path()), vec!["alpha semanticPass"]);
+    }
+
+    /// A sleeping plugin is not woken to be told: the pass that follows
+    /// finds it asleep too and records why, exactly as without the notice.
+    #[test]
+    fn a_sleeping_preparing_plugin_is_not_woken_to_be_told() {
+        let (_project, plugins, alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry_adjusted("alpha", true, false, "beta", false, false, |alpha, _| {
+                test_plugin::declare_semantic_prepare(alpha)
+            });
+        registry
+            .get_or_spawn("alpha")
+            .expect("the fixture plugin spawns")
+            .sleep_now("the test put it to sleep");
+
+        let run = run_with_registry(&registry, &conn);
+        assert!(run.completed.is_empty(), "{:?}", run.completed);
+        assert_eq!(test_plugin::spawns(&alpha_dir).len(), 1, "never woken");
+        assert!(test_plugin::frames(plugins.path()).is_empty(), "{:?}", test_plugin::frames(plugins.path()));
     }
 
     /// Each capable, present language gets its own `language_state.

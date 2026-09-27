@@ -398,6 +398,9 @@ semantic_pass = true
 # true: a complete whole-project pass re-sends every semantic edge it stands behind,
 # so core deletes this language's semantic edges it did not re-send. Default false.
 semantic_sweep = true
+# true: core sends prepareSemanticPass before an owed whole-project pass, so a slow
+# engine can start while core walks and asks other languages. Default false.
+semantic_prepare = false
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"
@@ -487,12 +490,19 @@ pub struct WireEdge {
 }
 ```
 
-The control messages are unchanged apart from one addition. `fileChanged` and
+The control messages are unchanged apart from two additions. `fileChanged` and
 `semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff.
 
 - **New:** `workspaceChanged { filePath }`, a notification. It exists so a plugin
   can drop cached module or crate maps. Core follows it with the per-language
   reindex, so the plugin does not have to answer with a diff.
+- **New:** `prepareSemanticPass`, a notification with no params. Core sends it
+  when a whole-project `semanticPass` is owed (after the cold walk, on an owed
+  retry, and right after `workspaceChanged`), before asking for the pass, and
+  only to a plugin declaring both `semantic_pass` and `semantic_prepare` whose
+  semantic tier is not suspended. The SDK starts the engine on it; readiness is
+  still decided inside the pass. Measurements and the choice of trigger:
+  [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
 
 ### Process lifetime: stdin is the lifeline (GM-397)
 

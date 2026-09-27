@@ -101,6 +101,13 @@ const REQUEST_LOG: &str = "requests.log";
 /// only [`notifications`] can answer.
 const NOTIFICATION_LOG: &str = "notifications.log";
 
+/// The file, in the directory *above* each plugin directory, that every fake
+/// plugin under it appends `"<language> <method>"` to for every framed message
+/// it receives, request or notification. One file shared by all of them, so a
+/// test can assert the order in which core sent messages to different
+/// plugins ([`frames`]).
+const FRAME_LOG: &str = "frames.log";
+
 /// Marks that a [`install_stalling`] plugin directory's *very first* framed
 /// request has already been (deliberately) left unanswered - see that
 /// function's doc comment. Written by the process that hits it, and read by
@@ -371,6 +378,24 @@ pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
     log.lines().map(str::to_string).collect()
 }
 
+/// Every framed message any fake plugin installed under `plugins_root` has
+/// received, oldest first, as `"<language> <method>"` - see [`FRAME_LOG`].
+pub(crate) fn frames(plugins_root: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugins_root.join(FRAME_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Adds `semantic_prepare = true` to a semantic-pass-capable plugin's
+/// `[plugin.capabilities]`. Takes effect at the next `discover`.
+pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest prepares");
+    let prepared =
+        manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_prepare = true\n");
+    fs::write(&path, prepared).expect("failed to write the fake plugin's manifest");
+}
+
 /// Just the `fileChanged` requests among [`requests`], as the file path each
 /// one named - i.e. one entry per real `PluginSupervisor::file_changed` ->
 /// `apply_file_change` round trip, the granularity task 129's debounce test
@@ -601,6 +626,7 @@ process.stdin.on("data", (chunk) => {{
     if (buffered.length < bodyEnd) return;
     const request = JSON.parse(buffered.slice(bodyStart, bodyEnd).toString("utf8"));
     buffered = buffered.slice(bodyEnd);
+    fs.appendFileSync(path.join(__dirname, "..", "{FRAME_LOG}"), "{language} " + request.method + "\n");
     if (request.id !== undefined && request.id !== null) {{
       const filePath = (request.params && request.params.filePath) || "";
       fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
