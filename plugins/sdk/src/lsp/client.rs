@@ -116,7 +116,7 @@ static LIVE_SERVERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
 /// control-plane reader's lifeline path, which ends the process while the main
 /// thread may be deep in a request holding the clients - so the kill goes
 /// through the shared `Child` handles rather than through `LspClient`.
-pub(crate) fn kill_live_servers() {
+pub fn kill_live_servers() {
     let servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for server in servers.iter().filter_map(Weak::upgrade) {
         let mut child = lock(&server);

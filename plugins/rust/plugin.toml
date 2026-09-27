@@ -58,6 +58,12 @@ semantic_pass = true
 # behind, so core may delete this language's semantic edges one did not
 # re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
 semantic_sweep = true
+# Core sends `prepareSemanticPass` when a whole-project pass is owed, before
+# asking for it, and the SDK starts rust-analyzer then: it needs ~20s to
+# become ready, and core asks rust only after the walk and the languages
+# sorted before it. Never sent for structural work, so the lazy-engine check
+# above still holds.
+semantic_prepare = true
 # Receiver calls (`x.m()`) are an open site the structural tier answers with
 # nothing and the semantic tier answers exactly - so the two fields differ,
 # which is the shape `core::mcp::instructions` reads to decide how long to

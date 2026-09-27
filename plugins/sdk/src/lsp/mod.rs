@@ -87,4 +87,7 @@ mod position;
 pub use bridge::{Budgets, LspBridge};
 pub use config::{SemanticConfig, ServerReadiness};
 
-pub(crate) use client::kill_live_servers;
+/// Public only so an integration test can take the lifeline's path; a
+/// plugin never calls it (`run`'s control-stream reader does).
+#[doc(hidden)]
+pub use client::kill_live_servers;

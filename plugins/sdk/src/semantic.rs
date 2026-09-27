@@ -25,7 +25,8 @@
 //! plugin's `main` spawning rust-analyzer, and by the time `run` is called
 //! the engine is already running. The argument is therefore a
 //! [`SemanticEngineFactory`] - a `FnOnce` the SDK calls at the moment the
-//! first `semanticPass` arrives, and never before. A plugin author can still
+//! first `semanticPass` arrives, or the `prepareSemanticPass` core sends when
+//! one is owed, and never before. A plugin author can still
 //! do the wrong thing (start a server in `main` and have the closure capture
 //! it), but they have to mean it, and the conformance kit will say so.
 //!
@@ -160,10 +161,21 @@ pub trait SemanticEngine: Send {
     /// The default does nothing. [`crate::lsp::LspBridge`] uses it to make
     /// the next pass wait for its server to finish reloading (GM-433).
     fn workspace_changed(&mut self) {}
+
+    /// Core sent `prepareSemanticPass`: a whole-project pass is owed and will
+    /// be asked for. An engine that is slow to become usable may start that
+    /// work now; readiness is still its own business inside
+    /// [`answer`](Self::answer). Called only after the engine has been
+    /// constructed, and never for structural work.
+    ///
+    /// The default does nothing. [`crate::lsp::LspBridge`] starts its
+    /// language server.
+    fn prepare(&mut self) {}
 }
 
 /// Builds the semantic engine, called at most once and only on the first
-/// `semanticPass` - see this module's doc for why this is a factory.
+/// `semanticPass` or `prepareSemanticPass` - see this module's doc for why
+/// this is a factory.
 ///
 /// The argument is the project root, absolute, exactly as
 /// [`Extractor::load_project`](crate::Extractor::load_project) is given it.
@@ -218,28 +230,10 @@ impl LazyEngine {
     /// - **The engine returned `Err`** - it produced nothing usable. Empty
     ///   diff, incomplete.
     pub(crate) fn answer(&mut self, files: &[RelPath], index: &SdkIndex, root: &Path) -> SemanticAnswer {
-        if self.engine.is_none() && !self.failed {
-            let Some(factory) = self.factory.take() else {
-                return SemanticAnswer::complete(FileChangeDiff::default());
-            };
-            // Before the factory runs, not after: the marker records the
-            // *attempt* to start. A factory that spawns a server and then
-            // fails its handshake has still started a process, and a marker
-            // written only on success would hide exactly that.
-            write_semantic_engine_marker(&self.language);
-            match factory(root) {
-                Ok(engine) => self.engine = Some(engine),
-                Err(err) => {
-                    self.failed = true;
-                    self.start_failure = Some(format!("the semantic engine could not be started: {err:#}"));
-                    eprintln!(
-                        "[{}] the semantic engine could not be started ({err:#}) - answering structurally \
-                         only for the rest of this process's life",
-                        self.language
-                    );
-                }
-            }
+        if self.engine.is_none() && !self.failed && self.factory.is_none() {
+            return SemanticAnswer::complete(FileChangeDiff::default());
         }
+        self.start(root);
 
         let Some(engine) = self.engine.as_mut() else {
             let reason = self
@@ -263,9 +257,47 @@ impl LazyEngine {
         }
     }
 
+    /// Runs the factory if nothing has run it yet. A no-op once the engine
+    /// exists, once a start has failed, and for a plugin with no factory.
+    fn start(&mut self, root: &Path) {
+        if self.engine.is_some() || self.failed {
+            return;
+        }
+        let Some(factory) = self.factory.take() else { return };
+        // Before the factory runs, not after: the marker records the
+        // *attempt* to start. A factory that spawns a server and then fails
+        // its handshake has still started a process, and a marker written
+        // only on success would hide exactly that.
+        write_semantic_engine_marker(&self.language);
+        match factory(root) {
+            Ok(engine) => self.engine = Some(engine),
+            Err(err) => {
+                self.failed = true;
+                self.start_failure = Some(format!("the semantic engine could not be started: {err:#}"));
+                eprintln!(
+                    "[{}] the semantic engine could not be started ({err:#}) - answering structurally only \
+                     for the rest of this process's life",
+                    self.language
+                );
+            }
+        }
+    }
+
+    /// Answers a `prepareSemanticPass`: starts the engine as the first
+    /// `semanticPass` would, and lets it begin whatever it needs before it
+    /// can answer ([`SemanticEngine::prepare`]). Core sends it only when a
+    /// whole-project pass is owed, so the lazy-engine contract holds: the
+    /// engine still starts only for a semantic question that is coming.
+    pub(crate) fn prepare(&mut self, root: &Path) {
+        self.start(root);
+        if let Some(engine) = self.engine.as_mut() {
+            engine.prepare();
+        }
+    }
+
     /// Passes a `workspaceChanged` on to the engine, if one has started - see
     /// [`SemanticEngine::workspace_changed`]. Never starts one: that stays
-    /// the first `semanticPass`'s job.
+    /// the job of the first `semanticPass` or `prepareSemanticPass`.
     pub(crate) fn workspace_changed(&mut self) {
         if let Some(engine) = self.engine.as_mut() {
             engine.workspace_changed();
@@ -402,6 +434,78 @@ mod tests {
         lazy.answer(&[], &SdkIndex::new(), root());
         lazy.workspace_changed();
         assert_eq!(changes.load(Ordering::SeqCst), 1, "a started engine is told about the change");
+    }
+
+    struct Preparing {
+        prepared: Arc<AtomicUsize>,
+        answers: Arc<AtomicUsize>,
+    }
+
+    impl SemanticEngine for Preparing {
+        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> Result<SemanticAnswer> {
+            self.answers.fetch_add(1, Ordering::SeqCst);
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+
+        fn prepare(&mut self) {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `prepare` starts the engine the first pass would have started, and
+    /// the pass then uses that engine rather than starting a second.
+    ///
+    /// Control: make `LazyEngine::prepare` a no-op (or skip
+    /// `engine.prepare()`) and the counts after `prepare` fail.
+    #[test]
+    fn prepare_starts_the_engine_once_and_the_pass_reuses_it() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let answers = Arc::new(AtomicUsize::new(0));
+        let (started, told, answered) = (Arc::clone(&starts), Arc::clone(&prepared), Arc::clone(&answers));
+        let mut lazy = LazyEngine::new(
+            "toy",
+            Some(Box::new(move |_root| {
+                started.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Preparing { prepared: Arc::clone(&told), answers: Arc::clone(&answered) })
+                    as Box<dyn SemanticEngine>)
+            })),
+        );
+
+        lazy.prepare(root());
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "prepare starts the engine");
+        assert_eq!(prepared.load(Ordering::SeqCst), 1, "and tells it to prepare");
+        assert_eq!(answers.load(Ordering::SeqCst), 0, "without answering anything");
+
+        let answer = lazy.answer(&[], &SdkIndex::new(), root());
+        assert!(answer.complete);
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "the pass reuses the prepared engine");
+        assert_eq!(answers.load(Ordering::SeqCst), 1);
+    }
+
+    /// With no factory, or one that fails, `prepare` changes nothing about
+    /// what the pass reports.
+    #[test]
+    fn prepare_without_a_working_engine_leaves_the_pass_as_it_was() {
+        let mut none = LazyEngine::new("toy", None);
+        none.prepare(root());
+        assert!(!none.started());
+        assert!(none.answer(&[], &SdkIndex::new(), root()).complete);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::clone(&attempts);
+        let mut failing = LazyEngine::new(
+            "toy",
+            Some(Box::new(move |_root| {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("no language server on PATH")
+            })),
+        );
+        failing.prepare(root());
+        let answer = failing.answer(&[], &SdkIndex::new(), root());
+        assert!(!answer.complete);
+        assert!(answer.reason.unwrap().contains("no language server on PATH"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "a failed start is not retried by the pass");
     }
 
     /// The factory is handed the project root, so an engine that needs one

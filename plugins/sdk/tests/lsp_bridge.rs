@@ -1852,3 +1852,82 @@ fn a_question_modified_twice_is_refused_rather_than_asked_forever() {
     assert!(reason(&answer).contains("content modified"), "{}", reason(&answer));
     assert_eq!(asked(&log, "textDocument/definition"), 2, "asked twice, not more");
 }
+
+/// `prepare` (core's `prepareSemanticPass`) starts the server before any
+/// pass is asked, the pass then uses that server instead of a second one,
+/// and the pass answers exactly what a pass on an unprepared bridge answers.
+/// Without `prepare`, constructing the bridge starts nothing.
+///
+/// Control: make `LspBridge::prepare` a no-op (the trait default) and the
+/// "started before the pass" assertion fails.
+#[test]
+fn a_prepared_server_starts_before_the_pass_and_answers_the_same() {
+    let scratch = Scratch::new("prepare");
+    let (index, _) = fixture(&scratch);
+    let script = |log: &Path| {
+        json!({
+            "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 0 },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "log": log.to_string_lossy(),
+        })
+    };
+
+    let unprepared_log = scratch.path().join("unprepared.log");
+    let mut unprepared =
+        LspBridge::with_budgets("toy", scratch.path(), scratch.server(script(&unprepared_log)), budgets());
+    assert_eq!(asked(&unprepared_log, "initialize"), 0, "constructing a bridge starts no server");
+    let baseline = pass(&mut unprepared, &index);
+    drop(unprepared);
+
+    let prepared_log = scratch.path().join("prepared.log");
+    let mut prepared =
+        LspBridge::with_budgets("toy", scratch.path(), scratch.server(script(&prepared_log)), budgets());
+    prepared.prepare();
+    assert_eq!(asked(&prepared_log, "initialize"), 1, "prepare starts and initializes the server");
+    assert_eq!(asked(&prepared_log, "textDocument/definition"), 0, "and asks it nothing yet");
+
+    let answer = pass(&mut prepared, &index);
+    assert_eq!(asked(&prepared_log, "initialize"), 1, "the pass uses the prepared server");
+    assert!(answer.complete && baseline.complete);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert_eq!(answer.diff, baseline.diff, "preparing changes when the server starts, not what it answers");
+}
+
+/// A server started by `prepare` is still made to prove its readiness inside
+/// the pass: one that indexes, answering `null` meanwhile, is waited for.
+///
+/// Control: have `prepare` mark the client settled (or skip `wait_ready` for
+/// a prepared server) and the pass asks during indexing and finds no edge.
+#[test]
+fn a_prepared_server_is_still_waited_for_by_the_pass() {
+    let scratch = Scratch::new("prepare-ready");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 600 },
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    bridge.prepare();
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "asked only once the server had finished indexing");
+}
+
+/// A missing server binary found by `prepare` turns the tier off exactly as
+/// a pass's own start would: the pass reports it, starting nothing.
+#[test]
+fn a_missing_server_found_by_prepare_is_reported_by_the_pass() {
+    let scratch = Scratch::new("prepare-missing");
+    let (index, _) = fixture(&scratch);
+    let config = SemanticConfig::new(scratch.path().join("there-is-no-such-server"));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    bridge.prepare();
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("could not be started"), "{}", reason(&answer));
+}

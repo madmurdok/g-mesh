@@ -133,6 +133,14 @@ pub struct Capabilities {
     /// pass that stops part-way without saying so would lose every edge it
     /// did not reach.
     pub semantic_sweep: bool,
+    /// Whether core may tell this plugin, with a `prepareSemanticPass`
+    /// notification, that a whole-project pass is owed before it asks for
+    /// one - so a plugin whose engine is slow to become ready can start it
+    /// while core is still walking and asking other languages.
+    /// Meaningless without `semantic_pass`. `false` (the default): the
+    /// notification is never sent, so a plugin that does not know it never
+    /// sees it.
+    pub semantic_prepare: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
     /// type, never its run-time type (`mcp::instructions`' `P4_STATIC_RECEIVER`

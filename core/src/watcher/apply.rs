@@ -463,6 +463,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::Status => "status",
         ControlMessage::SemanticPass { .. } => "semanticPass",
         ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
+        ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
     }
 }
 

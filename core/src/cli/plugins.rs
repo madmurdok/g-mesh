@@ -569,6 +569,7 @@ extensions = [".{language}"]
                 capabilities: Capabilities {
                     semantic_pass: true,
                     semantic_sweep: false,
+                    semantic_prepare: false,
                     receiver_calls: manifest::ReceiverCallResolution::Resolved,
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
                 },
