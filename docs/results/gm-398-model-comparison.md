@@ -240,3 +240,27 @@ Deltas are in points, except MRR.
   - snowflake: `579c1f1778a0993e…`
 - **Runs**: `eval/embedding/work/runs/<variant>/<corpus>/`, git-ignored and
   kept for S15.
+
+## Remaining options
+
+Cost/quality levers other than swapping the model, checked against the
+tracker before filing anything new:
+
+- **Skip embedding noise** (generated files, trivial nodes): no existing
+  task — filed as GM-437, depends on this eval.
+- **Batching by similar length** (this eval used batch size one): no
+  existing task — filed as GM-438, depends on this eval.
+- **Execution providers** (CoreML/DirectML/CUDA instead of CPU): no
+  existing task — filed as GM-439, depends on this eval.
+- **Background priority / fewer intra-op threads**: no existing task —
+  filed as GM-440, depends on this eval.
+- **Lazy or prioritised embedding** (defer or rank nodes instead of a full
+  eager pass): no existing task — filed as GM-441, depends on this eval.
+- **CodeRankEmbed**: not tried, and not filed as a follow-up — the owner
+  has not approved an ONNX export for it (see Method, above), so there is
+  nothing to run yet. Revisit once one exists.
+- **Int8 quantization and shorter input** are already covered: GM-422 and
+  GM-423, filed before this eval and unblocked by it.
+- Adapter/fine-tuning research is out of scope here and moves to GM-436;
+  the similarity-floor false-alarm issue (jina int8's Q5 failure, above) is
+  tracked as GM-434.
