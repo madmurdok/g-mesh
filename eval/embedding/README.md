@@ -17,6 +17,8 @@ The engine is the hidden `g-mesh debug-embed-eval` command
 | `export_mechanical.py` | writes `queries/mechanical/` from the snapshots |
 | `make_snapshot.sh` | indexes a pinned checkout with the model off and records the snapshot |
 | `fetch_models.py` | downloads candidate models at their pinned revisions |
+| `measure_costs.sh` | one script: candidate quality runs, query latency, D11 timed passes, report (GM-398 S14) |
+| `measure_summary.py` | writes `costs.toml` and the summary tables for `measure_costs.sh` |
 | `work/` | git-ignored: checkouts, snapshots, models, runs |
 
 ## Target sampling frame

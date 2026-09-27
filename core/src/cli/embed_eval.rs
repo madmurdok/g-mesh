@@ -1062,6 +1062,29 @@ fn report(args: &ReportArgs) -> Result<()> {
                 .map(|g| json!({"id": g.id, "passed": g.passed, "detail": g.detail}))
                 .collect::<Vec<_>>());
             entry["verdict"] = json!(format!("{verdict:?}"));
+            // Reported, not gated: each language's paired Q5 delta with its own
+            // bound, so the pooled gate can be read beside the per-language view.
+            entry["falseAlarmDeltaByLanguage"] = json!(fa
+                .iter()
+                .map(|(l, v)| {
+                    let one: metrics::Groups = BTreeMap::from([(l.clone(), v.clone())]);
+                    let b = bound_of(&one, settings);
+                    (
+                        l.clone(),
+                        json!({
+                            "n": v.len(),
+                            "point": b.as_ref().map(|b| b.point),
+                            "lower": b.as_ref().map(|b| b.lower),
+                            "upper": b.as_ref().map(|b| b.upper),
+                        }),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>());
+            entry["falseAlarmDelta"] = json!({
+                "point": evidence.false_alarm_delta.point,
+                "lower": evidence.false_alarm_delta.lower,
+                "upper": evidence.false_alarm_delta.upper,
+            });
             verdicts.push((arm.name.clone(), verdict));
         }
         arms_json.insert(arm.name.clone(), entry);
