@@ -419,14 +419,16 @@ mod tests {
 
     /// 100 scores 0.01..1.00: 3% may fall below, so the floor is the 4th
     /// smallest, 0.04. Control: `k` computed as `ceil`, or taking `s[k-1]`,
-    /// or rounding to nearest instead of down, each fails one assertion.
+    /// or rounding to nearest instead of down (`.round()` in place of
+    /// `.floor()` in `round_down_2`), each fails one assertion: 0.5968 is
+    /// 0.59 rounded down and 0.60 rounded to nearest.
     #[test]
     fn the_floor_is_the_largest_value_keeping_false_alarms_at_three_percent() {
         let scores: Vec<f64> = (1..=100).map(|i| i as f64 / 100.0).collect();
         assert_eq!(fit_floor(&scores, 0.03), Some(0.04));
 
-        // 0.5948 must round down to 0.59, not to 0.60.
-        let mut scores = vec![0.5948; 10];
+        // 0.5968 must round down to 0.59, not to nearest (0.60).
+        let mut scores = vec![0.5968; 10];
         scores.extend(vec![0.9; 90]);
         assert_eq!(fit_floor(&scores, 0.03), Some(0.59));
 
@@ -541,20 +543,29 @@ mod tests {
         assert_eq!(bootstrap(&noisy, 2000, 9).unwrap(), b);
     }
 
-    /// Control: computing `reference - candidate` flips the sign; skipping
-    /// the query-set check lets an unpaired comparison through.
+    /// The deltas are asymmetric (-1 then 0, in reference order), so the sign
+    /// matters. Control: computing `reference - candidate` (`rv - cv`) gives
+    /// `[1.0, -0.0]` and fails the first assertion. Control: removing the
+    /// `by_id.len() != reference.len()` check lets a candidate with an extra
+    /// query through (every reference id is still found) and fails the
+    /// `superset` assertion; its message is asserted too, so the later
+    /// "missing from the candidate arm" error cannot stand in for it.
     #[test]
     fn paired_deltas_are_candidate_minus_reference_and_require_the_same_queries() {
-        let reference = vec![outcome("a", "go", Some(1), None), outcome("b", "go", None, None)];
+        let hit = |o: &Outcome| Some(o.hit_at(10));
+        let reference = vec![outcome("a", "go", Some(1), None), outcome("b", "go", Some(3), None)];
         let candidate = vec![outcome("b", "go", Some(2), None), outcome("a", "go", Some(30), None)];
-        let deltas =
-            paired_deltas(&reference, &candidate, is_scored_positive, |o| Some(o.hit_at(10))).unwrap();
-        let mut got = deltas["go"].clone();
-        got.sort_by(f64::total_cmp);
-        assert_eq!(got, vec![-1.0, 1.0]);
+        let deltas = paired_deltas(&reference, &candidate, is_scored_positive, hit).unwrap();
+        assert_eq!(deltas["go"], vec![-1.0, 0.0]);
+
+        let mut superset = candidate.clone();
+        superset.push(outcome("c", "go", Some(1), None));
+        let err = paired_deltas(&reference, &superset, is_scored_positive, hit).unwrap_err();
+        assert!(err.to_string().contains("scored different query sets"), "{err}");
 
         let short = vec![outcome("a", "go", Some(1), None)];
-        assert!(paired_deltas(&reference, &short, is_scored_positive, |o| Some(o.hit_at(10))).is_err());
+        let err = paired_deltas(&reference, &short, is_scored_positive, hit).unwrap_err();
+        assert!(err.to_string().contains("scored different query sets"), "{err}");
     }
 
     #[test]
@@ -574,8 +585,10 @@ mod tests {
         assert_eq!(discordance(&reference, &candidate, 10), Some(0.5));
     }
 
-    /// Each of the three D7 conditions can fail on its own. Control:
-    /// dropping any one condition from `passes` lets its case through.
+    /// Each of the three D7 conditions fails on its own while the other two
+    /// hold. Control: dropping any one condition from `passes` lets its case
+    /// through (the gap: `gap_only_fails`, 16 points at ratio 0.2; the
+    /// ratio: `ratio_too_high`; the bounds: `overlapping`).
     #[test]
     fn a_broken_arm_must_be_lower_by_gap_ratio_and_bounds() {
         let reference = Bound { point: 0.60, lower: 0.55, upper: 0.65 };
@@ -584,6 +597,14 @@ mod tests {
 
         let small_gap = Bound { point: 0.45, lower: 0.40, upper: 0.50 };
         assert!(!broken_arm_check(reference, small_gap).passes);
+
+        let small_reference = Bound { point: 0.20, lower: 0.17, upper: 0.23 };
+        let gap_only_fails = Bound { point: 0.04, lower: 0.02, upper: 0.06 };
+        let check = broken_arm_check(small_reference, gap_only_fails);
+        assert!(
+            check.gap_points < 20.0 && check.ratio <= 0.25 && check.bounds_separate && !check.passes,
+            "{check:?}"
+        );
 
         let low_reference = Bound { point: 0.30, lower: 0.26, upper: 0.34 };
         let ratio_too_high = Bound { point: 0.09, lower: 0.07, upper: 0.10 };

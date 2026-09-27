@@ -1233,13 +1233,25 @@ mod tests {
     use super::*;
 
     /// Ties go to the lower candidate index (node id ascending), as
-    /// `search_code`'s `ORDER BY score DESC, id ASC`. Control: dropping the
-    /// `.then(a.cmp(&b))` tie-break with an unstable sort can reorder the
-    /// tied pair; ranking ascending fails the first element.
+    /// `search_code`'s `ORDER BY score DESC, id ASC`. Control: ranking
+    /// ascending fails the small case. Control: dropping the
+    /// `.then(a.cmp(&b))` tie-break AND switching to `sort_unstable_by`
+    /// fails the large case: 600 candidates over three interleaved scores
+    /// is past the length where std's unstable sort stops using insertion
+    /// sort, and its partitioning reorders equal keys (std's unstable sort
+    /// is deterministic, so this is reproducible for a given toolchain).
+    /// Dropping only the tie-break is not observable: a stable sort of
+    /// `0..n` already keeps ties in index order.
     #[test]
     fn top_hits_rank_by_score_then_candidate_order() {
         let scores = [0.2, 0.9, 0.5, 0.9, 0.1];
         assert_eq!(top_hits(&scores), vec![1, 3, 2, 0, 4]);
+
+        let scores: Vec<f64> = (0..600).map(|i| ((i * 7) % 3) as f64).collect();
+        let mut expected: Vec<usize> = (0..600).filter(|&i| scores[i] == 2.0).collect();
+        expected.extend((0..600).filter(|&i| scores[i] == 1.0));
+        expected.truncate(KEPT_HITS);
+        assert_eq!(top_hits(&scores), expected);
     }
 
     #[test]

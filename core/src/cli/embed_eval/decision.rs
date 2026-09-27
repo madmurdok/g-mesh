@@ -221,10 +221,23 @@ mod tests {
     }
 
     /// Each boundary sits exactly on its D9 threshold and passes; a hair
-    /// beyond it fails. Control: flipping any comparison (>= to >, or the
-    /// sign of a threshold) fails one of these.
+    /// beyond it fails. The comparisons carry an `EPS` tolerance, so a value
+    /// of exactly -0.02 passes under `>` too; the second block therefore
+    /// sits each value on the computed threshold itself (`-0.02 - EPS`,
+    /// `EPS`, ...), where only the inclusive comparison passes. Control:
+    /// turning any Q1-Q5 `>=` into `>` (or `<=` into `<`) fails that block;
+    /// flipping the sign of a threshold fails one of the others.
     #[test]
     fn cost_candidate_quality_gates_hold_at_their_thresholds() {
+        let mut on_eps = evidence();
+        on_eps.recall10_delta = bound(-0.02 - EPS, -0.05 - EPS, 0.0);
+        on_eps.mrr_delta = bound(-0.02 - EPS, -0.05 - EPS, 0.0);
+        on_eps.recall10_delta_by_language.insert("python".into(), -0.10 - EPS);
+        on_eps.confident_wrong_delta = bound(EPS, -0.02, 0.05 + EPS);
+        on_eps.false_alarm_delta = bound(EPS, -0.02, 0.05 + EPS);
+        let gates = quality_gates(Role::Cost, &on_eps);
+        assert!(gates.iter().all(|g| g.passed), "{gates:?}");
+
         let mut e = evidence();
         e.recall10_delta = bound(-0.02, -0.05, 0.0);
         e.mrr_delta = bound(-0.02, -0.05, 0.0);
