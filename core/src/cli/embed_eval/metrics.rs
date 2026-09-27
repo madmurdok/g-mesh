@@ -163,20 +163,48 @@ impl Rate {
 pub fn false_alarm(outcomes: &[Outcome], floors: &Floors, language: Option<&str>) -> Rate {
     let mut rate = Rate { events: 0, total: 0 };
     for o in outcomes {
-        if !(is_scored_positive(o) && o.held_out && o.top_is_expected()) {
-            continue;
-        }
         if language.is_some_and(|l| l != o.language) {
             continue;
         }
-        if let Some(clears) = o.top_clears_floor(floors) {
+        if let Some(v) = false_alarm_indicator(o, floors) {
             rate.total += 1;
-            if !clears {
+            if v > 0.0 {
                 rate.events += 1;
             }
         }
     }
     rate
+}
+
+/// Per-query false-alarm indicator, `None` for a query outside the held-out
+/// authored positives, whose top hit is not right, or with no floor to judge.
+pub fn false_alarm_indicator(o: &Outcome, floors: &Floors) -> Option<f64> {
+    if !(is_scored_positive(o) && o.held_out && o.top_is_expected()) {
+        return None;
+    }
+    let clears = o.top_clears_floor(floors)?;
+    Some(if clears { 0.0 } else { 1.0 })
+}
+
+/// Per-query `candidate - reference` of a floor-dependent `indicator`, each
+/// arm judged at its own floors, grouped by language, over the queries where
+/// both arms have a value (D9's Q4 and Q5).
+pub fn paired_at_own_floors(
+    reference: &[Outcome],
+    reference_floors: &Floors,
+    candidate: &[Outcome],
+    candidate_floors: &Floors,
+    indicator: impl Fn(&Outcome, &Floors) -> Option<f64>,
+) -> Groups {
+    let by_id: BTreeMap<&str, Option<f64>> =
+        reference.iter().map(|o| (o.query_id.as_str(), indicator(o, reference_floors))).collect();
+    let mut groups = Groups::new();
+    for o in candidate {
+        if let (Some(Some(r)), Some(c)) = (by_id.get(o.query_id.as_str()), indicator(o, candidate_floors)) {
+            groups.entry(o.language.clone()).or_default().push(c - r);
+        }
+    }
+    groups
 }
 
 /// Which held-out authored queries a confident-wrong rate counts.

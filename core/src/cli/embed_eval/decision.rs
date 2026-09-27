@@ -23,8 +23,13 @@ pub struct QualityEvidence {
     pub recall10_delta_by_language: BTreeMap<String, f64>,
     /// Held-out, positives and absent combined.
     pub confident_wrong_delta: Bound,
-    /// The candidate's own held-out false-alarm rate at its own floors;
-    /// `None` when a language had no held-out positive ranked first.
+    /// Held-out false alarm, each arm at its own floors, paired over the
+    /// positives both arms rank right first; pooled like Q4.
+    pub false_alarm_delta: Bound,
+    /// Point estimate per language, reported beside Q5 and not gated.
+    pub false_alarm_delta_by_language: BTreeMap<String, f64>,
+    /// The candidate's own held-out false-alarm rate at its own floors,
+    /// reported and not gated (D6 fits it to 3% on the fit half only).
     pub false_alarm_by_language: BTreeMap<String, Option<f64>>,
 }
 
@@ -97,23 +102,26 @@ pub fn quality_gates(role: Role, e: &QualityEvidence) -> Vec<Gate> {
             pts(e.confident_wrong_delta.upper)
         ),
     });
-    let over: Vec<String> = e
+    let or_none = |v: Vec<String>| if v.is_empty() { "none".to_string() } else { v.join(", ") };
+    let deltas = e.false_alarm_delta_by_language.iter().map(|(l, d)| format!("{l} {}", pts(*d))).collect();
+    let rates = e
         .false_alarm_by_language
         .iter()
-        .filter_map(|(language, rate)| match rate {
-            Some(r) if *r <= 0.03 + EPS => None,
-            Some(r) => Some(format!("{language} {:.1}%", r * 100.0)),
-            None => Some(format!("{language} unmeasured")),
+        .map(|(l, r)| match r {
+            Some(r) => format!("{l} {:.1}%", r * 100.0),
+            None => format!("{l} -"),
         })
         .collect();
     gates.push(Gate {
         id: "Q5",
-        passed: !e.false_alarm_by_language.is_empty() && over.is_empty(),
-        detail: if over.is_empty() {
-            "false alarm <= 3% in every language".to_string()
-        } else {
-            format!("false alarm over 3% or unmeasured: {}", over.join(", "))
-        },
+        passed: e.false_alarm_delta.point <= EPS && e.false_alarm_delta.upper <= 0.05 + EPS,
+        detail: format!(
+            "false-alarm delta {} (<= 0), upper {} (<= +5); delta by language {}; own rate {}",
+            pts(e.false_alarm_delta.point),
+            pts(e.false_alarm_delta.upper),
+            or_none(deltas),
+            or_none(rates)
+        ),
     });
     gates
 }
@@ -202,6 +210,8 @@ mod tests {
             mrr_delta: bound(-0.01, -0.03, 0.01),
             recall10_delta_by_language: [("go".to_string(), -0.05), ("rust".to_string(), 0.02)].into(),
             confident_wrong_delta: bound(-0.01, -0.03, 0.02),
+            false_alarm_delta: bound(0.0, -0.02, 0.02),
+            false_alarm_delta_by_language: [("go".to_string(), 0.0), ("rust".to_string(), 0.0)].into(),
             false_alarm_by_language: [("go".to_string(), Some(0.02)), ("rust".to_string(), Some(0.0))].into(),
         }
     }
@@ -220,7 +230,7 @@ mod tests {
         e.mrr_delta = bound(-0.02, -0.05, 0.0);
         e.recall10_delta_by_language.insert("python".into(), -0.10);
         e.confident_wrong_delta = bound(0.0, -0.02, 0.05);
-        e.false_alarm_by_language.insert("python".into(), Some(0.03));
+        e.false_alarm_delta = bound(0.0, -0.02, 0.05);
         let gates = quality_gates(Role::Cost, &e);
         assert!(gates.iter().all(|g| g.passed), "{gates:?}");
 
@@ -234,10 +244,63 @@ mod tests {
         assert!(!passed(&quality_gates(Role::Cost, &e), "Q4"));
         e.confident_wrong_delta = bound(0.0, -0.02, 0.051);
         assert!(!passed(&quality_gates(Role::Cost, &e), "Q4"));
-        e.false_alarm_by_language.insert("python".into(), Some(0.031));
+        e.false_alarm_delta = bound(0.001, -0.02, 0.03);
         assert!(!passed(&quality_gates(Role::Cost, &e), "Q5"));
-        e.false_alarm_by_language.insert("python".into(), None);
+        e.false_alarm_delta = bound(0.0, -0.02, 0.051);
         assert!(!passed(&quality_gates(Role::Cost, &e), "Q5"));
+        e.false_alarm_delta = bound(f64::NAN, f64::NAN, f64::NAN);
+        assert!(!passed(&quality_gates(Role::Cost, &e), "Q5"));
+    }
+
+    /// Q5 is relative to the reference: 20 held-out go positives ranked
+    /// right first, 3 of them below the floor (15% false alarm, jina's
+    /// order of magnitude). A candidate equal to R passes; one with 4 more
+    /// alarms (+20 points) fails. Control: restoring the absolute check
+    /// (`false_alarm_by_language` all <= 3%) fails the equal candidate.
+    #[test]
+    fn q5_false_alarm_is_judged_against_the_reference_not_against_3_percent() {
+        use super::super::metrics::{self, Floors, Outcome};
+        let arm = |alarms: usize| -> Vec<Outcome> {
+            (0..20)
+                .map(|i| Outcome {
+                    query_id: format!("q{i}"),
+                    corpus: "c".to_string(),
+                    language: "go".to_string(),
+                    positive: true,
+                    mechanical: false,
+                    overlap: false,
+                    held_out: true,
+                    first_expected_rank: Some(1),
+                    top_score: Some(if i < alarms { 0.40 } else { 0.70 }),
+                    top_language: Some("go".to_string()),
+                })
+                .collect()
+        };
+        let floors: Floors = [("go".to_string(), 0.50)].into();
+        let reference = arm(3);
+        let q5 = |candidate: &[Outcome]| {
+            let groups = metrics::paired_at_own_floors(
+                &reference,
+                &floors,
+                candidate,
+                &floors,
+                metrics::false_alarm_indicator,
+            );
+            let mut e = evidence();
+            e.false_alarm_delta = metrics::bootstrap(&groups, 2000, 398).unwrap();
+            e.false_alarm_by_language =
+                [("go".to_string(), metrics::false_alarm(candidate, &floors, Some("go")).value())].into();
+            quality_gates(Role::Cost, &e).into_iter().find(|g| g.id == "Q5").unwrap()
+        };
+
+        let equal = arm(3);
+        assert_eq!(metrics::false_alarm(&equal, &floors, None).value(), Some(0.15));
+        let gate = q5(&equal);
+        assert!(gate.passed, "{gate:?}");
+
+        let worse = arm(7);
+        let gate = q5(&worse);
+        assert!(!gate.passed, "{gate:?}");
     }
 
     /// A quality candidate must be better, not merely not worse. Control:

@@ -203,7 +203,8 @@ and per overlap stratum; positives only unless stated.
   positives, absent, and combined.
 - **false-alarm rate** at those floors (held-out): the right answer is
   ranked first but every row is below its floor, so `verdict` would say "no
-  match". This is what the floor was tuned to hold at 3%.
+  match". The floor is fitted to hold it at 3% on the fit half (D6); on
+  the held-out half it runs higher, so D9 gates it against R, not against 3%.
 - Also reported, not gated: recall@1, the discordance rate p against the
   reference (D2's assumption, checked), and the share of node texts longer
   than 512 and 1024 tokens under each tokenizer (the truncation confound).
@@ -298,7 +299,19 @@ R, and C beats the broken arms by the same margins.
 | Q2 MRR | Δ >= -0.02 | lower >= -0.05 |
 | Q3 per language recall@10 | Δ >= -10 points in every language | - |
 | Q4 confident-wrong (held-out, combined) | Δ <= 0 points | upper <= +5 points |
-| Q5 false alarm (held-out) | <= 3% per language, as the floors promise | - |
+| Q5 false alarm (held-out, pooled; each language reported) | Δ <= 0 points | upper <= +5 points |
+
+Q5 was first an absolute "<= 3% per language, as the floors promise". The
+reference itself fails that: at its own fitted floors jina's held-out false
+alarm is go 18.8%, python 9.5%, rust 14.3%, typescript 14.8% (run at
+620eae2): the 3% holds on the fit half, not on the authored held-out
+queries. Q5 is therefore
+relative to R and shaped like Q4: per query, each arm at its own floors,
+paired over the held-out positives both arms rank right first, pooled over
+languages with the per-language Δ reported beside it. Pooled, like Q4,
+because a language holds few such queries: one discordant query moves a
+per-language rate by several points, so a per-language +5 bound would veto
+almost any candidate not identical to R. Owner decision 2026-09-27.
 
 recall@5 is reported beside recall@10 and is not a separate gate (it is
 strongly correlated and would only add a multiple-comparison veto).

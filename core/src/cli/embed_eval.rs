@@ -1008,23 +1008,19 @@ fn report(args: &ReportArgs) -> Result<()> {
                 |o| Some(o.reciprocal_rank()),
             )?;
             let (ref_floors, _, _) = floors_and_rates(reference);
-            let cw = {
-                // Each arm's confident-wrong at its own floors, paired by query.
-                let ref_cw: HashMap<&str, Option<f64>> = reference
-                    .outcomes
-                    .iter()
-                    .map(|o| (o.query_id.as_str(), metrics::confident_wrong(o, &ref_floors)))
-                    .collect();
-                let mut groups = metrics::Groups::new();
-                for o in &arm.outcomes {
-                    if let (Some(Some(r)), Some(c)) =
-                        (ref_cw.get(o.query_id.as_str()), metrics::confident_wrong(o, &floors))
-                    {
-                        groups.entry(o.language.clone()).or_default().push(c - r);
-                    }
-                }
-                groups
+            // Each arm's confident-wrong and false alarm at its own floors, paired by query.
+            let paired = |indicator: fn(&Outcome, &Floors) -> Option<f64>| {
+                metrics::paired_at_own_floors(
+                    &reference.outcomes,
+                    &ref_floors,
+                    &arm.outcomes,
+                    &floors,
+                    indicator,
+                )
             };
+            let cw = paired(metrics::confident_wrong);
+            let fa = paired(metrics::false_alarm_indicator);
+            let nan = Bound { point: f64::NAN, lower: f64::NAN, upper: f64::NAN };
             let recall_bound = bound_of(&recall, settings).context("no paired positives")?;
             let evidence = decision::QualityEvidence {
                 recall10_delta: recall_bound,
@@ -1033,11 +1029,12 @@ fn report(args: &ReportArgs) -> Result<()> {
                     .iter()
                     .map(|(l, v)| (l.clone(), v.iter().sum::<f64>() / v.len() as f64))
                     .collect(),
-                confident_wrong_delta: bound_of(&cw, settings).unwrap_or(Bound {
-                    point: f64::NAN,
-                    lower: f64::NAN,
-                    upper: f64::NAN,
-                }),
+                confident_wrong_delta: bound_of(&cw, settings).unwrap_or(nan),
+                false_alarm_delta: bound_of(&fa, settings).unwrap_or(nan),
+                false_alarm_delta_by_language: fa
+                    .iter()
+                    .map(|(l, v)| (l.clone(), v.iter().sum::<f64>() / v.len() as f64))
+                    .collect(),
                 false_alarm_by_language: false_alarm.clone(),
             };
             let quality = decision::quality_gates(arm.variant.role, &evidence);
