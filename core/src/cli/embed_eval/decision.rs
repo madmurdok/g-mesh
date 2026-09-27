@@ -160,7 +160,7 @@ pub enum Verdict {
     /// [-7, -5): the one allowed extension of the query set applies.
     SecondStage,
     /// No verdict: validity failed, or the costs were not measured.
-    NoVerdict(String),
+    Undecided(String),
 }
 
 pub fn decide(
@@ -171,15 +171,12 @@ pub fn decide(
     cost: Option<&[Gate]>,
 ) -> Verdict {
     if let Err(reason) = valid {
-        return Verdict::NoVerdict(reason);
+        return Verdict::Undecided(reason);
     }
-    let failed: Vec<&'static str> = quality.iter().chain(cost.unwrap_or(&[])).filter(|g| !g.passed).map(|g| g.id).collect();
+    let failed: Vec<&'static str> =
+        quality.iter().chain(cost.unwrap_or(&[])).filter(|g| !g.passed).map(|g| g.id).collect();
     let second_stage_window = recall10_delta.lower >= -0.07 - EPS && recall10_delta.lower < -0.05 - EPS;
-    if role == Role::Cost
-        && failed == ["Q1"]
-        && recall10_delta.point >= -0.02 - EPS
-        && second_stage_window
-    {
+    if role == Role::Cost && failed == ["Q1"] && recall10_delta.point >= -0.02 - EPS && second_stage_window {
         return Verdict::SecondStage;
     }
     if !failed.is_empty() {
@@ -187,7 +184,7 @@ pub fn decide(
     }
     match cost {
         Some(_) => Verdict::Pass,
-        None => Verdict::NoVerdict("quality gates pass; costs (D11) not measured".to_string()),
+        None => Verdict::Undecided("quality gates pass; costs (D11) not measured".to_string()),
     }
 }
 
@@ -258,17 +255,21 @@ mod tests {
 
     #[test]
     fn a_cost_candidate_must_win_somewhere_and_lose_nowhere() {
-        let reference = Costs { pass_seconds: 600.0, max_rss_bytes: 1.5e9, model_bytes: 6.4e8, query_latency_ms: 20.0 };
-        let small = Costs { pass_seconds: 200.0, max_rss_bytes: 4e8, model_bytes: 1.3e8, query_latency_ms: 5.0 };
+        let reference =
+            Costs { pass_seconds: 600.0, max_rss_bytes: 1.5e9, model_bytes: 6.4e8, query_latency_ms: 20.0 };
+        let small =
+            Costs { pass_seconds: 200.0, max_rss_bytes: 4e8, model_bytes: 1.3e8, query_latency_ms: 5.0 };
         assert!(cost_gates(Role::Cost, &small, &reference).iter().all(|g| g.passed));
 
-        let no_win = Costs { pass_seconds: 500.0, max_rss_bytes: 1.4e9, model_bytes: 6e8, query_latency_ms: 20.0 };
+        let no_win =
+            Costs { pass_seconds: 500.0, max_rss_bytes: 1.4e9, model_bytes: 6e8, query_latency_ms: 20.0 };
         assert!(!passed(&cost_gates(Role::Cost, &no_win, &reference), "C-win"));
 
         let slow_queries = Costs { query_latency_ms: 23.0, ..small };
         assert!(!passed(&cost_gates(Role::Cost, &slow_queries, &reference), "C-no-worse"));
 
-        let big = Costs { pass_seconds: 800.0, max_rss_bytes: 1.7e9, model_bytes: 1.2e9, query_latency_ms: 30.0 };
+        let big =
+            Costs { pass_seconds: 800.0, max_rss_bytes: 1.7e9, model_bytes: 1.2e9, query_latency_ms: 30.0 };
         assert!(!passed(&cost_gates(Role::Quality, &big, &reference), "C-quality"));
     }
 
@@ -293,8 +294,8 @@ mod tests {
     fn validity_failure_and_missing_costs_give_no_verdict() {
         let ok = vec![Gate { id: "Q1", passed: true, detail: String::new() }];
         let b = bound(0.0, -0.01, 0.01);
-        assert!(matches!(decide(Role::Cost, Err("broken arms".into()), b, &ok, None), Verdict::NoVerdict(_)));
-        assert!(matches!(decide(Role::Cost, Ok(()), b, &ok, None), Verdict::NoVerdict(_)));
+        assert!(matches!(decide(Role::Cost, Err("broken arms".into()), b, &ok, None), Verdict::Undecided(_)));
+        assert!(matches!(decide(Role::Cost, Ok(()), b, &ok, None), Verdict::Undecided(_)));
         let cost = vec![Gate { id: "C-win", passed: true, detail: String::new() }];
         assert_eq!(decide(Role::Cost, Ok(()), b, &ok, Some(&cost)), Verdict::Pass);
     }

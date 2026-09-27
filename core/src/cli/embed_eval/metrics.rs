@@ -225,10 +225,7 @@ pub fn chance_recall(expected_sizes: &[usize], candidate_count: usize, k: usize)
     if expected_sizes.is_empty() || candidate_count == 0 {
         return 0.0;
     }
-    let total: f64 = expected_sizes
-        .iter()
-        .map(|&e| ((k * e) as f64 / candidate_count as f64).min(1.0))
-        .sum();
+    let total: f64 = expected_sizes.iter().map(|&e| ((k * e) as f64 / candidate_count as f64).min(1.0)).sum();
     total / expected_sizes.len() as f64
 }
 
@@ -499,7 +496,10 @@ mod tests {
         let mut constant = Groups::new();
         constant.insert("go".into(), vec![0.3; 50]);
         let b = bootstrap(&constant, 500, 1).unwrap();
-        assert_eq!((b.point, b.lower, b.upper), (0.3, 0.3, 0.3));
+        // Summing fifty 0.3s is not exactly 15.0, so compare within rounding.
+        for v in [b.point, b.lower, b.upper] {
+            assert!((v - 0.3).abs() < 1e-12, "{b:?}");
+        }
 
         let mut rng = Rng::new(2);
         let mut noisy = Groups::new();
@@ -519,7 +519,8 @@ mod tests {
     fn paired_deltas_are_candidate_minus_reference_and_require_the_same_queries() {
         let reference = vec![outcome("a", "go", Some(1), None), outcome("b", "go", None, None)];
         let candidate = vec![outcome("b", "go", Some(2), None), outcome("a", "go", Some(30), None)];
-        let deltas = paired_deltas(&reference, &candidate, is_scored_positive, |o| Some(o.hit_at(10))).unwrap();
+        let deltas =
+            paired_deltas(&reference, &candidate, is_scored_positive, |o| Some(o.hit_at(10))).unwrap();
         let mut got = deltas["go"].clone();
         got.sort_by(f64::total_cmp);
         assert_eq!(got, vec![-1.0, 1.0]);

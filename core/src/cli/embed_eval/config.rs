@@ -29,7 +29,8 @@ pub struct Corpus {
 impl CorporaFile {
     pub fn load(eval_dir: &Path) -> Result<Self> {
         let path = eval_dir.join("corpora.toml");
-        let text = std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
@@ -129,7 +130,8 @@ pub struct Variant {
 impl VariantsFile {
     pub fn load(eval_dir: &Path) -> Result<Self> {
         let path = eval_dir.join("variants.toml");
-        let text = std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
         Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
@@ -153,7 +155,10 @@ impl VariantsFile {
                     v.encoder_spec()?;
                 }
                 Arm::Shuffled | Arm::WordsShuffled => {
-                    let base = v.reference.as_deref().with_context(|| format!("variant {} needs `reference`", v.name))?;
+                    let base = v
+                        .reference
+                        .as_deref()
+                        .with_context(|| format!("variant {} needs `reference`", v.name))?;
                     if self.get(base)?.arm != Arm::Model {
                         bail!("variant {}'s reference {base} is not a model arm", v.name);
                     }
@@ -170,7 +175,10 @@ impl VariantsFile {
     }
 
     pub fn get(&self, name: &str) -> Result<&Variant> {
-        self.variants.iter().find(|v| v.name == name).with_context(|| format!("no variant {name} in variants.toml"))
+        self.variants
+            .iter()
+            .find(|v| v.name == name)
+            .with_context(|| format!("no variant {name} in variants.toml"))
     }
 
     /// The model variant whose encoder a variant runs: itself for a model
@@ -259,6 +267,9 @@ mod tests {
             role = "control"
         "#;
         assert!(VariantsFile::parse(text).is_err());
-        assert!(VariantsFile::parse(&text.replace("role = \"control\"", "role = \"control\"\nreference = \"r\"")).is_ok());
+        assert!(VariantsFile::parse(
+            &text.replace("role = \"control\"", "role = \"control\"\nreference = \"r\"")
+        )
+        .is_ok());
     }
 }

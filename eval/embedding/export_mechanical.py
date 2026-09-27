@@ -4,8 +4,9 @@ docs/architecture/embedding-eval.md), written to
 eval/embedding/queries/mechanical/<corpus>.jsonl.
 
 Positives: embeddable, non-test declarations sampled from the corpus's
-snapshot by a fixed seed, queried by their own name; only names unique in the
-snapshot are used, so the expected set is exactly that symbol.
+snapshot by a fixed seed, queried by their own name; names carried by at most
+three embeddable nodes, all of which are expected (a method name shared by two
+types is answered by either, as the calibration's name match allowed).
 Negatives: names sampled from the other corpora's snapshots that no node of
 this snapshot carries and that occur as a whole word in no file of the pinned
 checkout.
@@ -66,10 +67,12 @@ def main():
 
     rows = {c: snapshot_rows(c) for c in PREFIX}
     candidates = {}
+    mechanical_expected = {}
     for c, rs in rows.items():
         names = {}
         for r in rs:
-            names.setdefault(r["name"], []).append(r)
+            if embeddable(r["docComment"], r["signature"]):
+                names.setdefault(r["name"], []).append(r)
         candidates[c] = [
             r
             for r in rs
@@ -80,8 +83,16 @@ def main():
             and not TEST_QNAME.search(r["qualifiedName"])
             and len(r["name"]) >= 4
             and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", r["name"])
-            and len(names[r["name"]]) == 1
+            and len(names[r["name"]]) <= 3
         ]
+        # One query per name: the first sampled declaration stands for all.
+        seen, unique = set(), []
+        for r in candidates[c]:
+            if r["name"] not in seen:
+                seen.add(r["name"])
+                unique.append(r)
+        candidates[c] = unique
+        mechanical_expected[c] = names
 
     for c in args.corpora:
         rng = random.Random(f"{args.seed}:{c}")
@@ -104,10 +115,12 @@ def main():
                             "shape": "name",
                             "text": r["name"],
                             "expected": [
-                                {"filePath": r["filePath"], "qualifiedName": r["qualifiedName"], "kind": r["kind"]}
+                                {"filePath": e["filePath"], "qualifiedName": e["qualifiedName"], "kind": e["kind"]}
+                                for e in mechanical_expected[c][r["name"]]
                             ],
                             "derivation": f"Mechanical: sampled (seed {args.seed}) from the snapshot's embeddable, "
-                            "non-test declarations with a unique name; queried by that name.",
+                            "non-test declarations whose name at most 3 embeddable nodes carry; queried by that name, "
+                            "every embeddable node of that name expected.",
                             "author": "export_mechanical.py",
                         }
                     )

@@ -60,6 +60,9 @@ impl Query {
     }
 }
 
+/// `(path under the eval dir, sha256)` of a query file.
+pub type FileHash = (String, String);
+
 pub fn is_held_out_id(id: &str) -> bool {
     Sha256::digest(id.as_bytes())[0] % 2 == 1
 }
@@ -68,7 +71,7 @@ pub fn is_held_out_id(id: &str) -> bool {
 /// Returns them with the sha256 of each file read, keyed by its path under
 /// the eval dir, which the run manifest records (D3 step 7: the frozen
 /// files' hashes).
-pub fn load(eval_dir: &Path, corpus: &str) -> Result<(Vec<Query>, Vec<(String, String)>)> {
+pub fn load(eval_dir: &Path, corpus: &str) -> Result<(Vec<Query>, Vec<FileHash>)> {
     let mut queries = Vec::new();
     let mut hashes = Vec::new();
     let authored = eval_dir.join("queries").join(format!("{corpus}.jsonl"));
@@ -120,7 +123,8 @@ fn validate(q: &Query, corpus: &str) -> Result<()> {
         (QueryKind::Absent, n) if n > 0 => bail!("absent query {} lists expected symbols", q.id),
         _ => {}
     }
-    let shape_ok = if q.mechanical { q.shape == "name" } else { q.shape == "phrase" || q.shape == "sentence" };
+    let shape_ok =
+        if q.mechanical { q.shape == "name" } else { q.shape == "phrase" || q.shape == "sentence" };
     if !shape_ok {
         bail!("query {} has shape {:?}", q.id, q.shape);
     }
@@ -137,7 +141,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Last segment of a qualified name, whatever the language's separator
 /// (`a::b::c`, `A.b`, `A#b`, `path/to/file.rs`).
 pub fn symbol_name(qualified_name: &str) -> &str {
-    qualified_name.rsplit(|c| c == ':' || c == '.' || c == '#' || c == '/').next().unwrap_or(qualified_name)
+    qualified_name.rsplit([':', '.', '#', '/']).next().unwrap_or(qualified_name)
 }
 
 /// Camel/snake sub-tokens of an identifier, lower-cased, length >= 4.
@@ -173,9 +177,7 @@ pub fn overlaps(text: &str, expected: &[ExpectedSymbol]) -> bool {
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
-    expected
-        .iter()
-        .any(|e| sub_tokens(symbol_name(&e.qualified_name)).iter().any(|t| words.contains(t)))
+    expected.iter().any(|e| sub_tokens(symbol_name(&e.qualified_name)).iter().any(|t| words.contains(t)))
 }
 
 #[cfg(test)]
@@ -183,7 +185,11 @@ mod tests {
     use super::*;
 
     fn expected(qualified_name: &str) -> ExpectedSymbol {
-        ExpectedSymbol { file_path: "f".into(), qualified_name: qualified_name.into(), kind: "Function".into() }
+        ExpectedSymbol {
+            file_path: "f".into(),
+            qualified_name: qualified_name.into(),
+            kind: "Function".into(),
+        }
     }
 
     /// Control: a splitter that does not break on case (or on `_`) fails the

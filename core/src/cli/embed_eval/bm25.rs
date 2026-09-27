@@ -57,7 +57,8 @@ impl Bm25 {
             }
             doc_terms.push(tf);
         }
-        let avg_len = if doc_len.is_empty() { 0.0 } else { doc_len.iter().sum::<f64>() / doc_len.len() as f64 };
+        let avg_len =
+            if doc_len.is_empty() { 0.0 } else { doc_len.iter().sum::<f64>() / doc_len.len() as f64 };
         Self { doc_terms, doc_len, avg_len, df }
     }
 
@@ -96,16 +97,22 @@ mod tests {
 
     #[test]
     fn terms_split_identifiers_like_the_overlap_rule() {
-        assert_eq!(terms("fn getEncodingFromHeaders(h: &HeaderMap)"), vec![
-            "fn", "get", "encoding", "from", "headers", "header", "map"
-        ]);
+        assert_eq!(
+            terms("fn getEncodingFromHeaders(h: &HeaderMap)"),
+            vec!["fn", "get", "encoding", "from", "headers", "header", "map"]
+        );
     }
 
     /// Control: dropping the idf weight (every term weighs 1) lets twelve
     /// repetitions of the common "the" win, and document 0 comes first.
     #[test]
     fn a_rare_matching_term_outranks_a_common_one() {
-        let docs = ["the the the the the the the the the the the the", "charset", "the value of the thing", "the other thing"];
+        let docs = [
+            "the the the the the the the the the the the the",
+            "charset",
+            "the value of the thing",
+            "the other thing",
+        ];
         let bm25 = Bm25::new(docs.iter().copied());
         let scores = bm25.scores("the charset");
         let best = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;

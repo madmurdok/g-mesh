@@ -537,7 +537,8 @@ mod tests {
         values[EMBEDDING_DIM] = 100.0;
         values[EMBEDDING_DIM + 1] = 100.0;
 
-        let pooled = pool(Pooling::Mean, EMBEDDING_DIM, &[1, 2, EMBEDDING_DIM as i64], &values, &[1, 0], 2).unwrap();
+        let pooled =
+            pool(Pooling::Mean, EMBEDDING_DIM, &[1, 2, EMBEDDING_DIM as i64], &values, &[1, 0], 2).unwrap();
 
         assert!((pooled[0] - 1.0).abs() < 1e-6, "{}", pooled[0]);
         assert!(pooled[1].abs() < 1e-6, "{}", pooled[1]);
@@ -550,7 +551,8 @@ mod tests {
         values[1] = -3.0;
         values[2] = 6.0;
 
-        let pooled = pool(Pooling::Mean, EMBEDDING_DIM, &[1, 1, EMBEDDING_DIM as i64], &values, &[1], 1).unwrap();
+        let pooled =
+            pool(Pooling::Mean, EMBEDDING_DIM, &[1, 1, EMBEDDING_DIM as i64], &values, &[1], 1).unwrap();
 
         let norm = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "{norm}");
@@ -595,7 +597,12 @@ mod tests {
     fn the_production_spec_is_mean_pooling_768_wide_truncated_at_1024() {
         assert_eq!(
             EncoderSpec::production(),
-            EncoderSpec { pooling: Pooling::Mean, dimension: 768, max_sequence_length: 1024, token_type_ids: false }
+            EncoderSpec {
+                pooling: Pooling::Mean,
+                dimension: 768,
+                max_sequence_length: 1024,
+                token_type_ids: false
+            }
         );
     }
 
