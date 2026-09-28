@@ -1,0 +1,22 @@
+{"n": 7, "qualifiedName": "HTTPBasicAuth.__init__", "reason": "trivial: constructor only stores username and password"}
+{"n": 9, "qualifiedName": "MockRequest.host", "reason": "trivial: property delegating to get_host()"}
+{"n": 17, "qualifiedName": "HTTPBasicAuth.__ne__", "reason": "trivial: returns not (self == other)"}
+{"n": 30, "qualifiedName": "_KT", "reason": "trivial: bare TypeVar declaration, no behaviour"}
+{"n": 32, "qualifiedName": "PreparedRequest.__init__", "reason": "trivial: constructor only assigns None defaults and default_hooks()"}
+{"n": 37, "qualifiedName": "MockRequest.add_unredirected_header", "reason": "trivial: one-line dict assignment"}
+{"n": 44, "qualifiedName": "MockRequest.get_new_headers", "reason": "trivial: one-line accessor returning _new_headers"}
+{"n": 47, "qualifiedName": "LookupDict.__repr__", "reason": "boilerplate: repr with no logic"}
+{"n": 52, "qualifiedName": "RequestsCookieJar.__delitem__", "reason": "trivial: one-line delegation to remove_cookie_by_name"}
+{"n": 55, "qualifiedName": "SessionRedirectMixin.send", "reason": "trivial: typing stub whose body is ..."}
+{"n": 64, "qualifiedName": "Response.__init__", "reason": "trivial: constructor only assigns default attribute values"}
+{"n": 67, "qualifiedName": "RequestsCookieJar.values", "reason": "trivial: one-line list(self.itervalues())"}
+{"n": 69, "qualifiedName": "CaseInsensitiveDict.__repr__", "reason": "boilerplate: repr with no logic"}
+{"n": 70, "qualifiedName": "ssl", "reason": "trivial: optional import alias set to None on ImportError"}
+{"n": 74, "qualifiedName": "Response.__exit__", "reason": "trivial: one-line delegation to close()"}
+{"n": 75, "qualifiedName": "RequestsCookieJar.keys", "reason": "trivial: one-line list(self.iterkeys())"}
+{"n": 80, "qualifiedName": "__author__", "reason": "trivial: string constant"}
+{"n": 81, "qualifiedName": "MockRequest.unverifiable", "reason": "trivial: property delegating to is_unverifiable()"}
+{"n": 82, "qualifiedName": "RequestsCookieJar.__iter__", "reason": "trivial: one-line delegation to CookieJar.__iter__"}
+{"n": 85, "qualifiedName": "BaseAdapter.__init__", "reason": "trivial: only calls super().__init__()"}
+{"n": 92, "qualifiedName": "MockRequest.get_host", "reason": "trivial: one-line return of urlparse(url).netloc"}
+{"n": 120, "qualifiedName": "DEFAULT_POOL_TIMEOUT", "reason": "trivial: constant None, unused anywhere in src (grep -rn DEFAULT_POOL_TIMEOUT: definition only)"}

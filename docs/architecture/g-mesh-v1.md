@@ -1670,10 +1670,14 @@ into defaults:
   rethinking, not just tuning.
 - **Kùzu migration trigger** (p95 ~200-300ms on a synthetic hub-node
   traversal) needs a real prototype benchmark before it's actionable.
-- **Default embedding model** (`jina-embeddings-v2-base-code`) is an
-  architectural pick based on training-data fit (code+NL pairs, ~30
-  languages, 8192-token context, Apache 2.0), not a benchmark result on
-  real code — validate before hard-fixing `meta.embedding_model`.
+- **Default embedding model**: resolved by GM-398 (2026-09-28) — kept
+  `jina-embeddings-v2-base-code` fp32. No candidate (int8, gte-small,
+  bge-small, snowflake-arctic-embed-s) passed decision rule D9; the closest,
+  jina int8, matched fp32 on recall@10/MRR at a fraction of the cost but
+  failed the Q5 false-alarm bound. See
+  [`docs/results/gm-398-model-comparison.md`](../results/gm-398-model-comparison.md)
+  for the full comparison; adapter/fine-tuning research continues under
+  GM-436, and the similarity-floor false-alarm issue under GM-434.
 - **Idle timeout defaults** (`plugin.idleTimeoutMinutes` = 60,
   `daemon.coreIdleTimeoutHours` = 24) and traversal limits (`maxDepth` = 5,
   `maxFanout` = 50, exploration budget = 5000) are reasonable-sounding

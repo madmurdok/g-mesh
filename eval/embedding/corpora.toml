@@ -1,0 +1,49 @@
+# Corpora of the embedding eval (docs/architecture/embedding-eval.md, D1).
+# Revisions are copied from g-mesh-bench/corpora/registry.json (g-mesh itself
+# is pinned at the design note's base). `checkout` is relative to this
+# directory; `debug-embed-eval snapshot` refuses a checkout whose HEAD is not
+# `revision`.
+
+[[corpus]]
+id = "task-tracker-mcp"
+language = "typescript"
+source = "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/task-tracker-mcp"
+revision = "35237c8bab17c6b9bf1939d0a06e9e5d1c36bf4f"
+checkout = "work/corpora/task-tracker-mcp"
+
+[[corpus]]
+id = "excalidraw"
+language = "typescript"
+source = "/Users/Valentin_Taiurskii/Projects/excalidraw"
+revision = "1acf66edabc2ac5bbd4aed0714aed7dca7cc2aab"
+checkout = "work/corpora/excalidraw"
+
+[[corpus]]
+id = "ripgrep"
+language = "rust"
+source = "https://github.com/BurntSushi/ripgrep.git"
+ref = "15.2.0"
+revision = "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f"
+checkout = "work/corpora/ripgrep"
+
+[[corpus]]
+id = "g-mesh"
+language = "rust"
+source = "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh"
+revision = "805686ff79fc56ffcb4dbebd4a86e36cf4e5f38a"
+checkout = "work/corpora/g-mesh"
+
+[[corpus]]
+id = "gin"
+language = "go"
+source = "https://github.com/gin-gonic/gin.git"
+ref = "v1.12.0"
+revision = "73726dc606796a025971fe451f0aa6f1b9b847f6"
+checkout = "work/corpora/gin"
+
+[[corpus]]
+id = "py-requests"
+language = "python"
+source = "https://github.com/psf/requests.git"
+revision = "6e83187b8feb273ed4c6cdab5efd8d54901dfab3"
+checkout = "work/corpora/py-requests"

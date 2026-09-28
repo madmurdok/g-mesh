@@ -1,0 +1,3 @@
+{"n": 4, "qualifiedName": "CompletionVerificationError#constructor", "reason": "trivial: constructor only calls super(message), stores one field and sets name"}
+{"n": 14, "qualifiedName": "TaskNotClaimableError#constructor", "reason": "trivial: constructor only calls super(message), stores one field and sets name"}
+{"n": 39, "qualifiedName": "ReleaseNotAllDoneError#constructor", "reason": "trivial: constructor only calls super(message), stores one field and sets name"}

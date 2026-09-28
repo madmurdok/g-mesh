@@ -255,7 +255,7 @@ const DEFAULT_FLOOR: f64 = 0.50;
 /// `nodes.language` and `daemon::manifest` spell it, for the reason
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
-pub(super) fn floor(language: &str) -> f64 {
+pub(crate) fn floor(language: &str) -> f64 {
     match language {
         // 0.594 on the fit half, rounded down. 1.2% false alarm, 90.5% of
         // absent-answer pages caught, over 161 positives and 284 negatives.
