@@ -190,3 +190,47 @@ ADR's "killed after the swap" case, not the pending case). Load 3.72 ->
 4. A freshly started daemon does not index until its first client
    connects (the first cold start sat at `unindexed` for 21 minutes until
    the probe connected). Not a GM-425 matter; noted because it cost time.
+
+## GM-431 re-measure
+
+Slice S6 of GM-431: the node count across the swap with the placeholder fix
+(`6c55669`, `fix/GM-431-reindex-swap-keeps-semantic-nodes`) against its
+merge base `20a4ed3` (`release-3.15.0`, before the fix) as the control.
+`d180aa4` was not used: GM-428/429/433 changed the reindex and semantic pass
+after it, and `20a4ed3` is the fix's direct parent. No code was changed.
+
+Method: S10's, reduced to the counts. The indexed project was a detached
+throwaway worktree at `20a4ed3` (separate from both build worktrees, both
+`cargo build --workspace --release`). Each arm had its own
+`G_MESH_HOME=/tmp/gm431-<arm>` (models linked, embedding cache a copy of
+`~/.g-mesh`'s), cold-built with the cache on, then restarted with
+`G_MESH_EMBEDDING_CACHE=off` and `G_MESH_CORE_IDLE_MS=0` on the ready index.
+The script then bumped the patch version in the project's `core/Cargo.toml`
+and read `index.db` every 0.2s (total nodes; rust `Module` nodes with
+`nativeKind = 'pending_symbol'`, the placeholders) until the
+`[rust] semantic pass:` line plus 20s. Daemons were started without a shell
+(real pids recorded) and stopped with SIGTERM; `ps` afterwards showed none of
+them left, and only the pre-existing daemons for other roots were running.
+
+| | control `20a4ed3` | fix `6c55669` |
+|---|---|---|
+| Nodes before the edit (placeholders) | 14,623 (5,042) | 14,623 (5,042) |
+| Swap log line | +5.78s: `nodes -1240 +6, edges -17 +0` | +4.54s: `nodes -0 +6, edges -0 +0 ... 1240 placeholder(s) kept for it` |
+| First sample after the swap | **13,383 (3,802)**, at +5.81s | **14,623 (5,042)** |
+| Between the swap and the end of the pass | 13,383 until +61.19s | 14,623 in all 286 samples |
+| Rust semantic pass done | +60.85s (53.4s) | +67.72s (61.6s) |
+| After the pass | 14,623 (5,042) | 14,623 (5,042) |
+| Lowest count after the edit | 13,383 (3,802) | 14,623 (5,042), 410 samples |
+
+The control reproduces S10's gap: 1,240 placeholders (1,161 at S10's
+`fccd632`; the tree differs) and 17 edges gone for ~55s. The fix keeps all
+of them: the count never moves.
+
+Machine: 8-CPU macOS x86_64. Control: `uptime` load 14.59 / 58.16 / 46.77
+at start (another workload had just finished), 9.18 at the edit, 19.11 at
+the end; `real 1064.71 user 41.11 sys 34.72` (the script waited out its 900s
+cap because its pass-done pattern did not match the log line; the samples
+cover the whole window). Fix: load 14.41 at start, 5.82 at the edit, 5.74 at
+the end; `real 201.89 user 14.83 sys 7.90`. Daemon CPU over the measured
+window: 3.1s (control), 2.8s (fix); the pass runs in the plugin and
+rust-analyzer.
