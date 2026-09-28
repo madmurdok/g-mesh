@@ -91,7 +91,7 @@ fn after_a_swap() -> (tempfile::TempDir, Arc<IndexStore>) {
 
     let mut staging = open_staging(&staging_path).unwrap();
     apply_diff(&mut staging, &walk("fn a(x: u32)")).unwrap();
-    language_swap::plan(&mut staging, live_path.to_str().unwrap(), "rust", "model").unwrap();
+    language_swap::plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
     drop(staging);
     let capable = HashSet::from(["rust".to_string()]);
     language_swap::swap(

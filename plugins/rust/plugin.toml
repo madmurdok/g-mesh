@@ -55,8 +55,10 @@ extensions = [".rs"]
 # first one arrives (see src/main.rs, which passes a factory).
 semantic_pass = true
 # Every complete whole-project pass re-sends each semantic edge it stands
-# behind, so core may delete this language's semantic edges one did not
-# re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+# behind, and each pending-symbol placeholder node one of them lands on
+# (the SDK LSP bridge's `Answers::finish`), so core may delete this language's semantic
+# edges, and the placeholders its last workspace reindex kept, that one did
+# not re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
 semantic_sweep = true
 # Core sends `prepareSemanticPass` when a whole-project pass is owed, before
 # asking for it, and the SDK starts rust-analyzer then: it needs ~20s to
