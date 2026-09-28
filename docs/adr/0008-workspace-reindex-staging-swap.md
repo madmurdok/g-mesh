@@ -228,7 +228,31 @@ unlinked placeholders are ordinary rows and go through the same diff.
   edge sweep): the pass re-sends every placeholder it still stands behind,
   so what it did not send is one nobody owns. It is the same ownership
   reasoning as the edge sweep. An incomplete or per-file pass deletes
-  nothing. A language without the sweep keeps the old rule (deleted at the
+  nothing.
+  *The node contract.* This rests on `capabilities.semantic_sweep`
+  promising nodes as well as edges: a complete whole-project pass re-sends
+  every placeholder node one of its semantic edges lands on
+  (`daemon::manifest::Capabilities::semantic_sweep`). The three swept tiers
+  keep it by construction, because they build every answer as a placeholder
+  plus an edge onto it and emit every placeholder of the pass in the same
+  diff: the SDK LSP bridge (Rust, Python) adds a placeholder only in
+  `Answers::record`, next to the edge, and `Answers::finish` writes all of
+  them to `upsert_nodes`; the Go tier adds one only in
+  `semanticDiff.placeholder`, whose id is the edge's target in
+  `answerFile` and `answerImplements`, and `semanticDiff.finish` writes all
+  of them to `UpsertNodes`. So a kept placeholder the pass did not re-send
+  has no semantic edge of the pass onto it, and the edge sweep has already
+  deleted the ones it had. A plugin that re-sent an edge without its
+  placeholder would break the contract, and must leave `semantic_sweep`
+  off.
+  *Claims and the lock.* Each write that touches the unclaimed set does so
+  under the store guard of the write it describes: a diff's claim in the
+  step that committed it, the swap's kept ids before its guard drops, the
+  sweep's read of the set in the step that deletes. With a per-step unit
+  the lock is released between steps, so a claim made after its step, or
+  kept ids recorded after the swap's guard, leave a window in which a kept
+  id is upserted without being claimed and is then swept. A debug build
+  checks the guard (`IndexStore::unclaimed`). A language without the sweep keeps the old rule (deleted at the
   swap, re-added by the pass), because nothing would ever remove a kept one.
   *Rejected:* an ownership column on `nodes`, or a side table of
   semantic-owned ids. Either is a schema change, and the in-memory set's one

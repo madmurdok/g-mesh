@@ -126,12 +126,16 @@ pub struct Capabilities {
     /// never requires an answer to one.
     pub semantic_pass: bool,
     /// Whether a complete whole-project `semanticPass` re-sends every semantic
-    /// edge this plugin stands behind and says `incomplete` whenever it did
-    /// not. `true`: after such a pass core deletes this language's semantic
-    /// edges the pass did not re-send (`watcher::apply::sweep_semantic_edges`).
-    /// `false` (the default): core never sweeps this language, because a
-    /// pass that stops part-way without saying so would lose every edge it
-    /// did not reach.
+    /// edge this plugin stands behind, and every placeholder node such an edge
+    /// lands on, and says `incomplete` whenever it did not. `true`: after such
+    /// a pass core deletes this language's semantic edges the pass did not
+    /// re-send (`watcher::apply::sweep_semantic_edges`), and the swap of a
+    /// workspace reindex keeps the language's pending-symbol placeholders the
+    /// walk no longer emits until that pass, which deletes those it did not
+    /// re-send (`IndexStore::sweep_unclaimed_nodes`). `false` (the default):
+    /// core never sweeps this language, because a pass that stops part-way
+    /// without saying so would lose every edge it did not reach, and the swap
+    /// deletes such placeholders for the pass to re-add.
     pub semantic_sweep: bool,
     /// Whether core may tell this plugin, with a `prepareSemanticPass`
     /// notification, that a whole-project pass is owed before it asks for

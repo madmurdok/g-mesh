@@ -1826,7 +1826,7 @@ mod tests {
     /// `plan_delete_nodes` in `language_swap::plan_attached` -> the swap fails
     /// on the foreign key from the kept `alpha-sem` into the deleted
     /// `alpha-sp` (production runs without foreign keys: both gone at the
-    /// swap); drop `self.store.claim(diff)` from `Writer::apply_diff_linked`
+    /// swap); drop `store.claim(diff)` from `Writer::apply_diff_linked`
     /// -> the rows are gone after the pass.
     #[test]
     fn a_semantic_placeholder_and_its_edge_survive_an_unchanged_swap() {
