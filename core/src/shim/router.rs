@@ -975,6 +975,7 @@ mod tests {
             text.contains("after the call was sent. "),
             "no switch happened, so no cause is claimed: {text}"
         );
+        assert!(text.contains("Its result, if any, was not received"), "{text}");
         session.session.join().unwrap().expect("the session ends when its daemon does");
     }
 }
