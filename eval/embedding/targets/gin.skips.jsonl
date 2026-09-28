@@ -1,0 +1,26 @@
+{"n": 15, "qualifiedName": "RouterGroup.PATCH", "reason": "duplicate: its honest query (register a handler for PATCH) has the same expected set as gin-007 (#7)"}
+{"n": 21, "qualifiedName": "bsonBinding.Name", "reason": "trivial: returns the constant string \"bson\""}
+{"n": 23, "qualifiedName": "msgpackBinding", "reason": "trivial: empty marker struct msgpackBinding struct{}"}
+{"n": 24, "qualifiedName": "responseWriter.Size", "reason": "trivial: one-line accessor returning w.size"}
+{"n": 25, "qualifiedName": "Core.NewDecoder", "reason": "too-broad: creating a JSON stream decoder is satisfied by Core.NewDecoder plus jsonApi/sonicApi/jsoniterApi/gojsonApi.NewDecoder (5 symbols), and naming a library would drop the target"}
+{"n": 31, "qualifiedName": "TOML.WriteContentType", "reason": "trivial: one-line delegation writeContentType(w, tomlContentType)"}
+{"n": 36, "qualifiedName": "tomlBinding", "reason": "trivial: empty marker struct tomlBinding struct{}"}
+{"n": 39, "qualifiedName": "head", "reason": "trivial: one-line wrapper over strings.Cut returning head and tail"}
+{"n": 43, "qualifiedName": "formBinding", "reason": "trivial: empty marker struct formBinding struct{}"}
+{"n": 45, "qualifiedName": "Render.WriteContentType", "reason": "too-broad: the content-type-writing interface method is implemented by about 20 renderers (grep -n 'WriteContentType' render/*.go), no honest query narrows it to the interface alone"}
+{"n": 47, "qualifiedName": "Context.requestHeader", "reason": "trivial: one-line delegation c.Request.Header.Get(key)"}
+{"n": 52, "qualifiedName": "YAML.WriteContentType", "reason": "trivial: one-line delegation writeContentType(w, yamlContentType)"}
+{"n": 55, "qualifiedName": "HTML.WriteContentType", "reason": "trivial: one-line delegation writeContentType(w, htmlContentType)"}
+{"n": 63, "qualifiedName": "uriBinding", "reason": "trivial: empty marker struct uriBinding struct{}"}
+{"n": 68, "qualifiedName": "formMultipartBinding", "reason": "trivial: empty marker struct formMultipartBinding struct{}"}
+{"n": 69, "qualifiedName": "plainBinding.Name", "reason": "trivial: returns the constant string \"plain\""}
+{"n": 85, "qualifiedName": "Render.Render", "reason": "too-broad: the renderer write method is implemented by ~20 render types (grep -n ') Render(w http.ResponseWriter)' render/*.go)"}
+{"n": 88, "qualifiedName": "formPostBinding", "reason": "trivial: empty marker struct formPostBinding struct{}"}
+{"n": 94, "qualifiedName": "Error.SetType", "reason": "trivial: setter assigning msg.Type and returning msg"}
+{"n": 98, "qualifiedName": "xmlBinding", "reason": "trivial: empty marker struct xmlBinding struct{}"}
+{"n": 102, "qualifiedName": "AsciiJSON.Render", "reason": "duplicate: its query (escape non-ASCII characters when writing JSON) has the same expected set as gin-030 (#38), which already lists AsciiJSON.Render"}
+{"n": 108, "qualifiedName": "gojsonApi", "reason": "trivial: empty marker struct gojsonApi struct{}"}
+{"n": 111, "qualifiedName": "Core.Marshal", "reason": "too-broad: marshal-to-bytes is satisfied by Core.Marshal plus four library implementations (sqlite: qualifiedName LIKE '%Api.Marshal')"}
+{"n": 115, "qualifiedName": "BSON.WriteContentType", "reason": "trivial: one-line delegation writeContentType(w, bsonContentType)"}
+{"n": 117, "qualifiedName": "Context.ShouldBindBodyWithYAML", "reason": "trivial: one-line delegation to ShouldBindBodyWith(obj, binding.YAML)"}
+{"n": 124, "qualifiedName": "LoadHTMLGlob", "reason": "duplicate: same expected set as gin-075 (#95), which already lists ginS LoadHTMLGlob with Engine.LoadHTMLGlob"}

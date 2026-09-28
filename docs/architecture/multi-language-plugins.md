@@ -398,6 +398,9 @@ semantic_pass = true
 # true: a complete whole-project pass re-sends every semantic edge it stands behind,
 # so core deletes this language's semantic edges it did not re-send. Default false.
 semantic_sweep = true
+# true: core sends prepareSemanticPass before an owed whole-project pass, so a slow
+# engine can start while core walks and asks other languages. Default false.
+semantic_prepare = false
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"
@@ -487,12 +490,19 @@ pub struct WireEdge {
 }
 ```
 
-The control messages are unchanged apart from one addition. `fileChanged` and
+The control messages are unchanged apart from two additions. `fileChanged` and
 `semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff.
 
 - **New:** `workspaceChanged { filePath }`, a notification. It exists so a plugin
   can drop cached module or crate maps. Core follows it with the per-language
   reindex, so the plugin does not have to answer with a diff.
+- **New:** `prepareSemanticPass`, a notification with no params. Core sends it
+  when a whole-project `semanticPass` is owed (after the cold walk, on an owed
+  retry, and right after `workspaceChanged`), before asking for the pass, and
+  only to a plugin declaring both `semantic_pass` and `semantic_prepare` whose
+  semantic tier is not suspended. The SDK starts the engine on it; readiness is
+  still decided inside the pass. Measurements and the choice of trigger:
+  [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
 
 ### Process lifetime: stdin is the lifeline (GM-397)
 
@@ -697,6 +707,24 @@ than silence. `core/src/mcp/provenance.rs`'s module doc has the full
 argument, including why the per-edge `source`/`engine` columns cannot answer
 this question and why the block is response-level rather than per-row (on
 excalidraw's `pointFrom` at `limit: 200`, 51 rows: 63 bytes against 2448).
+
+After a workspace reindex swaps a language in, its whole-project semantic
+pass runs against live, and until it finishes the block says `pending`
+instead of `absent` ([ADR 0009](../adr/0009-semantic-pending.md)):
+
+```json
+"provenance": { "language": "rust", "semanticTier": "pending",
+                "since": "2026-09-26T10:14:03Z", "pendingFiles": ["core/src/a.rs"] }
+```
+
+`pendingFiles` lists the files this response names (the anchor's first)
+whose edges the pass has not refreshed yet, at most 25, with
+`pendingFilesOmitted` counting the rest; it is absent when none are. The
+state lives in `semantic_pending`/`semantic_pending_files`, written in the
+swap's transaction and cleared by any recorded outcome of the pass: a
+failed, incomplete or not-run pass clears it too, and the language reads
+`absent` again. A complete per-file pass clears its own file. `g-mesh status`
+prints a `semantic pending:` line per such language.
 
 ### Plugin SDK (`plugins/sdk`, Rust crate)
 

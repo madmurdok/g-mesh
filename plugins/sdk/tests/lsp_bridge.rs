@@ -1669,3 +1669,265 @@ fn a_ceiling_that_cuts_a_pass_short_retracts_nothing_it_did_not_ask_about() {
         second.diff
     );
 }
+
+/// GM-433 (GM-429 finding 1): after a `workspaceChanged`, the next pass waits
+/// out the server's whole reload rather than the first gap in it.
+///
+/// The scripted server is rust-analyzer after a version bump: it notices the
+/// manifest change itself (here, a trigger file), then reports two phases
+/// with a gap between them - "Building compile-time-deps", ~13ms of silence,
+/// "Building CrateGraph" and the rest - answering `null` throughout. Pass one
+/// has already latched the settle, which is the state a warm server is in
+/// when the bump arrives. The test waits until the reload's first `begin` is
+/// on the wire before it tells the bridge about the change and runs the
+/// pass, so the pass starts mid-reload by construction, not by a race.
+///
+/// Unfixed, the latched client reads the end of phase one as ready, asks into
+/// the gap, is answered `null`, defers, and re-asks after phase two: two
+/// `definition` requests for one site - the "asks every question twice" of
+/// the finding. Fixed, `workspace_changed` unlatches the settle and the one
+/// question goes out once the server has been quiet for a whole settle.
+/// Settle is 1s against a 30ms gap, a margin that survives a loaded machine
+/// (see `a_gap_between_two_progress_phases_is_not_readiness`).
+#[test]
+fn after_a_workspace_change_each_question_is_asked_once_after_the_reload() {
+    let scratch = Scratch::new("workspace-reload");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let trigger = scratch.path().join("manifest.bumped");
+    let started = scratch.path().join("reload.started");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+        "reloadOnFile": {
+            "trigger": trigger.to_string_lossy(),
+            "started": started.to_string_lossy(),
+            "phases": [
+                { "token": "compile-time-deps", "holdMs": 100 },
+                { "token": "crate-graph", "beginAfterMs": 30, "holdMs": 600 },
+            ],
+        },
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(1_000);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    // Pass one latches the settle, as on any warm server.
+    let first = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&first).len(), 1, "the baseline pass resolves the site: {:#?}", first.diff);
+
+    // The bump: the server starts reloading, and core says so.
+    std::fs::write(&trigger, "").expect("write the trigger");
+    let waiting = std::time::Instant::now();
+    while !started.exists() {
+        assert!(waiting.elapsed() < Duration::from_secs(10), "the scripted reload never began");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    bridge.workspace_changed();
+
+    let before = asked(&log, "textDocument/definition");
+    let uptime_before = uptime();
+    let clock = std::time::Instant::now();
+    let second = pass(&mut bridge, &index);
+    let elapsed = clock.elapsed();
+    let after = asked(&log, "textDocument/definition");
+    eprintln!(
+        "after_a_workspace_change_each_question_is_asked_once_after_the_reload: pass two took \
+         {elapsed:?}; uptime before {uptime_before:?}, after {:?}",
+        uptime()
+    );
+
+    assert_eq!(semantic_edges(&second).len(), 1, "the site is resolved: {:#?}", second.diff);
+    assert!(second.complete, "{:?}", second.reason);
+    assert_eq!(
+        after - before,
+        1,
+        "the question is asked once, after the reload - not into the gap between its phases and \
+         then again"
+    );
+}
+
+/// GM-433, the half that must not regress: `workspaceChanged` makes an
+/// indexed server's next pass pay the settle again, and leaves an on-demand
+/// one alone (see `LspClient::unsettle` for that decision).
+///
+/// Both arms run one pass (latching), then a change, then a second pass
+/// timed. A server with no progress becomes ready purely by the clock, so
+/// the indexed arm's second pass waits out the 900ms settle only if the
+/// change unlatched it; the on-demand arm's must not. Relative, like
+/// `an_on_demand_server_does_not_wait_out_a_settle_its_manifest_says_it_does_not_need`.
+#[test]
+fn a_workspace_change_costs_an_indexed_server_a_settle_and_an_on_demand_one_nothing() {
+    let scratch = Scratch::new("workspace-settle");
+    let (index, _) = fixture(&scratch);
+    let script = json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    });
+
+    let mut elapsed = Vec::new();
+    for readiness in [ServerReadiness::Indexed, ServerReadiness::OnDemand] {
+        let mut config = scratch.server(script.clone());
+        config.readiness = readiness;
+        let mut budgets = budgets();
+        budgets.settle = Duration::from_millis(900);
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+        assert_eq!(semantic_edges(&pass(&mut bridge, &index)).len(), 1, "{readiness:?}");
+        bridge.workspace_changed();
+        let started = std::time::Instant::now();
+        let answer = pass(&mut bridge, &index);
+        elapsed.push(started.elapsed());
+        assert_eq!(semantic_edges(&answer).len(), 1, "{readiness:?}: {:#?}", answer.diff);
+        assert!(answer.complete, "{readiness:?}");
+    }
+
+    let load = uptime();
+    assert!(
+        elapsed[0] >= Duration::from_millis(800),
+        "the indexed arm waits out a settle after the change: {:?} ({load})",
+        elapsed[0]
+    );
+    let saved = elapsed[0].saturating_sub(elapsed[1]);
+    assert!(
+        saved >= Duration::from_millis(500),
+        "the on-demand arm must not: indexed {:?}, on-demand {:?}, saved only {saved:?} ({load})",
+        elapsed[0],
+        elapsed[1]
+    );
+}
+
+/// GM-433: LSP `ContentModified` (-32801) is "ask again", not a refusal.
+/// rust-analyzer answers it to every request in flight when it switches crate
+/// graphs; before this, one of them made the whole pass incomplete and the
+/// next daemon start reran it.
+#[test]
+fn a_content_modified_answer_is_asked_again_and_the_pass_is_complete() {
+    let scratch = Scratch::new("content-modified");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("content modified");
+    answers[0]["errorCode"] = json!(-32801);
+    answers[0]["errorTimes"] = json!(1);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "a ContentModified is not a refusal: {:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "the re-ask is answered: {:#?}", answer.diff);
+    assert_eq!(asked(&log, "textDocument/definition"), 2, "asked, modified, asked again");
+}
+
+/// GM-433, the bound on the above: "again" is once, under the same
+/// `re_asked` rule as an empty answer. A server that answers
+/// `ContentModified` every time is refused on the second, and the pass says
+/// so - rather than re-asking until its budget runs out.
+#[test]
+fn a_question_modified_twice_is_refused_rather_than_asked_forever() {
+    let scratch = Scratch::new("content-modified-twice");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("content modified");
+    answers[0]["errorCode"] = json!(-32801);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("content modified"), "{}", reason(&answer));
+    assert_eq!(asked(&log, "textDocument/definition"), 2, "asked twice, not more");
+}
+
+/// `prepare` (core's `prepareSemanticPass`) starts the server before any
+/// pass is asked, the pass then uses that server instead of a second one,
+/// and the pass answers exactly what a pass on an unprepared bridge answers.
+/// Without `prepare`, constructing the bridge starts nothing.
+///
+/// Control: make `LspBridge::prepare` a no-op (the trait default) and the
+/// "started before the pass" assertion fails.
+#[test]
+fn a_prepared_server_starts_before_the_pass_and_answers_the_same() {
+    let scratch = Scratch::new("prepare");
+    let (index, _) = fixture(&scratch);
+    let script = |log: &Path| {
+        json!({
+            "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 0 },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "log": log.to_string_lossy(),
+        })
+    };
+
+    let unprepared_log = scratch.path().join("unprepared.log");
+    let mut unprepared =
+        LspBridge::with_budgets("toy", scratch.path(), scratch.server(script(&unprepared_log)), budgets());
+    assert_eq!(asked(&unprepared_log, "initialize"), 0, "constructing a bridge starts no server");
+    let baseline = pass(&mut unprepared, &index);
+    drop(unprepared);
+
+    let prepared_log = scratch.path().join("prepared.log");
+    let mut prepared =
+        LspBridge::with_budgets("toy", scratch.path(), scratch.server(script(&prepared_log)), budgets());
+    prepared.prepare();
+    assert_eq!(asked(&prepared_log, "initialize"), 1, "prepare starts and initializes the server");
+    assert_eq!(asked(&prepared_log, "textDocument/definition"), 0, "and asks it nothing yet");
+
+    let answer = pass(&mut prepared, &index);
+    assert_eq!(asked(&prepared_log, "initialize"), 1, "the pass uses the prepared server");
+    assert!(answer.complete && baseline.complete);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert_eq!(answer.diff, baseline.diff, "preparing changes when the server starts, not what it answers");
+}
+
+/// A server started by `prepare` is still made to prove its readiness inside
+/// the pass: one that indexes, answering `null` meanwhile, is waited for.
+///
+/// Control: have `prepare` mark the client settled (or skip `wait_ready` for
+/// a prepared server) and the pass asks during indexing and finds no edge.
+#[test]
+fn a_prepared_server_is_still_waited_for_by_the_pass() {
+    let scratch = Scratch::new("prepare-ready");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 600 },
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    bridge.prepare();
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "asked only once the server had finished indexing");
+}
+
+/// A missing server binary found by `prepare` turns the tier off exactly as
+/// a pass's own start would: the pass reports it, starting nothing.
+#[test]
+fn a_missing_server_found_by_prepare_is_reported_by_the_pass() {
+    let scratch = Scratch::new("prepare-missing");
+    let (index, _) = fixture(&scratch);
+    let config = SemanticConfig::new(scratch.path().join("there-is-no-such-server"));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    bridge.prepare();
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("could not be started"), "{}", reason(&answer));
+}

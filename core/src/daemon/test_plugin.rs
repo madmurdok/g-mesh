@@ -101,6 +101,13 @@ const REQUEST_LOG: &str = "requests.log";
 /// only [`notifications`] can answer.
 const NOTIFICATION_LOG: &str = "notifications.log";
 
+/// The file, in the directory *above* each plugin directory, that every fake
+/// plugin under it appends `"<language> <method>"` to for every framed message
+/// it receives, request or notification. One file shared by all of them, so a
+/// test can assert the order in which core sent messages to different
+/// plugins ([`frames`]).
+const FRAME_LOG: &str = "frames.log";
+
 /// Marks that a [`install_stalling`] plugin directory's *very first* framed
 /// request has already been (deliberately) left unanswered - see that
 /// function's doc comment. Written by the process that hits it, and read by
@@ -113,6 +120,11 @@ const STALL_MARKER: &str = "stalled-once.marker";
 /// answered one `semanticPass` as incomplete - kept on disk for the same
 /// reason as [`STALL_MARKER`].
 const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
+
+/// A plugin directory holding this file answers every complete
+/// `semanticPass` with its contents as the diff, instead of an empty one. See
+/// [`set_semantic_pass_answer`].
+const SEMANTIC_ANSWER: &str = "semantic-pass.json";
 
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
@@ -344,6 +356,19 @@ pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
     fs::write(&path, swept).expect("failed to write the fake plugin's manifest");
 }
 
+/// Makes every later complete `semanticPass` to the plugin in `plugin_dir`
+/// answer with `diff` (a `FileChangeDiff` as JSON), or, with `None`, with an
+/// empty diff again. Read per request, so it takes effect without a respawn.
+pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
+    let path = plugin_dir.join(SEMANTIC_ANSWER);
+    match diff {
+        Some(diff) => fs::write(&path, diff).expect("failed to write the fake plugin's semantic answer"),
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// Every pid this plugin directory has ever been spawned as, oldest first.
 /// Empty (rather than a panic) before the first spawn - "never spawned" is a
 /// perfectly ordinary thing for a test to assert.
@@ -369,6 +394,24 @@ pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
 pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(NOTIFICATION_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
+}
+
+/// Every framed message any fake plugin installed under `plugins_root` has
+/// received, oldest first, as `"<language> <method>"` - see [`FRAME_LOG`].
+pub(crate) fn frames(plugins_root: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugins_root.join(FRAME_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
+}
+
+/// Adds `semantic_prepare = true` to a semantic-pass-capable plugin's
+/// `[plugin.capabilities]`. Takes effect at the next `discover`.
+pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest prepares");
+    let prepared =
+        manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_prepare = true\n");
+    fs::write(&path, prepared).expect("failed to write the fake plugin's manifest");
 }
 
 /// Just the `fileChanged` requests among [`requests`], as the file path each
@@ -601,6 +644,7 @@ process.stdin.on("data", (chunk) => {{
     if (buffered.length < bodyEnd) return;
     const request = JSON.parse(buffered.slice(bodyStart, bodyEnd).toString("utf8"));
     buffered = buffered.slice(bodyEnd);
+    fs.appendFileSync(path.join(__dirname, "..", "{FRAME_LOG}"), "{language} " + request.method + "\n");
     if (request.id !== undefined && request.id !== null) {{
       const filePath = (request.params && request.params.filePath) || "";
       fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
@@ -624,6 +668,9 @@ process.stdin.on("data", (chunk) => {{
           response.incompleteReason = incompleteReason;
         }}
         writeFrame(response);
+      }} else if (request.method === "semanticPass" && fs.existsSync(path.join(__dirname, "{SEMANTIC_ANSWER}"))) {{
+        const answer = JSON.parse(fs.readFileSync(path.join(__dirname, "{SEMANTIC_ANSWER}"), "utf8"));
+        writeFrame({{ jsonrpc: "2.0", id: request.id, result: answer }});
       }} else {{
         writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
       }}

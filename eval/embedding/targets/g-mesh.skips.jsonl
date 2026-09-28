@@ -1,0 +1,9 @@
+{"n": 2, "qualifiedName": "cli::model::ModelSource::describe", "reason": "trivial: returns a constant label per enum variant"}
+{"n": 17, "qualifiedName": "extractor::decls::member_tail", "reason": "trivial: one-line delegation to BlockCtx::tail or the bare name"}
+{"n": 27, "qualifiedName": "mcp::get_file_outline::<OutlineSymbol as From>::from", "reason": "boilerplate: field-by-field copy from NodeRecord"}
+{"n": 29, "qualifiedName": "mcp::instructions::assemble", "reason": "trivial: joins five constant paragraphs with blank lines"}
+{"n": 39, "qualifiedName": "ipc::unix::<Stream as Read>::read", "reason": "boilerplate: forwards to the inner UnixStream"}
+{"n": 41, "qualifiedName": "mcp::tool_result::success", "reason": "trivial: one-line wrapper building a JSON tool result"}
+{"n": 45, "qualifiedName": "semantic::LazyEngine::configured", "reason": "trivial: one-line boolean over two fields"}
+{"n": 49, "qualifiedName": "census::enable", "reason": "trivial: sets a thread-local flag"}
+{"n": 54, "qualifiedName": "project::ProjectContext::notes", "reason": "trivial: field accessor"}

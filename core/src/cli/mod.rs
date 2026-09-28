@@ -29,6 +29,7 @@ pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;
 pub mod debug_candidates;
+pub mod embed_eval;
 pub mod init;
 pub mod model;
 pub mod plugin_check;
@@ -118,6 +119,15 @@ pub enum Command {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Scores embedding models against the search-quality eval's query set
+    /// (`docs/architecture/embedding-eval.md`): snapshot, run, report,
+    /// parity. An instrument for choosing the model - not a user-facing
+    /// command.
+    #[command(hide = true)]
+    DebugEmbedEval {
+        #[command(subcommand)]
+        command: embed_eval::EmbedEvalCommand,
     },
 }
 
@@ -222,6 +232,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),
         Command::DebugCandidates { dir, json } => debug_candidates::run(dir, json),
+        Command::DebugEmbedEval { command } => embed_eval::run(command),
     }
 }
 

@@ -56,7 +56,7 @@ use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 use crate::embedding::resolve_model_dir;
 
 /// The Hugging Face repository the default model comes from.
-const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
+pub(crate) const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
 
 /// Pinned, and pinned to a commit hash rather than a branch: these are the
 /// exact weights the embedding tests were verified against, and bumping this
@@ -64,7 +64,7 @@ const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
 /// the old one (REQUIREMENTS.md, "Инвалидация эмбеддингов при смене
 /// embedding-модели"). An immutable revision is also what makes the digests
 /// below meaningful - the bytes at this commit cannot legitimately change.
-const MODEL_REVISION: &str = "516f4baf13dec4ddddda8631e019b5737c8bc250";
+pub(crate) const MODEL_REVISION: &str = "516f4baf13dec4ddddda8631e019b5737c8bc250";
 
 /// Where the weights are fetched from, tried in order.
 ///

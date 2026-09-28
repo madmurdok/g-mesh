@@ -349,6 +349,18 @@ pub enum ControlMessage {
     WorkspaceChanged {
         file_path: String,
     },
+    /// Tells a plugin that a whole-project `semanticPass` is owed and will be
+    /// asked for, so it may start its semantic engine now rather than inside
+    /// that request - an engine that takes seconds to become ready then does
+    /// so while core walks and asks other languages. A notification: nothing
+    /// is answered, and readiness is still decided inside the pass itself.
+    ///
+    /// Sent only to a plugin whose manifest declares both
+    /// `capabilities.semantic_pass` and `capabilities.semantic_prepare`, never
+    /// to a language whose semantic tier is suspended, and only when that
+    /// language's pass really is owed - so it never starts an engine for
+    /// structural work, which is the lazy-engine contract's whole point.
+    PrepareSemanticPass,
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -425,11 +437,10 @@ pub struct FileChangeResponse {
     /// pass did resolve, and the retry would have to redo all of them from
     /// nothing.
     ///
-    /// Absent means `false`, so a plugin that predates this field - the
-    /// bundled JS/TS plugin (GM-384 gave the bundled Go plugin its own
-    /// `incomplete: true`), and any third-party one that has not adopted it -
-    /// keeps answering exactly as it did: a pass that answers at all is a
-    /// pass that finished. That is also why this is not an enum: the only
+    /// Absent means `false`, so a plugin that predates this field - any
+    /// third-party one that has not adopted it - keeps answering exactly as
+    /// it did: a pass that answers at all is a pass that finished. That is
+    /// also why this is not an enum: the only
     /// thing core branches on is "was this pass complete"; the reason it was
     /// not travels separately, in words, as [`Self::incomplete_reason`].
     #[serde(default, skip_serializing_if = "is_false")]
@@ -795,6 +806,21 @@ mod tests {
         assert!(json.contains("\"workspaceChanged\""), "{json}");
         assert!(json.contains("\"filePath\":\"go.mod\""), "{json}");
         assert!(!json.contains("\"id\""), "notifications must omit id per JSON-RPC 2.0");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
+
+    /// The SDK matches on this exact method string, with no params.
+    #[test]
+    fn prepare_semantic_pass_round_trips_as_a_notification() {
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::PrepareSemanticPass,
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(json, r#"{"jsonrpc":"2.0","method":"prepareSemanticPass"}"#);
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
     }

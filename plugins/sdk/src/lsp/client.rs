@@ -79,6 +79,12 @@ use crate::framing::{read_frame, write_message};
 /// produce megabytes per pass, and the daemon's log is a shared resource.
 const STDERR_LINE_BUDGET: usize = 200;
 
+/// LSP's `ContentModified` error code: the server's state changed while it
+/// was answering, so the answer it would have given is void - not a refusal
+/// of the question. rust-analyzer sends it for every request in flight when
+/// it switches crate graphs (GM-429 finding 1, GM-433).
+pub(crate) const CONTENT_MODIFIED: i64 = -32801;
+
 /// What [`LspClient::poll`] saw.
 #[derive(Debug)]
 pub(crate) enum Poll {
@@ -86,8 +92,10 @@ pub(crate) enum Poll {
     /// server answered, `Value::Null` included - which for `definition` is
     /// the ordinary "nothing here" answer and not an error.
     Answered { id: i64, result: Value },
-    /// The server answered a request with a JSON-RPC error.
-    Failed { id: i64, message: String },
+    /// The server answered a request with a JSON-RPC error. `code` is the
+    /// error's own code, when it carried a numeric one - the difference
+    /// between a refusal and [`CONTENT_MODIFIED`], "ask me again" (GM-433).
+    Failed { id: i64, code: Option<i64>, message: String },
     /// Something moved that is not an answer: a progress notification, a
     /// server request this client replied to, a log message. The caller
     /// re-reads whatever state it is waiting on.
@@ -108,7 +116,7 @@ static LIVE_SERVERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
 /// control-plane reader's lifeline path, which ends the process while the main
 /// thread may be deep in a request holding the clients - so the kill goes
 /// through the shared `Child` handles rather than through `LspClient`.
-pub(crate) fn kill_live_servers() {
+pub fn kill_live_servers() {
     let servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for server in servers.iter().filter_map(Weak::upgrade) {
         let mut child = lock(&server);
@@ -171,6 +179,10 @@ pub(crate) struct LspClient {
     /// rule, no second state machine - one server-shaped fact setting a latch
     /// that exists.
     settled: bool,
+    /// Whether this server's manifest says
+    /// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand) -
+    /// what [`LspClient::unsettle`] resets the latch *to*.
+    on_demand: bool,
     /// Set once the server's stdout has closed, so a caller that polls again
     /// after a crash is told the same thing rather than blocking.
     closed: bool,
@@ -240,6 +252,7 @@ impl LspClient {
             active_progress: BTreeMap::new(),
             idle_since: Some(Instant::now()),
             settled: config.readiness == ServerReadiness::OnDemand,
+            on_demand: config.readiness == ServerReadiness::OnDemand,
             closed: false,
         };
         client.initialize(config, root, deadline)?;
@@ -344,7 +357,8 @@ impl LspClient {
     }
 
     /// Whether this server is ready to be believed, latching the first time
-    /// it is.
+    /// it is - until a `workspaceChanged` unlatches it
+    /// ([`LspClient::unsettle`], GM-433).
     ///
     /// The first answer costs a full `quiet` period of silence; every answer
     /// after that costs only "nothing is in flight right now". A server
@@ -366,6 +380,45 @@ impl LspClient {
         }
         self.settled = self.quiet_for(quiet);
         self.settled
+    }
+
+    /// Undoes [`LspClient::settle`]'s latch, so the next
+    /// [`wait_ready`](super::bridge::LspBridge) pays a full settle again -
+    /// GM-433. Called on a `workspaceChanged` only, never on a per-file edit
+    /// (that is [`LspClient::mark_edited`], which keeps GM-290's guarantee
+    /// that a per-file pass never pays a settle).
+    ///
+    /// A project-model change is the one event after which a server that has
+    /// already proved its shape starts over: measured on rust-analyzer after a
+    /// version bump (GM-429 finding 1), it ends "Building compile-time-deps",
+    /// is silent for ~13ms, then spends 3.4-4.5s on "Building CrateGraph",
+    /// "Roots Scanned", "Loading proc-macros" and "Indexing". A latched
+    /// client reads that 13ms gap as ready, and every question asked into
+    /// the next four seconds comes back empty or `ContentModified`. That is
+    /// the same sequence-of-tokens shape the settle exists for at start-up,
+    /// so it gets the same settle.
+    ///
+    /// The quiet clock restarts here too, as in [`LspClient::mark_edited`]
+    /// (and only when nothing is in flight, for the same reason): a server
+    /// that has not yet begun reporting its reload - it watches the manifest
+    /// itself, and core's notice may reach this plugin first - has been
+    /// quiet since long before the change, and without the restart that old
+    /// quiet would satisfy the settle at once.
+    ///
+    /// An on-demand server is left unchanged: latched, clock untouched. Its
+    /// manifest's claim (GM-310) is that it answers correctly without an
+    /// up-front quiet period, traced for pyright on start-up; nothing
+    /// measured says a project-model change makes that false for it, and
+    /// adding 2s per workspace change to it would be an unmeasured cost.
+    /// Whatever it does report in flight is still waited for
+    /// (`quiet_for(Duration::ZERO)`), and its empty answers are still
+    /// deferred while it is busy.
+    pub(crate) fn unsettle(&mut self) {
+        if self.on_demand {
+            return;
+        }
+        self.settled = false;
+        self.mark_edited();
     }
 
     /// Whether this server is gone.
@@ -494,7 +547,8 @@ impl LspClient {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("the server reported an error with no message");
-                    return Poll::Failed { id, message: text.to_string() };
+                    let code = error.get("code").and_then(Value::as_i64);
+                    return Poll::Failed { id, code, message: text.to_string() };
                 }
                 Poll::Answered { id, result: message.get("result").cloned().unwrap_or(Value::Null) }
             }
@@ -549,7 +603,7 @@ impl LspClient {
             };
             match self.poll(remaining.min(Duration::from_millis(100))) {
                 Poll::Answered { id, result } if id == wanted => return Ok(result),
-                Poll::Failed { id, message } if id == wanted => {
+                Poll::Failed { id, message, .. } if id == wanted => {
                     bail!("the server answered request {wanted} with an error: {message}")
                 }
                 Poll::Closed => bail!("the language server exited before answering request {wanted}"),

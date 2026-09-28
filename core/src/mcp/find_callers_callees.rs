@@ -372,7 +372,13 @@ pub(crate) fn handle_callers(
             pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page_reserving_two_tallies(rows, page.has_more, page.next_cursor);
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let bounded = pagination::bound_page_reserving_two_tallies(
+        rows,
+        page.has_more,
+        page.next_cursor,
+        tier.page_reserve(),
+    );
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to tally calling files", e))?;
@@ -380,6 +386,15 @@ pub(crate) fn handle_callers(
         pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
+
+    // Every file this response names: rows, the tally, the excluded tally.
+    let touched = bounded
+        .results
+        .iter()
+        .map(|row| row.file_path.as_str())
+        .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
+        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())));
+    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
 
     success(&CallerPage {
         anchor: anchor_info,
@@ -390,7 +405,7 @@ pub(crate) fn handle_callers(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
-        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
+        provenance,
     })
 }
 
@@ -434,9 +449,22 @@ pub(crate) fn handle_callees(
             pagination::EdgeRow { item: CalleeSite::from(site), resolved, locality, edge_id }
         })
         .collect();
-    let bounded = pagination::bound_page_reserving_excluded_tally(rows, page.has_more, page.next_cursor);
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let bounded = pagination::bound_page_reserving_excluded_tally(
+        rows,
+        page.has_more,
+        page.next_cursor,
+        tier.page_reserve(),
+    );
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths);
+
+    // Every file this response names: rows and the excluded tally.
+    let touched =
+        bounded.results.iter().map(|row| row.file_path.as_str()).chain(
+            excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())),
+        );
+    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
 
     success(&CalleePage {
         anchor: anchor_info,
@@ -446,7 +474,7 @@ pub(crate) fn handle_callees(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
-        provenance: provenance::resolve(&conn, capabilities, &anchor.language),
+        provenance,
     })
 }
 
@@ -599,6 +627,7 @@ mod tests {
             Capabilities {
                 semantic_pass: true,
                 semantic_sweep: false,
+                semantic_prepare: false,
                 receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
                 receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
             },

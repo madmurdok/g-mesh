@@ -70,6 +70,7 @@ const NPM: &str = "npm";
 const GO_PLUGIN_BINARY: &str = "g-mesh-plugin-go";
 
 include!("go_plugin_build_flags.rs");
+include!("ts_build_stamp.rs");
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets this"));
@@ -81,12 +82,29 @@ fn main() {
 fn build_ts_plugin(manifest_dir: &Path) {
     let plugin_dir = manifest_dir.join("../plugins/typescript");
 
-    println!("cargo:rerun-if-changed={}", plugin_dir.join("src").display());
-    println!("cargo:rerun-if-changed={}", plugin_dir.join("package.json").display());
-    println!("cargo:rerun-if-changed={}", plugin_dir.join("tsconfig.json").display());
+    // The same list the skip below digests - see `TS_BUILD_INPUTS`.
+    for input in TS_BUILD_INPUTS {
+        println!("cargo:rerun-if-changed={}", plugin_dir.join(input).display());
+    }
+
+    // Cargo also reruns this script when nothing the plugin reads changed (a
+    // version bump changes the package's fingerprint); then the build would
+    // reproduce what is already there.
+    if !ts_build_needed(&plugin_dir) {
+        return;
+    }
+    ts_forget_build(&plugin_dir);
 
     match Command::new(NPM).arg("run").arg("build").current_dir(&plugin_dir).status() {
-        Ok(status) if status.success() => {}
+        Ok(status) if status.success() => {
+            if let Err(err) = ts_record_build(&plugin_dir) {
+                println!(
+                    "cargo:warning=could not record the JS/TS plugin's build inputs in {} ({err}) - the next \
+                     build script run rebuilds it rather than skipping",
+                    plugin_dir.display()
+                );
+            }
+        }
         // `npm run build` invokes `tsc` out of `node_modules/.bin`, which a
         // fresh clone does not have until `npm ci` has populated it - that
         // failure (exit status 127, "tsc: not found") is indistinguishable

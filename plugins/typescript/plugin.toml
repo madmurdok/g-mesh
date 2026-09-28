@@ -41,9 +41,11 @@ extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 # TypeScript's own checker is this plugin's semantic tier (src/semantic.ts) -
 # core may send it a semanticPass request.
 semantic_pass = true
-# Off: the checker's pass upgrades structural edges in place and never
-# reports itself incomplete, so a sweep after a pass that stopped part-way
-# would delete the upgraded edges it did not reach (ADR 0008, section 3).
+# Off: the checker's pass upgrades structural edges in place, under the
+# structural edge's own id, so a sweep after a pass that no longer re-sends an
+# upgrade (the checker now answers with no single declaration) would delete
+# the edge itself rather than fall back to the structural one (ADR 0008,
+# section 3).
 semantic_sweep = false
 # Both tiers leave receiver calls (`x.foo()`) unresolved: the structural pass
 # has no type information to know what `x` is, and the semantic pass

@@ -12,7 +12,7 @@ import {
 } from "../src/extract";
 import { resetIncrementalState } from "../src/incremental";
 import { createProjectResolver } from "../src/resolve";
-import { SemanticProject } from "../src/semantic";
+import { SemanticProject, type DefinitionLocation, type TsServerPosition } from "../src/semantic";
 import {
   resetSemanticPassState,
   runSemanticPass,
@@ -950,6 +950,7 @@ export function run(): number {
     assert.deepEqual(result.upsertEdges, []);
     assert.deepEqual(result.upsertNodes, []);
     assert.equal(result.unresolvedUses, 1, "the site is counted, not silently dropped");
+    assert.equal(result.incomplete, true, "a checker that never answered did not cover the scope");
     assert.ok(
       logged.some((message) => message.includes("ns.someExport")),
       `the failure must be reported: ${JSON.stringify(logged)}`,
@@ -973,6 +974,173 @@ test("a checker that dies costs the pass its answers, not the plugin", async () 
   try {
     const diff = await runSemanticPass(root, ["caller.ts"], { project });
     assert.deepEqual(diff.upsertEdges, []);
+  } finally {
+    await project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- saying when the pass fell short -------------------------------------
+
+/** A real tsserver that fails every question asked about one file - the shape
+ * a crash inside the checker on that file takes from here. */
+class FailingOnOneFile extends SemanticProject {
+  constructor(
+    root: string,
+    private readonly failing: string,
+  ) {
+    super(root);
+  }
+
+  override async definition(file: string, position: TsServerPosition): Promise<DefinitionLocation[]> {
+    if (file.endsWith(this.failing)) throw new Error(`checker crashed on ${this.failing}`);
+    return super.definition(file, position);
+  }
+}
+
+const NAMESPACE_CALLER = `import * as ns from "./mod";
+
+export function run(): number {
+  return ns.someExport();
+}
+`;
+
+test("a pass the checker fails on one file for is incomplete, and keeps what it did resolve", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/mod.ts": "export function someExport(): number {\n  return 1;\n}\n",
+    "src/app.ts": NAMESPACE_CALLER,
+    "src/other.ts": NAMESPACE_CALLER,
+  });
+  const project = new FailingOnOneFile(root, path.join("src", "other.ts"));
+  try {
+    const result = await runSemanticPass(root, [], { project });
+
+    assert.equal(result.incomplete, true);
+    assert.ok(
+      result.incompleteReason?.includes("other.ts") === true,
+      `the reason must name what was not covered: ${result.incompleteReason}`,
+    );
+    assert.equal(result.upsertEdges.length, 1, "the file the checker did answer for still gets its edge");
+    assert.deepEqual(
+      result.upsertNodes.map((node) => node.filePath),
+      ["src/app.ts"],
+      "and the edge is that file's",
+    );
+  } finally {
+    await project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a pass that covers its whole scope is complete", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/mod.ts": "export function someExport(): number {\n  return 1;\n}\n",
+    "src/app.ts": NAMESPACE_CALLER,
+    "src/other.ts": NAMESPACE_CALLER,
+  });
+  try {
+    const result = await pass(root);
+
+    assert.equal(result.upsertEdges.length, 2, "the fixture must reach the checker for both files");
+    assert.equal(result.incomplete, false);
+    assert.equal(result.incompleteReason, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a file in scope that no longer exists leaves nothing uncovered", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({ "tsconfig.json": TSCONFIG, "src/mod.ts": "export const a = 1;\n" });
+  try {
+    const result = await pass(root, ["src/gone.ts"]);
+    assert.equal(result.incomplete, false, `${result.incompleteReason}`);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "a file in scope that cannot be read makes the pass incomplete",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 ? "chmod 000 does not deny this user" : false },
+  async () => {
+    resetSemanticPassState();
+    const root = await makeProject({
+      "tsconfig.json": TSCONFIG,
+      "src/mod.ts": "export function someExport(): number {\n  return 1;\n}\n",
+      "src/locked.ts": NAMESPACE_CALLER,
+    });
+    const locked = path.join(root, "src", "locked.ts");
+    await fs.chmod(locked, 0o000);
+    try {
+      const result = await pass(root, ["src/locked.ts"]);
+      assert.equal(result.incomplete, true);
+      assert.ok(
+        result.incompleteReason?.includes("could not be read") === true &&
+          result.incompleteReason.includes("src/locked.ts"),
+        `${result.incompleteReason}`,
+      );
+    } finally {
+      await fs.chmod(locked, 0o644);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a file in scope whose extraction throws makes the pass incomplete", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/mod.ts": "export function someExport(): number {\n  return 1;\n}\n",
+    "src/broken.ts": NAMESPACE_CALLER,
+  });
+  // The resolver runs inside extractFile, so throwing from it for one file is
+  // a parse that throws for exactly that file and no other.
+  const real = createProjectResolver(root);
+  const resolveSpecifier = (specifier: string, fromFilePath: string): string | null => {
+    if (fromFilePath.endsWith("broken.ts")) throw new Error("parser exploded");
+    return real(specifier, fromFilePath);
+  };
+  const project = new SemanticProject(root);
+  try {
+    const result = await runSemanticPass(root, ["src/broken.ts"], { project, resolveSpecifier });
+    assert.equal(result.incomplete, true);
+    assert.ok(
+      result.incompleteReason?.includes("could not be parsed") === true &&
+        result.incompleteReason.includes("src/broken.ts"),
+      `${result.incompleteReason}`,
+    );
+  } finally {
+    await project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("questions left unasked after the checker keeps failing are reported, not dropped", async () => {
+  resetSemanticPassState();
+  const members = ["a", "b", "c", "d", "e", "f", "g"];
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/mod.ts": members.map((m) => `export function ${m}(): number {\n  return 1;\n}\n`).join(""),
+    "src/app.ts": `import * as ns from "./mod";
+
+export function run(): number {
+  return ${members.map((m) => `ns.${m}()`).join(" + ")};
+}
+`,
+  });
+  const project = new SemanticProject(root, { tsserverPath: path.join(root, "no-such-tsserver.js") });
+  try {
+    const result = await runSemanticPass(root, [], { project });
+    assert.equal(result.incomplete, true);
+    assert.ok(
+      result.incompleteReason?.includes("2 question(s) never asked") === true,
+      `the skipped questions must be counted: ${result.incompleteReason}`,
+    );
   } finally {
     await project.stop();
     await fs.rm(root, { recursive: true, force: true });

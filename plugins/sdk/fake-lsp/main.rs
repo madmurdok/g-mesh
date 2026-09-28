@@ -68,6 +68,15 @@ struct ScriptedAnswer {
     /// Answer this one with a JSON-RPC error instead.
     #[serde(default)]
     error: Option<String>,
+    /// That error's code - `-32603` (InternalError) when absent; `-32801` is
+    /// LSP's `ContentModified` (GM-433).
+    #[serde(default)]
+    error_code: Option<i64>,
+    /// Answer with the error only this many times, then answer normally -
+    /// a server whose state moved under one question and settled. Absent
+    /// means every time.
+    #[serde(default)]
+    error_times: Option<u32>,
     /// Never answer this one at all - what a per-request timeout is measured
     /// against.
     #[serde(default)]
@@ -175,9 +184,31 @@ struct ReindexOnChange {
     hold_ms: u64,
 }
 
+/// The GM-433 shape: a server reloading its project model after a change it
+/// noticed itself - rust-analyzer after `Cargo.toml` changed, which it
+/// watches on its own, so nothing on the client's wire starts it.
+///
+/// The test starts it by creating `trigger` (the stand-in for the edited
+/// manifest); a watcher thread runs `phases` as [`Readiness::phases`] does
+/// and writes `started` once the first phase's `begin` is on the wire, so the
+/// test can know the server is mid-reload before it asks - which is what
+/// makes the gap between the phases, not a race with the trigger, the thing
+/// under test. Every question is answered `null` from the trigger until the
+/// last phase ends, gaps included: measured, rust-analyzer answers nothing
+/// useful between "Building compile-time-deps" and the end of "Indexing".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReloadOnFile {
+    trigger: String,
+    started: String,
+    phases: Vec<Phase>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Script {
+    #[serde(default)]
+    reload_on_file: Option<ReloadOnFile>,
     #[serde(default)]
     readiness: Option<Readiness>,
     #[serde(default)]
@@ -262,6 +293,11 @@ fn main() {
     // script that only checked it would answer truthfully before the server
     // has any right to.
     let revealed = Arc::new(AtomicBool::new(false));
+    // Whether a `reloadOnFile` reload is under way - see [`ReloadOnFile`].
+    let reloading = Arc::new(AtomicBool::new(false));
+    // How many times each scripted answer has been sent as an error, for
+    // `errorTimes`.
+    let mut errors_sent: Vec<u32> = vec![0; script.answers.len()];
 
     while let Some(message) = read_frame(&mut reader) {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
@@ -283,6 +319,7 @@ fn main() {
             }
             "initialized" => {
                 start_progress(&script, Arc::clone(&indexing));
+                watch_for_reload(&script, Arc::clone(&reloading));
                 if !script.ask_configuration.is_empty() {
                     let items: Vec<Value> = script
                         .ask_configuration
@@ -328,14 +365,28 @@ fn main() {
                     close_stdin();
                 }
                 let key = position_of(&params);
-                let answer = script.answers.iter().find(|answer| {
+                let found = script.answers.iter().position(|answer| {
                     (answer.uri.as_str(), answer.line, answer.character) == (key.0.as_str(), key.1, key.2)
+                });
+                let answer = found.map(|at| &script.answers[at]);
+                let erroring = found.is_some_and(|at| {
+                    let answer = &script.answers[at];
+                    answer.error.is_some() && answer.error_times.is_none_or(|times| errors_sent[at] < times)
                 });
                 match answer {
                     Some(answer) if answer.silent => continue,
-                    Some(answer) if answer.error.is_some() => {
-                        error_response(&mut stdout, id, answer.error.clone().unwrap_or_default())
+                    Some(answer) if erroring => {
+                        if let Some(at) = found {
+                            errors_sent[at] += 1;
+                        }
+                        error_response(
+                            &mut stdout,
+                            id,
+                            answer.error_code.unwrap_or(-32603),
+                            answer.error.clone().unwrap_or_default(),
+                        )
                     }
+                    Some(_) if reloading.load(Ordering::SeqCst) => respond(&mut stdout, id, Value::Null),
                     Some(_) if script.null_while_indexing && indexing.load(Ordering::SeqCst) => {
                         respond(&mut stdout, id, Value::Null)
                     }
@@ -522,6 +573,38 @@ fn begin_reindex_on_change(script: &Script, indexing: Arc<AtomicBool>, revealed:
     });
 }
 
+/// Starts the watcher for a `reloadOnFile` reload, if one is scripted - see
+/// [`ReloadOnFile`]. One reload per server, which is all its one test needs.
+fn watch_for_reload(script: &Script, reloading: Arc<AtomicBool>) {
+    let Some(reload) = script.reload_on_file.clone() else { return };
+    std::thread::spawn(move || {
+        while !std::path::Path::new(&reload.trigger).exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reloading.store(true, Ordering::SeqCst);
+        let mut stdout = std::io::stdout();
+        for (at, phase) in reload.phases.iter().enumerate() {
+            std::thread::sleep(Duration::from_millis(phase.begin_after_ms));
+            notify(
+                &mut stdout,
+                "$/progress",
+                json!({ "token": phase.token, "value": { "kind": "begin", "title": phase.token } }),
+            );
+            if at == 0 {
+                let _ = std::fs::write(&reload.started, "");
+            }
+            std::thread::sleep(Duration::from_millis(phase.hold_ms));
+            // Cleared *before* the last `end` goes out, so a question the
+            // client sends once it has read that `end` is answered for real.
+            if at + 1 == reload.phases.len() {
+                reloading.store(false, Ordering::SeqCst);
+            }
+            notify(&mut stdout, "$/progress", json!({ "token": phase.token, "value": { "kind": "end" } }));
+        }
+        reloading.store(false, Ordering::SeqCst);
+    });
+}
+
 /// Closes this process's end of its stdin pipe, so the client's next write
 /// fails. Nothing reads stdin afterwards.
 #[cfg(unix)]
@@ -543,8 +626,13 @@ fn close_stdin() {
 
 fn log(script: &Script, method: &str) {
     let Some(path) = &script.log else { return };
+    // One `write` per line, never `writeln!`: that writes the method and the
+    // newline as two calls, and a server killed between them (a test that
+    // reaps servers does exactly that, right after `initialized`) leaves a
+    // line with no end, so the next server's first line joins onto it
+    // (`initializedinitialize`) and a count of either comes up short.
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{method}");
+        let _ = file.write_all(format!("{method}\n").as_bytes());
     }
 }
 
@@ -553,9 +641,9 @@ fn respond<W: Write>(out: &mut W, id: Option<Value>, result: Value) {
     write_frame(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
 }
 
-fn error_response<W: Write>(out: &mut W, id: Option<Value>, message: String) {
+fn error_response<W: Write>(out: &mut W, id: Option<Value>, code: i64, message: String) {
     let Some(id) = id else { return };
-    write_frame(out, &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } }));
+    write_frame(out, &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
 }
 
 fn notify<W: Write>(out: &mut W, method: &str, params: Value) {

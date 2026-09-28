@@ -245,7 +245,8 @@ ignore = ["node_modules"]    # optional; directory names skipped when
 
 [plugin.capabilities]        # optional; what the plugin's semantic tier can
                               # promise - semantic_pass, semantic_sweep,
-                              # receiver_calls, receiver_calls_structural.
+                              # semantic_prepare, receiver_calls,
+                              # receiver_calls_structural.
                               # Missing entirely or per-field defaults
                               # conservatively ("says nothing" => "can do
                               # the least").

@@ -28,6 +28,7 @@ use crate::protocol::types::{
     SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::index_store::{IndexStore, Unit, Writer};
+use crate::storage::schema;
 use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
@@ -180,7 +181,9 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 ///
 /// After a complete whole-project pass, `sweep_language`'s semantic edges
 /// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
-/// what an earlier process emitted and this one no longer does. `None` (a
+/// what an earlier process emitted and this one no longer does, and so are
+/// the placeholders the language's last workspace reindex kept that nothing
+/// has re-sent since (`IndexStore::sweep_unclaimed_nodes`). `None` (a
 /// plugin whose manifest leaves `capabilities.semantic_sweep` off), an
 /// incomplete pass and a per-file pass sweep nothing.
 #[allow(clippy::too_many_arguments)]
@@ -228,7 +231,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths },
+        ControlMessage::SemanticPass { file_paths: file_paths.clone() },
         request_id,
         embedding,
         timeout,
@@ -256,15 +259,27 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
              this pass did resolve"
         );
-    } else if whole_project {
-        if let Some(language) = sweep_language {
-            let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
-            if swept > 0 {
-                eprintln!(
-                    "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
-                     semantic edge(s) - deleted"
-                );
-            }
+    } else if !whole_project {
+        // A complete per-file pass has refreshed these files' edges, so they
+        // are no longer pending (ADR 0009). Best-effort: a row left behind
+        // only over-warns until the whole-project pass clears it.
+        if let Err(err) = store.step(|conn| schema::clear_semantic_pending_files(conn, &file_paths)) {
+            eprintln!("g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})");
+        }
+    } else if let Some(language) = sweep_language {
+        let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
+        if swept > 0 {
+            eprintln!(
+                "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
+                 semantic edge(s) - deleted"
+            );
+        }
+        let swept = store.sweep_unclaimed_nodes(language)?;
+        if swept > 0 {
+            eprintln!(
+                "g-mesh: {language}'s whole-project semantic pass did not re-send {swept} placeholder(s) \
+                 its last workspace reindex kept - deleted"
+            );
         }
     }
     Ok(())
@@ -457,6 +472,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::Status => "status",
         ControlMessage::SemanticPass { .. } => "semanticPass",
         ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
+        ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
     }
 }
 

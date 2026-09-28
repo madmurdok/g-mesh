@@ -105,6 +105,12 @@ async function handleFileChanged(projectRoot: string, filePath: string, id: Cont
  * keeps whatever the structural layer already resolved, which is the state it
  * was in anyway. A *partial* answer, which is what a per-question failure
  * inside the pass degrades to, still gets through.
+ *
+ * Either way the answer says so: a failed or partial pass carries
+ * `incomplete: true` and an `incompleteReason` beside `result` (core's
+ * `FileChangeResponse::incomplete`), so core leaves a whole-project pass
+ * unfinished and asks again on the next start instead of recording it as
+ * done. A complete pass omits both, as core expects.
  */
 async function handleSemanticPass(
   projectRoot: string,
@@ -118,6 +124,7 @@ async function handleSemanticPass(
   );
 
   let result = EMPTY_WIRE_DIFF;
+  let incompleteReason: string | undefined;
   try {
     const pass = await runSemanticPass(projectRoot, filePaths, { onLog: log });
     result = {
@@ -130,20 +137,30 @@ async function handleSemanticPass(
       upsertEdges: pass.upsertEdges,
       deleteEdgeIds: pass.deleteEdgeIds,
     };
+    if (pass.incomplete) {
+      incompleteReason = pass.incompleteReason ?? "the TypeScript semantic pass did not cover its scope";
+    }
     log(
       `semantic pass over ${pass.filesScanned} file(s): ${pass.upsertEdges.length} edge(s) answered, ` +
         `${pass.deleteEdgeIds.length} retracted, ${pass.unresolvedUses} left unresolved`,
     );
   } catch (err) {
     log(`semantic pass failed: ${(err as Error).message}`);
+    incompleteReason = `the TypeScript semantic pass failed: ${(err as Error).message}`;
   }
+  if (incompleteReason !== undefined) log(`semantic pass incomplete: ${incompleteReason}`);
 
   // Same contract as handleFileChanged: core blocks on a response to any
   // request it sent, so a request must always be answered with a diff -
   // never with the `{ acknowledged: true }` shape the no-op methods use,
   // which core would fail to deserialize as one.
   if (id !== undefined) {
-    writeMessage(process.stdout, { jsonrpc: JSONRPC_VERSION, id, result });
+    writeMessage(process.stdout, {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      result,
+      ...(incompleteReason === undefined ? {} : { incomplete: true, incompleteReason }),
+    });
   }
 }
 

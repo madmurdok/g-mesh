@@ -38,7 +38,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.14.0"
+plugin_version = "3.15.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
@@ -61,8 +61,10 @@ extensions = [".py", ".pyi"]
 # first one arrives (see src/main.rs, which passes a factory).
 semantic_pass = true
 # Every complete whole-project pass re-sends each semantic edge it stands
-# behind, so core may delete this language's semantic edges one did not
-# re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+# behind, and each pending-symbol placeholder node one of them lands on
+# (the SDK LSP bridge's `Answers::finish`), so core may delete this language's semantic
+# edges, and the placeholders its last workspace reindex kept, that one did
+# not re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
 semantic_sweep = true
 # Receiver calls (`obj.m()`) are an open site the structural tier answers with
 # nothing and the semantic tier answers *when it can* - so the two fields

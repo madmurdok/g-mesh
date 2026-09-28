@@ -1425,6 +1425,30 @@ impl PluginProcess {
             .context("failed to send the workspaceChanged notification")
     }
 
+    /// Sends the `prepareSemanticPass` notification if this plugin's manifest
+    /// declares both `semantic_pass` and `semantic_prepare`; returns whether
+    /// it did. The caller must already know a whole-project pass is owed and
+    /// that the language is not suspended: this is the plugin's cue to start
+    /// its semantic engine, which must never happen for structural work.
+    ///
+    /// Best-effort like [`Self::notify_workspace_changed`]: the pass that
+    /// follows starts the engine itself if this never arrived.
+    pub fn notify_prepare_semantic_pass(&self) -> Result<bool> {
+        let capabilities = &self.manifest.capabilities;
+        if !(capabilities.semantic_pass && capabilities.semantic_prepare) {
+            return Ok(false);
+        }
+        let mut state = self.state();
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::PrepareSemanticPass,
+        };
+        write_message(&mut state.io.writer, &envelope)
+            .context("failed to send the prepareSemanticPass notification")?;
+        Ok(true)
+    }
+
     /// Shared tail of [`Self::ensure_fresh`]/[`Self::semantic_pass`]: neither
     /// goes through [`Self::apply_file_change`]'s pending-queue replay, but
     /// both still owe the plugin a relaunch once they know for certain it is

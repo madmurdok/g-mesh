@@ -732,6 +732,17 @@ impl PluginRegistry {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
     }
 
+    /// Whether `language`'s manifest declares both `semantic_pass` and
+    /// `semantic_prepare` - the plugins `daemon::semantic` tells about an
+    /// owed pass before asking for it. Answered from the manifest, so it
+    /// spawns nothing.
+    pub fn wants_semantic_prepare(&self, language: &str) -> bool {
+        self.discovered
+            .manifests
+            .get(language)
+            .is_some_and(|m| m.capabilities.semantic_pass && m.capabilities.semantic_prepare)
+    }
+
     /// Every discovered language whose manifest declares
     /// `capabilities.semantic_pass = true`, sorted - what
     /// `daemon::semantic::run_with_registry` iterates over to ask each

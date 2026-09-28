@@ -88,7 +88,9 @@ We will stop deleting up front. A workspace reindex of language `L`:
    during the walk (`WalkContext { embedding: None }`).
 3. **Plans** (no live lock): the staging connection `ATTACH`es the live file
    read-only (WAL gives it a snapshot) and writes a plan into staging
-   tables: live node/edge ids of `L` absent from staging (delete); staged
+   tables: live node/edge ids of `L` absent from staging (delete), **except
+   the pending-symbol placeholders a swept language keeps (section 3,
+   "Semantic-owned placeholders")**; staged
    rows that are new or differ (upsert), **except the outgoing edges of an
    unchanged node, which come from live (the unchanged-node rule,
    section 3)**; containers likewise;
@@ -202,6 +204,59 @@ unlinked placeholders are ordinary rows and go through the same diff.
   failure part-way would sweep upgraded structural edges it did not
   repeat (gone, not downgraded, until the file is reparsed). The Go tier
   reports incomplete only when every module fails to load.
+- **Semantic-owned placeholders.** A semantic tier (the SDK's LSP bridge
+  for Rust and Python, the Go tier) records a cross-file answer as a
+  pending-symbol placeholder (`kind = 'Module'`, `nativeKind =
+  'pending_symbol'`) under an id no walk emits, plus its semantic edge onto
+  it. The walk never emits these, so staging lacking one says nothing about
+  it; deleting it at the swap removed ~1,161 rust nodes and their edges on
+  every reindex of an unchanged tree until the pass re-added them (~57s;
+  GM-425 results, finding 1). No column records who wrote a node, and none
+  is added: the plan uses absence from staging as the marker, restricted to
+  placeholders. For a language whose manifest declares both `semantic_pass`
+  and `semantic_sweep`, the plan keeps (`plan_keep_nodes`) every live
+  pending-symbol placeholder of `L` that staging lacks. A kept node counts as
+  surviving for edges and keeps its outgoing edges as an unchanged node does,
+  so the pass's edges onto it stay. A real declaration the walk dropped is
+  deleted at the swap as before; placeholders are hidden from
+  `graph::queries`' lookups, so a kept one never surfaces as a definition.
+  The swap hands the kept ids to the `IndexStore`, which holds them in memory
+  as *unclaimed*. Any diff that upserts one of them (the pass re-sending it,
+  or a reparse whose walk emits it again) claims it. After a complete
+  whole-project pass, the language's still-unclaimed ids are deleted with
+  every row hanging on them (`IndexStore::sweep_unclaimed_nodes`, next to the
+  edge sweep): the pass re-sends every placeholder it still stands behind,
+  so what it did not send is one nobody owns. It is the same ownership
+  reasoning as the edge sweep. An incomplete or per-file pass deletes
+  nothing.
+  *The node contract.* This rests on `capabilities.semantic_sweep`
+  promising nodes as well as edges: a complete whole-project pass re-sends
+  every placeholder node one of its semantic edges lands on
+  (`daemon::manifest::Capabilities::semantic_sweep`). The three swept tiers
+  keep it by construction, because they build every answer as a placeholder
+  plus an edge onto it and emit every placeholder of the pass in the same
+  diff: the SDK LSP bridge (Rust, Python) adds a placeholder only in
+  `Answers::record`, next to the edge, and `Answers::finish` writes all of
+  them to `upsert_nodes`; the Go tier adds one only in
+  `semanticDiff.placeholder`, whose id is the edge's target in
+  `answerFile` and `answerImplements`, and `semanticDiff.finish` writes all
+  of them to `UpsertNodes`. So a kept placeholder the pass did not re-send
+  has no semantic edge of the pass onto it, and the edge sweep has already
+  deleted the ones it had. A plugin that re-sent an edge without its
+  placeholder would break the contract, and must leave `semantic_sweep`
+  off.
+  *Claims and the lock.* Each write that touches the unclaimed set does so
+  under the store guard of the write it describes: a diff's claim in the
+  step that committed it, the swap's kept ids before its guard drops, the
+  sweep's read of the set in the step that deletes. With a per-step unit
+  the lock is released between steps, so a claim made after its step, or
+  kept ids recorded after the swap's guard, leave a window in which a kept
+  id is upserted without being claimed and is then swept. A debug build
+  checks the guard (`IndexStore::unclaimed`). A language without the sweep keeps the old rule (deleted at the
+  swap, re-added by the pass), because nothing would ever remove a kept one.
+  *Rejected:* an ownership column on `nodes`, or a side table of
+  semantic-owned ids. Either is a schema change, and the in-memory set's one
+  weakness (below, section 4) heals itself at the next reindex.
 - Embeddings: before the swap only the changed texts are embedded (step 4),
   so with the cache off an unchanged tree embeds nothing (today: 5,818
   texts, 687s, GM-424 arm 2 control). `search_code` sees old vectors until the swap, then
@@ -215,10 +270,20 @@ unlinked placeholders are ordinary rows and go through the same diff.
 - Killed after the swap, before the semantic pass: `semanticPassAt` is
   NULL for `L` and in meta, so `daemon/mod.rs:283`'s
   `needs_semantic_pass_retry` retries it, as for any interrupted pass.
+- Killed after the swap, before the pass has swept the placeholders it kept:
+  the unclaimed set was in memory only, so the retry pass sweeps nothing and
+  those placeholders stay (hidden from lookups, counted in `nodes`). The
+  language's next reindex keeps them again, as live placeholders staging
+  lacks, and the complete pass after it removes the ones it does not send.
 - Startup: stale `staging-*.db` files are deleted; each `pending_reindex`
   row schedules a workspace reindex of its language on activation (D2).
   Until then the old graph serves, and `g-mesh status` names the pending
-  language.
+  language. A row whose language's plugin was since removed does not
+  linger: the indexer generation digests every discovered plugin, so the
+  next start wipes the index, the row with it (tested:
+  `a_pending_reindex_of_a_removed_plugin_goes_at_the_next_start`). A row
+  whose plugin is installed but fails to start stays and is retried at each
+  start, which is the intended behaviour.
 - The roll-ups become reconcilers: `record_bulk_index` and
   `reconcile_semantic_pass_rollup` set the meta column when every present
   language has the fact *and clear it when one does not* (today they only
@@ -234,6 +299,9 @@ unchanged nodes stay as they were, the pass's retractions included, until
 the pass replaces them; the only transient states are the per-case ones in
 section 3, limited to what changed. Semantic edges no complete pass stands
 behind any more do not outlive the next complete whole-project pass.
+Placeholders and edges a semantic pass wrote survive the swap of a swept
+language (section 3, "Semantic-owned placeholders"). Those the next complete
+pass does not re-send go when it finishes.
 
 ### 6. Scope
 Fixed here: the workspace reindex, and the meta roll-ups (section 4).
@@ -335,6 +403,8 @@ start completes it. Control for the probe: the before build must show the
   structural edges no longer come back at a swap.
 - TypeScript is not swept (section 3, Sweep): its stale semantic edges
   from an earlier process last until their files are reparsed.
+- Which files a post-swap semantic pass has not reached yet is disclosed per
+  response as `semanticTier: "pending"`: [ADR 0009](0009-semantic-pending.md).
 
 ## Owner's answers
 1. The semantic pass is not run into staging; it runs after the swap, and
