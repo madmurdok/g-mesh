@@ -3,7 +3,7 @@
 # Env: VARIANTS (candidates), QCORPORA ("" = all), TCORPUS, ROUNDS, OUT, RUNS
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-cd "$HERE/../.."
+cd "$HERE/../.." || exit
 BIN=$PWD/target/release/g-mesh
 REF=jina-v2-base-code-fp32
 VARIANTS=${VARIANTS:-"jina-v2-base-code-int8 bge-small-en-v1.5 gte-small snowflake-arctic-embed-s"}
@@ -34,6 +34,7 @@ log "uptime $(uptime)"
 for v in ${QVARIANTS-$VARIANTS}; do
   wait_quiet
   log "quality $v: uptime $(uptime)"
+  # shellcheck disable=SC2046 # corpus_args expands to multiple "--corpus X" flags, one per word
   /usr/bin/time -p "$BIN" debug-embed-eval run --variant "$v" $(corpus_args) --out "$RUNS" \
     > "$OUT/quality-$v.out" 2> "$OUT/quality-$v.err"
   rc=$?
@@ -64,7 +65,7 @@ for r in $(seq 1 "$ROUNDS"); do
         --corpus "$TCORPUS" --embed-only --force --out "$OUT/timed/r$r" > "$f.out" 2> "$f"
       rc=$?
       after=$(uptime); la=$(load1)
-      echo "before: $before" >> "$f"; echo "after: $after" >> "$f"; echo "attempt: $attempt" >> "$f"
+      { echo "before: $before"; echo "after: $after"; echo "attempt: $attempt"; } >> "$f"
       log "timed r$r $v attempt $attempt rc=$rc $(grep -E '^(real|user|sys)' "$f" | tr '\n' ' ') load-after $la"
       # Owner-approved noisy machine: start below 7.0 (not 2.0); redo if after-load > 8.0 (not 3.0).
       # D11's after-load includes the run's own ORT threads (user/real ~3.4),
@@ -77,12 +78,15 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 
 # 4. costs.toml and report
+# shellcheck disable=SC2086 # $VARIANTS is a space-separated list; each name must be its own arg
 python3 "$HERE/measure_summary.py" costs "$OUT" "$REF" $VARIANTS > "$OUT/costs.toml"
 log "costs written"
 ARMS="$RUNS/$REF $RUNS/random $RUNS/shuffled $RUNS/words-shuffled $RUNS/bm25"
 for v in $VARIANTS; do ARMS="$ARMS $RUNS/$v"; done
+# shellcheck disable=SC2086 # $ARMS is a space-separated list of paths; each must be its own arg
 "$BIN" debug-embed-eval report $ARMS --costs "$OUT/costs.toml" --json "$OUT/report.json" > "$OUT/report.txt" 2>&1
 log "report rc=$?"
+# shellcheck disable=SC2086 # $VARIANTS is a space-separated list; each name must be its own arg
 python3 "$HERE/measure_summary.py" table "$OUT" "$REF" $VARIANTS > "$OUT/summary.md" 2>&1
 log "summary rc=$? uptime $(uptime)"
-log done
+log "done"
