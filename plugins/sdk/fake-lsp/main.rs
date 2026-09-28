@@ -626,8 +626,13 @@ fn close_stdin() {
 
 fn log(script: &Script, method: &str) {
     let Some(path) = &script.log else { return };
+    // One `write` per line, never `writeln!`: that writes the method and the
+    // newline as two calls, and a server killed between them (a test that
+    // reaps servers does exactly that, right after `initialized`) leaves a
+    // line with no end, so the next server's first line joins onto it
+    // (`initializedinitialize`) and a count of either comes up short.
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{method}");
+        let _ = file.write_all(format!("{method}\n").as_bytes());
     }
 }
 
