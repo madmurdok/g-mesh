@@ -1,8 +1,8 @@
 //! Acceptance tests for GM-395's slice 1: splitting the embedding backfill
 //! pass (`embedding::backfill::run`) out of the cold-start walk must not make
 //! a structural tool call (`find_definition`, ...) wait for it, and must
-//! still make `search_code` wait for it - `daemon::indexing_status::Need`'s
-//! whole reason to distinguish the two.
+//! still make `search_code` wait for it, within its bound -
+//! `daemon::indexing_status::Need`'s whole reason to distinguish the two.
 //!
 //! [`g_mesh::embedding::backfill::HOLD_FILE_ENV`] parks the backfill pass
 //! open, with the structural walk and its `bulkIndexedAt` marker already
@@ -198,10 +198,13 @@ async fn structural_tools_answer_while_the_embedding_backfill_pass_is_held_open(
 /// unavailable" error is the expected outcome with no real weights on disk;
 /// the point under test is *when* it returns, not what it says).
 ///
-/// *Control:* in `mcp::mod::GMeshMcpServer::search_code`, change
-/// `self.prepare(Need::Embeddings)` to `self.prepare(Need::Structural)`. The
-/// `tokio::select!` below then resolves the call arm within the 3s window
-/// instead of the timer arm, and the `panic!` fires.
+/// The 3s window is well inside `mcp::SEARCH_EMBEDDING_WAIT`, the bound on
+/// that wait.
+///
+/// *Control:* in `mcp::mod::GMeshMcpServer::search_code`, skip the
+/// `wait_for_embeddings` call. The `tokio::select!` below then resolves the
+/// call arm within the 3s window instead of the timer arm, and the `panic!`
+/// fires.
 #[tokio::test]
 async fn search_code_waits_for_the_embedding_backfill_pass_but_not_forever() {
     let project = Project::new();
