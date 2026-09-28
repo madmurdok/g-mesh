@@ -121,6 +121,11 @@ const STALL_MARKER: &str = "stalled-once.marker";
 /// reason as [`STALL_MARKER`].
 const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 
+/// A plugin directory holding this file answers every complete
+/// `semanticPass` with its contents as the diff, instead of an empty one. See
+/// [`set_semantic_pass_answer`].
+const SEMANTIC_ANSWER: &str = "semantic-pass.json";
+
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
 ///
@@ -349,6 +354,19 @@ pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
     assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest sweeps");
     let swept = manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_sweep = true\n");
     fs::write(&path, swept).expect("failed to write the fake plugin's manifest");
+}
+
+/// Makes every later complete `semanticPass` to the plugin in `plugin_dir`
+/// answer with `diff` (a `FileChangeDiff` as JSON), or, with `None`, with an
+/// empty diff again. Read per request, so it takes effect without a respawn.
+pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
+    let path = plugin_dir.join(SEMANTIC_ANSWER);
+    match diff {
+        Some(diff) => fs::write(&path, diff).expect("failed to write the fake plugin's semantic answer"),
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// Every pid this plugin directory has ever been spawned as, oldest first.
@@ -650,6 +668,9 @@ process.stdin.on("data", (chunk) => {{
           response.incompleteReason = incompleteReason;
         }}
         writeFrame(response);
+      }} else if (request.method === "semanticPass" && fs.existsSync(path.join(__dirname, "{SEMANTIC_ANSWER}"))) {{
+        const answer = JSON.parse(fs.readFileSync(path.join(__dirname, "{SEMANTIC_ANSWER}"), "utf8"));
+        writeFrame({{ jsonrpc: "2.0", id: request.id, result: answer }});
       }} else {{
         writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
       }}

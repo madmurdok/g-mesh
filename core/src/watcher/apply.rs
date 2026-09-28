@@ -181,7 +181,9 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 ///
 /// After a complete whole-project pass, `sweep_language`'s semantic edges
 /// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
-/// what an earlier process emitted and this one no longer does. `None` (a
+/// what an earlier process emitted and this one no longer does, and so are
+/// the placeholders the language's last workspace reindex kept that nothing
+/// has re-sent since (`IndexStore::sweep_unclaimed_nodes`). `None` (a
 /// plugin whose manifest leaves `capabilities.semantic_sweep` off), an
 /// incomplete pass and a per-file pass sweep nothing.
 #[allow(clippy::too_many_arguments)]
@@ -270,6 +272,13 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             eprintln!(
                 "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
                  semantic edge(s) - deleted"
+            );
+        }
+        let swept = store.sweep_unclaimed_nodes(language)?;
+        if swept > 0 {
+            eprintln!(
+                "g-mesh: {language}'s whole-project semantic pass did not re-send {swept} placeholder(s) \
+                 its last workspace reindex kept - deleted"
             );
         }
     }

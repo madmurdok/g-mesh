@@ -22,6 +22,15 @@
 //! Every other node, changed or new, gets exactly staging's outgoing edges;
 //! the semantic pass that runs after the swap refines them.
 //!
+//! A live pending-symbol placeholder of the language that staging lacks is
+//! kept, not deleted, when the caller says the language's semantic tier is
+//! swept (`keep_semantic_placeholders`): a semantic pass adds such nodes under
+//! ids no walk emits, so their absence from staging says nothing about them.
+//! It stays until something re-sends it or a complete whole-project semantic
+//! pass does not (`IndexStore::sweep_unclaimed_nodes`). A kept node survives
+//! the swap for its edges exactly as an unchanged node does. Placeholders
+//! only: a declaration the walk no longer emits is deleted at the swap.
+//!
 //! Neither half enables foreign keys or depends on them: the swap deletes
 //! edges before nodes and inserts nodes before edges, so it is also valid on
 //! a connection that enforces them.
@@ -33,6 +42,7 @@ use rusqlite::{params, Connection};
 
 use crate::embedding::pipeline::{text_to_embed, ComputedEmbedding};
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::schema;
 use crate::storage::write::{Diff, NodeRecord};
 
@@ -48,7 +58,8 @@ const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 /// vector is therefore stale; `plan_unchanged_nodes` the nodes the
 /// unchanged-node rule (module doc) keeps live's outgoing edges for;
 /// `plan_pending_files` the files whose edges the swap leaves structural until
-/// the language's semantic pass refreshes them (ADR 0009).
+/// the language's semantic pass refreshes them (ADR 0009); `plan_keep_nodes`
+/// the live placeholders staging lacks that the swap keeps (module doc).
 const PLAN_DDL: &str = "
 DROP TABLE IF EXISTS plan_delete_nodes;
 DROP TABLE IF EXISTS plan_upsert_nodes;
@@ -59,6 +70,7 @@ DROP TABLE IF EXISTS plan_upsert_edges;
 DROP TABLE IF EXISTS plan_delete_containers;
 DROP TABLE IF EXISTS plan_upsert_containers;
 DROP TABLE IF EXISTS plan_pending_files;
+DROP TABLE IF EXISTS plan_keep_nodes;
 CREATE TABLE plan_delete_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_nodes (id TEXT PRIMARY KEY);
 CREATE TABLE plan_unchanged_nodes (id TEXT PRIMARY KEY);
@@ -68,6 +80,7 @@ CREATE TABLE plan_upsert_edges (id TEXT PRIMARY KEY);
 CREATE TABLE plan_delete_containers (nodeId TEXT PRIMARY KEY);
 CREATE TABLE plan_upsert_containers (nodeId TEXT PRIMARY KEY);
 CREATE TABLE plan_pending_files (filePath TEXT PRIMARY KEY);
+CREATE TABLE plan_keep_nodes (id TEXT PRIMARY KEY);
 ";
 
 /// Row counts of one plan, for the reindex's log line and for tests.
@@ -81,6 +94,8 @@ pub struct PlanCounts {
     pub upsert_containers: usize,
     /// Files whose edges stay structural until the semantic pass.
     pub pending_files: usize,
+    /// Live placeholders staging lacks, kept for the semantic pass to settle.
+    pub keep_nodes: usize,
 }
 
 impl PlanCounts {
@@ -121,24 +136,31 @@ fn read_only_uri(path: &str) -> String {
 /// index at `live_path`, attached read-only, and writes the plan tables into
 /// `staging`. Reads live inside one transaction, so the plan describes one
 /// snapshot of it. `embedding_version` is the pipeline's, for spotting a live
-/// vector made by another model.
+/// vector made by another model. `keep_semantic_placeholders`: whether the
+/// live placeholders staging lacks are kept (module doc).
 pub fn plan(
     staging: &mut Connection,
     live_path: &str,
     language: &str,
     embedding_version: &str,
+    keep_semantic_placeholders: bool,
 ) -> Result<Plan> {
     staging
         .execute("ATTACH DATABASE ?1 AS live", params![read_only_uri(live_path)])
         .with_context(|| format!("failed to attach the live index {live_path} to the staging index"))?;
-    let planned = plan_attached(staging, language, embedding_version);
+    let planned = plan_attached(staging, language, embedding_version, keep_semantic_placeholders);
     let detached = staging.execute("DETACH DATABASE live", []);
     let planned = planned?;
     detached.context("failed to detach the live index from the staging index")?;
     Ok(planned)
 }
 
-fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &str) -> Result<Plan> {
+fn plan_attached(
+    staging: &mut Connection,
+    language: &str,
+    embedding_version: &str,
+    keep_semantic_placeholders: bool,
+) -> Result<Plan> {
     let tx = staging.transaction().context("failed to start the plan transaction")?;
     tx.execute_batch(PLAN_DDL).context("failed to create the plan tables")?;
 
@@ -150,11 +172,25 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
         changed.with_context(|| format!("failed to plan {what}"))
     };
 
-    // Staged nodes are exactly the language's nodes after the swap, so "an
-    // endpoint survives" means "is a staged node".
+    // The language's nodes after the swap are the staged ones and the kept
+    // ones, so "an endpoint survives" means "is a staged or a kept node".
+    let keep_nodes = if keep_semantic_placeholders {
+        run(
+            &format!(
+                "INSERT INTO plan_keep_nodes (id)
+                 SELECT id FROM live.nodes
+                 WHERE language = ?1 AND kind = 'Module' AND nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}'
+                   AND id NOT IN (SELECT id FROM main.nodes)"
+            ),
+            "the placeholders to keep",
+        )?
+    } else {
+        0
+    };
     let delete_nodes = run(
         "INSERT INTO plan_delete_nodes (id)
-         SELECT id FROM live.nodes WHERE language = ?1 AND id NOT IN (SELECT id FROM main.nodes)",
+         SELECT id FROM live.nodes WHERE language = ?1 AND id NOT IN (SELECT id FROM main.nodes)
+           AND id NOT IN (SELECT id FROM plan_keep_nodes)",
         "the nodes to delete",
     )?;
     run(
@@ -196,18 +232,19 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
         "the unchanged nodes",
     )?;
 
-    // Whether node `x` exists after the swap: it is staged, or it is a live
+    // Whether node `x` exists after the swap: it is staged, kept, or a live
     // node of another language, which the swap does not touch.
     let survives = |x: &str| {
         format!(
             "({x} IN (SELECT id FROM main.nodes)
+              OR {x} IN (SELECT id FROM plan_keep_nodes)
               OR EXISTS (SELECT 1 FROM live.nodes o WHERE o.id = {x} AND o.language <> ?1))"
         )
     };
 
     // Live edges of the language: either endpoint is one of its live nodes.
-    // One from an unchanged node goes only when its target does; any other
-    // goes when staging lacks its id.
+    // One from an unchanged or a kept node goes only when its target does;
+    // any other goes when staging lacks its id.
     let delete_edges = run(
         &format!(
             "INSERT INTO plan_delete_edges (id)
@@ -215,6 +252,7 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
              WHERE (e.fromId IN (SELECT id FROM live.nodes WHERE language = ?1)
                     OR e.toId IN (SELECT id FROM live.nodes WHERE language = ?1))
                AND CASE WHEN e.fromId IN (SELECT id FROM plan_unchanged_nodes)
+                             OR e.fromId IN (SELECT id FROM plan_keep_nodes)
                         THEN NOT {target_survives}
                         ELSE e.id NOT IN (SELECT id FROM main.edges) END",
             target_survives = survives("e.toId"),
@@ -285,6 +323,7 @@ fn plan_attached(staging: &mut Connection, language: &str, embedding_version: &s
             delete_containers,
             upsert_containers,
             pending_files,
+            keep_nodes,
         },
         to_embed,
     })
@@ -352,28 +391,28 @@ pub struct SwapBookkeeping<'a> {
 /// (walked now, semantic pass owed), both meta roll-ups reconciled, the
 /// language's `pending_reindex` row removed and, for a language with a
 /// semantic pass, its semantic-pending rows written. A failure rolls all of it
-/// back.
+/// back. Returns the ids of the placeholders the plan kept.
 pub fn swap(
     live: &mut Connection,
     staging_path: &Path,
     vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
     bookkeeping: &SwapBookkeeping<'_>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let staging_path = staging_path.to_str().context("the staging index path is not valid UTF-8")?;
     live.execute("ATTACH DATABASE ?1 AS staging", params![staging_path])
         .with_context(|| format!("failed to attach the staging index {staging_path}"))?;
     let swapped = swap_attached(live, vectors, bookkeeping);
     let detached = live.execute("DETACH DATABASE staging", []);
-    swapped?;
+    let kept = swapped?;
     detached.context("failed to detach the staging index")?;
-    Ok(())
+    Ok(kept)
 }
 
 fn swap_attached(
     live: &mut Connection,
     vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
     bookkeeping: &SwapBookkeeping<'_>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let tx = live.transaction().context("failed to start the swap transaction")?;
     let run = |sql: &str, what: &str| -> Result<usize> {
         tx.execute(sql, []).with_context(|| format!("failed to swap in {what}"))
@@ -489,7 +528,50 @@ fn swap_attached(
     tx.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
         .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
 
-    tx.commit().context("failed to commit the swap")
+    let kept: Vec<String> = tx
+        .prepare("SELECT id FROM staging.plan_keep_nodes ORDER BY id")
+        .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+        .context("failed to read the kept placeholders")?;
+    tx.commit().context("failed to commit the swap")?;
+    Ok(kept)
+}
+
+/// Deletes those of `ids` that are still pending-symbol placeholders of
+/// `language`, with their edges (either end), vectors, declarations,
+/// placeholder targets and container rows, in one transaction, and returns
+/// how many nodes went.
+pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[String]) -> Result<usize> {
+    let tx = conn.transaction().context("failed to start the placeholder sweep")?;
+    let mut deleted = 0;
+    for id in ids {
+        let placeholder: bool = tx
+            .query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM nodes WHERE id = ?1 AND language = ?2 AND kind = 'Module'
+                                    AND nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}')"
+                ),
+                params![id, language],
+                |row| row.get(0),
+            )
+            .context("failed to look up a kept placeholder")?;
+        if !placeholder {
+            continue;
+        }
+        for sql in [
+            "DELETE FROM edges WHERE fromId = ?1 OR toId = ?1",
+            "DELETE FROM vectors WHERE nodeId = ?1",
+            "DELETE FROM declarations WHERE nodeId = ?1",
+            "DELETE FROM placeholder_targets WHERE nodeId = ?1",
+            "DELETE FROM containers WHERE nodeId = ?1",
+        ] {
+            tx.execute(sql, params![id]).context("failed to delete a kept placeholder's rows")?;
+        }
+        deleted += tx
+            .execute("DELETE FROM nodes WHERE id = ?1", params![id])
+            .context("failed to delete a kept placeholder")?;
+    }
+    tx.commit().context("failed to commit the placeholder sweep")?;
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -543,7 +625,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model").unwrap();
+        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
         drop(staging);
         assert_eq!(
             plan.counts,
@@ -646,7 +728,7 @@ mod tests {
             },
         )
         .unwrap();
-        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model").unwrap();
+        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
         (dir, live, staging_path, plan)
     }
 

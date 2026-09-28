@@ -292,7 +292,16 @@ fn rebuild(
         Ok(conn) => conn,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let plan = language_swap::plan(&mut staged, live_path, language, embedding.embedding_version())?;
+    // Only a swept language's pass removes what the plan keeps.
+    let keep_semantic_placeholders =
+        manifest.capabilities.semantic_pass && manifest.capabilities.semantic_sweep;
+    let plan = language_swap::plan(
+        &mut staged,
+        live_path,
+        language,
+        embedding.embedding_version(),
+        keep_semantic_placeholders,
+    )?;
     drop(staged);
     let mut stats = EmbedStats::default();
     let computed = embedding.compute(&plan.to_embed, &mut stats);
@@ -312,7 +321,8 @@ fn rebuild(
     let counts = plan.counts;
     eprintln!(
         "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
-         {} texts owed a vector, {} file(s) structural until the semantic pass",
+         {} texts owed a vector, {} file(s) structural until the semantic pass, {} placeholder(s) kept \
+         for it",
         counts.delete_nodes,
         counts.upsert_nodes,
         counts.delete_edges,
@@ -320,7 +330,8 @@ fn rebuild(
         counts.delete_containers,
         counts.upsert_containers,
         plan.to_embed.upsert_nodes.len(),
-        counts.pending_files
+        counts.pending_files,
+        counts.keep_nodes
     );
     Ok(stats)
 }
@@ -1716,6 +1727,191 @@ mod tests {
                 edge_row("alpha-stale", "semantic", "alpha-n3")
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Placeholders a semantic pass added, across a swap and the pass after it.
+    // -----------------------------------------------------------------
+
+    /// A placeholder as a semantic tier adds it: a pending-symbol `Module`
+    /// under an id no walk emits, addressing a declaration nothing indexes,
+    /// so linking leaves the pass's edge on it.
+    fn semantic_placeholder(id: &str) -> WireNode {
+        WireNode {
+            kind: NodeKind::Module,
+            native_kind: Some("pending_symbol".to_string()),
+            target: Some(PlaceholderTarget {
+                scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
+                key: TargetKey::QualifiedName("elsewhere::gone".to_string()),
+                from_container: None,
+            }),
+            ..wire_node(id, "src/a.alpha-src")
+        }
+    }
+
+    /// The pass's answer: `alpha-sp` and a semantic edge onto it from the
+    /// unchanged `alpha-n1`.
+    fn a_pass_adding_a_placeholder() -> String {
+        let edge = WireEdge {
+            source: SourceTier::Semantic,
+            engine: "fake-lsp".to_string(),
+            resolved: false,
+            ..wire_edge("alpha-sem", "alpha-n1", "alpha-sp")
+        };
+        format!(
+            r#"{{"upsertNodes":[{}],"upsertEdges":[{}]}}"#,
+            json(&semantic_placeholder("alpha-sp")),
+            json(&edge)
+        )
+    }
+
+    /// What one reindex of an unchanged tree leaves, for `alpha` with a
+    /// semantic pass (and `semantic_sweep` when asked) whose earlier pass
+    /// added `alpha-sp`: the `alpha-sp` node and `alpha-sem` edge rows at the
+    /// swap, and after the reindex's own pass, which re-sends them only when
+    /// `resend` is set. The walk streams `extra` besides `three_nodes`, in the
+    /// first walk only.
+    fn placeholder_rows_around_a_reindex(
+        semantic_sweep: bool,
+        resend: bool,
+        extra: &[String],
+    ) -> (Vec<String>, Vec<String>) {
+        let counters = Counters::default();
+        let (project, plugins, _scratch, registry, conn) =
+            alpha_staging_registry_with(&counters, true, semantic_sweep);
+        let plugin_dir = plugins.path().join("alpha");
+        let mut first = three_nodes();
+        first.extend(extra.iter().cloned());
+        test_plugin::set_bulk_stream(project.path(), "alpha", &first, 0);
+        test_plugin::set_semantic_pass_answer(&plugin_dir, Some(&a_pass_adding_a_placeholder()));
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let placeholder_rows = |conn: &IndexStore| {
+            rows(
+                &conn.lock().unwrap(),
+                "SELECT id FROM nodes WHERE id IN ('alpha-sp', 'alpha-n4')
+                 UNION ALL SELECT id FROM edges WHERE id = 'alpha-sem' ORDER BY 1",
+            )
+        };
+        assert_eq!(
+            placeholder_rows(&conn).len(),
+            2 + usize::from(!extra.is_empty()),
+            "the first pass added the placeholder and its edge"
+        );
+
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        if !resend {
+            test_plugin::set_semantic_pass_answer(&plugin_dir, None);
+        }
+        let mut at_swap = None;
+        run_with(&registry, &supervisor, &conn, "go.mod", &mut |stage| {
+            if stage == Stage::Swapped {
+                at_swap = Some(placeholder_rows(&conn));
+            }
+        })
+        .expect("the second reindex succeeds");
+        (at_swap.expect("the swap was reached"), placeholder_rows(&conn))
+    }
+
+    fn text(id: &str) -> String {
+        format!("Text(\"{id}\")")
+    }
+
+    /// A placeholder a semantic pass added, and the pass's edge onto it,
+    /// survive the swap of an unchanged tree: the walk never emits them, so
+    /// staging lacking them says nothing about them. The pass after the swap
+    /// re-sends both, so they stay.
+    ///
+    /// Controls: drop `AND id NOT IN (SELECT id FROM plan_keep_nodes)` from
+    /// `plan_delete_nodes` in `language_swap::plan_attached` -> the swap fails
+    /// on the foreign key from the kept `alpha-sem` into the deleted
+    /// `alpha-sp` (production runs without foreign keys: both gone at the
+    /// swap); drop `self.store.claim(diff)` from `Writer::apply_diff_linked`
+    /// -> the rows are gone after the pass.
+    #[test]
+    fn a_semantic_placeholder_and_its_edge_survive_an_unchanged_swap() {
+        let (at_swap, after) = placeholder_rows_around_a_reindex(true, true, &[]);
+        assert_eq!(at_swap, vec![text("alpha-sem"), text("alpha-sp")], "kept at the swap");
+        assert_eq!(after, vec![text("alpha-sem"), text("alpha-sp")], "re-sent by the pass, so still there");
+    }
+
+    /// The same placeholder goes once a complete whole-project pass no longer
+    /// sends it: kept at the swap, deleted with its edge after the pass.
+    ///
+    /// Control: remove the `store.sweep_unclaimed_nodes(language)` call from
+    /// `watcher::apply::apply_semantic_pass_in` -> `alpha-sp` is still there
+    /// after the pass (its edge goes with the edge sweep either way).
+    #[test]
+    fn a_kept_placeholder_the_next_complete_pass_does_not_send_is_deleted() {
+        let (at_swap, after) = placeholder_rows_around_a_reindex(true, false, &[]);
+        assert_eq!(at_swap, vec![text("alpha-sem"), text("alpha-sp")], "kept at the swap");
+        assert!(after.is_empty(), "swept after the pass: {after:?}");
+    }
+
+    /// A language whose pass is not swept keeps the old rule: nothing would
+    /// ever remove a kept placeholder, so the swap deletes it and the pass
+    /// adds it back.
+    ///
+    /// Control: pass `true` for `keep_semantic_placeholders` in `rebuild`
+    /// regardless of `semantic_sweep` -> `alpha-sp` is there at the swap.
+    #[test]
+    fn a_language_without_the_sweep_drops_the_placeholder_at_the_swap() {
+        let (at_swap, after) = placeholder_rows_around_a_reindex(false, true, &[]);
+        assert!(at_swap.is_empty(), "deleted at the swap: {at_swap:?}");
+        assert_eq!(after, vec![text("alpha-sem"), text("alpha-sp")], "added back by the pass");
+    }
+
+    /// Only placeholders are kept: a declaration the walk no longer emits is
+    /// deleted at the swap even for a swept language.
+    ///
+    /// Control: drop `AND kind = 'Module' AND nativeKind = ...` from
+    /// `plan_keep_nodes` in `language_swap::plan_attached` -> `alpha-n4` is
+    /// there at the swap.
+    #[test]
+    fn a_declaration_the_walk_dropped_is_deleted_at_the_swap_all_the_same() {
+        let (at_swap, _) =
+            placeholder_rows_around_a_reindex(true, true, &[json(&wire_node("alpha-n4", "src/a.alpha-src"))]);
+        assert_eq!(
+            at_swap,
+            vec![text("alpha-sem"), text("alpha-sp")],
+            "alpha-n4 is gone, the placeholder kept"
+        );
+    }
+
+    /// A `pending_reindex` row whose language's plugin was removed does not
+    /// outlive the next daemon start, so `g-mesh status` stops naming it: the
+    /// indexer generation digests every discovered plugin
+    /// (`registry::indexer_version`), so removing one changes it and
+    /// `schema::ensure_current` wipes the index, that row included. With the
+    /// same plugins the row stays for `resume_pending`.
+    ///
+    /// Control: drop `DROP TABLE IF EXISTS pending_reindex;` from
+    /// `schema::wipe` -> `beta`'s row survives the start without its plugin.
+    #[test]
+    fn a_pending_reindex_of_a_removed_plugin_goes_at_the_next_start() {
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
+        let beta =
+            test_plugin::install_with_workspace(plugins.path(), "beta", &[".beta-src"], &["go.work"], &[]);
+        let generation = || {
+            let discovered =
+                discover(&[plugins.path().to_path_buf()]).expect("the fixtures discover cleanly");
+            crate::daemon::registry::indexer_version(&discovered)
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::ensure_current(&conn, &generation()).unwrap();
+        schema::mark_pending_reindex(&conn, "beta", "go.work").unwrap();
+
+        assert!(!schema::ensure_current(&conn, &generation()).unwrap(), "the same plugins keep the index");
+        assert_eq!(
+            schema::pending_reindexes(&conn).unwrap(),
+            vec![("beta".to_string(), "go.work".to_string())],
+            "a start with beta's plugin still installed resumes it"
+        );
+
+        std::fs::remove_dir_all(&beta).unwrap();
+        assert!(schema::ensure_current(&conn, &generation()).unwrap(), "a removed plugin wipes the index");
+        assert!(schema::pending_reindexes(&conn).unwrap().is_empty(), "beta's row went with the wipe");
     }
 
     // -----------------------------------------------------------------

@@ -13,8 +13,8 @@
 //! no code may take `PluginRegistry::supervisors`, `PluginSupervisor::inner`
 //! or `PluginProcess::state`/`pending`; those are always taken first, and the
 //! store only inside them. The `IndexingStatus` and `last_activity` mutexes
-//! are leaves (nothing is locked under them), so taking them under the store
-//! is allowed.
+//! and the store's own `unclaimed` set are leaves (nothing is locked under
+//! them), so taking them under the store is allowed.
 //!
 //! Two checks back this up. Every store guard sets a thread-local flag:
 //! acquiring the store again on the same thread panics (always on) instead
@@ -25,6 +25,7 @@
 //! correct under tokio.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 
@@ -148,11 +149,16 @@ pub struct LinkCounts {
 /// composition roots and passed down as `&IndexStore`.
 pub struct IndexStore {
     conn: Mutex<Connection>,
+    /// Per language, the placeholders the last swap kept that no diff has
+    /// upserted since (`storage::language_swap`, module doc). In memory only:
+    /// a restart forgets them, and they stay until the language's next swap
+    /// keeps them again.
+    unclaimed: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl IndexStore {
     pub fn new(conn: Connection) -> Self {
-        Self { conn: Mutex::new(conn) }
+        Self { conn: Mutex::new(conn), unclaimed: Mutex::new(HashMap::new()) }
     }
 
     /// The raw guard, for tests only: no production code outside `storage/`
@@ -214,7 +220,33 @@ impl IndexStore {
         diff: &Diff,
         vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
     ) -> Result<()> {
-        commit_batch_on(&mut self.acquire(), diff, vectors)
+        commit_batch_on(&mut self.acquire(), diff, vectors)?;
+        self.claim(diff);
+        Ok(())
+    }
+
+    /// Takes every node `diff` upserted out of the unclaimed set: whoever sent
+    /// it owns it again.
+    fn claim(&self, diff: &Diff) {
+        let mut unclaimed = self.unclaimed.lock().unwrap_or_else(PoisonError::into_inner);
+        if unclaimed.is_empty() {
+            return;
+        }
+        for ids in unclaimed.values_mut() {
+            for node in &diff.upsert_nodes {
+                ids.remove(&node.id);
+            }
+        }
+        unclaimed.retain(|_, ids| !ids.is_empty());
+    }
+
+    /// The placeholders of `language` the last swap kept that nothing has
+    /// upserted since, sorted.
+    pub fn unclaimed_nodes(&self, language: &str) -> Vec<String> {
+        let unclaimed = self.unclaimed.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ids: Vec<String> = unclaimed.get(language).into_iter().flatten().cloned().collect();
+        ids.sort();
+        ids
     }
 
     /// Links every import, then every cross-file symbol usage, in one hold.
@@ -242,8 +274,16 @@ impl IndexStore {
         staging_path: &std::path::Path,
         vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
         bookkeeping: &SwapBookkeeping<'_>,
-    ) -> Result<()> {
-        language_swap::swap(&mut self.acquire(), staging_path, vectors, bookkeeping)
+    ) -> Result<usize> {
+        let kept = language_swap::swap(&mut self.acquire(), staging_path, vectors, bookkeeping)?;
+        let count = kept.len();
+        let mut unclaimed = self.unclaimed.lock().unwrap_or_else(PoisonError::into_inner);
+        if kept.is_empty() {
+            unclaimed.remove(bookkeeping.language);
+        } else {
+            unclaimed.insert(bookkeeping.language.to_string(), kept.into_iter().collect());
+        }
+        Ok(count)
     }
 
     /// Writes `(filePath, mtimeMillis, contentHash)` baselines in one
@@ -292,7 +332,21 @@ impl Writer<'_> {
 
     /// Commits `diff` and links its imports and symbol usages, in one step.
     pub fn apply_diff_linked(&mut self, diff: &Diff, label: &str) -> Result<()> {
-        self.step(|conn| apply_and_link(conn, diff, label))
+        self.step(|conn| apply_and_link(conn, diff, label))?;
+        self.store.claim(diff);
+        Ok(())
+    }
+
+    /// Deletes `language`'s kept placeholders that nothing has upserted since
+    /// the swap that kept them, with every row hanging on them, in one step,
+    /// and returns how many went. Called after a complete whole-project
+    /// semantic pass: it re-sends every placeholder it still stands behind.
+    pub fn sweep_unclaimed_nodes(&mut self, language: &str) -> Result<usize> {
+        let ids = self.store.unclaimed.lock().unwrap_or_else(PoisonError::into_inner).remove(language);
+        let Some(ids) = ids else { return Ok(0) };
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        self.step(|conn| language_swap::delete_placeholders(conn, language, &ids))
     }
 
     /// Stores precomputed vectors, in one step. Best-effort, like
@@ -307,7 +361,9 @@ impl Writer<'_> {
         diff: &Diff,
         vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
     ) -> Result<()> {
-        self.step(|conn| commit_batch_on(conn, diff, vectors))
+        self.step(|conn| commit_batch_on(conn, diff, vectors))?;
+        self.store.claim(diff);
+        Ok(())
     }
 }
 
