@@ -368,13 +368,15 @@ async fn guidance_reflects_the_projects_current_state() {
     in_b.cancel().await.expect("failed to shut the b session down");
 }
 
-/// Reselecting the current project is a full switch (Q9), so it re-renders
-/// the guidance for the project's state now.
+/// Reselecting the current project keeps its connection and answers with the
+/// guidance from the switch that connected it, even once the project's state
+/// has moved on.
 ///
-/// Control: a same-project shortcut that re-sends the first switch's cached
-/// guidance: the second text still says "Not indexed yet".
+/// Control: drop the same-root check at the top of the router's `switch`:
+/// the reselect reconnects and the second text no longer says "Not indexed
+/// yet".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reselecting_the_same_project_refreshes_its_guidance() {
+async fn reselecting_the_same_project_keeps_its_connection() {
     let folder = Folder::new();
     let client = folder.connect(None).await;
     let b = folder.sub("b");
@@ -386,8 +388,9 @@ async fn reselecting_the_same_project_refreshes_its_guidance() {
     common::wait_for("b's index to record a completed walk", common::startup_timeout(), || bulk_indexed(&b));
 
     let second = guidance_of(&select(&client, "b").await, &b);
-    assert!(second.contains(P1_FIRST_SENTENCE), "{second}");
-    assert!(!second.contains("Not indexed yet"), "reselection must re-render b's guidance:\n{second}");
+    assert_eq!(second, first, "a reselect answers with the cached guidance");
+    let outline = call(&client, "get_file_outline", json!({ "file_path": "b.ts" })).await;
+    assert_eq!(outline_names(&outline), Some(vec!["b".to_string()]), "{}", text_of(&outline));
 
     client.cancel().await.expect("failed to shut the client down");
 }
