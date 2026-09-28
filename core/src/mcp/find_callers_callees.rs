@@ -316,10 +316,10 @@ struct CalleePage {
     /// See `Page::all_unresolved` - true when every callee in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
-    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
-    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    /// `anchor::file_anchor_hint`, then `session_hints::ALL_UNRESOLVED` when
+    /// `all_unresolved`; absent (not `null`) when neither applies.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     /// See [`ExcludedReferences`] - absent, not zero, when the walk left
     /// nothing behind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -481,7 +481,7 @@ pub(crate) fn handle_callees(
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
-        hint,
+        hint: session_hints::join([hint, bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED)]),
         excluded_references: excluded,
         provenance,
     })
@@ -1641,5 +1641,43 @@ mod tests {
         assert!(hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY));
         assert!(!hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY), "once per session");
         assert!(hint_for(&repeated_file, &SessionHints::default()).contains(session_hints::FILES_TALLY));
+    }
+
+    /// Like `used_by`, but `target` calls each of `callees` (id, file).
+    fn calling(callees: &[(&str, &str)], resolved: bool) -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        for (id, file) in callees {
+            upsert_node(
+                &mut conn,
+                NodeRecord::new(*id, "Function", *id, format!("pkg::{id}"), *file, "rust"),
+            )
+            .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{id}"), "target", *id, "CALLS", "tree-sitter", resolved),
+            )
+            .unwrap();
+        }
+        Arc::new(IndexStore::new(conn))
+    }
+
+    fn callee_hint(store: &Arc<IndexStore>) -> String {
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(
+            &handle_callees(store, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+        );
+        body["hint"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn an_all_unresolved_callee_page_carries_its_hint_on_every_call() {
+        let unresolved = calling(&[("a", "a.rs"), ("b", "b.rs")], false);
+        assert_eq!(callee_hint(&unresolved), session_hints::ALL_UNRESOLVED);
+        assert_eq!(callee_hint(&unresolved), session_hints::ALL_UNRESOLVED, "every time");
+
+        let resolved = calling(&[("a", "a.rs"), ("b", "b.rs")], true);
+        assert_eq!(callee_hint(&resolved), "");
     }
 }
