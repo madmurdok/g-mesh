@@ -169,11 +169,14 @@ first place (fix B, the bound).
   itself.** It sends a tool error (`isError: true`):
 
   > g-mesh: this call was not answered: the connection to the daemon serving
-  > `<root>` ended `<N>` s after the call was sent (`<reason>`). Nothing was
-  > computed for it - call the tool again.
+  > `<root>` ended `<N>` s after the call was sent (the session had switched
+  > to `<other root>`). Its result, if any, was not received - call the tool
+  > again.
 
-  `<reason>` is only what the shim knows: "the session switched to `<other
-  root>`", or "the daemon closed the connection". This also covers a daemon
+  The parenthesis appears only when the shim itself switched away from that
+  connection; otherwise no cause is claimed, because the shim cannot tell a
+  daemon's clean close from a crash or a read error. Whether the daemon
+  computed anything is not known to the shim either. This also covers a daemon
   that crashes or is replaced mid-call, which today loses the answer the same
   way.
 

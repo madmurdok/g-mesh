@@ -545,9 +545,12 @@ impl Shared {
         }
         let reason = match router.retired.iter().position(|retired| retired.upstream.id == id) {
             Some(index) => {
-                format!("the session switched to {}", router.retired.remove(index).switched_to.display())
+                format!(
+                    " (the session had switched to {})",
+                    router.retired.remove(index).switched_to.display()
+                )
             }
-            None => "the daemon closed the connection".to_string(),
+            None => String::new(),
         };
         let owed: Vec<Value> = router
             .pending
@@ -560,7 +563,7 @@ impl Shared {
             let Some(in_flight) = router.pending.remove(&request) else { continue };
             let message = format!(
                 "g-mesh: this call was not answered: the connection to the daemon serving {} ended {} s \
-                 after the call was sent ({reason}). Nothing was computed for it - call the tool again.",
+                 after the call was sent{reason}. Its result, if any, was not received - call the tool again.",
                 served.display(),
                 in_flight.sent.elapsed().as_secs(),
             );
@@ -910,7 +913,7 @@ mod tests {
         assert_eq!(answer["result"]["isError"], true, "{answer}");
         let text = answer["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("the daemon serving {} ended", a.root.display())), "{text}");
-        assert!(text.contains(&format!("the session switched to {}", b.root.display())), "{text}");
+        assert!(text.contains(&format!("(the session had switched to {})", b.root.display())), "{text}");
         assert!(text.contains("call the tool again"), "{text}");
     }
 
@@ -968,7 +971,10 @@ mod tests {
         assert_eq!(answer["result"]["isError"], true, "{answer}");
         let text = answer["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("serving {} ended", session.root.display())), "{text}");
-        assert!(text.contains("(the daemon closed the connection)"), "{text}");
+        assert!(
+            text.contains("after the call was sent. "),
+            "no switch happened, so no cause is claimed: {text}"
+        );
         session.session.join().unwrap().expect("the session ends when its daemon does");
     }
 }
