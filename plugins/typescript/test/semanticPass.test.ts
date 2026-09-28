@@ -1091,6 +1091,35 @@ test(
   },
 );
 
+test("a file in scope whose extraction throws makes the pass incomplete", async () => {
+  resetSemanticPassState();
+  const root = await makeProject({
+    "tsconfig.json": TSCONFIG,
+    "src/mod.ts": "export function someExport(): number {\n  return 1;\n}\n",
+    "src/broken.ts": NAMESPACE_CALLER,
+  });
+  // The resolver runs inside extractFile, so throwing from it for one file is
+  // a parse that throws for exactly that file and no other.
+  const real = createProjectResolver(root);
+  const resolveSpecifier = (specifier: string, fromFilePath: string): string | null => {
+    if (fromFilePath.endsWith("broken.ts")) throw new Error("parser exploded");
+    return real(specifier, fromFilePath);
+  };
+  const project = new SemanticProject(root);
+  try {
+    const result = await runSemanticPass(root, ["src/broken.ts"], { project, resolveSpecifier });
+    assert.equal(result.incomplete, true);
+    assert.ok(
+      result.incompleteReason?.includes("could not be parsed") === true &&
+        result.incompleteReason.includes("src/broken.ts"),
+      `${result.incompleteReason}`,
+    );
+  } finally {
+    await project.stop();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("questions left unasked after the checker keeps failing are reported, not dropped", async () => {
   resetSemanticPassState();
   const members = ["a", "b", "c", "d", "e", "f", "g"];

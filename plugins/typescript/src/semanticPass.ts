@@ -327,6 +327,10 @@ export interface SemanticPassOptions {
    * (`semanticProjectFor`), which is what the plugin process uses; tests pass
    * their own so they can dispose of it deterministically. */
   project?: SemanticProject;
+  /** How the pass's own extractions resolve module specifiers. Defaults to
+   * `createProjectResolver(projectRoot)`, the same resolver bulk indexing
+   * uses; tests pass their own to make one file's extraction fail. */
+  resolveSpecifier?: SpecifierResolver;
 }
 
 /**
@@ -895,7 +899,7 @@ class ProjectIndex {
     private readonly options: SemanticPassOptions,
     private readonly shortfall: Shortfall,
   ) {
-    this.resolveSpecifier = createProjectResolver(projectRoot);
+    this.resolveSpecifier = options.resolveSpecifier ?? createProjectResolver(projectRoot);
     this.isIndexable = createIndexabilityChecker(projectRoot);
     this.roots = new Set([path.resolve(projectRoot), canonicalizeProjectRoot(projectRoot)]);
   }
