@@ -225,20 +225,20 @@ func TestOpenSitesAreCachedPerFileAndReplacedWholesale(t *testing.T) {
 
 func TestHandleSemanticPassAlwaysAnswersEmpty(t *testing.T) {
 	state := newPluginState(t.TempDir())
-	diff, incomplete := state.handleSemanticPass(nil)
+	diff, reason := state.handleSemanticPass(nil)
 	if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 {
 		t.Fatalf("handleSemanticPass(nil) = %+v, want an empty diff", diff)
 	}
-	if incomplete {
-		t.Fatalf("handleSemanticPass(nil) on an empty project answered incomplete=true, want false - " +
-			"there was nothing to resolve, which is a trivially complete pass")
+	if reason != "" {
+		t.Fatalf("handleSemanticPass(nil) on an empty project answered incomplete (%q), want complete - "+
+			"there was nothing to resolve, which is a trivially complete pass", reason)
 	}
-	diff, incomplete = state.handleSemanticPass([]string{"a.go"})
+	diff, reason = state.handleSemanticPass([]string{"a.go"})
 	if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 {
 		t.Fatalf("handleSemanticPass([a.go]) = %+v, want an empty diff", diff)
 	}
-	if incomplete {
-		t.Fatalf("handleSemanticPass([a.go]) for a file this project doesn't have answered incomplete=true, want false")
+	if reason != "" {
+		t.Fatalf("handleSemanticPass([a.go]) for a file this project doesn't have answered incomplete (%q), want complete", reason)
 	}
 }
 
