@@ -606,6 +606,7 @@ use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
+use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{
     find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
     FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
@@ -906,12 +907,20 @@ impl SymbolTool {
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
-            SymbolTool::Callers => {
-                find_callers_callees::handle_callers(ctx.conn, ctx.embedding, ctx.capabilities, params)
-            }
-            SymbolTool::References => {
-                find_references::handle(ctx.conn, ctx.embedding, ctx.capabilities, params)
-            }
+            SymbolTool::Callers => find_callers_callees::handle_callers(
+                ctx.conn,
+                ctx.embedding,
+                ctx.capabilities,
+                &SessionHints::default(),
+                params,
+            ),
+            SymbolTool::References => find_references::handle(
+                ctx.conn,
+                ctx.embedding,
+                ctx.capabilities,
+                &SessionHints::default(),
+                params,
+            ),
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths } = params;
                 find_implementations::dispatch(
@@ -1095,7 +1104,12 @@ fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Resul
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    tool_json(tool_outcome(get_dependencies::handle(ctx.conn, ctx.entry_points, params)))
+    tool_json(tool_outcome(get_dependencies::handle(
+        ctx.conn,
+        ctx.entry_points,
+        &SessionHints::default(),
+        params,
+    )))
 }
 
 /// The set comparison both walk categories share, with decision 8's

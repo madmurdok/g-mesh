@@ -49,6 +49,7 @@ mod provenance;
 mod search_code;
 #[cfg(test)]
 mod semantic_pending_tests;
+pub(crate) mod session_hints;
 mod similarity;
 mod source;
 mod tool_result;
@@ -153,6 +154,7 @@ pub struct GMeshMcpServer {
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
+    hints: session_hints::SessionHints,
     tool_router: ToolRouter<Self>,
 }
 
@@ -165,7 +167,15 @@ impl GMeshMcpServer {
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        Self { store, registry, core_activity, indexing, embedding, tool_router: Self::tool_router() }
+        Self {
+            store,
+            registry,
+            core_activity,
+            indexing,
+            embedding,
+            hints: session_hints::SessionHints::default(),
+            tool_router: Self::tool_router(),
+        }
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -560,7 +570,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_references::handle(&self.store, &self.embedding, &capabilities, params.0)
+        find_references::handle(&self.store, &self.embedding, &capabilities, &self.hints, params.0)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -573,7 +583,13 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let capabilities = self.capabilities();
-        find_callers_callees::handle_callers(&self.store, &self.embedding, &capabilities, params.0)
+        find_callers_callees::handle_callers(
+            &self.store,
+            &self.embedding,
+            &capabilities,
+            &self.hints,
+            params.0,
+        )
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -643,7 +659,7 @@ impl GMeshMcpServer {
         // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
         // never changes while the daemon runs.
         let entry_points = self.registry.entry_points();
-        get_dependencies::handle(&self.store, &entry_points, params.0)
+        get_dependencies::handle(&self.store, &entry_points, &self.hints, params.0)
     }
 
     #[tool(
@@ -658,7 +674,7 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "search_code", Need::Embeddings).await? {
             return Ok(early);
         }
-        search_code::handle(&self.store, &self.embedding, params.0)
+        search_code::handle(&self.store, &self.embedding, &self.hints, params.0)
     }
 }
 

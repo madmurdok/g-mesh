@@ -19,7 +19,7 @@ fn ts_entry_points() -> Vec<String> {
 /// (a fake Rust manifest, an empty one) calls `super::handle` directly
 /// instead of this wrapper.
 fn handle(conn: &Arc<IndexStore>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
-    super::handle(conn, &ts_entry_points(), params)
+    super::handle(conn, &ts_entry_points(), &SessionHints::default(), params)
 }
 
 /// [`handle`]'s own shadow, for [`super::from_file`].
@@ -326,6 +326,7 @@ fn a_depth_cut_reports_max_depth_and_hands_back_only_the_frontier() {
     assert_eq!(body["truncatedBy"], "maxDepth");
     assert_eq!(body["frontierNodes"], serde_json::json!(["b.rs"]), "the level to re-root the same call on");
     assert!(body["resumeToken"].is_null(), "a depth cut is re-rooted, not resumed");
+    assert_eq!(body["hint"].as_str(), session_hints::truncated_by("maxDepth"));
 }
 
 /// Cause two: a node had more imports than the fan-out cap. Deliberately
@@ -346,6 +347,7 @@ fn a_fanout_cut_reports_max_fanout_and_hands_back_no_continuation_field() {
     assert_eq!(body["results"].as_array().unwrap().len(), 1, "one of the three imports, and a warning");
     assert_eq!(body["truncated"], true);
     assert_eq!(body["truncatedBy"], "maxFanout");
+    assert_eq!(body["hint"].as_str(), session_hints::truncated_by("maxFanout"));
     assert_eq!(
         body["frontierNodes"].as_array().unwrap().len(),
         0,
@@ -476,6 +478,7 @@ fn a_wide_fan_in_too_big_for_one_response_truncates_with_a_resume_token_instead_
     assert!(results.len() < wide, "the full {wide}-wide fan-in must not fit in one response");
     assert_eq!(body["truncated"], true);
     assert_eq!(body["truncatedBy"], "responseSize");
+    assert_eq!(body["hint"].as_str(), session_hints::truncated_by("responseSize"));
     let raw_len = serde_json::to_vec(results).unwrap().len();
     assert!(
         raw_len <= pagination::MAX_RESPONSE_BYTES,
@@ -599,7 +602,12 @@ fn a_path_passed_as_a_module_id_is_answered_rather_than_refused() {
     let result = from_module(
         &conn,
         "packages/math/src/index.ts",
-        &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        &WalkShape {
+            direction: Direction::Incoming,
+            max_depth: Some(1),
+            max_fanout: Some(50),
+            hints: SessionHints::default(),
+        },
     )
     .unwrap();
 
@@ -622,7 +630,12 @@ fn a_package_specifier_with_one_entry_point_is_answered_not_refused() {
     let result = from_file(
         &conn,
         "@excalidraw/math",
-        &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        &WalkShape {
+            direction: Direction::Incoming,
+            max_depth: Some(1),
+            max_fanout: Some(50),
+            hints: SessionHints::default(),
+        },
     )
     .unwrap();
 
@@ -649,7 +662,12 @@ fn a_directory_with_one_entry_point_is_answered_too() {
         &from_file(
             &conn,
             "packages/math",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -682,7 +700,12 @@ fn a_directory_with_one_declared_rust_entry_point_is_answered_too() {
             &conn,
             &["mod.rs".to_string()],
             "crates/math",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -710,7 +733,12 @@ fn two_declared_rust_entry_points_in_one_directory_still_refuse() {
             &conn,
             &["mod.rs".to_string(), "lib.rs".to_string()],
             "crates/math",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -732,7 +760,12 @@ fn two_entry_points_still_refuse_and_list_the_candidates() {
         &from_file(
             &conn,
             "packages/math",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -753,7 +786,12 @@ fn a_directory_without_an_entry_point_is_not_guessed_at() {
         &from_file(
             &conn,
             "packages/math",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -773,7 +811,12 @@ fn an_exact_file_anchor_reports_no_substitution() {
     let result = from_file(
         &conn,
         "packages/math/src/index.ts",
-        &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        &WalkShape {
+            direction: Direction::Incoming,
+            max_depth: Some(1),
+            max_fanout: Some(50),
+            hints: SessionHints::default(),
+        },
     )
     .unwrap();
     let raw = json_body(&result).to_string();
@@ -886,7 +929,12 @@ fn incoming_on_a_container_key_returns_the_importing_files() {
     let result = from_file(
         &conn,
         "github.com/x/pkg",
-        &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+        &WalkShape {
+            direction: Direction::Incoming,
+            max_depth: Some(1),
+            max_fanout: Some(50),
+            hints: SessionHints::default(),
+        },
     )
     .unwrap();
     let body = json_body(&result);
@@ -916,7 +964,12 @@ fn a_container_key_ambiguous_across_languages_is_refused_with_the_languages_name
         &from_file(
             &conn,
             "shared",
-            &WalkShape { direction: Direction::Incoming, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Incoming,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -1018,7 +1071,12 @@ fn nested_module(
 }
 
 fn incoming(max_depth: u32) -> WalkShape {
-    WalkShape { direction: Direction::Incoming, max_depth: Some(max_depth), max_fanout: Some(50) }
+    WalkShape {
+        direction: Direction::Incoming,
+        max_depth: Some(max_depth),
+        max_fanout: Some(50),
+        hints: SessionHints::default(),
+    }
 }
 
 /// The defect itself, on the Python shape that was measured:
@@ -1187,7 +1245,12 @@ fn outgoing_from_a_module_graph_file_is_left_alone() {
         &from_file(
             &conn,
             "render/render.go",
-            &WalkShape { direction: Direction::Outgoing, max_depth: Some(1), max_fanout: Some(50) },
+            &WalkShape {
+                direction: Direction::Outgoing,
+                max_depth: Some(1),
+                max_fanout: Some(50),
+                hints: SessionHints::default(),
+            },
         )
         .unwrap(),
     );
@@ -1241,4 +1304,47 @@ fn a_file_defining_two_sibling_modules_is_refused_with_both_named() {
 
     assert!(message.contains("x::pair::a"), "{message}");
     assert!(message.contains("x::pair::b"), "{message}");
+}
+
+/// The `hint` a walk out of `a` over `conn`'s import chain answers with on
+/// `session`, `""` when absent.
+fn walk_hint_on(conn: &Arc<IndexStore>, params: GetDependenciesParams, session: &SessionHints) -> String {
+    let body = json_body(&super::handle(conn, &ts_entry_points(), session, params).unwrap());
+    body["hint"].as_str().unwrap_or_default().to_string()
+}
+
+#[test]
+fn a_complete_walk_hint_is_sent_once_per_session() {
+    let conn = Arc::new(IndexStore::new(import_chain()));
+    let complete = || anchored_at("a.rs", Direction::Outgoing);
+    let cut = || GetDependenciesParams { max_depth: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
+    let session = SessionHints::default();
+
+    assert!(!walk_hint_on(&conn, cut(), &session).contains(session_hints::WALK_COMPLETE));
+    assert_eq!(walk_hint_on(&conn, complete(), &session), session_hints::WALK_COMPLETE);
+    assert_eq!(walk_hint_on(&conn, complete(), &session), "", "once per session");
+    assert_eq!(
+        walk_hint_on(&conn, cut(), &session),
+        session_hints::truncated_by("maxDepth").unwrap(),
+        "a truncated walk's sentence is every time"
+    );
+    assert_eq!(walk_hint_on(&conn, complete(), &SessionHints::default()), session_hints::WALK_COMPLETE);
+}
+
+#[test]
+fn the_import_type_clause_is_only_for_a_typescript_anchor() {
+    let mut conn = setup();
+    for path in ["a.ts", "b.ts"] {
+        upsert_node(&mut conn, NodeRecord::new(path, "File", path, path, path, "typescript")).unwrap();
+    }
+    imports(&mut conn, "a.ts", "b.ts");
+    let typescript = Arc::new(IndexStore::new(conn));
+    let rust = Arc::new(IndexStore::new(import_chain()));
+
+    let ts_hint =
+        walk_hint_on(&typescript, anchored_at("b.ts", Direction::Incoming), &SessionHints::default());
+    let rust_hint = walk_hint_on(&rust, anchored_at("c.rs", Direction::Incoming), &SessionHints::default());
+    assert_eq!(ts_hint, session_hints::WALK_COMPLETE_IMPORT_TYPE);
+    assert_eq!(rust_hint, session_hints::WALK_COMPLETE);
+    assert!(!rust_hint.contains("import type"));
 }

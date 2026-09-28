@@ -18,6 +18,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 
+use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::{anchor, provenance, SymbolQueryParams};
 
@@ -95,10 +96,10 @@ struct ReferencePage {
     /// See `Page::all_unresolved` - true when every reference in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
-    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
-    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    /// `anchor::file_anchor_hint`, then the `super::session_hints` sentences
+    /// this page's fields trigger; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -166,6 +167,7 @@ pub(crate) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -208,6 +210,13 @@ pub(crate) fn handle(
         .map(|row| row.file_path.as_str())
         .chain(files.iter().flatten().map(|tally| tally.path.as_str()));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+    let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
+    let hint = session_hints::join([
+        hint,
+        page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+        hints.once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
+        hints.once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
+    ]);
 
     success(&ReferencePage {
         anchor: anchor_info,
@@ -285,6 +294,7 @@ mod tests {
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
+            &SessionHints::default(),
             params,
         )
         .unwrap();
@@ -401,6 +411,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -423,6 +434,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -469,6 +481,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     limit: Some(1),
@@ -518,6 +531,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -557,6 +571,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -596,6 +611,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(vec!["a.ts".to_string()]),
@@ -673,6 +689,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -820,8 +837,16 @@ mod tests {
             limit: Some(25),
             ..Default::default()
         };
-        let body =
-            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+        let body = json_body(
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap(),
+        );
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
     }
@@ -890,8 +915,16 @@ mod tests {
             file_paths: Some(known_files.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         };
-        let body =
-            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+        let body = json_body(
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap(),
+        );
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
         file_paths.sort();
@@ -931,8 +964,16 @@ mod tests {
             file_paths: Some(vec!["a.rs".to_string()]),
             ..Default::default()
         };
-        let body =
-            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+        let body = json_body(
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap(),
+        );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
         assert_eq!(results[0]["referencingSymbolId"], "in_scope");
@@ -967,6 +1008,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -976,6 +1018,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams {
                     symbol_id: Some("target".to_string()),
                     file_paths: Some(Vec::new()),
@@ -1002,6 +1045,7 @@ mod tests {
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
+            &SessionHints::default(),
             params,
         )
         .unwrap();
@@ -1042,6 +1086,7 @@ mod tests {
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 params,
             )
             .unwrap(),
@@ -1086,6 +1131,7 @@ mod tests {
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 params,
             )
             .unwrap(),
@@ -1120,6 +1166,7 @@ mod tests {
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 params,
             )
             .unwrap(),
@@ -1153,6 +1200,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1162,6 +1210,7 @@ mod tests {
                 &conn,
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
             )
             .unwrap(),
@@ -1193,6 +1242,7 @@ mod tests {
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
+            &SessionHints::default(),
             params,
         )
         .unwrap();
@@ -1208,6 +1258,7 @@ mod tests {
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
             &no_capabilities(),
+            &SessionHints::default(),
             params,
         )
         .unwrap();
@@ -1240,8 +1291,16 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-        let body =
-            json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+        let body = json_body(
+            &handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap(),
+        );
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
         assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -1269,6 +1328,7 @@ mod tests {
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
                 &no_capabilities(),
+                &SessionHints::default(),
                 params,
             )
             .unwrap(),
@@ -1315,7 +1375,14 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
+            let result = handle(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["referencingSymbolId"].as_str().unwrap().to_string()));
@@ -1328,5 +1395,67 @@ mod tests {
 
         seen.sort();
         assert_eq!(seen, vec!["caller_a", "caller_b", "caller_c"]);
+    }
+
+    /// `target` used by each of `users` (id, kind, file) through one `REFERENCES`
+    /// edge apiece, every edge `resolved` or none.
+    fn used_by(users: &[(&str, &str, &str)], resolved: bool) -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        for (id, kind, file) in users {
+            upsert_node(&mut conn, NodeRecord::new(*id, *kind, *id, format!("pkg::{id}"), *file, "rust"))
+                .unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e_{id}"), *id, "target", "REFERENCES", "tree-sitter", resolved),
+            )
+            .unwrap();
+        }
+        Arc::new(IndexStore::new(conn))
+    }
+
+    /// The `hint` a find_references call on `target` answers with, `""` when absent.
+    fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
+        let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
+        let body = json_body(
+            &handle(store, &EmbeddingPipeline::disabled(), &no_capabilities(), hints, params).unwrap(),
+        );
+        body["hint"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn an_all_unresolved_page_carries_its_hint_on_every_call() {
+        let unresolved = used_by(&[("a", "Function", "a.rs"), ("b", "Function", "b.rs")], false);
+        let session = SessionHints::default();
+        assert!(hint_for(&unresolved, &session).contains(session_hints::ALL_UNRESOLVED));
+        assert!(hint_for(&unresolved, &session).contains(session_hints::ALL_UNRESOLVED), "every time");
+
+        let resolved = used_by(&[("a", "Function", "a.rs"), ("b", "Function", "b.rs")], true);
+        assert!(!hint_for(&resolved, &SessionHints::default()).contains(session_hints::ALL_UNRESOLVED));
+    }
+
+    #[test]
+    fn a_file_row_hint_is_sent_once_per_session() {
+        let symbols_only = used_by(&[("a", "Function", "a.rs")], true);
+        let with_file_row = used_by(&[("f", "File", "f.rs")], true);
+        let session = SessionHints::default();
+
+        assert!(!hint_for(&symbols_only, &session).contains(session_hints::FILE_ROW));
+        assert!(hint_for(&with_file_row, &session).contains(session_hints::FILE_ROW));
+        assert!(!hint_for(&with_file_row, &session).contains(session_hints::FILE_ROW), "once per session");
+        assert!(hint_for(&with_file_row, &SessionHints::default()).contains(session_hints::FILE_ROW));
+    }
+
+    #[test]
+    fn a_files_tally_hint_is_sent_once_per_session() {
+        let one_row_per_file = used_by(&[("a", "Function", "a.rs"), ("b", "Function", "b.rs")], true);
+        let repeated_file = used_by(&[("a1", "Function", "a.rs"), ("a2", "Function", "a.rs")], true);
+        let session = SessionHints::default();
+
+        assert!(!hint_for(&one_row_per_file, &session).contains(session_hints::FILES_TALLY));
+        assert!(hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY));
+        assert!(!hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY), "once per session");
+        assert!(hint_for(&repeated_file, &SessionHints::default()).contains(session_hints::FILES_TALLY));
     }
 }
