@@ -25,9 +25,15 @@
 //!
 //! - [`ensure_agents_md`] wraps its injected block in
 //!   `<!-- g-mesh:agents-md:begin -->` / `<!-- g-mesh:agents-md:end -->`
-//!   marker comments. A second run checks for the marker's presence, not for
-//!   the exact snippet text, so hand-written content elsewhere in the file is
-//!   never touched and a second `init` never appends a second copy.
+//!   marker comments. A second run replaces exactly the span from the begin
+//!   marker through the end marker with the current snippet, so an upgraded
+//!   g-mesh refreshes an installed block, hand-written content outside the
+//!   markers is never touched, and a second `init` never appends a second
+//!   copy. Edits *inside* the markers are overwritten: edit outside them. A
+//!   file whose markers do not delimit exactly one block (a begin marker with
+//!   no end marker after it, or two begin markers) is refused rather than
+//!   guessed at, since a wrong guess about where the block ends deletes user
+//!   text.
 //! - [`ensure_bridge_file`] checks whether the file's first line already
 //!   reads `@AGENTS.md`. No marker is needed there because the only thing
 //!   this function ever writes is that one line, prepended once.
@@ -35,7 +41,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::cli::AgentTarget;
 
@@ -45,41 +51,54 @@ const BRIDGE_LINE: &str = "@AGENTS.md";
 
 /// The canonical cross-tool project-instruction snippet.
 ///
-/// Copied from README.md's "Reducing self-verification cost" section and the
-/// user's own `~/.claude/CLAUDE.md` "Code search" section, and mirrored in
-/// g-mesh-bench's `GMESH_CONFIGURED_CLAUDE_MD` - all three must be kept in
-/// sync by hand if this ever changes.
-pub const AGENTS_MD_SNIPPET: &str = r#"# Code search (TypeScript/JavaScript projects)
+/// The only source of this text. README.md's "Reducing self-verification
+/// cost" section carries a copy that `readme_mirrors_the_snippet` pins byte
+/// for byte; g-mesh-bench's `GMESH_CONFIGURED_CLAUDE_MD` is pinned by its own
+/// drift guard; an installed `AGENTS.md` block is refreshed by re-running
+/// `g-mesh init --agent ...` (see [`ensure_agents_md`]).
+pub const AGENTS_MD_SNIPPET: &str = r#"# Code search (TypeScript/JavaScript, Rust, Python, Go projects)
 
-- In TS/JS projects, prefer g-mesh (`mcp__g-mesh__*`) for cross-file impact analysis, ambiguous naming (same symbol name declared in different scopes/files), and call-graph/multi-hop questions (callers, implementations, transitive dependencies) — grep can't resolve these reliably and has real unbounded cost (many round-trips, occasionally very expensive) when it tries. For simple, unambiguous single-symbol lookups, grep/`Explore`/manual reading is often just as fast and cheaper — g-mesh's tool schema adds fixed overhead per turn that doesn't pay for itself on easy questions (measured: g-mesh costs *more* tokens than grep on simple lookups, both isolated and in a long session — see `g-mesh-bench/docs/results/v0.2.0-session-economy-findings.md`). Fall back to grep when g-mesh returns no result, errors, or the target isn't something it tracks (non-code files, config, CSS, etc.).
+- Prefer g-mesh (`mcp__g-mesh__*`) for cross-file impact analysis, ambiguous naming (same symbol name declared in different scopes/files), and call-graph/multi-hop questions (callers, implementations, transitive dependencies) — grep can't resolve these reliably and has real unbounded cost (many round-trips, occasionally very expensive) when it tries. For simple, unambiguous single-symbol lookups, grep/`Explore`/manual reading is often just as fast and cheaper — g-mesh's tool schema adds fixed overhead per turn that doesn't pay for itself on easy questions (measured: g-mesh costs *more* tokens than grep on simple lookups, both isolated and in a long session — see `g-mesh-bench/docs/results/v0.2.0-session-economy-findings.md`). Fall back to grep when g-mesh returns no result, errors, or the target isn't something it tracks (non-code files, config, CSS, etc.).
 - No manual indexing command exists or is needed. The g-mesh daemon bootstraps and indexes a project automatically on its first tool call in that project's directory. On first use in a new project, just issue any g-mesh call (e.g. `get_file_outline` on a source file) to trigger indexing, then proceed.
-- How to use the tools:
-  - `get_file_outline(file_path)` — list a file's top-level symbols before reading it in full, or to find the right symbol name to query next.
-  - `find_definition(symbol_name)` or `find_definition(file_path, position)` — resolve a symbol to its definition and get its `symbol_id`. **The response carries the declaration's own source in `source.text`, so do not follow it with a Read or Grep of that file — the code you were about to look at is already in the answer.** A long declaration is cut at a line/char cap and says so in `source.omittedLines`; only then is reading the file worth a turn. Pass `include_source: false` if you genuinely want coordinates alone. Not required before the tools below — they accept `symbol_name` directly, skip this call when the name is likely unambiguous, and their response's `anchor` field ({id, qualifiedName, kind, filePath, startLine}) already gives the declaration site. Call `find_definition` first only when you expect ambiguity.
-  - `find_references(symbol_name or symbol_id)` — every usage of a symbol across the project; use before renaming or removing something.
-  - `find_callers(symbol_name or symbol_id)` / `find_callees(...)` — walk the call graph up or down from a function.
-  - `find_implementations(symbol_name or symbol_id)` — concrete types implementing an interface/abstract class.
-  - `get_dependencies(file_path, direction: Outgoing|Incoming)` — walk the import graph (what a file imports / what imports it); use for impact analysis before changing a shared module.
-  - `search_code(query)` — free-text semantic search over doc comments and signatures, ranked by similarity. Default to this as your *first* move on a "find the function/bug that does X" prompt when no symbol name is given — not something to reach for only after Grep has already failed a few times. Measured: on a bug-hunt task with no named symbol, reps that called `search_code` first converged in 8-11 turns; the one rep that skipped it and grep-guessed regex patterns from turn 1 took 15 turns for the same final answer (g-mesh-bench, `ex-implement-mutateelement-elbow-zero-position`). Skip it only for a symbol whose name you already know — `find_definition`/`find_references` are cheaper and exact there. Needs the project's embedding model available; if it errors saying semantic search is unavailable, fall back to grep or the structural tools instead.
-  - If a `symbol_name` turns out ambiguous, the result carries `ambiguous: true` with a ranked candidate list — re-query using a candidate's `id` as `symbol_id`, not its `qualifiedName` (the same qualifiedName can name more than one declaration).
-  - **Read `resolvedBy` before trusting a result.** `id`/`qualifiedName`/`name` mean the symbol was resolved exactly. `nameAmbiguous`/`fileName`/`semanticNeighbours` mean the answer is *candidates* — pick one by `id` and re-query. `semanticNeighbours` is the weakest: nothing structural matched, so these are the nearest declarations *by meaning*, and a closely-related-but-wrong one can score as high as the right one (measured: `AppState` returns `createAppState` at 0.845). Check the candidate before you build on it. Getting candidates back is still cheaper than the tool refusing and you re-asking another way, which is why they are offered at all.
-- Typical flow: call `find_references`/`find_callers`/`find_callees`/`find_implementations` directly with `symbol_name` when it's likely unique — their `anchor` field already carries the declaration site, so only call `find_definition` first if you expect ambiguity. Use `get_file_outline` first if you don't already know the right symbol name.
-- A `find_references`/`find_callers`/`find_callees`/`find_implementations` result is complete for the question it answers when: it was anchored by `symbol_id` or an unambiguous `symbol_name` (same guarantee either way), every row shows `resolved: true`, and the response has no `allUnresolved: true` flag — don't re-verify that with grep/Read. As of g-mesh 0.8.x, `resolved: false` is a narrow, accurate signal (only edges whose target is in another file g-mesh couldn't confirm — same-file edges are always `resolved: true`, matched against declarations actually in scope), not a blanket disclaimer, so still check: a row that shows `resolved: false` (check that row, not the whole list), a response with `allUnresolved: true` (the whole page is unconfirmed), or anything the result doesn't claim to cover at all — e.g. whether other, similarly-named symbols exist elsewhere, or a method call reached through a variable receiver (`x.foo()`, which produces no edge by design). Measured on real g-mesh-bench runs after the 0.8.x same-file-resolution fix: mean cost dropped ~38% and mean turns ~35% on the task this was tested on, with the remaining tool calls answering things g-mesh genuinely doesn't cover rather than re-checking it (see g-mesh's README "Reducing self-verification cost" section) — but grep/Read still earn their keep on the cases above, so don't suppress those.
-- Resolving an ambiguous name (the bullet above on `ambiguous: true` candidates) to a specific `symbol_id` doesn't reopen the completeness question: a `find_references`/`find_callers`/`find_callees`/`find_implementations` page anchored by that `symbol_id` carries the exact same `resolved: true`/no-`allUnresolved` guarantee as an unambiguous `symbol_name` query. Once you've picked the right candidate, treat its result as final — don't grep/Read each returned call site file-by-file to reconfirm it's "really" that symbol and not the same-named other one, and don't run a second, broad text search across the repo to check for anything the query might have missed. Both duplicate work the tool has already resolved, the same way re-verifying a plain unambiguous result would.
-- `find_callers`/`find_callees` only ever walk `CALLS` edges, and a `CALLS` edge only exists when the call site sits lexically inside a *named, tracked* function or method. A call written at a file's top level, or inside an anonymous/inline callback that isn't itself extracted as its own symbol (exactly the shape of `it("...", () => { requireTask(...) })` in a test file), gets a `REFERENCES` edge instead — which `find_callers` never sees, even on an otherwise complete, `resolved: true`, `hasMore: false` page. That's not a hole in its own guarantee (it's complete for `CALLS` edges specifically), but it's narrower than "every place this is called" when the prompt implies that — use `find_references` *instead of* `find_callers` whenever the task needs an exhaustive caller list (before a rename/removal, or anything that should include test files). Instead of, not as well as: for the same anchor `find_references` returns a strict superset of `find_callers`' rows (every `CALLS` edge, plus the `REFERENCES`/`SUPERTYPE_OF` ones), and each row's own `referenceKind` separates them inside that one page — asking both tools is two round-trips for one answer. A usage that sits outside any tracked symbol comes back as a whole-file row — `kind: File`, with no `qualifiedName`/`startLine`/`startCol` — because the graph has no smaller unit to point at there, not because the position went missing from an otherwise complete row. When the task asks which *files* are affected (a rename, an impact list), that row is already the answer at the granularity it claims: take it and move on, rather than grepping the file for the exact lines it deliberately doesn't carry.
-- When the question is about which *files* are affected — a rename, a signature change, "list every file that calls X" — read the response's `files` array and answer from it. `find_references`/`find_callers` attach `files` exactly when the rows don't already answer at that granularity (the page is incomplete, or several rows share one file), and unlike `results` it is computed over the *whole* edge set rather than the page: on excalidraw's `pointFrom`, a `limit: 200` call returns 51 rows spanning 46 files and still says `hasMore: true`, while the same response's `files` lists all 81 referencing files with a per-file count in a quarter of the bytes. So it is both the cheaper answer and the *more complete* one — deduplicating the rows by hand produces a shorter file list than the tally already holds, and paging the cursor to repair that spends round-trips on something already in hand. Use `results` when you need the calling symbol or its line; use `files` for "what do I have to touch". When `files` is absent the page is complete and its rows already sit one per file, so there is nothing to deduplicate — the `filePath` column is the list.
-- A `get_dependencies` result's completeness is signaled by `truncated`/`truncatedBy`, not a per-row `resolved` flag — there isn't one; a multi-hop path can't be summarized by one boolean the way a single edge can. `truncated: false` means the walk reached everything within its depth/fanout bounds — trust it fully, don't re-verify with grep. `truncated: true` needs a follow-up keyed off `truncatedBy`, not a blanket re-query: on `maxDepth`, re-call anchored on the returned `frontierNodes` to go further; on `maxFanout`, that one node had more imports/importers than the fanout cap, so re-query just that node with the single-hop tools' own pagination; on `explorationBudget`/`responseSize`, call again with the returned `resumeToken`. The default `max_depth` is only 2 (shallower than a single-hop tool's own completeness bar), so check `truncated` before treating one result as the whole *transitive* tree — but a depth bound limits only how far the walk goes, never how completely it walked the levels it did reach: `truncated: false` with an empty `frontierNodes` is the entire answer for the depth you asked for, and at `max_depth: 1` that is exactly the complete set of direct importers (`Incoming`) or direct imports (`Outgoing`).
-- Which imports produce those rows is the other half of trusting one. A row is a *file*, not an import statement, and its edge comes from a parsed module specifier: `import ... from`, type-only `import type ...`, `export ... from`, and `import()`/`require()` whose specifier is a static string or folds to one. Type-only imports sit in the graph exactly like value imports, so an `Incoming` walk already answers "every file that imports this, both kinds" — measured on g-mesh-bench's `tt-deps-incoming-db-connection`, one `Incoming`, `max_depth: 1` call on `src/db/connection.ts` returned all 21 importing `src/` files (18 of them `import type`-only), exactly the task's ground-truth set, and the follow-up greps three separate runs ran to check it found nothing it had missed. So don't re-derive that list with a `from ["'].*<module path>` grep: it is the most expensive habit on this tool, a whole extra round-trip that reproduces an answer already in hand. What a row genuinely doesn't carry is which names the importing file binds, whether that particular import was type-only, and on what line — `IMPORTS` edges have no position in the schema. When the task needs that for some file, Read that one file; don't grep the tree for all of them. The only importer that can be missing is one whose specifier no static fold can compute (built from a runtime value, `process.env`, or another file's constant).
-- `search_code` is similarity-ranked, not a resolved graph query — its top hit isn't automatically "the answer" the way a `find_definition` hit is. A response carrying a `noMatch` block is the tool itself saying this page is not a match: don't do the confirming read and don't reword the query — go to grep or a structural tool. Its absence is the normal case, and means at least one hit cleared the floor for its language. But once a hit's `qualifiedName`/`kind`/`filePath` plausibly match what the prompt describes, one targeted confirming read (the exact lines, or `get_file_outline`) is enough — check the doc comment/signature there, then stop. Don't keep re-issuing `search_code` with reworded queries hunting for a "better" match, and don't follow a confirmed hit with a broad grep sweep across the repo "just in case" — that's the same wasted re-verification the bullet above warns against for the structural tools, just dressed up as more searching instead of more reading.
-- `find_implementations` only returns direct implementors/extenders by default — a class extending a class that implements the anchor interface won't show up in a `hasMore: false` page. For the whole hierarchy, re-call with `transitive: true` (walks the same edges transitively, up to a bounded depth, resumable via `resume_token`).
+- When the g-mesh server covers a folder of several projects, call `select_project` first. In Claude Code its tools may be deferred: load them (ToolSearch) before the first call.
+- Trust a complete answer from the structural tools (`find_*`, `get_dependencies`). A response says when it is not complete or not exact (`hasMore`, `truncated`, `allUnresolved`, a `resolved: false` row, a `resolvedBy` other than `id`/`qualifiedName`/`name`), and its `hint`/`explanation` says what to do next. Absent those, do not re-check it with grep or Read: that re-verification is the most expensive habit these tools have.
+- The index serves the checkout it was built on. In a `git worktree` on another branch, trust g-mesh for code the branch has not changed and read the changed files directly.
+- When delegating, put this section in the subagent's brief: a subagent does not inherit it, and it may need to load the g-mesh tools too. grep is still right there for one known symbol or for non-code.
 "#;
+
+/// Upper bound on [`AGENTS_MD_SNIPPET`]'s size in bytes, the counterpart of
+/// `mcp::instructions::INSTRUCTIONS_BYTE_CEILING` for the text a project's
+/// `AGENTS.md`/`CLAUDE.md` carries. That file is re-read on every turn and has
+/// no transport truncation, so this bound is a cost decision: growing past it
+/// is a behaviour change that needs a measurement, not a quiet edit.
+pub const AGENTS_MD_SNIPPET_BYTE_CEILING: usize = 2560;
+
+/// What [`ensure_agents_md`] did to `AGENTS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentsMdWrite {
+    /// The file did not exist and was created with the block.
+    Created,
+    /// The file existed without the block, which was appended to it.
+    Appended,
+    /// The file held an older block, which was replaced with the current one.
+    Refreshed,
+    /// The file already held the current block, or nothing was requested.
+    #[default]
+    Unchanged,
+}
+
+impl AgentsMdWrite {
+    /// Whether the file's bytes changed.
+    pub fn wrote(self) -> bool {
+        self != AgentsMdWrite::Unchanged
+    }
+}
 
 /// What [`apply`] actually wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
-    /// Whether `AGENTS.md` was created or appended to. `false` means the
-    /// marker was already present and nothing changed.
-    pub agents_md_written: bool,
+    /// What happened to `AGENTS.md`.
+    pub agents_md_written: AgentsMdWrite,
     /// Whether `CLAUDE.md` was created or given the bridge line. `false`
     /// (with `AgentTarget::Claude` requested) means it already bridged.
     pub claude_md_written: bool,
@@ -88,41 +107,68 @@ pub struct Outcome {
     pub gemini_md_written: bool,
 }
 
-/// Ensures `project_root/AGENTS.md` contains [`AGENTS_MD_SNIPPET`].
+/// Ensures `project_root/AGENTS.md` contains the current [`AGENTS_MD_SNIPPET`].
 ///
-/// If the file does not exist, it is created with the snippet wrapped in the
-/// `g-mesh:agents-md` marker comments. If it exists but lacks the begin
-/// marker, the marker-wrapped block is appended after a blank-line separator,
-/// so existing content is never overwritten. If the begin marker is already
-/// present, this is a no-op.
-///
-/// Returns `true` if the file was created or appended to, `false` if it was
-/// already set up.
-pub fn ensure_agents_md(project_root: &Path) -> Result<bool> {
+/// - No file: it is created with the snippet wrapped in the
+///   `g-mesh:agents-md` marker comments.
+/// - A file without the begin marker: the marker-wrapped block is appended
+///   after a blank-line separator; existing content is never overwritten.
+/// - A file with exactly one begin marker and an end marker after it: the
+///   span from the begin marker through the end marker is replaced with the
+///   current block, leaving everything before and after it byte-identical.
+///   If the span already equals the current block, nothing is written.
+/// - Any other arrangement of markers is an error naming the file and the
+///   fix, and the file is left untouched.
+pub fn ensure_agents_md(project_root: &Path) -> Result<AgentsMdWrite> {
     let path = project_root.join("AGENTS.md");
-    let existing = fs::read_to_string(&path).ok();
+    let block = format!("{BEGIN_MARKER}\n{AGENTS_MD_SNIPPET}{END_MARKER}");
 
-    if let Some(contents) = &existing {
-        if contents.contains(BEGIN_MARKER) {
-            return Ok(false);
-        }
-    }
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
 
-    let block = format!("{BEGIN_MARKER}\n{AGENTS_MD_SNIPPET}{END_MARKER}\n");
-    let new_contents = match existing {
-        None => block,
-        Some(mut contents) => {
-            if !contents.ends_with('\n') {
+    let (new_contents, write) = match existing {
+        None => (format!("{block}\n"), AgentsMdWrite::Created),
+        Some(contents) => match contents.match_indices(BEGIN_MARKER).count() {
+            0 => {
+                let mut contents = contents;
+                if !contents.ends_with('\n') {
+                    contents.push('\n');
+                }
                 contents.push('\n');
+                contents.push_str(&block);
+                contents.push('\n');
+                (contents, AgentsMdWrite::Appended)
             }
-            contents.push('\n');
-            contents.push_str(&block);
-            contents
-        }
+            1 => {
+                let begin = contents.find(BEGIN_MARKER).expect("counted one begin marker");
+                let Some(end_offset) = contents[begin..].find(END_MARKER) else {
+                    bail!(
+                        "{} has a `{BEGIN_MARKER}` line with no `{END_MARKER}` after it, so the \
+                         g-mesh block's extent is unknown; add the end marker where the block \
+                         ends, or delete the begin marker to have a fresh block appended",
+                        path.display()
+                    );
+                };
+                let end = begin + end_offset + END_MARKER.len();
+                if contents[begin..end] == block {
+                    return Ok(AgentsMdWrite::Unchanged);
+                }
+                let refreshed = format!("{}{block}{}", &contents[..begin], &contents[end..]);
+                (refreshed, AgentsMdWrite::Refreshed)
+            }
+            _ => bail!(
+                "{} has more than one `{BEGIN_MARKER}` line, so which g-mesh block to refresh is \
+                 ambiguous; delete all but one begin/end marker pair",
+                path.display()
+            ),
+        },
     };
 
     fs::write(&path, new_contents).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(true)
+    Ok(write)
 }
 
 /// Ensures `project_root/<filename>` bridges to `AGENTS.md` via Claude
@@ -203,21 +249,19 @@ mod tests {
 
         let written = ensure_agents_md(project.path()).unwrap();
 
-        assert!(written);
+        assert_eq!(written, AgentsMdWrite::Created);
         let contents = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
-        assert!(contents.contains(BEGIN_MARKER), "{contents}");
-        assert!(contents.contains(END_MARKER), "{contents}");
-        assert!(contents.contains("Code search (TypeScript/JavaScript projects)"), "{contents}");
+        assert_eq!(contents, format!("{BEGIN_MARKER}\n{AGENTS_MD_SNIPPET}{END_MARKER}\n"));
     }
 
     #[test]
     fn ensure_agents_md_is_a_noop_once_the_marker_is_present() {
         let project = project();
-        assert!(ensure_agents_md(project.path()).unwrap());
+        assert_eq!(ensure_agents_md(project.path()).unwrap(), AgentsMdWrite::Created);
 
         let written_again = ensure_agents_md(project.path()).unwrap();
 
-        assert!(!written_again, "a second run must not report a write");
+        assert_eq!(written_again, AgentsMdWrite::Unchanged, "a second run must not report a write");
         let contents = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
         assert_eq!(contents.matches(BEGIN_MARKER).count(), 1, "the block must not be duplicated");
     }
@@ -230,7 +274,7 @@ mod tests {
 
         let written = ensure_agents_md(project.path()).unwrap();
 
-        assert!(written);
+        assert_eq!(written, AgentsMdWrite::Appended);
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.starts_with("# My project\n\nSome hand-written notes.\n"), "{contents}");
         assert!(contents.contains(BEGIN_MARKER), "{contents}");
@@ -290,7 +334,7 @@ mod tests {
 
         let outcome = apply(project.path(), &[AgentTarget::AgentsMd]).unwrap();
 
-        assert!(outcome.agents_md_written);
+        assert_eq!(outcome.agents_md_written, AgentsMdWrite::Created);
         assert!(!outcome.claude_md_written);
         assert!(!outcome.gemini_md_written);
         assert!(project.path().join("AGENTS.md").exists());
@@ -304,7 +348,7 @@ mod tests {
 
         let outcome = apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
 
-        assert!(outcome.agents_md_written);
+        assert_eq!(outcome.agents_md_written, AgentsMdWrite::Created);
         assert!(outcome.claude_md_written);
         assert!(outcome.gemini_md_written);
         assert!(project.path().join("AGENTS.md").exists());
@@ -322,8 +366,123 @@ mod tests {
 
         let outcome = apply(project.path(), &[AgentTarget::Claude, AgentTarget::Gemini]).unwrap();
 
-        assert!(!outcome.agents_md_written);
+        assert_eq!(outcome.agents_md_written, AgentsMdWrite::Unchanged);
         assert!(!outcome.claude_md_written);
         assert!(!outcome.gemini_md_written);
+    }
+
+    #[test]
+    fn ensure_agents_md_refreshes_an_old_block_and_preserves_text_around_it() {
+        let project = project();
+        let path = project.path().join("AGENTS.md");
+        let before = "# My project\n\nNotes above the block.\n\n";
+        let after = "\n\n## Mine\n\nNotes below the block.\n";
+        let old_block = format!("{BEGIN_MARKER}\n# Code search (old)\n\n- an outdated bullet\n{END_MARKER}");
+        fs::write(&path, format!("{before}{old_block}{after}")).unwrap();
+
+        let written = ensure_agents_md(project.path()).unwrap();
+
+        assert_eq!(written, AgentsMdWrite::Refreshed);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, format!("{before}{BEGIN_MARKER}\n{AGENTS_MD_SNIPPET}{END_MARKER}{after}"));
+        assert_eq!(ensure_agents_md(project.path()).unwrap(), AgentsMdWrite::Unchanged);
+    }
+
+    #[test]
+    fn ensure_agents_md_refuses_a_begin_marker_without_an_end_marker() {
+        let project = project();
+        let path = project.path().join("AGENTS.md");
+        let original = format!("# Mine\n\n{BEGIN_MARKER}\n# Code search\n\nmy own notes after it\n");
+        fs::write(&path, &original).unwrap();
+
+        let err = ensure_agents_md(project.path()).unwrap_err().to_string();
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(END_MARKER), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "a refused file must stay untouched");
+    }
+
+    #[test]
+    fn ensure_agents_md_refuses_an_end_marker_only_before_the_begin_marker() {
+        let project = project();
+        let path = project.path().join("AGENTS.md");
+        let original = format!("{END_MARKER}\n# Mine\n{BEGIN_MARKER}\n# Code search\n");
+        fs::write(&path, &original).unwrap();
+
+        assert!(ensure_agents_md(project.path()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn ensure_agents_md_refuses_two_begin_markers() {
+        let project = project();
+        let path = project.path().join("AGENTS.md");
+        let block = format!("{BEGIN_MARKER}\n{AGENTS_MD_SNIPPET}{END_MARKER}\n");
+        let original = format!("{block}\n{block}");
+        fs::write(&path, &original).unwrap();
+
+        let err = ensure_agents_md(project.path()).unwrap_err().to_string();
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("more than one"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn agents_md_snippet_fits_its_ceiling() {
+        assert!(
+            AGENTS_MD_SNIPPET.len() <= AGENTS_MD_SNIPPET_BYTE_CEILING,
+            "AGENTS_MD_SNIPPET is {} bytes, over its {AGENTS_MD_SNIPPET_BYTE_CEILING}-byte ceiling",
+            AGENTS_MD_SNIPPET.len()
+        );
+    }
+
+    /// README.md carries a copy for people who paste it into a global
+    /// `CLAUDE.md` instead of running `init`; it must be this exact text.
+    #[test]
+    fn readme_mirrors_the_snippet() {
+        let readme = include_str!("../../../README.md");
+        let heading = readme
+            .find("### Reducing self-verification cost")
+            .expect("README.md lost its \"Reducing self-verification cost\" heading");
+        let fence = "```markdown\n";
+        let start = heading
+            + readme[heading..].find(fence).expect("no ```markdown block after the heading")
+            + fence.len();
+        let len = readme[start..].find("\n```\n").expect("the ```markdown block is not closed") + 1;
+
+        assert_eq!(
+            &readme[start..start + len],
+            AGENTS_MD_SNIPPET,
+            "README.md's snippet block drifted from AGENTS_MD_SNIPPET"
+        );
+    }
+
+    /// Every bundled language plugin is named in the snippet's heading, so a
+    /// new plugin cannot ship with guidance that says its projects are out of
+    /// scope.
+    #[test]
+    fn snippet_heading_names_every_bundled_plugin_language() {
+        let heading = AGENTS_MD_SNIPPET.lines().next().unwrap().to_lowercase();
+        let words: Vec<&str> =
+            heading.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+
+        let mut languages = Vec::new();
+        for entry in fs::read_dir(&plugins).unwrap() {
+            let manifest = entry.unwrap().path().join("plugin.toml");
+            if !manifest.exists() {
+                continue;
+            }
+            let parsed: toml::Value = toml::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+            let language = parsed["plugin"]["language"].as_str().unwrap().to_lowercase();
+            assert!(
+                words.contains(&language.as_str()),
+                "{} declares language {language:?}, which the snippet heading {heading:?} does not name",
+                manifest.display()
+            );
+            languages.push(language);
+        }
+        assert!(languages.len() >= 4, "found only {languages:?} under {}", plugins.display());
     }
 }

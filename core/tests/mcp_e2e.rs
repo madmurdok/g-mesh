@@ -142,6 +142,15 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
         );
     }
 
+    let search_code = tools.iter().find(|tool| tool.name == "search_code").expect("search_code is listed");
+    assert!(
+        search_code.description.as_deref().is_some_and(
+            |d| d.contains("first for a \"find the code that does X\" prompt that names no symbol")
+        ),
+        "search_code's description must say when to reach for it first: {:?}",
+        search_code.description
+    );
+
     // Every tool is a stub for now, so this is the "answers instead of
     // crashing" check: a tool-level error result, connection intact.
     let called = client
