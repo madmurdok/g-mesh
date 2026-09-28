@@ -13,12 +13,22 @@
 //!
 //! Client frames are parsed, to learn which ones to record or route
 //! specially; they are forwarded as the original bytes, never re-serialized.
-//! Upstream frames are parsed only on the front's connection, and only while
-//! a `select_project` call is outstanding, so a sub-project daemon's (often
-//! large) tool results are never parsed at all. A single-project session
-//! never has a switch directive to act on, so for it every frame crosses
-//! byte-for-byte, as it did before this module existed; a frame that fails to
-//! parse is forwarded raw.
+//! Every upstream frame is scanned for its `id` and `method` only (the rest,
+//! such as a large tool result, is skipped, not built), to settle the request
+//! it answers. Upstream frames are parsed in full only on the front's
+//! connection, and only while a `select_project` call is outstanding. A
+//! single-project session never has a switch directive to act on, so for it
+//! every frame crosses byte-for-byte, as it did before this module existed; a
+//! frame that fails to parse is forwarded raw.
+//!
+//! # Every forwarded request is answered
+//!
+//! Each request forwarded upstream is recorded with the upstream it went to
+//! until its response passes back. A switch does not close the previous
+//! sub-project upstream while it still owes answers: it is *retired*, and
+//! half-closed once its last one has passed. An upstream that ends while it
+//! still owes answers has the shim answer each of them with an error, so the
+//! client never waits on a request nobody will answer.
 //!
 //! # Who writes stdout
 //!
@@ -26,14 +36,17 @@
 //! frames through one channel, so two readers' frames cannot interleave: that
 //! holds by construction rather than by locking discipline.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use serde::de::IgnoredAny;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::mcp::front::{SELECT_PROJECT, SWITCH_PROJECT_META};
@@ -54,13 +67,20 @@ pub(crate) type Connector = Box<dyn Fn(&Path) -> Result<Link> + Send + Sync>;
 #[derive(Clone)]
 struct Upstream {
     id: u64,
+    /// The root its daemon serves.
+    root: PathBuf,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     closer: Arc<dyn Fn(Shutdown) + Send + Sync>,
 }
 
 impl Upstream {
-    fn new(id: u64, writer: Box<dyn Write + Send>, closer: Box<dyn Fn(Shutdown) + Send + Sync>) -> Self {
-        Self { id, writer: Arc::new(Mutex::new(writer)), closer: Arc::from(closer) }
+    fn new(
+        id: u64,
+        root: PathBuf,
+        writer: Box<dyn Write + Send>,
+        closer: Box<dyn Fn(Shutdown) + Send + Sync>,
+    ) -> Self {
+        Self { id, root, writer: Arc::new(Mutex::new(writer)), closer: Arc::from(closer) }
     }
 
     fn send(&self, frame: &[u8]) -> Result<()> {
@@ -81,6 +101,12 @@ struct Router {
     front: Option<Upstream>,
     /// The selected sub-project's daemon, once a switch has happened.
     sub: Option<Upstream>,
+    /// Sub-project upstreams switched away from while they still owed
+    /// answers. Each is half-closed once it owes none, and dropped from here
+    /// when its connection ends.
+    retired: Vec<Retired>,
+    /// Client requests forwarded upstream and not yet answered, by id.
+    pending: HashMap<Value, InFlight>,
     init_frame: Option<Vec<u8>>,
     initialized_frame: Option<Vec<u8>>,
     /// Ids of `select_project` calls sent to the front and not yet answered.
@@ -89,9 +115,40 @@ struct Router {
     next_upstream: u64,
 }
 
+struct Retired {
+    upstream: Upstream,
+    /// The root the session switched to when this upstream was retired.
+    switched_to: PathBuf,
+}
+
+struct InFlight {
+    upstream: u64,
+    method: String,
+    sent: Instant,
+}
+
 impl Router {
     fn current(&self) -> Option<&Upstream> {
         self.sub.as_ref().or(self.front.as_ref())
+    }
+
+    fn upstream(&self, id: u64) -> Option<&Upstream> {
+        [self.front.as_ref(), self.sub.as_ref()]
+            .into_iter()
+            .flatten()
+            .chain(self.retired.iter().map(|retired| &retired.upstream))
+            .find(|upstream| upstream.id == id)
+    }
+
+    /// Half-closes upstream `id` if it is retired and owes no answers. Its
+    /// reader then sees the connection end.
+    fn release_if_drained(&self, id: u64) {
+        if self.pending.values().any(|in_flight| in_flight.upstream == id) {
+            return;
+        }
+        if let Some(retired) = self.retired.iter().find(|retired| retired.upstream.id == id) {
+            retired.upstream.close(Shutdown::Write);
+        }
     }
 }
 
@@ -113,17 +170,32 @@ enum ClientFrame {
     Initialized,
     SelectProject(Value),
     ToolsList,
+    /// `notifications/cancelled` for the request with this id.
+    Cancelled(Value),
     Other,
 }
 
-fn classify(frame: &[u8]) -> ClientFrame {
+/// A client frame's routing class, and its id and method when it is a
+/// request (a response to a server request has an id but no method).
+fn classify(frame: &[u8]) -> (ClientFrame, Option<(Value, String)>) {
     let Ok(message) = serde_json::from_slice::<Value>(frame) else {
-        return ClientFrame::Other;
+        return (ClientFrame::Other, None);
     };
-    match message.get("method").and_then(Value::as_str) {
+    let method = message.get("method").and_then(Value::as_str);
+    let request = match (message.get("id"), method) {
+        (Some(id), Some(method)) if !id.is_null() => Some((id.clone(), method.to_string())),
+        _ => None,
+    };
+    let kind = match method {
         Some("initialize") => ClientFrame::Initialize,
         Some("notifications/initialized") => ClientFrame::Initialized,
         Some("tools/list") => ClientFrame::ToolsList,
+        Some("notifications/cancelled") => {
+            match message.get("params").and_then(|params| params.get("requestId")) {
+                Some(id) => ClientFrame::Cancelled(id.clone()),
+                None => ClientFrame::Other,
+            }
+        }
         Some("tools/call") => {
             let name = message.get("params").and_then(|params| params.get("name")).and_then(Value::as_str);
             match (name, message.get("id")) {
@@ -132,6 +204,22 @@ fn classify(frame: &[u8]) -> ClientFrame {
             }
         }
         _ => ClientFrame::Other,
+    };
+    (kind, request)
+}
+
+/// The id of the request an upstream frame answers, or `None` for a
+/// notification, a server request, or an unparsable frame. Only `id` and
+/// `method` are built; every other field is skipped.
+fn response_id(frame: &[u8]) -> Option<Value> {
+    #[derive(Deserialize)]
+    struct Head {
+        id: Option<Value>,
+        method: Option<IgnoredAny>,
+    }
+    match serde_json::from_slice::<Head>(frame) {
+        Ok(Head { id: Some(id), method: None }) => Some(id),
+        _ => None,
     }
 }
 
@@ -154,9 +242,11 @@ where
     let Link { reader, writer, closer } = front;
     let shared = Arc::new(Shared {
         router: Mutex::new(Router {
-            root,
-            front: Some(Upstream::new(0, writer, closer)),
+            root: root.clone(),
+            front: Some(Upstream::new(0, root.clone(), writer, closer)),
             sub: None,
+            retired: Vec::new(),
+            pending: HashMap::new(),
             init_frame: None,
             initialized_frame: None,
             select_ids: HashSet::new(),
@@ -188,6 +278,9 @@ fn spawn_reader(shared: &Arc<Shared>, id: u64, mut reader: Box<dyn BufRead + Sen
         loop {
             match read_ndjson_frame(&mut reader) {
                 Ok(Some(frame)) => {
+                    if let Some(answered) = response_id(&frame) {
+                        shared.settle(id, &answered);
+                    }
                     let frame = if is_front { shared.on_front_frame(frame) } else { Some(frame) };
                     if let Some(frame) = frame {
                         if shared.events.send(Event::Frame(frame)).is_err() {
@@ -230,15 +323,29 @@ impl Shared {
             }
         };
         let router = self.lock();
-        for upstream in [&router.front, &router.sub].into_iter().flatten() {
+        let retired = router.retired.iter().map(|retired| &retired.upstream);
+        for upstream in [router.front.as_ref(), router.sub.as_ref()].into_iter().flatten().chain(retired) {
             upstream.close(how);
         }
     }
 
+    /// Records that upstream `upstream` answered request `id`.
+    fn settle(&self, upstream: u64, id: &Value) {
+        let mut router = self.lock();
+        if router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
+            router.pending.remove(id);
+            router.release_if_drained(upstream);
+        }
+    }
+
     fn on_client_frame(&self, frame: Vec<u8>) {
+        let (kind, request) = classify(&frame);
+        // The upstream a cancelled request went to, when it owes nothing else
+        // once the cancel is sent.
+        let mut cancelled_on = None;
         let target = {
             let mut router = self.lock();
-            match classify(&frame) {
+            let target = match kind {
                 ClientFrame::Initialize => {
                     router.init_frame = Some(frame.clone());
                     router.current().cloned()
@@ -267,14 +374,33 @@ impl Shared {
                     }
                 },
                 ClientFrame::ToolsList => router.front.clone().or_else(|| router.current().cloned()),
+                // The cancel goes where the request went; a daemon is not
+                // required to answer a cancelled request, so it is no longer
+                // owed.
+                ClientFrame::Cancelled(id) => match router.pending.remove(&id) {
+                    Some(in_flight) => {
+                        cancelled_on = Some(in_flight.upstream);
+                        router.upstream(in_flight.upstream).cloned()
+                    }
+                    None => router.current().cloned(),
+                },
                 ClientFrame::Other => router.current().cloned(),
+            };
+            // Recorded before the frame is sent, so the answer can never
+            // overtake it.
+            if let (Some(upstream), Some((id, method))) = (&target, request) {
+                router.pending.insert(id, InFlight { upstream: upstream.id, method, sent: Instant::now() });
             }
+            target
         };
         if let Some(upstream) = target {
             if let Err(err) = upstream.send(&frame) {
                 // Its reader ends too, and decides whether the session does.
                 eprintln!("g-mesh mcp-shim: could not forward a frame to the daemon: {err:#}");
             }
+        }
+        if let Some(upstream) = cancelled_on {
+            self.lock().release_if_drained(upstream);
         }
     }
 
@@ -388,9 +514,11 @@ impl Shared {
         let id = router.next_upstream;
         router.next_upstream += 1;
         spawn_reader(self, id, reader, false);
-        if let Some(previous) = router.sub.replace(Upstream::new(id, writer, closer)) {
-            // Its reader drains the replies still in flight, then ends.
-            previous.close(Shutdown::Write);
+        if let Some(previous) = router.sub.replace(Upstream::new(id, target.clone(), writer, closer)) {
+            // Its reader passes the replies it still owes, then ends.
+            let previous_id = previous.id;
+            router.retired.push(Retired { upstream: previous, switched_to: target.clone() });
+            router.release_if_drained(previous_id);
         }
         Ok((target, guidance))
     }
@@ -398,6 +526,7 @@ impl Shared {
     fn upstream_ended(&self, id: u64) {
         let mut router = self.lock();
         let current = router.current().map(|upstream| upstream.id);
+        let served = router.upstream(id).map(|upstream| upstream.root.clone());
         if router.front.as_ref().map(|front| front.id) == Some(id) {
             router.front = None;
             // Nobody is left to answer these; say so rather than leave the
@@ -407,11 +536,38 @@ impl Shared {
                 router.root.display()
             );
             for pending in router.select_ids.drain().collect::<Vec<_>>() {
+                router.pending.remove(&pending);
                 let _ = self.events.send(Event::Frame(error_result(&pending, &message)));
             }
         }
         if router.sub.as_ref().map(|sub| sub.id) == Some(id) {
             router.sub = None;
+        }
+        let reason = match router.retired.iter().position(|retired| retired.upstream.id == id) {
+            Some(index) => {
+                format!(
+                    " (the session had switched to {})",
+                    router.retired.remove(index).switched_to.display()
+                )
+            }
+            None => String::new(),
+        };
+        let owed: Vec<Value> = router
+            .pending
+            .iter()
+            .filter(|(_, in_flight)| in_flight.upstream == id)
+            .map(|(request, _)| request.clone())
+            .collect();
+        let served = served.unwrap_or_else(|| router.root.clone());
+        for request in owed {
+            let Some(in_flight) = router.pending.remove(&request) else { continue };
+            let message = format!(
+                "g-mesh: this call was not answered: the connection to the daemon serving {} ended {} s \
+                 after the call was sent{reason}. Its result, if any, was not received - call the tool again.",
+                served.display(),
+                in_flight.sent.elapsed().as_secs(),
+            );
+            let _ = self.events.send(Event::Frame(unanswered(&request, &in_flight.method, &message)));
         }
         if current == Some(id) {
             let _ = self.events.send(Event::Done);
@@ -428,9 +584,25 @@ fn error_result(id: &Value, text: &str) -> Vec<u8> {
     .expect("a Value always serializes")
 }
 
+/// The shim's own answer to a request its upstream will never answer: a
+/// tool error for `tools/call`, a JSON-RPC error for any other method, whose
+/// result would not have a tool result's shape.
+fn unanswered(id: &Value, method: &str, text: &str) -> Vec<u8> {
+    if method == "tools/call" {
+        return error_result(id, text);
+    }
+    serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32603, "message": text },
+    }))
+    .expect("a Value always serializes")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, BufReader, Read};
+    use std::time::Duration;
 
     use super::*;
 
@@ -489,5 +661,321 @@ mod tests {
             upstream_frames.iter().flat_map(|frame| frame.iter().copied().chain(*b"\n")).collect();
         assert_eq!(String::from_utf8_lossy(&out), String::from_utf8_lossy(&expected));
         drop(client_w);
+    }
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    /// A scripted daemon. It answers `initialize` (with instructions naming
+    /// its root) and `select_project` (with a switch directive to
+    /// `<root>/<project>`) itself, and hands every other frame to the test,
+    /// which answers through [`Fake::answer`]. Like the real daemon, it takes
+    /// a half-close as "client gone" and closes its side: whatever it has not
+    /// answered by then is never answered.
+    struct Fake {
+        root: PathBuf,
+        got: mpsc::Receiver<Value>,
+        writer: Arc<Mutex<Option<io::PipeWriter>>>,
+        closes: Arc<Mutex<Vec<Shutdown>>>,
+    }
+
+    impl Fake {
+        fn spawn(root: PathBuf) -> (Link, Fake) {
+            let (to_daemon_r, to_daemon_w) = io::pipe().unwrap();
+            let (from_daemon_r, from_daemon_w) = io::pipe().unwrap();
+            let writer = Arc::new(Mutex::new(Some(from_daemon_w)));
+            let closes = Arc::new(Mutex::new(Vec::new()));
+            let (got_tx, got) = mpsc::channel();
+            let (auto, served) = (Arc::clone(&writer), root.clone());
+            thread::spawn(move || {
+                let mut input = BufReader::new(to_daemon_r);
+                while let Ok(Some(frame)) = read_ndjson_frame(&mut input) {
+                    let message: Value = serde_json::from_slice(&frame).unwrap();
+                    let reply = match message["method"].as_str() {
+                        Some("initialize") => Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": message["id"],
+                            "result": { "instructions": format!("guidance for {}", served.display()) },
+                        })),
+                        Some("tools/call") if message["params"]["name"] == SELECT_PROJECT => {
+                            let project = message["params"]["arguments"]["project"].as_str().unwrap();
+                            let mut meta = serde_json::Map::new();
+                            meta.insert(SWITCH_PROJECT_META.into(), json!({ "root": served.join(project) }));
+                            Some(json!({
+                                "jsonrpc": "2.0",
+                                "id": message["id"],
+                                "result": { "content": [], "_meta": meta },
+                            }))
+                        }
+                        _ => None,
+                    };
+                    match reply {
+                        Some(reply) => {
+                            if let Some(out) = auto.lock().unwrap().as_mut() {
+                                write_ndjson_frame(out, &serde_json::to_vec(&reply).unwrap()).unwrap();
+                            }
+                        }
+                        None => {
+                            if got_tx.send(message).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+            let (recorded, closing) = (Arc::clone(&closes), Arc::clone(&writer));
+            let link = Link {
+                reader: Box::new(BufReader::new(from_daemon_r)),
+                writer: Box::new(to_daemon_w),
+                closer: Box::new(move |how| {
+                    recorded.lock().unwrap().push(how);
+                    closing.lock().unwrap().take();
+                }),
+            };
+            (link, Fake { root, got, writer, closes })
+        }
+
+        /// The next frame this daemon received with `method`, skipping others.
+        fn expect(&self, method: &str) -> Value {
+            loop {
+                let message = self.got.recv_timeout(WAIT).unwrap_or_else(|_| panic!("no {method} arrived"));
+                if message["method"] == method {
+                    return message;
+                }
+            }
+        }
+
+        fn answer(&self, id: u64) {
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": format!("answer from {}", self.root.display()) }] },
+            });
+            if let Some(writer) = self.writer.lock().unwrap().as_mut() {
+                write_ndjson_frame(writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
+            }
+        }
+
+        /// Ends the connection from the daemon's side.
+        fn hang_up(&self) {
+            self.writer.lock().unwrap().take();
+        }
+
+        fn closes(&self) -> Vec<Shutdown> {
+            self.closes.lock().unwrap().clone()
+        }
+    }
+
+    /// A session over a folder holding projects `a` and `b`, initialized.
+    struct Session {
+        root: PathBuf,
+        client: io::PipeWriter,
+        out: mpsc::Receiver<Value>,
+        front: Fake,
+        /// Every daemon the connector connected to, in order.
+        daemons: mpsc::Receiver<Fake>,
+        session: thread::JoinHandle<Result<()>>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Session {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            std::fs::create_dir(root.join("a")).unwrap();
+            std::fs::create_dir(root.join("b")).unwrap();
+            let (front_link, front) = Fake::spawn(root.clone());
+            let (daemon_tx, daemons) = mpsc::channel();
+            let daemon_tx = Mutex::new(daemon_tx);
+            let connector: Connector = Box::new(move |path| {
+                let (link, fake) = Fake::spawn(path.to_path_buf());
+                daemon_tx.lock().unwrap().send(fake).unwrap();
+                Ok(link)
+            });
+            let (client_r, client) = io::pipe().unwrap();
+            let (out_r, out_w) = io::pipe().unwrap();
+            let serve_root = root.clone();
+            let session = thread::spawn(move || {
+                serve(BufReader::new(client_r), out_w, front_link, serve_root, connector)
+            });
+            let (out_tx, out) = mpsc::channel();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(out_r);
+                while let Ok(Some(frame)) = read_ndjson_frame(&mut reader) {
+                    if out_tx.send(serde_json::from_slice(&frame).unwrap()).is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut session = Self { root, client, out, front, daemons, session, _dir: dir };
+            session.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
+            assert_eq!(session.recv()["id"], 0);
+            session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+            session
+        }
+
+        fn send(&mut self, message: Value) {
+            write_ndjson_frame(&mut self.client, &serde_json::to_vec(&message).unwrap()).unwrap();
+        }
+
+        fn recv(&self) -> Value {
+            self.out.recv_timeout(WAIT).expect("no frame reached the client within 2 s")
+        }
+
+        fn call(&mut self, id: u64) {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "find_references", "arguments": {} },
+            }));
+        }
+
+        /// Selects `project` and returns the text of the answer.
+        fn select(&mut self, id: u64, project: &str) -> String {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": SELECT_PROJECT, "arguments": { "project": project } },
+            }));
+            let answer = self.recv();
+            assert_eq!(answer["id"], id);
+            assert!(answer["result"]["isError"].is_null(), "{answer}");
+            answer["result"]["content"][0]["text"].as_str().unwrap().to_string()
+        }
+
+        fn daemon(&self) -> Fake {
+            self.daemons.recv_timeout(WAIT).expect("the shim did not connect")
+        }
+    }
+
+    /// Re-selecting the project already served is a full switch: a second
+    /// connection, while the first stays open for the call in flight on it,
+    /// whose late answer reaches the client.
+    ///
+    /// Control: restore `previous.close(Shutdown::Write)` at the switch and
+    /// drop the pending-id tracking: the first connection is half-closed at
+    /// once, and id 7's answer never arrives within 2 s.
+    #[test]
+    fn reselecting_the_served_project_keeps_a_call_in_flight() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let first = session.daemon();
+        session.call(7);
+        assert_eq!(first.expect("tools/call")["id"], 7);
+
+        session.select(2, "a");
+        let second = session.daemon();
+        assert_eq!(second.root, first.root, "a reselect reconnects to the same project");
+        assert!(first.closes().is_empty(), "the first connection still owes 7");
+
+        first.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert!(answer["result"]["isError"].is_null(), "{answer}");
+        assert_eq!(first.closes(), vec![Shutdown::Write], "closed once it owes nothing");
+    }
+
+    /// A switch keeps the previous project's connection open while it owes
+    /// answers, passes its late answers through, and when that connection
+    /// ends with one still owed, the shim answers it with an error naming
+    /// the switch.
+    ///
+    /// Control: restore `previous.close(Shutdown::Write)` at the switch and
+    /// drop the pending-id tracking: the old connection is half-closed at
+    /// once, and id 8 gets no answer within 2 s.
+    #[test]
+    fn a_switch_never_drops_a_call_in_flight() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(7);
+        session.call(8);
+        assert_eq!(a.expect("tools/call")["id"], 7);
+        assert_eq!(a.expect("tools/call")["id"], 8);
+
+        session.select(2, "b");
+        let b = session.daemon();
+        assert!(a.closes().is_empty(), "a still owes 7 and 8, so it must not be closed");
+
+        a.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("answer from"), "{answer}");
+        assert!(a.closes().is_empty(), "a still owes 8");
+
+        session.call(9);
+        assert_eq!(b.expect("tools/call")["id"], 9, "calls after the switch go to b");
+
+        a.hang_up();
+        let answer = session.recv();
+        assert_eq!(answer["id"], 8, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("the daemon serving {} ended", a.root.display())), "{text}");
+        assert!(text.contains(&format!("(the session had switched to {})", b.root.display())), "{text}");
+        assert!(text.contains("call the tool again"), "{text}");
+    }
+
+    /// A previous project's connection is half-closed once it owes nothing:
+    /// a cancelled call is no longer owed, and its cancel goes to the daemon
+    /// the call went to.
+    ///
+    /// Control: route `notifications/cancelled` to the current upstream and
+    /// keep the cancelled id pending: the cancel reaches `b`, and `a` is
+    /// never closed.
+    #[test]
+    fn a_retired_connection_closes_once_it_owes_nothing() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(7);
+        session.call(8);
+        assert_eq!(a.expect("tools/call")["id"], 7);
+        assert_eq!(a.expect("tools/call")["id"], 8);
+        session.select(2, "b");
+        let b = session.daemon();
+
+        session.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 8, "reason": "t" },
+        }));
+        assert_eq!(a.expect("notifications/cancelled")["params"]["requestId"], 8);
+        assert!(a.closes().is_empty(), "a still owes 7");
+
+        a.answer(7);
+        assert_eq!(session.recv()["id"], 7);
+        assert_eq!(a.closes(), vec![Shutdown::Write]);
+        assert!(b.closes().is_empty());
+        a.hang_up();
+        assert!(
+            session.out.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a owed nothing when it ended"
+        );
+    }
+
+    /// The served daemon closing with a call pending gets that call answered
+    /// before the session ends.
+    ///
+    /// Control: skip answering owed ids in `upstream_ended`: the session
+    /// ends with no frame for id 7.
+    #[test]
+    fn a_daemon_that_closes_with_a_call_pending_gets_it_answered() {
+        let mut session = Session::start();
+        session.call(7);
+        assert_eq!(session.front.expect("tools/call")["id"], 7);
+        session.front.hang_up();
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("serving {} ended", session.root.display())), "{text}");
+        assert!(
+            text.contains("after the call was sent. "),
+            "no switch happened, so no cause is claimed: {text}"
+        );
+        assert!(text.contains("Its result, if any, was not received"), "{text}");
+        session.session.join().unwrap().expect("the session ends when its daemon does");
     }
 }

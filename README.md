@@ -594,7 +594,9 @@ before answering: the whole tree once (gitignore-aware, skipping `.git`,
 plugin claims by extension — `.ts`/`.tsx`/`.mts`/`.cts`/`.js`/`.jsx`/`.mjs`/
 `.cjs` for TypeScript/JavaScript, `.go` for Go, `.py`/`.pyi` for Python,
 `.rs` for Rust. Every structural tool answers as soon as that walk is linked;
-`search_code` alone also waits out the embedding pass that follows it. Expect
+`search_code` alone also waits for the embedding pass that follows it, for at
+most 20 s (`G_MESH_SEARCH_EMBEDDING_WAIT_MS`); past that it answers from the
+symbols embedded so far, with a leading note and a `partial` field. Expect
 that first call to take proportionally longer on a large project; every
 later call is immediate.
 
