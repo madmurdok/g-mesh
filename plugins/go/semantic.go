@@ -47,8 +47,10 @@ package main
 // # Degradation
 //
 // No `go` on PATH, or a `packages.Load` that fails outright: log once and
-// answer with an empty diff and `incomplete: true` (wire/src/lib.rs's
-// `FileChangeResponse::incomplete`). That field is what makes the rest of
+// answer with `incomplete: true` and an `incompleteReason` naming what did
+// not load (wire/src/lib.rs's `FileChangeResponse::incomplete`) - with an
+// empty diff when nothing loaded, and with what the other modules resolved
+// when only some failed (GM-442). That field is what makes the rest of
 // the sentence true rather than aspirational: core's
 // `watcher::apply::apply_semantic_pass` withholds
 // `language_state.semanticPassAt` only when a whole-project pass reports
@@ -301,12 +303,12 @@ func newResolutions() *resolutions {
 }
 
 // load runs `go list` + the type checker over `patterns` from `dir` and folds
-// the result into `into`. Returns false only for a driver-level failure -
+// the result into `into`. Returns an error only for a driver-level failure -
 // individual packages that do not compile are kept, because a file with a
 // broken sibling still has exact type information for everything the checker
 // did get through, and refusing the whole pass over one bad package is how a
 // semantic tier becomes useless in exactly the repositories that need it.
-func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) bool {
+func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
 	fset := token.NewFileSet()
 	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset}
 
@@ -315,13 +317,14 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 
 	loaded, err := packages.Load(cfg, patterns...)
 	if err != nil {
-		e.degrade("semantic pass degraded: packages.Load in %s failed: %v - answering with an empty diff", dir, err)
-		return false
+		e.degrade("semantic pass degraded: packages.Load in %s failed: %v - "+
+			"answering incomplete, with whatever the other modules resolved", dir, err)
+		return err
 	}
 	for _, pkg := range loaded {
 		e.foldPackage(into, fset, pkg)
 	}
-	return true
+	return nil
 }
 
 // foldPackage indexes one loaded package's type information by position and
@@ -454,14 +457,19 @@ func (e *semanticEngine) isProjectContainer(path string) bool {
 // project, core's own convention (protocol::types::ControlMessage::
 // SemanticPass).
 //
-// The second return is wire.go's `fileChangeResponse.Incomplete`: `true`
-// when this pass could not even try to resolve what it was asked about (no
-// toolchain, or every module's `go list` failed), `false` when it ran to
-// completion - including the trivial completion of "there was nothing in
-// scope to resolve." That distinction is why an empty `scope` and a failed
-// `loadFor` are not the same return: both answer an empty diff, but only
-// the second one is a pass that owed an answer and did not give one.
-func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff, bool) {
+// The second return is wire.go's `fileChangeResponse.IncompleteReason`, and
+// its being non-empty is `Incomplete`: set when this pass did not resolve
+// everything it was asked about (no toolchain, or any module's `go list`
+// failed - GM-442), "" when it ran to completion - including the trivial
+// completion of "there was nothing in scope to resolve." That distinction is
+// why an empty `scope` and a failed `loadFor` are not the same return: both
+// can answer an empty diff, but only the second is a pass that owed an
+// answer and did not give one.
+//
+// When some modules load and others do not, the diff still carries what the
+// loaded ones resolved; the failed modules' files are left out of the
+// answered scope, so this pass neither answers nor retracts anything in them.
+func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff, string) {
 	started := time.Now()
 	e.ws = ws
 	defer func() { e.ws = nil }()
@@ -469,7 +477,7 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	if _, err := exec.LookPath("go"); err != nil {
 		e.degrade("semantic pass degraded: no `go` binary on PATH (%v) - answering every "+
 			"semanticPass with an empty diff, incomplete=true; the structural graph is unaffected", err)
-		return emptyDiff(), true
+		return emptyDiff(), "the Go semantic pass did not run: no `go` binary on PATH"
 	}
 
 	wholeProject := len(filePaths) == 0
@@ -480,14 +488,19 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 		scope = e.claimedFiles(filePaths)
 	}
 	if len(scope) == 0 {
-		return emptyDiff(), false
+		return emptyDiff(), ""
 	}
 
-	structural := e.extractStructural(ws, scope)
 	resolved := newResolutions()
-	if !e.loadFor(ws, resolved, wholeProject, scope) {
-		return emptyDiff(), true
+	outcome := e.loadFor(ws, resolved, wholeProject, scope)
+	reason := outcome.incompleteReason()
+	if outcome.loaded == 0 {
+		return emptyDiff(), reason
 	}
+	if len(outcome.failed) > 0 {
+		scope = e.withoutFailedModules(ws, scope, outcome.failed)
+	}
+	structural := e.extractStructural(ws, scope)
 
 	builder := newSemanticDiff()
 	sites := 0
@@ -501,7 +514,23 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 		"%d node(s)/%d edge(s) upserted, %d edge(s) retracted, in %s",
 		len(scope), sites, implementsEdges, len(diff.UpsertNodes), len(diff.UpsertEdges),
 		len(diff.DeleteEdgeIds), time.Since(started).Round(time.Millisecond))
-	return diff, false
+	if reason != "" {
+		logf("semantic pass incomplete: %s", reason)
+	}
+	return diff, reason
+}
+
+// withoutFailedModules drops from `scope` every file whose module failed to
+// load. Such a file has no type information this pass could answer from, so
+// answering it would only retract the semantic edges an earlier pass gave it.
+func (e *semanticEngine) withoutFailedModules(ws *workspace, scope []string, failed map[string]error) []string {
+	out := make([]string, 0, len(scope))
+	for _, relPath := range scope {
+		if _, bad := failed[moduleDirFor(ws, normalizeDir(filepath.ToSlash(filepath.Dir(relPath))))]; !bad {
+			out = append(out, relPath)
+		}
+	}
+	return out
 }
 
 // claimedFiles narrows a per-file request to the `.go` files this plugin
@@ -531,33 +560,70 @@ func (e *semanticEngine) claimedFiles(filePaths []string) []string {
 // A per-file pass asks for `file=<abs>` per file, grouped by the module each
 // file belongs to - `go list`'s own way of saying "the package containing
 // this file", which is exactly "re-check that file's package".
-func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject bool, scope []string) bool {
+//
+// The result says which module roots failed to load (GM-442). *Any* failure
+// makes the pass incomplete, not only the one where every module failed: a
+// whole-project pass that skipped one module and still called itself
+// complete let core sweep that module's semantic edges away as stale.
+func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject bool, scope []string) loadOutcome {
+	byModule := map[string][]string{}
 	if wholeProject {
-		dirs := moduleDirs(ws)
-		ok := false
-		for _, dir := range dirs {
-			if e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), []string{"./..."}) {
-				ok = true
-			}
+		for _, dir := range moduleDirs(ws) {
+			byModule[dir] = []string{"./..."}
 		}
-		return ok
+	} else {
+		for _, relPath := range scope {
+			dir := moduleDirFor(ws, normalizeDir(filepath.ToSlash(filepath.Dir(relPath))))
+			abs := filepath.Join(e.realRoot, filepath.FromSlash(relPath))
+			byModule[dir] = append(byModule[dir], "file="+abs)
+		}
 	}
 
-	byModule := map[string][]string{}
-	for _, relPath := range scope {
-		dir := moduleDirFor(ws, normalizeDir(filepath.ToSlash(filepath.Dir(relPath))))
-		abs := filepath.Join(e.realRoot, filepath.FromSlash(relPath))
-		byModule[dir] = append(byModule[dir], "file="+abs)
-	}
-	ok := false
+	outcome := loadOutcome{failed: map[string]error{}}
 	for _, dir := range sortedKeys(byModule) {
 		patterns := byModule[dir]
 		sort.Strings(patterns)
-		if e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), patterns) {
-			ok = true
+		if err := e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), patterns); err != nil {
+			outcome.failed[dir] = err
+		} else {
+			outcome.loaded++
 		}
 	}
-	return ok
+	return outcome
+}
+
+// loadOutcome is what [semanticEngine.loadFor] managed: how many module
+// roots loaded, and the error of each one that did not, keyed by its
+// project-relative directory.
+type loadOutcome struct {
+	loaded int
+	failed map[string]error
+}
+
+// incompleteReason is the wire's `incompleteReason` for a pass with failed
+// modules, or "" when every module loaded. It names every failed module -
+// which is what `g-mesh status` needs to point at - but carries only the
+// first one's error, so the reason does not grow with the failure.
+func (o loadOutcome) incompleteReason() string {
+	if len(o.failed) == 0 {
+		return ""
+	}
+	dirs := sortedKeys(o.failed)
+	names := make([]string, len(dirs))
+	for i, dir := range dirs {
+		names[i] = moduleLabel(dir)
+	}
+	return fmt.Sprintf("the Go semantic pass could not load %d module(s): %s (first: %s: %v)",
+		len(dirs), strings.Join(names, ", "), moduleLabel(dirs[0]), o.failed[dirs[0]])
+}
+
+// moduleLabel is how a reason names a module root: its project-relative
+// directory, with the project root itself spelled ".".
+func moduleLabel(dir string) string {
+	if dir == "" {
+		return "."
+	}
+	return dir
 }
 
 // moduleDirs is every module root of the project, project-relative, sorted.

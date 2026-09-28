@@ -194,9 +194,9 @@ func TestSemanticPassResolvesEveryOpenShape(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	diff, incomplete := state.handleSemanticPass(nil)
-	if incomplete {
-		t.Fatalf("a whole-project pass with a toolchain present answered incomplete=true")
+	diff, reason := state.handleSemanticPass(nil)
+	if reason != "" {
+		t.Fatalf("a whole-project pass with a toolchain present answered incomplete: %s", reason)
 	}
 
 	want := []string{
@@ -470,12 +470,12 @@ func TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff(t *testing.T) {
 	}
 
 	for _, filePaths := range [][]string{nil, {"use.go"}} {
-		diff, incomplete := state.handleSemanticPass(filePaths)
+		diff, reason := state.handleSemanticPass(filePaths)
 		if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 ||
 			len(diff.DeleteNodeIds) != 0 || len(diff.DeleteEdgeIds) != 0 {
 			t.Fatalf("semanticPass(%v) without a toolchain answered %+v, want an empty diff", filePaths, diff)
 		}
-		if !incomplete {
+		if reason == "" {
 			t.Fatalf("semanticPass(%v) without a toolchain answered incomplete=false, want true - "+
 				"otherwise core records the pass as done and never asks again", filePaths)
 		}
