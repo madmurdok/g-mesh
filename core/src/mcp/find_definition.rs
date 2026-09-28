@@ -156,6 +156,8 @@ struct CandidatePage {
     /// a caller reads one field to tell an ambiguity from the other kind of
     /// candidate page (`fileName`), rather than inferring it from `ambiguous`.
     resolved_by: ResolvedBy,
+    /// Always `session_hints::AMBIGUOUS`: how to pick from this page.
+    explanation: &'static str,
     results: Vec<DefinitionCandidate>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -435,6 +437,7 @@ pub(super) fn resolve_symbol_name(
         return success(&CandidatePage {
             ambiguous: true,
             resolved_by: ResolvedBy::NameAmbiguous,
+            explanation: super::session_hints::AMBIGUOUS,
             results: page.results,
             has_more: page.has_more,
             next_cursor: page.next_cursor,

@@ -156,6 +156,10 @@ async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
     assert_eq!(body["results"].as_array().unwrap().len(), 3, "{body}");
     assert_eq!(body["partial"], json!({ "embedded": 3, "total": 10 }));
     assert!(body.get("noMatch").is_none(), "a partial page carries no floor verdict: {body}");
+    assert!(
+        body.get("hint").is_none(),
+        "a partial page does not spend the once-per-session search hint: {body}"
+    );
     assert_eq!(fixture.indexing.phase(), Phase::Embedding, "sanity: the pass never finished");
 }
 

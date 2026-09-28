@@ -22,6 +22,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::GetDependenciesParams;
 
@@ -141,6 +142,25 @@ struct DependencyWalk {
     /// from a wrong one.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolved_from: Option<ResolvedFrom>,
+    /// See [`walk_hint`]; absent (not `null`) when no sentence applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+/// `session_hints::WALK_COMPLETE` (with the `import type` clause for a
+/// language that has type-only imports) once per session on a walk that is
+/// not truncated; `session_hints::truncated_by` on every truncated one.
+/// `language` is the walk's first node's: the anchor on a fresh walk.
+fn walk_hint(walk: &DependencyWalk, language: Option<&str>, hints: &SessionHints) -> Option<String> {
+    let complete = if language == Some(session_hints::IMPORT_TYPE_LANGUAGE) {
+        session_hints::WALK_COMPLETE_IMPORT_TYPE
+    } else {
+        session_hints::WALK_COMPLETE
+    };
+    session_hints::join([
+        hints.once(!walk.truncated, HintKey::WalkComplete, complete),
+        walk.truncated_by.and_then(session_hints::truncated_by),
+    ])
 }
 
 /// What the caller named, and what it was taken to mean.
@@ -276,6 +296,7 @@ fn bound_walk(
             // Set by the anchor arm, which is the only layer that knows
             // whether the root it handed down was the one the caller named.
             resolved_from: None,
+            hint: None,
         };
     };
 
@@ -305,15 +326,18 @@ fn bound_walk(
         frontier_nodes: Vec::new(),
         resume_token: Some(token),
         resolved_from: None,
+        hint: None,
     }
 }
 
-/// A fresh walk's shape minus its root - what both anchor arms forward
-/// unchanged once they have resolved the root the caller meant.
+/// A fresh walk's shape minus its root, plus the session it answers for -
+/// what both anchor arms forward unchanged once they have resolved the root
+/// the caller meant.
 struct WalkShape {
     direction: Direction,
     max_depth: Option<u32>,
     max_fanout: Option<u32>,
+    hints: SessionHints,
 }
 
 /// The walk itself, at the documented defaults unless the caller narrowed
@@ -347,8 +371,10 @@ fn from_root_reporting(
 
     let result = traversal::traverse(conn, options)
         .map_err(|e| internal_error("failed to walk the import graph", e))?;
+    let language = result.nodes.first().map(|n| n.node.language.clone());
     let mut walk = bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new());
     walk.resolved_from = resolved_from;
+    walk.hint = walk_hint(&walk, language.as_deref(), &shape.hints);
     success(&walk)
 }
 
@@ -723,7 +749,7 @@ fn from_module(
 /// Continues a walk the exploration budget cut short. The token carries the
 /// anchor, direction and limits of the walk it continues, so nothing about
 /// its shape is re-read from the parameters here.
-fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData> {
+fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<CallToolResult, ErrorData> {
     // Decoded a second time here (`traversal::resume` decodes its own copy
     // internally) purely to read the walk's shape back out for `bound_walk` -
     // cheap, and keeps `traversal`'s public surface free of a getter that
@@ -741,7 +767,11 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 
     let result = traversal::resume(conn, token, traversal::DEFAULT_EXPLORATION_BUDGET)
         .map_err(|e| internal_error("failed to resume the import walk", e))?;
-    success(&bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked))
+    let language = result.nodes.first().map(|n| n.node.language.clone());
+    let mut walk =
+        bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked);
+    walk.hint = walk_hint(&walk, language.as_deref(), hints);
+    success(&walk)
 }
 
 /// `entry_points` is the union of every discovered plugin's
@@ -754,15 +784,16 @@ fn continued(conn: &Connection, token: &str) -> Result<CallToolResult, ErrorData
 pub(crate) fn handle(
     store: &Arc<IndexStore>,
     entry_points: &[String],
+    hints: &SessionHints,
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
     let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
         params;
-    let shape = WalkShape { direction, max_depth, max_fanout };
+    let shape = WalkShape { direction, max_depth, max_fanout, hints: hints.clone() };
 
     match (resume_token, file_path, module_id) {
-        (Some(token), None, None) => continued(&conn, &token),
+        (Some(token), None, None) => continued(&conn, &token, hints),
         // An anchor next to a token is a contradiction, not a preference to
         // resolve silently: the token already names the walk it continues,
         // and picking one of the two would answer a question nobody asked.

@@ -24,6 +24,7 @@ use crate::graph::pagination;
 use crate::storage::index_store::IndexStore;
 use crate::storage::vectors::pack;
 
+use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
 use super::tool_result::{error, internal_error, success};
 use super::{human_duration, SearchCodeParams};
@@ -95,6 +96,10 @@ struct SearchPage {
     /// not in hand.
     #[serde(skip_serializing_if = "Option::is_none")]
     no_match: Option<similarity::NoMatch>,
+    /// `session_hints::SEARCH_HITS`, once per session, on a page with hits
+    /// and no `noMatch`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
     /// Present only when the embedding pass was still owed: the rows were
     /// ranked from the vectors stored so far.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,6 +270,7 @@ pub(crate) fn top_k_for_eval(
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    hints: &SessionHints,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
 ) -> Result<CallToolResult, ErrorData> {
@@ -307,11 +313,16 @@ pub(super) fn handle(
         None => page.next_cursor,
         Some(_) => page.next_cursor.map(|next| partial_cursor(stored, &next)),
     };
+    let hint = match coverage {
+        None => search_hint(&page.results, no_match.as_ref(), hints),
+        Some(_) => None,
+    };
     let body = SearchPage {
         results: page.results,
         has_more: page.has_more,
         next_cursor,
         no_match,
+        hint,
         partial: coverage.map(|c| PartialCounts { embedded: c.embedded, total: c.total }),
     };
     match coverage {
@@ -321,6 +332,14 @@ pub(super) fn handle(
             ContentBlock::json(&body)?,
         ])),
     }
+}
+
+fn search_hint(
+    results: &[SearchResult],
+    no_match: Option<&similarity::NoMatch>,
+    hints: &SessionHints,
+) -> Option<&'static str> {
+    hints.once(!results.is_empty() && no_match.is_none(), HintKey::SearchHits, session_hints::SEARCH_HITS)
 }
 
 #[cfg(test)]
@@ -448,7 +467,7 @@ mod tests {
         let embedding = EmbeddingPipeline::disabled();
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, params, None).unwrap();
+        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
 
@@ -464,7 +483,7 @@ mod tests {
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, params, None).unwrap();
+        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
         std::env::remove_var(MODEL_DIR_ENV);
     }
@@ -522,6 +541,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 no_match: Some(verdict),
+                hint: None,
                 partial: None,
             })
             .unwrap(),
@@ -534,12 +554,27 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 no_match: None,
+                hint: None,
                 partial: None,
             })
             .unwrap(),
         )
         .unwrap();
         assert!(healthy.get("noMatch").is_none(), "a matching page must carry no key at all: {healthy}");
+    }
+
+    #[test]
+    fn a_page_with_hits_and_no_verdict_carries_the_search_hint_once_per_session() {
+        let hit = || vec![SearchResult::for_test(0.9, "rust")];
+        let verdict = similarity::verdict("reads a file", None, &[SearchResult::for_test(0.0, "rust")])
+            .expect("a page scoring 0.0 cannot be a match");
+        let session = SessionHints::default();
+
+        assert_eq!(search_hint(&[], None, &session), None, "no hits");
+        assert_eq!(search_hint(&hit(), Some(&verdict), &session), None, "noMatch");
+        assert_eq!(search_hint(&hit(), None, &session), Some(session_hints::SEARCH_HITS));
+        assert_eq!(search_hint(&hit(), None, &session), None, "once per session");
+        assert_eq!(search_hint(&hit(), None, &SessionHints::default()), Some(session_hints::SEARCH_HITS));
     }
 
     /// The other half of that contract, against a real paginated index: the
@@ -623,7 +658,7 @@ mod tests {
             query: "load the contents of a file from the filesystem".to_string(),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &embedding, params, None).unwrap());
+        let body = json_body(&handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap());
 
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both embedded symbols must come back");

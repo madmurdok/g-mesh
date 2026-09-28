@@ -166,6 +166,7 @@ fn a_page_where_every_implementor_is_unresolved_is_flagged_all_unresolved() {
         body["allUnresolved"], true,
         "every implementor unresolved must set the response-level marker"
     );
+    assert_eq!(body["hint"], session_hints::ALL_UNRESOLVED);
 }
 
 #[test]
@@ -193,6 +194,7 @@ fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved()
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
     assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
+    assert!(body.get("hint").is_none(), "no allUnresolved, no sentence: {body}");
 }
 
 /// Task #190: the single-hop response echoes the resolved anchor.
@@ -683,6 +685,7 @@ fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_singl
     assert!(walked["truncatedBy"].is_null());
     assert_eq!(walked["frontierNodes"].as_array().unwrap().len(), 0);
     assert!(walked["resumeToken"].is_null());
+    assert!(walked.get("hint").is_none(), "an untruncated walk carries no follow-up sentence: {walked}");
 }
 
 /// interface <- a <- b <- c <- d (`SUPERTYPE_OF` edges point subtype ->
@@ -736,6 +739,7 @@ fn a_max_depth_cut_reports_frontier_nodes_to_re_root_on() {
     assert_eq!(body["truncatedBy"], "maxDepth");
     assert_eq!(body["frontierNodes"], serde_json::json!(["b"]), "the level to re-root the same call on");
     assert!(body["resumeToken"].is_null(), "a depth cut is re-rooted, not resumed");
+    assert_eq!(body["hint"].as_str(), session_hints::truncated_by("maxDepth"));
 }
 
 /// Truncation contract, cause two: a node had more implementors than the
@@ -779,6 +783,7 @@ fn a_max_fanout_cut_reports_max_fanout_with_no_continuation_field() {
     assert_eq!(walk.truncated_by, Some("maxFanout"));
     assert!(walk.frontier_nodes.is_empty(), "a fanout cut is paginated per node, not re-rooted");
     assert!(walk.resume_token.is_none());
+    assert_eq!(walk.hint.as_deref(), session_hints::truncated_by("maxFanout"));
 }
 
 /// Truncation contract, cause three: the response-size budget, continued
@@ -829,6 +834,7 @@ fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_impl
     assert!(first.truncated);
     assert_eq!(first.truncated_by, Some("responseSize"));
     assert!(first.frontier_nodes.is_empty(), "a size cut is resumed, not re-rooted");
+    assert_eq!(first.hint.as_deref(), session_hints::truncated_by("responseSize"));
 
     let mut all: Vec<String> = first.results.iter().map(|r| r.implementing_symbol_id.clone()).collect();
     let mut token = first.resume_token.clone();

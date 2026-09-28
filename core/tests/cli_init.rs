@@ -194,7 +194,7 @@ fn init_with_agent_claude_writes_agents_md_and_a_claude_md_bridge_and_is_idempot
     assert_contains(&stdout, "CLAUDE.md:  wrote the @AGENTS.md bridge line");
 
     let agents_md = project.read("AGENTS.md");
-    assert!(agents_md.contains("Code search (TypeScript/JavaScript projects)"), "{agents_md}");
+    assert!(agents_md.contains(g_mesh::cli::agent_instructions::AGENTS_MD_SNIPPET), "{agents_md}");
     let claude_md = project.read("CLAUDE.md");
     assert!(claude_md.starts_with("@AGENTS.md"), "{claude_md}");
 
