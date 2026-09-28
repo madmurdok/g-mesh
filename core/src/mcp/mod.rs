@@ -48,6 +48,8 @@ mod instructions;
 mod provenance;
 mod search_code;
 #[cfg(test)]
+mod search_code_wait_tests;
+#[cfg(test)]
 mod semantic_pending_tests;
 pub(crate) mod session_hints;
 mod similarity;
@@ -100,6 +102,17 @@ pub const INDEX_WAIT_CAP_ENV: &str = "G_MESH_INDEX_WAIT_CAP_MS";
 /// before the client aborts it with one that says nothing about indexing.
 pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
 
+/// The longest `search_code` waits, after the structural wait, for the
+/// embedding pass to finish, in milliseconds; past it the call answers from
+/// the vectors already stored and says so. `0` does not wait. Unset or
+/// unparsable means [`SEARCH_EMBEDDING_WAIT`].
+pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
+
+/// Under Claude Code's 120 s move-to-background threshold; long enough for a
+/// small project's whole backfill or one file-change batch
+/// (`docs/architecture/gm-432-search-code-hang.md`).
+pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
+
 /// Reads a millisecond-valued env var, falling back to `default` when it is
 /// unset, empty or not a number. Read per call, so a test can change it
 /// without starting a new daemon.
@@ -121,6 +134,15 @@ fn human_duration(elapsed: Duration) -> String {
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
     }
+}
+
+/// A failed walk is a tool error carrying its message, never an answer read
+/// off an empty or partial graph; the next call retries
+/// (`IndexingStatus::request_activation`).
+fn walk_failed(message: &str) -> CallToolResult {
+    CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+        "g-mesh could not build this project's index: {message}. The next tool call retries the build."
+    ))])
 }
 
 /// Serves one accepted connection as an MCP session until the peer
@@ -386,11 +408,12 @@ impl GMeshMcpServer {
     ///   answers no part of the question, before the client's idle window.
     /// - **Cancellation** (`ctx.ct`): an error at once; indexing continues.
     ///
-    /// Structural tools pass [`Need::Structural`]; only `search_code` passes
-    /// [`Need::Embeddings`]. `get_info` never calls this. It runs before
-    /// [`mark_used`](Self::mark_used), which takes the store the walk holds
-    /// during batch commits. The fast path never suspends; a slow one
-    /// suspends the task, not the worker thread.
+    /// Every tool passes [`Need::Structural`]; `search_code` then waits for
+    /// embeddings separately and boundedly
+    /// ([`wait_for_embeddings`](Self::wait_for_embeddings)). `get_info` never
+    /// calls this. It runs before [`mark_used`](Self::mark_used), which takes
+    /// the store the walk holds during batch commits. The fast path never
+    /// suspends; a slow one suspends the task, not the worker thread.
     async fn wait_for_index(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -402,6 +425,37 @@ impl GMeshMcpServer {
         // `0` is "no cap": `checked_add` failing (a cap too large to be a
         // real instant) means the same.
         let deadline = if cap.is_zero() { None } else { started.checked_add(cap) };
+        let outcome = self.wait_until(ctx, tool, need, started, deadline).await?;
+
+        Ok(match outcome {
+            WaitOutcome::Satisfied => None,
+            // D7: the cap. No part of the question is answered - no rows,
+            // nothing that could be read as a result - only why, and that
+            // calling again is the remedy.
+            WaitOutcome::TimedOut => {
+                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
+                 computed - call this tool again; the index keeps building in the background.",
+                    self.registry.project_root().display(),
+                    self.indexing.progress_detail(),
+                    human_duration(started.elapsed())
+                ))]))
+            }
+            WaitOutcome::Failed(message) => Some(walk_failed(&message)),
+        })
+    }
+
+    /// The race behind [`wait_for_index`](Self::wait_for_index) and
+    /// [`wait_for_embeddings`](Self::wait_for_embeddings): `need`'s phase,
+    /// `deadline` (`None` waits indefinitely), progress and cancellation.
+    async fn wait_until(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        need: Need,
+        started: Instant,
+        deadline: Option<Instant>,
+    ) -> Result<WaitOutcome, ErrorData> {
         let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
         let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
 
@@ -461,29 +515,40 @@ impl GMeshMcpServer {
             },
             started.elapsed().as_millis()
         ));
+        Ok(outcome)
+    }
 
+    /// `search_code`'s bounded wait for [`Phase::Ready`], after `prepare` has
+    /// satisfied [`Need::Structural`]: at most [`SEARCH_EMBEDDING_WAIT_ENV`],
+    /// with the same progress and cancellation as the structural wait.
+    /// `Ok(Ok(None))`: every embeddable node is embedded. `Ok(Ok(Some))`: the
+    /// pass is still owed, and the answer is ranked from the stored vectors
+    /// alone. `Ok(Err)`: a finished tool result (a failed walk).
+    async fn wait_for_embeddings(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
+        let started = Instant::now();
+        let bound = env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT);
+        let deadline = started.checked_add(bound);
+        let outcome =
+            self.wait_until(ctx, "search_code:embeddings", Need::Embeddings, started, deadline).await?;
         Ok(match outcome {
-            WaitOutcome::Satisfied => None,
-            // D7: the cap. No part of the question is answered - no rows,
-            // nothing that could be read as a result - only why, and that
-            // calling again is the remedy.
+            WaitOutcome::Satisfied => Ok(None),
+            WaitOutcome::Failed(message) => Err(walk_failed(&message)),
+            // The phase is read after the progress so that a pass finishing
+            // in between reads as complete rather than as partial.
             WaitOutcome::TimedOut => {
-                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
-                    "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
-                 computed - call this tool again; the index keeps building in the background.",
-                    self.registry.project_root().display(),
-                    self.indexing.progress_detail(),
-                    human_duration(started.elapsed())
-                ))]))
-            }
-            // A failed walk is a tool error carrying its message, never an
-            // answer read off an empty or partial graph; the next call retries
-            // (`IndexingStatus::request_activation`).
-            WaitOutcome::Failed(message) => {
-                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
-                    "g-mesh could not build this project's index: {message}. The next tool call retries \
-                     the build."
-                ))]))
+                let (embedded, total) = self.indexing.embed_progress();
+                let phase = self.indexing.phase();
+                search_code::Coverage::partial(
+                    &phase,
+                    embedded,
+                    total,
+                    started.elapsed(),
+                    self.registry.project_root(),
+                )
+                .map_or(Ok(None), |coverage| Ok(Some(coverage)))
             }
         })
     }
@@ -671,10 +736,14 @@ impl GMeshMcpServer {
         params: Parameters<SearchCodeParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(early) = self.prepare(&ctx, "search_code", Need::Embeddings).await? {
+        if let Some(early) = self.prepare(&ctx, "search_code", Need::Structural).await? {
             return Ok(early);
         }
-        search_code::handle(&self.store, &self.embedding, &self.hints, params.0)
+        let coverage = match self.wait_for_embeddings(&ctx).await? {
+            Ok(coverage) => coverage,
+            Err(early) => return Ok(early),
+        };
+        search_code::handle(&self.store, &self.embedding, &self.hints, params.0, coverage.as_ref())
     }
 }
 

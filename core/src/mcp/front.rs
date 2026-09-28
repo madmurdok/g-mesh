@@ -104,7 +104,7 @@ impl Front {
         let Some(project) = params.project else {
             return text_result(false, list_candidates(&self.root, &found));
         };
-        match find_candidate(&found.candidates, &project) {
+        match find_candidate(&self.root, &found.candidates, &project) {
             Some(candidate) => {
                 let root = candidate.abs_path.display().to_string();
                 let mut meta = JsonObject::new();
@@ -177,23 +177,32 @@ fn list_candidates(root: &Path, found: &candidates::Walk) -> String {
     out
 }
 
-/// `path` without a leading `./` and trailing `/`, `\` turned into `/`.
-fn normalize(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let path = path.trim_start_matches("./");
-    path.trim_end_matches('/').to_string()
+/// `path`'s segments, split on `/` and `\` alike, without empty and `.` ones.
+fn segments(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect()
 }
 
-/// The candidate `project` names: by `rel_path`, or by absolute path
-/// (canonicalized, so a symlinked spelling of a candidate still matches).
-fn find_candidate<'a>(candidates: &'a [Candidate], project: &str) -> Option<&'a Candidate> {
+/// The candidate `project` names: by `rel_path`, or by a path with a root
+/// under `root`, both compared as [`segments`].
+///
+/// `has_root` rather than `is_absolute` picks the branch, as in
+/// [`containing_candidate`]: on Windows `/root/a` has a root but no drive.
+/// A rooted path that names no candidate by its segments below `root` (a
+/// symlink inside it, `..` in it) is retried canonicalized against each
+/// candidate's canonical `abs_path`.
+fn find_candidate<'a>(root: &Path, candidates: &'a [Candidate], project: &str) -> Option<&'a Candidate> {
+    let by_segments = |rel: &str| {
+        let rel = segments(rel);
+        candidates.iter().find(|c| segments(&c.rel_path) == rel)
+    };
     let as_path = Path::new(project);
-    if as_path.is_absolute() {
-        let canonical = as_path.canonicalize().ok()?;
-        return candidates.iter().find(|c| c.abs_path == canonical);
+    if !as_path.has_root() {
+        return by_segments(project);
     }
-    let rel = normalize(project);
-    candidates.iter().find(|c| c.rel_path == rel)
+    relative_to_root(root, as_path).and_then(|rel| by_segments(&rel.to_string_lossy())).or_else(|| {
+        let canonical = as_path.canonicalize().ok()?;
+        candidates.iter().find(|c| c.abs_path == canonical)
+    })
 }
 
 /// The candidate whose directory holds `file_path` (relative to the root,
@@ -216,9 +225,9 @@ fn containing_candidate<'a>(
     } else {
         file_path.to_string()
     };
-    let rel: Vec<&str> = rel.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect();
+    let rel = segments(&rel);
     candidates.iter().find(|c| {
-        let candidate: Vec<&str> = c.rel_path.split('/').collect();
+        let candidate = segments(&c.rel_path);
         rel.len() > candidate.len() && rel.iter().zip(&candidate).all(|(a, b)| a == b)
     })
 }
@@ -361,9 +370,100 @@ mod tests {
 
     #[test]
     fn a_project_is_found_by_its_relative_path() {
+        let root = Path::new("/root");
         let candidates = [candidate("a"), candidate("group/c")];
-        assert_eq!(find_candidate(&candidates, "group/c/").map(|c| c.rel_path.as_str()), Some("group/c"));
-        assert_eq!(find_candidate(&candidates, "./a").map(|c| c.rel_path.as_str()), Some("a"));
-        assert!(find_candidate(&candidates, "c").is_none());
+        let hit = |project: &str| find_candidate(root, &candidates, project).map(|c| c.rel_path.as_str());
+        assert_eq!(hit("group/c/"), Some("group/c"));
+        assert_eq!(hit("./a"), Some("a"));
+        assert_eq!(hit("group\\c"), Some("group/c"));
+        assert_eq!(hit(".\\group/c\\"), Some("group/c"), "mixed separators");
+        assert_eq!(hit("c"), None);
+    }
+
+    /// A path with a root is matched below the served root by its segments,
+    /// without touching the filesystem (`/root` does not exist). On Windows
+    /// `/root/group/c` has a root but no drive, so it is not absolute: this
+    /// is the shape an `is_absolute` branch sent down the relative path.
+    #[test]
+    fn a_project_is_found_by_a_rooted_path_under_the_root() {
+        let root = Path::new("/root");
+        let candidates = [candidate("a"), candidate("group/c")];
+        let hit = |project: &str| find_candidate(root, &candidates, project).map(|c| c.rel_path.as_str());
+        assert_eq!(hit("/root/group/c"), Some("group/c"));
+        assert_eq!(hit("/root/a/"), Some("a"));
+        assert_eq!(hit("/root/group\\c"), Some("group/c"), "mixed separators below the root");
+        assert_eq!(hit("/root/c"), None, "whole segments, not a suffix");
+        assert_eq!(hit("/root/group"), None, "a directory above a candidate is not one");
+        assert_eq!(hit("/elsewhere/group/c"), None);
+    }
+
+    /// The drive-letter shape of the test above; a drive only means one on
+    /// Windows.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_is_found_by_a_drive_letter_path_under_the_root() {
+        let root = Path::new(r"C:\root");
+        let candidates = [candidate("a"), candidate("group/c")];
+        let hit = |project: &str| find_candidate(root, &candidates, project).map(|c| c.rel_path.as_str());
+        assert_eq!(hit(r"C:\root\group\c"), Some("group/c"));
+        assert_eq!(hit("C:/root/group/c"), Some("group/c"));
+        assert_eq!(hit(r"C:\root\a\"), Some("a"));
+        assert_eq!(hit(r"D:\root\group\c"), None);
+    }
+
+    /// The root is canonical; a project path spelling it differently (here a
+    /// symlink) is retried canonicalized. The candidates' `abs_path` is the
+    /// fake `/root/...`, so only the match below the root can succeed.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_through_another_spelling_of_the_root_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("group").join("c")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&root, dir.path().join("link")).unwrap();
+        let candidates = [candidate("group/c")];
+        let project = dir.path().join("link").join("group").join("c");
+        let hit = find_candidate(&root, &candidates, project.to_str().unwrap());
+        assert_eq!(hit.map(|c| c.rel_path.as_str()), Some("group/c"));
+    }
+
+    /// The Windows shape of the test above: the served root carries the
+    /// verbatim prefix `canonicalize` adds, the client's path does not.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_without_the_verbatim_prefix_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("root");
+        std::fs::create_dir_all(plain.join("group").join("c")).unwrap();
+        let root = plain.canonicalize().unwrap();
+        let candidates = [candidate("group/c")];
+        let project = plain.join("group").join("c");
+        let hit = find_candidate(&root, &candidates, project.to_str().unwrap());
+        assert_eq!(hit.map(|c| c.rel_path.as_str()), Some("group/c"));
+    }
+
+    /// A rooted path below the root whose segments name no candidate (a
+    /// symlink inside the root, a `..`) still resolves to the candidate its
+    /// canonical form is.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_whose_segments_differ_is_found_by_its_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("group").join("c")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::os::unix::fs::symlink(root.join("group").join("c"), root.join("alias")).unwrap();
+        let candidates = [Candidate {
+            rel_path: "group/c".to_string(),
+            abs_path: root.join("group").join("c"),
+            markers: vec![".git"],
+            is_worktree: false,
+        }];
+        let hit = |project: PathBuf| {
+            find_candidate(&root, &candidates, project.to_str().unwrap()).map(|c| c.rel_path.as_str())
+        };
+        assert_eq!(hit(root.join("alias")), Some("group/c"));
+        assert_eq!(hit(root.join("group").join("..").join("group").join("c")), Some("group/c"));
     }
 }

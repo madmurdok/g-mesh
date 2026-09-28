@@ -9,13 +9,16 @@
 //! to resolve before searching and no `still_indexing`-style staleness check
 //! beyond the shared one `prepare` already runs.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::daemon::indexing_status::Phase;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::storage::index_store::IndexStore;
@@ -24,7 +27,7 @@ use crate::storage::vectors::pack;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
 use super::tool_result::{error, internal_error, success};
-use super::SearchCodeParams;
+use super::{human_duration, SearchCodeParams};
 
 /// One matched symbol, ranked by similarity to the query.
 #[derive(Serialize)]
@@ -97,6 +100,109 @@ struct SearchPage {
     /// and no `noMatch`.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
+    /// Present only when the embedding pass was still owed: the rows were
+    /// ranked from the vectors stored so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial: Option<PartialCounts>,
+}
+
+/// `IndexingStatus::embed_progress` at the moment the page was ranked.
+#[derive(Serialize)]
+struct PartialCounts {
+    embedded: u64,
+    total: u64,
+}
+
+/// Where the embedding pass stood when a `search_code` call stopped waiting
+/// for it.
+enum PassState {
+    /// Counting done: `embedded` of `total` computed.
+    Running,
+    /// Started, with nothing counted yet (`total` is 0).
+    Counting,
+    /// Not started ([`Phase::Structural`], or a walk under way again).
+    NotStarted,
+}
+
+/// Why a `search_code` page is partial: the embedding pass had not finished
+/// when the call's bounded wait ran out.
+pub(super) struct Coverage {
+    state: PassState,
+    embedded: u64,
+    total: u64,
+    waited: Duration,
+    root: PathBuf,
+}
+
+impl Coverage {
+    /// `None` once `phase` is [`Phase::Ready`]: every embeddable node has its
+    /// vector and the page is complete.
+    pub(super) fn partial(
+        phase: &Phase,
+        embedded: u64,
+        total: u64,
+        waited: Duration,
+        root: &Path,
+    ) -> Option<Self> {
+        let state = match phase {
+            Phase::Ready => return None,
+            Phase::Embedding if total > 0 => PassState::Running,
+            Phase::Embedding => PassState::Counting,
+            _ => PassState::NotStarted,
+        };
+        Some(Self { state, embedded, total, waited, root: root.to_path_buf() })
+    }
+
+    /// The text that leads a partial page, from the pass's own counts and
+    /// `stored`, the number of vectors the page was ranked from.
+    fn note(&self, stored: u64) -> String {
+        let root = self.root.display();
+        let waited = human_duration(self.waited);
+        let head = match self.state {
+            PassState::Running => format!(
+                "g-mesh: the embedding pass for {root} is still running (embeddings {} of {} computed, this \
+                 call waited {waited}). Only symbols embedded so far were ranked",
+                self.embedded, self.total
+            ),
+            PassState::Counting => format!(
+                "g-mesh: the embedding pass for {root} has started but has not yet counted what needs \
+                 embedding (this call waited {waited}); {stored} symbols from an earlier pass were ranked"
+            ),
+            PassState::NotStarted => format!(
+                "g-mesh: the embedding pass for {root} has not started yet (this call waited {waited}); \
+                 {stored} symbols from an earlier pass were ranked"
+            ),
+        };
+        format!(
+            "{head}. A symbol missing from these results may simply not be embedded yet. Call again later \
+             for complete results."
+        )
+    }
+}
+
+/// Marks a cursor issued on a partial page: `partial:<stored>:<cursor>`,
+/// where `<stored>` is the vector count the page was ranked from. The inner
+/// cursor is base64 and never contains `:`.
+const PARTIAL_CURSOR_PREFIX: &str = "partial:";
+
+fn partial_cursor(stored: u64, cursor: &str) -> String {
+    format!("{PARTIAL_CURSOR_PREFIX}{stored}:{cursor}")
+}
+
+/// `(stored, inner cursor)` for a cursor issued on a partial page; `None`
+/// for any other cursor.
+fn split_partial_cursor(cursor: &str) -> Option<(u64, &str)> {
+    let (stored, inner) = cursor.strip_prefix(PARTIAL_CURSOR_PREFIX)?.split_once(':')?;
+    Some((stored.parse().ok()?, inner))
+}
+
+/// How many vectors [`search`] ranks from.
+fn stored_vectors(conn: &Connection) -> anyhow::Result<u64> {
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM vectors v JOIN nodes n ON n.id = v.nodeId", [], |row| {
+            row.get(0)
+        })?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// Ranks every embedded node against `query` and paginates the result.
@@ -156,11 +262,17 @@ pub(crate) fn top_k_for_eval(
     Ok(page.results.into_iter().map(|row| (row.symbol_id, row.score)).collect())
 }
 
+/// Answers one `search_code` call. `coverage` is `Some` when the embedding
+/// pass is still owed: the page is then ranked from the stored vectors, led
+/// by a note, marked `partial`, carries no floor verdict, and its cursor is
+/// refused once the stored vector count changes (the continuation would rank
+/// a different set).
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     hints: &SessionHints,
     params: SearchCodeParams,
+    coverage: Option<&Coverage>,
 ) -> Result<CallToolResult, ErrorData> {
     let Some(query_vector) = embedding.embed_query(&params.query) else {
         return error(
@@ -171,20 +283,55 @@ pub(super) fn handle(
     };
 
     let conn = store.read();
+    let partial_cursor_in = params.cursor.as_deref().and_then(split_partial_cursor);
+    let stored = if coverage.is_some() || partial_cursor_in.is_some() {
+        stored_vectors(&conn).map_err(|e| internal_error("failed to count stored vectors", e))?
+    } else {
+        0
+    };
+    let cursor = match partial_cursor_in {
+        Some((issued, _)) if issued != stored => {
+            return error(format!(
+                "g-mesh: this cursor came from a page ranked while the embedding pass was still running \
+                 ({issued} symbols embedded then, {stored} now), so its continuation would rank a different \
+                 set. Call search_code again without `cursor`."
+            ));
+        }
+        Some((_, inner)) => Some(inner),
+        None => params.cursor.as_deref(),
+    };
+
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = search(&conn, &query_vector, page_size, params.cursor.as_deref())
+    let page = search(&conn, &query_vector, page_size, cursor)
         .map_err(|e| internal_error("failed to search code", e))?;
 
-    let no_match = similarity::verdict(&params.query, params.cursor.as_deref(), &page.results);
-    let hint = search_hint(&page.results, no_match.as_ref(), hints);
-
-    success(&SearchPage {
+    let no_match = match coverage {
+        None => similarity::verdict(&params.query, cursor, &page.results),
+        Some(_) => similarity::partial_verdict(&params.query, cursor, &page.results),
+    };
+    let next_cursor = match coverage {
+        None => page.next_cursor,
+        Some(_) => page.next_cursor.map(|next| partial_cursor(stored, &next)),
+    };
+    let hint = match coverage {
+        None => search_hint(&page.results, no_match.as_ref(), hints),
+        Some(_) => None,
+    };
+    let body = SearchPage {
         results: page.results,
         has_more: page.has_more,
-        next_cursor: page.next_cursor,
+        next_cursor,
         no_match,
         hint,
-    })
+        partial: coverage.map(|c| PartialCounts { embedded: c.embedded, total: c.total }),
+    };
+    match coverage {
+        None => success(&body),
+        Some(coverage) => Ok(CallToolResult::success(vec![
+            ContentBlock::text(coverage.note(stored)),
+            ContentBlock::json(&body)?,
+        ])),
+    }
 }
 
 fn search_hint(
@@ -320,7 +467,7 @@ mod tests {
         let embedding = EmbeddingPipeline::disabled();
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, &SessionHints::default(), params).unwrap();
+        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
 
@@ -336,7 +483,7 @@ mod tests {
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, &SessionHints::default(), params).unwrap();
+        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
         std::env::remove_var(MODEL_DIR_ENV);
     }
@@ -395,6 +542,7 @@ mod tests {
                 next_cursor: None,
                 no_match: Some(verdict),
                 hint: None,
+                partial: None,
             })
             .unwrap(),
         )
@@ -407,6 +555,7 @@ mod tests {
                 next_cursor: None,
                 no_match: None,
                 hint: None,
+                partial: None,
             })
             .unwrap(),
         )
@@ -509,7 +658,7 @@ mod tests {
             query: "load the contents of a file from the filesystem".to_string(),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &embedding, &SessionHints::default(), params).unwrap());
+        let body = json_body(&handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap());
 
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both embedded symbols must come back");
