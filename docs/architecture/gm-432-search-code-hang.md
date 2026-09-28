@@ -151,14 +151,13 @@ first place (fix B, the bound).
 
 ### A. The shim never drops a forwarded request (fixes the incident)
 
-- **A1. Re-selecting the project already served is not a switch.** In
-  `on_front_frame`, if the target is the current sub's root, keep the upstream
-  and answer with the guidance cached from the last switch.
-  - Benefit: removes the trigger in the common case (parallel subagents all
-    select the same project).
-  - Risk: the guidance could be stale if the daemon was replaced by a new
-    build. In that case the upstream would have ended anyway and the next
-    select reconnects.
+- **A1 (dropped by the owner).** The proposal was to treat re-selecting the
+  project already served as no switch: keep the upstream and answer with the
+  guidance cached from the last switch. It contradicts Q9
+  (`lazy-indexing.md`: reselecting the current project is a full switch, so
+  the guidance is re-rendered for the project's state now). A2 and A3 cover
+  the same-project case without it: the reselect connects anew, and the old
+  upstream stays open until it has answered what it owes.
 - **A2. Track in-flight ids per upstream.** `on_client_frame` records the id of
   every request it forwards, with the upstream it went to. Each upstream's
   reader removes the id when the response passes through. On a real switch,
@@ -225,10 +224,12 @@ Today `search_code` waits for `Phase::Ready` for up to 25 min.
    pipe-based harness (`single_project_frames_are_byte_identical`) with a
    `Connector` that hands out scripted fake upstreams.
    - a. Select A, forward `tools/call` id 7 to U1 (which does not answer
-     yet), select A again. Assert no second connect, then U1 answers id 7 and
-     the client receives it. Control: remove the A1 check. The connector is
-     called twice and id 7's answer never reaches the client (read with a 2 s
-     bound; the test fails).
+     yet), select A again. Assert a second connect (U2), that U1 is not
+     half-closed while id 7 is pending, and that U1's late answer for id 7
+     reaches the client. The fake daemon closes its side on a half-close, as
+     rmcp does. Control: restore `previous.close(Shutdown::Write)` and drop
+     the pending-id tracking. U1 is half-closed at once and id 7's answer
+     never arrives (read with a 2 s bound; the test fails).
    - b. Select A, id 7 on U1, select B. Assert U1 is not half-closed while id 7
      is pending, and that U1's late answer reaches the client. Then close U1
      with id 8 pending and assert the client receives the A3 error for id 8

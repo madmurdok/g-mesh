@@ -101,8 +101,6 @@ struct Router {
     front: Option<Upstream>,
     /// The selected sub-project's daemon, once a switch has happened.
     sub: Option<Upstream>,
-    /// The guidance `sub`'s daemon answered the replayed `initialize` with.
-    sub_guidance: String,
     /// Sub-project upstreams switched away from while they still owed
     /// answers. Each is half-closed once it owes none, and dropped from here
     /// when its connection ends.
@@ -247,7 +245,6 @@ where
             root: root.clone(),
             front: Some(Upstream::new(0, root.clone(), writer, closer)),
             sub: None,
-            sub_guidance: String::new(),
             retired: Vec::new(),
             pending: HashMap::new(),
             init_frame: None,
@@ -471,13 +468,8 @@ impl Shared {
     }
 
     /// D11 step 3.1-3.5 and 3.7. On error nothing about routing has changed.
-    /// Selecting the project already served keeps its upstream and answers
-    /// with the guidance cached from the switch that connected it.
     fn switch(self: &Arc<Self>, router: &mut Router, target: &Path) -> Result<(PathBuf, String)> {
         let target = target.canonicalize().with_context(|| format!("cannot resolve {}", target.display()))?;
-        if router.sub.as_ref().is_some_and(|sub| sub.root == target) {
-            return Ok((target, router.sub_guidance.clone()));
-        }
         if target == router.root || !target.starts_with(&router.root) {
             bail!("{} is not a project below {}", target.display(), router.root.display());
         }
@@ -522,7 +514,6 @@ impl Shared {
         let id = router.next_upstream;
         router.next_upstream += 1;
         spawn_reader(self, id, reader, false);
-        router.sub_guidance = guidance.clone();
         if let Some(previous) = router.sub.replace(Upstream::new(id, target.clone(), writer, closer)) {
             // Its reader passes the replies it still owes, then ends.
             let previous_id = previous.id;
@@ -674,7 +665,9 @@ mod tests {
     /// A scripted daemon. It answers `initialize` (with instructions naming
     /// its root) and `select_project` (with a switch directive to
     /// `<root>/<project>`) itself, and hands every other frame to the test,
-    /// which answers through [`Fake::answer`].
+    /// which answers through [`Fake::answer`]. Like the real daemon, it takes
+    /// a half-close as "client gone" and closes its side: whatever it has not
+    /// answered by then is never answered.
     struct Fake {
         root: PathBuf,
         got: mpsc::Receiver<Value>,
@@ -726,11 +719,14 @@ mod tests {
                     }
                 }
             });
-            let recorded = Arc::clone(&closes);
+            let (recorded, closing) = (Arc::clone(&closes), Arc::clone(&writer));
             let link = Link {
                 reader: Box::new(BufReader::new(from_daemon_r)),
                 writer: Box::new(to_daemon_w),
-                closer: Box::new(move |how| recorded.lock().unwrap().push(how)),
+                closer: Box::new(move |how| {
+                    recorded.lock().unwrap().push(how);
+                    closing.lock().unwrap().take();
+                }),
             };
             (link, Fake { root, got, writer, closes })
         }
@@ -751,8 +747,9 @@ mod tests {
                 "id": id,
                 "result": { "content": [{ "type": "text", "text": format!("answer from {}", self.root.display()) }] },
             });
-            let mut writer = self.writer.lock().unwrap();
-            write_ndjson_frame(writer.as_mut().unwrap(), &serde_json::to_vec(&reply).unwrap()).unwrap();
+            if let Some(writer) = self.writer.lock().unwrap().as_mut() {
+                write_ndjson_frame(writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
+            }
         }
 
         /// Ends the connection from the daemon's side.
@@ -849,29 +846,31 @@ mod tests {
         }
     }
 
-    /// Re-selecting the project already served keeps its connection: no
-    /// second connect, no close, and a call in flight on it is answered.
+    /// Re-selecting the project already served is a full switch: a second
+    /// connection, while the first stays open for the call in flight on it,
+    /// whose late answer reaches the client.
     ///
-    /// Control: drop the same-root check at the top of `switch`: the
-    /// connector is called a second time and the test fails there.
+    /// Control: restore `previous.close(Shutdown::Write)` at the switch and
+    /// drop the pending-id tracking: the first connection is half-closed at
+    /// once, and id 7's answer never arrives within 2 s.
     #[test]
-    fn reselecting_the_served_project_keeps_its_connection() {
+    fn reselecting_the_served_project_keeps_a_call_in_flight() {
         let mut session = Session::start();
-        let first = session.select(1, "a");
-        let a = session.daemon();
-        assert!(first.contains(&format!("guidance for {}", a.root.display())), "{first}");
+        session.select(1, "a");
+        let first = session.daemon();
         session.call(7);
-        assert_eq!(a.expect("tools/call")["id"], 7);
+        assert_eq!(first.expect("tools/call")["id"], 7);
 
-        let again = session.select(2, "a");
-        assert_eq!(again, first, "the cached guidance answers a reselect");
-        assert!(session.daemons.try_recv().is_err(), "reselecting the served project must not connect again");
-        assert!(a.closes().is_empty(), "the served project's connection must stay open");
+        session.select(2, "a");
+        let second = session.daemon();
+        assert_eq!(second.root, first.root, "a reselect reconnects to the same project");
+        assert!(first.closes().is_empty(), "the first connection still owes 7");
 
-        a.answer(7);
+        first.answer(7);
         let answer = session.recv();
         assert_eq!(answer["id"], 7, "{answer}");
         assert!(answer["result"]["isError"].is_null(), "{answer}");
+        assert_eq!(first.closes(), vec![Shutdown::Write], "closed once it owes nothing");
     }
 
     /// A switch keeps the previous project's connection open while it owes
