@@ -233,6 +233,10 @@ test("plugin answers a semanticPass request with a diff-shaped result", async ()
       upsertEdges: [],
       deleteEdgeIds: [],
     });
+    // A file that does not exist leaves nothing uncovered, and a complete pass
+    // says nothing about completeness at all.
+    assert.equal("incomplete" in response, false, JSON.stringify(response));
+    assert.equal("incompleteReason" in response, false, JSON.stringify(response));
     assert.equal(child.exitCode, null, "process must still be alive");
   } finally {
     child.kill();
@@ -271,3 +275,42 @@ test("a whole-project semanticPass (empty filePaths) is answered the same way", 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+/** The flag core reads to leave a whole-project pass unfinished travels beside
+ * `result`, as core's `FileChangeResponse` has it - not inside the diff. */
+test(
+  "a semanticPass that could not cover a file answers incomplete, with a reason, beside the diff",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 ? "chmod 000 does not deny this user" : false },
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-e2e-semantic-"));
+    const locked = path.join(root, "locked.ts");
+    await fs.writeFile(locked, "export const a = 1;\n", "utf8");
+    await fs.chmod(locked, 0o000);
+    const child = spawnPlugin(root);
+    const out = collectFrames(child.stdout);
+
+    try {
+      await out.wait(1); // handshake
+
+      child.stdin.write(
+        encodeFrame(
+          Buffer.from(
+            JSON.stringify({ jsonrpc: "2.0", id: 9, method: "semanticPass", params: { filePaths: ["locked.ts"] } }),
+          ),
+        ),
+      );
+
+      await out.wait(2);
+      const response = JSON.parse(out.frames[1].toString("utf8"));
+      assert.equal(response.id, 9);
+      assert.equal(response.incomplete, true, JSON.stringify(response));
+      assert.equal(typeof response.incompleteReason, "string");
+      assert.ok(response.incompleteReason.includes("locked.ts"), response.incompleteReason);
+      assert.deepEqual(response.result.upsertEdges, []);
+    } finally {
+      child.kill();
+      await fs.chmod(locked, 0o644);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);

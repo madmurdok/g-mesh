@@ -302,6 +302,22 @@ export interface SemanticPassResult {
   filesScanned: number;
   /** Questions that reached no single declaration, likewise. */
   unresolvedUses: number;
+  /**
+   * Whether the pass did *not* cover everything it was asked about: a file it
+   * could not read or parse, a question the checker failed on (a dead or
+   * crashed tsserver, a timeout, a refusal), or questions it never asked
+   * because the checker had already failed too often in a row. What it did
+   * answer is still in the diff - this is the wire's
+   * `FileChangeResponse::incomplete`, which makes core leave the
+   * whole-project pass unfinished and ask again on the next start.
+   *
+   * Not set by a question the checker *answered* with nothing usable (no
+   * declaration, several, one outside the index): that is the pass working,
+   * and a retry would get the same answer.
+   */
+  incomplete: boolean;
+  /** Beside `incomplete: true` only: what it did not cover, in words. */
+  incompleteReason?: string;
 }
 
 export interface SemanticPassOptions {
@@ -344,7 +360,9 @@ export function resetSemanticPassState(): void {
  * upgrade over a graph that is already committed and serviceable (core drops a
  * failing one on the floor by design), so a partial answer is always better
  * than none, and "that edge stays missing" is the only failure mode this layer
- * is allowed to have.
+ * is allowed to have. It is not a silent one, though: any of these marks the
+ * result `incomplete`, with a reason, so core does not record the pass as
+ * finished.
  *
  * The tsserver child is started lazily by the first question actually asked - a
  * pass that finds nothing to ask about spawns no checker at all, which is the
@@ -356,7 +374,8 @@ export async function runSemanticPass(
   options: SemanticPassOptions = {},
 ): Promise<SemanticPassResult> {
   const scope = filePaths.length > 0 ? filePaths.map(toPosixPath) : await allProjectFiles(projectRoot);
-  const index = new ProjectIndex(projectRoot, options);
+  const shortfall = new Shortfall();
+  const index = new ProjectIndex(projectRoot, options, shortfall);
 
   const scanned: ScopedFile[] = [];
   let filesScanned = 0;
@@ -393,6 +412,7 @@ export async function runSemanticPass(
     const checker = new Checker(
       options.project ?? semanticProjectFor(projectRoot, { onLog: options.onLog }),
       options,
+      shortfall,
     );
     // Namespace uses first, so that if the two halves ever reached for one edge
     // id the upgrade - which carries a real declaration rather than another
@@ -402,7 +422,7 @@ export async function runSemanticPass(
     for (const question of bindingWork) await askBinding(question, index, checker, out);
   }
 
-  return out.finish(scope, filesScanned);
+  return { ...out.finish(scope, filesScanned), ...shortfall.verdict() };
 }
 
 // --- what one file contributes -------------------------------------------
@@ -801,6 +821,7 @@ class Checker {
   constructor(
     private readonly project: SemanticProject,
     private readonly options: SemanticPassOptions,
+    private readonly shortfall: Shortfall,
   ) {}
 
   /**
@@ -814,7 +835,13 @@ class Checker {
     col: number,
     what: string,
   ): Promise<DefinitionLocation[] | null> {
-    if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return null;
+    if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      this.shortfall.note(
+        `question(s) never asked after ${MAX_CONSECUTIVE_FAILURES} consecutive checker failures`,
+        `${what} in ${file}`,
+      );
+      return null;
+    }
     try {
       // tree-sitter counts rows/columns from zero, tsserver lines/offsets from
       // one; both count UTF-16 code units, so this is the whole conversion.
@@ -823,6 +850,7 @@ class Checker {
       return locations;
     } catch (err) {
       this.options.onLog?.(`semantic pass could not resolve ${what}: ${(err as Error).message}`);
+      this.shortfall.note("question(s) the checker failed on", `${what}: ${(err as Error).message}`);
       this.consecutiveFailures += 1;
       return null;
     }
@@ -865,6 +893,7 @@ class ProjectIndex {
   constructor(
     private readonly projectRoot: string,
     private readonly options: SemanticPassOptions,
+    private readonly shortfall: Shortfall,
   ) {
     this.resolveSpecifier = createProjectResolver(projectRoot);
     this.isIndexable = createIndexabilityChecker(projectRoot);
@@ -902,13 +931,22 @@ class ProjectIndex {
     let sourceText: string;
     try {
       sourceText = await fs.readFile(this.absolute(relPath), "utf8");
-    } catch {
-      return null; // deleted, unreadable - the next reparse is the one that matters
+    } catch (err) {
+      // A file that is gone has nothing left to cover - the reparse that
+      // notices is the one that matters. One that is there but unreadable is
+      // a file this pass skipped, and says so.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        this.options.onLog?.(`semantic pass could not read ${relPath}: ${(err as Error).message}`);
+        this.shortfall.note("file(s) that could not be read", `${relPath}: ${(err as Error).message}`);
+      }
+      return null;
     }
     try {
       return extractFile(relPath, sourceText, { resolveSpecifier: this.resolveSpecifier });
     } catch (err) {
       this.options.onLog?.(`semantic pass could not parse ${relPath}: ${(err as Error).message}`);
+      this.shortfall.note("file(s) that could not be parsed", `${relPath}: ${(err as Error).message}`);
       return null;
     }
   }
@@ -1184,7 +1222,7 @@ class PassOutput {
    * previous pass wrote for these same files that no longer has a call site
    * behind it.
    */
-  finish(scope: readonly string[], filesScanned: number): SemanticPassResult {
+  finish(scope: readonly string[], filesScanned: number): Omit<SemanticPassResult, "incomplete" | "incompleteReason"> {
     // A collapsed edge goes out with the bound edges that replace it. Guarded
     // against the one way that could destroy information: an id this pass is
     // also writing (`apply_diff` deletes before it upserts, so the write would
@@ -1206,6 +1244,30 @@ class PassOutput {
       filesScanned,
       unresolvedUses: this.unresolved,
     };
+  }
+}
+
+/**
+ * What kept one pass from covering its scope, by kind: how many times, and the
+ * first instance in words - enough for `g-mesh status` to say why, without a
+ * reason that grows with the size of the failure.
+ *
+ * Kept apart from `PassOutput` because the diff and the verdict are separate
+ * answers: a pass that fell short still sends everything it did resolve.
+ */
+class Shortfall {
+  private readonly kinds = new Map<string, { count: number; first: string }>();
+
+  note(kind: string, detail: string): void {
+    const existing = this.kinds.get(kind);
+    if (existing === undefined) this.kinds.set(kind, { count: 1, first: detail });
+    else existing.count += 1;
+  }
+
+  verdict(): { incomplete: boolean; incompleteReason?: string } {
+    if (this.kinds.size === 0) return { incomplete: false };
+    const parts = [...this.kinds].map(([kind, { count, first }]) => `${count} ${kind} (first: ${first})`);
+    return { incomplete: true, incompleteReason: `the TypeScript semantic pass skipped ${parts.join("; ")}` };
   }
 }
 
