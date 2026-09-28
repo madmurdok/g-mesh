@@ -147,6 +147,116 @@ came with fewer g-mesh calls and slightly lower correctness, and it is reported 
 Whether to ship anyway (for example, restoring the one-line `find_definition`-returns-source note,
 about 100 B under the 2,560-B ceiling, and re-measuring) is the owner's decision.
 
+## B2: `find_definition` bullet restored
+
+The owner asked for one re-measurement with the one-line note restored:
+"`find_definition` returns the declaration's source in `source.text`: do not Read the file
+after it unless `source.omittedLines` says it was cut." (g-mesh 4abe6c8, snippet **2,378 B**).
+Everything else in B is unchanged.
+
+| | B2 |
+|---|---|
+| g-mesh | `feat/GM-389-lighter-guidance-prefix` at 4abe6c8, `cargo build --release -p g-mesh` rerun (it relinked), `G_MESH_BENCH_BINARY` pointed at it, `g-mesh 3.16.0` |
+| bench | `chore/GMB-183-pin-gm389-snippet` at dd952b7; the drift test passes against this g-mesh worktree (`G_MESH_BENCH_REPO`) |
+| task set | **A's 33 task ids passed on the command line** (`npm run token-economy -- <ids>`, the harness's only task filter): "Running 33 of 79 tasks", 198 records, all `ok`; `taskDefHash` identical to A for all 33 |
+| result | `results/token-economy/2026-09-28T22-01-18-232Z.json` (bench-wt-gmb183) |
+| transcripts | `results/transcripts/2026-09-28T22-01-40-962Z`, 198 files, every one `claude_code_version: 2.1.283` |
+| machine | start 01:01, load 71.08 75.62 39.24 (a parallel verify agent's cargo/npm tests); end 01:56, load 4.87 4.62 5.10; `time -p` real 3296.21, user 687.99, sys 208.07 |
+| spend | arms $10.27, judge $1.77 |
+
+Figures below come from a rebuilt analysis (`ab2.py`, same definitions as *Reproducing*). It reproduces
+this document's A and B1 tokens, turns, oracle, per-tool counts and per-task ratios exactly; its
+complete-result and re-verification counts come out 1-2 lower than S9's for A and B1 (128/16 and 94/12
+against 130/17 and 95/13), so those two rows are given from the rebuilt script for all three columns.
+
+### 27 Go/Rust/Python tasks (n = 81 per arm per invocation)
+
+| | A gmesh | B1 gmesh | **B2 gmesh** | A base | B1 base | B2 base |
+|---|---|---|---|---|---|---|
+| tokens/run | 114,333 | 98,727 | **98,507 (-13.8%)** | 75,734 | 75,384 | 69,826 |
+| cacheRead / run | 105,363 | 91,167 | 90,898 | 68,287 | 67,571 | 62,176 |
+| cacheCreation / run | 7,394 | 6,026 | 6,124 | 5,772 | 6,101 | 6,011 |
+| cacheRead per turn | 17,597 | 15,984 | **15,119** | 10,740 | 10,774 | 10,113 |
+| turns/run | 5.99 | 5.70 | **6.01** | 6.36 | 6.27 | 6.15 |
+| oracle | 80/81 | 78/81 | **79/81** | 79/81 | 75/81 | 76/81 |
+| g-mesh calls (total, per run) | 190, 2.35 | 136, 1.68 | **179, 2.21 (-6%)** | 0 | 0 | 0 |
+| `find_definition` / `find_references` | 82 / 34 | 48 / 18 | **79 / 21** | - | - | - |
+| `find_callers` / `find_implementations` / `get_dependencies` | 27 / 13 / 11 | 23 / 14 / 10 | 33 / 15 / 9 | - | - | - |
+| `find_callees` / `search_code` / `get_file_outline` | 8 / 6 / 9 | 9 / 5 / 9 | 7 / 6 / 9 | - | - | - |
+| `Read` calls | 97 | 127 | **117** | 157 | 175 | 166 |
+| `Grep` / `Glob` | 110 / 7 | 111 / 7 | 99 / 11 | 264 / 13 | 243 / 9 | 238 / 13 |
+| complete structural results | 128 | 94 | 116 | - | - | - |
+| re-verification turns (per complete result) | 16 (12.5%) | 12 (12.8%) | **12 (10.3%)** | - | - | - |
+| grep after a structural call | 87 | 59 | 65 | - | - | - |
+
+Per task (median of 3 reps), B2 against A: `gmesh-configured` lower on 21 of 27, 9 separated downward,
+0 upward, median ratio **0.836**; `baseline` 13 of 27 lower, 3 down, 1 up, ratio 1.000. B2 against B1:
+`gmesh-configured` ratio 1.002 (13 lower, 0 down, 5 up), `baseline` 0.999. The bullet cost no measurable
+tokens against B1; the prefix saving is intact. B2's baseline mean is 7.8% below A's while its per-task
+median ratio is 1.000: a few high-variance tasks moved the mean, not the environment.
+
+### TS spot-check, 6 tasks (n = 18 per arm per invocation)
+
+| | A gmesh | B1 gmesh | **B2 gmesh** | A base | B1 base | B2 base |
+|---|---|---|---|---|---|---|
+| tokens/run | 78,887 | 63,254 | **69,414 (-12.0%)** | 58,435 | 56,262 | 54,855 |
+| cacheRead / cacheCreation per run | 71,381 / 6,796 | 58,382 / 4,091 | 63,591 / 5,051 | 53,637 / 3,570 | 52,463 / 2,811 | 50,311 / 3,587 |
+| cacheRead per turn | 21,414 | 16,420 | 17,084 | 8,395 | 10,981 | 11,320 |
+| turns/run | 3.33 | 3.56 | 3.72 | 6.39 | 4.78 | 4.44 |
+| oracle | 18/18 | 18/18 | 18/18 | 16/18 | 14/18 | 16/18 |
+| g-mesh calls (total, per run) | 30, 1.67 | 25, 1.39 | **31, 1.72** | 0 | 0 | 0 |
+| `find_definition` / `find_references` / `find_callers` / `get_dependencies` / `search_code` | 8 / 7 / 6 / 6 / 3 | 6 / 1 / 12 / 3 / 3 | 9 / 3 / 11 / 3 / 5 | - | - | - |
+| `Read` calls | 2 | 6 | 1 | 12 | 8 | 9 |
+| complete results / re-verification turns | 16 / 2 | 16 / 3 | 20 / 3 | - | - | - |
+
+Per task B2 against A, `gmesh-configured`: lower on 4 of 6, 4 separated downward, 1 upward, median ratio 0.790.
+
+### Did the `find_definition` -> `Read` substitution reverse?
+
+Mostly. On the 27 tasks `find_definition` went 82 (A) -> 48 (B1) -> **79** (B2) and `Read` 97 -> 127 -> **117**;
+both scopes together, `find_definition` 90 -> 54 -> 88 and `Read` 99 -> 133 -> 118. `Read` stays 20 above A, but
+the baseline arm's own `Read` count moves by 18 between invocations of an unchanged arm (157 / 175 / 166), so the
+remainder is not distinguishable from noise. What did not come back is `find_references`: 34 -> 18 -> 21 on the 27
+tasks (41 -> 19 -> 24 both scopes). Its -13 is more than B2's whole remaining g-mesh-call deficit (179 against 190,
+-11), and it is a change of habit the restored bullet does not address.
+
+### `rs-deps-json-printer-workspace-crates`, per rep (`gmesh-configured`)
+
+| rep | A | B1 | B2 |
+|---|---|---|---|
+| 1 | pass (`get_dependencies`, then grep) | pass (same) | pass: `get_dependencies`, `Grep ^use` + Read of the first 25 lines, `Grep grep_regex`; excluded `grep-regex` as test-only |
+| 2 | pass (same) | **fail**: trusted `get_dependencies`, listed `grep-regex` | pass: `get_dependencies`, one `Grep` for the three crate names; listed `grep-regex` marked "only in `#[cfg(test)]`" |
+| 3 | pass (same) | **fail** (same as rep 2) | pass: `get_dependencies`, two `Grep`s; same answer as rep 2 |
+
+All three B2 reps checked the complete `get_dependencies` answer with a grep, as all of A's did. The bullet does not
+touch `get_dependencies`, so this is the agent's choice varying between invocations, not an effect of the change: B1's
+two failures had a real mechanism, and B2 shows it does not fire every time.
+
+### Oracle failures (B2)
+
+- gmesh: `py-references-httpbasicauth` rep1 and rep2. In A, B1 and B2 all nine reps made the same two calls
+  (`find_definition`, `find_references`) and gave the same answer (`src/requests/models.py`, `prepare_auth`, plus one
+  file-scope reference); A passed 2/3 with it, B1 3/3, B2 1/3. The judge is splitting identical answers; this is grader
+  variance, not agent behaviour.
+- baseline: 5 of 81 (A 2, B1 6) and 2 of 18 on TS.
+
+### Decision rule (section 8) applied to B2 (B2 against A)
+
+| criterion | result | met |
+|---|---|---|
+| tokens/run drop | -13.8% (27 tasks), -12.0% (TS); per-task ratio 0.836 / 0.790 with baseline 1.000 / 1.025 | **yes** |
+| oracle not lower | 80/81 -> 79/81 (27 tasks), 18/18 -> 18/18 (TS) | **no, by 1** (the one extra failure is the judge splitting identical answers, above; baseline moves by up to 4/81 between invocations) |
+| g-mesh calls/run do not fall | 2.35 -> 2.21 (-6%) on the 27 tasks; 1.67 -> 1.72 on TS; both scopes 220 -> 210 | **no, by 6%** (all of it `find_references`; B1 was -28%) |
+| turns do not rise beyond the baseline spread | 5.99 -> 6.01 (+0.02; baseline spread 0.21); TS 3.33 -> 3.72 (baseline spread 1.95) | yes |
+| re-verification turns do not rise beyond the spread | 16 -> 12 (12.5% -> 10.3% of complete results); TS 2 -> 3 | yes |
+
+**Verdict: as written, the rule is still not met, but only by margins inside the measured run-to-run spread.** The restored
+bullet brought `find_definition` back to A's level (79 against 82) at no token cost against B1 (per-task ratio 1.002), kept
+the -13.8% saving, and removed B1's one failure with a mechanism (json-printer passes 3/3). The two guards still miss by
+one oracle point that traces to grader variance on identical answers and by 6% of g-mesh calls, all in `find_references`.
+Reading "not lower" and "do not fall" as strict inequalities fails B2; reading them against the baseline arms' spread
+passes it. Which reading the rule intends is for the owner to decide.
+
 ## D3: owner's `~/.claude/CLAUDE.md` "Code search" section vs the new `AGENTS_MD_SNIPPET`
 
 Read only; `~/.claude/CLAUDE.md` was not edited. The owner's section is 2,983 B (hand-trimmed),
@@ -181,7 +291,7 @@ verbatim "Prefer" and "indexing" bullets, plus the delegation bullet the owner's
 
 ## Reproducing
 
-Analysis: `ab.py` (in the S9 agent's scratchpad; logic in brief). Tokens = input + output + cacheRead + cacheCreation;
+Analysis: `ab.py` (in the S9 agent's scratchpad, since lost; logic in brief), rebuilt for B2 as `ab2.py` (S12 agent's scratchpad). Tokens = input + output + cacheRead + cacheCreation;
 cacheRead per turn = sum cacheRead / sum `numTurns`. A *complete structural result* is a
 `find_*`/`get_dependencies` response that parses, has no `error`, `ambiguous`, `allUnresolved`,
 `truncated: true` or `hasMore`, no `resolved: false` row, and no anchor `resolvedBy` of
