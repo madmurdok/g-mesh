@@ -36,7 +36,7 @@ for dir in "$home"/projects/*/; do
   if [ -f "$dir/project.root" ] && [ -f "$dir/index.db" ]; then db="$dir/index.db"; fi
 done
 if [ -z "$db" ]; then
-  db="$(ls "$home"/projects/*/index.db | head -1)"
+  db="$(find "$home/projects" -mindepth 2 -maxdepth 2 -name index.db -print -quit)"
 fi
 [ -f "$db" ] || { echo "no index.db under $home/projects" >&2; exit 1; }
 
