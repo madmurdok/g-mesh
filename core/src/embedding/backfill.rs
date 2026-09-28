@@ -22,8 +22,9 @@
 //!
 //! `daemon::indexing_status::IndexingStatus`'s `Embedding` phase covers
 //! exactly the time this pass runs: structural tools do not wait on it
-//! (`Need::Structural` is already satisfied), `search_code`
-//! (`Need::Embeddings`) does.
+//! (`Need::Structural` is already satisfied), `search_code` waits on it for
+//! at most `mcp::SEARCH_EMBEDDING_WAIT` (`Need::Embeddings`), then answers
+//! from the vectors stored so far.
 //!
 //! # Termination
 //!

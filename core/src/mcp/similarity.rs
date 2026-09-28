@@ -338,6 +338,17 @@ pub(super) fn verdict(query: &str, cursor: Option<&str>, results: &[SearchResult
     })
 }
 
+/// [`verdict`] for a page ranked while the embedding pass is still owed.
+/// "Nothing close" is not known while vectors are missing, so the floor's
+/// verdict is withheld; the one about the query's shape still stands.
+pub(super) fn partial_verdict(
+    query: &str,
+    cursor: Option<&str>,
+    results: &[SearchResult],
+) -> Option<NoMatch> {
+    verdict(query, cursor, results).filter(|no_match| no_match.reason == NoMatchReason::QueryIsAPathOrPackage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +459,19 @@ mod tests {
 
         assert_eq!(json, r#"{"reason":"belowSimilarityFloor","explanation":"…"}"#);
         assert!(!BELOW_FLOOR_EXPLANATION.contains("0.5"), "the floor must not leak through the prose");
+    }
+
+    /// The same below-floor page, judged complete and judged partial: only
+    /// the partial judgement is silent. A specifier keeps its verdict either
+    /// way.
+    #[test]
+    fn a_partial_page_withholds_the_floor_verdict_but_not_the_specifier_one() {
+        let page = [hit(0.10, "typescript")];
+        assert!(verdict("reads a file", None, &page).is_some(), "the control: complete, this page is a no");
+        assert_eq!(partial_verdict("reads a file", None, &page), None);
+        assert_eq!(
+            partial_verdict("@excalidraw/element", None, &page).map(|v| v.reason),
+            Some(NoMatchReason::QueryIsAPathOrPackage)
+        );
     }
 }
