@@ -4,13 +4,15 @@ Question: does fusing gte-small with bge-small, or an embedder with BM25,
 match or beat jina-v2-base-code fp32 (NL recall@10 0.633, MRR 0.427) under the
 GM-398 eval (`docs/architecture/embedding-eval.md`, D5/D6/D9)?
 
-Answer: **no variant passes D9 as it stands.** gte+bge fusion does not beat
-gte alone. The one lead is **jina + BM25 by weighted score fusion**: on the
+Answer: **no variant passes D9 as it stands, against fp32 or against the
+shipped int8 model.** gte+bge fusion does not beat gte alone. The one lead is **jina + BM25 by weighted score fusion**: on the
 held-out half it lifts recall@10 by +6.6 points (lower bound +3.4) with MRR
 unchanged. It fails Q4 when its floors are read on jina's cosine. It passes
 Q1-Q5 when they are read on its own fused score, but that score is relative to
 the query (below). It is also not a cheaper model, so D9's "clearly better"
-rule applies, and MRR's lower bound (-0.025) fails that rule.
+rule applies, and MRR's lower bound (-0.025) fails that rule. Against int8 the gain
+shrinks to +2.8 points (lower bound +1.1) with MRR flat. Verdict: no-go (see
+"Verdict").
 
 Stored data only (no new embedding): the GM-398 runs under
 `eval/embedding/work/runs/{jina-v2-base-code-fp32,gte-small,bge-small-en-v1.5,bm25}`
@@ -275,3 +277,24 @@ because int8 alone is already 1.2 points above fp32 on the held-out half
 (0.645 vs 0.633), and the fused variant reaches 0.673 instead of fp32+BM25's
 0.699. The open questions from S1 (which score gives the verdict, whether a
 recall-only gain is worth a second retriever, and the cost) are unchanged.
+
+## Verdict
+
+**No-go for every variant**, against jina fp32 (S1) and against the shipped
+jina-v2-base-code int8 (S4).
+
+- gte+bge fusion adds nothing over gte. The two models fail on the same
+  queries.
+- Small model + BM25 fails Q1-Q4.
+- jina+BM25 min-max was the only lead. Held-out r@10 is +6.6 [+3.4] against
+  fp32, but only +2.8 [+1.1] against int8. MRR is flat. Q4 fails at
+  embedder-cosine floors. Its own-score floor judges agreement between the
+  retrievers, not similarity.
+
+The cost step (S2 in the original plan) was not run: it applies only to a go.
+
+Owner's decision, 2026-09-29: «окей, пишем что no-go»
+
+Revisit only if GM-443's reranker takes over the no-match verdict. A
+calibrated score would remove the floor problem that sinks jina+BM25 and
+int8+BM25.
