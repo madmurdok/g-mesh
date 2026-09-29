@@ -248,3 +248,107 @@ is g-mesh's LSP edge tier, not embeddings; D10 names the bucket, so it is
 included as specified, and it serves as a set where the arms should not differ.
 
 **26 tasks** (not low-power), 5 repetitions per task and arm, arms alternating.
+
+### Setup
+
+- **R**: `release-3.17.0` at `5a8b5a7`, built in a detached worktree, fp32
+  weights from `~/.g-mesh/models/jina-embeddings-v2-base-code`
+  (`model.onnx` sha256 `63363fc1…6733b`), shipped floors
+  go/python/rust/typescript 0.59 / 0.57 / 0.55 / 0.50.
+- **C**: the same commit, throwaway (never merged). Weights through g-mesh's
+  existing runtime switch `G_MESH_MODEL_DIR` (`embedding::model::default_model_dir`),
+  no code change: a directory holding `onnx/model_quantized.onnx`, downloaded
+  from the same repository at `MODEL_REVISION` `516f4ba`, renamed
+  `model.onnx` (sha256 `ed458702…2cb16d`, identical to the eval harness's
+  int8 copy), plus the same `tokenizer.json`. Floors: the only code change,
+  `similarity::floor` go 0.59 → 0.57 and typescript 0.50 → 0.53 (ADR 0011's
+  0.57 / 0.57 / 0.55 / 0.53).
+- Located with g-mesh: `find_definition floor` (the floor table),
+  `find_definition default_model_dir` / `resolve_model_dir` (the
+  `G_MESH_MODEL_DIR` switch), `find_definition EmbeddingModel`,
+  `find_references MODEL_REVISION` (no references outside `cli/model.rs`;
+  the pin is used only by `g-mesh model fetch`, not at load time, so C needs
+  no sha change to load).
+- Harness: g-mesh-bench `chore/GM-422-d10-veto` (`138ee41`),
+  `scripts/d10-int8-veto.sh` (adapted from GM-434's `ab-prose-floor.sh`),
+  `gmesh-configured` only, `claude-sonnet-5`. Per-arm `G_MESH_HOME`
+  (`~/.gm422R`, `~/.gm422C`). 5 rounds; each round runs every task once per
+  arm (`REPS=low` per invocation), arm order R C, C R, R C, C R, R C.
+  Tokens = input + output + cache read + cache creation. Per task: pass
+  count, and median C vs median R; the rules take the median over tasks.
+
+### Control: C served int8
+
+- **Probe** (`scripts/probe-d10-int8.ts`, before the run, task-tracker-mcp
+  corpus, same three queries per arm): every top-3 score differs, e.g.
+  "detect a dependency cycle between tasks" `addDependency` R 0.4999 /
+  C 0.4791; "check whether docs drifted from the code" `isDocDrifted`
+  R 0.6546 / C 0.6715. Same top-3 names, shifted scores: the int8 signature
+  S8 found.
+- **In the run's transcripts**: 14 `search_code` queries were issued
+  verbatim in both arms, and all 14 have different top scores (e.g.
+  "cancel task status transition" R 0.5538 / C 0.5660).
+
+### Results
+
+260 records (26 tasks × 2 arms × 5), all `ok`, no missing transcripts.
+
+| task | R pass | C pass | R med tokens | C med tokens | tok Δ | R med turns | C med turns | turn Δ | sc calls R/C |
+|---|---|---|---|---|---|---|---|---|---|
+| ex-implement-mutateelement-elbow-zero-position | 5/5 | 5/5 | 184,231 | 172,791 | -6.2% | 11 | 10 | -1 | 3/4 |
+| ex-semantic-arrow-endpoint-grid-align | 5/5 | 5/5 | 63,139 | 63,050 | -0.1% | 3 | 3 | +0 | 5/5 |
+| ex-semantic-arrow-zorder-above-bound | 5/5 | 5/5 | 213,022 | 114,948 | -46.0% | 12 | 7 | -5 | 9/8 |
+| ex-semantic-cjk-charclass-check | 5/5 | 5/5 | 61,638 | 62,252 | +1.0% | 3 | 3 | +0 | 5/5 |
+| ex-semantic-collab-conflict-keep-local | 5/5 | 5/5 | 62,143 | 62,150 | +0.0% | 3 | 3 | +0 | 5/5 |
+| ex-semantic-drag-text-anchor | 5/5 | 5/5 | 63,100 | 63,894 | +1.3% | 3 | 4 | +1 | 6/5 |
+| ex-semantic-fractional-index-mutate-repair | 5/5 | 5/5 | 62,700 | 62,621 | -0.1% | 3 | 3 | +0 | 5/5 |
+| ex-semantic-library-diff-update | 5/5 | 5/5 | 84,539 | 86,852 | +2.7% | 4 | 4 | +0 | 5/5 |
+| ex-semantic-scroll-lock-clamp | 5/5 | 5/5 | 86,676 | 108,976 | +25.7% | 5 | 5 | +0 | 5/5 |
+| ex-stale-name-canvas-search | 5/5 | 5/5 | 38,435 | 39,925 | +3.9% | 3 | 3 | +0 | 0/2 |
+| gin-callers-writeheadernow-dispatch | 5/5 | 5/5 | 164,138 | 179,306 | +9.2% | 11 | 11 | +0 | 0/0 |
+| gin-find-impl-render | 5/5 | 5/5 | 187,113 | 226,003 | +20.8% | 11 | 12 | +1 | 0/0 |
+| gin-scenario-abort-callers | 5/5 | 5/5 | 57,408 | 57,409 | +0.0% | 3 | 3 | +0 | 0/0 |
+| py-callers-prepare-two-classes | 5/5 | 5/5 | 148,701 | 126,953 | -14.6% | 7 | 8 | +1 | 0/0 |
+| py-callers-register-hook-mixin | 5/5 | 5/5 | 154,137 | 168,515 | +9.3% | 8 | 10 | +2 | 0/0 |
+| py-scenario-callers-httpadapter-send | 5/5 | 5/5 | 88,173 | 112,650 | +27.8% | 7 | 8 | +1 | 0/0 |
+| rs-callers-flag-name-long-dyn | 4/5 | 5/5 | 208,548 | 176,054 | -15.6% | 14 | 14 | +0 | 5/4 |
+| rs-callers-sink-matched | 5/5 | 4/5 | 259,159 | 215,432 | -16.9% | 12 | 10 | -2 | 0/0 |
+| tt-deps-incoming-db-connection | 5/5 | 5/5 | 81,821 | 83,341 | +1.9% | 5 | 6 | +1 | 1/0 |
+| tt-feature-bulk-cancel-epic-tasks | 5/5 | 5/5 | 226,816 | 291,705 | +28.6% | 13 | 14 | +1 | 8/10 |
+| tt-implement-release-cancelled-task-bug | 5/5 | 5/5 | 358,469 | 489,783 | +36.6% | 12 | 15 | +3 | 0/0 |
+| tt-implement-split-task-cancelled-release | 3/5 | 4/5 | 1,063,122 | 1,166,467 | +9.7% | 26 | 29 | +3 | 2/7 |
+| tt-semantic-board-stale-task-flag | 5/5 | 5/5 | 60,258 | 60,349 | +0.2% | 4 | 4 | +0 | 5/5 |
+| tt-semantic-dedupe-prefix-collision | 5/5 | 5/5 | 59,925 | 59,917 | -0.0% | 3 | 3 | +0 | 5/5 |
+| tt-semantic-doc-drift-check | 5/5 | 5/5 | 61,163 | 62,176 | +1.7% | 3 | 3 | +0 | 5/5 |
+| tt-stale-name-doc-sync-check | 5/5 | 5/5 | 60,564 | 60,668 | +0.2% | 3 | 3 | +0 | 5/5 |
+
+`sc calls` counts `search_code` calls; 18 of the 26 tasks used it in this run
+(R 84 calls, C 90). The eight GMB-180 tasks plus a few others used none, so
+their deltas are agent noise, not the model. On the 18 tasks that did, the
+medians are +0.6 % tokens and +0 turns.
+
+### Veto rules (D10)
+
+| rule | threshold | measured | result |
+|---|---|---|---|
+| total oracle passes, C below R | > 2 | R 127, C 128 (C +1) | no veto |
+| a task R passes 5/5, C ≤ 3/5 | any | none (C's lowest: 4/5 on rs-callers-sink-matched, tt-implement-split-task-cancelled-release) | no veto |
+| median per-task token Δ | > +10 % | +1.1 % | no veto |
+| median per-task turn Δ | > +0.5 | +0 | no veto |
+
+**D10: NO VETO.** As D10 says, this is a veto, not a win condition: 5 runs per
+task cannot show an improvement, and the per-task spread (-46 % to +37 %,
+several on tasks with no `search_code` call) is the agent's own variance.
+
+### Timing and cost
+
+- 10 invocations, 3 h 26 m wall (`/usr/bin/time -p` real 12,384 s, user
+  5,270 s, sys 1,156 s); per invocation 1,088-1,610 s. Round 1 carried the
+  cold index builds (R user 2,102 s, C 872 s); later invocations user
+  265-305 s.
+- Load: 1-minute load 7.3 at the start (5-minute 37.7, another agent's work
+  finishing), 2.7-11.8 across invocations, 4.5 at the end. Timing does not
+  enter any rule; tokens and turns do not depend on load.
+- Cost: R $14.51, C $14.51, total **$29.02** (plus the $0.07 dry run, one
+  task on C). No g-mesh daemon under either arm's `G_MESH_HOME` before the
+  run or after it; the probe's daemons stopped on SIGTERM.
