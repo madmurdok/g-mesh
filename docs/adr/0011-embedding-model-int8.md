@@ -1,11 +1,11 @@
 # 0011. Embedding model: switch to jina-v2-base-code int8
 
 ## Status
-Proposed (2026-09-29, GM-422/S9); D10 agent-level veto run 2026-09-29 (GM-422/S12): **no veto** (26 tasks, 5 runs per arm; passes R 127 / C 128, median token Δ +1.1 %, median turn Δ +0; [results](../results/gm-422-int8-confirm.md), "D10 (agent-level)"). The decision follows mechanically from
+Accepted (2026-09-29, GM-422/S13). Proposed 2026-09-29 (GM-422/S9); D10 agent-level veto run 2026-09-29 (GM-422/S12): **no veto** (26 tasks, 5 runs per arm; passes R 127 / C 128, median token Δ +1.1 %, median turn Δ +0; [results](../results/gm-422-int8-confirm.md), "D10 (agent-level)"). The decision follows mechanically from
 the rule the owner fixed before the data existed
 ([protocol](../architecture/embedding-eval-int8-confirm.md), "Owner
 decisions (2026-09-29)": switch if and only if int8 passes). It replaces
-GM-398's int8 verdict (fail on Q5). The switch itself is GM-422/S10.
+GM-398's int8 verdict (fail on Q5). The switch itself is GM-422/S13.
 
 ## Context
 g-mesh embeds with `jinaai/jina-embeddings-v2-base-code` fp32
@@ -74,8 +74,21 @@ advance (owner decision 4).
     check rejects fp32's refit Go and Python floors on these queries, and
     its Q4 fails D9's point condition. That view does not decide here.
   - D9 also names the D10 agent-level check as a veto before a switch is
-    proposed. The confirmatory protocol does not mention it, and it has
-    not run.
+    proposed. It ran after the proposal (GM-422/S12) and found no veto:
+    26 tasks, 5 runs per arm, passes 127 (fp32) / 128 (int8), median token
+    Δ +1.1 %, median turn Δ +0.
+- **The upgrade path.** The int8 file keeps the loader's name,
+  `model.onnx`, so the eval harness and `G_MESH_MODEL_DIR` directories need
+  no second file name. That makes an fp32 `model.onnx` already on disk look
+  present, so two checks by size (a stat, 641,517,466 vs 161,895,621 bytes)
+  keep it from passing for int8: `g-mesh model fetch` and the fetch script
+  replace a file of the wrong size instead of skipping it, and for the
+  default model the daemon neither loads nor counts as available a
+  `model.onnx` of the wrong size, naming `g-mesh model fetch` instead.
+  Loading it would tag fp32 vectors with the int8 `embeddingVersion`
+  (`jina-embeddings-v2-base-code+int8`), and nothing would re-embed them.
+  The re-embed itself is the backfill pass: a node whose vector carries
+  another `embeddingVersion` is owed one, as a reindex already treated it.
 - **fp32 stays the reference** for future candidates. A regression found
   after the switch is reverted by restoring the fp32 pin and floors and
   bumping `embeddingVersion` again.

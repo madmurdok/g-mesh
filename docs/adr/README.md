@@ -79,4 +79,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0008 | [Workspace reindex: walk into a staging index, swap in only the difference](0008-workspace-reindex-staging-swap.md) | Accepted |
 | 0009 | [Semantic pending: say which files a running post-swap semantic pass has not reached](0009-semantic-pending.md) | Accepted |
 | 0010 | [search_code: a below-floor name query is told `noMatch`, a below-floor prose query `lowSimilarity`](0010-search-code-low-similarity-on-prose.md) | Accepted |
-| 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Proposed |
+| 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Accepted |
