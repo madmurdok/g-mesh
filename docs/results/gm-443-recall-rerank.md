@@ -7,6 +7,10 @@ quality at small-model indexing cost. This slice measures only the
 candidate sets, from the stored GM-398 runs. Nothing was re-embedded, and no
 reranker was chosen or run.
 
+**Verdict (final, see "## Verdict" at the end):** go for F4 at K=30, beta 80.
+int8 takes the top-30, a cross-encoder reranks it, and the noMatch verdict
+stays int8's own. The slices below are the evidence.
+
 ## Method
 
 - Data: the stored `g-mesh embed-eval run` output
@@ -982,3 +986,55 @@ gain.
 ```
 python3 eval/embedding/rerank_q5_diag.py --work <main checkout>/eval/embedding/work --fixes --table out.md --table14 s14.md
 ```
+
+## Verdict
+
+**Go for F4 at K=30, beta 80 (tuned on the FIT half).** The shipped
+jina-v2-base-code int8 takes the top-30. The ms-marco-MiniLM-L6-v2
+cross-encoder score + 80 x int8 cosine orders those rows. The noMatch
+verdict stays exactly as today: int8's own un-reranked top-1 cosine at the
+shipped floors.
+
+### Why
+
+- Held-out NL: r@10 +4.6 [+2.1], MRR +0.046 [+0.021] vs int8.
+- Passes D9 vs int8 and vs fp32. Q5 is unchanged. NL CW absent is 22%, as
+  int8.
+- K=50 adds only about +0.2 r@10 for about 1.7x the latency.
+- K=20 loses about a third of the r@10 gain (int8 recall@20 ceiling 0.740).
+
+### Cost and risks
+
+- Latency at K=30 is estimated at about 210 / 700 ms p50 / p95 at 4 threads,
+  from S12's per-pair cost. It is not measured. Measure it in the product
+  path.
+- A second model ships.
+- The Q4 margin is small (upper bound about +0.5).
+
+### Ruled out
+
+- Rerank over gte-small: nothing passes.
+- Plain cross-encoders: worse than recall alone.
+- The blend-score floor of S4: its CW gain was a stricter operating point,
+  and it fails Q5 on TypeScript signature-only symbols (S8).
+- F1/F2 cosine floors refit: NL CW absent 39-41% vs 22%.
+- F4': misled 29% vs 14%.
+- Graph rerank: fails Q4.
+
+### Known weak spots
+
+- The MS MARCO cross-encoder scores signature-only code near -10.
+- Rust recall ceiling: int8 recall@50 is 0.68.
+
+### Follow-ups
+
+- GM-464: implement in search_code.
+- GM-463: reranker bake-off.
+- GM-462: richer reranker input.
+- GM-461: learned noMatch verdict.
+- GM-460: enlarge the eval.
+- GM-436: fine-tuning.
+
+### Owner's decision
+
+2026-09-30, verbatim: «да, норм»
