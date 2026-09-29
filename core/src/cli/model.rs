@@ -3,7 +3,7 @@
 //!
 //! # Why this exists
 //!
-//! The weights are ~612 MiB and are not vendored (see
+//! The weights are ~154 MiB and are not vendored (see
 //! [`crate::embedding::model`]). Until this command existed, the only way to
 //! get them was `core/scripts/fetch-embedding-model.sh`, which lives in this
 //! repository - fine for someone who cloned it, and nothing at all for someone
@@ -52,7 +52,9 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::ModelCommand;
 use crate::config::EmbeddingConfig;
-use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
+use crate::embedding::model::{
+    DEFAULT_ONNX_REMOTE_PATH, DEFAULT_ONNX_SHA256, DEFAULT_ONNX_SIZE, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
+};
 use crate::embedding::resolve_model_dir;
 
 /// The Hugging Face repository the default model comes from.
@@ -130,7 +132,7 @@ fn sources_from(override_base: Option<&str>) -> Vec<Source> {
 }
 
 /// How long to wait for the connection itself. Deliberately *not* a deadline
-/// on the whole request: 612 MiB over a slow link legitimately takes many
+/// on the whole request: 154 MiB over a slow link legitimately takes many
 /// minutes, and a total timeout would turn a working download into a failure
 /// for exactly the users who can least afford to repeat it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -150,24 +152,25 @@ struct RemoteFile {
     /// SHA-256 of the file's bytes.
     ///
     /// Both digests were confirmed from two independent sources before being
-    /// pinned: Hugging Face's own metadata API for this revision, and hashing
-    /// the files after download (for `tokenizer.json`, which is not stored in
-    /// LFS and therefore has no published digest, the git blob id of the
-    /// downloaded bytes was recomputed and matched the revision's tree, then
-    /// its SHA-256 taken locally).
+    /// pinned: Hugging Face's own metadata for this revision (the LFS
+    /// `x-linked-etag` of `onnx/model_quantized.onnx`), and hashing the files
+    /// after download (for `tokenizer.json`, which is not stored in LFS and
+    /// therefore has no published digest, the git blob id of the downloaded
+    /// bytes was recomputed and matched the revision's tree, then its SHA-256
+    /// taken locally).
     sha256: &'static str,
 }
 
 /// The two files a model directory consists of, in download order: the small
 /// one last, so an interrupted run leaves the cheap file to redo.
 const FILES: [RemoteFile; 2] = [
-    // The fp32 export, not model_fp16/model_quantized: those trade accuracy
-    // for size and produce different vectors than the ones the tests pin.
+    // The int8 export (docs/adr/0011-embedding-model-int8.md), written under
+    // the loader's `model.onnx`.
     RemoteFile {
-        remote_path: "onnx/model.onnx",
+        remote_path: DEFAULT_ONNX_REMOTE_PATH,
         local_name: ONNX_FILE_NAME,
-        size: 641_517_466,
-        sha256: "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b",
+        size: DEFAULT_ONNX_SIZE,
+        sha256: DEFAULT_ONNX_SHA256,
     },
     RemoteFile {
         remote_path: "tokenizer.json",
@@ -263,7 +266,7 @@ fn resolved_model_in(root: &Path) -> ResolvedModel {
 /// nothing else, so "download the configured one" is not something this command
 /// could do even in principle - which was the original reasoning for reading the
 /// default name, and it still holds. What does not follow is fetching the wrong
-/// weights anyway: 612 MiB landing in a directory the daemon never reads, with
+/// weights anyway: 154 MiB landing in a directory the daemon never reads, with
 /// `model status` then inspecting that same wrong directory and reporting
 /// success.
 ///
@@ -305,11 +308,13 @@ fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> 
 /// `g-mesh model fetch`: downloads whatever is missing from the model
 /// directory, verifies it, and leaves nothing behind if it fails.
 ///
-/// A file that is already there is left alone rather than re-downloaded, so
-/// re-running after an interrupted fetch only pays for what is still missing.
-/// Existence is the test, not size or digest: verifying 612 MiB on every
-/// invocation to catch a case `g-mesh model status` already reports (and
-/// which deleting the file fixes) would cost every user for a rare one.
+/// A file that is already there at its pinned size is left alone rather than
+/// re-downloaded, so re-running after an interrupted fetch only pays for what
+/// is still missing. Size is the test, not digest: hashing 154 MiB on every
+/// invocation would cost every user for a rare case. A file of any other size
+/// is replaced: a `model.onnx` holding other weights (the fp32 export, at
+/// 641,517,466 bytes) must not pass for the pinned one. The replacement is downloaded and verified beside it and renamed
+/// over it only once verified, so a failed fetch leaves the old file intact.
 fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
     // Before the directory is created, so a refused fetch leaves nothing
@@ -330,9 +335,19 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
     let sources = sources();
     for file in &FILES {
         let dest = dir.join(file.local_name);
-        if dest.exists() {
-            writeln!(out, "already present: {}", dest.display())?;
-            continue;
+        match on_disk(&dest, file) {
+            OnDisk::Pinned => {
+                writeln!(out, "already present: {}", dest.display())?;
+                continue;
+            }
+            OnDisk::Other(size) => writeln!(
+                out,
+                "replacing {} ({} on disk, not the pinned {})",
+                dest.display(),
+                human_size(size),
+                human_size(file.size)
+            )?,
+            OnDisk::Missing => {}
         }
         writeln!(
             out,
@@ -349,11 +364,29 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// What [`fetch`] finds at a file's destination.
+#[derive(Debug, PartialEq, Eq)]
+enum OnDisk {
+    Missing,
+    /// Present at the pinned size: left alone.
+    Pinned,
+    /// Present at another size (other weights, a truncated copy): replaced.
+    Other(u64),
+}
+
+fn on_disk(dest: &Path, file: &RemoteFile) -> OnDisk {
+    match fs::metadata(dest) {
+        Ok(meta) if meta.len() == file.size => OnDisk::Pinned,
+        Ok(meta) => OnDisk::Other(meta.len()),
+        Err(_) => OnDisk::Missing,
+    }
+}
+
 /// Resolves the model directory and makes sure it exists.
 ///
 /// Split out of [`fetch`] so the part that touches the filesystem can be
 /// tested without the part that touches the network - a test calling `fetch`
-/// on an empty directory would start a 612 MiB download.
+/// on an empty directory would start a 154 MiB download.
 fn prepare_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> {
     let dir = model_dir(explicit, model)?;
     fs::create_dir_all(&dir)
@@ -364,7 +397,7 @@ fn prepare_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf
 /// `g-mesh model status`: says where the weights are expected and whether they
 /// are there.
 ///
-/// Checks presence and size only - never digests. Hashing 612 MiB to answer
+/// Checks presence and size only - never digests. Hashing 154 MiB to answer
 /// "do I have the model?" would make the cheap question expensive; the size
 /// check is enough to catch the one damaged state this command can produce
 /// (a file restored from a truncated backup, say), and [`fetch`] verifies the
@@ -399,7 +432,7 @@ fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
                 complete = false;
                 writeln!(
                     out,
-                    "  {}: {} on disk but {} expected - delete it and re-run `g-mesh model fetch`",
+                    "  {}: {} on disk but {} expected - `g-mesh model fetch` replaces it",
                     file.local_name,
                     human_size(meta.len()),
                     human_size(file.size)
@@ -485,7 +518,7 @@ fn download_to_partial(
     let mut sink =
         File::create(partial).with_context(|| format!("failed to create {}", partial.display()))?;
     let mut hasher = Sha256::new();
-    // 256 KiB: large enough that syscall overhead is noise against a 612 MiB
+    // 256 KiB: large enough that syscall overhead is noise against a 154 MiB
     // transfer, small enough to stay off the stack and out of the way.
     let mut buffer = vec![0u8; 256 * 1024];
     let mut written: u64 = 0;
@@ -550,7 +583,7 @@ fn human_size(bytes: u64) -> String {
 ///
 /// stderr rather than stdout so that redirecting the command's output keeps
 /// the progress visible and the output clean, and rate-limited rather than
-/// per-chunk: 612 MiB in 256 KiB reads is ~2400 updates, which is a repainted
+/// per-chunk: 154 MiB in 256 KiB reads is ~2400 updates, which is a repainted
 /// line on a terminal and 2400 lines of noise in a log. On a terminal it
 /// rewrites one line; anywhere else it prints a line per decile, which is what
 /// a CI log or a piped install script can actually use.
@@ -793,6 +826,12 @@ mod tests {
                 file.remote_path
             );
             assert!(FETCH_SCRIPT.contains(file.local_name), "the script does not write {}", file.local_name);
+            assert!(
+                FETCH_SCRIPT.contains(&format!(" {}\n", file.size)),
+                "the script does not expect {}'s pinned size {}",
+                file.local_name,
+                file.size
+            );
         }
         // The repo is spelled `jinaai/${MODEL_NAME}` in the script, so only
         // the halves it actually contains are checked.
@@ -865,14 +904,52 @@ mod tests {
     #[test]
     fn fetch_leaves_an_already_populated_directory_alone() {
         let dir = tempfile::tempdir().unwrap();
+        // Sparse files of the pinned sizes: `fetch` judges by length, and a
+        // file of any other length would be replaced (next test).
         for file in &FILES {
-            fs::write(dir.path().join(file.local_name), b"pretend weights").unwrap();
+            File::create(dir.path().join(file.local_name)).unwrap().set_len(file.size).unwrap();
         }
 
         let output = fetch_output(dir.path());
 
         assert_eq!(output.matches("already present").count(), 2, "{output}");
         assert!(!output.contains("downloading"), "{output}");
+    }
+
+    /// An fp32 `model.onnx` in the model directory is not "already present":
+    /// `fetch` replaces it, or `g-mesh model fetch` could never deliver the
+    /// pinned int8 weights over it. Judged on `on_disk`, the decision `fetch`
+    /// acts on, so no download starts.
+    ///
+    /// *Control:* make `on_disk` return `Pinned` for any existing file (an
+    /// existence test), and the fp32 file reads as present.
+    #[test]
+    fn fp32_weights_on_disk_are_replaced_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let onnx = &FILES[0];
+        assert_eq!(onnx.local_name, ONNX_FILE_NAME);
+        let dest = dir.path().join(onnx.local_name);
+
+        assert_eq!(on_disk(&dest, onnx), OnDisk::Missing);
+        File::create(&dest).unwrap().set_len(641_517_466).unwrap();
+        assert_eq!(on_disk(&dest, onnx), OnDisk::Other(641_517_466), "the fp32 file must be replaced");
+        File::create(&dest).unwrap().set_len(onnx.size).unwrap();
+        assert_eq!(on_disk(&dest, onnx), OnDisk::Pinned);
+    }
+
+    /// The shipped weights are the int8 export at the pinned revision, with
+    /// the size and digest of the downloaded file.
+    ///
+    /// *Control:* restore the fp32 entry (`onnx/model.onnx`, 641,517,466,
+    /// `63363fc1...`) in `FILES`, and every assertion here fails.
+    #[test]
+    fn the_pinned_weights_are_the_int8_export() {
+        let onnx = &FILES[0];
+        assert_eq!(onnx.remote_path, "onnx/model_quantized.onnx");
+        assert_eq!(onnx.local_name, "model.onnx", "the loader's name, not the remote one");
+        assert_eq!(onnx.size, 161_895_621);
+        assert_eq!(onnx.sha256, "ed45870251c9f0cf656e78aab0d37a23489066df8a222bb1c8caf8a45f2cb16d");
+        assert_eq!(MODEL_REVISION, "516f4baf13dec4ddddda8631e019b5737c8bc250");
     }
 
     /// `--dir` is taken as given, and a fetch into a path that does not exist
@@ -909,7 +986,7 @@ mod tests {
     #[test]
     fn status_reports_a_complete_model_as_usable() {
         let dir = tempfile::tempdir().unwrap();
-        // `set_len` rather than writing 612 MiB of zeros: `status` asks the
+        // `set_len` rather than writing 154 MiB of zeros: `status` asks the
         // filesystem for a length and never reads the bytes, so a sparse file
         // of the right size is exactly the state under test.
         for file in &FILES {
@@ -935,7 +1012,7 @@ mod tests {
         let output = status_output(dir.path());
 
         assert!(output.contains("expected"), "{output}");
-        assert!(output.contains("delete it"), "{output}");
+        assert!(output.contains("`g-mesh model fetch` replaces it"), "{output}");
     }
 
     #[test]

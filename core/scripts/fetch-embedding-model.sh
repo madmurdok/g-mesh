@@ -21,9 +21,10 @@
 #   core/scripts/fetch-embedding-model.sh [target-dir]
 #
 # Default target dir is ~/.g-mesh/models/jina-embeddings-v2-base-code, which is
-# where embedding::model::default_model_dir looks. Existing files are left
-# alone, so re-running after an interrupted download is cheap for the file that
-# already finished but does NOT resume a partial one - delete it and re-run.
+# where embedding::model::default_model_dir looks. Existing files of the
+# pinned size are left alone (any other size is replaced), so re-running after
+# an interrupted download is cheap for the file that already finished but does
+# NOT resume a partial one.
 #
 # The revision below is pinned: these are the exact weights the embedding tests
 # were verified against. Bumping it changes every vector the model produces and
@@ -57,11 +58,20 @@ mkdir -p "${TARGET_DIR}"
 fetch() {
   local remote_path="$1"
   local local_name="$2"
+  local size="$3"
   local dest="${TARGET_DIR}/${local_name}"
 
+  # Judged by size, as `g-mesh model fetch` does: a file of another size (the
+  # fp32 model.onnx g-mesh shipped before ADR 0011, or a truncated copy) is
+  # replaced, and only once its replacement has fully arrived.
   if [ -f "${dest}" ]; then
-    echo "already present: ${dest}"
-    return
+    local have
+    have="$(wc -c < "${dest}" | tr -d ' ')"
+    if [ "${have}" = "${size}" ]; then
+      echo "already present: ${dest}"
+      return
+    fi
+    echo "replacing ${dest} (${have} bytes, not the pinned ${size})"
   fi
 
   local -a urls=()
@@ -87,10 +97,10 @@ fetch() {
   exit 1
 }
 
-# The fp32 export, not model_fp16/model_quantized: those trade accuracy for
-# size, and the vectors they produce differ from the ones the tests pin.
-fetch "onnx/model.onnx" "model.onnx"
-fetch "tokenizer.json" "tokenizer.json"
+# The int8 export (ADR 0011, GM-422), written as the loader's model.onnx. It
+# replaced the fp32 onnx/model.onnx, which stays the embedding eval's reference.
+fetch "onnx/model_quantized.onnx" "model.onnx" 161895621
+fetch "tokenizer.json" "tokenizer.json" 2561316
 
 echo
 echo "model ready in ${TARGET_DIR}"

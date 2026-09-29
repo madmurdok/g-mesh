@@ -1,0 +1,8 @@
+{"n": 5, "qualifiedName": "Scene#getNonDeletedElements", "reason": "trivial: plain accessor returning this.nonDeletedElements"}
+{"n": 11, "qualifiedName": "curve", "reason": "trivial: packs four points into a branded tuple, no logic"}
+{"n": 41, "qualifiedName": "useExcalidrawActionManager", "reason": "pure forwarder: useContext of the action manager context"}
+{"n": 57, "qualifiedName": "AppStateDelta.empty", "reason": "trivial: factory of an empty delta"}
+{"n": 67, "qualifiedName": "defineTools", "reason": "trivial: identity cast that only preserves key types"}
+{"n": 71, "qualifiedName": "Trail#addPointToPath", "reason": "interface method with five same-named implementations (AnimatedTrail, DrawShapeTrail, EraserTrail, LaserTrails, LassoTrail); no query can keep the expected set within 1-3"}
+{"n": 75, "qualifiedName": "App#resetHistory", "reason": "pure forwarder: this.history.clear()"}
+{"n": 85, "qualifiedName": "DrawShapeTrail#startPath", "reason": "pure forwarder: this.trail.startPath(x, y)"}

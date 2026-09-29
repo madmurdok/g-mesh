@@ -150,7 +150,7 @@ pub enum PluginsCommand {
 /// [`crate::cli::model`] for how that stays true.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// Download the embedding model's weights (~612 MiB) into the directory
+    /// Download the embedding model's weights (~154 MiB) into the directory
     /// the loader reads.
     Fetch {
         /// Where to put the weights. Defaults to `$G_MESH_MODEL_DIR`, else
