@@ -196,3 +196,55 @@ of -0.004, and floor crossings follow the frozen floor gaps (Go +0.01,
 TypeScript -0.02) rather than the score shift. That is consistent with
 the per-language Q5 signs above. It is context only; it did not enter the
 verdict.
+
+## D10 (agent-level)
+
+The agent-level veto of [embedding-eval.md](../architecture/embedding-eval.md)
+D10, applied to int8 before the switch (GM-422/S12). This subsection's task
+list was written and committed before any run.
+
+### Task list (fixed before the run)
+
+Arms: R = g-mesh `release-3.17.0` at `5a8b5a7` (fp32), C = the same commit
+with int8 weights and ADR 0011's floors. Both `gmesh-configured`, nothing else.
+
+**Source 1, GMB-150's saved logs.** GMB-150's records were written by the
+token-economy harness, not by the `hooks/tool-use-logger.mjs` hook that
+`scripts/analyzeToolUseLog.ts` parses, so the equivalent cut was taken
+directly from its saved transcripts
+(`results/transcripts/2026-08-26T12-31-03-311Z` and the partial
+`2026-08-25T23-03-13-702Z`): every task with at least one
+`mcp__g-mesh__search_code` call in a `gmesh-configured` transcript. 18 tasks
+(110 calls):
+
+| task | runs with search_code / 5 | calls |
+|---|---|---|
+| ex-implement-mutateelement-elbow-zero-position | 5 | 5 |
+| ex-semantic-arrow-endpoint-grid-align | 5 | 5 |
+| ex-semantic-arrow-zorder-above-bound | 5 | 13 |
+| ex-semantic-cjk-charclass-check | 5 | 5 |
+| ex-semantic-collab-conflict-keep-local | 5 | 6 |
+| ex-semantic-drag-text-anchor | 5 | 5 |
+| ex-semantic-fractional-index-mutate-repair | 5 | 7 |
+| ex-semantic-library-diff-update | 5 | 5 |
+| ex-semantic-scroll-lock-clamp | 5 | 5 |
+| ex-stale-name-canvas-search | 5 | 5 |
+| tt-deps-incoming-db-connection | 1 | 1 |
+| tt-feature-bulk-cancel-epic-tasks | 5 | 10 |
+| tt-implement-release-cancelled-task-bug | 5 | 9 |
+| tt-implement-split-task-cancelled-release | 5 | 9 |
+| tt-semantic-board-stale-task-flag | 5 | 5 |
+| tt-semantic-dedupe-prefix-collision | 5 | 5 |
+| tt-semantic-doc-drift-check | 5 | 5 |
+| tt-stale-name-doc-sync-check | 5 | 5 |
+
+**Source 2, GMB-180's semantic-tier bucket** (8 tasks, from
+`g-mesh-bench/docs/results/v0.24.0-gmb180-the-semantic-tier-bucket.md`, "The
+bucket"): gin-find-impl-render, gin-callers-writeheadernow-dispatch,
+gin-scenario-abort-callers, py-callers-prepare-two-classes,
+py-callers-register-hook-mixin, py-scenario-callers-httpadapter-send,
+rs-callers-flag-name-long-dyn, rs-callers-sink-matched. Their "semantic tier"
+is g-mesh's LSP edge tier, not embeddings; D10 names the bucket, so it is
+included as specified, and it serves as a set where the arms should not differ.
+
+**26 tasks** (not low-power), 5 repetitions per task and arm, arms alternating.
