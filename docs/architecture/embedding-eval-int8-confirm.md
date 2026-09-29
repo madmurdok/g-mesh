@@ -429,6 +429,135 @@ The owner accepted the recommendation on all four points, verbatim: "да".
 4. The Go false-alarm excess at the shipped floors is accepted: the gate is
    pooled, and the per-language Go figure is reported in the ADR.
 
+## Runbook (GM-422/S7)
+
+Commands the authoring and embedding slices run, from the repo root of the
+branch. `W` is the GM-398 work dir, which holds the D4 snapshots, the pinned
+checkouts, the models and the GM-398 runs:
+`W=/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh/eval/embedding/work`.
+
+**Targets (done in S7, re-runnable).** `eval/embedding/confirm/sample.sh $W`
+writes `eval/embedding/confirm/targets/<corpus>.jsonl` with seed 4222 over the
+snapshots, stopping on a sha256 other than section 3's table. Re-running it
+gives byte-identical files. `python3 eval/embedding/confirm/check_targets.py`
+checks, independently of the sampler, that no target is a GM-398 consumed
+target or GM-398 expected symbol, that the seed and snapshot sha256 are the
+protocol's, and that the strata pattern holds.
+
+| corpus | targets listed | positives needed | absent | query ids | frame after exclusion (fn / type / other) |
+|---|---|---|---|---|---|
+| gin | 400 | 200 | 50 | `gin-c001`..`c200` positive, `gin-c201`..`c250` absent | 446 / 54 / 27 |
+| py-requests | 298 (whole frame) | 150 | 38 | `req-c001`..`c150`, `req-c151`..`c188` | 168 / 16 / 114 |
+| ripgrep | 200 | 75 | 19 | `rg-c001`..`c075`, `rg-c076`..`c094` | 2,111 / 369 / 120 |
+| g-mesh | 150 | 75 | 19 | `gm-c001`..`c075`, `gm-c076`..`c094` | 1,518 / 397 / 526 |
+| excalidraw | 180 | 90 | 19 | `exc-c001`..`c090`, `exc-c091`..`c109` | 2,379 / 52 / 38 |
+| task-tracker-mcp | 80 (whole frame) | 60 | 19 | `ttm-c001`..`c060`, `ttm-c061`..`c079` | 80 / 0 / 0 |
+
+**Authoring (one fresh author agent per corpus, Go first, at most three at
+a time).** The author gets D3 of `embedding-eval.md`, section 3 of this
+note, `confirm/targets/<corpus>.jsonl` and the skeleton
+`confirm/queries/<corpus>.jsonl`. The skeleton already has every record
+with its id, corpus, language, kind and alternating shape. The author fills
+in `text`, `expected`, `derivation` and `author`, and changes nothing else.
+Positives take targets from the top of the list in order. A skipped target
+goes to `confirm/targets/<corpus>.skips.jsonl` as `{"n", "qualifiedName",
+"reason"}`, as in GM-398, and the next target is taken. Each positive's
+derivation starts with `Target sampled (seed 4222, #N).` The author's check
+loop:
+
+```sh
+python3 eval/embedding/check_queries.py <corpus> --eval-dir eval/embedding/confirm \
+    --seed 4222 --disjoint-from eval/embedding --checkout $W/corpora/<corpus> \
+    --positives <P> --absent <A>
+```
+
+**Freeze.** When all six files pass that check and the verify slice, one
+commit adds them with `docs/results/gm-422-int8-confirm.md`, which lists
+each file's sha256 (`shasum -a 256 eval/embedding/confirm/queries/*.jsonl`)
+and query counts (section 3 step 6).
+
+**Embedding (after the freeze commit only).**
+
+```sh
+cargo build --release --bin g-mesh           # this branch; target/ is 6-8 GB
+eval/embedding/confirm/setup_work.sh $W      # symlinks + seeds run dirs with GM-398 manifest.json/vectors.bin
+for v in jina-v2-base-code-fp32 jina-v2-base-code-int8 random shuffled; do   # fp32 before shuffled
+  uptime
+  /usr/bin/time -p target/release/g-mesh debug-embed-eval run \
+      --eval-dir eval/embedding/confirm --variant $v
+done
+```
+
+Runs land in `eval/embedding/confirm/work/runs/<variant>/<corpus>/`, which
+is gitignored. `embedNodesMs` in each `timings.json` must be 0, because the
+node vectors are reused. A non-zero value means the fingerprint did not
+match and the nodes were re-embedded. Stop and report that; do not re-seed.
+
+**Gated verdict.**
+
+```sh
+python3 eval/embedding/int8_confirm_report.py \
+    --old-runs $W/runs --old-eval-dir eval/embedding \
+    --runs eval/embedding/confirm/work/runs --eval-dir eval/embedding/confirm \
+    --json eval/embedding/confirm/work/report.json
+```
+
+It exits 2, with no verdict, if any of controls A and 2-5 fails.
+`--rehearse` in place of `--runs`/`--eval-dir` runs the whole path with
+the GM-398 runs playing the confirm runs. S7 used that to test the script,
+and its verdict line means nothing.
+
+**Secondary, not gated (section 4).** Floors are refit on the parity fit
+half of the new queries plus the mechanical ones:
+
+```sh
+target/release/g-mesh debug-embed-eval report --eval-dir eval/embedding/confirm \
+    eval/embedding/confirm/work/runs/{jina-v2-base-code-fp32,jina-v2-base-code-int8,random,shuffled} \
+    --json eval/embedding/confirm/work/report-harness.json
+```
+
 ## Deviations
 
-(none yet)
+**2026-09-29 (GM-422/S7, before any query was authored).**
+
+1. *Harness eval dir.* The harness reads `<eval dir>/queries/<corpus>.jsonl`
+   and takes `corpora.toml`, `variants.toml`, the snapshots and the models
+   from the same eval dir. `eval/embedding/confirm` is therefore the eval
+   dir. `corpora.toml`, `variants.toml` and `queries/mechanical` are
+   committed symlinks to the GM-398 files, and `work/` is local
+   (`setup_work.sh`). The mechanical queries ride along in the confirm runs
+   only for section 4's secondary refit report. They are never held-out and
+   never enter a gate.
+2. *Node-vector reuse (control 2).* The harness reuses node vectors only
+   when the run dir already holds a matching `manifest.json` and
+   `vectors.bin`. It does not look in another run dir. `setup_work.sh`
+   copies both from the GM-398 run into each confirm run dir before the
+   run. The report still checks each `vectors.bin` sha256 against GM-398's.
+3. *Strata.* Section 3 keeps D3's 6/3/1 pattern only while every stratum
+   has rows left. After exclusion, types run out at 54 in gin, 16 in
+   py-requests and 52 in excalidraw. task-tracker-mcp has only functions
+   left: GM-398 consumed all 8 types and its 1 other. Past those points the
+   sampler hands the slot to functions, as the D3 sampler always has. The
+   type share of those corpora's positives is therefore below 30%. The
+   frame is fixed, so no fix exists within this protocol.
+4. *Absent ids.* Absent queries continue the same `-cNNN` numbering after
+   the positives (for example `gin-c201`), rather than GM-398's `-aNN`, so
+   every new id matches section 3 step 5's `-c<NNN>`.
+5. *Planted-harm arms (control 4).* The harm5 shares are recomputed exactly
+   as `int8_confirm_power.py` computes them (its `equal` draw, seed 4227,
+   sd 0.012). Doubled, they are Q5 11.0-12.4% and Q4 16.4-36.2%. Harm is
+   planted row by row on int8's outcomes, seed 4223. A Q4-harmed row gets a
+   top score of 1.0. If it was a right-first positive, it is demoted to
+   rank 2, which keeps recall@10, lowers MRR and takes the row out of the
+   Q5 pairs. Q5 harm (top score -1.0) applies to the remaining right-first
+   positives. Only Q4 and Q5 of these arms are read.
+6. *Broken and null arms as candidates.* When random, shuffled and the
+   fp32 null arm are run through the gates as candidates, they are judged
+   at fp32's frozen floors, since they have no frozen floors of their own.
+   Control 3 also requires random and shuffled to fail the gates as
+   candidates, and control A also reproduces GM-398's D7 figures.
+7. *Author check.* `check_queries.py` gains `--eval-dir`, `--seed` and
+   `--disjoint-from`. The last one is the exact-match check against every
+   GM-398 authored text, after lower-casing and stripping. Near-duplicates
+   remain the verify slice's job.
+
