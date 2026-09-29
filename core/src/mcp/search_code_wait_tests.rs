@@ -135,8 +135,10 @@ fn page(result: &CallToolResult) -> Value {
 /// Controls: pass `Need::Embeddings` to `prepare` in
 /// `GMeshMcpServer::search_code` - the call waits for `Phase::Ready` under
 /// the 25 min cap and `CALL_BOUND` fires. Use `similarity::verdict` for a
-/// partial page in `search_code::handle` - `noMatch` appears (every row is
-/// below the floor, as the next test's complete page shows).
+/// partial page in `search_code::handle` - `noMatch` appears on the name
+/// query (every row is below the floor, as the next test's complete page
+/// shows). Use `similarity::low_similarity` for a partial page -
+/// `lowSimilarity` appears on the prose query.
 #[tokio::test]
 async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
     let fixture = fixture(3, 3, 10).await;
@@ -162,6 +164,10 @@ async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
         "a partial page does not spend the once-per-session search hint: {body}"
     );
     assert_eq!(fixture.indexing.phase(), Phase::Embedding, "sanity: the pass never finished");
+
+    let name = page(&search(&fixture.client, json!({ "query": "readFile" })).await);
+    assert_eq!(name["partial"], json!({ "embedded": 3, "total": 10 }), "{name}");
+    assert!(name.get("noMatch").is_none(), "a partial name page carries no floor verdict: {name}");
 }
 
 /// The pass finishes 50 ms into the call's 200 ms wait: the answer is
