@@ -41,6 +41,12 @@ usage:
       dry run before the new runs exist: the OLD runs play the confirm runs,
       every authored GM-398 query treated as held-out. Exercises controls 2-5
       and the verdict path; its verdict means nothing.
+  --controls-only (with --runs/--eval-dir): controls A and 2-5 only, blind to
+      int8. The int8 verdict arm, the int8-at-fp32-floors view and the verdict
+      line are skipped, and arms derived from int8 (control 3's int8 lines,
+      control 4's planted-harm arms) print pass/fail without figures. Exit 2
+      on a control failure, else 0. The embedding slice (GM-422/S7) runs this;
+      the verdict run (S9) runs without it.
 """
 import hashlib
 import json
@@ -233,6 +239,7 @@ def control_old(boot, old_runs, old_eval, settings):
 def main():
     old_runs, old_eval = Path(arg("--old-runs")), Path(arg("--old-eval-dir"))
     rehearse = "--rehearse" in sys.argv
+    blind = "--controls-only" in sys.argv
     runs = old_runs if rehearse else Path(arg("--runs"))
     eval_dir = old_eval if rehearse else Path(arg("--eval-dir"))
     settings = settings_of(eval_dir)
@@ -288,8 +295,12 @@ def main():
         for broken in (RANDOM, SHUFFLED):
             c = broken_arm(boot, arms[good], arms[broken])
             d7[f"{good} vs {broken}"] = c
-            print(f"{good:24s} vs {broken:8s} gap {c['gap']:.1f} ratio {c['ratio']:.3f} "
-                  f"bounds separate {c['separate']}: {'pass' if c['passes'] else 'FAIL'}")
+            if blind and good == CAND:
+                print(f"{good:24s} vs {broken:8s} (figures withheld, --controls-only): "
+                      f"{'pass' if c['passes'] else 'FAIL'}")
+            else:
+                print(f"{good:24s} vs {broken:8s} gap {c['gap']:.1f} ratio {c['ratio']:.3f} "
+                      f"bounds separate {c['separate']}: {'pass' if c['passes'] else 'FAIL'}")
             if not c["passes"]:
                 bad.append(f"{good} is not clearly above {broken}")
     obs = q5s.pooled_mean(r10_groups(arms[RANDOM]))
@@ -317,11 +328,12 @@ def main():
         bad.append("null arm is not exactly 0 and passing")
 
     # the verdict arm
-    print("\n== int8 vs fp32, frozen floors, rule B ==")
-    g8 = gates(boot, arms[REF], rf, arms[CAND], FROZEN[CAND])
-    show("int8", g8)
-    for l, (b, n, w, bt) in g8["Q5_by_language"].items():
-        print(f"   Q5 {l:10s} {q5s.pb(b)} n={n} +{w}/-{bt} (reported, not gated)")
+    if not blind:
+        print("\n== int8 vs fp32, frozen floors, rule B ==")
+        g8 = gates(boot, arms[REF], rf, arms[CAND], FROZEN[CAND])
+        show("int8", g8)
+        for l, (b, n, w, bt) in g8["Q5_by_language"].items():
+            print(f"   Q5 {l:10s} {q5s.pb(b)} n={n} +{w}/-{bt} (reported, not gated)")
 
     # control 4: planted harm
     h5, h4 = harm_shares(ref_old, cand_old)
@@ -333,12 +345,23 @@ def main():
     for factor, name in ((2, "int8-harm10"), (1, "int8-harm5")):
         arm = plant_harm(arms[CAND], h5, h4, factor, HARM_SEED)
         g = gates(boot, arms[REF], rf, arm, FROZEN[CAND])
-        harm[name] = g
-        show(name, g)
+        harm[name] = {"passes": g["passes"]} if blind else g
+        if not blind:
+            show(name, g)
         print(f"   {name}: Q4 {'fails' if not g['passes']['Q4'] else 'PASSES'}, "
               f"Q5 {'fails' if not g['passes']['Q5'] else 'PASSES'} under rule B")
     if harm["int8-harm10"]["passes"]["Q4"] or harm["int8-harm10"]["passes"]["Q5"]:
         bad.append("int8-harm10 passes Q4 or Q5: the sample cannot see harm, the study is void")
+
+    if blind:
+        result.update({"mode": "controls-only (int8 figures withheld)", "null": null, "harm": harm,
+                       "vectors_same": vec, "control_failures": bad})
+        result["d7"] = {k: ({"passes": v["passes"]} if k.startswith(CAND) else v) for k, v in result["d7"].items()}
+        print("\n== controls ==")
+        print("CONTROL FAILED:\n  " + "\n  ".join(bad) if bad else "controls A, 2, 3, 4, 5: OK (no verdict computed)")
+        if arg("--json"):
+            Path(arg("--json")).write_text(json.dumps(result, indent=1, default=str))
+        sys.exit(2 if bad else 0)
 
     # secondary, not gated: both arms at fp32's floors (S1's shared-floor view)
     shared = gates(boot, arms[REF], rf, arms[CAND], rf)
