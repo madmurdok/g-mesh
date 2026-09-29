@@ -1,0 +1,15 @@
+{"n": 22, "qualifiedName": "yamlBinding.Name", "reason": "trivial: returns the constant string \"yaml\""}
+{"n": 24, "qualifiedName": "formPostBinding.Name", "reason": "trivial: returns the constant string \"form-urlencoded\""}
+{"n": 58, "qualifiedName": "queryBinding", "reason": "trivial: empty marker struct queryBinding struct{}"}
+{"n": 61, "qualifiedName": "tomlBinding.Name", "reason": "trivial: returns the constant string \"toml\""}
+{"n": 88, "qualifiedName": "bsonBinding", "reason": "trivial: empty marker struct bsonBinding struct{}"}
+{"n": 99, "qualifiedName": "Redirect.WriteContentType", "reason": "trivial: empty method body, writes nothing"}
+{"n": 106, "qualifiedName": "jsonBinding", "reason": "trivial: empty marker struct jsonBinding struct{}"}
+{"n": 118, "qualifiedName": "yamlBinding", "reason": "trivial: empty marker struct yamlBinding struct{}"}
+{"n": 131, "qualifiedName": "xmlBinding.Name", "reason": "trivial: returns the constant string \"xml\""}
+{"n": 134, "qualifiedName": "HTMLRender.Instance", "reason": "duplicate: its honest query (interface producing a template renderer by name) has the same expected set as gin-c034 (#36), where it is listed with its single-method interface"}
+{"n": 138, "qualifiedName": "BindUnmarshaler", "reason": "duplicate: single-method interface already in the expected set of gin-c104 (#111, UnmarshalParam)"}
+{"n": 146, "qualifiedName": "plainBinding", "reason": "trivial: empty marker struct plainBinding struct{}"}
+{"n": 148, "qualifiedName": "headerBinding", "reason": "trivial: empty marker struct headerBinding struct{}"}
+{"n": 153, "qualifiedName": "protobufBinding", "reason": "trivial: empty marker struct protobufBinding struct{}"}
+{"n": 204, "qualifiedName": "decodePlain", "reason": "duplicate: already in the expected set of gin-c172 (#186, plainBinding.BindBody), which is just return decodePlain(body, obj)"}

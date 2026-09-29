@@ -561,3 +561,34 @@ target/release/g-mesh debug-embed-eval report --eval-dir eval/embedding/confirm 
    GM-398 authored text, after lower-casing and stripping. Near-duplicates
    remain the verify slice's job.
 
+
+**2026-09-29 (GM-422/S7 verifier fixes, after authoring, before the freeze).**
+
+1. *Constants un-skipped.* The authors had skipped documented constants
+   as "constant", which D3 does not treat as trivial (GM-398 wrote queries
+   for them). The owner chose to fix it. Queries were written for g-mesh
+   targets #10, #50, #80 and #90 and for excalidraw targets #20, #30, #40,
+   #50, #60 and #70. g-mesh #20 (`STAGING_PREFIX`) stays skipped with a
+   sharper reason: it has no doc comment, and its embedded text is only
+   `const STAGING_PREFIX: &str`. To keep the positive counts (g-mesh 75,
+   excalidraw 90), the positives with the highest target numbers were
+   dropped: g-mesh #99, #103, #104 and #105, and excalidraw #99 to #104.
+   The used set is again the first N non-skipped targets. The new queries
+   take the freed ids (`gm-c072`..`c075`, `exc-c085`..`c090`) in target
+   order, in each id's skeleton shape. `check_queries.py` and
+   `check_targets.py` do not require id order to follow target order, so
+   nothing was re-sequenced. The g-mesh skip records for #100, #101 and
+   #102 were removed, since those targets now lie past the last one used.
+2. *ripgrep expected sets.* `rg-c003` adds `SearcherBuilder::memory_map`
+   and `rg-c047` adds `SearcherBuilder::stop_on_nonmatch`. For `rg-c045`,
+   the two `RegexMatcherBuilder::whole_line` methods (regex and pcre2)
+   also qualified for the old text. That made 4 symbols, so the query now
+   names the CLI switch and the set stays at the flag and its `update()`.
+3. *Near-duplicates of GM-398.* `gin-c196` was rewritten to ask for
+   `Context.PostFormMap`'s own behaviour, which is dropping the found flag.
+   `Context.GetPostFormMap` (gin-028's target) left its expected set.
+   `gin-c033` (`setter.TrySet`) and `rg-c047` (`StopOnNonmatch`) keep their
+   targets, because each target is inherently the GM-398 query's concept:
+   the only method of gin-008's interface, and the flag whose handler
+   rg-042 asks for. `gin-c033` was reworded to the method's contract. Each
+   derivation says why.
