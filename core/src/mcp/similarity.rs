@@ -129,6 +129,12 @@
 //! | rust | 0.55 | 1.3% | 74.8% | 3.1% / 85.8% |
 //! | typescript | 0.50 | 2.4% | 70.9% | **8.1%** / 92.5% |
 //!
+//! Those are the fp32 model's floors and rates. g-mesh ships the int8
+//! weights with their own fitted floors, go / python / rust / typescript
+//! **0.57 / 0.57 / 0.55 / 0.53** (`docs/adr/0011-embedding-model-int8.md`,
+//! fit in `docs/results/gm-398-model-comparison.md`); [`floor`] holds them.
+//! The argument above for one floor per language holds for both.
+//!
 //! Averaging these into one number would cost TypeScript a false "nothing
 //! matched" on one search in twelve - which is precisely the "a guarantee
 //! measured on TypeScript is a guarantee about TypeScript" failure
@@ -262,7 +268,7 @@ const SPECIFIER_EXPLANATION: &str =
 /// existed, rather than somewhere new and wrong. The same "assumed to do the
 /// least" default `mcp::instructions::present_languages` applies to a
 /// language whose manifest has gone missing.
-const DEFAULT_FLOOR: f64 = 0.50;
+const DEFAULT_FLOOR: f64 = 0.53;
 
 /// The similarity floor for `language`, measured per language because
 /// doc-comment density is not a constant - see this module's doc comment for
@@ -273,21 +279,14 @@ const DEFAULT_FLOOR: f64 = 0.50;
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
 pub(crate) fn floor(language: &str) -> f64 {
+    // The int8 model's fitted floors (ADR 0011). Held-out false alarm at
+    // each, go / python / rust / typescript: 29.4 / 10.0 / 14.3 / 7.7%.
     match language {
-        // 0.594 on the fit half, rounded down. 1.2% false alarm, 90.5% of
-        // absent-answer pages caught, over 161 positives and 284 negatives.
-        "go" => 0.59,
-        // 0.570 on the fit half. 0.0% false alarm, 81.9% caught, over 164
-        // positives and 282 negatives.
+        "go" => 0.57,
         "python" => 0.57,
-        // 0.555 on the fit half, rounded down. 1.3% false alarm, 74.8%
-        // caught, over 159 positives and 282 negatives.
         "rust" => 0.55,
-        // 0.505 on the fit half, rounded down - the lowest of the four, and
-        // the language the shipped 0.60 was measured on. 2.4% false alarm and
-        // 70.9% caught, over 371 positives and 416 negatives; 0.60 would cost
-        // 8.1% here.
-        "typescript" => 0.50,
+        // The lowest of the four: DEFAULT_FLOOR must equal it.
+        "typescript" => 0.53,
         _ => DEFAULT_FLOOR,
     }
 }
@@ -410,7 +409,7 @@ mod tests {
     /// present in both arms would be a permanent footnote, not a signal.
     #[test]
     fn a_page_whose_best_row_clears_its_floor_says_nothing() {
-        let page = [hit(0.51, "typescript"), hit(0.30, "typescript")];
+        let page = [hit(0.54, "typescript"), hit(0.30, "typescript")];
         for query in ["parses a config file", "parseConfigFile"] {
             assert_eq!(verdict(query, None, &page), None, "{query}");
             assert_eq!(low_similarity(query, None, &page), None, "{query}");
@@ -477,17 +476,29 @@ mod tests {
     }
 
     /// The per-language table is the point, not decoration: one score, four
-    /// languages, two verdicts. 0.52 clears TypeScript's 0.50 and misses
-    /// Rust's 0.55, Python's 0.57 and Go's 0.59.
+    /// languages, two verdicts. 0.54 clears TypeScript's 0.53 and misses
+    /// Rust's 0.55, Python's 0.57 and Go's 0.57.
     #[test]
     fn one_score_is_a_match_in_one_language_and_not_in_another() {
-        assert_eq!(verdict("readFile", None, &[hit(0.52, "typescript")]), None);
+        assert_eq!(verdict("readFile", None, &[hit(0.54, "typescript")]), None);
         for language in ["rust", "python", "go"] {
             assert!(
-                verdict("readFile", None, &[hit(0.52, language)]).is_some(),
-                "0.52 must be below {language}'s floor"
+                verdict("readFile", None, &[hit(0.54, language)]).is_some(),
+                "0.54 must be below {language}'s floor"
             );
         }
+    }
+
+    /// The shipped floors are the int8 model's fitted ones (ADR 0011), the
+    /// floors its confirmatory gates and agent-level check ran at.
+    ///
+    /// *Control:* restore the fp32 floors (go 0.59, typescript 0.50, default
+    /// 0.50) and this fails.
+    #[test]
+    fn the_shipped_floors_are_the_int8_models() {
+        let shipped: Vec<f64> = ["go", "python", "rust", "typescript"].iter().map(|l| floor(l)).collect();
+        assert_eq!(shipped, vec![0.57, 0.57, 0.55, 0.53]);
+        assert_eq!(floor("kotlin"), 0.53);
     }
 
     /// A language nothing has calibrated falls to the lowest measured floor,
@@ -502,13 +513,13 @@ mod tests {
     }
 
     /// In a polyglot page each row is judged by its own language. The Go row
-    /// at 0.52 is below Go's 0.59 while the TypeScript row at 0.52 is above
-    /// TypeScript's 0.50, so the page is a match - and it would not be under
+    /// at 0.54 is below Go's 0.57 while the TypeScript row at 0.54 is above
+    /// TypeScript's 0.53, so the page is a match - and it would not be under
     /// a single global floor taken from either language.
     #[test]
     fn a_mixed_language_page_judges_each_row_by_its_own_floor() {
-        assert_eq!(verdict("readFile", None, &[hit(0.52, "go"), hit(0.52, "typescript")]), None);
-        assert!(verdict("readFile", None, &[hit(0.52, "go"), hit(0.49, "typescript")]).is_some());
+        assert_eq!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.54, "typescript")]), None);
+        assert!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.49, "typescript")]).is_some());
     }
 
     /// The measured case the floor cannot catch: `@excalidraw/element` scores

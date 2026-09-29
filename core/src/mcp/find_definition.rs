@@ -505,7 +505,7 @@ fn is_module_specifier(name: &str) -> bool {
 /// # When it stays silent
 ///
 /// No model (`embed_query` is `None` on a machine that never downloaded the
-/// 612 MiB weights), a specifier-shaped query, or nothing scoring above its
+/// 154 MiB weights), a specifier-shaped query, or nothing scoring above its
 /// language's [`similarity::floor`]: all three fall through to the terse
 /// refusal this rung was added in front of, never to an error.
 ///

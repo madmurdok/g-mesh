@@ -513,7 +513,7 @@ jobs:
       # current drive. That file is what makes this job safe to run at all:
       # without it the suite would write into the runner's real home.
       #
-      # The embedding-weights tests stay `#[ignore]`d. 612 MiB per runner, on
+      # The embedding-weights tests stay `#[ignore]`d. 154 MiB per runner, on
       # four runners, is not a cost worth paying for a check that a download
       # works.
       # A detached daemon has no console, so this file is the only account of
