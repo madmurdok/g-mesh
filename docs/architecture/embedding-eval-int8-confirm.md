@@ -416,6 +416,19 @@ D3 of `embedding-eval.md` applies unchanged, with these fixed choices:
    only alternative is refitting int8's Go floor, which is a separate
    floor-policy change, not part of this study.
 
+## Owner decisions (2026-09-29)
+
+The owner accepted the recommendation on all four points, verbatim: "да".
+
+1. Rule **B**: one-sided 95% upper bound <= +5 only, frozen GM-398 floors.
+   The 97.5% bound is not adopted.
+2. n: **814 queries** (Go 200 + 50; Python, Rust, TypeScript 150 + 38 each).
+3. This study's verdict replaces GM-398's int8 verdict. int8 is switched
+   if and only if it passes here, and there is no third study. fp32 stays
+   the reference.
+4. The Go false-alarm excess at the shipped floors is accepted: the gate is
+   pooled, and the per-language Go figure is reported in the ADR.
+
 ## Deviations
 
 (none yet)
