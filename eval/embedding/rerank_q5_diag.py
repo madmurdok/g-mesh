@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--work", required=True, type=Path)
     ap.add_argument("--fixes", action="store_true")
     ap.add_argument("--table", type=Path, help="write the fix tables here")
+    ap.add_argument("--table14", type=Path, help="write the S14 tables (F4 at K=20/30) here")
     a = ap.parse_args()
     eval_dir = Path(R.__file__).resolve().parent
     toml = (eval_dir / "variants.toml").read_text()
@@ -419,69 +420,156 @@ def fixes(a, cs, base, shipped, s4, beta, CE, COS):
     rows.append(row("F4' blend order, verdict on int8 cosine of the reranked top (shipped floors)", f4p, shipped))
 
     # flips among queries whose verdict clears the floor: int8 top right -> reranked wrong, and the reverse
-    flips = {}
-    for lab, outs in (("F4", f4), ("F4'", f4p)):
-        for grp, keep in (("NL held-out", lambda o: R.nl_ho_all(o) and o["positive"]),
-                          ("name", lambda o: R.name_all(o) and o["positive"])):
-            d = {}
-            for o in outs:
-                if not keep(o) or not R.clears(o, shipped):
-                    continue
-                b8 = by8[o["id"]]
-                was, now = b8["rank"] == 1, o["rank"] == 1
-                l = o["language"]
-                t = d.setdefault(l, [0, 0, 0])
-                t[0] += was and not now
-                t[1] += now and not was
-                t[2] += 1
-            flips[(lab, grp)] = d
-    FL = ["", "S11 flips among positives the verdict clears (int8 top right -> reranked top wrong / "
-          "wrong -> right; n = cleared positives)", "",
-          "| variant | queries | " + " | ".join(R.LANGS) + " | total |", "|---|---|" + "---|" * (len(R.LANGS) + 1)]
-    for (lab, grp), d in flips.items():
-        tot = [sum(d.get(l, [0, 0, 0])[j] for l in R.LANGS) for j in range(3)]
-        FL.append(f"| {lab} | {grp} | " + " | ".join(
-            "{} / {} (n={})".format(*d.get(l, [0, 0, 0])) for l in R.LANGS) + " | {} / {} (n={}) |".format(*tot))
+    def flip_table(title, variants):
+        """Per language: int8 top right -> reranked top wrong / wrong -> right, among cleared positives."""
+        flips = {}
+        for lab, outs in variants:
+            for grp, keep in (("NL held-out", lambda o: R.nl_ho_all(o) and o["positive"]),
+                              ("name", lambda o: R.name_all(o) and o["positive"])):
+                d = {}
+                for o in outs:
+                    if not keep(o) or not R.clears(o, shipped):
+                        continue
+                    b8 = by8[o["id"]]
+                    was, now = b8["rank"] == 1, o["rank"] == 1
+                    l = o["language"]
+                    t = d.setdefault(l, [0, 0, 0])
+                    t[0] += was and not now
+                    t[1] += now and not was
+                    t[2] += 1
+                flips[(lab, grp)] = d
+        FL = ["", title, "",
+              "| variant | queries | " + " | ".join(R.LANGS) + " | total |", "|---|---|" + "---|" * (len(R.LANGS) + 1)]
+        for (lab, grp), d in flips.items():
+            tot = [sum(d.get(l, [0, 0, 0])[j] for l in R.LANGS) for j in range(3)]
+            FL.append(f"| {lab} | {grp} | " + " | ".join(
+                "{} / {} (n={})".format(*d.get(l, [0, 0, 0])) for l in R.LANGS) + " | {} / {} (n={}) |".format(*tot))
+        return FL
+
+    FL = flip_table("S11 flips among positives the verdict clears (int8 top right -> reranked top wrong / "
+                    "wrong -> right; n = cleared positives)", (("F4", f4), ("F4'", f4p)))
     print("\n".join(FL))
 
     # ---------------- tables ----------------
-    base_rows = [row("jina fp32 (baseline)", base[R.REF], rf32), int8row]
-    allr = base_rows + [s4row] + rows
-    ci = lambda t: f"{t[0]:.3f} [{t[1]:.3f}, {t[2]:.3f}]"
-    L = ["| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |", "|---|---|---|---|"]
-    for r in allr:
-        L.append(f"| {r['label']} | {ci(r['r10'])} | {ci(r['mrr'])} | {r['name'][0]:.3f} / {r['name'][1]:.3f} |")
-    for tag, title in (("fp32", "jina fp32 at its D6 floors"), ("int8", "shipped jina int8 at its shipped floors")):
-        L += ["", f"D9 gates vs {title}", "",
-              "| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |",
+    def render(allr):
+        ci = lambda t: f"{t[0]:.3f} [{t[1]:.3f}, {t[2]:.3f}]"
+        L = ["| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |", "|---|---|---|---|"]
+        for r in allr:
+            L.append(f"| {r['label']} | {ci(r['r10'])} | {ci(r['mrr'])} | {r['name'][0]:.3f} / {r['name'][1]:.3f} |")
+        for tag, title in (("fp32", "jina fp32 at its D6 floors"), ("int8", "shipped jina int8 at its shipped floors")):
+            L += ["", f"D9 gates vs {title}", "",
+                  "| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |",
+                  "|---|---|---|---|---|---|---|---|"]
+            for r in allr:
+                g = r["vs"][tag]
+                fails = [q for q in ("Q1", "Q2", "Q3", "Q4", "Q5") if not g["pass"][q]]
+                up = lambda t: "-" if t is None else f"{R.pts(t[0])} [{R.pts(t[2])}]"
+                L.append(f"| {r['label']} | {R.pts(g['r10'][0])} [{R.pts(g['r10'][1])}] | {g['mrr'][0]:+.3f} [{g['mrr'][1]:+.3f}] | "
+                         f"{g['q3_worst'][0]} {R.pts(g['q3_worst'][1])} | {up(g['cw'])} | {up(g['fa'])} | "
+                         f"{'pass' if not fails else '**' + ','.join(fails) + '**'} | "
+                         + ", ".join(f"{l[:2]} {R.pts(d)} n={n}" for l, (d, n) in g["fa_lang"].items()) + " |")
+        c434 = lambda t: "-" if not t[1] else f"{100 * t[0] / t[1]:.0f}% ({t[0]}/{t[1]})"
+        L += ["", "GM-434 columns (option a), at each row's own floors", "",
+              "| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |",
               "|---|---|---|---|---|---|---|---|"]
         for r in allr:
-            g = r["vs"][tag]
-            fails = [q for q in ("Q1", "Q2", "Q3", "Q4", "Q5") if not g["pass"][q]]
-            up = lambda t: "-" if t is None else f"{R.pts(t[0])} [{R.pts(t[2])}]"
-            L.append(f"| {r['label']} | {R.pts(g['r10'][0])} [{R.pts(g['r10'][1])}] | {g['mrr'][0]:+.3f} [{g['mrr'][1]:+.3f}] | "
-                     f"{g['q3_worst'][0]} {R.pts(g['q3_worst'][1])} | {up(g['cw'])} | {up(g['fa'])} | "
-                     f"{'pass' if not fails else '**' + ','.join(fails) + '**'} | "
-                     + ", ".join(f"{l[:2]} {R.pts(d)} n={n}" for l, (d, n) in g["fa_lang"].items()) + " |")
-    c434 = lambda t: "-" if not t[1] else f"{100 * t[0] / t[1]:.0f}% ({t[0]}/{t[1]})"
-    L += ["", "GM-434 columns (option a), at each row's own floors", "",
-          "| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |",
-          "|---|---|---|---|---|---|---|---|"]
-    for r in allr:
-        fl, g = r["floors"], r["gm434"]
-        L.append(f"| {r['label']} | {' / '.join(f'{fl[l]:.2f}' for l in R.LANGS)} | {c434(g['nl']['misled'])} | "
-                 f"{c434(g['nl']['cw_pos'])} | {c434(g['nl']['cw_abs'])} | {c434(g['name']['misled'])} | "
-                 f"{c434(g['name']['cw_pos'])} | {c434(g['name']['cw_abs'])} |")
-    L += ["", "GM-434 per language, held-out NL (misled / CW pos / CW absent)", "",
-          "| variant | " + " | ".join(R.LANGS) + " |", "|---|" + "---|" * len(R.LANGS)]
-    for r in allr:
-        gl = r["gm434_lang"]
-        L.append(f"| {r['label']} | " + " | ".join(
-            f"{c434(gl[l]['misled'])} / {c434(gl[l]['cw_pos'])} / {c434(gl[l]['cw_abs'])}" for l in R.LANGS) + " |")
+            fl, g = r["floors"], r["gm434"]
+            L.append(f"| {r['label']} | {' / '.join(f'{fl[l]:.2f}' for l in R.LANGS)} | {c434(g['nl']['misled'])} | "
+                     f"{c434(g['nl']['cw_pos'])} | {c434(g['nl']['cw_abs'])} | {c434(g['name']['misled'])} | "
+                     f"{c434(g['name']['cw_pos'])} | {c434(g['name']['cw_abs'])} |")
+        L += ["", "GM-434 per language, held-out NL (misled / CW pos / CW absent)", "",
+              "| variant | " + " | ".join(R.LANGS) + " |", "|---|" + "---|" * len(R.LANGS)]
+        for r in allr:
+            gl = r["gm434_lang"]
+            L.append(f"| {r['label']} | " + " | ".join(
+                f"{c434(gl[l]['misled'])} / {c434(gl[l]['cw_pos'])} / {c434(gl[l]['cw_abs'])}" for l in R.LANGS) + " |")
+        return L
+
+    base_rows = [row("jina fp32 (baseline)", base[R.REF], rf32), int8row]
+    allr = base_rows + [s4row] + rows
+    L = render(allr)
     L += FL
     print("\n" + "\n".join(L))
     if a.table:
         a.table.write_text("\n".join(L) + "\n")
+
+    # ---------------- S14: F4 at smaller K ----------------
+    # CE(c, q) and COS(c, q) cover int8's top-50 (all cached); a smaller K is their prefix.
+    fit_keys = [(c, q) for c in cs for q in c.qids if R.fit_nl(c.queries[q])]
+
+    def blend(c, q, k, b):
+        return CE(c, q)[:k] + b * COS(c, q)[:k]
+
+    def tune_beta_at(k):
+        """S4's objective at K=k: pooled FIT-half NL r@10, then MRR, then the smaller beta."""
+        best = None
+        for b in R.BETAS:
+            g10, gm = {}, {}
+            for c, q in fit_keys:
+                hits, _ = R.reranked(c, q, k, blend(c, q, k, b), ARM)
+                r = R.first_rank(c, q, hits)
+                lang = c.queries[q]["language"]
+                g10.setdefault(lang, []).append(1.0 if r and r <= 10 else 0.0)
+                gm.setdefault(lang, []).append(1.0 / r if r else 0.0)
+            key = (round(R.pooled_mean(g10), 9), round(R.pooled_mean(gm), 9), -b)
+            if best is None or key > best[0]:
+                best = (key, b)
+        return best[1], best[0]
+
+    def f4_at(k, b, rerank=True):
+        """F4 at K=k: int8's top-k in the blend's order, verdict on int8's own top-1 cosine."""
+        outs = []
+        for c in cs:
+            for q in c.qids:
+                lst = c.lists[ARM][q]
+                n = min(k, len(lst))
+                sc_ = blend(c, q, n, b) if rerank else -np.arange(n, dtype=np.float64)
+                hits, _ = R.reranked(c, q, k, sc_, ARM)
+                o = R.outcome(c, q, hits, lst[0][1] if lst else None)
+                o["top_language"] = c.node_lang.get(lst[0][0]) if lst else None
+                outs.append(o)
+        return outs
+
+    print("\n== S14: F4 at K=20 / 30 / 50 ==")
+    f4row = next(r for r in rows if r["label"].startswith("F4 blend order"))
+    c50 = f4_at(50, 40.0)
+    ok50 = c50 == f4 and sig(row("F4 K=50 beta=40", c50, shipped)) == sig(f4row)
+    print(f"control: F4 at K=50 beta=40 == S11 F4 row: outcomes {c50 == f4}, row {ok50}")
+    if not ok50:
+        sys.exit("STOP: S14 K=50 control failed")
+    rows14, var14, ceil = [], [], {}
+    for k in (20, 30, 50):
+        ceil[k] = R.pooled(base[R.INT8], R.hit_at(k), R.ho)
+        n_in = sum(sum(v) for v in ceil[k][1].values())
+        n_all = sum(len(v) for v in ceil[k][1].values())
+        print(f"int8 recall@{k} held-out NL (pooled): {ceil[k][0]:.3f} ({n_in:g}/{n_all}); per language "
+              + ", ".join(f"{l} {sum(v) / len(v):.3f}" for l, v in sorted(ceil[k][1].items())))
+        bk, key = tune_beta_at(k)
+        print(f"K={k}: beta re-tuned on FIT {bk:g} (fit r@10 {key[0]:.3f}, MRR {key[1]:.3f})")
+        for b in sorted({bk, 40.0}):
+            ctl = f4_at(k, b, rerank=False)
+            same = ctl == base[R.INT8] and sig(row("off", ctl, shipped)) == sig(int8row)
+            print(f"  control K={k} beta={b:g} rerank disabled == int8: {same}")
+            if not same:
+                sys.exit(f"STOP: S14 K={k} rerank-disabled control failed")
+            outs = c50 if (k, b) == (50, 40.0) else f4_at(k, b)
+            tag = "FIT-tuned" if b == bk else "fixed"
+            if b == bk and b == 40.0:
+                tag = "FIT-tuned = fixed"
+            lab = f"F4 K={k} beta={b:g} ({tag})"
+            rows14.append(row(lab, outs, shipped))
+            var14.append((lab, outs))
+    L14 = render(base_rows + rows14)
+    L14 += ["", "int8 recall@K on held-out NL (the ceiling a K-row rerank can reach for r@10 and MRR), pooled over "
+            "languages", "", "| K | pooled | " + " | ".join(R.LANGS) + " |", "|---|---|" + "---|" * len(R.LANGS)]
+    for k, (m, g) in ceil.items():
+        L14.append(f"| {k} | {m:.3f} | " + " | ".join(
+            f"{sum(g[l]) / len(g[l]):.3f} ({sum(g[l]):g}/{len(g[l])})" for l in R.LANGS) + " |")
+    L14 += flip_table("S14 flips among positives the verdict clears (int8 top right -> reranked top wrong / "
+                      "wrong -> right; n = cleared positives)", var14)
+    print("\n" + "\n".join(L14))
+    if a.table14:
+        a.table14.write_text("\n".join(L14) + "\n")
 
 if __name__ == "__main__":
     main()

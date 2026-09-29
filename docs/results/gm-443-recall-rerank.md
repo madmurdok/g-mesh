@@ -850,3 +850,135 @@ the latency of K=50 is judged too high.
 python3 eval/embedding/rerank_eval.py --work <main checkout>/eval/embedding/work --latency-f4 200
 python3 eval/embedding/rerank_eval.py --work <main checkout>/eval/embedding/work --latency-f4 200 --ort-threads 1
 ```
+
+## S14: F4 at K=20 and K=30
+
+F4 as in S11 (int8's top-K in the order of ce-minilm + beta * int8 cosine,
+verdict on int8's own top-1 cosine at the shipped floors, nothing refit), at
+K = 20 and 30. The CE scores are the cached K=50 pairs (a K=20/30 list is
+their prefix; ce_cache checked all K=50 pairs are present, so none are
+missing); nothing rescored. Beta for each K is re-tuned on the FIT half with
+S4's grid and objective (pooled FIT NL r@10, then MRR, then the smaller
+beta): **80 at K=20 and at K=30** (FIT r@10 0.669 / 0.671, MRR 0.492 /
+0.493), 40 at K=50 (as in S4). Each K is shown at its tuned beta and at 40.
+
+### Controls
+
+- F4 at K=50, beta 40 through the S14 code path equals S11's F4 on every
+  outcome and every reported cell (and each row matches the S11 table in
+  this document); S4's step-0 MATCH and the S8/S11 tables are unchanged
+  (`--table` output byte-identical before and after this change).
+- F4 at K=20 and K=30 with the rerank disabled (int8 order through the same
+  code path) equals the int8 baseline on every outcome and every cell.
+
+| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |
+|---|---|---|---|
+| jina fp32 (baseline) | 0.633 [0.582, 0.685] | 0.423 [0.379, 0.469] | 0.917 / 0.745 |
+| jina int8 (baseline, shipped floors) | 0.645 [0.593, 0.697] | 0.419 [0.374, 0.464] | 0.915 / 0.750 |
+| F4 K=20 beta=40 (fixed) | 0.675 [0.622, 0.727] | 0.473 [0.425, 0.520] | 0.953 / 0.881 |
+| F4 K=20 beta=80 (FIT-tuned) | 0.678 [0.626, 0.729] | 0.464 [0.417, 0.510] | 0.952 / 0.859 |
+| F4 K=30 beta=40 (fixed) | 0.692 [0.641, 0.744] | 0.472 [0.425, 0.518] | 0.967 / 0.887 |
+| F4 K=30 beta=80 (FIT-tuned) | 0.691 [0.640, 0.742] | 0.465 [0.418, 0.511] | 0.963 / 0.862 |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+
+D9 gates vs jina fp32 at its D6 floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=16, py +0.0 n=21, ru +0.0 n=7, ty +0.0 n=27 |
+| jina int8 (baseline, shipped floors) | +1.2 [-0.9] | -0.004 [-0.016] | go -1.6 | -1.4 [+1.0] | +2.1 [+6.2] | **Q5** | go +12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty -4.0 n=25 |
+| F4 K=20 beta=40 (fixed) | +4.1 [+0.5] | +0.050 [+0.017] | typescript -1.7 | -4.1 [-0.4] | -1.1 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.5 n=22 |
+| F4 K=20 beta=80 (FIT-tuned) | +4.4 [+1.2] | +0.041 [+0.013] | typescript +1.7 | -3.3 [+0.0] | -1.0 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.0 n=25 |
+| F4 K=30 beta=40 (fixed) | +5.9 [+1.8] | +0.049 [+0.016] | typescript -1.7 | -3.7 [-0.1] | -1.1 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.5 n=22 |
+| F4 K=30 beta=80 (FIT-tuned) | +5.8 [+2.4] | +0.042 [+0.014] | typescript +1.7 | -3.3 [+0.0] | -1.0 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.0 n=25 |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | -4.2 [-0.5] | -1.1 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.5 n=22 |
+
+D9 gates vs shipped jina int8 at its shipped floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | -1.2 [-3.4] | +0.004 [-0.008] | rust -4.3 | +1.4 [+3.8] | -2.1 [+1.4] | **Q4** | go -12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty +4.0 n=25 |
+| jina int8 (baseline, shipped floors) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=17, py +0.0 n=20, ru +0.0 n=7, ty +0.0 n=26 |
+| F4 K=20 beta=40 (fixed) | +2.9 [-0.1] | +0.054 [+0.024] | typescript -1.7 | -2.7 [+0.3] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=23 |
+| F4 K=20 beta=80 (FIT-tuned) | +3.2 [+0.9] | +0.045 [+0.020] | typescript +1.7 | -1.9 [+0.5] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=26 |
+| F4 K=30 beta=40 (fixed) | +4.7 [+1.2] | +0.053 [+0.023] | typescript -1.7 | -2.3 [+0.6] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=23 |
+| F4 K=30 beta=80 (FIT-tuned) | +4.6 [+2.1] | +0.046 [+0.021] | typescript +1.7 | -1.9 [+0.5] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=26 |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | -2.8 [+0.2] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=23 |
+
+GM-434 columns (option a), at each row's own floors
+
+| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | 0.56 / 0.58 / 0.56 / 0.55 | 14% (10/71) | 53% (113/215) | 26% (12/46) | 1% (7/569) | 32% (283/879) | 20% (183/900) |
+| jina int8 (baseline, shipped floors) | 0.57 / 0.57 / 0.55 / 0.53 | 14% (10/70) | 52% (111/215) | 22% (10/46) | 2% (9/577) | 32% (282/879) | 23% (204/900) |
+| F4 K=20 beta=40 (fixed) | 0.57 / 0.57 / 0.55 / 0.53 | 16% (13/80) | 48% (104/215) | 22% (10/46) | 2% (18/721) | 17% (147/879) | 23% (204/900) |
+| F4 K=20 beta=80 (FIT-tuned) | 0.57 / 0.57 / 0.55 / 0.53 | 17% (13/78) | 49% (106/215) | 22% (10/46) | 2% (16/694) | 20% (172/879) | 23% (204/900) |
+| F4 K=30 beta=40 (fixed) | 0.57 / 0.57 / 0.55 / 0.53 | 16% (13/79) | 49% (105/215) | 22% (10/46) | 2% (18/724) | 16% (144/879) | 23% (204/900) |
+| F4 K=30 beta=80 (FIT-tuned) | 0.57 / 0.57 / 0.55 / 0.53 | 17% (13/78) | 49% (106/215) | 22% (10/46) | 2% (16/695) | 19% (171/879) | 23% (204/900) |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | 0.57 / 0.57 / 0.55 / 0.53 | 16% (13/80) | 48% (104/215) | 22% (10/46) | 2% (18/724) | 16% (144/879) | 23% (204/900) |
+
+GM-434 per language, held-out NL (misled / CW pos / CW absent)
+
+| variant | go | python | rust | typescript |
+|---|---|---|---|---|
+| jina fp32 (baseline) | 19% (3/16) / 51% (31/61) / 9% (1/11) | 10% (2/21) / 45% (21/47) / 36% (4/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 15% (4/27) / 42% (25/60) / 15% (2/13) |
+| jina int8 (baseline, shipped floors) | 29% (5/17) / 41% (25/61) / 0% (0/11) | 10% (2/20) / 47% (22/47) / 27% (3/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 8% (2/26) / 47% (28/60) / 15% (2/13) |
+| F4 K=20 beta=40 (fixed) | 26% (5/19) / 38% (23/61) / 0% (0/11) | 11% (2/19) / 49% (23/47) / 27% (3/11) | 23% (3/13) / 68% (32/47) / 45% (5/11) | 10% (3/29) / 43% (26/60) / 15% (2/13) |
+| F4 K=20 beta=80 (FIT-tuned) | 29% (5/17) / 41% (25/61) / 0% (0/11) | 11% (2/19) / 49% (23/47) / 27% (3/11) | 25% (3/12) / 70% (33/47) / 45% (5/11) | 10% (3/30) / 42% (25/60) / 15% (2/13) |
+| F4 K=30 beta=40 (fixed) | 28% (5/18) / 39% (24/61) / 0% (0/11) | 11% (2/19) / 49% (23/47) / 27% (3/11) | 23% (3/13) / 68% (32/47) / 45% (5/11) | 10% (3/29) / 43% (26/60) / 15% (2/13) |
+| F4 K=30 beta=80 (FIT-tuned) | 29% (5/17) / 41% (25/61) / 0% (0/11) | 11% (2/19) / 49% (23/47) / 27% (3/11) | 25% (3/12) / 70% (33/47) / 45% (5/11) | 10% (3/30) / 42% (25/60) / 15% (2/13) |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | 28% (5/18) / 39% (24/61) / 0% (0/11) | 10% (2/20) / 47% (22/47) / 27% (3/11) | 23% (3/13) / 68% (32/47) / 45% (5/11) | 10% (3/29) / 43% (26/60) / 15% (2/13) |
+
+int8 recall@K on held-out NL (the ceiling a K-row rerank can reach for r@10 and MRR), pooled over languages
+
+| K | pooled | go | python | rust | typescript |
+|---|---|---|---|---|---|
+| 20 | 0.740 | 0.820 (50/61) | 0.766 (36/47) | 0.574 (27/47) | 0.800 (48/60) |
+| 30 | 0.791 | 0.902 (55/61) | 0.830 (39/47) | 0.617 (29/47) | 0.817 (49/60) |
+| 50 | 0.839 | 0.934 (57/61) | 0.872 (41/47) | 0.681 (32/47) | 0.867 (52/60) |
+
+S14 flips among positives the verdict clears (int8 top right -> reranked top wrong / wrong -> right; n = cleared positives)
+
+| variant | queries | go | python | rust | typescript | total |
+|---|---|---|---|---|---|---|
+| F4 K=20 beta=40 (fixed) | NL held-out | 2 / 4 (n=37) | 3 / 2 (n=40) | 0 / 4 (n=42) | 3 / 5 (n=52) | 8 / 15 (n=171) |
+| F4 K=20 beta=40 (fixed) | name | 0 / 48 (n=144) | 0 / 20 (n=143) | 1 / 50 (n=291) | 2 / 20 (n=272) | 3 / 138 (n=850) |
+| F4 K=20 beta=80 (FIT-tuned) | NL held-out | 2 / 2 (n=37) | 3 / 2 (n=40) | 0 / 3 (n=42) | 0 / 3 (n=52) | 5 / 10 (n=171) |
+| F4 K=20 beta=80 (FIT-tuned) | name | 0 / 39 (n=144) | 0 / 16 (n=143) | 1 / 40 (n=291) | 0 / 16 (n=272) | 1 / 111 (n=850) |
+| F4 K=30 beta=40 (fixed) | NL held-out | 2 / 3 (n=37) | 3 / 2 (n=40) | 0 / 4 (n=42) | 3 / 5 (n=52) | 8 / 14 (n=171) |
+| F4 K=30 beta=40 (fixed) | name | 0 / 49 (n=144) | 0 / 20 (n=143) | 1 / 52 (n=291) | 2 / 20 (n=272) | 3 / 141 (n=850) |
+| F4 K=30 beta=80 (FIT-tuned) | NL held-out | 2 / 2 (n=37) | 3 / 2 (n=40) | 0 / 3 (n=42) | 0 / 3 (n=52) | 5 / 10 (n=171) |
+| F4 K=30 beta=80 (FIT-tuned) | name | 0 / 39 (n=144) | 0 / 16 (n=143) | 1 / 41 (n=291) | 0 / 16 (n=272) | 1 / 112 (n=850) |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | NL held-out | 2 / 3 (n=37) | 3 / 3 (n=40) | 0 / 4 (n=42) | 3 / 5 (n=52) | 8 / 15 (n=171) |
+| F4 K=50 beta=40 (FIT-tuned = fixed) | name | 0 / 49 (n=144) | 0 / 20 (n=143) | 1 / 52 (n=291) | 2 / 20 (n=272) | 3 / 141 (n=850) |
+
+### S14 reading
+
+**Every K passes every D9 gate against both baselines, and the verdict
+columns do not move** (Q5 +0.0 [+0.0] vs int8 by construction; NL CW absent
+22% at every K). K=30 keeps essentially all of K=50's ranking gain: at beta
+40, r@10 0.692 vs 0.693 and MRR 0.472 vs 0.477 (vs int8: +4.7 [+1.2] /
++0.053 [+0.023] against K=50's +4.8 [+1.2] / +0.058 [+0.027]), with the same
+flips (8 wrong / 14 right on held-out NL). K=20 keeps the MRR gain (+0.054
+[+0.024] at beta 40) but loses about 2 points of r@10 (0.675; +2.9 [-0.1]
+vs int8, a lower bound just below zero); its FIT-tuned beta 80 gives +3.2
+[+0.9] / +0.045 [+0.020] and fewer confident-wrong flips (5 / 10 on NL, 1 /
+111 on names, vs 8 / 15 and 3 / 138 at beta 40), trading some MRR and name
+MRR (0.859 vs 0.881) for it; beta 80 at K=30 does the same (+4.6 [+2.1],
++0.046 [+0.021], 5 / 10). The loss at K=20 is the ceiling: int8 has the
+expected node in its top 20 for 74.0% of held-out NL (pooled), 79.1% at 30,
+83.9% at 50, with Rust lowest (57 / 62 / 68%), and F4 cannot promote what
+is not in its top K. **Quality x latency** (S12, default threads, idle):
+K=50 costs 355 / 1137 ms p50 / p95 (NL p95 1281 ms) for r@10 +4.8 / MRR
++0.058; K=20 costs 131 / 460 ms for +2.9 to +3.2 / +0.045 to +0.054. K=30
+was not timed; S12's per-pair cost (8.8-9.6 ms, roughly linear in K) puts it
+near 0.6x K=50, about 210 ms p50 and 700 ms p95 (an estimate, not a
+measurement), for nearly all of K=50's gain. On these numbers K=30 is the
+knee; K=20 is the cheap option that keeps the MRR gain and about two thirds of the r@10
+gain.
+
+### S14 reproduce
+
+```
+python3 eval/embedding/rerank_q5_diag.py --work <main checkout>/eval/embedding/work --fixes --table out.md --table14 s14.md
+```
