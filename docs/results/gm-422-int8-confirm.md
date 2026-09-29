@@ -74,3 +74,125 @@ python/rust/typescript 150 each; absent 50/38/38/38.
 | 3 D7 broken arms | pass: fp32 vs random gap 60.9, ratio 0.027; fp32 vs shuffled gap 62.3, ratio 0.005; bounds separate; int8 vs random and vs shuffled pass (figures withheld); random recall@10 0.017 vs chance 0.0122 (limit 3x + 0.02); random and shuffled fail the gates as candidates |
 | 4 planted harm, seed 4223 | pass: int8-harm10 fails Q4 and Q5; int8-harm5 fails Q4 and Q5 (reported) |
 | 5 null arm fp32 vs fp32 | pass: exactly 0 on Q1-Q5 (n4 814, n5 176), passes |
+
+## Verdict (S9)
+
+**GO: int8 passes every gate under the pre-registered rule.** Per the owner
+decisions of 2026-09-29, this verdict replaces GM-398's int8 verdict
+(Fail: Q5), and jina-v2-base-code int8 is switched in. The decision is
+recorded in [ADR 0010](../adr/0010-embedding-model-int8.md).
+
+2026-09-29, branch `docs/GM-422-int8-q5-floor-fit` at `ffdb249`. All six
+query sha256 re-checked against the Files table first: all match. The
+runbook's "Gated verdict" command, without `--controls-only`:
+
+```sh
+python3 eval/embedding/int8_confirm_report.py \
+    --old-runs $W/runs --old-eval-dir eval/embedding \
+    --runs eval/embedding/confirm/work/runs --eval-dir eval/embedding/confirm \
+    --json eval/embedding/confirm/work/report.json
+```
+
+Exit 0; `uptime` before: load 3.72 / 9.22 / 17.26; `time -p`: real 6.36,
+user 4.73, sys 1.20. The report reads stored rankings only.
+
+### Controls (same run)
+
+"controls A, 2, 3, 4, 5: OK". Control A, 2, 3's fp32 lines and 5 give the
+same figures as the blind S7 run above. Figures that S7 withheld:
+
+- **3, int8 vs broken arms**: vs random gap 61.5, ratio 0.027; vs shuffled
+  gap 62.9, ratio 0.005; bounds separate: pass.
+- **4, planted harm** (seed 4223; harm5 shares Q5 5.5-6.2%, Q4 8.2-18.1%,
+  doubled for harm10):
+
+| arm | Q4 | Q5 | result |
+|---|---|---|---|
+| int8-harm10 | +13.4 [+11.2, +15.7] | +4.2 [-1.2, +9.9] n=125 | fails Q4 and Q5 (required): pass |
+| int8-harm5 | +7.6 [+5.7, +9.4] | +3.0 [-1.6, +7.7] n=143 | fails Q4 and Q5 (reported) |
+
+The planted Q5 effect reads smaller than its nominal size (+4.2 against
+int8's own -2.0, not +10). A Q4-harmed right-first positive is demoted and
+leaves the Q5 pairs (Deviation 5), so part of the planted harm goes to Q4.
+The control still does its job: both harm arms fail Q5 on the bound.
+
+### Gates: int8 vs fp32, frozen GM-398 floors, rule B
+
+814 new queries (650 positives, 164 absent), every one held-out. Δ = int8 -
+fp32; points for Q1, Q3-Q5, raw for Q2. Bounds are one-sided 95%
+(SplitMix64, seed 398, 10,000 resamples), languages weighted equally.
+
+| gate | point | bound | limit | result |
+|---|---|---|---|---|
+| Validity (D7, control 3) | int8 above random by 61.5, shuffled by 62.9 | bounds separate | gap >= 20, ratio <= 0.25 | pass |
+| Q1 recall@10 | +0.6 | lower -0.6 | point >= -2.0, lower >= -5.0 | pass |
+| Q2 MRR | +0.005 | lower -0.004 | point >= -0.02, lower >= -0.05 | pass |
+| Q3 recall@10 per language | min 0.0 | - | >= -10 in every language | pass |
+| Q4 confident-wrong (n = 814) | +1.5 | upper +2.9 | upper <= +5 | pass |
+| Q5 false alarm, pooled (n = 161) | -2.0 | upper +1.2 | upper <= +5 | pass |
+| Cost (GM-398/S14, D11) | size 0.26x, RSS 0.48x, pass time 0.69x, query 0.54x | - | one of time <= 0.60, size <= 0.50, RSS <= 0.70; none > 1.10 | pass |
+
+Q4's lower bound is +0.1: int8 is measurably, slightly more often
+confidently wrong at its shipped floors. Rule B gates on the upper bound
+only, so this passes; rule A (D9 unchanged) would have failed it on the
+point. At fp32's floors int8's Q4 is -0.9 [upper +0.4] (secondary view
+below), so the excess comes from int8's lower TypeScript and Python floors,
+not from its rankings.
+
+**Per language** (Q3 is gated per language; Q5 per language is reported,
+not gated; Q4 is gated combined only and the script does not split it):
+
+| language | Q3 Δ recall@10 | Q5 Δ false alarm [lower, upper] | Q5 pairs | int8 worse / better |
+|---|---|---|---|---|
+| go | +0.5 | +2.1 [-4.2, +8.3] | 48 | 2 / 1 |
+| python | 0.0 | -8.8 [-17.6, -2.9] | 34 | 0 / 3 |
+| rust | +2.0 | +4.2 [0.0, +12.5] | 24 | 1 / 0 |
+| typescript | 0.0 | -5.5 [-10.9, -1.8] | 55 | 0 / 3 |
+
+**Go.** The accepted Go false-alarm excess (owner decision 4) shows as
++2.1 points, upper bound +8.3, from 2 queries worse and 1 better. The
+protocol expected about +6.6. A per-language +5 gate would fail Go (and
+Rust) on the bound; the gate is pooled by decision.
+
+### Secondary views (not gated; they do not change the verdict)
+
+- **int8 at fp32's floors** (S1's shared-floor view): Q1 +0.6 [-0.6],
+  Q2 +0.005 [-0.004], Q3 min 0.0, Q4 -0.9 [upper +0.4], Q5 -0.1
+  [-3.5, +3.3]. Passes; agrees with the gated verdict.
+- **Old + new, descriptive only, does not decide.** GM-398's runs (harness
+  parity split: its held-out half for Q4/Q5) plus the new queries, at the
+  frozen floors, through the same `gates` function (a scratch script,
+  not committed). Pooling them for a verdict is what section 4 forbids.
+
+| view | Q1 | Q2 | Q3 min | Q4 (n) | Q5 (n) |
+|---|---|---|---|---|---|
+| old + new, not gated | +0.6 [-0.3] | +0.002 [-0.004] | -0.4 (ts) | +0.9 [upper +2.1] (1,075) | -0.6 [upper +1.9] (228) |
+
+  Per language Q5 (old + new): go +4.7 [0.0, +10.9] n=64 (4 worse / 1
+  better), python -5.6 [-11.1, -1.9] n=54, rust +3.3 [0.0, +10.0] n=30,
+  typescript -5.0 [-8.8, -1.2] n=80.
+- **Harness `report`, floors refit** (section 4; runbook "Secondary"
+  command; load 3.56 / 7.35 / 15.41, real 0.60, user 0.31, sys 0.03). Floors
+  are refit on the parity fit half of the new queries plus the mechanical
+  ones: fp32 go/python/rust/typescript 0.54 / 0.46 / 0.56 / 0.48, int8
+  0.51 / 0.45 / 0.55 / 0.48. Its verdict is **Undecided**: the harness's
+  floor-parity check finds fp32's refit Go (0.54) and Python (0.46) floors
+  more than 0.03 from the floors shipped in `similarity.rs` (0.59, 0.57).
+  Its gates, under D9 as written (point <= 0 for Q4/Q5): Q1 +0.6 [-0.6],
+  Q2 +0.005 [-0.004], Q3 worst 0.0, Q4 +1.2 [upper +3.3] fails on the point
+  (it would pass rule B's bound), Q5 -5.1 [upper +0.3]. **This disagrees
+  with the gated verdict** (Undecided, and Q4 fails rule A), which the
+  protocol requires to be reported. It does not change the verdict
+  (section 4). The floor-parity miss is against the shipped `similarity.rs`
+  floors, which GM-398's own fit had already moved away from (0.56 / 0.58 /
+  0.56 / 0.55); the frozen-floor path checks its floors by control A
+  instead.
+
+### Context: S8's gap analysis
+
+[gm-422-int8-gap.md](gm-422-int8-gap.md) found no quantization-specific
+loss at rank or margin: int8 lowers cosine scores by a common-mode median
+of -0.004, and floor crossings follow the frozen floor gaps (Go +0.01,
+TypeScript -0.02) rather than the score shift. That is consistent with
+the per-language Q5 signs above. It is context only; it did not enter the
+verdict.
