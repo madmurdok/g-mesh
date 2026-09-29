@@ -316,7 +316,16 @@ impl EmbeddingPipeline {
             return loaded.is_some();
         }
         let Ok(dir) = self.model_dir() else { return false };
-        model_files_exist(&dir) && (!self.pinned_weights || check_default_weights(&dir).is_ok())
+        self.loadable_files(&dir)
+    }
+
+    /// Whether `dir` holds model files the loader would accept: both files
+    /// present and, for the default model, its pinned weights
+    /// ([`check_default_weights`]). The one gate for everything that uses the
+    /// weights without loading them - availability and the cache's
+    /// fingerprint - so neither trusts a file the load itself refuses.
+    fn loadable_files(&self, dir: &Path) -> bool {
+        model_files_exist(dir) && (!self.pinned_weights || check_default_weights(dir).is_ok())
     }
 
     /// Embeds a free-text query (`search_code`'s input) with the same model
@@ -527,8 +536,11 @@ impl EmbeddingPipeline {
     fn open_cache(&self, settings: &CacheSettings) -> Result<Option<ActiveCache>, ()> {
         let Ok(dir) = self.model_dir() else { return Ok(None) };
         // Without the model's files there is nothing to fingerprint, and no
-        // model to have produced a cached vector either.
-        if !model_files_exist(&dir) {
+        // model to have produced a cached vector either. Weights the loader
+        // refuses (an fp32 `model.onnx` under the default model) are not
+        // fingerprinted: their cached vectors would be stored under the int8
+        // `embeddingVersion`, and backfill would never re-embed them.
+        if !self.loadable_files(&dir) {
             return Ok(None);
         }
         let mut cache = match EmbeddingCache::open(&settings.path) {
@@ -1212,6 +1224,44 @@ mod tests {
             assert_eq!(bits(&cached.embedding), bits(&fresh.embedding));
             assert_eq!(cached.text, fresh.text);
         }
+    }
+
+    /// A warm cache built from weights the default model refuses (not the
+    /// pinned size, as an fp32 `model.onnx` left over from 3.16 is) serves
+    /// nothing to the default pipeline: no vector is computed, and nothing is
+    /// stored under the int8 `embeddingVersion`.
+    ///
+    /// Control: drop the `check_default_weights` half of `loadable_files`
+    /// from `open_cache`'s early return (test `model_files_exist` alone) and
+    /// the pinned pipeline serves all 3 cached vectors and stores them.
+    #[test]
+    fn a_warm_cache_of_refused_weights_serves_nothing_to_the_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "fp32 weights");
+        assert_ne!(
+            std::fs::metadata(model_dir.join(ONNX_FILE_NAME)).unwrap().len(),
+            crate::embedding::model::DEFAULT_ONNX_SIZE
+        );
+        let diff = diff_of(3);
+
+        let counters = Counters::default();
+        fake_pipeline(&model_dir, Some(cache_at(dir.path())), &counters)
+            .compute(&diff, &mut EmbedStats::default());
+        assert_eq!(counters.embeds(), 3, "the cache is warm for these weights");
+
+        let pinned = EmbeddingPipeline::build(
+            &EmbeddingConfig::default(),
+            Some(model_dir.clone()),
+            CacheSlot::Unopened(Some(cache_at(dir.path()))),
+        );
+        let conn = index_with(&diff);
+        let mut stats = EmbedStats::default();
+        let computed = pinned.compute(&diff, &mut stats);
+        pinned.store(&conn, &computed);
+
+        assert_eq!(computed.len(), 0, "cached vectors of refused weights must not be served");
+        assert_eq!((stats.texts, stats.hits), (0, 0));
+        assert_eq!(vector_count(&conn), 0, "nothing is stored under {}", pinned.embedding_version());
     }
 
     /// Same texts under a second fingerprint: nothing is shared.
