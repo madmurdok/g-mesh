@@ -176,3 +176,129 @@ one adverse discordant query is enough to make it positive.
   typescript (medians -0.004), which is below what n=67 can resolve.
 
 Any rule consequences are for S2 and the owner to decide.
+
+## Proposal (S2)
+
+S2 asks what change to the floor fit or the Q5 gate would apply to every
+model, not only to int8. It uses stored rankings only. Script:
+`q5_floor_sensitivity.py <runs> <eval> --proposal` (the default output is
+unchanged; the md5 of the default run is the same before and after the
+change, `9da90352…`). Runtime: real 410 s, user 288 s, sys 75 s, at load
+average 9-27 on a shared machine. The run is CPU-bound, not waiting.
+
+**Control.** The run stops unless it reproduces GM-398 at 0.1-point
+precision: the floors of the five arms, and Q1, Q2, Q4 and Q5 of the four
+candidates. The vectorised SplitMix draws must also equal `Rng.below`. All
+of these pass. Q4 is ported from `metrics.rs` `confident_wrong`, and Q1/Q2
+from `paired_deltas`. Cost gates are taken from GM-398, since floors do not
+affect them.
+
+### Where the noise comes from
+
+Each language's raw floor is a low order statistic of about 100-250 fit
+scores. Its bootstrap SD for jina is 0.016-0.032 (fp32) and 0.016-0.023
+(int8). The small models have 0.004-0.015. For jina that is 2-3 times the
+0.01 rounding step. So rounding is not the noise source, and a finer step
+cannot remove it. More mechanical queries would narrow the SD roughly as
+1/sqrt(n), but all 150 per corpus are already in the fit set. More would
+need new embedding runs.
+
+The Q5 point condition (Δ <= 0) is the other source. Go has n=16 paired
+queries, and one discordant Go query moves the pooled Δ by 1.6 points.
+
+### Options on every arm
+
+Rules: **A** = D9 today (Δ <= 0 and upper <= +5); **B** = bound only
+(upper <= +5); **C** = Q1-shaped tolerance (Δ <= +2 and upper <= +5). In the
+Overall column, Q4 and Q5 are judged under the same rule, and Q1-Q3 and cost
+are as in GM-398. Q1-Q3 do not depend on the floors. Under every option,
+gte, bge and snowflake fail Q1 and Q2. random and shuffled fail Q1 by about
+62 points, and words-shuffled fails Q2 (-0.031). **So under every option,
+nothing but int8 can change its verdict, and every broken arm still fails
+overall.**
+
+| option | int8 Q4 | int8 Q5 | other arms' Q5 changes | int8 overall A / B / C | selection A / B / C |
+|---|---|---|---|---|---|
+| O0 baseline (own floors, 0.01, fixed CI) | -1.4 [+1.0] | +2.1 [-1.4, +6.2] | - | fail / fail / fail | fp32 / fp32 / fp32 |
+| O1 own floors, step 0.001 | +0.2 [+2.8] (fails A) | +3.1 [0.0, +6.2] | gte Q5 -6.1 [+6.0] now fails; words-shuf -6.2 [+3.2] | fail / fail / fail | fp32 |
+| O2 own floors, unrounded | +0.2 [+2.8] (fails A) | +2.1 [-1.0, +6.2] | as O1 (gte fails Q5) | fail / fail / fail | fp32 |
+| O3 Q5 with both arms at R's floors | -1.4 [+1.0] | +1.6 [0.0, +4.7] | gte -16.3, bge -15.9 (on a different score scale, so this is meaningless); random n=1 at +100 | fail / **pass** / **pass** | fp32 / **int8** / **int8** |
+| O4 own 0.01 floors, joint CI (floors refit per resample) | -1.4 [+5.3] (fails B) | +2.1 [-7.2, +4.7] | every bound widens by 1-8 points | fail / fail / fail | fp32 |
+| O5 unrounded, joint CI | +0.2 [+5.5] | +2.1 [-6.0, +4.7] | gte Q5 upper +7.7 | fail / fail / fail | fp32 |
+
+Controls under every option: random and shuffled have no paired Q5 queries
+(n=0), so their Q5 bound is NaN and fails. That also means **Q5 is never
+what rejects a broken arm**: words-shuffled passes Q5 under every option,
+and the recall validity check (D7) is what catches it.
+
+**int8 passes Q5 under rules B and C only with shared floors (O3) or a joint
+CI (O4, O5)**. With a joint CI its overall verdict still fails, on Q4.
+Under the recommended option (below) int8 still fails, at Q5 upper +6.2.
+
+### How each rule behaves on candidates of known quality
+
+Simulated candidates are built from R's own rankings, with the top scores
+jittered. **Equal** gives both arms independent jitter, so the true Δ is 0.
+**Harm** also drops a share h of the candidate's held-out right-first
+queries below every floor: h=0.06 puts the true Δ at about +5 points (the
+margin), and h=0.12 at about +10. There are 200 reps with a fixed CI and 100
+with a joint CI.
+
+| scenario | O0 fail A / B / C | O3 shared, fail A / B | O4 joint, fail A / B | Q4 fail A / B (O0) |
+|---|---|---|---|---|
+| equal, arms 0.006 apart | 22 / 1 / 1% | 17 / 0% | 28 / 12% | 46 / 0% |
+| equal, arms 0.012 apart (int8-like) | 44 / 17 / 18% | 37 / 6% | 52 / 39% | 48 / 4% |
+| **harm** at margin (+5): share *passing* A / B / C | 6 / 17 / 15% | 6 / 18% | 1 / 4% | - |
+| **harm** +10: share passing | 0 / 0 / 0% | 0 / 0% | 0 / 0% | - |
+
+- **Rule A's point condition is close to a coin flip for an equal model.**
+  It fails 22-44% of equal candidates on Q5 and 46-48% on Q4. Q4 has the
+  same Δ <= 0 condition, so a candidate exactly as good as R passes both
+  only about 1 time in 3. This is separate from D2's power figure (~72%),
+  which was computed for the recall gate.
+- **Rule B** fails 1-17% of equal candidates on Q5 and 0-4% on Q4. It
+  passes 17% of candidates that are exactly at the +5 margin, against a
+  nominal 5%. The fixed-floor CI treats the floors as known, which makes it
+  too narrow.
+- **Joint CI** brings the at-margin pass rate to its nominal 4%, but fails
+  12-39% of equal candidates.
+- **Finer or no rounding** (O1, O2) does not reduce the noise, because the
+  fit SD is 0.016-0.03. It moves gte's Q5 and int8's Q4 across their gates
+  in opposite directions, which shows it relocates the noise rather than
+  removing it.
+
+### Options that look tuned to the result
+
+- **O3 shared floors**: the only option under which int8 passes. It is valid
+  only for a candidate on R's score scale: gte's floors are 0.84-0.86
+  against R's 0.55-0.58. For every other model it is meaningless, so it is
+  in effect an int8 rule.
+- **Rule C (Δ <= +2)**: int8's baseline Δ is +2.12. Any tolerance chosen
+  after seeing +1.6 and +2.1 is fitted to this result. Q1's -2 tolerance is
+  the only precedent, and it applies to a different metric.
+- **Larger n**: not computable from stored data. It is D2's stage-2
+  extension (new queries plus re-embedding) and would be decided before
+  seeing a result, so it is not tuned. It is also the only option that
+  shrinks both noise sources.
+
+### Recommendation
+
+**Rule B for Q5, and the same for Q4: keep D6's floors (own, 0.01, fixed
+CI), drop the point condition, and gate on the one-sided upper bound <= +5
+only.** A pair with no paired queries (NaN) still fails.
+
+- The case for it: the point condition adds a 22-48% false-fail chance per
+  gate for an equal candidate and protects against almost nothing the bound
+  does not already catch (harm at +10 passes 0% under every rule). It is a
+  rule change, not a floor change, so it does not depend on the score scale
+  and applies to every model. The GM-398 selection is unchanged under it:
+  fp32 is kept, the small models fail Q1 and Q2, and the broken arms fail.
+- int8 still fails under it (Q5 upper +6.2), so this is not an int8 rule.
+- **Risks**: the fixed-floor CI is too narrow. An at-margin candidate
+  passes 17% of the time instead of about 5%, so B is more permissive
+  exactly at the +5 edge. If the owner weighs that above power, the
+  alternative is B with a joint CI (O4): calibrated at the margin, but it
+  fails 12-39% of equal candidates, and int8 would then fail Q4 (upper
+  +5.3). Changing Q4 alongside Q5 goes beyond GM-422's scope, and it changes
+  D9 for every future candidate. Neither change is made to
+  `embedding-eval.md`; that is for the owner to decide.
