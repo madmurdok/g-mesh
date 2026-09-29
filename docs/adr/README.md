@@ -78,4 +78,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0007 | [Embedding cache: machine-wide, keyed by the embedded text and the model's bytes](0007-embedding-cache.md) | Accepted |
 | 0008 | [Workspace reindex: walk into a staging index, swap in only the difference](0008-workspace-reindex-staging-swap.md) | Accepted |
 | 0009 | [Semantic pending: say which files a running post-swap semantic pass has not reached](0009-semantic-pending.md) | Accepted |
-| 0010 | [Embedding model: switch to jina-v2-base-code int8](0010-embedding-model-int8.md) | Accepted |
+| 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Proposed |

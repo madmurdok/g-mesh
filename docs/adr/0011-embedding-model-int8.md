@@ -1,7 +1,7 @@
-# 0010. Embedding model: switch to jina-v2-base-code int8
+# 0011. Embedding model: switch to jina-v2-base-code int8
 
 ## Status
-Accepted (2026-09-29, GM-422/S9). The decision follows mechanically from
+Proposed (2026-09-29, GM-422/S9); pending the D10 agent-level veto, which D9 requires before a switch. The decision follows mechanically from
 the rule the owner fixed before the data existed
 ([protocol](../architecture/embedding-eval-int8-confirm.md), "Owner
 decisions (2026-09-29)": switch if and only if int8 passes). It replaces

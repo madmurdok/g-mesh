@@ -80,7 +80,7 @@ python/rust/typescript 150 each; absent 50/38/38/38.
 **GO: int8 passes every gate under the pre-registered rule.** Per the owner
 decisions of 2026-09-29, this verdict replaces GM-398's int8 verdict
 (Fail: Q5), and jina-v2-base-code int8 is switched in. The decision is
-recorded in [ADR 0010](../adr/0010-embedding-model-int8.md).
+recorded in [ADR 0011](../adr/0011-embedding-model-int8.md).
 
 2026-09-29, branch `docs/GM-422-int8-q5-floor-fit` at `ffdb249`. All six
 query sha256 re-checked against the Files table first: all match. The
