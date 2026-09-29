@@ -94,6 +94,15 @@
 //! specifiers, paths and invented identifiers) and on **0 of 2,275** name,
 //! short-phrase, sentence and cross-corpus queries.
 //!
+//! # A name is told *no*; prose is told *low*
+//!
+//! The same below-floor first page gets [`NoMatch`] when the query is a name
+//! and [`low_similarity`]'s sentence when it is prose ([`is_prose_query`]),
+//! never both. The prose sentence asks for one confirming read of the top
+//! row and must not vouch for it: a caller that accepts it unread loses the
+//! floor's protection. Decision and measurements:
+//! `docs/adr/0010-search-code-low-similarity-on-prose.md`.
+//!
 //! # Per language, because doc-comment density is not a constant
 //!
 //! Embeddings sit in one space; the text fed into them does not. The four
@@ -119,6 +128,12 @@
 //! | python | 0.57 | 0.0% | 81.9% | 1.8% / 87.2% |
 //! | rust | 0.55 | 1.3% | 74.8% | 3.1% / 85.8% |
 //! | typescript | 0.50 | 2.4% | 70.9% | **8.1%** / 92.5% |
+//!
+//! Those are the fp32 model's floors and rates. g-mesh ships the int8
+//! weights with their own fitted floors, go / python / rust / typescript
+//! **0.57 / 0.57 / 0.55 / 0.53** (`docs/adr/0011-embedding-model-int8.md`,
+//! fit in `docs/results/gm-398-model-comparison.md`); [`floor`] holds them.
+//! The argument above for one floor per language holds for both.
 //!
 //! Averaging these into one number would cost TypeScript a false "nothing
 //! matched" on one search in twelve - which is precisely the "a guarantee
@@ -231,6 +246,14 @@ const BELOW_FLOOR_EXPLANATION: &str =
      vectors, not matches. Fall back to a structural tool or to grep rather than rewording the \
      query.";
 
+/// [`low_similarity`]'s sentence: the soft counterpart of
+/// [`BELOW_FLOOR_EXPLANATION`] for a prose query. It asks for one check and
+/// must not vouch for the row (no "plausibly matches", no "stop").
+const LOW_SIMILARITY_EXPLANATION: &str =
+    "Every row scored low for its language, so none is a confident match. The top row may still \
+     be right: check it with one read, and if it is not, fall back to a structural tool or grep \
+     rather than rewording the query.";
+
 const SPECIFIER_EXPLANATION: &str =
     "This query is a path or a package specifier, not a description. Only declarations' doc \
      comments and signatures are embedded, so a specifier has nothing to match and the scores \
@@ -245,7 +268,7 @@ const SPECIFIER_EXPLANATION: &str =
 /// existed, rather than somewhere new and wrong. The same "assumed to do the
 /// least" default `mcp::instructions::present_languages` applies to a
 /// language whose manifest has gone missing.
-const DEFAULT_FLOOR: f64 = 0.50;
+const DEFAULT_FLOOR: f64 = 0.53;
 
 /// The similarity floor for `language`, measured per language because
 /// doc-comment density is not a constant - see this module's doc comment for
@@ -256,21 +279,14 @@ const DEFAULT_FLOOR: f64 = 0.50;
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
 pub(crate) fn floor(language: &str) -> f64 {
+    // The int8 model's fitted floors (ADR 0011). Held-out false alarm at
+    // each, go / python / rust / typescript: 29.4 / 10.0 / 14.3 / 7.7%.
     match language {
-        // 0.594 on the fit half, rounded down. 1.2% false alarm, 90.5% of
-        // absent-answer pages caught, over 161 positives and 284 negatives.
-        "go" => 0.59,
-        // 0.570 on the fit half. 0.0% false alarm, 81.9% caught, over 164
-        // positives and 282 negatives.
+        "go" => 0.57,
         "python" => 0.57,
-        // 0.555 on the fit half, rounded down. 1.3% false alarm, 74.8%
-        // caught, over 159 positives and 282 negatives.
         "rust" => 0.55,
-        // 0.505 on the fit half, rounded down - the lowest of the four, and
-        // the language the shipped 0.60 was measured on. 2.4% false alarm and
-        // 70.9% caught, over 371 positives and 416 negatives; 0.60 would cost
-        // 8.1% here.
-        "typescript" => 0.50,
+        // The lowest of the four: DEFAULT_FLOOR must equal it.
+        "typescript" => 0.53,
         _ => DEFAULT_FLOOR,
     }
 }
@@ -287,15 +303,38 @@ pub(crate) fn floor(language: &str) -> f64 {
 /// ones.
 pub(super) fn is_specifier_query(query: &str) -> bool {
     let query = query.trim();
-    !query.is_empty()
-        && !query.chars().any(char::is_whitespace)
-        && (query.starts_with('@') || query.contains('/'))
+    !query.is_empty() && !is_prose_query(query) && (query.starts_with('@') || query.contains('/'))
+}
+
+/// Whether `query` is prose rather than a name: whitespace *inside* it, after
+/// trimming, so `"  readFile  "` is still a name and `"read file"` is prose.
+/// `parse_config` is a name and `parse config` is prose.
+///
+/// This is exactly the rule the floor eval scores
+/// (`eval/embedding/shipped_floor_rates.py`:
+/// `any(c.isspace() for c in text.strip())`), and it is the whitespace half of
+/// [`is_specifier_query`], so the two cannot drift apart: a specifier is never
+/// prose, which keeps [`verdict`] and [`low_similarity`] disjoint.
+pub(super) fn is_prose_query(query: &str) -> bool {
+    query.trim().chars().any(char::is_whitespace)
+}
+
+/// A first page with rows, every one of them below its own language's floor.
+///
+/// Each row against its own language's floor, not the page's best row
+/// against one of them: in a polyglot repository a page can mix languages,
+/// and a Go hit at 0.58 and a TypeScript hit at 0.58 are not worth the same.
+/// On the single-language repositories this was measured over the two rules
+/// coincide, which is why the distinction is stated by what it guarantees
+/// rather than by a measurement that could not separate them.
+fn below_floor(cursor: Option<&str>, results: &[SearchResult]) -> bool {
+    cursor.is_none() && !results.is_empty() && results.iter().all(|hit| hit.score < floor(&hit.language))
 }
 
 /// The verdict for one `search_code` page, or `None` when there is nothing
 /// to say.
 ///
-/// Three ways to get `None`, and each is a deliberate silence:
+/// Four ways to get `None`, and each is a deliberate silence:
 ///
 /// - **`cursor` is `Some`.** Only a first page is judged. A continuation's
 ///   rows are by construction the ones the first page already outranked, so
@@ -313,6 +352,8 @@ pub(super) fn is_specifier_query(query: &str) -> bool {
 ///   the index happened to return.
 /// - **Some row cleared its language's floor.** The healthy case, and the
 ///   common one, which is what keeps the field worth reading when it appears.
+/// - **The query is prose.** A below-floor prose page gets
+///   [`low_similarity`] instead; only a name query is told *no*.
 pub(super) fn verdict(query: &str, cursor: Option<&str>, results: &[SearchResult]) -> Option<NoMatch> {
     if cursor.is_some() {
         return None;
@@ -323,19 +364,25 @@ pub(super) fn verdict(query: &str, cursor: Option<&str>, results: &[SearchResult
             explanation: SPECIFIER_EXPLANATION,
         });
     }
-    if results.is_empty() {
-        return None;
-    }
-    // Each row against its own language's floor, not the page's best row
-    // against one of them: in a polyglot repository a page can mix languages,
-    // and a Go hit at 0.58 and a TypeScript hit at 0.58 are not worth the
-    // same. On the single-language repositories this was measured over the
-    // two rules coincide, which is why the distinction is stated by what it
-    // guarantees rather than by a measurement that could not separate them.
-    results.iter().all(|hit| hit.score < floor(&hit.language)).then_some(NoMatch {
+    (below_floor(cursor, results) && !is_prose_query(query)).then_some(NoMatch {
         reason: NoMatchReason::BelowSimilarityFloor,
         explanation: BELOW_FLOOR_EXPLANATION,
     })
+}
+
+/// The soft counterpart of [`verdict`]'s floor verdict, for a prose query:
+/// the same page (first page, rows, every row below its language's floor),
+/// but a sentence saying the top row may still be right instead of a *no* -
+/// see this module's "A name is told *no*" section.
+///
+/// `None` on a name query, where [`verdict`] speaks instead, and on every
+/// page [`verdict`] would stay silent about for the same reasons.
+pub(super) fn low_similarity(
+    query: &str,
+    cursor: Option<&str>,
+    results: &[SearchResult],
+) -> Option<&'static str> {
+    (below_floor(cursor, results) && is_prose_query(query)).then_some(LOW_SIMILARITY_EXPLANATION)
 }
 
 /// [`verdict`] for a page ranked while the embedding pass is still owed.
@@ -362,33 +409,96 @@ mod tests {
     /// present in both arms would be a permanent footnote, not a signal.
     #[test]
     fn a_page_whose_best_row_clears_its_floor_says_nothing() {
-        assert_eq!(
-            verdict("parses a config file", None, &[hit(0.51, "typescript"), hit(0.30, "typescript")]),
-            None
-        );
+        let page = [hit(0.54, "typescript"), hit(0.30, "typescript")];
+        for query in ["parses a config file", "parseConfigFile"] {
+            assert_eq!(verdict(query, None, &page), None, "{query}");
+            assert_eq!(low_similarity(query, None, &page), None, "{query}");
+        }
     }
 
     #[test]
     fn a_page_whose_every_row_is_below_its_floor_is_a_no() {
         let page = [hit(0.49, "typescript"), hit(0.30, "typescript")];
 
-        let verdict = verdict("parses a config file", None, &page).expect("this page is not a match");
+        let verdict = verdict("parseConfigFile", None, &page).expect("this page is not a match");
 
         assert_eq!(verdict.reason, NoMatchReason::BelowSimilarityFloor);
+        assert_eq!(verdict.explanation, BELOW_FLOOR_EXPLANATION, "a name keeps today's wording");
+        assert_eq!(low_similarity("parseConfigFile", None, &page), None, "a name is never told 'low'");
+    }
+
+    /// The same below-floor page asked in prose is not a *no*. It
+    /// gets the soft sentence and no verdict; the name-query test above is
+    /// its control, differing only in the query's whitespace.
+    #[test]
+    fn a_prose_query_below_its_floor_is_low_similarity_not_a_no() {
+        let page = [hit(0.49, "typescript"), hit(0.30, "typescript")];
+
+        assert_eq!(verdict("parses a config file", None, &page), None);
+        assert_eq!(low_similarity("parses a config file", None, &page), Some(LOW_SIMILARITY_EXPLANATION));
+        assert_eq!(
+            low_similarity("parses a config file", Some("c"), &page),
+            None,
+            "a continuation is not judged"
+        );
+        assert_eq!(
+            low_similarity("parses a config file", None, &[]),
+            None,
+            "an empty page speaks for itself"
+        );
+    }
+
+    /// The shape test's edges: whitespace *inside* the trimmed query is prose,
+    /// surrounding whitespace is not, and an underscore is not whitespace.
+    #[test]
+    fn prose_means_whitespace_inside_the_trimmed_query() {
+        for name in ["readFile", "  readFile  ", "\treadFile\n", "parse_config", "", "   "] {
+            assert!(!is_prose_query(name), "{name:?} is a name");
+        }
+        for prose in ["read file", "  read file  ", "read\tfile", "parse config"] {
+            assert!(is_prose_query(prose), "{prose:?} is prose");
+        }
+        let page = [hit(0.10, "rust")];
+        assert!(verdict("  readFile  ", None, &page).is_some(), "a padded name keeps the hard verdict");
+        assert_eq!(low_similarity("  readFile  ", None, &page), None);
+        assert!(low_similarity("  read file  ", None, &page).is_some());
+    }
+
+    /// The sentence may not vouch for the row it cannot vouch for, may not
+    /// leak the floor, and is cheaper than the verdict it replaces.
+    #[test]
+    fn the_low_similarity_sentence_asks_for_a_check_and_does_not_vouch() {
+        for forbidden in ["plausibly", "stop", "0.5", "0.4"] {
+            assert!(!LOW_SIMILARITY_EXPLANATION.contains(forbidden), "{forbidden}");
+        }
+        assert!(LOW_SIMILARITY_EXPLANATION.contains("check it with one read"));
+        assert!(LOW_SIMILARITY_EXPLANATION.len() < BELOW_FLOOR_EXPLANATION.len());
     }
 
     /// The per-language table is the point, not decoration: one score, four
-    /// languages, two verdicts. 0.52 clears TypeScript's 0.50 and misses
-    /// Rust's 0.55, Python's 0.57 and Go's 0.59.
+    /// languages, two verdicts. 0.54 clears TypeScript's 0.53 and misses
+    /// Rust's 0.55, Python's 0.57 and Go's 0.57.
     #[test]
     fn one_score_is_a_match_in_one_language_and_not_in_another() {
-        assert_eq!(verdict("reads a file", None, &[hit(0.52, "typescript")]), None);
+        assert_eq!(verdict("readFile", None, &[hit(0.54, "typescript")]), None);
         for language in ["rust", "python", "go"] {
             assert!(
-                verdict("reads a file", None, &[hit(0.52, language)]).is_some(),
-                "0.52 must be below {language}'s floor"
+                verdict("readFile", None, &[hit(0.54, language)]).is_some(),
+                "0.54 must be below {language}'s floor"
             );
         }
+    }
+
+    /// The shipped floors are the int8 model's fitted ones (ADR 0011), the
+    /// floors its confirmatory gates and agent-level check ran at.
+    ///
+    /// *Control:* restore the fp32 floors (go 0.59, typescript 0.50, default
+    /// 0.50) and this fails.
+    #[test]
+    fn the_shipped_floors_are_the_int8_models() {
+        let shipped: Vec<f64> = ["go", "python", "rust", "typescript"].iter().map(|l| floor(l)).collect();
+        assert_eq!(shipped, vec![0.57, 0.57, 0.55, 0.53]);
+        assert_eq!(floor("kotlin"), 0.53);
     }
 
     /// A language nothing has calibrated falls to the lowest measured floor,
@@ -403,13 +513,13 @@ mod tests {
     }
 
     /// In a polyglot page each row is judged by its own language. The Go row
-    /// at 0.52 is below Go's 0.59 while the TypeScript row at 0.52 is above
-    /// TypeScript's 0.50, so the page is a match - and it would not be under
+    /// at 0.54 is below Go's 0.57 while the TypeScript row at 0.54 is above
+    /// TypeScript's 0.53, so the page is a match - and it would not be under
     /// a single global floor taken from either language.
     #[test]
     fn a_mixed_language_page_judges_each_row_by_its_own_floor() {
-        assert_eq!(verdict("reads a file", None, &[hit(0.52, "go"), hit(0.52, "typescript")]), None);
-        assert!(verdict("reads a file", None, &[hit(0.52, "go"), hit(0.49, "typescript")]).is_some());
+        assert_eq!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.54, "typescript")]), None);
+        assert!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.49, "typescript")]).is_some());
     }
 
     /// The measured case the floor cannot catch: `@excalidraw/element` scores
@@ -467,8 +577,8 @@ mod tests {
     #[test]
     fn a_partial_page_withholds_the_floor_verdict_but_not_the_specifier_one() {
         let page = [hit(0.10, "typescript")];
-        assert!(verdict("reads a file", None, &page).is_some(), "the control: complete, this page is a no");
-        assert_eq!(partial_verdict("reads a file", None, &page), None);
+        assert!(verdict("readFile", None, &page).is_some(), "the control: complete, this page is a no");
+        assert_eq!(partial_verdict("readFile", None, &page), None);
         assert_eq!(
             partial_verdict("@excalidraw/element", None, &page).map(|v| v.reason),
             Some(NoMatchReason::QueryIsAPathOrPackage)

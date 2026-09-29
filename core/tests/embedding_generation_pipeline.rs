@@ -172,7 +172,13 @@ fn load_real_pipeline() -> EmbeddingPipeline {
     );
     // Without the machine-wide embedding cache: these tests count what the
     // model computes, which a cache warmed by an earlier run would serve.
-    EmbeddingPipeline::load_with_cache(&g_mesh::config::EmbeddingConfig::default(), None)
+    let pipeline = EmbeddingPipeline::load_with_cache(&g_mesh::config::EmbeddingConfig::default(), None);
+    assert!(
+        pipeline.is_available(),
+        "{} does not hold the pinned weights (fp32 ones, say); run `g-mesh model fetch`",
+        model_dir().display()
+    );
+    pipeline
 }
 
 /// A disabled pipeline (no model loaded, e.g. weights never fetched) must
@@ -226,7 +232,8 @@ fn indexing_a_fixture_file_embeds_its_documented_symbols() {
         .unwrap();
     // sqlite-vec's packed format: 4 bytes per f32 dimension.
     assert_eq!(embedding_len, (g_mesh::embedding::EMBEDDING_DIM as i64) * 4);
-    assert_eq!(version, g_mesh::config::EmbeddingConfig::default().model);
+    // The default model's version names its pinned int8 weights.
+    assert_eq!(version, format!("{}+int8", g_mesh::config::EmbeddingConfig::default().model));
 }
 
 /// GM-395's slice 1 acceptance criterion: a structural-only walk
@@ -271,7 +278,8 @@ fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
 
     let recorded: Option<String> =
         conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
-    assert_eq!(recorded.as_deref(), Some(g_mesh::config::EmbeddingConfig::default().model.as_str()));
+    let expected = format!("{}+int8", g_mesh::config::EmbeddingConfig::default().model);
+    assert_eq!(recorded.as_deref(), Some(expected.as_str()));
 }
 
 /// The acceptance criterion's other half: a node with neither a doc comment

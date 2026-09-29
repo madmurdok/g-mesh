@@ -25,7 +25,7 @@ pub const HOME_ENV: &str = "G_MESH_HOME";
 /// socket, pid files) and the global `config.toml`. Two things under
 /// `~/.g-mesh` deliberately do not move with it:
 ///
-/// - `models/` - a ~612 MiB per-machine cache of immutable weights, not
+/// - `models/` - a ~154 MiB per-machine cache of immutable weights, not
 ///   per-run state. Pointing it at a test root would mean re-downloading it
 ///   rather than reusing what is already on disk, which is why it keeps its
 ///   own, older `G_MESH_MODEL_DIR` override

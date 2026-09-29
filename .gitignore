@@ -20,3 +20,4 @@
 # (docs/architecture/embedding-eval.md): large, and all reproducible from
 # eval/embedding/corpora.toml and variants.toml.
 /eval/embedding/work/
+/eval/embedding/confirm/work/

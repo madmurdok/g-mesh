@@ -60,6 +60,6 @@
 #
 # Only state moves. Model weights keep their own `G_MESH_MODEL_DIR` override
 # and stay in the real `~/.g-mesh/models`, so the `#[ignore]`d weight tests
-# reuse the 612 MiB already on disk instead of re-downloading it.
+# reuse the 154 MiB already on disk instead of re-downloading it.
 [env]
 G_MESH_HOME = { value = "/tmp/g-mesh-test-home", force = false }

@@ -10,6 +10,13 @@ overlap computation and additionally resolves every expected entry against
 the snapshot; this script is the author's fast loop, not the gate.
 
 Usage: check_queries.py <corpus> [--checkout DIR] [--positives N] [--absent N]
+                        [--eval-dir DIR] [--seed N] [--disjoint-from DIR]
+
+--eval-dir reads <DIR>/queries/<corpus>.jsonl (the GM-422 confirmatory
+study uses eval/embedding/confirm); --seed is the sampling seed each
+positive's derivation must name (398 for GM-398, 4222 for GM-422);
+--disjoint-from fails any query whose text, lower-cased and stripped, equals
+an authored query text of the eval dir DIR (any corpus).
 """
 
 import argparse
@@ -69,11 +76,22 @@ def main():
     ap.add_argument("--checkout")
     ap.add_argument("--positives", type=int)
     ap.add_argument("--absent", type=int)
+    ap.add_argument("--eval-dir", default=HERE)
+    ap.add_argument("--seed", type=int, default=398)
+    ap.add_argument("--disjoint-from")
     args = ap.parse_args()
+    earlier = set()
+    if args.disjoint_from:
+        qdir = os.path.join(args.disjoint_from, "queries")
+        for name in sorted(os.listdir(qdir)):
+            if name.endswith(".jsonl"):
+                for line in open(os.path.join(qdir, name)):
+                    if line.strip():
+                        earlier.add(json.loads(line)["text"].strip().lower())
 
     corpus = args.corpus
     checkout = args.checkout or os.path.join(HERE, "work", "corpora", corpus)
-    path = os.path.join(HERE, "queries", f"{corpus}.jsonl")
+    path = os.path.join(args.eval_dir, "queries", f"{corpus}.jsonl")
     errors = []
     ids = set()
     positives = absent = no_overlap = 0
@@ -94,6 +112,8 @@ def main():
             errors.append(f"{where}: id must start with {PREFIX[corpus]}-")
         if q.get("corpus") != corpus or q.get("language") != LANGUAGE[corpus]:
             errors.append(f"{where}: corpus/language mismatch")
+        if q.get("text", "").strip().lower() in earlier:
+            errors.append(f"{where}: text repeats a query of {args.disjoint_from}")
         words = len(q.get("text", "").split())
         if q.get("shape") == "phrase":
             phrases += 1
@@ -110,9 +130,9 @@ def main():
             positives += 1
             if not 1 <= len(expected) <= 3:
                 errors.append(f"{where}: positive needs 1-3 expected symbols")
-            m = re.search(r"Target sampled \(seed 398, #(\d+)\)", q.get("derivation", ""))
+            m = re.search(rf"Target sampled \(seed {args.seed}, #(\d+)\)", q.get("derivation", ""))
             if not m:
-                errors.append(f"{where}: derivation must start with 'Target sampled (seed 398, #N)'")
+                errors.append(f"{where}: derivation must start with 'Target sampled (seed {args.seed}, #N)'")
             elif m.group(1) in targets_used:
                 errors.append(f"{where}: target #{m.group(1)} used twice")
             else:

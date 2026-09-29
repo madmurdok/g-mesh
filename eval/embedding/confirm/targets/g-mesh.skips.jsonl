@@ -1,0 +1,23 @@
+{"n": 2, "qualifiedName": "storage::index_store::IndexStore::into_inner", "reason": "trivial: test-support forwarder to Mutex::into_inner"}
+{"n": 4, "qualifiedName": "daemon::build_stamp_path_in", "reason": "trivial: one-line join of a constant file name onto a directory"}
+{"n": 15, "qualifiedName": "embedding::pipeline::CacheSettings::new", "reason": "trivial constructor"}
+{"n": 20, "qualifiedName": "daemon::workspace_reindex::STAGING_PREFIX", "reason": "trivial: undocumented private const; its embedded text is only 'const STAGING_PREFIX: &str' (the \"staging-\" value is not in the signature), so nothing beyond the name describes it"}
+{"n": 30, "qualifiedName": "cli", "reason": "bare `mod cli;` declaration"}
+{"n": 31, "qualifiedName": "graph::queries::upsert_edge", "reason": "pure forwarder to apply_diff"}
+{"n": 34, "qualifiedName": "storage::write::NodeRecord::new", "reason": "trivial constructor"}
+{"n": 35, "qualifiedName": "path::RelPath::as_str", "reason": "plain field accessor"}
+{"n": 37, "qualifiedName": "embedding::model::<EmbeddingModel as Debug>::fmt", "reason": "trivial Debug impl"}
+{"n": 40, "qualifiedName": "watcher::burst", "reason": "bare `mod burst;` declaration"}
+{"n": 46, "qualifiedName": "ipc::unix::AsyncStream", "reason": "type alias to tokio UnixStream"}
+{"n": 49, "qualifiedName": "manifest::PluginSpec::new", "reason": "trivial constructor"}
+{"n": 53, "qualifiedName": "cli::plugin_check::session::StoredRange", "reason": "type alias of a four-integer tuple"}
+{"n": 57, "qualifiedName": "run::current_dir", "reason": "trivial: current_dir with a '.' fallback"}
+{"n": 62, "qualifiedName": "lsp::config::SemanticConfig::from_manifest_at", "reason": "near-duplicate of GM-398 gm-018 (SemanticConfig::from_manifest, whose testable half this is)"}
+{"n": 66, "qualifiedName": "lsp::bridge::Address", "reason": "type alias of a five-field tuple"}
+{"n": 67, "qualifiedName": "protocol::jsonrpc::<RoundTripTimedOut as Display>::fmt", "reason": "trivial Display impl"}
+{"n": 73, "qualifiedName": "census::Reason", "reason": "near-duplicate of GM-398 gm-029 (the Rust plugin's census::Reason, same concept)"}
+{"n": 79, "qualifiedName": "daemon::semantic::SemanticPassRun::any_ran", "reason": "trivial: returns !completed.is_empty()"}
+{"n": 84, "qualifiedName": "index::SdkIndex::source", "reason": "plain field accessor"}
+{"n": 86, "qualifiedName": "mcp::front::SelectProjectParams", "reason": "trivial single-field parameter struct"}
+{"n": 92, "qualifiedName": "cli::plugins::run", "reason": "trivial: prints render(list())"}
+{"n": 97, "qualifiedName": "daemon::candidates::<Limits as Default>::default", "reason": "trivial Default impl of constants"}
