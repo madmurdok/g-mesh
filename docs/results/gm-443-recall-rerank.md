@@ -379,10 +379,10 @@ default thread count.
 **The machine was not quiet**: load average 22 at start, 31-51 during the
 run (8 cores), `/usr/bin/time -p` real 626 s, user 2100 s, sys 26 s, with
 `spindump` on top and little other CPU in `ps`, so part of the load was
-processes waiting, not computing. Treat the cross-encoder times as upper
-bounds; they need a re-measure on an idle machine before any cost claim.
-Even halved, a cross-encoder adds hundreds of milliseconds per query; the
-graph rerank costs single-digit milliseconds.
+processes waiting, not computing. These times are superseded by
+[S12: latency on an idle machine](#s12-latency-on-an-idle-machine), which
+re-measures the carried-forward variant (F4, ce-minilm over int8) at K=50
+and K=20; the graph rerank costs single-digit milliseconds in both.
 
 ### Reading
 
@@ -777,3 +777,76 @@ is the owner's call.
 
 Same command as S8 (the F4/F4' rows, controls and flip table are in its
 output and `--table` file).
+
+## S12: latency on an idle machine
+
+What F4 adds per query on top of today's int8 search: ce-minilm
+(ms-marco-MiniLM-L6-v2, ONNX, CPU) scores int8's top-K (tokenization and
+model, length-sorted chunks of 16), then the blend `ce + 40 * cosine` and the
+sort. The verdict is int8's own top-1 cosine, so it costs nothing. The int8
+query embedding and vector search are excluded: they run today already. The
+graph rerank over int8 K=50 (SQL features) is timed for reference.
+
+Sample: 200 queries, seeded (`random.Random(50)`), stratified 100 NL
+(`queries/<corpus>.jsonl`, positives and absent) and 100 name queries
+(`queries/mechanical`), over all corpora. One full untimed warm-up pass per
+K, then the timed pass. Machine: Intel Core i7-1068NG7, 4 physical cores / 8
+logical; onnxruntime 1.19.2, CPUExecutionProvider.
+
+Before the gate (after a 90 s settle from a smoke test), top process
+PrinterInstallerClient at 6.4% CPU:
+
+```
+1:32  up 12:55, 7 users, load averages: 2.74 3.31 3.91
+```
+
+| F4 / graph, int8 recall | queries | n | default threads p50 / p95 / max ms | 1 thread p50 / p95 / max ms |
+|---|---|---|---|---|
+| F4 K=50 | NL | 100 | 498.7 / 1280.9 / 2147.5 | 1005.4 / 2990.4 / 4762.3 |
+| F4 K=50 | name | 100 | 254.0 / 892.6 / 1116.8 | 626.8 / 2101.4 / 2784.6 |
+| F4 K=50 | all | 200 | 355.2 / 1137.2 / 2147.5 | 828.7 / 2656.4 / 4762.3 |
+| F4 K=20 | NL | 100 | 158.5 / 559.6 / 925.4 | 384.8 / 1353.0 / 2090.8 |
+| F4 K=20 | name | 100 | 88.5 / 319.0 / 537.9 | 225.0 / 868.7 / 1458.3 |
+| F4 K=20 | all | 200 | 131.1 / 460.2 / 925.4 | 326.9 / 1215.8 / 2090.8 |
+| graph K=50 | NL | 100 | 1.1 / 2.4 / 2.8 | 0.9 / 1.9 / 2.7 |
+| graph K=50 | name | 100 | 1.1 / 2.1 / 3.0 | 1.2 / 2.3 / 3.6 |
+| graph K=50 | all | 200 | 1.1 / 2.3 / 3.0 | 1.1 / 2.2 / 3.6 |
+
+Mean cost per scored pair (total F4 time / pairs): default threads 9.62 ms
+at K=50 (10000 pairs), 8.84 ms at K=20 (4000 pairs); 1 thread 21.43 ms and
+21.74 ms. Time is dominated by pair length: NL queries are longer than
+names, and the p95/max tail is queries whose top-K carries long doc
+comments (up to the 512-token truncation).
+
+Runs, each one warm-up + timed pass for both K and the graph reference:
+
+| intra-op threads | uptime at start | uptime at end | `time -p` real / user / sys |
+|---|---|---|---|
+| 0 (onnxruntime default = physical cores, 4) | 2.60 3.27 3.89 | 7.02 5.49 4.71 | 244.41 / 953.11 / 5.46 s |
+| 1 | 7.02 5.49 4.71 | 3.78 4.26 4.44 | 602.92 / 598.51 / 3.81 s |
+
+The load rise during the default run is the run itself (user/real 3.9, four
+busy intra-op threads); spotlightknowledged at 30.9% was the top other
+process right after it. The 1-thread run started on that residual load but
+was CPU-bound throughout (user ≈ real), and no other process was above 50%
+at its end (two Chrome renderers at ~28%). Neither run was waiting.
+
+**Reading.** The realistic setting for an MCP server is the default
+(onnxruntime uses all physical cores; g-mesh's product code sets no thread
+count), on a laptop that is otherwise mostly idle between tool calls; the
+1-thread column is what the user gets when the machine is busy. At K=50 F4
+adds a median 0.36 s (NL 0.50 s) and a p95 of 1.1 s (NL 1.3 s), with a 2.1 s
+worst case, per `search_code` call; at K=20 it adds a median 0.13 s and a p95
+of 0.46 s (worst 0.93 s). For an agent tool call, where the model's own turn
+takes seconds, K=20 is comfortably acceptable and K=50 is acceptable but
+noticeable on NL queries, and doubles to 2.5-3 s p95 on a busy machine. The
+graph rerank is free by comparison (about 1 ms). Whether K=20 keeps F4's
+quality gain was not measured here (S11 used K=50); that is the question if
+the latency of K=50 is judged too high.
+
+### S12 reproduce
+
+```
+python3 eval/embedding/rerank_eval.py --work <main checkout>/eval/embedding/work --latency-f4 200
+python3 eval/embedding/rerank_eval.py --work <main checkout>/eval/embedding/work --latency-f4 200 --ort-threads 1
+```

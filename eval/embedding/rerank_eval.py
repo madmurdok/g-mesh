@@ -35,6 +35,7 @@ Cross-encoder logits are cached per pair under <work>/rerank_cache/.
 usage: rerank_eval.py --work <eval/embedding/work> [--corpora a,b --max-queries N]
                       [--table out.md] [--json out.json]
        rerank_eval.py --work <eval/embedding/work> --latency N   (K=50 timing only)
+       rerank_eval.py --work <eval/embedding/work> --latency-f4 N [--ort-threads T]   (S12)
 """
 import argparse
 import hashlib
@@ -370,7 +371,7 @@ def shipped_floors(repo):
 
 # --- rerankers ----------------------------------------------------------------
 class CrossEncoder:
-    def __init__(self, work, name):
+    def __init__(self, work, name, threads=0):
         import onnxruntime as ort
         from tokenizers import Tokenizer
         d = work / "models" / CE_DIR[name]
@@ -380,6 +381,7 @@ class CrossEncoder:
         self.pad_id = next(i for i in (self.tok.token_to_id(t) for t in ("[PAD]", "<pad>")) if i is not None)
         assert self.pad_id is not None
         so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
         self.sess = ort.InferenceSession(str(d / "model.onnx"), so, providers=["CPUExecutionProvider"])
         self.names = {i.name for i in self.sess.get_inputs()}
         self.threads = so.intra_op_num_threads
@@ -550,6 +552,71 @@ def latency_only(work, cs, n):
     return res
 
 
+F4_BETA = 40.0  # S11's F4: ce-minilm logit + 40 * int8 cosine orders int8's top-K
+
+
+def latency_f4(work, cs, n, threads):
+    """GM-443 S12: per-query wall time added by F4 on top of int8 recall: ce-minilm over
+    int8's top-K (tokenize + model) plus the blend and sort, for K=50 and K=20, and the
+    graph features over int8 K=50 for reference. Stratified seeded sample: n/2 NL
+    queries (queries/<corpus>.jsonl, positives and absent) and n/2 name queries
+    (queries/mechanical). One full untimed warm-up pass, then the timed pass. Excludes
+    the query embedding and vector search that int8 already runs today."""
+    rng = random.Random(50)
+    pool = {m: [(c, q) for c in cs for q in c.qids if c.queries[q]["mechanical"] == m] for m in (False, True)}
+    sample = [(c, q, m) for m in (False, True) for c, q in rng.sample(pool[m], min(n // 2, len(pool[m])))]
+    ce = CrossEncoder(work, "ce-minilm", threads)
+    print(f"sample {len(sample)} (NL {sum(1 for x in sample if not x[2])}, name {sum(1 for x in sample if x[2])}); "
+          f"ort intra-op threads {ce.threads} (0=default); {os.popen('uptime').read().strip()}", flush=True)
+
+    def f4(c, q, K):
+        hits = c.lists[INT8][q][:K]
+        t0 = time.perf_counter()
+        s = ce.score(c.queries[q]["text"], [c.text[x] for x, _ in hits])
+        s = s + F4_BETA * np.array([v for _, v in hits])
+        order = np.lexsort((np.arange(len(hits)), -s))
+        _ = [hits[i][0] for i in order]
+        return time.perf_counter() - t0
+
+    res = {}
+    steps, done = 2 * 2 * len(sample), 0
+    for K in (50, 20):
+        for timed in (False, True):
+            ts = {False: [], True: []}
+            for c, q, m in sample:
+                ts[m].append(f4(c, q, K))
+                done += 1
+                if done % max(1, steps // 10) == 0:
+                    print(f"  progress {done}/{steps}", flush=True)
+            if timed:
+                res[K] = ts
+    out = {}
+    for K, ts in res.items():
+        for label, v in (("NL", ts[False]), ("name", ts[True]), ("all", ts[False] + ts[True])):
+            out[f"F4 K={K} {label}"] = v
+    for K in (50, 20):
+        allv = out[f"F4 K={K} all"]
+        npairs = sum(min(K, len(c.lists[INT8][q])) for c, q, _ in sample)
+        print(f"per-pair K={K}: {1000 * sum(allv) / npairs:.2f} ms ({npairs} pairs)", flush=True)
+    for m, label in ((False, "NL"), (True, "name")):
+        for timed in (False, True):
+            ts = []
+            for c in cs:
+                qs = [q for cc, q, mm in sample if cc is c and mm == m]
+                ts += graph_features(c, qs, INT8)[1]
+            if timed:
+                out[f"graph K=50 {label}"] = ts
+    out["graph K=50 all"] = out["graph K=50 NL"] + out["graph K=50 name"]
+    print("| variant | queries | n | p50 ms | p95 ms | max ms |")
+    print("|---|---|---|---|---|---|")
+    for k, v in out.items():
+        name, K, label = k.rsplit(" ", 2)
+        print(f"| {name} {K} | {label} | {len(v)} | {1000 * statistics.median(v):.1f} | "
+              f"{1000 * pctl(v, 0.95):.1f} | {1000 * max(v):.1f} |")
+    print(f"ort intra-op threads {ce.threads} (0=default); end: {os.popen('uptime').read().strip()}", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True, type=Path)
@@ -561,6 +628,9 @@ def main():
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     ap.add_argument("--latency", type=int, default=0,
                     help="only time the K=50 rerank of N seeded-sampled queries per reranker (no cache)")
+    ap.add_argument("--latency-f4", type=int, default=0,
+                    help="GM-443 S12: time F4 (ce-minilm over int8, K=50/20) on N queries, half NL half name")
+    ap.add_argument("--ort-threads", type=int, default=0, help="onnxruntime intra-op threads (0=default)")
     a = ap.parse_args()
     toml = (a.eval_dir / "variants.toml").read_text()
     for k in ("bootstrap_seed", "bootstrap_resamples"):
@@ -571,6 +641,8 @@ def main():
     if a.corpora:
         corpora = a.corpora.split(",")
     cs = [Corpus(a.work, a.eval_dir, c, a.max_queries) for c in corpora]
+    if a.latency_f4:
+        return latency_f4(a.work, cs, a.latency_f4, a.ort_threads)
     if a.latency:
         return latency_only(a.work, cs, a.latency)
     print(f"corpora: {', '.join(corpora)}; queries {sum(len(c.qids) for c in cs)}; bootstrap seed "
