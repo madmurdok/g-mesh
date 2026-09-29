@@ -626,6 +626,17 @@ fn an_ambiguous_name_labels_its_page_as_the_ambiguity_it_is() {
 
     assert_eq!(body["ambiguous"], true);
     assert_eq!(body["resolvedBy"], "nameAmbiguous");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "on every candidate page");
+}
+
+#[test]
+fn a_unique_name_carries_no_ambiguity_explanation() {
+    let mut conn = setup();
+    upsert_node(&mut conn, NodeRecord::new("a", "Function", "run", "run", "a.rs", "rust")).unwrap();
+
+    let body = json_body(&by_name(&conn, None, None, "run", None).unwrap());
+
+    assert!(body.get("explanation").is_none(), "{body}");
 }
 
 // --- GM-360: neither key is a unique one -------------------------------

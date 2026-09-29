@@ -35,6 +35,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::session_hints;
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
 
@@ -85,10 +86,10 @@ struct ImplementationPage {
     /// See `Page::all_unresolved` - true when every implementor in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
-    /// See `anchor::file_anchor_hint` - present only when the anchor resolved
-    /// to a `File` node, absent (not `null`) on every ordinary symbol anchor.
+    /// `anchor::file_anchor_hint`, then `session_hints::ALL_UNRESOLVED` when
+    /// `all_unresolved`; absent (not `null`) when neither applies.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -193,7 +194,7 @@ pub(super) fn handle(
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
-        hint,
+        hint: session_hints::join([hint, page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED)]),
         provenance,
     })
 }
@@ -267,8 +268,10 @@ struct TransitiveImplementationWalk {
     truncated_by: Option<&'static str>,
     frontier_nodes: Vec<String>,
     resume_token: Option<String>,
+    /// The anchor's `anchor::file_anchor_hint`, then `session_hints::truncated_by`
+    /// for a truncated walk; absent (not `null`) when neither applies.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     /// See `super::provenance`. Present on a fresh walk under exactly the
     /// same condition the single-hop page carries it. A *resumed* page
     /// resolves no anchor and carries only a `pending` block, when its rows'
@@ -341,14 +344,15 @@ fn bound_walk(
 
     let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES - reserve)
     else {
+        let truncated_by = result.truncated_by.map(wire_name);
         return TransitiveImplementationWalk {
             anchor,
             results: dtos,
             truncated: result.truncated,
-            truncated_by: result.truncated_by.map(wire_name),
+            truncated_by,
             frontier_nodes: result.frontier_nodes,
             resume_token: result.resume_token,
-            hint,
+            hint: session_hints::join([hint, truncated_by.and_then(session_hints::truncated_by)]),
             provenance: None,
         };
     };
@@ -386,7 +390,7 @@ fn bound_walk(
         truncated_by: Some("responseSize"),
         frontier_nodes: Vec::new(),
         resume_token: Some(token),
-        hint,
+        hint: session_hints::join([hint, session_hints::truncated_by("responseSize")]),
         provenance: None,
     }
 }

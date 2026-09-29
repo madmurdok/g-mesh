@@ -7,6 +7,7 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
+use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
 use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
@@ -113,6 +114,7 @@ fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Va
         store,
         &EmbeddingPipeline::disabled(),
         &rust_with_a_semantic_tier(),
+        &SessionHints::default(),
         params,
     )
     .unwrap();
@@ -135,6 +137,7 @@ fn references(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
         store,
         &EmbeddingPipeline::disabled(),
         &rust_with_a_semantic_tier(),
+        &SessionHints::default(),
         by_id(id),
     )
     .unwrap();

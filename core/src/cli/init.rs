@@ -98,7 +98,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::cli::{agent_instructions, stop, AgentTarget};
+use crate::cli::agent_instructions::{self, AgentsMdWrite};
+use crate::cli::{stop, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
@@ -315,11 +316,12 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         let _ = writeln!(out, "  semantic:   pass complete over what the walk could not resolve");
     }
     if !outcome.agents.is_empty() {
-        if outcome.agent_instructions.agents_md_written {
-            let _ = writeln!(out, "  AGENTS.md:  wrote the g-mesh code-search snippet");
-        } else {
-            let _ = writeln!(out, "  AGENTS.md:  already had the g-mesh snippet - left untouched");
-        }
+        let agents_md = match outcome.agent_instructions.agents_md_written {
+            AgentsMdWrite::Created | AgentsMdWrite::Appended => "wrote the g-mesh code-search snippet",
+            AgentsMdWrite::Refreshed => "refreshed the g-mesh block to this version's snippet",
+            AgentsMdWrite::Unchanged => "already had the g-mesh snippet - left untouched",
+        };
+        let _ = writeln!(out, "  AGENTS.md:  {agents_md}");
         for agent in &outcome.agents {
             match agent {
                 AgentTarget::AgentsMd => {}
@@ -446,7 +448,7 @@ mod tests {
             semantic_pass_ran: false,
             agents: vec![AgentTarget::Claude, AgentTarget::Gemini],
             agent_instructions: agent_instructions::Outcome {
-                agents_md_written: true,
+                agents_md_written: AgentsMdWrite::Created,
                 claude_md_written: true,
                 gemini_md_written: true,
             },
@@ -482,5 +484,31 @@ mod tests {
         );
         assert!(rendered.contains("CLAUDE.md:  already bridges to AGENTS.md - left untouched"), "{rendered}");
         assert!(!rendered.contains("GEMINI.md"), "Gemini was never requested: {rendered}");
+    }
+
+    /// A re-run that replaced an older installed block says so, rather than
+    /// claiming a fresh write or that nothing changed.
+    #[test]
+    fn a_refreshed_agents_md_block_is_reported_as_refreshed() {
+        let outcome = Outcome {
+            project_id: "a1b2c3d4e5f6a7b8".to_string(),
+            state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
+            daemon_was_running: false,
+            config_written: false,
+            summary: None,
+            semantic_pass_ran: false,
+            agents: vec![AgentTarget::AgentsMd],
+            agent_instructions: agent_instructions::Outcome {
+                agents_md_written: AgentsMdWrite::Refreshed,
+                ..agent_instructions::Outcome::default()
+            },
+        };
+
+        let rendered = render(&outcome, &PathBuf::from("/tmp/project"));
+
+        assert!(
+            rendered.contains("AGENTS.md:  refreshed the g-mesh block to this version's snippet"),
+            "{rendered}"
+        );
     }
 }

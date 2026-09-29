@@ -265,6 +265,10 @@ type fileChangeResponse struct {
 	ID         json.RawMessage `json:"id"`
 	Result     fileChangeDiff  `json:"result"`
 	Incomplete bool            `json:"incomplete,omitempty"`
+	// IncompleteReason is the wire's `incompleteReason`: beside
+	// `incomplete: true` only, why the pass did not cover everything, which
+	// core records per language and shows in `g-mesh status`.
+	IncompleteReason string `json:"incompleteReason,omitempty"`
 }
 
 // ackResponse is the `{ acknowledged: true }` shape this plugin answers a

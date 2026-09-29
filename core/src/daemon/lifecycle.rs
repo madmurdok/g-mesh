@@ -742,8 +742,12 @@ pub fn supervise(
 /// are ignored: a leftover file is cosmetic, and refusing to exit over one
 /// would be worse. Plugin pid files are found by listing the state directory,
 /// not from the registry's live supervisors.
+///
+/// The daemon's own pid file goes after every other descriptive file: its
+/// absence is what tells an outside reader (the shim, `status`, the tests)
+/// that the daemon is gone, so nothing it describes may outlive it (GM-446).
+/// The endpoint stays last, as before.
 fn release_state_files(state_dir: &Path) {
-    let _ = fs::remove_file(super::pid_path_in(state_dir));
     for (_, pid_file) in super::registry::discovered_pid_files(state_dir) {
         let _ = fs::remove_file(pid_file);
     }
@@ -753,6 +757,7 @@ fn release_state_files(state_dir: &Path) {
     // `docs/architecture/lazy-indexing.md`).
     let _ = fs::remove_file(super::phase_path_in(state_dir));
     let _ = fs::remove_file(super::progress_path_in(state_dir));
+    let _ = fs::remove_file(super::pid_path_in(state_dir));
     // Derived through the parent module so what a daemon binds and what it
     // releases are the same endpoint by construction. No-op on Windows.
     if let Some(endpoint) = super::endpoint_in(state_dir) {

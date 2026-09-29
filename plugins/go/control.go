@@ -192,13 +192,14 @@ func nodesEqual(a, b wireNode) bool {
 // than merely go uninstrumented: the engine's own first `packages.Load`
 // writes the kit's marker, and that call can only be reached from here.
 //
-// With no Go toolchain on PATH, or a `packages.Load` that fails outright,
-// the engine logs once and returns an empty diff with the second return
-// value `true` - GM-384's `incomplete`, without which the structural graph
+// With no Go toolchain on PATH, or a `packages.Load` that fails outright in
+// any module, the engine logs once and returns a non-empty second value -
+// the wire's `incompleteReason`, whose presence is GM-384's `incomplete`
+// (GM-442 extended it from "every module failed" to "any"), without which the structural graph
 // stayed put but Go's `language_state.semanticPassAt` got set anyway, and
 // the receiver-call gap dropped out of the MCP instructions despite no
 // semantic tier having actually run.
-func (s *pluginState) handleSemanticPass(filePaths []string) (fileChangeDiff, bool) {
+func (s *pluginState) handleSemanticPass(filePaths []string) (fileChangeDiff, string) {
 	return s.semantic.run(s.workspace, filePaths)
 }
 
@@ -233,7 +234,7 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 			// A structural reparse has nothing to be incomplete about
 			// (core/src/watcher/apply.rs's own comment on this same
 			// distinction) - always `false`.
-			writeResult(out, env.ID, diff, false)
+			writeResult(out, env.ID, diff, "")
 		}
 		return
 
@@ -251,9 +252,9 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		} else {
 			logf("semantic pass requested for %d file(s)", len(params.FilePaths))
 		}
-		diff, incomplete := state.handleSemanticPass(params.FilePaths)
+		diff, incompleteReason := state.handleSemanticPass(params.FilePaths)
 		if hasID {
-			writeResult(out, env.ID, diff, incomplete)
+			writeResult(out, env.ID, diff, incompleteReason)
 		}
 		return
 
@@ -306,8 +307,17 @@ func workspaceChangedFilePath(params json.RawMessage) string {
 	return p.FilePath
 }
 
-func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incomplete bool) {
-	body, err := json.Marshal(fileChangeResponse{JSONRPC: jsonrpcVersion, ID: id, Result: diff, Incomplete: incomplete})
+// writeResult answers a request with a diff. A non-empty `incompleteReason`
+// marks the answer incomplete and says why; "" is a complete answer, which
+// carries neither field.
+func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incompleteReason string) {
+	body, err := json.Marshal(fileChangeResponse{
+		JSONRPC:          jsonrpcVersion,
+		ID:               id,
+		Result:           diff,
+		Incomplete:       incompleteReason != "",
+		IncompleteReason: incompleteReason,
+	})
 	if err != nil {
 		logf("failed to encode response: %v", err)
 		return
