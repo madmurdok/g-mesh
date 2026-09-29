@@ -19,6 +19,12 @@ confident-wrong, floors, held-out false alarm and the D9 verdict rows for
 jina fp32, gte-small, bge-small and bm25, plus int8's Q5 row (bootstrap check),
 and three fusion-code controls; any mismatch stops the script.
 
+The int8 arm (the shipped model) is fused with BM25 too and gated against both
+int8 and fp32. Its controls: int8's GM-398 rows, the shipped floors read from
+core/src/mcp/similarity.rs equal to its D6 fit, and the GM-434 verdict rule
+(`shipped_floor_rates.py --after`) reproduced on fp32. The GM-434 columns score
+each variant's first page at the shipped int8 floors, rows judged by int8 cosine.
+
 usage: fusion_eval.py --runs <eval/embedding/work/runs> [--work <eval/embedding/work>]
                       [--corpora a,b] [--json out.json]
 """
@@ -33,6 +39,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import shipped_floor_rates as SFR  # noqa: E402  (rust_is_prose / rust_is_specifier)
+
 KEPT_HITS = 100
 MAX_FALSE_ALARM = 0.03
 EPS = 1e-12
@@ -40,7 +49,9 @@ REF = "jina-v2-base-code-fp32"
 GTE, BGE, BM25, INT8 = "gte-small", "bge-small-en-v1.5", "bm25", "jina-v2-base-code-int8"
 EMBEDDERS = [REF, GTE, BGE]
 LANGS = ["go", "python", "rust", "typescript"]
-SHORT = {REF: "jina", GTE: "gte", BGE: "bge", BM25: "bm25"}
+SHORT = {REF: "jina", GTE: "gte", BGE: "bge", BM25: "bm25", INT8: "int8"}
+VECTOR_ARMS = EMBEDDERS + [INT8]  # arms whose vectors are loaded (judge scores, controls)
+PAGE = 20  # graph/pagination.rs DEFAULT_PAGE_SIZE: the first page search_code's verdict reads
 WEIGHTS = [round(0.05 * i, 2) for i in range(1, 20)]  # embedder weight grid, fit half only
 
 
@@ -130,12 +141,20 @@ class Corpus:
         # Full cosine matrices (queries x nodes) of the embedders, float64 of unit rows.
         self.cos = {}
         for arm in arms:
-            if arm in EMBEDDERS:
+            if arm in VECTOR_ARMS:
                 man = mans[arm]
                 nv = unit(read_vectors(runs / arm / corpus / "vectors.bin", man["nodeCount"], man["dimension"]))
                 qv = unit(read_vectors(runs / arm / corpus / "query_vectors.bin", len(self.qids), man["dimension"]))
                 self.cos[arm] = qv @ nv.T
         self.qrow = {q: i for i, q in enumerate(self.qids)}
+        self._stored = {}
+
+    def stored(self, arm, qid):
+        """{node id: stored score} of an arm's top-100 for one query."""
+        key = (arm, qid)
+        if key not in self._stored:
+            self._stored[key] = dict(self.lists[arm][qid])
+        return self._stored[key]
 
 
 # --- ranking helpers ---------------------------------------------------------
@@ -178,13 +197,19 @@ def full_rank_list(c, arm, qid):
 
 
 # --- outcomes -----------------------------------------------------------------
-def outcome(c, qid, hits, top_score):
+def outcome(c, qid, hits, top_score, page=None):
+    """`page`: [(language, judge score)] of the first PAGE rows, for the shipped verdict rule."""
     q = c.queries[qid]
     exp = c.expected[qid]
     rank = next((i + 1 for i, (nid, _) in enumerate(hits[:KEPT_HITS]) if nid in exp), None)
     return {"id": qid, "corpus": c.name, "language": q["language"], "positive": q["positive"],
             "mechanical": q["mechanical"], "held_out": q["held_out"], "rank": rank,
-            "top": top_score, "top_language": c.node_lang.get(hits[0][0]) if hits else None}
+            "top": top_score, "top_language": c.node_lang.get(hits[0][0]) if hits else None,
+            "text": q["text"], "page": page}
+
+
+def judge_page(c, arm, qid, hits):
+    return [(c.node_lang.get(nid), judge_score(c, [arm], qid, nid)) for nid, _ in hits[:PAGE]]
 
 
 def judge_score(c, arms, qid, nid):
@@ -192,7 +217,7 @@ def judge_score(c, arms, qid, nid):
     in that arm's stored top-100, else the recomputed cosine."""
     vals = []
     for arm in arms:
-        stored = dict(c.lists[arm][qid])
+        stored = c.stored(arm, qid)
         vals.append(stored[nid] if nid in stored else float(c.cos[arm][c.qrow[qid], c.index[nid]]))
     return sum(vals) / len(vals)
 
@@ -386,6 +411,64 @@ def summarize(outs):
     return s
 
 
+# --- GM-434: the shipped verdict rule at fixed floors (shipped_floor_rates.py) ---
+def read_shipped_floors(repo):
+    """core/src/mcp/similarity.rs `floor` and DEFAULT_FLOOR, read from the source."""
+    src = (repo / "core/src/mcp/similarity.rs").read_text()
+    body = re.search(r"pub\(crate\) fn floor\(language: &str\) -> f64 \{(.*?)\n\}", src, re.S).group(1)
+    fl = {m.group(1): float(m.group(2)) for m in re.finditer(r'"(\w+)" => ([0-9.]+),', body)}
+    default = float(re.search(r"const DEFAULT_FLOOR: f64 = ([0-9.]+);", src).group(1))
+    return fl, default
+
+
+def signal(o, floors, default, page_rule):
+    """similarity.rs verdict + low_similarity on a first page: HARD = noMatch, SOFT =
+    lowSimilarity, NONE. page_rule: every row of the page below its own language's floor
+    (below_floor); otherwise the top row against the top row's language, as GM-434 scored it."""
+    if SFR.rust_is_specifier(o["text"]):
+        return "HARD"
+    if o["top"] is None:
+        return "NONE"
+    rows = o["page"] if page_rule else [(o["top_language"], o["top"])]
+    if any(sc >= floors.get(l, default) for l, sc in rows):
+        return "NONE"
+    return "SOFT" if SFR.rust_is_prose(o["text"]) else "HARD"
+
+
+GM434_SETS = {"NL held-out": lambda o: not o["mechanical"] and o["held_out"],
+              "NL all": lambda o: not o["mechanical"], "name": lambda o: o["mechanical"]}
+
+
+def gm434(outs, floors, default, page_rule=True):
+    """{set: {language|all: counts}}; misled = HARD with the right answer at rank 1,
+    confident wrong = NONE with a wrong top row (positive) or any row (absent)."""
+    res = {}
+    for sname, sf in GM434_SETS.items():
+        res[sname] = {}
+        for lang in LANGS + ["all"]:
+            c = {"R": 0, "misled": 0, "pos": 0, "abs": 0, "cw_pos": 0, "cw_abs": 0, "HARD": 0, "SOFT": 0, "NONE": 0}
+            for o in outs:
+                if o["top"] is None or not sf(o) or (lang != "all" and o["language"] != lang):
+                    continue
+                sg = signal(o, floors, default, page_rule)
+                right = o["positive"] and o["rank"] == 1
+                c["R"] += right
+                c["pos"] += o["positive"]
+                c["abs"] += not o["positive"]
+                c[sg] += 1
+                c["misled"] += sg == "HARD" and right
+                if sg == "NONE" and not right:
+                    c["cw_pos" if o["positive"] else "cw_abs"] += 1
+            res[sname][lang] = c
+    return res
+
+
+def gm434_s(g, sname, lang="all"):
+    c = g[sname][lang]
+    f = lambda n, d: f"{100 * n / d:.1f}% ({n}/{d})" if d else "-"
+    return f"misled {f(c['misled'], c['R'])} CW pos {f(c['cw_pos'], c['pos'])} CW abs {f(c['cw_abs'], c['abs'])}"
+
+
 # --- main ---------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -410,14 +493,18 @@ def main():
           f"resamples {SETTINGS['bootstrap_resamples']}")
 
     # Unfused arms, straight from the stored lists.
-    base = {arm: [outcome(c, q, c.lists[arm][q], c.lists[arm][q][0][1] if c.lists[arm][q] else None)
+    base = {arm: [outcome(c, q, c.lists[arm][q], c.lists[arm][q][0][1] if c.lists[arm][q] else None,
+                          [(c.node_lang.get(n), sc) for n, sc in c.lists[arm][q][:PAGE]])
                   for c in cs for q in c.qids] for arm in arms}
+    repo = Path(__file__).resolve().parents[2]
+    ship_fl, ship_default = read_shipped_floors(repo)
+    print(f"shipped floors (similarity.rs): {ship_fl}, default {ship_default}")
 
     # ---------------- 0. controls ----------------
     bad = []
     print("\n== 0. controls ==")
     # 0a. vectors reproduce the stored rankings (vector loading and node order are right).
-    for arm in EMBEDDERS:
+    for arm in VECTOR_ARMS:
         same10 = tot = 0
         maxdiff = 0.0
         for c in cs:
@@ -437,13 +524,16 @@ def main():
             GTE: (0.275, 0.478, 0.580, 0.540, 0.617, 0.373, 0.340, 0.406, 59.8, 61.9, 50.0),
             BGE: (0.258, 0.485, 0.557, 0.518, 0.595, 0.360, 0.327, 0.392, 64.0, 66.5, 52.2),
             BM25: (0.245, 0.400, 0.448, 0.407, 0.488, 0.320, None, None, 73.9, 72.6, 80.4),
+            INT8: (0.328, 0.532, 0.637, 0.600, 0.675, 0.424, 0.392, 0.457, 46.4, 51.6, 21.7),
         }
         want_fl = {REF: ([.56, .58, .56, .55], [18.8, 9.5, 14.3, 14.8]),
                    GTE: ([.86, .86, .85, .84], [25.0, 7.7, 0.0, 5.0]),
-                   BGE: ([.69, .71, .70, .67], [8.3, 0.0, 0.0, 11.8])}
+                   BGE: ([.69, .71, .70, .67], [8.3, 0.0, 0.0, 11.8]),
+                   INT8: ([.57, .57, .55, .53], [29.4, 10.0, 14.3, 7.7])}
         # "Verdicts under D9": dr10, lower, dmrr, lower, q3 worst (lang, pts), dcw, upper, dfa, upper
         want_v = {GTE: (-5.3, -9.2, -0.055, -0.086, ("typescript", -9.0), 11.1, 16.7, -10.3, 0.0),
-                  BGE: (-7.5, -11.8, -0.068, -0.100, ("python", -10.0), 14.8, 20.1, -12.1, -0.2)}
+                  BGE: (-7.5, -11.8, -0.068, -0.100, ("python", -10.0), 14.8, 20.1, -12.1, -0.2),
+                  INT8: (0.5, -1.0, -0.003, -0.012, ("go", -1.0), -1.4, 1.0, 2.1, 6.2)}
         for arm, w in want.items():
             o = base[arm]
             r1 = pooled(o, lambda x: 1.0 if x["rank"] is not None and x["rank"] <= 1 else 0.0, scored)[0]
@@ -484,14 +574,41 @@ def main():
         print(f"0e int8 Q5 pooled {got}: {'MATCH' if ok else 'MISMATCH (2.1, -1.4, 6.2)'}")
         if not ok:
             bad.append("0e int8 Q5")
+        # 0h. the shipped int8 floors are its D6 fit (ADR 0011), and DEFAULT_FLOOR is their minimum.
+        fl8 = fit_floors(base[INT8])
+        ok = fl8 == ship_fl and ship_default == min(ship_fl.values())
+        print(f"0h int8 D6 floors {fl8} vs shipped {ship_fl} default {ship_default}: {'MATCH' if ok else 'MISMATCH'}")
+        if not ok:
+            bad.append("0h shipped floors")
+        # 0i. the GM-434 port: fp32 at the fp32 shipped floors, top-row rule, reproduces
+        # `shipped_floor_rates.py --after` ("after" columns: misled, R, CW abs, abs, CW pos, pos, HARD, SOFT).
+        want_434 = {"NL held-out": (0, 71, 17, 46, 110, 215, 0, 73), "NL all": (0, 134, 41, 100, 206, 400, 0, 139),
+                    "name": (5, 569, 222, 900, 292, 879, 701, 0)}
+        g = gm434(base[REF], SFR.SHIPPED, SFR.DEFAULT_FLOOR, page_rule=False)
+        for sname, w in want_434.items():
+            x = g[sname]["all"]
+            got = tuple(x[k] for k in ("misled", "R", "cw_abs", "abs", "cw_pos", "pos", "HARD", "SOFT"))
+            ok = got == w
+            print(f"0i GM-434 port, fp32 {sname}: {got}: {'MATCH' if ok else 'MISMATCH ' + str(w)}")
+            if not ok:
+                bad.append(f"0i GM-434 port {sname}")
     # 0f. fusion code: fusing jina with itself must give jina back.
-    for label, fn in [("RRF k=60", lambda c, q: rrf([c.lists[REF][q]] * 2, 60, c.index)),
-                      ("weighted w=0.5", lambda c, q: weighted(c.lists[REF][q], c.lists[REF][q], 0.5, c.index))]:
-        o = [outcome(c, q, fn(c, q), None) for c in cs for q in c.qids]
-        diff = sum(1 for x, y in zip(o, base[REF]) if x["rank"] != y["rank"])
-        print(f"0f {label} of jina with itself: first-expected rank differs on {diff} queries")
-        if diff:
-            bad.append(f"0f self-fusion {label}")
+    for arm in (REF, INT8):
+        for label, fn in [("RRF k=60", lambda c, q, a_=arm: rrf([c.lists[a_][q]] * 2, 60, c.index)),
+                          ("RRF k=10", lambda c, q, a_=arm: rrf([c.lists[a_][q]] * 2, 10, c.index)),
+                          ("weighted w=0.65", lambda c, q, a_=arm: weighted(c.lists[a_][q], c.lists[a_][q], 0.65, c.index))]:
+            o = [outcome(c, q, fn(c, q), None) for c in cs for q in c.qids]
+            diff = sum(1 for x, y in zip(o, base[arm]) if x["rank"] != y["rank"])
+            print(f"0f {label} of {SHORT[arm]} with itself: first-expected rank differs on {diff} queries")
+            if diff:
+                bad.append(f"0f self-fusion {SHORT[arm]} {label}")
+    # 0j. the page rule on int8 alone: judge page (recomputed cosines) equals the stored page.
+    o = [outcome(c, q, c.lists[INT8][q], c.lists[INT8][q][0][1], judge_page(c, INT8, q, c.lists[INT8][q]))
+         for c in cs for q in c.qids]
+    diff = sum(1 for x, y in zip(o, base[INT8]) if x["page"] != y["page"])
+    print(f"0j int8 judge page vs stored page: differs on {diff} queries")
+    if diff:
+        bad.append("0j judge page")
     # 0g. concat of gte with itself == gte from vectors.
     o = [outcome(c, q, top_from_scores((c.cos[GTE][c.qrow[q]] * 2) / 2, c.ids), None) for c in cs for q in c.qids]
     diff = sum(1 for x, y in zip(o, base[GTE]) if x["rank"] != y["rank"])
@@ -512,7 +629,8 @@ def main():
             for q in c.qids:
                 hits = fused_fn(c, q)
                 top = hits[0][0] if hits else None
-                judge.append(outcome(c, q, hits, judge_score(c, judge_arms, q, top) if top else None))
+                page = [(c.node_lang.get(n), judge_score(c, judge_arms, q, n)) for n, _ in hits[:PAGE]]
+                judge.append(outcome(c, q, hits, judge_score(c, judge_arms, q, top) if top else None, page))
                 own.append(outcome(c, q, hits, own_norm(hits[0][1]) if hits else None))
         variants[name] = {"judge": judge, "own": own, "meta": meta}
 
@@ -527,7 +645,7 @@ def main():
           [GTE, BGE], lambda s: s, {"tuned": False, "rrf": False, "own_is_judge": True})
 
     tuning = {}
-    for emb in EMBEDDERS:
+    for emb in EMBEDDERS + [INT8]:
         for k in (60, 10):
             build(f"{SHORT[emb]}+bm25 RRF k={k}", lambda c, q, e=emb, k=k: rrf([c.lists[e][q], c.lists[BM25][q]], k, c.index),
                   [emb], lambda s, k=k: s / (2.0 / (k + 1)), {"tuned": False, "rrf": True})
@@ -548,17 +666,18 @@ def main():
     # Truncation: untruncated RRF k=60 (embedders' full cosine rankings; bm25 stays top-100).
     untrunc = {}
     for label, parts in [("gte+bge RRF k=60", [GTE, BGE]), ("jina+bm25 RRF k=60", [REF, BM25]),
-                         ("gte+bm25 RRF k=60", [GTE, BM25]), ("bge+bm25 RRF k=60", [BGE, BM25])]:
+                         ("gte+bm25 RRF k=60", [GTE, BM25]), ("bge+bm25 RRF k=60", [BGE, BM25]),
+                         ("int8+bm25 RRF k=60", [INT8, BM25])]:
         outs = []
         for c in cs:
             for q in c.qids:
-                ls = [full_rank_list(c, p, q) if p in EMBEDDERS else c.lists[p][q] for p in parts]
+                ls = [full_rank_list(c, p, q) if p in VECTOR_ARMS else c.lists[p][q] for p in parts]
                 outs.append(outcome(c, q, rrf(ls, 60, c.index), None))
         untrunc[label] = summarize(outs)
     # How often the expected answer sits in only one of the two top-100 lists.
     one_list = {}
     for label, (x, y) in {"gte+bge": (GTE, BGE), "jina+bm25": (REF, BM25),
-                          "gte+bm25": (GTE, BM25), "bge+bm25": (BGE, BM25)}.items():
+                          "gte+bm25": (GTE, BM25), "bge+bm25": (BGE, BM25), "int8+bm25": (INT8, BM25)}.items():
         n = only = none = 0
         for c in cs:
             for q in c.qids:
@@ -574,10 +693,10 @@ def main():
         one_list[label] = (only, none, n)
 
     # ---------------- 2. report ----------------
-    res = {"controls": "ok", "base": {a_: summarize(base[a_]) for a_ in [REF, GTE, BGE, BM25]},
+    res = {"controls": "ok", "base": {a_: summarize(base[a_]) for a_ in [REF, INT8, GTE, BGE, BM25]},
            "variants": {}, "tuning": tuning, "untruncated": untrunc, "one_list": one_list}
     print("\n== 1. unfused ==")
-    for arm in [REF, GTE, BGE, BM25]:
+    for arm in [REF, INT8, GTE, BGE, BM25]:
         s = res["base"][arm]
         print(f"{arm}: NL r@10 {f3(s['nl']['r10'])} MRR {f3(s['nl']['mrr'])} | held-out NL r@10 "
               f"{f3(s['nl_heldout']['r10'])} MRR {f3(s['nl_heldout']['mrr'])} (n={s['nl_heldout']['n']}) | "
@@ -612,6 +731,34 @@ def main():
               f"[up {pts(go_['fa'][2])}] floors {floors_s(go_['floors'])}")
         print(f"  non-inferiority (cost role) fails: {fails or 'none'}; superiority Q1 lower>0 {p['Q1sup']}, "
               f"Q2 lower>0 {p['Q2sup']}")
+        if name.startswith("int8+"):
+            gi = gates(base[INT8], v["judge"], ho if v["meta"]["tuned"] else scored)
+            gio = gates(base[INT8], v["own"], ho if v["meta"]["tuned"] else scored)
+            fi = [q for q in ("Q1", "Q2", "Q3", "Q4", "Q5") if not gi["pass"][q]]
+            g434 = gm434(v["judge"], ship_fl, ship_default)
+            res["variants"][name].update({"gates_vs_int8": gi, "gates_vs_int8_own": {k_: gio[k_] for k_ in ("cw", "fa", "floors", "pass")},
+                                          "gm434_shipped_int8": g434})
+            print(f"  vs int8: Q1 dr@10 {pts(gi['r10'][0])} [lo {pts(gi['r10'][1])}] | Q2 dMRR {gi['mrr'][0]:+.3f} "
+                  f"[lo {gi['mrr'][1]:+.3f}] | Q3 worst {gi['q3_worst'][0]} {pts(gi['q3_worst'][1])} | Q4 dCW {pts(gi['cw'][0])} "
+                  f"[up {pts(gi['cw'][2])}] | Q5 dFA {pts(gi['fa'][0])} [up {pts(gi['fa'][2])}] | fails {fi or 'none'}; "
+                  f"sup Q1 {gi['pass']['Q1sup']} Q2 {gi['pass']['Q2sup']}")
+            print(f"  vs int8 own-score: Q4 dCW {pts(gio['cw'][0])} [up {pts(gio['cw'][2])}] Q5 dFA {pts(gio['fa'][0])} "
+                  f"[up {pts(gio['fa'][2])}] floors {floors_s(gio['floors'])} pass Q4 {gio['pass']['Q4']} Q5 {gio['pass']['Q5']}")
+            for sname in GM434_SETS:
+                print(f"  GM-434 @shipped int8 floors, {sname}: {gm434_s(g434, sname)}")
+            print("  GM-434 NL held-out per language: " + "; ".join(f"{l} {gm434_s(g434, 'NL held-out', l)}" for l in LANGS))
+    print("\n== 3b. GM-434 baselines (shipped verdict rule; page = first 20 rows) ==")
+    fl_ref = fit_floors(base[REF])
+    res["gm434_base"] = {}
+    for label, outs, fl, dflt, pr in [("int8 @shipped (page rule)", base[INT8], ship_fl, ship_default, True),
+                                      ("int8 @shipped (top-row rule)", base[INT8], ship_fl, ship_default, False),
+                                      ("int8 @D6-fitted (page rule)", base[INT8], fit_floors(base[INT8]), ship_default, True),
+                                      ("fp32 @D6-fitted (page rule)", base[REF], fl_ref, min(fl_ref.values()), True)]:
+        g434 = gm434(outs, fl, dflt, pr)
+        res["gm434_base"][label] = g434
+        for sname in GM434_SETS:
+            print(f"{label}, {sname}: {gm434_s(g434, sname)}")
+        print(f"{label}, NL held-out per language: " + "; ".join(f"{l} {gm434_s(g434, 'NL held-out', l)}" for l in LANGS))
     print("\n== 4. truncation ==")
     for label, s in untrunc.items():
         print(f"{label} untruncated embedder lists: NL r@10 {f3(s['nl']['r10'])} MRR {f3(s['nl']['mrr'])} "

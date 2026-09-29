@@ -162,3 +162,116 @@ proposed:
 2. Whether a recall-only gain with flat MRR is worth a second retriever. D9's
    quality rule says no.
 3. Cost (step 2, not run here: the owner confirms it first).
+
+## int8 + BM25
+
+GM-422 made jina-v2-base-code **int8** the shipped model (ADR 0011), with its
+own floors, go / python / rust / typescript 0.57 / 0.57 / 0.55 / 0.53
+(`similarity::floor`). This section repeats the jina+BM25 fusions with int8 as
+the embedder. It uses the same stored data (`runs/jina-v2-base-code-int8`) and
+the same script, which now also runs the int8 variants. One run, 224 s wall
+(load average 44 from another agent's build; `user` 164 s).
+
+### Control (int8)
+
+Every check matched; the script stops on any mismatch.
+
+| check | result |
+|---|---|
+| int8 vectors re-rank to the stored lists | top-10 order identical on 2278/2279 (one near-tie); max score diff 1.3e-6 |
+| int8 pooled r@1/r@5/r@10 [lo, hi]/MRR [lo, hi]/CW combined, positives, absent | 0.328 / 0.532 / 0.637 [0.600, 0.675] / 0.424 [0.392, 0.457] / 46.4 / 51.6 / 21.7%: match GM-398 |
+| int8 floors and held-out false alarm | 0.57 / 0.57 / 0.55 / 0.53, 29.4 / 10.0 / 14.3 / 7.7%: match |
+| int8 D9 row vs fp32 (Δr@10 [lower], ΔMRR [lower], Q3 worst, ΔCW [upper], ΔFA [upper]) | +0.5 [-1.0], -0.003 [-0.012], go -1.0, -1.4 [+1.0], +2.1 [+6.2]: match (Q5 +2.1 [-1.4, +6.2]) |
+| shipped floors, read from `core/src/mcp/similarity.rs` | equal to int8's D6 fit, and `DEFAULT_FLOOR` (0.53) is their minimum. So "shipped floors" and "D6-fitted floors" are one baseline, and every int8 row below holds for both |
+| GM-434 verdict port (`shipped_floor_rates.py --after`, fp32 at the 3.16.0 floors) | misled, confident wrong (positives, absent), noMatch and lowSimilarity counts: match on NL held-out, NL all and name |
+| RRF k=60, k=10 and min-max w=0.65 of int8 with itself (and of fp32 with itself) | first-expected rank unchanged on every query |
+| S1's rows (the fp32, gte, bge and bm25 variants, tuning, truncation) | the new run's JSON equals the S1 script's output, field for field, on all 28 entries |
+
+### Variants and results
+
+The variants are RRF k=60 and k=10, and min-max score fusion. The min-max
+weight was tuned as in S1: fit half of the NL positives, grid 0.05..0.95,
+objective r@10 then MRR. The chosen weight is **w = 0.85** (int8's weight;
+fp32 chose 0.65). The fit-half curve is a plateau from 0.60 to 0.95 (r@10
+0.652-0.660), so the exact w is weakly determined. The tuned variant is gated
+on the held-out NL half only.
+
+| variant | NL r@10 | NL MRR | held-out r@10 / MRR | name r@10 / MRR |
+|---|---|---|---|---|
+| **jina int8 (shipped)** | **0.637** | **0.424** | 0.645 / 0.419 | 0.915 / 0.750 |
+| jina fp32 | 0.633 | 0.427 | 0.633 / 0.423 | 0.917 / 0.745 |
+| int8+bm25 RRF k=60 | 0.575 | 0.390 | 0.600 / 0.384 | 0.971 / 0.829 |
+| int8+bm25 RRF k=10 | 0.620 | 0.406 | 0.624 / 0.398 | 0.973 / 0.830 |
+| int8+bm25 min-max w=0.85 † | (0.660) | (0.435) | **0.673** / 0.422 | 0.940 / 0.779 |
+
+D9 gates at judge floors, where the judge is the int8 cosine of the fused top
+hit and the floors are D6-fitted on it. Δ is variant minus baseline, with the
+one-sided 95% bound in brackets. † means gated on held-out NL.
+
+| variant | baseline | Q1 Δr@10 [lower] | Q2 ΔMRR [lower] | Q3 worst | Q4 ΔCW [upper] | Q5 ΔFA [upper] | fails (non-inferiority) | own-score Q4 / Q5 |
+|---|---|---|---|---|---|---|---|---|
+| RRF k=60 | int8 | -6.2 [-9.8] | -0.034 [-0.061] | python -14.0 | +0.6 [+5.5] | -8.3 [-0.2] | Q1-Q4 | fail / pass |
+| RRF k=60 | fp32 | -5.8 [-9.2] | -0.037 [-0.064] | ts -13.0 | -0.8 [+4.0] | -10.5 [-2.3] | Q1-Q3 | fail / pass |
+| RRF k=10 | int8 | -1.8 [-4.8] | -0.018 [-0.042] | python -8.0 | +2.5 [+7.5] | -8.3 [-0.3] | Q4 | fail / fail |
+| RRF k=10 | fp32 | -1.2 [-4.2] | -0.021 [-0.046] | python -6.0 | +1.1 [+5.9] | -10.4 [-2.3] | Q2, Q4 | fail / pass |
+| min-max † | int8 | **+2.8 [+1.1]** | +0.003 [-0.013] | ts +1.7 | +3.4 [+6.1] | -4.9 [-1.6] | Q4 | pass / pass |
+| min-max † | fp32 | **+4.0 [+1.2]** | -0.001 [-0.019] | go +1.6 | +2.0 [+4.5] | -4.3 [-1.0] | Q4 | pass / fail |
+
+The judge floors of the variants, go / python / rust / typescript, are:
+RRF k=60 0.50 / 0.49 / 0.49 / 0.55, RRF k=10 0.50 / 0.49 / 0.47 / 0.55 and
+min-max 0.55 / 0.56 / 0.55 / 0.53 (int8 alone: 0.57 / 0.57 / 0.55 / 0.53).
+Min-max's own-score floors are 0.92 / 0.88 / 0.90 / 0.92. Its Q4 against
+int8 at own-score floors is -16.4 [-10.5], and its Q5 against fp32 at
+own-score floors is -2.3 [+8.2].
+
+**GM-434 columns** apply the shipped verdict rule (`similarity::verdict` /
+`low_similarity`) at int8's shipped floors, with no refit. Fusion changes only
+the order. Every row keeps its int8 cosine, and the page is judged by
+`below_floor`'s rule: every row of the first 20 below its own language's
+floor. For int8 alone that rule gives the same counts as the top-row rule
+GM-434 used.
+
+- **misled**: the answer is at rank 1, but the page says noMatch.
+- **CW**: confident wrong. The page clears the floor, but the top hit is
+  wrong (positives), or the query has no answer at all (absent).
+
+NL pages below the floor get lowSimilarity, not noMatch, so NL misled is 0
+for every arm.
+
+| arm | NL held-out CW pos | NL held-out CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|
+| **int8 (shipped = D6)** | 51.6% (111/215) | 21.7% (10/46) | 1.6% (9/577) | 32.1% (282/879) | 22.7% (204/900) |
+| fp32 at its D6 floors | 52.6% (113/215) | 26.1% (12/46) | 1.2% (7/569) | 32.2% (283/879) | 20.3% (183/900) |
+| int8+bm25 RRF k=60 | 55.3% (119/215) | 21.7% (10/46) | 2.8% (18/646) | 25.0% (220/879) | 21.9% (197/900) |
+| int8+bm25 RRF k=10 | 54.9% (118/215) | 21.7% (10/46) | 2.5% (16/648) | 24.8% (218/879) | 22.7% (204/900) |
+| int8+bm25 min-max † | 52.6% (113/215) | 21.7% (10/46) | 2.0% (12/601) | 29.7% (261/879) | 22.7% (204/900) |
+
+The table below breaks NL held-out CW positives down by language. The absent
+counts are the same for every arm (0/11, 3/11, 5/11 and 2/13), so only the
+positives are shown.
+
+| arm | go | python | rust | typescript |
+|---|---|---|---|---|
+| int8 | 41.0% (25/61) | 46.8% (22/47) | 76.6% (36/47) | 46.7% (28/60) |
+| int8+bm25 RRF k=60 | 39.3% | 53.2% | 72.3% | 60.0% |
+| int8+bm25 RRF k=10 | 39.3% | 53.2% | 72.3% | 58.3% |
+| int8+bm25 min-max † | 42.6% | 53.2% | 74.5% | 45.0% |
+
+**Truncation.** int8+BM25 has the expected answer in only one of the two
+top-100 lists on 96 of 400 NL queries, and in neither on 40 (jina fp32: 97
+and 39). RRF k=60 over int8's full ranking moves NL r@10 from 0.575 to 0.565,
+so the top-100 cut does not explain the RRF losses.
+
+### Go / no-go against the shipped int8
+
+| variant | verdict |
+|---|---|
+| int8+bm25 RRF k=60 | **No-go.** Fails Q1-Q4 against int8. Its worst language is python at -14 points. |
+| int8+bm25 RRF k=10 | **No-go.** It fails only Q4 (+2.5 [+7.5]), but r@10 and MRR both sit below int8, so it has nothing to offer as a quality candidate. |
+| int8+bm25 min-max w=0.85 | **No-go under D9 as written; still the only lead, and weaker than on fp32.** Held-out r@10 is +2.8 [+1.1] and MRR +0.003 [-0.013] against int8. The quality rule needs the MRR lower bound above 0, and it is not. At judge floors Q4 fails (+3.4 [+6.1]). At own-score floors Q4 and Q5 pass, with the S1 caveat that those floors are relative to the query. Under the shipped rule it adds 2 NL held-out confident-wrong positives out of 215 (113 vs 111) and 4 name misled pages (12 vs 9), and it removes 21 name confident-wrong positives (261 vs 282). |
+
+Against fp32 the picture is the same as S1's. The min-max gain shrinks
+because int8 alone is already 1.2 points above fp32 on the held-out half
+(0.645 vs 0.633), and the fused variant reaches 0.673 instead of fp32+BM25's
+0.699. The open questions from S1 (which score gives the verdict, whether a
+recall-only gain is worth a second retriever, and the cost) are unchanged.
