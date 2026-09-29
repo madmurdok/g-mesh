@@ -401,3 +401,61 @@ g-mesh calls behind the code facts: `find_references NoMatch` (used by
 `find_references BELOW_FLOOR_EXPLANATION` (only `verdict`). `grep` for
 `noMatch` in non-code: no agent guidance mentions it (only
 `docs/architecture/gm-389-guidance-prefix.md` and tests).
+
+## A/B (S8): agents on a task whose prose queries fall below the floor
+
+g-mesh-bench token-economy, arm `gmesh-configured`, model claude-sonnet-5,
+REPS=max, corpus excalidraw `1acf66ed`. Arm A = `release-3.17.0` (`c9e6606`,
+reports `g-mesh 3.17.0`), arm B = this branch at `7566680` (not
+version-bumped, reports `g-mesh 3.16.0`). Each arm gets its own
+`G_MESH_HOME`, and the arms alternate run by run. Scripts are on g-mesh-bench
+`chore/GM-434-ab-prose-floor`: `scripts/ab-prose-floor.sh` and
+`scripts/ab-prose-floor-summary.py`.
+
+**Task choice.** In 25 arm-A runs, `ex-semantic-collab-conflict-keep-local`,
+`gin-semantic-panic-recovery`, `py-semantic-basicauth-header` and
+`rs-semantic-detect-binary-content` never got a below-floor page, so they
+were dropped. `ex-semantic-arrow-zorder-above-bound` got one in about half
+of its runs and is the only task measured.
+
+**Control.** Each `search_code` result in the transcripts was classified.
+The arms are told apart:
+
+| arm | runs | runs with a below-floor page | `noMatch` pages | `lowSimilarity` pages | other pages |
+|---|---|---|---|---|---|
+| A | 35 | 19 | 20 | 0 | 41 |
+| B | 30 | 20 | 0 | 20 | 34 |
+
+**Result** (tokens = input + output + cache read + cache creation. Fallback =
+Read/Grep/Glob calls after the first below-floor page. CI = bootstrap 95% CI
+of B-A):
+
+| subset | arm | n | oracle pass | mean tokens | mean tool calls | mean fallback |
+|---|---|---|---|---|---|---|
+| all runs | A | 35 | 35/35 | 131,701 | 5.8 | - |
+| all runs | B | 30 | 30/30 | 138,553 | 6.7 | - |
+| below-floor runs | A | 19 | 19/19 | 155,268 | 6.9 | 4.1 |
+| below-floor runs | B | 20 | 20/20 | 153,594 | 7.7 | 5.0 |
+
+B-A over all runs: tokens +6,852 [-34,852, +39,919], calls +0.9 [-0.9, +2.4].
+Over below-floor runs: tokens -1,674 [-68,594, +47,674], fallback +1.0
+[-1.1, +2.8].
+
+**Reading.** Every CI spans zero, so this A/B shows no measurable
+difference in tokens, tool calls or confirming reads. Risk 1 did not happen
+here: B's 20 `lowSimilarity` runs all passed the oracle, so no agent took a
+soft row as a confident wrong answer. A and B agents behave alike. After a
+below-floor page they read about 4-5 files and find the answer either way.
+Caveats: this is one task, so the result says nothing about the other
+languages. The below-floor subset is chosen by outcome, not by assignment.
+
+**Runs.** 65 in total. Ten result files (40 runs) came from an earlier
+attempt that a machine reboot cut off. Each was attributed to its arm by
+`gmeshVersion` from the serving binary's serverInfo, and its transcripts
+were matched 1:1 in time order. Their `time -p` and uptime logs were lost in
+`/tmp`. That attempt's last run, an arm-B run with 4 of 5 transcripts and no
+result, was discarded. The remaining 5 runs (B,A,B,A,B, 25 agent runs) were
+rerun on 2026-09-29: `real 758.42 user 275.93 sys 61.26`, 126-180 s per
+arm run. Load averages were 3.92/25.90/42.96 at the start, still falling
+after the reboot, and 7.37/8.62/21.24 at the end. user+sys is about 45% of
+real, the rest being the model API wait.
