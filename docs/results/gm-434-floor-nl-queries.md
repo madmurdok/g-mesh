@@ -138,6 +138,71 @@ partial shape `{"results":[],"hasMore":false,"nextCursor":null,"partial":{"embed
 with the "embedding pass has not started yet" note, twice; the below-floor
 shape above is from code and its test, not from a live page.
 
+## After (S7): the shipped rule on the same stored rankings
+
+`core/src/mcp/similarity.rs` at `8e4a9e0`, floors unchanged (go 0.59,
+python 0.57, rust 0.55, typescript 0.50). Before = S1 (every below-floor
+page is `noMatch`); after = `verdict` + `low_similarity`: a name query below
+its floor keeps `noMatch`, a prose query gets `lowSimilarity` instead.
+**misled** = the right answer ranks first but the agent is told `noMatch`
+(S1's false alarm); **lowSimilarity pages** = the extra confirming reads.
+Per query language, as in S1's table.
+
+| set | language | misled before | misled after | confident wrong, absent (before = after) | confident wrong, pos (before = after) | noMatch pages before / after | lowSimilarity pages after |
+|---|---|---|---|---|---|---|---|
+| NL held-out | go | 31.2% (5/16) | **0.0%** (0/16) | 9.1% (1/11) | 36.1% (22/61) | 38 / 0 | 38 |
+| NL held-out | python | 9.5% (2/21) | **0.0%** (0/21) | 36.4% (4/11) | 44.7% (21/47) | 14 / 0 | 14 |
+| NL held-out | rust | 14.3% (1/7) | **0.0%** (0/7) | 45.5% (5/11) | 76.6% (36/47) | 11 / 0 | 11 |
+| NL held-out | typescript | 7.4% (2/27) | **0.0%** (0/27) | 53.8% (7/13) | 51.7% (31/60) | 10 / 0 | 10 |
+| NL held-out | all | 14.1% (10/71) | **0.0%** (0/71) | 37.0% (17/46) | 51.2% (110/215) | 73 / 0 | 73 |
+| NL all | go | 30.0% (9/30) | **0.0%** (0/30) | 4.0% (1/25) | 38.0% (38/100) | 65 / 0 | 65 |
+| NL all | python | 9.5% (4/42) | **0.0%** (0/42) | 36.0% (9/25) | 42.0% (42/100) | 36 / 0 | 36 |
+| NL all | rust | 13.3% (2/15) | **0.0%** (0/15) | 60.0% (15/25) | 79.0% (79/100) | 18 / 0 | 18 |
+| NL all | typescript | 10.6% (5/47) | **0.0%** (0/47) | 64.0% (16/25) | 47.0% (47/100) | 20 / 0 | 20 |
+| NL all | all | 14.9% (20/134) | **0.0%** (0/134) | 41.0% (41/100) | 51.5% (206/400) | 139 / 0 | 139 |
+| name | go | 2.3% (2/86) | 2.3% (2/86) | 8.0% (12/150) | 38.7% (58/150) | 146 / 146 | 0 |
+| name | python | 1.0% (1/103) | 1.0% (1/103) | 13.3% (20/150) | 28.0% (42/150) | 136 / 136 | 0 |
+| name | rust | 1.3% (2/149) | 1.3% (2/149) | 32.0% (96/300) | 48.3% (145/300) | 212 / 212 | 0 |
+| name | typescript | 0.0% (0/231) | 0.0% (0/231) | 31.3% (94/300) | 16.8% (47/279) | 207 / 207 | 0 |
+| name | all | 0.9% (5/569) | 0.9% (5/569) | 24.7% (222/900) | 33.2% (292/879) | 701 / 701 | 0 |
+
+Of the 73 NL held-out lowSimilarity pages, 10 have the right answer on top
+and 63 do not (139: 20 / 119 on NL all) - S2's risk 1: those 63 stay out of
+"confident wrong" only if the confirming read is sceptical.
+
+Rule check, Rust against S2's simulated option f, over all 2,279 queries:
+
+- **Prose predicate.** Rust `query.trim().chars().any(char::is_whitespace)`
+  (Unicode White_Space); the script `any(c.isspace() for c in text.strip())`
+  (which also counts U+001C-U+001F). Disagreements: **0**; no eval query
+  contains whitespace other than U+0020.
+- **Specifier verdict.** Rust answers `noMatch` (`QueryIsAPathOrPackage`)
+  on a non-prose query starting with `@` or containing `/`, whatever the
+  scores; the simulation has no such branch. Eval queries it fires on: **0**.
+- **No verdict at all in Rust.** Empty first page (and any continuation
+  page): **0** eval queries have an empty page; the eval scores first pages
+  only.
+- **Page signal** (HARD / SOFT / NONE) per query: **0** disagreements, so
+  S2's option f rows reproduce exactly (NL held-out misled 0/71, confident
+  wrong 110/215 and 17/46, soft-ok 10, soft-miss 63; name = a).
+- Not measurable here, as in S1's caveat: Rust judges **every row** against
+  its own language's floor, the eval only the top row against the top hit's
+  language; they can differ only on a mixed-language page.
+
+The checks can fire: on synthetic strings the script's Rust port calls
+`"a\x1cb"` a name where Python calls it prose, `@scope/pkg` and `src/a.rs`
+specifiers, and `serialize/deserialize the config` prose, matching
+`similarity.rs`'s own tests.
+
+```sh
+python3 eval/embedding/shipped_floor_rates.py --run "$RUN" --after
+```
+
+Control: the default, `--floors fitted` and `--options` outputs are
+byte-identical before and after adding `--after` (md5
+`8ad95fbef93d0f3937913fa46de7104a`, `45cf0e231dcc11a71050825a512df597`,
+`c8b3c606c21394cf748e544c3a982aa0`).
+
 ## Method and reproduction
 
 No re-embedding: the script reads GM-398's stored rankings (top 100 hits
