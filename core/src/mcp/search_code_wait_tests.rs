@@ -135,8 +135,10 @@ fn page(result: &CallToolResult) -> Value {
 /// Controls: pass `Need::Embeddings` to `prepare` in
 /// `GMeshMcpServer::search_code` - the call waits for `Phase::Ready` under
 /// the 25 min cap and `CALL_BOUND` fires. Use `similarity::verdict` for a
-/// partial page in `search_code::handle` - `noMatch` appears (every row is
-/// below the floor, as the next test's complete page shows).
+/// partial page in `search_code::handle` - `noMatch` appears on the name
+/// query (every row is below the floor, as the next test's complete page
+/// shows). Use `similarity::low_similarity` for a partial page -
+/// `lowSimilarity` appears on the prose query.
 #[tokio::test]
 async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
     let fixture = fixture(3, 3, 10).await;
@@ -156,11 +158,16 @@ async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
     assert_eq!(body["results"].as_array().unwrap().len(), 3, "{body}");
     assert_eq!(body["partial"], json!({ "embedded": 3, "total": 10 }));
     assert!(body.get("noMatch").is_none(), "a partial page carries no floor verdict: {body}");
+    assert!(body.get("lowSimilarity").is_none(), "nor the prose one: {body}");
     assert!(
         body.get("hint").is_none(),
         "a partial page does not spend the once-per-session search hint: {body}"
     );
     assert_eq!(fixture.indexing.phase(), Phase::Embedding, "sanity: the pass never finished");
+
+    let name = page(&search(&fixture.client, json!({ "query": "readFile" })).await);
+    assert_eq!(name["partial"], json!({ "embedded": 3, "total": 10 }), "{name}");
+    assert!(name.get("noMatch").is_none(), "a partial name page carries no floor verdict: {name}");
 }
 
 /// The pass finishes 50 ms into the call's 200 ms wait: the answer is
@@ -179,13 +186,39 @@ async fn a_pass_that_finishes_within_the_wait_gives_a_complete_answer() {
         indexing.set_phase(Phase::Ready);
     });
 
-    let result = search(&fixture.client, json!({ "query": "reads a file" })).await;
+    let result = search(&fixture.client, json!({ "query": "readFile" })).await;
 
     assert_eq!(texts(&result).len(), 1, "a complete page has no note: {:?}", texts(&result));
     let body = page(&result);
     assert_eq!(body["results"].as_array().unwrap().len(), 3, "{body}");
     assert!(body.get("partial").is_none(), "{body}");
     assert_eq!(body["noMatch"]["reason"], "belowSimilarityFloor", "{body}");
+}
+
+/// Over the wire, on a complete index where every row is below the floor:
+/// a prose query gets `lowSimilarity` with its rows and no `noMatch` and no
+/// search hint; the name query, same rows, gets `noMatch` and no
+/// `lowSimilarity`.
+///
+/// Control: pass `None` for `low_similarity` in `search_code::handle` - the
+/// prose page loses its key. Drop `!is_prose_query` from
+/// `similarity::verdict` - the prose page gains `noMatch`.
+#[tokio::test]
+async fn a_below_floor_prose_query_is_low_similarity_and_a_name_query_is_no_match() {
+    let fixture = fixture(3, 3, 3).await;
+    fixture.indexing.set_phase(Phase::Ready);
+
+    let prose = page(&search(&fixture.client, json!({ "query": "  reads a file " })).await);
+    assert_eq!(prose["results"].as_array().unwrap().len(), 3, "the rows stay: {prose}");
+    assert!(prose.get("noMatch").is_none(), "{prose}");
+    assert!(prose.get("hint").is_none(), "{prose}");
+    let text = prose["lowSimilarity"].as_str().unwrap_or_else(|| panic!("no lowSimilarity: {prose}"));
+    assert!(text.contains("may still be right") && text.contains("one read"), "{text}");
+
+    let name = page(&search(&fixture.client, json!({ "query": "  readFile " })).await);
+    assert_eq!(name["results"].as_array().unwrap().len(), 3, "{name}");
+    assert_eq!(name["noMatch"]["reason"], "belowSimilarityFloor", "{name}");
+    assert!(name.get("lowSimilarity").is_none(), "{name}");
 }
 
 /// A cursor from a partial page continues while the stored vectors are the

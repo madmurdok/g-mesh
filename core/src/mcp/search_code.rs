@@ -96,8 +96,13 @@ struct SearchPage {
     /// not in hand.
     #[serde(skip_serializing_if = "Option::is_none")]
     no_match: Option<similarity::NoMatch>,
+    /// [`super::similarity::low_similarity`]'s sentence: the same below-floor
+    /// page asked in prose, where the top row may still be right. Never
+    /// present together with `noMatch`; absent wherever `noMatch` would be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_similarity: Option<&'static str>,
     /// `session_hints::SEARCH_HITS`, once per session, on a page with hits
-    /// and no `noMatch`.
+    /// and neither `noMatch` nor `lowSimilarity`.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'static str>,
     /// Present only when the embedding pass was still owed: the rows were
@@ -309,12 +314,16 @@ pub(super) fn handle(
         None => similarity::verdict(&params.query, cursor, &page.results),
         Some(_) => similarity::partial_verdict(&params.query, cursor, &page.results),
     };
+    let low_similarity = match coverage {
+        None => similarity::low_similarity(&params.query, cursor, &page.results),
+        Some(_) => None,
+    };
     let next_cursor = match coverage {
         None => page.next_cursor,
         Some(_) => page.next_cursor.map(|next| partial_cursor(stored, &next)),
     };
     let hint = match coverage {
-        None => search_hint(&page.results, no_match.as_ref(), hints),
+        None => search_hint(&page.results, no_match.is_some() || low_similarity.is_some(), hints),
         Some(_) => None,
     };
     let body = SearchPage {
@@ -322,6 +331,7 @@ pub(super) fn handle(
         has_more: page.has_more,
         next_cursor,
         no_match,
+        low_similarity,
         hint,
         partial: coverage.map(|c| PartialCounts { embedded: c.embedded, total: c.total }),
     };
@@ -334,12 +344,10 @@ pub(super) fn handle(
     }
 }
 
-fn search_hint(
-    results: &[SearchResult],
-    no_match: Option<&similarity::NoMatch>,
-    hints: &SessionHints,
-) -> Option<&'static str> {
-    hints.once(!results.is_empty() && no_match.is_none(), HintKey::SearchHits, session_hints::SEARCH_HITS)
+/// `judged` is true when the page carries `noMatch` or `lowSimilarity`: the
+/// hint's "once one plausibly matches ... stop" must not sit beside either.
+fn search_hint(results: &[SearchResult], judged: bool, hints: &SessionHints) -> Option<&'static str> {
+    hints.once(!results.is_empty() && !judged, HintKey::SearchHits, session_hints::SEARCH_HITS)
 }
 
 #[cfg(test)]
@@ -532,8 +540,8 @@ mod tests {
         let matched = search(&conn, &[1.0, 0.0], 10, None).unwrap();
         let missed = search(&conn, &[0.0, 1.0], 10, None).unwrap();
 
-        assert_eq!(super::super::similarity::verdict("reads a file", None, &matched.results), None);
-        let verdict = super::super::similarity::verdict("reads a file", None, &missed.results)
+        assert_eq!(super::super::similarity::verdict("readFile", None, &matched.results), None);
+        let verdict = super::super::similarity::verdict("readFile", None, &missed.results)
             .expect("a page scoring 0.0 cannot be a match");
         let body: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&SearchPage {
@@ -541,6 +549,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 no_match: Some(verdict),
+                low_similarity: None,
                 hint: None,
                 partial: None,
             })
@@ -554,6 +563,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 no_match: None,
+                low_similarity: None,
                 hint: None,
                 partial: None,
             })
@@ -561,20 +571,50 @@ mod tests {
         )
         .unwrap();
         assert!(healthy.get("noMatch").is_none(), "a matching page must carry no key at all: {healthy}");
+        assert!(healthy.get("lowSimilarity").is_none(), "{healthy}");
+    }
+
+    /// The prose counterpart of the test above: the same missed page, asked
+    /// in prose, serializes a `lowSimilarity` string beside its rows and no
+    /// `noMatch` key.
+    #[test]
+    fn a_prose_page_below_the_floor_carries_low_similarity_and_its_rows() {
+        let conn = setup();
+        insert_node_in(&conn, "ts", "typescript");
+        insert(&conn, "ts", &[1.0, 0.0], "v1").unwrap();
+        let missed = search(&conn, &[0.0, 1.0], 10, None).unwrap();
+
+        let no_match = similarity::verdict("reads a file", None, &missed.results);
+        let low_similarity = similarity::low_similarity("reads a file", None, &missed.results);
+        let body: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&SearchPage {
+                results: missed.results,
+                has_more: false,
+                next_cursor: None,
+                no_match,
+                low_similarity,
+                hint: None,
+                partial: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(body.get("noMatch").is_none(), "{body}");
+        assert!(body["lowSimilarity"].as_str().is_some_and(|s| s.contains("may still be right")), "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "the rows stay: {body}");
     }
 
     #[test]
     fn a_page_with_hits_and_no_verdict_carries_the_search_hint_once_per_session() {
         let hit = || vec![SearchResult::for_test(0.9, "rust")];
-        let verdict = similarity::verdict("reads a file", None, &[SearchResult::for_test(0.0, "rust")])
-            .expect("a page scoring 0.0 cannot be a match");
         let session = SessionHints::default();
 
-        assert_eq!(search_hint(&[], None, &session), None, "no hits");
-        assert_eq!(search_hint(&hit(), Some(&verdict), &session), None, "noMatch");
-        assert_eq!(search_hint(&hit(), None, &session), Some(session_hints::SEARCH_HITS));
-        assert_eq!(search_hint(&hit(), None, &session), None, "once per session");
-        assert_eq!(search_hint(&hit(), None, &SessionHints::default()), Some(session_hints::SEARCH_HITS));
+        assert_eq!(search_hint(&[], false, &session), None, "no hits");
+        assert_eq!(search_hint(&hit(), true, &session), None, "noMatch or lowSimilarity");
+        assert_eq!(search_hint(&hit(), false, &session), Some(session_hints::SEARCH_HITS));
+        assert_eq!(search_hint(&hit(), false, &session), None, "once per session");
+        assert_eq!(search_hint(&hit(), false, &SessionHints::default()), Some(session_hints::SEARCH_HITS));
     }
 
     /// The other half of that contract, against a real paginated index: the
@@ -603,14 +643,16 @@ mod tests {
         );
 
         assert!(
-            super::super::similarity::verdict("reads a file", None, &first.results).is_some(),
+            super::super::similarity::verdict("readFile", None, &first.results).is_some(),
             "the control: the first page of this same search is a no"
         );
         assert_eq!(
-            super::super::similarity::verdict("reads a file", Some(&cursor), &second.results),
+            super::super::similarity::verdict("readFile", Some(&cursor), &second.results),
             None,
             "a continuation is never judged"
         );
+        assert!(similarity::low_similarity("reads a file", None, &first.results).is_some(), "prose control");
+        assert_eq!(similarity::low_similarity("reads a file", Some(&cursor), &second.results), None);
     }
 
     /// Task #50's acceptance criterion, end to end: a free-text query
