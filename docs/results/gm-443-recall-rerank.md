@@ -672,3 +672,108 @@ python3 eval/embedding/rerank_q5_diag.py --work <main checkout>/eval/embedding/w
 
 Reads S4's CE cache only (stops on a missing pair); real 25.6 s, user 15.2 s,
 sys 5.5 s at load 23.
+
+## S11: order-only rerank (F4)
+
+The blend (ce-minilm + 40 * int8 cosine, K = 50) only orders the rows shown;
+the no-match verdict is not taken from the blend. Nothing is refit: both
+variants use the shipped int8 floors (0.57 / 0.57 / 0.55 / 0.53, read from
+`similarity.rs::floor`), the same D9 gates and the same GM-434 option-a
+columns as S4/S8. Cached CE scores only; nothing rescored.
+
+- **F4**: the verdict is int8's own: its un-reranked top-1 cosine and that
+  row's language against the shipped floor. It equals int8's verdict on
+  every query (checked), and only the rows shown change.
+- **F4'**: the verdict is the int8 cosine (and language) of the *reranked*
+  top-1, at the shipped floors (F1 without its refit).
+
+### Controls
+
+- S4's row reproduces (step 0 MATCH), and the F1, F2, F3 reverts equal S4;
+  all 30 S8 table rows are reproduced unchanged.
+- F4 and F4' with the rerank disabled (int8 order through the same code
+  path) equal the int8 baseline on every outcome and every reported cell.
+
+How Q4 can still move under F4: CW counts a query that clears the floor
+with a wrong top row; the verdict is fixed, but the top row is the blend's,
+so a cleared query whose top the rerank fixes leaves CW and one it breaks
+enters it (NL held-out: 111 - 15 + 8 = 104).
+
+#### S11 quality (held-out NL)
+
+| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |
+|---|---|---|---|
+| jina fp32 (baseline) | 0.633 [0.582, 0.685] | 0.423 [0.379, 0.469] | 0.917 / 0.745 |
+| jina int8 (baseline, shipped floors) | 0.645 [0.593, 0.697] | 0.419 [0.374, 0.464] | 0.915 / 0.750 |
+| F4 blend order, verdict on int8's own top-1 cosine (shipped floors) | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+| F4' blend order, verdict on int8 cosine of the reranked top (shipped floors) | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+
+#### S11 D9 gates vs jina fp32 at its D6 floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=16, py +0.0 n=21, ru +0.0 n=7, ty +0.0 n=27 |
+| jina int8 (baseline, shipped floors) | +1.2 [-0.9] | -0.004 [-0.016] | go -1.6 | -1.4 [+1.0] | +2.1 [+6.2] | **Q5** | go +12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty -4.0 n=25 |
+| F4 blend order, verdict on int8's own top-1 cosine (shipped floors) | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | -4.2 [-0.5] | -1.1 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.5 n=22 |
+| F4' blend order, verdict on int8 cosine of the reranked top (shipped floors) | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | -16.3 [-11.8] | -1.1 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.5 n=22 |
+
+#### S11 D9 gates vs shipped jina int8 at its shipped floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | -1.2 [-3.4] | +0.004 [-0.008] | rust -4.3 | +1.4 [+3.8] | -2.1 [+1.4] | **Q4** | go -12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty +4.0 n=25 |
+| jina int8 (baseline, shipped floors) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=17, py +0.0 n=20, ru +0.0 n=7, ty +0.0 n=26 |
+| F4 blend order, verdict on int8's own top-1 cosine (shipped floors) | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | -2.8 [+0.2] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=23 |
+| F4' blend order, verdict on int8 cosine of the reranked top (shipped floors) | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | -14.9 [-10.7] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +0.0 n=23 |
+
+#### S11 GM-434 columns (option a), at each row's own floors
+
+| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | 0.56 / 0.58 / 0.56 / 0.55 | 14% (10/71) | 53% (113/215) | 26% (12/46) | 1% (7/569) | 32% (283/879) | 20% (183/900) |
+| jina int8 (baseline, shipped floors) | 0.57 / 0.57 / 0.55 / 0.53 | 14% (10/70) | 52% (111/215) | 22% (10/46) | 2% (9/577) | 32% (282/879) | 23% (204/900) |
+| F4 blend order, verdict on int8's own top-1 cosine (shipped floors) | 0.57 / 0.57 / 0.55 / 0.53 | 16% (13/80) | 48% (104/215) | 22% (10/46) | 2% (18/724) | 16% (144/879) | 23% (204/900) |
+| F4' blend order, verdict on int8 cosine of the reranked top (shipped floors) | 0.57 / 0.57 / 0.55 / 0.53 | 29% (23/80) | 35% (75/215) | 15% (7/46) | 5% (39/724) | 14% (127/879) | 20% (179/900) |
+
+#### S11 GM-434 per language, held-out NL (misled / CW pos / CW absent)
+
+| variant | go | python | rust | typescript |
+|---|---|---|---|---|
+| jina fp32 (baseline) | 19% (3/16) / 51% (31/61) / 9% (1/11) | 10% (2/21) / 45% (21/47) / 36% (4/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 15% (4/27) / 42% (25/60) / 15% (2/13) |
+| jina int8 (baseline, shipped floors) | 29% (5/17) / 41% (25/61) / 0% (0/11) | 10% (2/20) / 47% (22/47) / 27% (3/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 8% (2/26) / 47% (28/60) / 15% (2/13) |
+| F4 blend order, verdict on int8's own top-1 cosine (shipped floors) | 28% (5/18) / 39% (24/61) / 0% (0/11) | 10% (2/20) / 47% (22/47) / 27% (3/11) | 23% (3/13) / 68% (32/47) / 45% (5/11) | 10% (3/29) / 43% (26/60) / 15% (2/13) |
+| F4' blend order, verdict on int8 cosine of the reranked top (shipped floors) | 44% (8/18) / 25% (15/61) / 0% (0/11) | 15% (3/20) / 38% (18/47) / 27% (3/11) | 46% (6/13) / 53% (25/47) / 27% (3/11) | 21% (6/29) / 28% (17/60) / 8% (1/13) |
+
+#### S11 flips among positives the verdict clears (int8 top right -> reranked top wrong / wrong -> right; n = cleared positives)
+
+| variant | queries | go | python | rust | typescript | total |
+|---|---|---|---|---|---|---|
+| F4 | NL held-out | 2 / 3 (n=37) | 3 / 3 (n=40) | 0 / 4 (n=42) | 3 / 5 (n=52) | 8 / 15 (n=171) |
+| F4 | name | 0 / 49 (n=144) | 0 / 20 (n=143) | 1 / 52 (n=291) | 2 / 20 (n=272) | 3 / 141 (n=850) |
+| F4' | NL held-out | 2 / 0 (n=25) | 3 / 2 (n=35) | 0 / 1 (n=32) | 1 / 2 (n=40) | 6 / 5 (n=132) |
+| F4' | name | 0 / 41 (n=136) | 0 / 17 (n=139) | 1 / 44 (n=273) | 2 / 18 (n=264) | 3 / 120 (n=812) |
+
+### S11 reading
+
+**Both pass every D9 gate against both baselines.** Ranking is the blend's
+in both (r@10 +4.8 [+1.2], MRR +0.058 [+0.027] vs int8). **F4** keeps int8's
+verdict, so Q5 is +0.0 [+0.0] vs int8 by construction and NL CW absent stays
+at int8's 22% (10/46); its Q4 gain is small and only just inside the bound
+(-2.8 [+0.2] vs int8), coming from the rerank fixing more cleared tops than
+it breaks: 15 vs 8 on held-out NL, 141 vs 3 on names (name CW pos 32% ->
+16%). The cost is 8 held-out NL queries (and 3 name) where int8's top was
+right, the verdict says "match", and the rerank now shows a wrong top. NL
+misled rises 10/70 -> 13/80 only on queries the rerank newly made rank-1.
+**F4'** gets a much larger Q4 gain (-14.9 [-10.7] vs int8; NL CW absent 15%,
+CW pos 35%) with Q5 also +0.0 [+0.0], but that Q5 is paired on queries
+rank-1 in both arms: on all rank-1 positives its NL misled is 29% (23/80)
+against int8's 14% (10/70), name misled 5% vs 2%. That is the S8 mechanism
+again (the reranked top's own cosine is lower), just outside Q5's pairing.
+F4 is the conservative option: int8's confidence behaviour unchanged, the
+ranking gain kept, 8 new confident-wrong NL tops. Which one, if any, ships
+is the owner's call.
+
+### S11 reproduce
+
+Same command as S8 (the F4/F4' rows, controls and flip table are in its
+output and `--table` file).

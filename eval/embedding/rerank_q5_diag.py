@@ -380,8 +380,72 @@ def fixes(a, cs, base, shipped, s4, beta, CE, COS):
     o3r, _ = build(-math.inf)
     print(f"F3 revert (c0 = -inf) == S4: {sig(row('F3 revert', o3r, R.fit_floors(o3r))) == sig(s4row)}")
 
+    # ---------------- S11: order-only rerank (F4, F4') ----------------
+    int8row = row("jina int8 (baseline, shipped floors)", base[R.INT8], shipped)
+
+    def build_f4(verdict, rerank=True):
+        """Rows shown in the blend's order (int8's own order if not rerank), shipped floors, no refit.
+        verdict "int8": top/top_language of int8's own un-reranked top-1 (the shipped verdict).
+        verdict "reranked": int8 cosine and language of the reranked top-1."""
+        outs = []
+        for c in cs:
+            for q in c.qids:
+                lst = c.lists[ARM][q]
+                k = min(K, len(lst))
+                s = CE(c, q) + beta * COS(c, q) if rerank else -np.arange(k, dtype=np.float64)
+                hits, _ = R.reranked(c, q, K, s, ARM)
+                if verdict == "int8":
+                    o = R.outcome(c, q, hits, lst[0][1] if lst else None)
+                    o["top_language"] = c.node_lang.get(lst[0][0]) if lst else None
+                else:
+                    i = [n for n, _ in lst[:K]].index(hits[0][0])
+                    o = R.outcome(c, q, hits, float(COS(c, q)[i]))
+                outs.append(o)
+        return outs
+
+    f4 = build_f4("int8")
+    f4p = build_f4("reranked")
+    for lab, v in (("F4", "int8"), ("F4'", "reranked")):
+        ctl = build_f4(v, rerank=False)
+        same_outs = ctl == base[R.INT8]
+        same_row = sig(row(f"{lab} rerank disabled", ctl, shipped)) == sig(int8row)
+        print(f"{lab} rerank disabled == int8 baseline: outcomes {same_outs}, row {same_row}")
+        if not (same_outs and same_row):
+            sys.exit(f"STOP: {lab} control failed")
+    by8 = {o["id"]: o for o in base[R.INT8]}
+    print(f"F4 verdict == int8 verdict on every query: "
+          f"{all(R.clears(o, shipped) == R.clears(by8[o['id']], shipped) for o in f4)}")
+    rows.append(row("F4 blend order, verdict on int8's own top-1 cosine (shipped floors)", f4, shipped))
+    rows.append(row("F4' blend order, verdict on int8 cosine of the reranked top (shipped floors)", f4p, shipped))
+
+    # flips among queries whose verdict clears the floor: int8 top right -> reranked wrong, and the reverse
+    flips = {}
+    for lab, outs in (("F4", f4), ("F4'", f4p)):
+        for grp, keep in (("NL held-out", lambda o: R.nl_ho_all(o) and o["positive"]),
+                          ("name", lambda o: R.name_all(o) and o["positive"])):
+            d = {}
+            for o in outs:
+                if not keep(o) or not R.clears(o, shipped):
+                    continue
+                b8 = by8[o["id"]]
+                was, now = b8["rank"] == 1, o["rank"] == 1
+                l = o["language"]
+                t = d.setdefault(l, [0, 0, 0])
+                t[0] += was and not now
+                t[1] += now and not was
+                t[2] += 1
+            flips[(lab, grp)] = d
+    FL = ["", "S11 flips among positives the verdict clears (int8 top right -> reranked top wrong / "
+          "wrong -> right; n = cleared positives)", "",
+          "| variant | queries | " + " | ".join(R.LANGS) + " | total |", "|---|---|" + "---|" * (len(R.LANGS) + 1)]
+    for (lab, grp), d in flips.items():
+        tot = [sum(d.get(l, [0, 0, 0])[j] for l in R.LANGS) for j in range(3)]
+        FL.append(f"| {lab} | {grp} | " + " | ".join(
+            "{} / {} (n={})".format(*d.get(l, [0, 0, 0])) for l in R.LANGS) + " | {} / {} (n={}) |".format(*tot))
+    print("\n".join(FL))
+
     # ---------------- tables ----------------
-    base_rows = [row("jina fp32 (baseline)", base[R.REF], rf32), row("jina int8 (baseline, shipped floors)", base[R.INT8], shipped)]
+    base_rows = [row("jina fp32 (baseline)", base[R.REF], rf32), int8row]
     allr = base_rows + [s4row] + rows
     ci = lambda t: f"{t[0]:.3f} [{t[1]:.3f}, {t[2]:.3f}]"
     L = ["| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |", "|---|---|---|---|"]
@@ -414,6 +478,7 @@ def fixes(a, cs, base, shipped, s4, beta, CE, COS):
         gl = r["gm434_lang"]
         L.append(f"| {r['label']} | " + " | ".join(
             f"{c434(gl[l]['misled'])} / {c434(gl[l]['cw_pos'])} / {c434(gl[l]['cw_abs'])}" for l in R.LANGS) + " |")
+    L += FL
     print("\n" + "\n".join(L))
     if a.table:
         a.table.write_text("\n".join(L) + "\n")
