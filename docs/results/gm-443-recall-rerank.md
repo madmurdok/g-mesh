@@ -433,3 +433,242 @@ python3 eval/embedding/rerank_eval.py --work <main checkout>/eval/embedding/work
 The cold full run took real 6341 s, user 22524 s and sys 212 s, with load
 4.5 at start and 34 at the end. 537k cross-encoder pairs were scored; a
 cached rerun takes seconds.
+
+## S8: TypeScript Q5 diagnosis
+
+Script: `eval/embedding/rerank_q5_diag.py`. It reads only stored data and
+S4's cross-encoder cache (`<work>/rerank_cache/`), and it stops if a pair is
+missing, so it never scores anything (a full run takes about 25 s). Variant
+under study: ce-minilm + int8, K = 50, blend = CE logit + beta * int8 cosine.
+
+**Control.** Re-tuning on the FIT half gives beta = 40 again. The script
+then reproduces S4's row exactly: held-out r@10 0.693, MRR 0.477; vs int8
+Q1 +4.8 [+1.2], Q2 +0.058 [+0.027], Q5 +6.5 [+12.7], TS +26.1 n=23; vs fp32
+Q5 +5.7 [+12.1], TS +22.7 n=22; floors 19.48 / 17.02 / 24.91 / 17.10; NL
+misled 20/80. Each fix below also has a revert (F1: floor on the blend; F2:
+cosine floor = +inf; F3: c0 = -inf), and each revert reproduces every S4
+cell.
+
+A correction to the question as it was posed: Q5's false alarm is not about
+absent queries. It counts **held-out NL positives that both arms rank
+correctly at rank 1, where the top score falls below the arm's floor**, so a
+correct answer is reported as "no match". On TypeScript absent queries the
+blend is no worse than int8 (CW absent 2/13 for both).
+
+### 1. Noise or real
+
+Paired Q5 against int8 at its shipped floors, per language:
+
+| language | n (paired) | int8 FA | blend FA | 0->1 | 1->0 | Δ [lo, up] |
+|---|---|---|---|---|---|---|
+| go | 13 | 3 | 3 | 0 | 0 | +0.0 |
+| python | 17 | 2 | 2 | 2 | 2 | +0.0 [-17.6, +17.6] |
+| rust | 7 | 1 | 1 | 0 | 0 | +0.0 |
+| typescript | 23 | 2 | 8 | **6** | **0** | **+26.1 [+13.0, +43.5]** |
+
+The TypeScript effect is real in direction: 6 queries flip and none flip
+back (sign test p = 2/2^6 ≈ 0.03), and the per-language lower bound is +13.0.
+Its size rests on 6 queries. **The Q5 verdict does not depend on one or two
+of them.** When k of the six TypeScript flips are removed, the pooled upper
+bound is +11.3 at k=1, +10.2 at k=2, +8.8 at k=3, +7.7 at k=4 and +6.2 at
+k=5. Only k=6 (no TypeScript flip at all) gives +4.4, which passes. With
+TypeScript dropped from the pool the upper bound is +5.9, which would still
+fail, because python's 2-up / 2-down on n=17 makes the interval wide by
+itself.
+
+### 2. What the flipped queries hit
+
+The top row of every flipped query is the correct answer. The int8 cosine
+clears the shipped TS floor (0.53) every time; the cross-encoder gives a
+strongly negative logit, and that drags the blend below its floor of 17.10.
+
+| query | top row (the expected symbol) | text the CE sees | CE | int8 cos | blend |
+|---|---|---|---|---|---|
+| exc-013 "contract for storing text-to-diagram chat history" | type `TTDPersistenceAdapter` | "Interface for TTD chat persistence. Preferably ..." | -10.64 | 0.606 | 13.58 |
+| exc-030 "Return what every item in a list has in common ..." | fn `reduceToCommonValue` | `reduceToCommonValue<T, R = T>(collection: ...` (signature only) | -6.59 | 0.574 | 16.39 |
+| ttm-029 "tally task states for one release" | fn `releaseTaskCounts` | `releaseTaskCounts(db: DatabaseInstance, releaseId: string): ProjectStatus` | -10.56 | 0.654 | 15.60 |
+| ttm-031 "confirm then ask dashboard server to exit" | fn `wireShutdownButton` (picker.js) | `wireShutdownButton()` | -11.13 | 0.600 | 12.86 |
+| ttm-045 "fetch full task record or throw" | fn `requireTask` | `requireTask(db: DatabaseInstance, taskId: string): Task` | -10.64 | 0.600 | 13.37 |
+| ttm-047 "display fatal message in board page" | fn `showError` (board.js) | `showError(message)` | -9.95 | 0.586 | 13.47 |
+
+(ttm-003 and ttm-046 are false alarms in both arms: their int8 cosines of
+0.462 and 0.436 are below 0.53.)
+
+**Pattern: undocumented TypeScript symbols.** In five of the six, the CE
+sees a bare signature with no doc comment. `exc-013` is a documented
+interface that the CE still scores at -10.6. MS MARCO MiniLM is a passage
+reranker, and a lone identifier with a parameter list is out of its
+distribution. It gives such text about -10 whether the match is right or
+not. TypeScript is where this concentrates: of the 29 held-out NL rank-1
+tops, 10 have no doc comment (median CE -8.58), and 6 of those 10 fall
+below the floor. Among documented TS tops the median CE is +0.33 and 3 of
+19 fall below. The other languages have few undocumented tops: go 1 of 18,
+python 5 of 20, rust 0 of 13. Four of the six flips come from
+task-tracker-mcp, whose JS/TS functions largely lack JSDoc.
+
+### 3. The floor
+
+The floor is on the **blend score of the new top row**, per top-row language,
+fitted by D6: the 3% quantile (rounded down to 0.01) of the rank-1 positives
+among **all name queries plus the FIT half of NL**. For TypeScript that is
+255 name queries and 24 FIT NL. Name queries make up 91% of the fit, so the
+floor is effectively a name-query floor:
+
+| TS rank-1 positives | n | blend p3 | blend median | CE median | int8 cos median |
+|---|---|---|---|---|---|
+| name | 255 | 26.22 | 37.34 | +7.06 | 0.76 |
+| NL, FIT half | 24 | 6.37 | 22.18 | -1.87 | 0.62 |
+| NL, held-out | 29 | 6.37 | 21.82 | -0.94 | 0.61 |
+
+The floor from names alone would be 26.22 and from NL-FIT alone 6.37; the
+pooled 3% quantile, 17.10, sits between them. So the TS floor is not a
+small-sample misestimate: the FIT and held-out NL halves have the same
+distribution (p3 6.37 in both). The floor fails on NL because **the blend is
+bimodal across query types**. On name queries the CE sees its own
+vocabulary (median +7), on NL-to-signature pairs it does not (median -1 to
+-2, with a tail near -11). The cosine alone shows the same gap but a much
+smaller one. For int8's own ranking the TS name p3 is 0.576 and the NL-FIT
+p3 is 0.409, both on a scale where the shipped floor is 0.53. Python shows
+the same bimodality (floor 17.02; NL-FIT only 9.38, names only 26.65), but
+its NL tops are more often documented, so its held-out NL mass sits above
+the floor. Rust's floor (24.91) is set by names, and its NL-FIT
+p3 is higher (28.19, n=7).
+
+### 4. Where the extra misled share comes from
+
+Held-out NL misled (rank-1 positives called no-match), int8 at its shipped
+floors against the blend: go 5/17 -> 4/18, python 2/20 -> 2/20, **rust 1/7 ->
+5/13**, **typescript 2/26 -> 9/29**; total 10/70 -> 20/80. On name queries
+misled is 1-2% for both (9/577 against 10/724). So the extra share comes
+from TS NL (+7) and rust NL (+4). The two have different causes:
+
+- **TypeScript**: 6 of its 9 misled are queries that int8 also had at rank 1
+  and cleared. These are the Q5 flips from section 2.
+- **Rust**: 4 of its 5 misled are queries that int8 did **not** have at rank
+  1. The blend moves the right answer to the top but leaves it below the
+  rust floor. These are recall gains that stay silent, not regressions, and
+  they fall outside paired Q5.
+
+**Q4 and Q5 are one effect.** Shifting every floor by d traces each arm's
+operating points on held-out NL (misled / CW pos / CW absent):
+
+| arm, floor shift | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|---|
+| int8, shipped | 14% (10/70) | 52% (111/215) | 22% (10/46) | 2% | 32% | 23% |
+| int8, +0.04 | 21% (15/70) | 40% (86/215) | 15% (7/46) | 4% | 30% | 14% |
+| blend, -2 | 20% (16/80) | 40% (87/215) | 20% (9/46) | 0% | 15% | 13% |
+| blend, D6 (S4) | 25% (20/80) | 31% (66/215) | 9% (4/46) | 1% | 14% | 9% |
+| blend, -4 | 9% (7/80) | 48% (104/215) | 30% (14/46) | 0% | 16% | 18% |
+
+At a matched NL misled rate, the blend's NL confident-wrong is about int8's
+(blend -2 against int8 +0.04: 40% against 40% on positives, 20% against 15%
+on absent). **Most of S4's NL Q4 gain (CW pos 52% -> 31%, absent 22% -> 9%)
+is a stricter NL operating point**, which the name-dominated floor imposes.
+The Q5 failure is the price of that same point. The gain that does not
+depend on the floor is ranking (held-out r@10 +4.8, MRR +0.058) and name
+queries (name CW pos 32% -> 14%, name misled 2% -> 1%).
+
+### 5. Fix candidates
+
+Chosen after 1-4, each gated on the held-out half. F1 and F2 have nothing
+to tune (their floors are D6-fitted, and D6 fits on names plus the FIT half
+only). F3's c0 is tuned on the FIT half: the best FIT r@10/MRR with FIT-half
+false alarm at or below int8's (11.2%). No c0 on the grid
+{-10, -8, -6, -4, -2, 0, 2} meets that bound; the lowest FIT FA is 14.3% at
+c0 = -10, so c0 = -10 is used. The baseline rows here are gated on
+held-out NL, so int8 vs fp32 Q1 reads +1.2 here against +0.5 on all NL in S4.
+
+- **F1**: rank by the blend, and floor on the int8 cosine of the new top row
+  (D6-fitted on that cosine).
+- **F2**: a joint rule. The top clears if blend >= its D6 floor **or** cosine
+  >= F1's cosine floor.
+- **F3**: a CE minimum. blend = max(CE, c0) + 40 * cos, which caps how far the
+  CE can pull down a bare signature.
+
+#### S8 quality (held-out NL)
+
+| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |
+|---|---|---|---|
+| jina fp32 (baseline) | 0.633 [0.582, 0.685] | 0.423 [0.379, 0.469] | 0.917 / 0.745 |
+| jina int8 (baseline, shipped floors) | 0.645 [0.593, 0.697] | 0.419 [0.374, 0.464] | 0.915 / 0.750 |
+| S4 ce-minilm+int8 K=50 (beta=40), floor on blend | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+| F1 floor on int8 cosine of the reranked top | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+| F2 clears if blend >= its floor OR cosine >= its floor | 0.693 [0.642, 0.744] | 0.477 [0.430, 0.523] | 0.970 / 0.888 |
+| F3 CE minimum c0=-10 | 0.702 [0.651, 0.753] | 0.477 [0.430, 0.524] | 0.970 / 0.888 |
+
+#### S8 D9 gates vs jina fp32 at its D6 floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=16, py +0.0 n=21, ru +0.0 n=7, ty +0.0 n=27 |
+| jina int8 (baseline, shipped floors) | +1.2 [-0.9] | -0.004 [-0.016] | go -1.6 | -1.4 [+1.0] | +2.1 [+6.2] | **Q5** | go +12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty -4.0 n=25 |
+| S4 ce-minilm+int8 K=50 (beta=40), floor on blend | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | -22.2 [-17.3] | +5.7 [+12.1] | **Q5** | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty +22.7 n=22 |
+| F1 floor on int8 cosine of the reranked top | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | +2.0 [+6.8] | -12.9 [-4.9] | **Q4** | go -25.0 n=12, py -5.6 n=18, ru -16.7 n=6, ty -4.5 n=22 |
+| F2 clears if blend >= its floor OR cosine >= its floor | +6.0 [+1.8] | +0.054 [+0.020] | typescript -3.3 | +4.5 [+9.2] | -14.3 [-6.0] | **Q4** | go -25.0 n=12, py -11.1 n=18, ru -16.7 n=6, ty -4.5 n=22 |
+| F3 CE minimum c0=-10 | +6.8 [+2.8] | +0.054 [+0.022] | typescript -1.7 | -21.1 [-16.3] | +7.0 [+13.4] | **Q5** | go +0.0 n=12, py +5.3 n=19, ru +0.0 n=6, ty +22.7 n=22 |
+
+#### S8 D9 gates vs shipped jina int8 at its shipped floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | -1.2 [-3.4] | +0.004 [-0.008] | rust -4.3 | +1.4 [+3.8] | -2.1 [+1.4] | **Q4** | go -12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty +4.0 n=25 |
+| jina int8 (baseline, shipped floors) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=17, py +0.0 n=20, ru +0.0 n=7, ty +0.0 n=26 |
+| S4 ce-minilm+int8 K=50 (beta=40), floor on blend | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | -20.8 [-16.2] | +6.5 [+12.7] | **Q5** | go +0.0 n=13, py +0.0 n=17, ru +0.0 n=7, ty +26.1 n=23 |
+| F1 floor on int8 cosine of the reranked top | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | +3.4 [+8.2] | -10.8 [-3.8] | **Q4** | go -23.1 n=13, py -5.9 n=17, ru -14.3 n=7, ty +0.0 n=23 |
+| F2 clears if blend >= its floor OR cosine >= its floor | +4.8 [+1.2] | +0.058 [+0.027] | typescript -3.3 | +5.9 [+10.5] | -12.3 [-5.0] | **Q4** | go -23.1 n=13, py -11.8 n=17, ru -14.3 n=7, ty +0.0 n=23 |
+| F3 CE minimum c0=-10 | +5.6 [+2.2] | +0.059 [+0.029] | typescript -1.7 | -19.7 [-15.2] | +7.9 [+14.3] | **Q5** | go +0.0 n=13, py +5.6 n=18, ru +0.0 n=7, ty +26.1 n=23 |
+
+#### S8 GM-434 columns (option a), at each row's own floors
+
+| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|---|---|
+| jina fp32 (baseline) | 0.56 / 0.58 / 0.56 / 0.55 | 14% (10/71) | 53% (113/215) | 26% (12/46) | 1% (7/569) | 32% (283/879) | 20% (183/900) |
+| jina int8 (baseline, shipped floors) | 0.57 / 0.57 / 0.55 / 0.53 | 14% (10/70) | 52% (111/215) | 22% (10/46) | 2% (9/577) | 32% (282/879) | 23% (204/900) |
+| S4 ce-minilm+int8 K=50 (beta=40), floor on blend | 19.48 / 17.02 / 24.91 / 17.10 | 25% (20/80) | 31% (66/215) | 9% (4/46) | 1% (10/724) | 14% (127/879) | 9% (81/900) |
+| F1 floor on int8 cosine of the reranked top | 0.48 / 0.50 / 0.52 / 0.50 | 18% (14/80) | 53% (113/215) | 39% (18/46) | 2% (15/724) | 15% (133/879) | 31% (276/900) |
+| F2 clears if blend >= its floor OR cosine >= its floor | 0.00 / 0.00 / 0.00 / 0.00 | 9% (7/80) | 55% (119/215) | 41% (19/46) | 1% (4/724) | 16% (142/879) | 32% (285/900) |
+| F3 CE minimum c0=-10 | 19.48 / 16.72 / 24.91 / 17.10 | 26% (21/81) | 32% (68/215) | 11% (5/46) | 1% (10/724) | 14% (127/879) | 10% (88/900) |
+
+#### S8 GM-434 per language, held-out NL (misled / CW pos / CW absent)
+
+| variant | go | python | rust | typescript |
+|---|---|---|---|---|
+| jina fp32 (baseline) | 19% (3/16) / 51% (31/61) / 9% (1/11) | 10% (2/21) / 45% (21/47) / 36% (4/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 15% (4/27) / 42% (25/60) / 15% (2/13) |
+| jina int8 (baseline, shipped floors) | 29% (5/17) / 41% (25/61) / 0% (0/11) | 10% (2/20) / 47% (22/47) / 27% (3/11) | 14% (1/7) / 77% (36/47) / 45% (5/11) | 8% (2/26) / 47% (28/60) / 15% (2/13) |
+| S4 ce-minilm+int8 K=50 (beta=40), floor on blend | 22% (4/18) / 39% (24/61) / 0% (0/11) | 10% (2/20) / 36% (17/47) / 9% (1/11) | 38% (5/13) / 19% (9/47) / 9% (1/11) | 31% (9/29) / 27% (16/60) / 15% (2/13) |
+| F1 floor on int8 cosine of the reranked top | 17% (3/18) / 62% (38/61) / 18% (2/11) | 10% (2/20) / 51% (24/47) / 55% (6/11) | 31% (4/13) / 64% (30/47) / 45% (5/11) | 17% (5/29) / 35% (21/60) / 38% (5/13) |
+| F2 clears if blend >= its floor OR cosine >= its floor | 6% (1/18) / 64% (39/61) / 18% (2/11) | 0% (0/20) / 53% (25/47) / 55% (6/11) | 31% (4/13) / 64% (30/47) / 45% (5/11) | 7% (2/29) / 42% (25/60) / 46% (6/13) |
+| F3 CE minimum c0=-10 | 22% (4/18) / 39% (24/61) / 0% (0/11) | 14% (3/21) / 36% (17/47) / 18% (2/11) | 38% (5/13) / 19% (9/47) / 9% (1/11) | 31% (9/29) / 30% (18/60) / 15% (2/13) |
+
+### S8 reading
+
+No candidate passes every gate. **F1 and F2 pass Q5**: vs int8 -10.8
+[-3.8] and -12.3 [-5.0]; vs fp32 -12.9 [-4.9] and -14.3 [-6.0]. They keep
+all of the ranking gain, since the ranking is unchanged: r@10 +4.8 [+1.2],
+MRR +0.058 [+0.027] vs int8. **But they fail Q4** (+3.4 [+8.2] and +5.9
+[+10.5] vs int8), and NL CW on absent queries rises to 39-41% against
+int8's 22%. So they trade the confident-wrong gain for the false-alarm fix,
+which is what section 4 predicts: on NL, S4's Q4 gain and its Q5 loss are
+the same stricter operating point. **F3 does nothing useful.** No CE
+minimum brings FIT-half false alarm down to int8's. The c0 it picks (-10)
+adds +0.8 r@10 and leaves Q5 failing (+7.9 [+14.3]).
+
+The rerank's floor-independent value is ranking (r@10 +4.8, MRR +0.058, name
+r@10 0.97) and name-query confidence. For NL confidence it adds little that
+a stricter floor on int8 would not also give. The TypeScript failure is
+real, but it is a symptom, not the disease. The disease is a
+general-English cross-encoder scoring undocumented signatures near -10,
+together with a floor fitted mostly on name queries. The option still open
+is F1 (rank by the blend, gate on the cosine). It fails Q4 by a margin of
++8.2 on the upper bound. A stricter cosine floor would move it along the
+same curve, trading Q5 margin for Q4 margin; that sweep was not run here. Whether that trade is acceptable is the owner's decision; these
+gates do not settle it.
+
+### S8 reproduce
+
+```
+python3 eval/embedding/rerank_q5_diag.py --work <main checkout>/eval/embedding/work --fixes --table out.md
+```
+
+Reads S4's CE cache only (stops on a missing pair); real 25.6 s, user 15.2 s,
+sys 5.5 s at load 23.
