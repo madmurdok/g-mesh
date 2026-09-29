@@ -1,0 +1,201 @@
+{"meta": {"corpus": "ripgrep", "seed": 4222, "frameSource": "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh/eval/embedding/work/ripgrep.sqlite", "frameSha256": "d00f8a256d17c0cda5fe81c1a0c744a697d8c2cce9d5a6075e11f9ff3954aca0", "frameSizes": {"fn": 2111, "type": 369, "other": 120}, "dropped": {"not_embeddable": 2748, "test_or_fixture": 715, "not_at_pin": 14, "duplicate": 0, "excluded": 99}, "exclude": {"study": "eval/embedding", "consumedPrefix": 81, "consumedTargets": 81, "expectedSymbols": 68, "keys": 99}}}
+{"n": 1, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<NoIgnoreVcs as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4687}
+{"n": 2, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Pre as Flag>::doc_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5474}
+{"n": 3, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "hyperlink::<HyperlinkFormat as FromStr>::Err", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 100}
+{"n": 4, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "is_tty_stdout", "filePath": "crates/cli/src/lib.rs", "lineAtPin": 279}
+{"n": 5, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<MultilineDotall as Flag>::update", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4254}
+{"n": 6, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::Mmap", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4062}
+{"n": 7, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<FixedStrings as Flag>::name_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2291}
+{"n": 8, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "dir::IgnoreMatch", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 38}
+{"n": 9, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<NoMessages as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4749}
+{"n": 10, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "overrides", "filePath": "crates/ignore/src/lib.rs", "lineAtPin": 59}
+{"n": 11, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<TypeAdd as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6944}
+{"n": 12, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::WalkBuilder::require_git", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 900}
+{"n": 13, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "flags::lowargs::BoundaryMode", "filePath": "crates/core/flags/lowargs.rs", "lineAtPin": 257}
+{"n": 14, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Sortr as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6417}
+{"n": 15, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "dir::strip_if_is_prefix", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 1104}
+{"n": 16, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "dir::IgnoreBuilder", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 753}
+{"n": 17, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<MaxColumns as Flag>::name_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3767}
+{"n": 18, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "GlobSet", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 309}
+{"n": 19, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::Searcher::passthru", "filePath": "crates/searcher/src/searcher/mod.rs", "lineAtPin": 933}
+{"n": 20, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "path", "filePath": "crates/printer/src/lib.rs", "lineAtPin": 99}
+{"n": 21, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<AutoHybridRegex as Flag>::update", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 290}
+{"n": 22, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "standard::StandardBuilder::separator_field_context", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 423}
+{"n": 23, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "flags::lowargs::LoggingMode", "filePath": "crates/core/flags/lowargs.rs", "lineAtPin": 616}
+{"n": 24, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<NoPcre2Unicode as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4787}
+{"n": 25, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "standard::StandardImpl::trim_line_terminator", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 1523}
+{"n": 26, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "testutil::<KitchenSink as Sink>::Error", "filePath": "crates/searcher/src/testutil.rs", "lineAtPin": 129}
+{"n": 27, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "dir::IgnoreMatch::overrides", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 52}
+{"n": 28, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "standard::<StandardSink as Sink>::Error", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 764}
+{"n": 29, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "matcher::RegexMatcherBuilder::dfa_size_limit", "filePath": "crates/regex/src/matcher.rs", "lineAtPin": 223}
+{"n": 30, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "sink::sinks", "filePath": "crates/searcher/src/sink.rs", "lineAtPin": 517}
+{"n": 31, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "literal::TSeq::infinite", "filePath": "crates/regex/src/literal.rs", "lineAtPin": 451}
+{"n": 32, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "summary::SummaryBuilder::stats", "filePath": "crates/printer/src/summary.rs", "lineAtPin": 264}
+{"n": 33, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "hyperlink::Interpolator", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 626}
+{"n": 34, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<TypeList as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 7173}
+{"n": 35, "stratum": "fn", "kind": "Function", "nativeKind": "trait_method", "qualifiedName": "walk::ParallelVisitorBuilder::build", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1296}
+{"n": 36, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "color::ColorError", "filePath": "crates/printer/src/color.rs", "lineAtPin": 24}
+{"n": 37, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "hyperlink::FormatBuilder::validate", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 442}
+{"n": 38, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::LineNumberNo", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3654}
+{"n": 39, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::SearcherBuilder::encoding", "filePath": "crates/searcher/src/searcher/mod.rs", "lineAtPin": 533}
+{"n": 40, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "hyperlink", "filePath": "crates/printer/src/lib.rs", "lineAtPin": 94}
+{"n": 41, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "glob::Glob::literal", "filePath": "crates/globset/src/glob.rs", "lineAtPin": 334}
+{"n": 42, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "flags::FlagValue::unwrap_value", "filePath": "crates/core/flags/mod.rs", "lineAtPin": 294}
+{"n": 43, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "overrides::Override", "filePath": "crates/ignore/src/overrides.rs", "lineAtPin": 47}
+{"n": 44, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "Match::end", "filePath": "crates/matcher/src/lib.rs", "lineAtPin": 100}
+{"n": 45, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<IncludeZero as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3342}
+{"n": 46, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "human::ParseSizeErrorKind", "filePath": "crates/cli/src/human.rs", "lineAtPin": 12}
+{"n": 47, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "line_buffer::LineBuffer::fill", "filePath": "crates/searcher/src/line_buffer.rs", "lineAtPin": 406}
+{"n": 48, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "logger::Logger", "filePath": "crates/core/logger.rs", "lineAtPin": 16}
+{"n": 49, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::glue::SliceByLine::byte_count", "filePath": "crates/searcher/src/searcher/glue.rs", "lineAtPin": 133}
+{"n": 50, "stratum": "other", "kind": "Variable", "nativeKind": "const", "qualifiedName": "logger::LOGGER", "filePath": "crates/core/logger.rs", "lineAtPin": 19}
+{"n": 51, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<FilesWithoutMatch as Flag>::doc_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2245}
+{"n": 52, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Pre as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5471}
+{"n": 53, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "search::Config", "filePath": "crates/core/search.rs", "lineAtPin": 19}
+{"n": 54, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "decompress::DecompressionReaderBuilder::matcher", "filePath": "crates/cli/src/decompress.rs", "lineAtPin": 251}
+{"n": 55, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "literal::Extractor::extract_class_bytes", "filePath": "crates/regex/src/literal.rs", "lineAtPin": 336}
+{"n": 56, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "hyperlink::Part", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 513}
+{"n": 57, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "flags::parse::set_log_levels", "filePath": "crates/core/flags/parse.rs", "lineAtPin": 116}
+{"n": 58, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "LiteralStrategy", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 710}
+{"n": 59, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "testutil::SearcherTester::print_labels", "filePath": "crates/searcher/src/testutil.rs", "lineAtPin": 316}
+{"n": 60, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "gitignore", "filePath": "crates/ignore/src/lib.rs", "lineAtPin": 58}
+{"n": 61, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Mmap as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4074}
+{"n": 62, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<WithFilename as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 7418}
+{"n": 63, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "gitignore::Glob", "filePath": "crates/ignore/src/gitignore.rs", "lineAtPin": 32}
+{"n": 64, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "decompress::DecompressionReader::new", "filePath": "crates/cli/src/decompress.rs", "lineAtPin": 352}
+{"n": 65, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "counter::<CounterWriter as WriteColor>::set_hyperlink", "filePath": "crates/printer/src/counter.rs", "lineAtPin": 84}
+{"n": 66, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "walk::FnVisitorImp", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1334}
+{"n": 67, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "<&'a M as Matcher>::line_terminator", "filePath": "crates/matcher/src/lib.rs", "lineAtPin": 1368}
+{"n": 68, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::Text", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6631}
+{"n": 69, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "glob::GlobMatcher::is_match", "filePath": "crates/globset/src/glob.rs", "lineAtPin": 142}
+{"n": 70, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "wtr", "filePath": "crates/cli/src/lib.rs", "lineAtPin": 132}
+{"n": 71, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "standard::<StandardSink as Sink>::begin", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 841}
+{"n": 72, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "stats::Stats::bytes_searched", "filePath": "crates/printer/src/stats.rs", "lineAtPin": 47}
+{"n": 73, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "testutil::SearcherTester", "filePath": "crates/searcher/src/testutil.rs", "lineAtPin": 204}
+{"n": 74, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<RegexSizeLimit as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5776}
+{"n": 75, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "search::SearchWorker::should_decompress", "filePath": "crates/core/search.rs", "lineAtPin": 276}
+{"n": 76, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::LineRegexp", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3710}
+{"n": 77, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "gitignore::gitconfig_global_env_contents", "filePath": "crates/ignore/src/gitignore.rs", "lineAtPin": 604}
+{"n": 78, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::StopOnNonmatch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6572}
+{"n": 79, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<MaxDepth as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3959}
+{"n": 80, "stratum": "other", "kind": "Variable", "nativeKind": "const", "qualifiedName": "flags::complete::bash::TEMPLATE_CASE_CHOICES", "filePath": "crates/core/flags/complete/bash.rs", "lineAtPin": 52}
+{"n": 81, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<PCRE2Version as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5423}
+{"n": 82, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "types::TypesBuilder::add_def", "filePath": "crates/ignore/src/types.rs", "lineAtPin": 442}
+{"n": 83, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "decompress::DecompressionCommand", "filePath": "crates/cli/src/decompress.rs", "lineAtPin": 25}
+{"n": 84, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "types::Selection::is_negated", "filePath": "crates/ignore/src/types.rs", "lineAtPin": 191}
+{"n": 85, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "color::ColorError::from_parse_error", "filePath": "crates/printer/src/color.rs", "lineAtPin": 40}
+{"n": 86, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "haystack::Haystack", "filePath": "crates/core/haystack.rs", "lineAtPin": 98}
+{"n": 87, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "dir::Ignore::add_child", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 268}
+{"n": 88, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "matcher::<RegexMatcher as Matcher>::Captures", "filePath": "crates/pcre2/src/matcher.rs", "lineAtPin": 316}
+{"n": 89, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "flags::hiargs::HiArgs::path_printer_builder", "filePath": "crates/core/flags/hiargs.rs", "lineAtPin": 545}
+{"n": 90, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "hostname", "filePath": "crates/cli/src/lib.rs", "lineAtPin": 128}
+{"n": 91, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::core::Core::binary_byte_offset", "filePath": "crates/searcher/src/searcher/core.rs", "lineAtPin": 91}
+{"n": 92, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<FilesWithoutMatch as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2239}
+{"n": 93, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "color::ColorSpecs", "filePath": "crates/printer/src/color.rs", "lineAtPin": 88}
+{"n": 94, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "gitignore::Gitignore::len", "filePath": "crates/ignore/src/gitignore.rs", "lineAtPin": 177}
+{"n": 95, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::core::Core::begin", "filePath": "crates/searcher/src/searcher/core.rs", "lineAtPin": 155}
+{"n": 96, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "matcher::RegexCaptures", "filePath": "crates/regex/src/matcher.rs", "lineAtPin": 524}
+{"n": 97, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Version as Flag>::doc_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 7312}
+{"n": 98, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "decompress::DecompressionMatcher", "filePath": "crates/cli/src/decompress.rs", "lineAtPin": 147}
+{"n": 99, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::WalkState::is_quit", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1285}
+{"n": 100, "stratum": "other", "kind": "File", "nativeKind": null, "qualifiedName": "crates/cli/src/lib.rs", "filePath": "crates/cli/src/lib.rs", "lineAtPin": 1}
+{"n": 101, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "wtr::stdout_buffered_line", "filePath": "crates/cli/src/wtr.rs", "lineAtPin": 39}
+{"n": 102, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Null as Flag>::doc_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4983}
+{"n": 103, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "dir::<Parents as Iterator>::Item", "filePath": "crates/ignore/src/dir.rs", "lineAtPin": 734}
+{"n": 104, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "matcher::RegexMatcherBuilder::case_insensitive", "filePath": "crates/regex/src/matcher.rs", "lineAtPin": 103}
+{"n": 105, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "matcher::RegexMatcherBuilder::extended", "filePath": "crates/pcre2/src/matcher.rs", "lineAtPin": 135}
+{"n": 106, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "walk::WalkBuilder", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 487}
+{"n": 107, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<LineBuffered as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3552}
+{"n": 108, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "search::SearchResult", "filePath": "crates/core/search.rs", "lineAtPin": 171}
+{"n": 109, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "literal::TSeq::min_literal_len", "filePath": "crates/regex/src/literal.rs", "lineAtPin": 533}
+{"n": 110, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "messages", "filePath": "crates/core/main.rs", "lineAtPin": 12}
+{"n": 111, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "<ErrorKind as Display>::fmt", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 255}
+{"n": 112, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "gitignore::excludes_file_default", "filePath": "crates/ignore/src/gitignore.rs", "lineAtPin": 652}
+{"n": 113, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "search::SearchWorkerBuilder", "filePath": "crates/core/search.rs", "lineAtPin": 41}
+{"n": 114, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "process::<CommandError as Display>::fmt", "filePath": "crates/cli/src/process.rs", "lineAtPin": 44}
+{"n": 115, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<NoIgnoreExclude as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4457}
+{"n": 116, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::Hidden", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2770}
+{"n": 117, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "matcher::<RegexMatcher as Matcher>::line_terminator", "filePath": "crates/regex/src/matcher.rs", "lineAtPin": 486}
+{"n": 118, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::FilesWithMatches", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2174}
+{"n": 119, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "path::<Config as Default>::default", "filePath": "crates/printer/src/path.rs", "lineAtPin": 21}
+{"n": 120, "stratum": "other", "kind": "Variable", "nativeKind": "static", "qualifiedName": "messages::ERRORED", "filePath": "crates/core/messages.rs", "lineAtPin": 25}
+{"n": 121, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "Candidate::path_suffix", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 644}
+{"n": 122, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::Config::line_buffer", "filePath": "crates/searcher/src/searcher/mod.rs", "lineAtPin": 218}
+{"n": 123, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "hyperlink::HyperlinkConfig", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 25}
+{"n": 124, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::DirEntry::is_dir", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 102}
+{"n": 125, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Context as Flag>::name_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 1004}
+{"n": 126, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "sink::sinks::Bytes", "filePath": "crates/searcher/src/sink.rs", "lineAtPin": 638}
+{"n": 127, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "json::JSONSink::has_match", "filePath": "crates/printer/src/json.rs", "lineAtPin": 614}
+{"n": 128, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "line_buffer::Config", "filePath": "crates/searcher/src/line_buffer.rs", "lineAtPin": 86}
+{"n": 129, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<MaxColumns as Flag>::update", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3791}
+{"n": 130, "stratum": "other", "kind": "Variable", "nativeKind": "const", "qualifiedName": "MAX_LOOK_AHEAD", "filePath": "crates/printer/src/lib.rs", "lineAtPin": 87}
+{"n": 131, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<PreGlob as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5583}
+{"n": 132, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<TypeAdd as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6941}
+{"n": 133, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "flags::lowargs::ContextMode", "filePath": "crates/core/flags/lowargs.rs", "lineAtPin": 340}
+{"n": 134, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<SmartCase as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6150}
+{"n": 135, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<FixedStrings as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2300}
+{"n": 136, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "json::JSONBuilder", "filePath": "crates/printer/src/json.rs", "lineAtPin": 54}
+{"n": 137, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "GlobSet::builder", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 319}
+{"n": 138, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "jsont::Context", "filePath": "crates/printer/src/jsont.rs", "lineAtPin": 111}
+{"n": 139, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "Candidate::from_cow", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 633}
+{"n": 140, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "ban", "filePath": "crates/regex/src/lib.rs", "lineAtPin": 12}
+{"n": 141, "stratum": "fn", "kind": "Function", "nativeKind": "trait_method", "qualifiedName": "Matcher::shortest_match", "filePath": "crates/matcher/src/lib.rs", "lineAtPin": 1010}
+{"n": 142, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Trace as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6774}
+{"n": 143, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "error::ErrorKind", "filePath": "crates/pcre2/src/error.rs", "lineAtPin": 25}
+{"n": 144, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "strip::strip_from_match", "filePath": "crates/regex/src/strip.rs", "lineAtPin": 39}
+{"n": 145, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "<NoError as Error>::description", "filePath": "crates/matcher/src/lib.rs", "lineAtPin": 500}
+{"n": 146, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "hyperlink::InterpolatorStatus", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 693}
+{"n": 147, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "hyperlink::InterpolatorStatus::inactive", "filePath": "crates/printer/src/hyperlink/mod.rs", "lineAtPin": 700}
+{"n": 148, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "glob::MatchStrategy", "filePath": "crates/globset/src/glob.rs", "lineAtPin": 16}
+{"n": 149, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<FixedStrings as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2294}
+{"n": 150, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "standard", "filePath": "crates/printer/src/lib.rs", "lineAtPin": 100}
+{"n": 151, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Multiline as Flag>::doc_category", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 4141}
+{"n": 152, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<GlobCaseInsensitive as Flag>::update", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2619}
+{"n": 153, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "jsont::Message", "filePath": "crates/printer/src/jsont.rs", "lineAtPin": 11}
+{"n": 154, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::Work::add_ignore", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1537}
+{"n": 155, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "literal::Extractor::enforce_literal_len", "filePath": "crates/regex/src/literal.rs", "lineAtPin": 434}
+{"n": 156, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "ExtensionStrategy", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 780}
+{"n": 157, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "summary::SummaryBuilder::separator_field", "filePath": "crates/printer/src/summary.rs", "lineAtPin": 299}
+{"n": 158, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "stats::<Stats as Add>::Output", "filePath": "crates/printer/src/stats.rs", "lineAtPin": 108}
+{"n": 159, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<IgnoreCase as Flag>::name_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3154}
+{"n": 160, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "searcher", "filePath": "crates/searcher/src/lib.rs", "lineAtPin": 103}
+{"n": 161, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "path::PathPrinterBuilder::separator", "filePath": "crates/printer/src/path.rs", "lineAtPin": 108}
+{"n": 162, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "standard::StandardBuilder::build", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 127}
+{"n": 163, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "lines::<LineIter as Iterator>::Item", "filePath": "crates/searcher/src/lines.rs", "lineAtPin": 32}
+{"n": 164, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<CaseSensitive as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 647}
+{"n": 165, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "walk::should_skip_entry", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 2008}
+{"n": 166, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "walk::ReadDirResult", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1505}
+{"n": 167, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<PreGlob as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5574}
+{"n": 168, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "SuffixStrategy", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 863}
+{"n": 169, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "sink::<&'a mut S as Sink>::context_break", "filePath": "crates/searcher/src/sink.rs", "lineAtPin": 247}
+{"n": 170, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "flags", "filePath": "crates/core/main.rs", "lineAtPin": 14}
+{"n": 171, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "jsont::<Message as Serialize>::serialize", "filePath": "crates/printer/src/jsont.rs", "lineAtPin": 19}
+{"n": 172, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<RegexSizeLimit as Flag>::doc_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5782}
+{"n": 173, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::OneFileSystem", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5079}
+{"n": 174, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "sink::sinks::<UTF8 as Sink>::matched", "filePath": "crates/searcher/src/sink.rs", "lineAtPin": 550}
+{"n": 175, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::WalkBuilder::min_depth", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 698}
+{"n": 176, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::Crlf", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 1382}
+{"n": 177, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<IGlob as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3094}
+{"n": 178, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::AfterContext", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 156}
+{"n": 179, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Version as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 7303}
+{"n": 180, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "error", "filePath": "crates/pcre2/src/lib.rs", "lineAtPin": 15}
+{"n": 181, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<ByteOffset as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 587}
+{"n": 182, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Color as Flag>::doc_variable", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 700}
+{"n": 183, "stratum": "type", "kind": "Type", "nativeKind": "type_alias", "qualifiedName": "PatternSetPoolFn", "filePath": "crates/globset/src/lib.rs", "lineAtPin": 978}
+{"n": 184, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "json::JSONBuilder::new", "filePath": "crates/printer/src/json.rs", "lineAtPin": 60}
+{"n": 185, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "standard::StandardBuilder::per_match_one_line", "filePath": "crates/printer/src/standard.rs", "lineAtPin": 275}
+{"n": 186, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::LineNumber", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3601}
+{"n": 187, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::core::Core::new", "filePath": "crates/searcher/src/searcher/core.rs", "lineAtPin": 40}
+{"n": 188, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "flags::lowargs::EncodingMode", "filePath": "crates/core/flags/lowargs.rs", "lineAtPin": 513}
+{"n": 189, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<PCRE2 as Flag>::name_long", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 5341}
+{"n": 190, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "types", "filePath": "crates/ignore/src/lib.rs", "lineAtPin": 61}
+{"n": 191, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Heading as Flag>::doc_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2666}
+{"n": 192, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Text as Flag>::name_short", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 6637}
+{"n": 193, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "walk::Sorter", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 514}
+{"n": 194, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "walk::Work::read_dir", "filePath": "crates/ignore/src/walk.rs", "lineAtPin": 1550}
+{"n": 195, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "searcher::Searcher::search_file", "filePath": "crates/searcher/src/searcher/mod.rs", "lineAtPin": 665}
+{"n": 196, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::lowargs::ContextSeparator", "filePath": "crates/core/flags/lowargs.rs", "lineAtPin": 472}
+{"n": 197, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "line_buffer::LineBuffer::set_binary_detection", "filePath": "crates/searcher/src/line_buffer.rs", "lineAtPin": 330}
+{"n": 198, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "flags::defs::LineBuffered", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 3537}
+{"n": 199, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "flags::defs::<Help as Flag>::is_switch", "filePath": "crates/core/flags/defs.rs", "lineAtPin": 2713}
+{"n": 200, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "flags::defs", "filePath": "crates/core/flags/mod.rs", "lineAtPin": 44}

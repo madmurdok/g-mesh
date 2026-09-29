@@ -1,0 +1,51 @@
+{"n": 1, "qualifiedName": "flags::defs::<NoIgnoreVcs as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 2, "qualifiedName": "flags::defs::<Pre as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 3, "qualifiedName": "hyperlink::<HyperlinkFormat as FromStr>::Err", "reason": "trivial: associated type alias to HyperlinkFormatError"}
+{"n": 7, "qualifiedName": "flags::defs::<FixedStrings as Flag>::name_short", "reason": "trivial: returns the constant short flag letter"}
+{"n": 9, "qualifiedName": "flags::defs::<NoMessages as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 10, "qualifiedName": "overrides", "reason": "trivial: bare `pub mod overrides;` declaration"}
+{"n": 11, "qualifiedName": "flags::defs::<TypeAdd as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 14, "qualifiedName": "flags::defs::<Sortr as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 17, "qualifiedName": "flags::defs::<MaxColumns as Flag>::name_short", "reason": "trivial: returns the constant short flag letter"}
+{"n": 19, "qualifiedName": "searcher::Searcher::passthru", "reason": "trivial: field accessor"}
+{"n": 20, "qualifiedName": "path", "reason": "trivial: bare `mod path;` declaration"}
+{"n": 24, "qualifiedName": "flags::defs::<NoPcre2Unicode as Flag>::is_switch", "reason": "trivial: returns a constant bool"}
+{"n": 25, "qualifiedName": "standard::StandardImpl::trim_line_terminator", "reason": "boilerplate: forwards to the free function trim_line_terminator"}
+{"n": 26, "qualifiedName": "testutil::<KitchenSink as Sink>::Error", "reason": "trivial: associated type alias in test utility sink"}
+{"n": 27, "qualifiedName": "dir::IgnoreMatch::overrides", "reason": "trivial: wraps an override glob in an enum variant"}
+{"n": 28, "qualifiedName": "standard::<StandardSink as Sink>::Error", "reason": "trivial: associated type alias to io::Error"}
+{"n": 31, "qualifiedName": "literal::TSeq::infinite", "reason": "trivial: constructs an infinite literal sequence"}
+{"n": 34, "qualifiedName": "flags::defs::<TypeList as Flag>::name_long", "reason": "trivial: returns the constant flag name"}
+{"n": 40, "qualifiedName": "hyperlink", "reason": "trivial: bare `mod hyperlink;` declaration"}
+{"n": 44, "qualifiedName": "Match::end", "reason": "trivial: field accessor"}
+{"n": 45, "qualifiedName": "flags::defs::<IncludeZero as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 51, "qualifiedName": "flags::defs::<FilesWithoutMatch as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 52, "qualifiedName": "flags::defs::<Pre as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 60, "qualifiedName": "gitignore", "reason": "trivial: bare `pub mod gitignore;` declaration"}
+{"n": 61, "qualifiedName": "flags::defs::<Mmap as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 62, "qualifiedName": "flags::defs::<WithFilename as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 65, "qualifiedName": "counter::<CounterWriter as WriteColor>::set_hyperlink", "reason": "boilerplate: forwards to the wrapped writer"}
+{"n": 67, "qualifiedName": "<&'a M as Matcher>::line_terminator", "reason": "boilerplate: forwards to the referenced matcher"}
+{"n": 70, "qualifiedName": "wtr", "reason": "trivial: bare `mod wtr;` declaration"}
+{"n": 72, "qualifiedName": "stats::Stats::bytes_searched", "reason": "trivial: field accessor"}
+{"n": 74, "qualifiedName": "flags::defs::<RegexSizeLimit as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 79, "qualifiedName": "flags::defs::<MaxDepth as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 81, "qualifiedName": "flags::defs::<PCRE2Version as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 84, "qualifiedName": "types::Selection::is_negated", "reason": "trivial: variant check on a two-variant enum"}
+{"n": 88, "qualifiedName": "matcher::<RegexMatcher as Matcher>::Captures", "reason": "trivial: associated type alias to RegexCaptures"}
+{"n": 90, "qualifiedName": "hostname", "reason": "trivial: bare `mod hostname;` declaration"}
+{"n": 91, "qualifiedName": "searcher::core::Core::binary_byte_offset", "reason": "trivial: field accessor converting to u64"}
+{"n": 92, "qualifiedName": "flags::defs::<FilesWithoutMatch as Flag>::doc_category", "reason": "trivial: returns a constant category"}
+{"n": 94, "qualifiedName": "gitignore::Gitignore::len", "reason": "trivial: returns the size of the inner glob set"}
+{"n": 95, "qualifiedName": "searcher::core::Core::begin", "reason": "boilerplate: forwards to the sink's begin"}
+{"n": 97, "qualifiedName": "flags::defs::<Version as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 99, "qualifiedName": "walk::WalkState::is_quit", "reason": "trivial: equality check against WalkState::Quit"}
+{"n": 102, "qualifiedName": "flags::defs::<Null as Flag>::doc_long", "reason": "trivial: returns the flag documentation string"}
+{"n": 103, "qualifiedName": "dir::<Parents as Iterator>::Item", "reason": "trivial: associated type alias to IgnoreRef"}
+{"n": 107, "qualifiedName": "flags::defs::<LineBuffered as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 109, "qualifiedName": "literal::TSeq::min_literal_len", "reason": "boilerplate: forwards to the inner literal sequence"}
+{"n": 110, "qualifiedName": "messages", "reason": "trivial: bare `mod messages;` declaration"}
+{"n": 115, "qualifiedName": "flags::defs::<NoIgnoreExclude as Flag>::doc_short", "reason": "trivial: returns the flag short doc string"}
+{"n": 117, "qualifiedName": "matcher::<RegexMatcher as Matcher>::line_terminator", "reason": "trivial: field accessor"}
+{"n": 124, "qualifiedName": "walk::DirEntry::is_dir", "reason": "boilerplate: forwards to the wrapped entry"}
+{"n": 125, "qualifiedName": "flags::defs::<Context as Flag>::name_short", "reason": "trivial: returns the constant short flag letter"}

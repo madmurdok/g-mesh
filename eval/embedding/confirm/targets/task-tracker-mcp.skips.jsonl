@@ -1,0 +1,2 @@
+{"n": 44, "qualifiedName": "TaskConflictError#constructor", "reason": "trivial constructor (super, name, two stored fields); its only intent is its class TaskConflictError's, already GM-398 ttm-014, so any query would near-duplicate it"}
+{"n": 46, "qualifiedName": "TaskBlockedError#constructor", "reason": "trivial constructor (super and name only); its only intent is its class TaskBlockedError's, already GM-398 ttm-003"}
