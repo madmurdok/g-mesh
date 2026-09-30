@@ -265,8 +265,9 @@ mod tests {
         assert_eq!(structured_doc(py), "Sends it.");
         let md = "S.\n\n    let x = 1;\n    let y = 2;";
         assert_eq!(structured_doc(md), "S.");
-        let list = "S.\n\n  - an item\n    continued";
-        assert_eq!(structured_doc(list), "S.\n\n- an item\n    continued");
+        // Indented four spaces, so only the list-item guard keeps it.
+        let list = "S.\n\n    - an item\n      continued";
+        assert_eq!(structured_doc(list), "S.\n\n- an item\n      continued");
     }
 
     /// Control: making `is_dropped_name` return `false` fails it.
