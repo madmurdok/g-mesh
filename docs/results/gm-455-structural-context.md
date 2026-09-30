@@ -330,6 +330,9 @@ with no context.
   a gain of a few points with its lower bound above zero and Q4 held, the
   cost side would be small: about 13 header tokens and file-local churn.
 
+**Owner decision (2026-10-01):** "да, no-go". No structural context goes
+into the embedded text; GM-423's ADR decides the doc form alone.
+
 ## Reproduce
 
 ```sh
