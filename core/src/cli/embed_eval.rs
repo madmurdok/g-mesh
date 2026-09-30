@@ -27,6 +27,7 @@ mod metrics;
 mod progress;
 mod queries;
 mod rng;
+mod structured;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -233,6 +234,12 @@ impl Node {
             TextForm::Full => self.text.clone(),
             TextForm::FirstParagraph => {
                 text_to_embed(self.doc.as_deref().map(first_paragraph), self.signature.as_deref())
+            }
+            // A doc that trims to nothing and no signature would leave the
+            // node with no text; it falls back to the full text instead.
+            TextForm::Structured => {
+                let doc = self.doc.as_deref().map(structured::structured_doc);
+                text_to_embed(doc.as_deref(), self.signature.as_deref()).or_else(|| self.text.clone())
             }
         }
     }
@@ -1427,6 +1434,45 @@ mod tests {
         assert_eq!(node.text_for(TextForm::FirstParagraph).as_deref(), Some("Short.\n\nfn f()"));
     }
 
+    fn node(doc: Option<&str>, signature: Option<&str>) -> Node {
+        Node {
+            id: "n".into(),
+            kind: "Function".into(),
+            qualified_name: "f".into(),
+            file_path: "f.rs".into(),
+            language: "rust".into(),
+            text: text_to_embed(doc, signature),
+            doc: doc.map(Into::into),
+            signature: signature.map(Into::into),
+        }
+    }
+
+    /// The structured form trims the doc and appends the signature in
+    /// `text_to_embed`'s layout, and is `Some` exactly when `text` is.
+    /// Control: making the `Structured` arm return `self.text.clone()` fails
+    /// the first assertion; dropping its `.or_else(..)` fallback fails the
+    /// code-only one.
+    #[test]
+    fn structured_form_trims_the_doc_before_the_signature() {
+        let doc = "Short.\n\n# Examples\n\n```\nf();\n```\n\n@param x y";
+        assert_eq!(
+            node(Some(doc), Some("fn f()")).text_for(TextForm::Structured).as_deref(),
+            Some("Short.\n\nfn f()")
+        );
+        // Absent doc: the signature alone, as in the full form.
+        assert_eq!(node(None, Some("fn f()")).text_for(TextForm::Structured).as_deref(), Some("fn f()"));
+        // A doc of only code and no signature falls back to the full text
+        // rather than dropping the node from the candidate set.
+        let code = "```\nf();\n```";
+        assert_eq!(node(Some(code), None).text_for(TextForm::Structured).as_deref(), Some(code));
+        // A doc of only code with a signature: the signature alone.
+        assert_eq!(
+            node(Some(code), Some("fn f()")).text_for(TextForm::Structured).as_deref(),
+            Some("fn f()")
+        );
+        assert_eq!(node(None, None).text_for(TextForm::Structured), None);
+    }
+
     /// A default `text` leaves the fingerprint of every run made before the
     /// field existed unchanged. Control: hashing `format!("{variant:?}")`
     /// fails the first assertion (and `report` then refuses stored runs as
@@ -1457,6 +1503,15 @@ mod tests {
             dimension = 768
             max_tokens = 1024
             text = "first-paragraph"
+
+            [[variant]]
+            name = "s"
+            arm = "model"
+            role = "cost"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+            text = "structured"
             "#,
         )
         .unwrap();
@@ -1465,6 +1520,8 @@ mod tests {
         assert!(plain.ends_with("reference: None }"), "{plain}");
         let cut = fingerprint_text(file.get("p").unwrap());
         assert!(cut.ends_with("text: FirstParagraph }"), "{cut}");
+        let structured = fingerprint_text(file.get("s").unwrap());
+        assert!(structured.ends_with("text: Structured }"), "{structured}");
     }
 
     /// Words are permuted, not dropped or altered. Control: returning the

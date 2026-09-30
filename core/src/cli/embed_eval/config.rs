@@ -95,6 +95,11 @@ pub enum TextForm {
     /// The doc comment cut at its first blank line, then the signature, in
     /// `text_to_embed`'s layout.
     FirstParagraph,
+    /// The doc comment trimmed to its prose outline by
+    /// `structured::structured_doc` (summary, headings, short paragraphs; no
+    /// code, parameter lists or link lines), then the signature, in
+    /// `text_to_embed`'s layout.
+    Structured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

@@ -122,6 +122,22 @@ max_tokens = 1024
 token_type_ids = false
 text = "first-paragraph"
 
+# GM-465: "structured" keeps the doc's summary, headings and short prose and
+# drops code, parameter lists and link lines (core/src/cli/embed_eval/structured.rs).
+[[variant]]
+name = "jina-v2-base-code-int8-structured"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "structured"
+
 # --- broken arms (D7) -------------------------------------------------------
 
 [[variant]]
