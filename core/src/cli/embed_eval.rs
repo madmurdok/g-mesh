@@ -24,6 +24,7 @@ mod bm25;
 mod config;
 mod decision;
 mod metrics;
+mod progress;
 mod queries;
 mod rng;
 
@@ -665,17 +666,31 @@ fn run_corpus(
         let vectors = match variant.arm {
             Arm::Model => {
                 let (base, _, model) = encoder.unwrap();
+                let mut progress = progress::stderr(&variant.name, corpus, "embed", texts.len());
                 texts
                     .iter()
-                    .map(|t| model.embed(&format!("{}{t}", base.document_prefix)))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let v = model.embed(&format!("{}{t}", base.document_prefix));
+                        progress.tick(i + 1);
+                        v
+                    })
                     .collect::<Result<Vec<_>>>()?
             }
             Arm::WordsShuffled => {
                 let (base, _, model) = encoder.unwrap();
+                let mut progress = progress::stderr(&variant.name, corpus, "embed", texts.len());
                 texts
                     .iter()
-                    .map(|t| {
-                        model.embed(&format!("{}{}", base.document_prefix, shuffle_words(t, &mut arm_rng)))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let v = model.embed(&format!(
+                            "{}{}",
+                            base.document_prefix,
+                            shuffle_words(t, &mut arm_rng)
+                        ));
+                        progress.tick(i + 1);
+                        v
                     })
                     .collect::<Result<Vec<_>>>()?
             }
@@ -708,7 +723,16 @@ fn run_corpus(
     let started = Instant::now();
     let scores_per_query: Vec<Vec<f64>> = if variant.arm == Arm::Bm25 {
         let index = bm25::Bm25::new(texts.iter().copied());
-        queries.iter().map(|q| index.scores(&q.text)).collect()
+        let mut progress = progress::stderr(&variant.name, corpus, "score", queries.len());
+        queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let scores = index.scores(&q.text);
+                progress.tick(i + 1);
+                scores
+            })
+            .collect()
     } else {
         let query_vectors: Vec<Vec<f32>> = if same_queries && dir.join("query_vectors.bin").exists() {
             read_vectors(&dir.join("query_vectors.bin"), queries.len(), dimension)?
@@ -717,10 +741,12 @@ fn run_corpus(
                 Arm::Model | Arm::WordsShuffled => {
                     let (base, _, model) = encoder.unwrap();
                     let mut out = Vec::with_capacity(queries.len());
+                    let mut progress = progress::stderr(&variant.name, corpus, "query", queries.len());
                     for q in &queries {
                         let t = Instant::now();
                         out.push(model.embed(&format!("{}{}", base.query_prefix, q.text))?);
                         timings.query_embed_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                        progress.tick(out.len());
                     }
                     out
                 }
@@ -734,9 +760,15 @@ fn run_corpus(
             write_vectors(&dir.join("query_vectors.bin"), &vectors)?;
             vectors
         };
+        let mut progress = progress::stderr(&variant.name, corpus, "score", query_vectors.len());
         query_vectors
             .iter()
-            .map(|qv| node_vectors.iter().map(|nv| f64::from(cosine_similarity(qv, nv))).collect())
+            .enumerate()
+            .map(|(i, qv)| {
+                let scores = node_vectors.iter().map(|nv| f64::from(cosine_similarity(qv, nv))).collect();
+                progress.tick(i + 1);
+                scores
+            })
             .collect()
     };
 
