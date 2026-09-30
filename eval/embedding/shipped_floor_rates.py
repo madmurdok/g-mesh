@@ -33,6 +33,11 @@ SHIPPED = {"go": 0.59, "python": 0.57, "rust": 0.55, "typescript": 0.50}
 # report-phaseB.json, arms["jina-v2-base-code-fp32"].floors.floors (GM-398 D6).
 FITTED = {"go": 0.56, "python": 0.58, "rust": 0.56, "typescript": 0.55}
 DEFAULT_FLOOR = 0.50
+# core/src/mcp/similarity.rs::floor, release-3.17.0: the int8 model's floors
+# (ADR 0011; read, not remembered). Its DEFAULT_FLOOR equals typescript's.
+# `--floors shipped-int8` (GM-423).
+SHIPPED_INT8 = {"go": 0.57, "python": 0.57, "rust": 0.55, "typescript": 0.53}
+SHIPPED_INT8_DEFAULT = 0.53
 
 
 def held_out(qid: str, mechanical: bool) -> bool:
@@ -56,12 +61,13 @@ def load_queries(corpus: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
-    ap.add_argument("--floors", choices=["shipped", "fitted"], default="shipped")
+    ap.add_argument("--floors", choices=["shipped", "fitted", "shipped-int8"], default="shipped")
     ap.add_argument("--json")
     ap.add_argument("--options", action="store_true", help="GM-434/S2: evaluate the below-floor options")
     ap.add_argument("--after", action="store_true", help="GM-434/S7: score similarity.rs's shipped verdict rule")
     a = ap.parse_args()
-    floors = SHIPPED if a.floors == "shipped" else FITTED
+    floors = {"shipped": SHIPPED, "fitted": FITTED, "shipped-int8": SHIPPED_INT8}[a.floors]
+    default_floor = SHIPPED_INT8_DEFAULT if a.floors == "shipped-int8" else DEFAULT_FLOOR
 
     rows = []
     for d in sorted(Path(a.run).iterdir()):
@@ -83,7 +89,7 @@ def main():
             rows.append(dict(
                 id=r["id"], corpus=man["corpus"], lang=q["language"], mech=q["_mech"],
                 pos=q["kind"] == "positive", held=held_out(r["id"], q["_mech"]),
-                rank1=rank == 1, clears=None if top is None else top >= floors.get(tl, DEFAULT_FLOOR),
+                rank1=rank == 1, clears=None if top is None else top >= floors.get(tl, default_floor),
                 rank=rank, top=top, tl=tl, prose=any(c.isspace() for c in q["text"].strip()),
                 text=q["text"],
             ))
