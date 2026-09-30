@@ -24,6 +24,7 @@ mod bm25;
 mod churn;
 mod config;
 mod context;
+mod cost;
 mod decision;
 mod metrics;
 mod progress;
@@ -65,6 +66,10 @@ pub enum EmbedEvalCommand {
     Parity(ParityArgs),
     /// Count the embedded texts synthetic edits invalidate, per variant.
     Churn(churn::ChurnArgs),
+    /// The embedding cost model: calibrate latency per token count, predict
+    /// a variant's pass time from it.
+    #[command(subcommand)]
+    Cost(cost::CostCommand),
 }
 
 #[derive(Debug, Args)]
@@ -150,6 +155,7 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Report(args) => report(&args),
         EmbedEvalCommand::Parity(args) => parity(&args),
         EmbedEvalCommand::Churn(args) => churn::run(&args),
+        EmbedEvalCommand::Cost(command) => cost::run(&command),
     }
 }
 
@@ -558,7 +564,20 @@ fn shuffle_words(text: &str, rng: &mut Rng) -> String {
     words.join(" ")
 }
 
-fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
+/// The ranking candidates (nodes with text, by index) and the text `run`
+/// embeds for each under `variant`'s text form and context, before the
+/// encoder's document prefix. `cost predict` counts exactly these.
+fn candidate_texts(nodes: &[Node], variant: &Variant, arm_seed: u64) -> (Vec<usize>, Vec<String>) {
+    let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
+    let mut all_texts = context::embed_texts(nodes, variant.text, variant.context, arm_seed);
+    let texts = candidates.iter().map(|&i| all_texts[i].take().unwrap()).collect();
+    (candidates, texts)
+}
+
+/// The model's tokenizer with no padding and no truncation: it counts the
+/// tokens (special ones included) `EmbeddingModel` truncates to
+/// `max_sequence_length`.
+fn plain_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
     let path = model_dir.join(TOKENIZER_FILE_NAME);
     let mut tokenizer = tokenizers::Tokenizer::from_file(&path)
         .map_err(|err| anyhow::anyhow!("failed to load tokenizer {}: {err}", path.display()))?;
@@ -566,6 +585,11 @@ fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
     tokenizer
         .with_truncation(None)
         .map_err(|err| anyhow::anyhow!("failed to clear tokenizer truncation: {err}"))?;
+    Ok(tokenizer)
+}
+
+fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
+    let tokenizer = plain_tokenizer(model_dir)?;
     let mut over_512 = 0usize;
     let mut over_1024 = 0usize;
     for text in texts {
@@ -646,11 +670,8 @@ fn run_corpus(
     let eval_dir = &args.dir.eval_dir;
     let snapshot_sha = verified_snapshot(eval_dir, corpora, corpus)?;
     let nodes = load_nodes(&snapshot_path(eval_dir, corpus))?;
-    let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
+    let (candidates, owned_texts) = candidate_texts(&nodes, variant, variants.settings.arm_seed);
     let candidate_of: HashMap<usize, usize> = candidates.iter().enumerate().map(|(c, &i)| (i, c)).collect();
-    let mut all_texts =
-        context::embed_texts(&nodes, variant.text, variant.context, variants.settings.arm_seed);
-    let owned_texts: Vec<String> = candidates.iter().map(|&i| all_texts[i].take().unwrap()).collect();
     let texts: Vec<&str> = owned_texts.iter().map(String::as_str).collect();
     let node_ids_sha = {
         let mut h = Sha256::new();
