@@ -85,6 +85,23 @@ pub enum Role {
     Informational,
 }
 
+/// Which text of a node a model arm embeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextForm {
+    /// `text_to_embed`'s output, what production embeds.
+    #[default]
+    Full,
+    /// The doc comment cut at its first blank line, then the signature, in
+    /// `text_to_embed`'s layout.
+    FirstParagraph,
+    /// The doc comment trimmed to its prose outline by
+    /// `structured::structured_doc` (summary, headings, short paragraphs; no
+    /// code, parameter lists or link lines), then the signature, in
+    /// `text_to_embed`'s layout.
+    Structured,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolingName {
@@ -125,6 +142,10 @@ pub struct Variant {
     /// The model variant a shuffled or words-shuffled arm is derived from.
     #[serde(default)]
     pub reference: Option<String>,
+    /// Kept last: `embed_eval::fingerprint` drops it when it is the default,
+    /// so a default variant's fingerprint is the one it had without the field.
+    #[serde(default)]
+    pub text: TextForm,
 }
 
 impl VariantsFile {
