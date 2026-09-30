@@ -44,7 +44,7 @@ use crate::embedding::model::{
 };
 use crate::embedding::pipeline::text_to_embed;
 
-use config::{Arm, CorporaFile, Role, Variant, VariantsFile};
+use config::{Arm, CorporaFile, Role, TextForm, Variant, VariantsFile};
 use metrics::{Bound, Floors, Outcome, KEPT_HITS};
 use queries::{hex, Query};
 use rng::Rng;
@@ -113,6 +113,10 @@ pub struct ReportArgs {
     /// Also write the full report as JSON here.
     #[arg(long)]
     pub json: Option<PathBuf>,
+    /// Score the candidates against this run instead of `settings.reference`
+    /// (e.g. a shorter input against the shipped model).
+    #[arg(long)]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -216,6 +220,37 @@ struct Node {
     file_path: String,
     language: String,
     text: Option<String>,
+    doc: Option<String>,
+    signature: Option<String>,
+}
+
+impl Node {
+    /// The text a variant embeds for this node. Every form is `Some` exactly
+    /// when `text` is, so the candidate set does not depend on the form.
+    fn text_for(&self, form: TextForm) -> Option<String> {
+        match form {
+            TextForm::Full => self.text.clone(),
+            TextForm::FirstParagraph => {
+                text_to_embed(self.doc.as_deref().map(first_paragraph), self.signature.as_deref())
+            }
+        }
+    }
+}
+
+/// `doc` up to its first blank (whitespace-only) line, trimmed; all of it
+/// when it has none.
+fn first_paragraph(doc: &str) -> &str {
+    let doc = doc.trim();
+    let mut end = doc.len();
+    let mut offset = 0;
+    for line in doc.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    doc[..end].trim_end()
 }
 
 fn load_nodes(db: &Path) -> Result<Vec<Node>> {
@@ -236,6 +271,8 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
                 file_path: row.get(3)?,
                 language: row.get(4)?,
                 text: text_to_embed(doc.as_deref(), signature.as_deref()),
+                doc,
+                signature,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -377,7 +414,18 @@ struct Timings {
 }
 
 fn fingerprint(variant: &Variant) -> String {
-    hex(&Sha256::digest(format!("{variant:?}").as_bytes()))
+    hex(&Sha256::digest(fingerprint_text(variant).as_bytes()))
+}
+
+/// The variant's `Debug` form, without the `text` field when it is the
+/// default: a default `text` must leave the fingerprints of runs stored
+/// before the field existed valid.
+fn fingerprint_text(variant: &Variant) -> String {
+    let debug = format!("{variant:?}");
+    match variant.text {
+        TextForm::Full => debug.replacen(", text: Full }", " }", 1),
+        _ => debug,
+    }
 }
 
 fn run_dir(args: &RunArgs, variant: &str, corpus: &str) -> PathBuf {
@@ -525,7 +573,9 @@ fn run_corpus(
     let nodes = load_nodes(&snapshot_path(eval_dir, corpus))?;
     let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
     let candidate_of: HashMap<usize, usize> = candidates.iter().enumerate().map(|(c, &i)| (i, c)).collect();
-    let texts: Vec<&str> = candidates.iter().map(|&i| nodes[i].text.as_deref().unwrap()).collect();
+    let owned_texts: Vec<String> =
+        candidates.iter().map(|&i| nodes[i].text_for(variant.text).unwrap()).collect();
+    let texts: Vec<&str> = owned_texts.iter().map(String::as_str).collect();
     let node_ids_sha = {
         let mut h = Sha256::new();
         for &i in &candidates {
@@ -942,10 +992,11 @@ fn report(args: &ReportArgs) -> Result<()> {
     let settings = &variants.settings;
     let arms: Vec<ArmRun> =
         args.runs.iter().map(|r| load_arm(eval_dir, &variants, r)).collect::<Result<_>>()?;
+    let reference_name = args.reference.as_deref().unwrap_or(&settings.reference);
     let reference = arms
         .iter()
-        .find(|a| a.name == settings.reference)
-        .with_context(|| format!("the reference {} is not among the runs", settings.reference))?;
+        .find(|a| a.name == reference_name)
+        .with_context(|| format!("the reference {reference_name} is not among the runs"))?;
     let costs: Option<BTreeMap<String, decision::Costs>> = match &args.costs {
         None => None,
         Some(path) => {
@@ -1038,7 +1089,7 @@ fn report(args: &ReportArgs) -> Result<()> {
         entry["discordanceVsReference@10"] =
             json!(metrics::discordance(&reference.outcomes, &arm.outcomes, 10));
 
-        if matches!(arm.variant.role, Role::Cost | Role::Quality) {
+        if matches!(arm.variant.role, Role::Cost | Role::Quality) && arm.name != reference.name {
             let recall = metrics::paired_deltas(
                 &reference.outcomes,
                 &arm.outcomes,
@@ -1319,6 +1370,69 @@ mod tests {
         write_vectors(&path, &vectors).unwrap();
         assert_eq!(read_vectors(&path, 2, 3).unwrap(), vectors);
         assert!(read_vectors(&path, 3, 3).is_err());
+    }
+
+    #[test]
+    fn first_paragraph_stops_at_the_first_blank_line() {
+        // Control: returning `doc.trim()` unchanged fails the first two.
+        assert_eq!(
+            first_paragraph("Summary line\ncontinued.\n\nDetails.\n\nMore."),
+            "Summary line\ncontinued."
+        );
+        assert_eq!(first_paragraph("  Summary.\n   \t\nDetails."), "Summary.");
+        assert_eq!(first_paragraph("One paragraph\nonly.\n"), "One paragraph\nonly.");
+        let node = Node {
+            id: "n".into(),
+            kind: "Function".into(),
+            qualified_name: "f".into(),
+            file_path: "f.rs".into(),
+            language: "rust".into(),
+            text: text_to_embed(Some("Short.\n\nLong tail."), Some("fn f()")),
+            doc: Some("Short.\n\nLong tail.".into()),
+            signature: Some("fn f()".into()),
+        };
+        assert_eq!(node.text_for(TextForm::Full).as_deref(), Some("Short.\n\nLong tail.\n\nfn f()"));
+        assert_eq!(node.text_for(TextForm::FirstParagraph).as_deref(), Some("Short.\n\nfn f()"));
+    }
+
+    /// A default `text` leaves the fingerprint of every run made before the
+    /// field existed unchanged. Control: hashing `format!("{variant:?}")`
+    /// fails the first assertion (and `report` then refuses stored runs as
+    /// "run with a different definition").
+    #[test]
+    fn default_text_form_keeps_earlier_fingerprints() {
+        let file = VariantsFile::parse(
+            r#"
+            [settings]
+            reference = "r"
+            bootstrap_seed = 1
+            bootstrap_resamples = 10
+            arm_seed = 1
+
+            [[variant]]
+            name = "r"
+            arm = "model"
+            role = "reference"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+
+            [[variant]]
+            name = "p"
+            arm = "model"
+            role = "cost"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+            text = "first-paragraph"
+            "#,
+        )
+        .unwrap();
+        let plain = fingerprint_text(file.get("r").unwrap());
+        assert!(!plain.contains("text:"), "{plain}");
+        assert!(plain.ends_with("reference: None }"), "{plain}");
+        let cut = fingerprint_text(file.get("p").unwrap());
+        assert!(cut.ends_with("text: FirstParagraph }"), "{cut}");
     }
 
     /// Words are permuted, not dropped or altered. Control: returning the

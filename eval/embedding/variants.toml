@@ -77,6 +77,51 @@ max_tokens = 512
 token_type_ids = true
 query_prefix = "Represent this sentence for searching relevant passages: "
 
+# --- GM-423: shorter embedding input, on the shipped int8 model -------------
+# The int8 row's files and spec with only the input changed: max_tokens, or
+# which text of a node is embedded (`text`, default "full"). Scored against
+# jina-v2-base-code-int8 with `report --reference`.
+
+[[variant]]
+name = "jina-v2-base-code-int8-seq512"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 512
+token_type_ids = false
+
+[[variant]]
+name = "jina-v2-base-code-int8-seq256"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 256
+token_type_ids = false
+
+[[variant]]
+name = "jina-v2-base-code-int8-first-paragraph"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+
 # --- broken arms (D7) -------------------------------------------------------
 
 [[variant]]
