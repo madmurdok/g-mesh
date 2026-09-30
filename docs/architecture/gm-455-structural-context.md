@@ -260,13 +260,16 @@ passing arms: fewer header tokens, then file-local churn only.
   no `container`; per-language Q3 shows whether one language pays for
   another's gain.
 
-## Open decisions for the owner
+## Owner decisions
 
-1. Base form: first-paragraph (proposed) or wait for GM-465's `structured`
-   and use that as the base?
-2. Is "quality candidate" (both lower bounds > 0) the go bar for the context
-   effect, or is a non-inferior pass with a sig-split gain enough, given the
-   power limit?
-3. Body-head arm: out (proposed) or add as a stage-3 run?
-4. Unlabelled header lines (proposed) versus labelled (`file: ...`,
-   `in: ...`); only one is run, to avoid tuning the format on the eval.
+Approved 2026-09-30 ("455 - давай попробуем, да") with the proposed answers:
+
+1. Base form: first-paragraph; `structured` is crossed with the winner in
+   stage 2.
+2. Go bar: quality candidate (both lower bounds > 0), as written. A result
+   below it is "inconclusive = keep"; the remedy is a larger eval (GM-460),
+   not a softer bar chosen after seeing the data.
+3. Body-head arm: out.
+4. Header lines: unlabelled; only that format is run.
+5. Stage 3 (callees): not run, since cross-file invalidation makes it a
+   no-go for this task whatever it scores.
