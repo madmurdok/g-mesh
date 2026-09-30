@@ -138,6 +138,89 @@ max_tokens = 1024
 token_type_ids = false
 text = "structured"
 
+# --- GM-455: structural context before the text, on the first-paragraph form -
+# `context` (default "none") prefixes unlabelled header lines - the file path,
+# then the parent type or trait impl - and a blank line
+# (core/src/cli/embed_eval/context.rs). Scored against fp-ctx-none, the same
+# form without context; fp-ctx-none is control C0 (it must reproduce
+# jina-v2-base-code-int8-first-paragraph's vectors) and the shuffled row is
+# control C1 (real header shape, wrong content); both are informational, so
+# their comparisons come from `report --reference <them>`.
+
+[[variant]]
+name = "fp-ctx-none"
+arm = "model"
+role = "informational"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+
+[[variant]]
+name = "fp-path"
+arm = "model"
+role = "quality"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+context = "path"
+
+[[variant]]
+name = "fp-parent"
+arm = "model"
+role = "quality"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+context = "parent"
+
+[[variant]]
+name = "fp-path-parent"
+arm = "model"
+role = "quality"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+context = "path-parent"
+
+[[variant]]
+name = "fp-path-parent-shuffled"
+arm = "model"
+role = "informational"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "first-paragraph"
+context = "path-parent-shuffled"
+
 # --- broken arms (D7) -------------------------------------------------------
 
 [[variant]]

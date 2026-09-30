@@ -52,3 +52,12 @@ g-mesh debug-embed-eval report eval/embedding/work/runs/* [--costs costs.toml] -
 
 Timing (D11): `G_MESH_EMBEDDING_CACHE=off /usr/bin/time -lp g-mesh
 debug-embed-eval run --variant <v> --corpus g-mesh --embed-only --force`.
+
+Churn of a variant's text (structural context, GM-455): `g-mesh
+debug-embed-eval churn --variant <v> [--variant <w> ...] --corpus g-mesh
+[--edit e4 --target <qualifiedName>] [--dump <dir>] [--index-db <db>]`.
+It applies every instance of edits E1-E5 in memory and counts cache misses
+(distinct text hashes absent before the edit) with the same text builder as
+`run`; `--dump` writes `id<TAB>sha256(text)` per variant for a real-edit
+control, `--index-db` reads a scratch index instead of the snapshot. No model
+runs.

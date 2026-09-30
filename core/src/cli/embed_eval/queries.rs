@@ -170,13 +170,17 @@ pub fn sub_tokens(identifier: &str) -> BTreeSet<String> {
     out
 }
 
-/// D3 step 6: the query shares a sub-token with an expected symbol's name.
-pub fn overlaps(text: &str, expected: &[ExpectedSymbol]) -> bool {
-    let words: BTreeSet<String> = text
-        .split(|c: char| !c.is_ascii_alphanumeric())
+/// A query's words, lowercased, split on anything not ASCII alphanumeric.
+pub fn words(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_lowercase)
-        .collect();
+        .collect()
+}
+
+/// D3 step 6: the query shares a sub-token with an expected symbol's name.
+pub fn overlaps(text: &str, expected: &[ExpectedSymbol]) -> bool {
+    let words = words(text);
     expected.iter().any(|e| sub_tokens(symbol_name(&e.qualified_name)).iter().any(|t| words.contains(t)))
 }
 

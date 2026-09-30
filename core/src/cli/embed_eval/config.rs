@@ -102,6 +102,38 @@ pub enum TextForm {
     Structured,
 }
 
+/// Structural context prefixed to a model arm's text, as unlabelled
+/// header lines: the file path, then the parent. Orthogonal to `TextForm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextForm {
+    /// No header: the text is `TextForm`'s, byte for byte.
+    #[default]
+    None,
+    /// The node's project-relative `filePath`.
+    Path,
+    /// The enclosing type or trait impl (`context::parent_of`).
+    Parent,
+    PathParent,
+    /// `PathParent` with the paths deranged across files and the parent
+    /// lines across nodes: the broken-context control.
+    PathParentShuffled,
+}
+
+impl ContextForm {
+    pub fn has_path(self) -> bool {
+        matches!(self, Self::Path | Self::PathParent | Self::PathParentShuffled)
+    }
+
+    pub fn has_parent(self) -> bool {
+        matches!(self, Self::Parent | Self::PathParent | Self::PathParentShuffled)
+    }
+
+    pub fn shuffled(self) -> bool {
+        self == Self::PathParentShuffled
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolingName {
@@ -146,6 +178,10 @@ pub struct Variant {
     /// so a default variant's fingerprint is the one it had without the field.
     #[serde(default)]
     pub text: TextForm,
+    /// Kept after `text` and dropped from the fingerprint when default, for
+    /// the same reason.
+    #[serde(default)]
+    pub context: ContextForm,
 }
 
 impl VariantsFile {

@@ -23,9 +23,14 @@ points. Its cost win is narrow: pass time 0.72x (fails the 0.60x gate), max
 RSS 0.696x (passes the 0.70x gate by 0.004, one round). In this run
 first-paragraph costs 0.67x pass time / 0.68x RSS, so structured spends
 about 6% more embedding time than first-paragraph for +1.2 points recall@10.
-**Only one clean timing round exists** (round 2 was discarded for thermal
-throttling, below); a second clean round is owed before GM-423's ADR relies
-on any cost ratio.
+**Second round (GM-465/S4, run with GM-455's timing):** structured and
+first-paragraph each got a valid second pass, int8 did not (outside load
+on both attempts). Over the two valid rounds per arm, structured's median
+is 0.68x pass time and 0.68x RSS against int8's round 1. It passes D9
+(C-win on RSS, with a wider margin than before), and first-paragraph still
+fails C-no-worse on its round-1 query latency. Both trims miss the 0.60x
+pass-time gate in these medians. The cost ratios for GM-423's ADR now come
+from GM-466 (a token-based cost model); these rounds validate it.
 
 ## Method
 
@@ -50,10 +55,16 @@ on any cost ratio.
   first-paragraph, structured. Round 2 embed-only, reversed. Before every
   timed invocation the script waits for 1-minute load < 5 and no
   jamf/cargo/rustc process, and records `uptime` before/after and
-  `/usr/bin/time -lp`. The rerun ran under `caffeinate -ims`.
-- **Cost gates**: pass time = g-mesh `embedNodesMs` and max RSS, from
-  **round 1 only** (`COST_ROUNDS=1`, see Timing); query latency = median of
-  round-1 g-mesh queries; model size the same file (1.00x).
+  `/usr/bin/time -lp`. The rerun ran under `caffeinate -ims`. Round 2 was
+  redone in GM-465/S4 by `gm455_measure.sh`, embed-only, in the order
+  structured, first-paragraph, int8 (see Embedding time).
+- **Cost gates**: pass time = g-mesh `embedNodesMs` and max RSS, as the
+  **median of each arm's valid rounds**: round 1 plus GM-465/S4's round 2
+  for structured and first-paragraph, round 1 only for int8, whose round-2
+  attempts were both invalid. This is `runs-gm455/costs-465.toml`, used by
+  `report-465-vs-int8`. Query latency is the median of round-1 g-mesh
+  queries (round 2 is embed-only), and the model size is the same file
+  (1.00x).
 
 ### Controls
 
@@ -108,7 +119,8 @@ between the two trims by at most 9 tokens at p99; full table in
 
 Δ = arm - int8, pooled over languages, one-sided 95% bounds (10,000 paired
 resamples, seed 398). Floors re-fitted per arm (D6) on the fit half; Q4/Q5
-on the held-out half. Cost ratios from this run's round 1.
+on the held-out half. Cost ratios: median of each arm's valid rounds
+against int8's round 1 (round 1 alone in parentheses).
 
 | | structured | first-paragraph (comparison) |
 |---|---|---|
@@ -120,10 +132,10 @@ on the held-out half. Cost ratios from this run's round 1.
 | Q4 Δ confident-wrong (≤ 0, upper ≤ +5) | -1.8 (+0.3) pass | -2.2 (+0.3) pass |
 | Q5 Δ false alarm (≤ 0, upper ≤ +5) | -1.3 (+0.0) pass | -1.2 (+0.0) pass |
 | fitted floors go/py/rust/ts | .57/**.59**/**.57**/.53 | .57/**.59/.58**/.53 |
-| pass time vs int8 | 0.72x | 0.67x (GM-423: 0.58x) |
-| max RSS vs int8 | **0.696x** | 0.68x (GM-423: 0.71x) |
+| pass time vs int8 | 0.68x (r1 0.72x) | 0.65x (r1 0.67x; GM-423: 0.58x) |
+| max RSS vs int8 | **0.684x** (r1 0.696x) | 0.675x (r1 0.68x; GM-423: 0.71x) |
 | query latency vs int8 | 0.92x | 1.71x* (GM-423: 1.01x) |
-| C-win (pass ≤ 0.60x or RSS ≤ 0.70x or size ≤ 0.50x) | pass (RSS, margin 0.004) | pass (RSS) |
+| C-win (pass ≤ 0.60x or RSS ≤ 0.70x or size ≤ 0.50x) | pass (RSS, margin 0.016; r1 0.004) | pass (RSS) |
 | C-no-worse (each ≤ 1.10x) | pass | FAIL* (query latency) |
 | **verdict** | **Pass** | Fail (C-no-worse)* |
 
@@ -176,15 +188,62 @@ Either trim means shipping new python/rust floors (D6).
 
 structured / first-paragraph = 1.062x pass time, 1.025x RSS.
 
-**Round 2 discarded (thermal throttling).** Round 2 (embed-only, order
+**Round 2 (GM-465/S4, 2026-09-30/10-01).** Run by
+`eval/embedding/gm455_measure.sh`, interleaved with GM-455's timing,
+embed-only, in the reverse of round 1's order: structured, first-paragraph,
+int8. Before each invocation a gate waited for `pmset -g therm` at
+CPU_Speed_Limit = CPU_Scheduler_Limit = 100, a 1-minute load below 4 and
+no jamf/cargo/rustc process, all held for 2 minutes. An invocation is
+**valid** if it started from that gate and its 1-minute load stayed <= 20
+(sampled every 10 s; the pass alone holds it near 5). Throttling during the
+pass is recorded, not rejected: this 4-core laptop throttles under every
+4-thread pass. So round 2's ratios compare arms under the same conditions,
+a cool start and then throttling; a slower arm spends more of its run
+throttled, which slightly exaggerates its ratio. Invalid runs were retried
+once.
+
+| arm | attempt | embed (s) | real | user | sys | user/real | max RSS (MiB) | load before -> after (1/5/15) | pmset start / min / end | max load1 in run | valid |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---|
+| structured | 1 | 346.0 | 348.3 | 1298.2 | 9.3 | 3.73 | 495 | 3.64 4.03 4.39 -> 11.08 8.51 6.34 | 100 / 65 / 78 | 16.7 | yes |
+| first-paragraph | 1 | 335.6 | 337.7 | 1305.1 | 7.0 | 3.86 | 495 | 2.56 4.23 4.96 -> 8.64 8.14 6.65 | 100 / 65 / 80 | 13.6 | yes |
+| int8 1024 | 1 | 583.6 | 586.6 | 2226.7 | 14.1 | 3.80 | 726 | 3.86 5.10 5.65 -> 17.13 12.16 9.10 | 100 / 70 / 78 | 24.6 | no (load) |
+| int8 1024 | 2 | 628.8 | 631.2 | 2328.5 | 13.9 | 3.69 | 711 | 2.73 4.87 6.50 -> 312.82 142.67 65.48 | 100 / 68 / 73 | 303.8 | no (load) |
+
+Every round-2 pass reproduced round 1's vectors (max |Δ| 0 over 5,202,432
+floats, invalid attempts included).
+
+**Cost gates, median of the valid rounds** (int8: round 1 only):
+
+| arm | round 1 s | round 2 s | median s | pass time vs int8 (539.8 s) | median RSS vs int8 (737 MiB) | query latency vs int8 (round 1) |
+|---|---:|---:|---:|---:|---:|---:|
+| int8 1024 | 539.8 | invalid | 539.8 | 1.000x | 1.000x | 1.00x |
+| first-paragraph | 363.9 | 335.6 | 349.7 | **0.648x** | 0.675x | 1.71x* |
+| structured | 386.5 | 346.0 | 366.3 | **0.679x** | 0.684x | 0.92x |
+
+structured / first-paragraph = 1.047x pass time (round 1 1.062x, round 2
+1.031x). Against round 2's first int8 attempt, which is invalid by its load
+peak (24.6) but kept its cores (user/real 3.80), the same-window ratios
+would be 0.575x (first-paragraph) and 0.593x (structured). They are shown
+only to say that round 2 does not contradict round 1: they are not used.
+
+**Absolute int8 time.** int8's g-mesh pass ran 540 s in round 1 and 584 s
+and 629 s in round 2's two invalid attempts. GM-423 measured 384-400 s on
+the same machine. The trims moved less: first-paragraph 364 -> 336 s,
+structured 387 -> 346 s. So round 1's 540 s was not a one-off, and today's
+machine is about 40% slower than GM-423's on the long int8 pass. A long
+pass spends longer throttled, and that would also make int8's ratio
+denominator larger than GM-423's, which flatters the trims. That is the
+case for GM-466's token-based model over wall-clock ratios.
+
+**First round-2 attempt discarded (thermal throttling).** Round 2 (embed-only, order
 structured, first-paragraph, int8) started at 18:06 with 1-minute load 4.26,
 but the laptop was thermally throttled: `pmset -g therm` read
 CPU_Speed_Limit 24 and CPU_Scheduler_Limit 54 with load ~725. structured
 took 712.0 s (round 1: 386.5 s) at user/real 2.74 (round 1: 3.84), load
 after 18.27 / 101.46 / 76.20; first-paragraph ran 27+ minutes before the
 orchestrator stopped the script with the owner's approval; int8 never ran.
-The structured row stays in `work/runs-gm465/timing.tsv` but is left out of
-every gate (`COST_ROUNDS=1`).
+The structured row stays in `work/runs-gm465/timing.tsv` and is left out of
+every gate. Round 2 was redone as above.
 
 **Earlier attempts, also discarded.**
 - Dry run and first full run (15:07-15:39): a corporate `jamf policy` run
@@ -229,25 +288,29 @@ evidence of this machine's round-to-round spread.
 
 ## Recommendation for GM-423's ADR
 
-**Adopt `structured`**, conditional on a second clean timing round.
+**Adopt `structured`.** The recommendation stands after the second
+round. Its cost ratios for the ADR come from GM-466.
 
 - Quality decides it: structured is the only trim with no recall loss
   (Δ recall@10 +0.0 vs -1.2; rust -1.0 vs -4.0), with the same
   confident-wrong/false-alarm improvement as first-paragraph and the same
   floor changes (python 0.59, rust 0.57 vs 0.58).
-- Its price over first-paragraph is small and measured in the same round:
-  1.06x pass time, 1.03x RSS.
-- Both trims beat full input by a wide margin (0.67-0.72x pass time,
-  0.68-0.70x RSS); full input stays only if the ADR wants no floor change.
-- **Owed before the ADR relies on the cost numbers**: one more g-mesh round
-  (int8, first-paragraph, structured, alternated) on a cool, quiet machine
-  (`pmset -g therm` with no speed limit). If structured's RSS ratio lands
-  above 0.70x and pass time above 0.60x, it fails C-win as a cost candidate
-  and the ADR must either accept it on the quality argument (it is no worse
-  than int8 on every quality gate) or fall back to first-paragraph, whose
-  own 0.60x pass-time pass is now also in doubt (0.58x vs 0.67x).
-- GM-455 (structural context prefix) is measured next on first-paragraph;
-  whichever trim the ADR adopts is then crossed with the GM-455 winner.
+- Its price over first-paragraph is small and consistent across both
+  rounds: 1.06x and 1.03x pass time (1.05x median), 1.03x and 1.00x RSS.
+- Both trims beat full input by a wide margin (medians 0.65-0.68x pass
+  time, 0.68x RSS). Full input stays only if the ADR wants no floor
+  change.
+- The cost gate settles the same way on the medians. structured passes
+  C-win on RSS (0.684x, margin 0.016, up from 0.004) and C-no-worse. Both
+  trims miss the 0.60x pass-time gate (0.68x, 0.65x). int8 got no valid
+  round 2, so each ratio still divides by one int8 pass, and the
+  wall-clock spread on this laptop (up to 33% per arm, int8 540-629 s
+  against GM-423's 384-400 s) is too wide for a closer reading. GM-466
+  (a token-based cost model calibrated in short cool bursts) supplies
+  the cost ratios the ADR cites; these rounds validate it.
+- GM-455 (structural context) was measured on first-paragraph and is a
+  no-go ([`gm-455-structural-context.md`](gm-455-structural-context.md)),
+  so there is no context arm to cross with the adopted trim.
 
 ## Reproduce
 
@@ -256,5 +319,7 @@ cargo build --release
 ln -s <main checkout>/eval/embedding/work eval/embedding/work   # in a worktree
 caffeinate -ims bash eval/embedding/gm465_measure.sh     # quality + timing; waits for a quiet machine
 SKIP_QUALITY=1 caffeinate -ims bash eval/embedding/gm465_measure.sh  # timing rounds only
-SKIP_RUNS=1 COST_ROUNDS=1 bash eval/embedding/gm465_measure.sh       # reports from round 1 only (as here)
+SKIP_RUNS=1 COST_ROUNDS=1 bash eval/embedding/gm465_measure.sh       # reports from round 1 only (S3)
+# round 2 (S4): gm455_measure.sh with TIMING='465:2:<variant> ...' SKIP_QUALITY=1 SKIP_CHURN=1;
+# costs-465.toml and report-465-vs-int8 by gm455_summary.py reports (see gm-455-structural-context.md)
 ```
