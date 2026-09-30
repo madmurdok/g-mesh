@@ -353,7 +353,9 @@ mod tests {
 
     /// Controls: replacing Sattolo's derangement with the identity (or a
     /// plain Fisher-Yates shuffle) leaves some path or parent in place;
-    /// seeding from anything but `arm_seed` breaks the repeat.
+    /// seeding from anything but `arm_seed` breaks the repeat; a fixed seed
+    /// for either stream alone, or skipping the parent-line shuffle, fails
+    /// the per-stream assertions.
     #[test]
     fn the_shuffled_context_is_a_deterministic_derangement() {
         let mut nodes = Vec::new();
@@ -398,6 +400,19 @@ mod tests {
             assert_eq!(*path_of_file.entry(&nodes[i].file_path).or_insert(s_path), s_path);
             assert_eq!(r.lines().last(), s.lines().last(), "the form text is untouched");
         }
+        // Each stream is shuffled and follows `arm_seed` on its own.
+        let line = |texts: &[Option<String>], n: usize| -> Vec<String> {
+            texts.iter().flatten().filter_map(|t| t.lines().nth(n).map(str::to_string)).collect()
+        };
+        let other_seed = embed_texts(&nodes, TextForm::FirstParagraph, ContextForm::PathParentShuffled, 8);
+        assert_ne!(line(&shuffled, 0), line(&other_seed, 0), "paths ignore arm_seed");
+        let (real_parents, shuffled_parents) = (line(&real, 1), line(&shuffled, 1));
+        assert_ne!(real_parents, shuffled_parents, "parent lines not shuffled");
+        assert_ne!(shuffled_parents, line(&other_seed, 1), "parent lines ignore arm_seed");
+        let (mut a, mut b) = (real_parents.clone(), shuffled_parents.clone());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "parent lines are reassigned, not replaced");
         // Parent lines are a derangement of positions over the 18 nodes that have one.
         let lines: Vec<String> = (0..5).map(|i| format!("l{i}")).collect();
         let d = deranged_lines(&lines, 3);
