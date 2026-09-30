@@ -17,7 +17,7 @@ side, "-" where no run is stored. For "structured" this is also the check
 that the Python port agrees with the Rust rules.
 
 Usage: python3 eval/embedding/gm423_token_lengths.py [--model jina-v2-base-code-int8]
-       [--forms full,first-paragraph,structured] [--json out.json]
+       [--forms full,first-paragraph,structured] [--runs runs,runs-gm423,runs-gm465] [--json out.json]
 """
 import argparse
 import json
@@ -226,6 +226,11 @@ def main():
     ap.add_argument("--model", default="jina-v2-base-code-int8")
     ap.add_argument("--forms", default=",".join(FORMS), help="comma-separated subset of " + ",".join(FORMS))
     ap.add_argument("--json")
+    ap.add_argument(
+        "--runs",
+        default="runs",
+        help="comma-separated run roots under work/ searched in order for the harness manifests (control)",
+    )
     a = ap.parse_args()
     forms = a.forms.split(",")
     unknown = [f for f in forms if f not in FORMS]
@@ -256,8 +261,11 @@ def main():
         harness = {}
         for form in forms:
             run = a.model if form == "full" else f"{a.model}-{form}"
-            manifest = EVAL / "work" / "runs" / run / corpus / "manifest.json"
-            if manifest.exists():
+            manifest = next(
+                (m for r in a.runs.split(",") if (m := EVAL / "work" / r / run / corpus / "manifest.json").exists()),
+                None,
+            )
+            if manifest:
                 m = json.loads(manifest.read_text())
                 harness[form] = {
                     "n": m["nodeCount"],
