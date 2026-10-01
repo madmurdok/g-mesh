@@ -684,17 +684,30 @@ contains = ["no symbol named 'nosuchname' found"]
 
 [[definition]]
 symbol = "gaps::Ledger::settle"
-# The inherent method is a node under its full module-qualified name; whatever
-# becomes of partial paths, this spelling must keep resolving.
+# The inherent method is a node under its full module-qualified name, and
+# that spelling resolves on the exact-qualifiedName rung.
+expect = ["crates/alpha/src/gaps.rs:gaps::Ledger::settle"]
+
+[[definition]]
+symbol = "Ledger::settle"
+# The same method by `Type::method` is neither a whole qualifiedName nor a
+# bare name; the qualifiedName-suffix rung resolves it. Removing that rung
+# turns this back into a refusal.
 expect = ["crates/alpha/src/gaps.rs:gaps::Ledger::settle"]
 
 [[refusal]]
 tool = "definition"
-symbol = "Ledger::settle"
-# The same method by `Type::method` is neither a whole qualifiedName nor a
-# bare name, so every rung misses. A suffix rung in the resolver would turn
-# this into an answer; until then it is a refusal.
-contains = ["no symbol named 'Ledger::settle' found"]
+symbol = "edger::settle"
+# A suffix that splits a segment is not a path tail: `edger` is not a
+# segment of `gaps::Ledger::settle`.
+contains = ["no symbol named 'edger::settle' found"]
+
+[[definition]]
+symbol = "Square::area"
+# A trait-impl member `shapes::<Square as Shape>::area` is reached through its
+# self type. `Circle::area` would be ambiguous with nothing else to pick by
+# file, both impls of `Circle` sharing `shapes.rs`.
+expect = ["crates/alpha/src/shapes.rs:shapes::<Square as Shape>::area"]
 
 [[definition]]
 symbol = "all_unresolved"

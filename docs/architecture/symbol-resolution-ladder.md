@@ -63,7 +63,7 @@ context, and C reintroduces exactly the duplication the shared resolver was extr
 
 ## Chosen approach
 
-Six rungs, tried in order, each labelled by what it establishes:
+Seven rungs, tried in order, each labelled by what it establishes:
 
 | # | rung | establishes | `resolvedBy` |
 |---|---|---|---|
@@ -72,8 +72,10 @@ Six rungs, tried in order, each labelled by what it establishes:
 | 2′ | exact `qualifiedName`, several matches | **suggestion** | `nameAmbiguous` |
 | 3 | bare name, single match | resolution | `name` |
 | 3′ | bare name, several matches | **suggestion** — today's ranked candidate page | `nameAmbiguous` |
+| 3.5 | a partial path (`IndexStore::read`) stored as exactly one declaration's qualified suffix | resolution | `qualifiedNameSuffix` |
+| 3.5′ | the same, several declarations | **suggestion** — the ranked candidate page of 3′ | `nameAmbiguous` |
 | 4 | the name is a path, or a file's stem | resolution *of the file*, suggestion about the symbol | `fileName` |
-| 5 | semantic neighbours above threshold | **suggestion** | `semantic` |
+| 5 | semantic neighbours above threshold | **suggestion** | `semanticNeighbours` |
 | 6 | nothing | refusal | — |
 
 Rungs 1–3 are what exists. Rung 4 is what 0b95d41c and 0299043a each built locally, lifted into the
@@ -89,6 +91,18 @@ in ripgrep is a `pub(crate)` fixture under `tests/`, and in gin is `ginS/gins.go
 facts about module depth. So rung 2 now requires that the query is not also some declaration's own
 `name` (the language-agnostic way to say "genuinely qualified" — no separator to know), and several
 exact matches is rung 2′, an ambiguity, rather than a miss that falls all the way to rung 5.
+
+**Rung 3.5 answers a partial path.** `IndexStore::read` is neither a whole qualifiedName nor a
+declaration's name, so without this rung every structural rung misses and the query reaches rung 5.
+The rung runs only when rungs 2 and 3 found nothing, so no answer they give changes. It looks the
+query up, as given and by exact equality, in `qualified_suffixes`: the partial paths of two or more
+segments that index time derives from each declaration's plugin-sent segments and aliases
+([ADR 0015](../adr/0015-qualified-name-segments.md)). Core never splits the query and knows no
+separator. So `Store::read` does not match `IndexStore::read` (only whole segments are stored), a
+Rust getter `T::f` and field `T.f` never answer for each other, `Foo.bar` does not reach `Foo#bar`,
+and a Rust trait-impl member `<X as T>::m` is reached as `X::m` through the plugin's alias. Equality,
+never `LIKE`, whose `_` is a wildcard. Several matches are rung 3.5′, the same ranked page as 3′.
+Design and measurements: [`gm-469-qualified-name-suffix.md`](gm-469-qualified-name-suffix.md).
 
 **Every rung answers with a declaration, and GM-367 is where that became true.** Rungs 2, 2′, 3 and
 3′ all read `graph::queries`' name/qualifiedName lookups, and those lookups excluded three
@@ -174,11 +188,11 @@ sequenceDiagram
     participant E as EmbeddingPipeline
     A->>T: symbol_name "DropdownMenuGroup"
     T->>R: resolve(name)
-    R->>R: rungs 1-3 - no match
+    R->>R: rungs 1-3.5 - no match
     R->>R: rung 4 - a file is named that
     R->>E: rung 5 - embed_query(name)
     E-->>R: Some(vector) - neighbours, top 0.61
-    R-->>T: Candidates([MenuGroup, ...], resolvedBy: semantic)
+    R-->>T: Candidates([MenuGroup, ...], resolvedBy: semanticNeighbours)
     T-->>A: candidates + how they were reached
 ```
 

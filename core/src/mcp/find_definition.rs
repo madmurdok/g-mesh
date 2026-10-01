@@ -238,6 +238,33 @@ fn find_candidates_by_name(
     name: &str,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
+    rank_candidates(conn, &format!("{} = ?1", column.sql()), &[&name], cursor)
+}
+
+/// The same ranked page over the declarations one of whose stored partial
+/// paths (`qualified_suffixes`) is exactly `suffix` - the set
+/// [`queries::find_by_qualified_suffix`] returns.
+fn find_candidates_by_qualified_suffix(
+    conn: &Connection,
+    suffix: &str,
+    cursor: Option<&str>,
+) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
+    rank_candidates(
+        conn,
+        "n.id IN (SELECT s.nodeId FROM qualified_suffixes s WHERE s.suffix = ?1)",
+        &[&suffix],
+        cursor,
+    )
+}
+
+/// Declarations satisfying `filter` (a condition on alias `n`, bound by
+/// `params`), ranked as [`find_candidates_by_name`] documents.
+fn rank_candidates(
+    conn: &Connection,
+    filter: &str,
+    params: &[&dyn rusqlite::ToSql],
+    cursor: Option<&str>,
+) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
     // The `nativeKind` filter is `graph::queries`' own, shared rather than
     // restated (GM-367): the lookups that decide whether a candidate page is
     // needed and the page itself have to agree about what counts as a
@@ -247,8 +274,7 @@ fn find_candidates_by_name(
         "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
          n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
          CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-         FROM nodes n WHERE {} = ?1 AND {}",
-        column.sql(),
+         FROM nodes n WHERE {filter} AND {}",
         queries::declaration_only("n.")
     );
 
@@ -267,7 +293,7 @@ fn find_candidates_by_name(
         Ok((candidate, score, id))
     }
 
-    pagination::paginate_by_score(conn, &base_sql, &[&name], CANDIDATE_PAGE_SIZE, cursor, map_row)
+    pagination::paginate_by_score(conn, &base_sql, params, CANDIDATE_PAGE_SIZE, cursor, map_row)
 }
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
@@ -292,8 +318,9 @@ fn by_position(
 /// `docs/architecture/symbol-resolution-ladder.md`.
 ///
 /// Echoed on every response so a *suggestion* can never be read as a
-/// *resolution*. `Id`, `QualifiedName` and `Name` establish that this is the
-/// symbol asked for; `NameAmbiguous` and `FileName` establish only that these
+/// *resolution*. `Id`, `QualifiedName`, `Name` and `QualifiedNameSuffix`
+/// establish that this is the symbol asked for; `NameAmbiguous` and
+/// `FileName` establish only that these
 /// are candidates worth re-querying. Without the label the two are
 /// indistinguishable in the response, and this codebase's standing rule is
 /// that a missing edge beats a wrong one.
@@ -306,6 +333,10 @@ pub(super) enum ResolvedBy {
     QualifiedName,
     /// A bare name matching exactly one declaration.
     Name,
+    /// A partial path (`IndexStore::read`) that exactly one declaration's
+    /// qualifiedName ends in at a segment boundary. The answer carries the
+    /// full qualifiedName, so the caller sees what the tail matched.
+    QualifiedNameSuffix,
     /// A name matching several declarations - bare (`RegexMatcher`, four
     /// times in ripgrep) or qualified (`matcher::RegexMatcher`, twice: a Rust
     /// qualifiedName is a module path *within* a crate, and two crates can
@@ -454,7 +485,45 @@ pub(super) fn resolve_symbol_name(
             let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
             Ok(Ok(Resolved { node, by }))
         }
-        None => by_file_name(conn, embedding, name),
+        None => match by_qualified_name_suffix(conn, name, cursor)? {
+            Some(answer) => Ok(answer),
+            None => by_file_name(conn, embedding, name),
+        },
+    }
+}
+
+/// The qualifiedName-suffix rung: a partial path such as `IndexStore::read`,
+/// which is neither a whole qualifiedName nor a declaration's name. Reached
+/// only when the rungs above found nothing, so it never changes an answer
+/// they give. The query is looked up as given, by exact equality, in the
+/// partial paths the plugins' segments produced (`qualified_suffixes`, ADR
+/// 0015): core never splits it and knows no language's separators. One
+/// match resolves; several are the same ranked candidate page as an
+/// ambiguous name. `None` means this rung has nothing to say and the ladder
+/// goes on.
+fn by_qualified_name_suffix(
+    conn: &Connection,
+    name: &str,
+    cursor: Option<&str>,
+) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
+    let mut matched = queries::find_by_qualified_suffix(conn, name)
+        .map_err(|e| internal_error("failed to look up nodes by qualifiedName suffix", e))?;
+    match matched.len() {
+        0 => Ok(None),
+        1 => Ok(Some(Ok(Resolved { node: matched.remove(0), by: ResolvedBy::QualifiedNameSuffix }))),
+        _ => {
+            let page = find_candidates_by_qualified_suffix(conn, name, cursor)
+                .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
+            success(&CandidatePage {
+                ambiguous: true,
+                resolved_by: ResolvedBy::NameAmbiguous,
+                explanation: super::session_hints::AMBIGUOUS,
+                results: page.results,
+                has_more: page.has_more,
+                next_cursor: page.next_cursor,
+            })
+            .map(|page| Some(Err(page)))
+        }
     }
 }
 

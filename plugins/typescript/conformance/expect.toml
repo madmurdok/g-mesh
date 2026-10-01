@@ -257,3 +257,11 @@ contains = ["no symbol named 'nosuchname' found"]
 # answered: with five real declarations in scope and a semantic tier
 # running, "nosuchname" must still come back as nothing. See
 # `plugins/rust/conformance/expect.toml` for why that is deterministic here.
+
+[[refusal]]
+tool = "definition"
+symbol = "Greetable.greet"
+# The interface method is `Greetable#greet`: an instance member is joined by
+# `#`. The qualifiedName-suffix rung matches by exact spelling, so the same
+# path written with `.` is refused rather than answered.
+contains = ["no symbol named 'Greetable.greet' found"]
