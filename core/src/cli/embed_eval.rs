@@ -130,6 +130,10 @@ pub struct ReportArgs {
     pub reference: Option<String>,
 }
 
+/// The `variants.toml` row that embeds what production embeds: the shipped
+/// int8 weights and `embedding::text::text_to_embed`'s text.
+const PRODUCTION_VARIANT: &str = "jina-v2-base-code-int8-structured";
+
 #[derive(Debug, Args)]
 pub struct ParityArgs {
     #[command(flatten)]
@@ -140,7 +144,11 @@ pub struct ParityArgs {
     /// by the daemon.
     #[arg(long)]
     pub index_db: PathBuf,
-    /// The reference variant's run directory.
+    /// The variant whose run is compared: the one embedding exactly what
+    /// production does (model, weights and text form).
+    #[arg(long, default_value = PRODUCTION_VARIANT)]
+    pub variant: String,
+    /// That variant's run directory.
     #[arg(long)]
     pub run: PathBuf,
     /// How many authored queries (in id order) to compare.
@@ -1453,11 +1461,11 @@ const PARITY_TOLERANCE: f64 = 1e-4;
 fn parity(args: &ParityArgs) -> Result<()> {
     let eval_dir = &args.dir.eval_dir;
     let variants = VariantsFile::load(eval_dir)?;
-    let reference = variants.get(&variants.settings.reference)?;
+    let reference = variants.get(&args.variant)?;
     let dir = args.run.join(&args.corpus);
     let manifest: Manifest = read_json(&dir.join("manifest.json"))?;
     if manifest.variant != reference.name {
-        bail!("{} is a run of {}, not of the reference {}", dir.display(), manifest.variant, reference.name);
+        bail!("{} is a run of {}, not of {}", dir.display(), manifest.variant, reference.name);
     }
 
     let (queries, _) = queries::load(eval_dir, &args.corpus)?;
@@ -1687,6 +1695,30 @@ mod tests {
             assert_eq!(node.text_for(TextForm::Structured), case.expected, "{label}");
             assert_eq!(node.text_for(TextForm::Full), full_text(doc, signature), "{label}");
         }
+    }
+
+    /// `parity`'s default variant embeds what production embeds: the
+    /// production encoder spec, the pinned revision and int8 weights file, the
+    /// production text form, no context header and no prefixes. Control:
+    /// defaulting `--variant` to `settings.reference` (fp32, full text) fails
+    /// the weights-file and text-form assertions.
+    #[test]
+    fn parity_defaults_to_the_production_configuration() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            parity: ParityArgs,
+        }
+        let args = Cli::parse_from(["parity", "--index-db", "i.sqlite", "--run", "r"]).parity;
+        let file = VariantsFile::parse(include_str!("../../../eval/embedding/variants.toml")).unwrap();
+        let variant = file.get(&args.variant).unwrap();
+        assert_eq!(variant.encoder_spec().unwrap(), crate::embedding::model::EncoderSpec::production());
+        assert_eq!(variant.revision.as_deref(), Some(crate::cli::model::MODEL_REVISION));
+        assert_eq!(variant.onnx_file.as_deref(), Some(crate::embedding::model::DEFAULT_ONNX_REMOTE_PATH));
+        assert_eq!(variant.text, TextForm::Structured);
+        assert_eq!(variant.context, ContextForm::None);
+        assert_eq!((variant.query_prefix.as_str(), variant.document_prefix.as_str()), ("", ""));
     }
 
     /// A default `text` leaves the fingerprint of every run made before the
