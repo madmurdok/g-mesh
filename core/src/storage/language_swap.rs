@@ -903,6 +903,40 @@ mod tests {
         assert_eq!(column(&live, "SELECT suffix FROM qualified_suffixes ORDER BY suffix").len(), 3);
     }
 
+    /// A `qualifiedName`-keyed placeholder for `a::T.f`, its key path either
+    /// `a`, `::T`, `.f` (`split`) or `a`, `::T.f`; both join to the same key.
+    fn keyed_placeholder(split: bool) -> NodeRecord {
+        let mut node = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        node.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: "src/a.rs".to_string(),
+            key_kind: "qualifiedName".to_string(),
+            key: "a::T.f".to_string(),
+            from_container: None,
+            key_path: Some(if split {
+                qpath("a", &[("::", "T"), (".", "f")])
+            } else {
+                qpath("a", &[("::", "T.f")])
+            }),
+        });
+        node
+    }
+
+    /// A placeholder whose only change is its `keyPath` is re-swapped, and
+    /// live ends with staging's. Control: drop `keyPath` from
+    /// `TARGET_COLUMNS` (upsert count 0, live keeps the old path).
+    #[test]
+    fn a_swap_carries_a_key_path_only_change() {
+        let (_dir, live, counts) = swap_one(keyed_placeholder(false), keyed_placeholder(true));
+
+        assert_eq!(counts.upsert_nodes, 1, "the keyPath change alone marks the placeholder upserted");
+        assert_eq!(
+            column(&live, "SELECT keyPath FROM placeholder_targets WHERE nodeId = 'p1'"),
+            vec!["a\u{1f}::\u{1f}T\u{1f}.\u{1f}f"]
+        );
+    }
+
     /// A swept placeholder takes any suffix rows under its id with it.
     /// Control: drop the `qualified_suffixes` delete from
     /// `delete_placeholders` (the row remains).
