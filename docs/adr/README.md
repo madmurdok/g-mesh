@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0011`). Use this
+zero-padded, incrementing — the next free number is `0013`). Use this
 template:
 
 ```markdown
@@ -80,3 +80,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0009 | [Semantic pending: say which files a running post-swap semantic pass has not reached](0009-semantic-pending.md) | Accepted |
 | 0010 | [search_code: a below-floor name query is told `noMatch`, a below-floor prose query `lowSimilarity`](0010-search-code-low-similarity-on-prose.md) | Accepted |
 | 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Accepted |
+| 0012 | [Embedded text: the doc comment trimmed to its prose outline](0012-embedded-text-structured.md) | Accepted |
