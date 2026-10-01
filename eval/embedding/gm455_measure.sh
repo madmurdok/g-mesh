@@ -27,9 +27,6 @@ cd "$HERE/../.." || exit
 BIN=$PWD/target/release/g-mesh
 EVAL=eval/embedding
 OUT=${OUT:-$PWD/$EVAL/work/runs-gm455}
-RUNS=$PWD/$EVAL/work/runs
-GM423=$PWD/$EVAL/work/runs-gm423
-GM465=$PWD/$EVAL/work/runs-gm465
 INT8=jina-v2-base-code-int8
 FP=jina-v2-base-code-int8-first-paragraph
 ST=jina-v2-base-code-int8-structured
@@ -119,7 +116,7 @@ one() {
   real=$(awk '/^real/{print $2}' "$OUT/logs/$tag.err"); user=$(awk '/^user/{print $2}' "$OUT/logs/$tag.err")
   sys=$(awk '/^sys/{print $2}' "$OUT/logs/$tag.err"); rss=$(awk '/maximum resident set size/{print $1}' "$OUT/logs/$tag.err")
   read -r embed qmed < <(python3 -c "import json;d=json.load(open('$out/$v/$c/timings.json'));print(d['embedNodesMs']/1000, d.get('queryEmbedMsMedian'))" 2>/dev/null || echo "nan None")
-  local valid=1 s=${ta%/*} cl=${ta#*/} l1; l1=$(echo "$la" | awk '{print $1}')
+  local valid=1 s=${ta%/*}
   { [ "$GATE" != 1 ] || [ "$tb" != 100/100 ] || [ "$(echo "$lmax > $LOAD_MAX" | bc -l)" = 1 ] || [ "$rc" != 0 ]; } && valid=0
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$stage" "$round" "$c" "$v" "$rc" \
     "$embed" "$real" "$user" "$sys" "$rss" "$qmed" "$lb" "$la" "$tb" "$ta" "$tmin" "$lmax" "$valid" >> "$tsv"
@@ -137,7 +134,7 @@ TOTAL=0
 log "start; daemons: $(pgrep -fl 'g-mesh daemon' | tr '\n' ';') uptime: $(uptime) therm $(therm)"
 
 if [ "${SKIP_QUALITY:-0}" != 1 ]; then
-  [ -f "$QTSV" ] || printf "$HDR" > "$QTSV"
+  [ -f "$QTSV" ] || printf '%b' "$HDR" > "$QTSV"
   for v in "${QARMS[@]}"; do
     for c in "${CORPORA[@]}"; do one "$QTSV" quality q "$c" "$v" full "$OUT" "q-$c-$v"; done
   done
@@ -158,7 +155,7 @@ if [ "${SKIP_CHURN:-0}" != 1 ]; then
 fi
 
 if [ "${SKIP_TIMING:-0}" != 1 ]; then
-  [ -f "$TSV" ] || printf "$HDR" > "$TSV"
+  [ -f "$TSV" ] || printf '%b' "$HDR" > "$TSV"
   for e in "${TIMING[@]}"; do
     task=${e%%:*}; rest=${e#*:}; round=${rest%%:*}; v=${rest#*:}
     for attempt in 1 2; do
