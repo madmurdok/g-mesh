@@ -249,7 +249,7 @@ pub(super) fn test_node(
         container: None,
         start_line: 1,
         end_line: 1,
-        text: crate::embedding::pipeline::text_to_embed(None, sig),
+        text: crate::embedding::text::full_text(None, sig),
         doc: None,
         signature: sig.map(Into::into),
     }

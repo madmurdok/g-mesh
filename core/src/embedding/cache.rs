@@ -38,7 +38,7 @@ pub const CACHE_ENV: &str = "G_MESH_EMBEDDING_CACHE";
 /// cached vector unreachable. It must be bumped whenever that code changes;
 /// `pipeline`'s tests pin it to `text_to_embed`'s output so a format change
 /// cannot land without touching it.
-pub const PIPELINE_EPOCH: u32 = 1;
+pub const PIPELINE_EPOCH: u32 = 2;
 
 /// The `ort` crate version the vectors were computed with - an ONNX Runtime
 /// upgrade may change floating-point results. Must equal the exact version

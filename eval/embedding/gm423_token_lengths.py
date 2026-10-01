@@ -5,7 +5,7 @@ Reads each corpus snapshot (work/<corpus>.sqlite), rebuilds the text
 `text_to_embed` produces (doc comment, blank line, signature; both trimmed,
 empty ones dropped), the GM-423 "first-paragraph" form (the doc cut at its
 first blank line) and the GM-465 "structured" form (`structured_doc` below, a
-line-for-line port of core/src/cli/embed_eval/structured.rs), and tokenizes it with work/models/<model>/tokenizer.json,
+line-for-line port of core/src/embedding/text.rs), and tokenizes it with work/models/<model>/tokenizer.json,
 special tokens included and no truncation - what `EmbeddingModel` counts
 against `max_sequence_length`.
 
@@ -40,7 +40,9 @@ def first_paragraph(doc: str) -> str:
     return "\n".join(out).rstrip()
 
 
-# --- "structured": keep in step with core/src/cli/embed_eval/structured.rs ---
+# --- "structured": keep in step with core/src/embedding/text.rs ---
+# (gm423_text_fixture.py writes this port's output into the fixture the Rust
+# tests check production's text_to_embed against.)
 
 SHORT_PARAGRAPH_CHARS = 200
 DROPPED_SECTIONS = {

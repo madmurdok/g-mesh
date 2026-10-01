@@ -649,6 +649,14 @@ signatures, ranked by similarity. It is the one tool with a prerequisite —
 the embedding model above — and the one whose top hit is a ranked guess
 rather than a resolved graph answer.
 
+What gets embedded is each symbol's doc comment trimmed to its prose — the
+summary, headings and short paragraphs; code examples, parameter and return
+lists and link-only lines dropped — then its signature
+([ADR 0012](docs/adr/0012-embedded-text-structured.md)). An index whose
+vectors embedded the whole doc comment is re-embedded once, in the
+background, on upgrade; until that finishes `search_code` ranks a mix of old
+and new vectors.
+
 ## Known limits
 
 **Computed `import()`/`require()` specifiers.** `import(\`./plugins/${name}/index.js\`)`

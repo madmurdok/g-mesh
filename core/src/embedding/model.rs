@@ -108,15 +108,22 @@ pub(crate) const DEFAULT_ONNX_SHA256: &str =
 /// name.
 const DEFAULT_WEIGHTS_TAG: &str = "int8";
 
+/// Which text form every model's vectors are tagged with, as part of
+/// [`embedding_version`]: `embedding::text::text_to_embed`'s. Changed
+/// whenever that function's output changes for any node, so every vector made
+/// from the old text is owed a re-embed, under any model. Vectors from the
+/// untrimmed doc comment carry no text tag.
+const TEXT_FORM_TAG: &str = "structured";
+
 /// The `embeddingVersion` a pipeline configured with `model_name` stores its
 /// vectors under: the default model's name plus [`DEFAULT_WEIGHTS_TAG`], or
 /// any other model's name as configured (its weights are not g-mesh's to
-/// pin).
+/// pin), then [`TEXT_FORM_TAG`].
 pub(crate) fn embedding_version(model_name: &str) -> String {
     if model_name == crate::config::EmbeddingConfig::default().model {
-        format!("{model_name}+{DEFAULT_WEIGHTS_TAG}")
+        format!("{model_name}+{DEFAULT_WEIGHTS_TAG}+{TEXT_FORM_TAG}")
     } else {
-        model_name.to_string()
+        format!("{model_name}+{TEXT_FORM_TAG}")
     }
 }
 

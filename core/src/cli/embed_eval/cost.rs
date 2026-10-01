@@ -822,10 +822,8 @@ mod tests {
         let mut documented =
             test_node("a", "Function", "function_item", "m::alpha", "src/lib.rs", "rust", Some("fn alpha()"));
         documented.doc = Some("First line of prose.\n\nSecond paragraph with many more words in it.".into());
-        documented.text = crate::embedding::pipeline::text_to_embed(
-            documented.doc.as_deref(),
-            documented.signature.as_deref(),
-        );
+        documented.text =
+            crate::embedding::text::full_text(documented.doc.as_deref(), documented.signature.as_deref());
         let plain = test_node(
             "b",
             "Function",

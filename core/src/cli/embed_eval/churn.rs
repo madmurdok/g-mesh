@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use super::config::{ContextForm, CorporaFile, TextForm, VariantsFile};
 use super::context::{self, ParentRef};
 use super::{load_nodes, snapshot_path, verified_snapshot, EvalDir, Node};
-use crate::embedding::pipeline::text_to_embed;
+use crate::embedding::text::full_text;
 
 #[derive(Debug, Args)]
 pub struct ChurnArgs {
@@ -157,7 +157,7 @@ pub fn replace_ident(text: &str, old: &str, new: &str) -> String {
 }
 
 fn set_signature(n: &mut Node, signature: Option<String>) {
-    n.text = text_to_embed(n.doc.as_deref(), signature.as_deref());
+    n.text = full_text(n.doc.as_deref(), signature.as_deref());
     n.signature = signature;
 }
 
@@ -237,7 +237,7 @@ pub fn apply(nodes: &[Node], edit: Edit, target: &Target) -> Vec<Node> {
                 container: t.container.clone(),
                 start_line: t.end_line + 1,
                 end_line: t.end_line + 1,
-                text: text_to_embed(None, Some(&signature)),
+                text: full_text(None, Some(&signature)),
                 doc: None,
                 signature: Some(signature),
             });
