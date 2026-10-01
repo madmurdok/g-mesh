@@ -50,6 +50,8 @@ mod search_code;
 #[cfg(test)]
 mod search_code_wait_tests;
 #[cfg(test)]
+mod search_code_worker_tests;
+#[cfg(test)]
 mod semantic_pending_tests;
 pub(crate) mod session_hints;
 mod similarity;
@@ -755,7 +757,14 @@ impl GMeshMcpServer {
             Ok(coverage) => coverage,
             Err(early) => return Ok(early),
         };
-        search_code::handle(&self.store, &self.embedding, &self.hints, params.0, coverage.as_ref())
+        search_code::handle_off_worker(
+            Arc::clone(&self.store),
+            Arc::clone(&self.embedding),
+            self.hints.clone(),
+            params.0,
+            coverage,
+        )
+        .await
     }
 }
 
