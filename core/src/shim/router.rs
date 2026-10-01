@@ -917,6 +917,42 @@ mod tests {
         assert!(text.contains("call the tool again"), "{text}");
     }
 
+    /// KNOWN BUG (GM-447), asserted as it behaves today so the suite stays
+    /// green: two agents sharing one client connection share one selection.
+    /// Agent A selects `a`, agent B selects `b`, and A's next call - which A
+    /// still believes goes to `a` - is routed to `b` and answered from `b`,
+    /// with nothing in the answer naming the project that served it.
+    /// The JSON-RPC ids are the only thing telling the two agents apart here,
+    /// exactly as on a real shared connection. GM-447/S2 replaces these
+    /// assertions with the chosen fix's.
+    #[test]
+    fn known_bug_another_agents_select_reroutes_this_agents_calls() {
+        let mut session = Session::start();
+        // Agent A.
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(10);
+        assert_eq!(a.expect("tools/call")["id"], 10);
+        a.answer(10);
+        assert_eq!(session.recv()["id"], 10);
+
+        // Agent B, on the same connection.
+        session.select(2, "b");
+        let b = session.daemon();
+
+        // Agent A again: its call goes to b, not to the a it selected.
+        session.call(11);
+        assert_eq!(b.expect("tools/call")["id"], 11, "A's call is routed to B's project");
+        b.answer(11);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 11, "{answer}");
+        assert!(answer["result"]["isError"].is_null(), "answered as a success: {answer}");
+        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&b.root.display().to_string()), "served by b: {text}");
+        assert!(answer["result"]["_meta"].is_null(), "nothing names the answering project: {answer}");
+        assert!(a.closes() == vec![Shutdown::Write], "a was released once it owed nothing: {:?}", a.closes());
+    }
+
     /// A previous project's connection is half-closed once it owes nothing:
     /// a cancelled call is no longer owed, and its cancel goes to the daemon
     /// the call went to.
