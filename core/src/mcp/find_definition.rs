@@ -509,37 +509,23 @@ fn is_module_specifier(name: &str) -> bool {
 /// language's [`similarity::floor`]: all three fall through to the terse
 /// refusal this rung was added in front of, never to an error.
 ///
-/// # The floor moved, and it moved *down* here - on purpose
+/// # The floor is shared with `search_code`
 ///
-/// GM-381 needed the same judgement for `search_code`, measured it over four
-/// languages, and found one constant could not serve them; the table now
-/// lives in `mcp::similarity::floor` and this rung reads it per hit rather
-/// than holding a constant of its own. That is not a free refactor, because
-/// the two call sites do not see the same kind of query: this rung is only
-/// ever reached with a *symbol name*, while `search_code` takes free text,
-/// and the safe floor for free text sits lower. So the shared table changes
-/// what this rung does, and the change is worth stating rather than
-/// discovering.
+/// This rung reads the per-language table in `mcp::similarity::floor`
+/// rather than holding a constant of its own, although it only ever sees a
+/// *symbol name* while `search_code` takes free text. The table must keep
+/// this rung's false refusals (a top-3 page that held the right answer,
+/// refused) at or under about 3% on name queries: a refusal is the expensive
+/// error here, and a labelled "did you mean" on a hopeless query is cheap.
+/// Changing the table changes this rung, so a change is re-checked on name
+/// queries as well.
 ///
-/// Calibrated on name queries alone (149 go, 145 python, 143 rust, 291
-/// typescript positives against 150-300 absent-name negatives each), the
-/// floor that keeps this rung's false refusals at or under 3% is 0.648 for
-/// go, 0.628 for python, 0.555 for rust and 0.538 for typescript (fp32
-/// model, untrimmed text). The shared table ships 0.57 / 0.59 / 0.57 / 0.53:
-/// below those for go, python and typescript, and 0.015 above for rust, the
-/// one language where this rung leans toward refusing; that table was not
-/// re-calibrated on name queries for the shipped model and text. **The
-/// intended deviation is toward offering candidates rather than
-/// refusing**, which is the direction this rung's own argument asks for: a
-/// labelled "did you mean" is cheap and a refusal is what GM-234 existed to
-/// stop. Concretely, on TypeScript name queries the old 0.60 wrongly refused
-/// 6.9% of pages that held the right answer; at 0.50 that is 0.0%, paid for
-/// by offering candidates on 35% of hopeless queries instead of 10%.
-///
-/// Tightening this rung with a *name-query* table of its own is a real
-/// improvement left undone here, because it is a different calibration with
-/// a different cost matrix and it would have ridden in unmeasured on a task
-/// about `search_code`.
+/// On name queries for the shipped model and text (int8, structured), the
+/// table 0.57 / 0.59 / 0.57 / 0.53 (go / python / rust / typescript) refuses
+/// 2.3% / 3.1% / 2.9% / 1.5% of such pages and offers candidates on 12% /
+/// 11% / 26% / 24% of hopeless queries; a table fitted on names alone
+/// differs by one to three queries per language
+/// (`docs/results/gm-468-name-query-floors.md`).
 fn by_semantic_neighbours(
     conn: &Connection,
     embedding: Option<&EmbeddingPipeline>,
