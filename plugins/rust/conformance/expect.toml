@@ -671,3 +671,39 @@ contains = ["no symbol named 'nosuchname' found"]
 # pipeline disabled (`expectations.rs`'s `EvalContext`), so the semantic
 # rung cannot offer neighbours here and this refusal is deterministic rather
 # than model-dependent.
+
+# --- struct fields and inherent methods, CURRENT behaviour ------------------
+#
+# `gaps.rs` GAP 4 and `internals::tally`. These four entries pin what the
+# index answers today, as a baseline to flip. `docs/architecture/gm-450-rust-fields.md` has the gap and
+# the proposal. When fields become nodes, the two field refusals below turn
+# into `[[definition]]`/`[[references]]` entries, and that flip is their
+# control: with fields indexed, each refusal fails as "an answer".
+
+[[definition]]
+symbol = "gaps::Ledger::settle"
+# The inherent method IS a node, under its full module-qualified name. This is
+# the positive half: whatever S2 does about partial paths, this spelling must
+# keep resolving.
+expect = ["crates/alpha/src/gaps.rs:gaps::Ledger::settle"]
+
+[[refusal]]
+tool = "definition"
+symbol = "Ledger::settle"
+# CURRENT BEHAVIOUR. The same method by `Type::method` - the
+# spelling GM-432/S1 used for `IndexStore::read` - is neither a whole
+# qualifiedName nor a bare name, so every rung misses.
+contains = ["no symbol named 'Ledger::settle' found"]
+
+[[refusal]]
+tool = "definition"
+symbol = "all_unresolved"
+# CURRENT BEHAVIOUR: struct fields are not nodes.
+contains = ["no symbol named 'all_unresolved' found"]
+
+[[refusal]]
+tool = "references"
+symbol = "truncated_by"
+# CURRENT BEHAVIOUR: `internals::tally` writes this field in a struct
+# literal and `Ledger::settle` reads it, and neither use is an edge.
+contains = ["no symbol named 'truncated_by' found"]

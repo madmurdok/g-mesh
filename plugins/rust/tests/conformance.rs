@@ -105,7 +105,9 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // the empty page an agent gets when it asks who calls an override whose call
 // sites were all attributed to the trait. It is deliberately NOT semantic: the
 // page is empty in both arms, which is the hazard that entry exists to record.
-const EXPECTATIONS: usize = 22;
+// Includes one `[[definition]]` and three `[[refusal]]`s pinning how struct
+// fields and `Type::method` spellings answer today. None is semantic.
+const EXPECTATIONS: usize = 26;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of

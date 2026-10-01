@@ -57,3 +57,28 @@ pub fn platform() -> &'static str {
 pub fn measure<S: crate::prelude::Shape>(shape: &S) -> u8 {
     shape.area()
 }
+
+// GAP 4 - struct fields, and inherent methods by a partial path.
+// `Ledger` is a node (`Type`, `struct`) and `settle` is one (`Function`,
+// `method`, qualifiedName `gaps::Ledger::settle`). Its two fields are not:
+// `decls::node_kinds` has no arm for a `field_declaration`, and
+// `bodies::visit` walks only the receiver of `ledger.all_unresolved`. So
+// `find_definition("all_unresolved")` refuses, and so does
+// `find_definition("Ledger::settle")` - a qualifiedName is matched whole,
+// never by a suffix, and a Rust one always starts at the module path.
+// `internals::tally` is the use from another file.
+
+/// A struct with fields and an inherent method.
+pub struct Ledger {
+    /// Whether every row is unresolved.
+    pub all_unresolved: bool,
+    /// What cut the page short, if anything.
+    pub truncated_by: Option<u8>,
+}
+
+impl Ledger {
+    /// An inherent method that reads both fields.
+    pub fn settle(&self) -> bool {
+        self.all_unresolved && self.truncated_by.is_none()
+    }
+}

@@ -14,3 +14,9 @@ pub(crate) fn crate_only() -> u8 {
 pub fn published() -> u8 {
     crate_only() + 1
 }
+
+/// The cross-file use of `gaps::Ledger`'s fields and inherent method.
+pub fn tally() -> bool {
+    let ledger = crate::gaps::Ledger { all_unresolved: true, truncated_by: None };
+    ledger.settle() && ledger.all_unresolved
+}

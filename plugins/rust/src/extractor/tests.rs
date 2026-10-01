@@ -742,3 +742,61 @@ fn an_orphan_file_is_indexed_under_its_synthetic_container() {
     assert_eq!(node.container.as_deref(), Some("orphan:src/loose.rs"));
     assert_eq!(node.container_parent, None);
 }
+
+// --- struct fields: current behaviour (docs/architecture/gm-450-rust-fields.md) -
+
+/// CURRENT BEHAVIOUR, not the intended one: a struct's fields are
+/// not nodes, an inherent method's qualifiedName starts at its module path,
+/// and a field read or written from another file is no edge at all - only the
+/// struct name in the literal is. Fails once fields are emitted.
+#[test]
+fn struct_fields_are_not_nodes_yet() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub struct Ledger {
+    /// Whether every row is unresolved.
+    pub all_unresolved: bool,
+    pub truncated_by: Option<u8>,
+}
+impl Ledger {
+    pub fn settle(&self) -> bool { self.all_unresolved && self.truncated_by.is_none() }
+}
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+pub fn tally() -> bool {
+    let ledger = crate::store::Ledger { all_unresolved: true, truncated_by: None };
+    ledger.settle() && ledger.all_unresolved
+}
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    assert_eq!(store.node("store::Ledger").native_kind.as_deref(), Some("struct"));
+    assert_eq!(store.node("store::Ledger::settle").native_kind.as_deref(), Some("method"));
+    // The `Type::method` spelling an agent tends to type is not a
+    // qualifiedName: the module path is part of it.
+    assert!(store.find("Ledger::settle").is_none(), "{:#?}", store.names());
+    for field in ["all_unresolved", "truncated_by"] {
+        assert!(
+            store.0.nodes.iter().all(|node| node.name != field),
+            "field {field} became a node: {:#?}",
+            store.names()
+        );
+    }
+    // `self.all_unresolved` inside `settle` produces no edge onto a field.
+    assert!(store.targets(EdgeKind::References, "store::Ledger::settle").is_empty());
+
+    let user = krate.extract("src/user.rs");
+    // The literal's type is a reference; its fields, and the trailing
+    // `ledger.all_unresolved` read, are nothing.
+    assert_eq!(
+        user.targets(EdgeKind::References, "user::tally"),
+        vec!["pending_symbol krate::store::Ledger"]
+    );
+}
