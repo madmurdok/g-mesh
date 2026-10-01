@@ -600,7 +600,7 @@ func (e *extractor) declareFunc(d *ast.FuncDecl) {
 	name := d.Name.Name
 
 	nativeKind := "function"
-	qualifiedName := name
+	path := dotPath(name)
 
 	if d.Recv != nil && len(d.Recv.List) > 0 {
 		receiver, ok := receiverTypeName(d.Recv.List[0].Type)
@@ -614,7 +614,7 @@ func (e *extractor) declareFunc(d *ast.FuncDecl) {
 			return
 		}
 		nativeKind = "method"
-		qualifiedName = receiver + "." + name
+		path = dotPath(receiver, name)
 	} else if name == "init" {
 		nativeKind = "init"
 		if e.initOrdinal > 0 {
@@ -623,11 +623,13 @@ func (e *extractor) declareFunc(d *ast.FuncDecl) {
 		e.initOrdinal++
 	}
 
+	qualifiedName := joinPath(path)
 	id := e.declareSymbol(wireNode{
 		ID:            nodeIDFor(e.relPath, nodeKindFunction, qualifiedName, nativeKind),
 		Kind:          nodeKindFunction,
 		Name:          name,
 		QualifiedName: qualifiedName,
+		QualifiedPath: path,
 		Range:         e.rangeOf(d.Pos(), d.End()),
 		Signature:     e.funcSignature(d),
 		Visibility:    e.visibilityOf(name),
@@ -671,6 +673,7 @@ func (e *extractor) declareType(gen *ast.GenDecl, spec *ast.TypeSpec) {
 		Kind:          nodeKindType,
 		Name:          name,
 		QualifiedName: name,
+		QualifiedPath: dotPath(name),
 		Range:         e.specRange(gen, spec),
 		Signature:     e.typeSignature(spec, nativeKind),
 		Visibility:    e.visibilityOf(name),
@@ -703,12 +706,14 @@ func (e *extractor) declareInterfaceMethods(interfaceName string, iface *ast.Int
 			if methodName == nil || methodName.Name == "" || methodName.Name == "_" {
 				continue
 			}
-			qualifiedName := interfaceName + "." + methodName.Name
+			path := dotPath(interfaceName, methodName.Name)
+			qualifiedName := joinPath(path)
 			e.declareSymbol(wireNode{
 				ID:            nodeIDFor(e.relPath, nodeKindFunction, qualifiedName, "interface_method"),
 				Kind:          nodeKindFunction,
 				Name:          methodName.Name,
 				QualifiedName: qualifiedName,
+				QualifiedPath: path,
 				Range:         e.rangeOf(field.Pos(), field.End()),
 				Signature:     e.interfaceMethodSignature(methodName, funcType),
 				Visibility:    e.visibilityOf(methodName.Name),
@@ -737,6 +742,7 @@ func (e *extractor) declareValues(gen *ast.GenDecl, spec *ast.ValueSpec) {
 			Kind:          nodeKindVariable,
 			Name:          name,
 			QualifiedName: name,
+			QualifiedPath: dotPath(name),
 			Range:         e.specRange(gen, spec),
 			Visibility:    e.visibilityOf(name),
 			DocComment:    docText(firstDoc(spec.Doc, gen)),

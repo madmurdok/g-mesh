@@ -667,11 +667,11 @@ func (e *semanticEngine) answerFile(
 	answered := 0
 	for _, site := range file.openSites {
 		obj := resolved.objectAt(sitePos{file: relPath, line: site.Line, col: site.Col}, site.Kind)
-		container, qualifiedName, isFunc, ok := e.addressOf(obj)
+		container, key, isFunc, ok := e.addressOf(obj)
 		if !ok {
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container, qualifiedName,
+		toID := builder.placeholder(relPath, file.container, container, key,
 			wirePosition{Line: site.Line, Col: site.Col}, site.Name)
 		if site.IsCall && isFunc && site.EnclosingCallerID != "" {
 			builder.edge(relPath, site.EnclosingCallerID, edgeKindCalls, toID)
@@ -690,7 +690,7 @@ func (e *semanticEngine) answerFile(
 		// produced a structural edge in the first place - it is an open
 		// site, handled above.
 		obj := resolved.uses[sitePos{file: relPath, line: call.Line, col: call.Col}]
-		container, qualifiedName, isFunc, ok := e.addressOf(obj)
+		container, key, isFunc, ok := e.addressOf(obj)
 		if !ok || isFunc {
 			// Either nothing to say, or the structural tier was right and
 			// core has already linked its edge. Leaving a correct edge alone
@@ -703,7 +703,7 @@ func (e *semanticEngine) answerFile(
 		if call.EnclosingSymbolID == "" {
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container, qualifiedName,
+		toID := builder.placeholder(relPath, file.container, container, key,
 			wirePosition{Line: call.Line, Col: call.Col}, call.Name)
 		builder.edge(relPath, call.EnclosingSymbolID, edgeKindReferences, toID)
 		answered++
@@ -740,20 +740,21 @@ func (r *resolutions) objectAt(key sitePos, kind openSiteKind) types.Object {
 // The qualifiedName spelling has to agree, character for character, with
 // what extract.go gives the declaration node, because that is the key core
 // matches on: `F` for a function, `T` for a type, `T.M` for a method (value
-// and pointer receivers alike), `I.M` for an interface method.
-func (e *semanticEngine) addressOf(obj types.Object) (container, qualifiedName string, isFunc, ok bool) {
+// and pointer receivers alike), `I.M` for an interface method. It is
+// returned as the path whose joinPath is that spelling.
+func (e *semanticEngine) addressOf(obj types.Object) (container string, key []pathSegment, isFunc, ok bool) {
 	if obj == nil || obj.Pkg() == nil {
 		// A builtin (`len`), a universe type (`error`), `nil`: no package,
 		// and nothing this index declares.
-		return "", "", false, false
+		return "", nil, false, false
 	}
 	name := obj.Name()
 	if name == "" || name == "_" {
-		return "", "", false, false
+		return "", nil, false, false
 	}
 	container = obj.Pkg().Path()
 	if !e.isProjectContainer(container) {
-		return "", "", false, false
+		return "", nil, false, false
 	}
 
 	switch object := obj.(type) {
@@ -762,39 +763,39 @@ func (e *semanticEngine) addressOf(obj types.Object) (container, qualifiedName s
 		if signature != nil && signature.Recv() != nil {
 			receiver := receiverName(signature.Recv().Type())
 			if receiver == "" {
-				return "", "", false, false
+				return "", nil, false, false
 			}
-			return container, receiver + "." + name, true, true
+			return container, dotPath(receiver, name), true, true
 		}
 		if name == "init" {
 			// Not addressable in Go at all, so nothing can be referring to
 			// one here; extract.go gives each its own node precisely because
 			// nothing can name it.
-			return "", "", false, false
+			return "", nil, false, false
 		}
-		return container, name, true, true
+		return container, dotPath(name), true, true
 
 	case *types.TypeName:
 		if !isPackageLevel(object) {
-			return "", "", false, false
+			return "", nil, false, false
 		}
-		return container, name, false, true
+		return container, dotPath(name), false, true
 
 	case *types.Var:
 		if object.IsField() || !isPackageLevel(object) {
 			// A struct field has no node in this graph (extract.go models
 			// declarations, not members), and a local has none by design.
-			return "", "", false, false
+			return "", nil, false, false
 		}
-		return container, name, false, true
+		return container, dotPath(name), false, true
 
 	case *types.Const:
 		if !isPackageLevel(object) {
-			return "", "", false, false
+			return "", nil, false, false
 		}
-		return container, name, false, true
+		return container, dotPath(name), false, true
 	}
-	return "", "", false, false
+	return "", nil, false, false
 }
 
 // isPackageLevel reports whether an object is declared in its package's own
@@ -898,7 +899,7 @@ func (e *semanticEngine) answerImplements(
 				!types.Implements(types.NewPointer(subtype.named), iface) {
 				continue
 			}
-			toID := builder.placeholder(file, node.Container, ifaceObj.Pkg().Path(), ifaceObj.Name(),
+			toID := builder.placeholder(file, node.Container, ifaceObj.Pkg().Path(), dotPath(ifaceObj.Name()),
 				node.Range.Start, ifaceObj.Name())
 			builder.edge(file, node.ID, edgeKindSupertypeOf, toID)
 			emitted++
@@ -986,7 +987,8 @@ func newSemanticDiff() *semanticDiff {
 }
 
 // placeholder adds (once) the qualifiedName-keyed placeholder that addresses
-// one declaration, and returns its node id.
+// one declaration, and returns its node id. `key` is the declaration's path;
+// the key string is its joinPath and the path itself goes out as keyPath.
 //
 // The node's own `qualifiedName` is `<container>.<declaration>`, which is a
 // display string and nothing more: core reads the address off
@@ -994,10 +996,12 @@ func newSemanticDiff() *semanticDiff {
 // is a row, not a string"). It is spelled that way because it is the one
 // rendering a human reading a diff can act on.
 func (d *semanticDiff) placeholder(
-	relPath, fromContainer, container, qualifiedName string,
+	relPath, fromContainer, container string,
+	key []pathSegment,
 	at wirePosition,
 	displayName string,
 ) string {
+	qualifiedName := joinPath(key)
 	address := container + "." + qualifiedName
 	id := nodeIDFor(relPath, nodeKindModule, address, pendingSymbolNativeKind)
 	if _, exists := d.nodes[id]; exists {
@@ -1020,6 +1024,7 @@ func (d *semanticDiff) placeholder(
 			Scope:         targetScope{Container: container},
 			Key:           targetKey{QualifiedName: qualifiedName},
 			FromContainer: fromContainer,
+			KeyPath:       key,
 		},
 	}
 	return id
