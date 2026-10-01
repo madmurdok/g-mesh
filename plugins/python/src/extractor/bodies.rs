@@ -90,7 +90,7 @@ use tree_sitter::Node;
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::ModuleCtx;
 use crate::extractor::model::{FileModel, Import};
-use crate::extractor::scope::{FrameKind, Scopes};
+use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     decorators, definition_name, dotted_segments, first_parameter_name, has_decorator, inner_definition,
     looks_like_class, text,
@@ -714,11 +714,11 @@ impl<'a, 's> Bodies<'a, 's> {
                         }
                     };
                 }
-                Bound::There {
-                    target: container_target(&container, TargetKey::QualifiedName(full), &self.module.key),
-                    name: (*last).to_string(),
-                    looks_class: looks_like_class(last),
-                }
+                let key_path = dotted_path(&full);
+                let mut target =
+                    container_target(&container, TargetKey::QualifiedName(full), &self.module.key);
+                target.key_path = key_path;
+                Bound::There { target, name: (*last).to_string(), looks_class: looks_like_class(last) }
             }
             Qualifier::Opaque => Bound::Receiver,
             Qualifier::External => {
