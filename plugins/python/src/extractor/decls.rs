@@ -121,7 +121,7 @@ use tree_sitter::Node;
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{is_public, visibility, FileRole, ModuleCtx};
 use crate::extractor::model::{DeclRef, FileModel, Import};
-use crate::extractor::scope::{FrameKind, Scopes};
+use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     assignment_signature, definition_name, docstring, dotted_segments, inner_definition, signature,
     string_literal, text,
@@ -165,7 +165,8 @@ impl Declarer<'_, '_> {
         )
         .native_kind(native_kind)
         .visibility(own.clone())
-        .in_container(container, parent);
+        .in_container(container.clone(), parent);
+        spec.qualified_path = dotted_path(&container).map(|path| path.child(".", spec.name.clone()));
         spec.doc_comment = docstring(root, self.source);
         self.emitter.declare(spec, is_public(&own));
     }
@@ -280,6 +281,7 @@ impl Declarer<'_, '_> {
                 .native_kind(native_kind)
                 .visibility(own.clone())
                 .in_container(self.module.key.clone(), self.module.parent.clone());
+        spec.qualified_path = self.scopes.child_qualified_path(&name);
         spec.signature = signature(outer, self.source);
         spec.doc_comment = inner.child_by_field_name("body").and_then(|body| docstring(body, self.source));
         let id = self.emitter.declare(spec, is_public(&own));
@@ -308,6 +310,7 @@ impl Declarer<'_, '_> {
             .native_kind("variable")
             .visibility(own.clone())
             .in_container(self.module.key.clone(), self.module.parent.clone());
+            spec.qualified_path = self.scopes.child_qualified_path(name);
             spec.signature = Some(assignment_signature(name, assignment, self.source));
             let id = self.emitter.declare(spec, is_public(&own));
             let scope = self.scopes.path().to_string();

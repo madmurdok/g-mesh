@@ -64,7 +64,7 @@
 //! closes, and it is the cheap side of the trade: the alternative loses a
 //! declaration outright.
 
-use g_mesh_plugin_sdk::wire::Visibility;
+use g_mesh_plugin_sdk::wire::{QualifiedPath, Visibility};
 use tree_sitter::Node;
 
 use crate::extractor::syntax::{flatten_path, looks_like_type, Seg};
@@ -119,15 +119,39 @@ impl ModuleCtx {
         }
     }
 
-    /// The `qualifiedName` of a member of this module whose own name (within
-    /// the module) is `tail` - `f`, `T::m`, `<T as Tr>::m`.
-    pub(crate) fn qualified(&self, tail: &str) -> String {
-        qualified_in(&self.key, tail)
+    /// The `qualifiedName` of a member of this module, as segments, whose
+    /// own path within the module is `tail` - `f`, `T::m`, `<T as Tr>::m`,
+    /// `T.f`. Joined, it is [`qualified_in`] of this module and `tail`.
+    pub(crate) fn qualified_path(&self, tail: &QualifiedPath) -> QualifiedPath {
+        qualified_path_in(&self.key, tail)
     }
 }
 
-/// See [`ModuleCtx::qualified`] - the same rule for a container key that is
-/// not the walk's current one (a placeholder addressed at another module).
+/// [`qualified_in`] as segments: one `::`-joined segment per module of the
+/// container's module path, then `tail`'s own segments, the first of them
+/// written after `::`. Joined, it is exactly `qualified_in(container,
+/// &tail.display())`.
+pub(crate) fn qualified_path_in(container: &str, tail: &QualifiedPath) -> QualifiedPath {
+    let module_path = module_path_of(container);
+    let mut segments = Vec::new();
+    if !module_path.is_empty() {
+        segments.extend(module_path.split("::").map(str::to_string));
+    }
+    let mut tail_segments = tail.segments().iter();
+    let Some(first) = tail_segments.next() else { return tail.clone() };
+    segments.push(first.name.clone());
+    let mut path = QualifiedPath::root(segments.remove(0));
+    for name in segments {
+        path = path.child("::", name);
+    }
+    for segment in tail_segments {
+        path = path.child(segment.sep.clone().unwrap_or_default(), segment.name.clone());
+    }
+    path
+}
+
+/// The `qualifiedName` of the member whose own path within `container` is
+/// `tail`: the container's module path, without the crate name, then `tail`.
 pub(crate) fn qualified_in(container: &str, tail: &str) -> String {
     let module_path = module_path_of(container);
     if module_path.is_empty() {
@@ -479,8 +503,33 @@ mod tests {
 
     #[test]
     fn a_qualified_name_carries_the_module_path_but_never_the_crate_name() {
-        assert_eq!(module("krate", None).qualified("f"), "f");
-        assert_eq!(module("krate::a::b", Some("krate::a")).qualified("T::m"), "a::b::T::m");
+        assert_eq!(module("krate", None).qualified_path(&QualifiedPath::root("f")).display(), "f");
+        let tail = QualifiedPath::root("T").child("::", "m");
+        assert_eq!(module("krate::a::b", Some("krate::a")).qualified_path(&tail).display(), "a::b::T::m");
+    }
+
+    /// One segment per module, then the tail's own segments with their own
+    /// separators: a `<T as Tr>` prefix stays one segment and a field keeps `.`.
+    #[test]
+    fn a_qualified_path_has_one_segment_per_module_and_keeps_the_tails_separators() {
+        let names = |path: &QualifiedPath| -> Vec<(Option<String>, String)> {
+            path.segments().iter().map(|segment| (segment.sep.clone(), segment.name.clone())).collect()
+        };
+        let sep = |text: &str| Some(text.to_string());
+        let here = module("krate::a::b", Some("krate::a"));
+        let method = here.qualified_path(&QualifiedPath::root("<T as Tr>").child("::", "m"));
+        assert_eq!(
+            names(&method),
+            vec![
+                (None, "a".to_string()),
+                (sep("::"), "b".to_string()),
+                (sep("::"), "<T as Tr>".to_string()),
+                (sep("::"), "m".to_string()),
+            ]
+        );
+        assert_eq!(method.check_joins_to(&qualified_in("krate::a::b", "<T as Tr>::m")), Ok(()));
+        let field = qualified_path_in("krate", &QualifiedPath::root("T").child(".", "f"));
+        assert_eq!(names(&field), vec![(None, "T".to_string()), (sep("."), "f".to_string())]);
     }
 
     /// An orphan file has no crate path, so its items are named from its own
@@ -488,8 +537,8 @@ mod tests {
     #[test]
     fn an_orphan_files_items_are_named_from_the_file_itself() {
         let orphan = ModuleCtx::for_file(&ContainerInfo::Orphan { key: "orphan:src/dead.rs".into() });
-        assert_eq!(orphan.qualified("f"), "f");
-        assert_eq!(orphan.child("inner").qualified("f"), "inner::f");
+        assert_eq!(orphan.qualified_path(&QualifiedPath::root("f")).display(), "f");
+        assert_eq!(orphan.child("inner").qualified_path(&QualifiedPath::root("f")).display(), "inner::f");
         assert_eq!(orphan.parent, None);
         assert_eq!(orphan.crate_root, "orphan:src/dead.rs");
     }
