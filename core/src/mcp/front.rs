@@ -52,6 +52,17 @@ pub struct SelectProjectParams {
     pub project: Option<String>,
 }
 
+/// The tools a front lists: the usual eight, then `select_project`.
+pub(super) fn listed_tools() -> Vec<Tool> {
+    let mut tools = GMeshMcpServer::tool_router().list_all();
+    tools.push(Tool::new(
+        SELECT_PROJECT,
+        SELECT_PROJECT_DESCRIPTION,
+        schema_for_type::<SelectProjectParams>(),
+    ));
+    tools
+}
+
 /// Everything a front's connections share, built once at startup.
 pub struct Front {
     /// Canonical.
@@ -64,14 +75,12 @@ pub struct Front {
 
 impl Front {
     pub fn new(root: PathBuf, detection: &Detection) -> Self {
-        let index_tools_listed = GMeshMcpServer::tool_router().list_all();
-        let index_tools = index_tools_listed.iter().map(|tool| tool.name.to_string()).collect();
-        let mut tools = index_tools_listed;
-        tools.push(Tool::new(
-            SELECT_PROJECT,
-            SELECT_PROJECT_DESCRIPTION,
-            schema_for_type::<SelectProjectParams>(),
-        ));
+        let tools = listed_tools();
+        let index_tools = tools
+            .iter()
+            .filter(|tool| tool.name != SELECT_PROJECT)
+            .map(|tool| tool.name.to_string())
+            .collect();
         let indexed: HashSet<&str> = detection
             .candidates
             .iter()

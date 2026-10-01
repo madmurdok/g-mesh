@@ -55,6 +55,8 @@ pub(crate) mod session_hints;
 mod similarity;
 mod source;
 mod tool_result;
+#[cfg(test)]
+mod tools_list_tests;
 
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.
@@ -112,6 +114,16 @@ pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
 /// small project's whole backfill or one file-change batch
 /// (`docs/architecture/gm-432-search-code-hang.md`).
 pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
+
+/// Upper bound on the serialized `tools/list` result in bytes, measured on a
+/// front's list (the eight tools plus `select_project`, a superset of what a
+/// project daemon lists). The counterpart of
+/// `instructions::INSTRUCTIONS_BYTE_CEILING` for tool names, descriptions and
+/// input schemas, which a client resends on every turn: growing past it is a
+/// behaviour change that needs a measured token effect, not a quiet edit. The
+/// headroom is kept smaller than the smallest tool's own entry, so a wording
+/// fix fits but a new tool or a batch of new parameters does not.
+pub const TOOLS_LIST_BYTE_CEILING: usize = 11_500;
 
 /// Reads a millisecond-valued env var, falling back to `default` when it is
 /// unset, empty or not a number. Read per call, so a test can change it
