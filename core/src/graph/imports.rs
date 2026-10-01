@@ -363,6 +363,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         let mut drop_placeholder_dependents = [
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
             "DELETE FROM declarations WHERE nodeId = ?1",
+            "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
             "DELETE FROM vectors WHERE nodeId = ?1",
         ]
         .into_iter()
@@ -452,6 +453,7 @@ mod tests {
             key_kind: "name".to_string(),
             key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
+            key_path: None,
         }
     }
 
@@ -464,6 +466,7 @@ mod tests {
             key_kind: "name".to_string(),
             key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
+            key_path: None,
         }
     }
 
@@ -872,6 +875,8 @@ mod tests {
             )
             .unwrap();
             crate::storage::vectors::insert(&conn, id, &[1.0, 0.0], "test-model").unwrap();
+            conn.execute("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES ('x::y', ?1)", params![id])
+                .unwrap();
         }
 
         let summary = link_all(&mut conn).unwrap();
@@ -881,6 +886,11 @@ mod tests {
         assert_eq!(count(&conn, "placeholder_targets"), 0, "a dropped placeholder's target must go with it");
         assert_eq!(count(&conn, "declarations"), 0, "a dropped placeholder's declarations must go with it");
         assert_eq!(count(&conn, "vectors"), 0, "a dropped placeholder's embedding must go with it");
+        assert_eq!(
+            count(&conn, "qualified_suffixes"),
+            0,
+            "a dropped placeholder's suffix rows must go with it"
+        );
     }
 
     #[test]

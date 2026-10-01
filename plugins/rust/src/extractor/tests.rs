@@ -1002,3 +1002,116 @@ fn gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module(
         );
     }
 }
+
+/// The segments of a path as `(sep, name)` pairs, `""` for the first.
+fn segments(path: &g_mesh_plugin_sdk::wire::QualifiedPath) -> Vec<(String, String)> {
+    path.segments()
+        .iter()
+        .map(|segment| (segment.sep.clone().unwrap_or_default(), segment.name.clone()))
+        .collect()
+}
+
+/// Every declaration carries a `qualifiedPath` that joins back to its
+/// `qualifiedName` and ends in its name; placeholders, the `File` node and
+/// `external_module` nodes carry none; every `qualifiedName`-keyed
+/// placeholder carries a `keyPath` that joins back to its key.
+fn assert_paths_are_well_formed(graph: &Graph) {
+    const PATHLESS: [&str; 5] = ["pending_symbol", "reexport", "resolved_module", "external_module", "file"];
+    for node in &graph.0.nodes {
+        let pathless = node.kind == NodeKind::File
+            || node.native_kind.as_deref().is_some_and(|native| PATHLESS.contains(&native));
+        if pathless {
+            assert_eq!(node.qualified_path, None, "{node:#?}");
+            assert!(node.alias_paths.is_empty(), "{node:#?}");
+        } else {
+            assert!(node.qualified_path.is_some(), "a declaration without a path: {node:#?}");
+            assert_eq!(node.check_qualified_path(), Ok(()), "{node:#?}");
+            for alias in &node.alias_paths {
+                assert_eq!(node.check_alias_path(alias), Ok(()), "{node:#?}");
+            }
+        }
+        if let Some(target) = &node.target {
+            match &target.key {
+                TargetKey::QualifiedName(_) => assert!(target.key_path.is_some(), "{node:#?}"),
+                TargetKey::Name(_) => assert_eq!(target.key_path, None, "{node:#?}"),
+            }
+            assert_eq!(target.check_key_path(), Ok(()), "{node:#?}");
+        }
+    }
+}
+
+/// Module segments joined by `::`, a trait impl's `<X as T>` kept as one
+/// segment, a field after `.`, a raw identifier as written; a trait-impl
+/// member's only alias is the path with that segment replaced by the self
+/// type's plain name, and no other member has one.
+#[test]
+fn every_declaration_carries_its_qualified_name_as_segments() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub trait Show { fn show(&self) -> u8; }
+pub struct Holder<T> { pub inner: T }
+impl<T> Holder<T> {
+    pub fn inner(&self) -> u8 { 0 }
+}
+impl<'a, T> Show for &'a Holder<T> {
+    fn show(&self) -> u8 { 1 }
+}
+impl Show for (u8, u8) {
+    fn show(&self) -> u8 { 2 }
+}
+pub mod nested {
+    pub fn r#type() {}
+}
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+use crate::store::Holder;
+pub fn make() -> Holder<u8> { Holder { inner: 1 } }
+pub fn get(holder: &Holder<u8>) -> u8 { Holder::inner(holder) }
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    assert_paths_are_well_formed(&store);
+    let user = krate.extract("src/user.rs");
+    assert_paths_are_well_formed(&user);
+
+    let pairs = |items: &[(&str, &str)]| -> Vec<(String, String)> {
+        items.iter().map(|(sep, name)| (sep.to_string(), name.to_string())).collect()
+    };
+    let path_of =
+        |qualified_name: &str| segments(store.node(qualified_name).qualified_path.as_ref().unwrap());
+
+    assert_eq!(path_of("store::Holder.inner"), pairs(&[("", "store"), ("::", "Holder"), (".", "inner")]));
+    assert_eq!(path_of("store::Holder::inner"), pairs(&[("", "store"), ("::", "Holder"), ("::", "inner")]));
+    assert_eq!(path_of("store::nested::r#type"), pairs(&[("", "store"), ("::", "nested"), ("::", "r#type")]));
+    let show = store.node("store::<&'a Holder<T> as Show>::show");
+    assert_eq!(
+        segments(show.qualified_path.as_ref().unwrap()),
+        pairs(&[("", "store"), ("::", "<&'a Holder<T> as Show>"), ("::", "show")])
+    );
+    let aliases: Vec<_> = show.alias_paths.iter().map(segments).collect();
+    assert_eq!(aliases, vec![pairs(&[("", "store"), ("::", "Holder"), ("::", "show")])]);
+
+    // A self type with no single name has no alias; an inherent method or
+    // a field never has one.
+    assert!(store.node("store::<(u8, u8) as Show>::show").alias_paths.is_empty());
+    assert!(store.node("store::Holder::inner").alias_paths.is_empty());
+    assert!(store.node("store::Holder.inner").alias_paths.is_empty());
+
+    // A cross-file field key and a method key keep their own last separator.
+    let key_paths: Vec<_> = user
+        .0
+        .nodes
+        .iter()
+        .filter_map(|node| node.target.as_ref()?.key_path.as_ref())
+        .map(segments)
+        .collect();
+    assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), (".", "inner")])), "{key_paths:?}");
+    assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), ("::", "inner")])), "{key_paths:?}");
+}

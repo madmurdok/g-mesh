@@ -140,6 +140,7 @@ impl Extractor for ToyExtractor {
                         scope: TargetScope::File(file_name.to_string()),
                         key: TargetKey::Name(name.to_string()),
                         from_container: None,
+                        key_path: None,
                     },
                     range,
                 );
@@ -206,6 +207,7 @@ impl SemanticEngine for ToyEngine {
                         scope: TargetScope::File(declaring.as_str().to_string()),
                         key: TargetKey::Name(site.name.clone()),
                         from_container: site.from_container.clone(),
+                        key_path: None,
                     },
                     Range { start: site.position, end: site.position },
                 );

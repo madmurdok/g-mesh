@@ -53,6 +53,8 @@ impl ConformanceReport {
 ///    reported here rather than surfacing as an opaque parse failure.
 ///  - `nativeKind: "container"` is never plugin-emitted - core alone
 ///    materializes container nodes (Data Model > Logical containers).
+///  - a `qualifiedPath`, `aliasPaths` entry or `keyPath`, when sent, obeys
+///    its rules ([`qualified_path_violation`]).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let reader = NdjsonReader::new(BufReader::new(Cursor::new(ndjson.to_vec())));
     let mut violations = Vec::new();
@@ -71,6 +73,7 @@ fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
     placeholder_target_violation(node)
         .into_iter()
         .chain(plugin_emitted_container_violation(node))
+        .chain(qualified_path_violation(node))
         .map(|message| Violation { context: context.to_string(), message })
         .collect()
 }
@@ -90,6 +93,35 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
             node.id, node.qualified_name
         )
     })
+}
+
+/// The path rules: a `qualifiedPath` joins back to `qualifiedName` and ends
+/// in `name`; each `aliasPaths` entry has at least two segments, ends in
+/// `name`, differs from `qualifiedPath` and comes with one; a `keyPath`
+/// joins back to its `qualifiedName` key. Absent paths are conformant. Core
+/// drops a path that breaks these at ingest and keeps the node.
+pub(crate) fn qualified_path_violation(node: &WireNode) -> Option<String> {
+    let error = node
+        .check_qualified_path()
+        .map_err(|error| ("qualifiedPath", error))
+        .and_then(|()| {
+            node.alias_paths
+                .iter()
+                .try_for_each(|alias| node.check_alias_path(alias))
+                .map_err(|error| ("aliasPaths entry", error))
+        })
+        .and_then(|()| {
+            node.target
+                .as_ref()
+                .map_or(Ok(()), |target| target.check_key_path())
+                .map_err(|error| ("keyPath", error))
+        })
+        .err()?;
+    let (what, error) = error;
+    Some(format!(
+        "node {:?} (qualifiedName {:?}) has an invalid {what}: {error}",
+        node.id, node.qualified_name
+    ))
 }
 
 /// The "core alone materializes container nodes" rule on its own - see
@@ -177,6 +209,18 @@ mod tests {
     }
 
     /// A v2 node whose `target` is present on the wire is conformant.
+    #[test]
+    fn a_node_whose_path_does_not_join_back_is_a_violation() {
+        let good = b"{\"id\":\"n1\",\"kind\":\"Function\",\"name\":\"f\",\"qualifiedName\":\"a::T.f\",\"filePath\":\"a.rs\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"rust\",\"qualifiedPath\":[{\"name\":\"a\"},{\"sep\":\"::\",\"name\":\"T\"},{\"sep\":\".\",\"name\":\"f\"}]}\n";
+        let report = check_bulk_output(good);
+        assert!(report.is_conformant(), "{:?}", report.violations);
+
+        let bad = String::from_utf8(good.to_vec()).unwrap().replace("\"sep\":\".\"", "\"sep\":\"::\"");
+        let report = check_bulk_output(bad.as_bytes());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("invalid qualifiedPath"), "{:?}", report.violations);
+    }
+
     #[test]
     fn v2_placeholder_with_an_explicit_target_is_conformant() {
         let ndjson = b"{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"foo\",\"qualifiedName\":\"target.ts#foo\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"typescript\",\"nativeKind\":\"pending_symbol\",\"target\":{\"scope\":{\"file\":\"target.ts\"},\"key\":{\"name\":\"foo\"}}}\n";

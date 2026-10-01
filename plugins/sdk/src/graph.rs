@@ -24,8 +24,8 @@
 //! to read.
 
 use g_mesh_wire::{
-    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, SourceTier, Visibility, WireDeclaration,
-    WireEdge, WireNode,
+    EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, Visibility,
+    WireDeclaration, WireEdge, WireNode,
 };
 
 use crate::ids::{edge_id, node_id};
@@ -254,6 +254,11 @@ pub struct NodeSpec {
     /// A plugin that builds a placeholder through [`NodeSpec`] directly owns
     /// keeping them consistent itself.
     pub target: Option<PlaceholderTarget>,
+    /// `qualified_name` as segments. Set by [`NodeSpec::with_path`], which
+    /// also derives `qualified_name` from it, so the two always agree.
+    pub qualified_path: Option<QualifiedPath>,
+    /// Other spellings of this declaration, appended by [`NodeSpec::alias`].
+    pub alias_paths: Vec<QualifiedPath>,
 }
 
 impl NodeSpec {
@@ -278,7 +283,27 @@ impl NodeSpec {
             container_parent: None,
             declarations: None,
             target: None,
+            qualified_path: None,
+            alias_paths: Vec::new(),
         }
+    }
+
+    /// A declaration addressed by `path`: `qualifiedName` is the path joined,
+    /// so the node id is exactly what [`NodeSpec::new`] with that string
+    /// would give. The path's last segment must be `name`; core drops a path
+    /// that breaks a rule of [`QualifiedPath::check`] and keeps the node.
+    pub fn with_path(kind: NodeKind, name: impl Into<String>, path: QualifiedPath, range: Range) -> Self {
+        let mut spec = Self::new(kind, name, path.display(), range);
+        spec.qualified_path = Some(path);
+        spec
+    }
+
+    /// Adds another spelling by which a partial-path lookup finds this
+    /// declaration. It must have at least two segments, end in `name` and
+    /// differ from the node's own path; it need not join to `qualifiedName`.
+    pub fn alias(mut self, path: QualifiedPath) -> Self {
+        self.alias_paths.push(path);
+        self
     }
 
     /// Visible from anywhere - TS `export`, Go capitalized, Rust `pub`.
@@ -422,6 +447,8 @@ impl FileGraphBuilder {
             container: spec.container,
             container_parent: spec.container_parent,
             target: spec.target,
+            qualified_path: spec.qualified_path,
+            alias_paths: spec.alias_paths,
         });
         id
     }
@@ -612,6 +639,7 @@ mod tests {
                 scope: TargetScope::File("src/b.toy".into()),
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
+                key_path: None,
             },
             range(1, 1),
         );
@@ -622,6 +650,7 @@ mod tests {
                 scope: TargetScope::File("src/c.toy".into()),
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
+                key_path: None,
             },
             range(2, 2),
         );
@@ -632,6 +661,7 @@ mod tests {
                 scope: TargetScope::Container("pkg".into()),
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
+                key_path: None,
             },
             range(3, 3),
         );
@@ -643,6 +673,7 @@ mod tests {
                 scope: TargetScope::File("src/b.toy".into()),
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
+                key_path: None,
             },
             range(4, 4),
         );
@@ -664,6 +695,7 @@ mod tests {
             scope: TargetScope::Container("pkg".into()),
             key: TargetKey::Name("helper".into()),
             from_container: None,
+            key_path: None,
         };
         for kind in
             [PlaceholderKind::PendingSymbol, PlaceholderKind::Reexport, PlaceholderKind::ResolvedModule]
@@ -698,6 +730,7 @@ mod tests {
                     scope: TargetScope::File("src/b.toy".into()),
                     key: TargetKey::Name("x".into()),
                     from_container: None,
+                    key_path: None,
                 },
                 range(1, 1),
             );
@@ -736,5 +769,23 @@ mod tests {
         graph.mark_syntax_errors();
         let graph = graph.finish();
         assert!(graph.nodes.iter().all(|node| node.has_syntax_errors));
+    }
+
+    /// `with_path` sets `qualifiedName` to the joined path, so the id is the
+    /// one `new` gives for that string; aliases ride along to the wire node.
+    #[test]
+    fn a_node_built_from_a_path_keeps_the_id_of_its_display_string() {
+        let path = QualifiedPath::root("m").child("::", "<S as Read>").child("::", "read");
+        let alias = QualifiedPath::root("m").child("::", "S").child("::", "read");
+        let mut graph = builder();
+        let id = graph.add_node(
+            NodeSpec::with_path(NodeKind::Function, "read", path.clone(), range(1, 2)).alias(alias.clone()),
+        );
+        assert_eq!(id, crate::ids::node_id("src/a.toy", NodeKind::Function, "m::<S as Read>::read", None));
+        let graph = graph.finish();
+        assert_eq!(graph.nodes[0].qualified_name, "m::<S as Read>::read");
+        assert_eq!(graph.nodes[0].qualified_path, Some(path));
+        assert_eq!(graph.nodes[0].alias_paths, vec![alias]);
+        assert_eq!(graph.nodes[0].check_qualified_path(), Ok(()));
     }
 }
