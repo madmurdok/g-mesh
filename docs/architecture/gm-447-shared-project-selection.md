@@ -1,7 +1,9 @@
 # GM-447: one project selection shared by every agent on a connection
 
-Status: reproduction and design (GM-447/S1). No production code changed in
-this slice. The option below needs the owner's approval before S2 builds it.
+Status: option 2 approved and built; the decision is
+[ADR 0014](../adr/0014-answering-project-stamp.md). The reproduction test
+below is now the regression test
+`another_agents_select_is_named_in_this_agents_answer`.
 
 ## The problem
 

@@ -21,6 +21,18 @@
 //! every frame crosses byte-for-byte, as it did before this module existed; a
 //! frame that fails to parse is forwarded raw.
 //!
+//! # Which project answered
+//!
+//! Every agent on one client connection shares the session's selection, and
+//! the shim cannot tell them apart, so one agent's `select_project` reroutes
+//! another's later calls. A `tools/call` result that a sub-project's daemon
+//! answers therefore starts with a text item naming that project, relative
+//! to the shim's root ([`answered_from`]): the root of the upstream the call
+//! was sent to, not the selection at the time the answer arrives. Such a
+//! result is parsed and re-serialized to add it. Front answers, JSON-RPC
+//! error responses, and answers the shim makes itself are not stamped (see
+//! `docs/adr/0014-answering-project-stamp.md`).
+//!
 //! # Every forwarded request is answered
 //!
 //! Each request forwarded upstream is recorded with the upstream it went to
@@ -277,9 +289,11 @@ fn spawn_reader(shared: &Arc<Shared>, id: u64, mut reader: Box<dyn BufRead + Sen
     thread::spawn(move || {
         loop {
             match read_ndjson_frame(&mut reader) {
-                Ok(Some(frame)) => {
+                Ok(Some(mut frame)) => {
                     if let Some(answered) = response_id(&frame) {
-                        shared.settle(id, &answered);
+                        if let Some(stamp) = shared.settle(id, &answered) {
+                            frame = stamped(frame, &stamp);
+                        }
                     }
                     let frame = if is_front { shared.on_front_frame(frame) } else { Some(frame) };
                     if let Some(frame) = frame {
@@ -329,13 +343,21 @@ impl Shared {
         }
     }
 
-    /// Records that upstream `upstream` answered request `id`.
-    fn settle(&self, upstream: u64, id: &Value) {
+    /// Records that upstream `upstream` answered request `id`. Returns the
+    /// line the answer must start with: [`answered_from`] when it answers a
+    /// `tools/call` and `upstream` serves a sub-project, `None` otherwise.
+    fn settle(&self, upstream: u64, id: &Value) -> Option<String> {
         let mut router = self.lock();
-        if router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
-            router.pending.remove(id);
-            router.release_if_drained(upstream);
+        if !router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
+            return None;
         }
+        let in_flight = router.pending.remove(id)?;
+        router.release_if_drained(upstream);
+        let served = &router.upstream(upstream)?.root;
+        // The front serves the shim's root; a sub-project never does (a
+        // switch refuses the root itself).
+        (in_flight.method == "tools/call" && *served != router.root)
+            .then(|| answered_from(&router.root, served))
     }
 
     fn on_client_frame(&self, frame: Vec<u8>) {
@@ -434,7 +456,10 @@ impl Shared {
         let (text, is_error) = match self.switch(&mut router, &target) {
             Ok((served, guidance)) => (
                 format!(
-                    "g-mesh: this session now serves {served}; file paths are relative to it. Guidance for \
+                    "g-mesh: this session now serves {served}; file paths are relative to it. Agents \
+                     sharing this connection share this choice, so each tool result from here on starts \
+                     with `g-mesh: answered from project <name>.`; if it names a project other than the \
+                     one you selected, call select_project again before using the result. Guidance for \
                      this project, as a session started in {served} would receive it:\n\n{guidance}",
                     served = served.display()
                 ),
@@ -573,6 +598,31 @@ impl Shared {
             let _ = self.events.send(Event::Done);
         }
     }
+}
+
+/// The first text item of a `tools/call` result answered by the daemon
+/// serving `served`, a project below `root`.
+fn answered_from(root: &Path, served: &Path) -> String {
+    let relative = served.strip_prefix(root).unwrap_or(served);
+    let name: Vec<_> = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect();
+    format!("g-mesh: answered from project {}.", name.join("/"))
+}
+
+/// `frame` with `stamp` as the first text item of its tool result. A frame
+/// with no `result.content` array (a JSON-RPC error, or a frame that does not
+/// parse) is returned unchanged. A tool error (`isError`) is stamped too.
+fn stamped(frame: Vec<u8>, stamp: &str) -> Vec<u8> {
+    let Ok(mut message) = serde_json::from_slice::<Value>(&frame) else {
+        return frame;
+    };
+    let Some(content) = message.get_mut("result").and_then(|result| result.get_mut("content")) else {
+        return frame;
+    };
+    let Some(items) = content.as_array_mut() else {
+        return frame;
+    };
+    items.insert(0, json!({ "type": "text", "text": stamp }));
+    serde_json::to_vec(&message).expect("a Value always serializes")
 }
 
 fn error_result(id: &Value, text: &str) -> Vec<u8> {
@@ -745,11 +795,14 @@ mod tests {
         }
 
         fn answer(&self, id: u64) {
-            let reply = json!({
+            self.reply(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": { "content": [{ "type": "text", "text": format!("answer from {}", self.root.display()) }] },
-            });
+            }));
+        }
+
+        fn reply(&self, reply: Value) {
             if let Some(writer) = self.writer.lock().unwrap().as_mut() {
                 write_ndjson_frame(writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
             }
@@ -901,7 +954,7 @@ mod tests {
         a.answer(7);
         let answer = session.recv();
         assert_eq!(answer["id"], 7, "{answer}");
-        assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("answer from"), "{answer}");
+        assert!(answer["result"]["content"][1]["text"].as_str().unwrap().contains("answer from"), "{answer}");
         assert!(a.closes().is_empty(), "a still owes 8");
 
         session.call(9);
@@ -917,16 +970,23 @@ mod tests {
         assert!(text.contains("call the tool again"), "{text}");
     }
 
-    /// KNOWN BUG (GM-447), asserted as it behaves today so the suite stays
-    /// green: two agents sharing one client connection share one selection.
-    /// Agent A selects `a`, agent B selects `b`, and A's next call - which A
-    /// still believes goes to `a` - is routed to `b` and answered from `b`,
-    /// with nothing in the answer naming the project that served it.
-    /// The JSON-RPC ids are the only thing telling the two agents apart here,
-    /// exactly as on a real shared connection. GM-447/S2 replaces these
-    /// assertions with the chosen fix's.
+    /// The first text item of an answer, which a switched session's
+    /// sub-project answers carry as the answering project's name.
+    fn first_text(answer: &Value) -> &str {
+        answer["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text item: {answer}"))
+    }
+
+    /// Two agents sharing one client connection share one selection: agent
+    /// A selects `a`, agent B selects `b`, and A's next call is routed to
+    /// `b`. The answer says so in its first text item, so A can tell and
+    /// re-select. The JSON-RPC ids are the only thing telling the two agents
+    /// apart here, exactly as on a real shared connection.
+    ///
+    /// Control: make `settle` return `None` always: id 11's first text item
+    /// is `b`'s own answer, and the `answered from project b.` assertion
+    /// fails.
     #[test]
-    fn known_bug_another_agents_select_reroutes_this_agents_calls() {
+    fn another_agents_select_is_named_in_this_agents_answer() {
         let mut session = Session::start();
         // Agent A.
         session.select(1, "a");
@@ -934,23 +994,108 @@ mod tests {
         session.call(10);
         assert_eq!(a.expect("tools/call")["id"], 10);
         a.answer(10);
-        assert_eq!(session.recv()["id"], 10);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 10);
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
 
         // Agent B, on the same connection.
-        session.select(2, "b");
+        let selected = session.select(2, "b");
+        assert!(selected.contains("call select_project again"), "{selected}");
         let b = session.daemon();
 
-        // Agent A again: its call goes to b, not to the a it selected.
+        // Agent A again: its call goes to b, and the answer says so.
         session.call(11);
-        assert_eq!(b.expect("tools/call")["id"], 11, "A's call is routed to B's project");
+        assert_eq!(b.expect("tools/call")["id"], 11);
         b.answer(11);
         let answer = session.recv();
         assert_eq!(answer["id"], 11, "{answer}");
-        assert!(answer["result"]["isError"].is_null(), "answered as a success: {answer}");
-        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains(&b.root.display().to_string()), "served by b: {text}");
-        assert!(answer["result"]["_meta"].is_null(), "nothing names the answering project: {answer}");
-        assert!(a.closes() == vec![Shutdown::Write], "a was released once it owed nothing: {:?}", a.closes());
+        assert_eq!(first_text(&answer), "g-mesh: answered from project b.", "{answer}");
+        let served = answer["result"]["content"][1]["text"].as_str().unwrap();
+        assert_eq!(served, format!("answer from {}", b.root.display()), "the answer itself is untouched");
+    }
+
+    /// The stamp names the daemon a call was sent to, not the selection when
+    /// its answer arrives: a call sent to `a` and answered after a switch to
+    /// `b` names `a`.
+    ///
+    /// Control: in `settle`, take the stamp's root from `router.current()`
+    /// instead of `router.upstream(upstream)`: id 7 is stamped `b`.
+    #[test]
+    fn the_stamp_names_the_project_a_call_was_sent_to() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(7);
+        assert_eq!(a.expect("tools/call")["id"], 7);
+        session.select(2, "b");
+        let _b = session.daemon();
+
+        a.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
+    }
+
+    /// No stamp before a switch, and none on front answers after one: a call
+    /// answered by the front, then `tools/list` after the switch, cross as
+    /// the daemon sent them; only the sub-project's `tools/call` answer is
+    /// stamped.
+    ///
+    /// Control: drop the `*served != router.root` condition in `settle`: id
+    /// 7, answered by the front before any switch, is stamped.
+    #[test]
+    fn only_sub_project_tool_answers_are_stamped() {
+        let mut session = Session::start();
+        session.call(7);
+        assert_eq!(session.front.expect("tools/call")["id"], 7);
+        session.front.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), format!("answer from {}", session.root.display()), "{answer}");
+
+        session.select(1, "a");
+        let a = session.daemon();
+        session.send(json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" }));
+        assert_eq!(session.front.expect("tools/list")["id"], 8);
+        let listed = json!({ "jsonrpc": "2.0", "id": 8, "result": { "tools": [] } });
+        session.front.reply(listed.clone());
+        assert_eq!(session.recv(), listed);
+
+        session.call(9);
+        assert_eq!(a.expect("tools/call")["id"], 9);
+        a.answer(9);
+        assert_eq!(first_text(&session.recv()), "g-mesh: answered from project a.");
+    }
+
+    /// A tool error from a sub-project is stamped like a success; a JSON-RPC
+    /// error response, which has no content to carry it, crosses unchanged.
+    /// The project's name is relative to the shim's root, `/`-separated.
+    ///
+    /// Control: in `stamped`, return `frame` unchanged when
+    /// `result.isError` is true: id 7's first text item is the error text.
+    #[test]
+    fn tool_errors_are_stamped_and_protocol_errors_are_not() {
+        let mut session = Session::start();
+        std::fs::create_dir_all(session.root.join("nested").join("inner")).unwrap();
+        session.select(1, "nested/inner");
+        let inner = session.daemon();
+        session.call(7);
+        session.call(8);
+        assert_eq!(inner.expect("tools/call")["id"], 7);
+        assert_eq!(inner.expect("tools/call")["id"], 8);
+        inner.reply(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": { "content": [{ "type": "text", "text": "no such symbol" }], "isError": true },
+        }));
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project nested/inner.", "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+
+        let error = json!({ "jsonrpc": "2.0", "id": 8, "error": { "code": -32602, "message": "bad" } });
+        inner.reply(error.clone());
+        assert_eq!(session.recv(), error);
     }
 
     /// A previous project's connection is half-closed once it owes nothing:
