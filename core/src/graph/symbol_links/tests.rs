@@ -1749,3 +1749,210 @@ fn link_all_and_link_diff_agree_on_the_same_end_state() {
         assert_eq!(usage_edges(&incremental), reference, "diff order {order:?}");
     }
 }
+
+// --- GM-472: members reached through a re-export (current behaviour) --------
+//
+// The rows below are what the Rust plugin sends for the GM-472 fixture,
+// asserted at the source level by `plugins/rust/src/extractor/tests.rs`'
+// `gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module`:
+// `krate::a` declares `T`, its field `T.f` and its method `T::m`; `named`
+// republishes `T` (also as `Renamed`), `glob` does `pub use crate::a::*`, and
+// `outer` globs `named`. Each user addresses `f` and `m` by qualifiedName in
+// the module its `use` named.
+//
+// These tests pin the behaviour GM-472 S1 found, so the suite stays green
+// while documenting the gap: every address through a re-export stays
+// unresolved, because `Resolver::resolve` walks re-exports for `name` keys
+// only. GM-472's implement slice flips `gm472_current_*` to "links onto
+// `a::T.f` / `a::T::m`"; the direct-address control and the cycle and
+// ambiguity cases must keep passing as they are. See
+// docs/architecture/gm-472-reexport-links.md.
+
+const GM472_T: &str = "Type:src/a.rs:a::T";
+const GM472_F: &str = "Variable:src/a.rs:a::T.f";
+const GM472_M: &str = "Function:src/a.rs:a::T::m";
+
+fn gm472_at(file: &'static str, module: &'static str) -> At<'static> {
+    At { file, language: "rust", container: module, parent: Some("krate") }
+}
+
+/// A re-export with an explicit id, for two `pub use` items in one module
+/// forwarding the same target under two names.
+fn gm472_reexport(at: At, published: &str, scope: &str, key: &str) -> NodeRecord {
+    let mut node = container_reexport(at, published, scope, key);
+    node.id = format!("{}:as:{published}", node.id);
+    node.qualified_name = node.id.clone();
+    node
+}
+
+fn gm472_declarations() -> Vec<NodeRecord> {
+    let a = gm472_at("src/a.rs", "krate::a");
+    let mut field = member(a, "Variable", "a::T.f", Vis::Public);
+    field.native_kind = Some("field".to_string());
+    let mut method = member(a, "Function", "a::T::m", Vis::Public);
+    method.native_kind = Some("method".to_string());
+    vec![member(a, "Type", "a::T", Vis::Public), field, method]
+}
+
+fn gm472_reexports() -> Vec<NodeRecord> {
+    vec![
+        gm472_reexport(gm472_at("src/named.rs", "krate::named"), "T", "krate::a", "T"),
+        gm472_reexport(gm472_at("src/named.rs", "krate::named"), "Renamed", "krate::a", "T"),
+        gm472_reexport(
+            gm472_at("src/glob.rs", "krate::glob"),
+            REEXPORT_ALL_NAME,
+            "krate::a",
+            REEXPORT_ALL_NAME,
+        ),
+        gm472_reexport(
+            gm472_at("src/outer.rs", "krate::outer"),
+            REEXPORT_ALL_NAME,
+            "krate::named",
+            REEXPORT_ALL_NAME,
+        ),
+    ]
+}
+
+/// One user file: `run` uses `<head>.f` (REFERENCES) and `<head>::m` (CALLS),
+/// addressed in `module`. Returns `(field edge, method edge)`.
+fn gm472_use(
+    conn: &mut Connection,
+    file: &'static str,
+    user: &'static str,
+    module: &str,
+    head: &str,
+) -> (String, String) {
+    let at = gm472_at(file, user);
+    let run = member(at, "Function", &format!("{}::run", user.trim_start_matches("krate::")), Vis::Public);
+    let run_id = run.id.clone();
+    let prefix = module.trim_start_matches("krate::");
+    let field = use_through(
+        conn,
+        vec![run],
+        &run_id,
+        "REFERENCES",
+        container_placeholder(at, module, KEY_QUALIFIED_NAME, &format!("{prefix}::{head}.f")),
+    );
+    let method = use_through(
+        conn,
+        Vec::new(),
+        &run_id,
+        "CALLS",
+        container_placeholder(at, module, KEY_QUALIFIED_NAME, &format!("{prefix}::{head}::m")),
+    );
+    (field, method)
+}
+
+/// Control for everything below: the same rows addressed straight at the
+/// declaring module link, so an unresolved edge further down is the
+/// re-export hop and nothing else about the fixture.
+#[test]
+fn gm472_control_a_member_addressed_at_its_own_module_links() {
+    let mut conn = setup();
+    upsert(&mut conn, gm472_declarations());
+    let (field, method) = gm472_use(&mut conn, "src/user_direct.rs", "krate::user_direct", "krate::a", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 2 });
+    assert_eq!(edge_target(&conn, &field), (GM472_F.to_string(), true));
+    assert_eq!(edge_target(&conn, &method), (GM472_M.to_string(), true));
+}
+
+/// CURRENT BEHAVIOUR (GM-472 gap): named `pub use`, its alias, a glob, and a
+/// two-hop glob-over-named chain - none of the eight edges links. GM-472's
+/// implement slice flips this to all eight on `a::T.f` / `a::T::m`.
+#[test]
+fn gm472_current_members_through_a_reexport_stay_unresolved() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.extend(gm472_reexports());
+    upsert(&mut conn, nodes);
+    let edges = [
+        gm472_use(&mut conn, "src/user_named.rs", "krate::user_named", "krate::named", "T"),
+        gm472_use(&mut conn, "src/user_renamed.rs", "krate::user_renamed", "krate::named", "Renamed"),
+        gm472_use(&mut conn, "src/user_glob.rs", "krate::user_glob", "krate::glob", "T"),
+        gm472_use(&mut conn, "src/user_outer.rs", "krate::user_outer", "krate::outer", "T"),
+    ];
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    for (field, method) in &edges {
+        assert!(!edge_target(&conn, field).1, "{field}");
+        assert!(!edge_target(&conn, method).1, "{method}");
+    }
+    // The head itself does resolve through the same re-exports by name -
+    // which is the walk a qualifiedName key is never given today.
+    let head = use_through(
+        &mut conn,
+        Vec::new(),
+        "Function:src/user_outer.rs:user_outer::run",
+        "REFERENCES",
+        container_placeholder(
+            gm472_at("src/user_outer.rs", "krate::user_outer"),
+            "krate::outer",
+            KEY_NAME,
+            "T",
+        ),
+    );
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &head), (GM472_T.to_string(), true));
+}
+
+/// CURRENT BEHAVIOUR, incremental half: the declarations arriving after the
+/// usage (`link_diff`) do not wake a qualifiedName placeholder waiting at a
+/// re-exporting module either. GM-472 flips this with the full pass.
+#[test]
+fn gm472_current_a_late_declaration_does_not_link_through_a_reexport() {
+    let mut conn = setup();
+    let reexports = Diff { upsert_nodes: gm472_reexports(), ..Default::default() };
+    apply_diff(&mut conn, &reexports).unwrap();
+    link_diff(&mut conn, &reexports).unwrap();
+    let (field, method) = gm472_use(&mut conn, "src/user_named.rs", "krate::user_named", "krate::named", "T");
+
+    let declarations = Diff { upsert_nodes: gm472_declarations(), ..Default::default() };
+    apply_diff(&mut conn, &declarations).unwrap();
+    assert_eq!(link_diff(&mut conn, &declarations).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &field).1);
+    assert!(!edge_target(&conn, &method).1);
+}
+
+/// Must hold before and after GM-472: two globs re-exporting each other
+/// terminate, and leave a member nobody declares unresolved.
+#[test]
+fn gm472_a_glob_cycle_terminates_and_links_nothing() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.push(gm472_reexport(
+        gm472_at("src/cyc_a.rs", "krate::cyc_a"),
+        REEXPORT_ALL_NAME,
+        "krate::cyc_b",
+        REEXPORT_ALL_NAME,
+    ));
+    nodes.push(gm472_reexport(
+        gm472_at("src/cyc_b.rs", "krate::cyc_b"),
+        REEXPORT_ALL_NAME,
+        "krate::cyc_a",
+        REEXPORT_ALL_NAME,
+    ));
+    upsert(&mut conn, nodes);
+    let (field, method) = gm472_use(&mut conn, "src/user_cyc.rs", "krate::user_cyc", "krate::cyc_a", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &field).1);
+    assert!(!edge_target(&conn, &method).1);
+}
+
+/// Must hold before and after GM-472: two globs offering two different `T`s,
+/// both with an `m`, are ambiguous - Rust itself rejects the use - and stay
+/// unresolved rather than picking one.
+#[test]
+fn gm472_two_globs_offering_one_head_stay_unresolved() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    let b = gm472_at("src/b.rs", "krate::b");
+    nodes.push(member(b, "Type", "b::T", Vis::Public));
+    nodes.push(member(b, "Function", "b::T::m", Vis::Public));
+    let both = gm472_at("src/both.rs", "krate::both");
+    nodes.push(gm472_reexport(both, REEXPORT_ALL_NAME, "krate::a", REEXPORT_ALL_NAME));
+    nodes.push(gm472_reexport(both, REEXPORT_ALL_NAME, "krate::b", REEXPORT_ALL_NAME));
+    upsert(&mut conn, nodes);
+    let (_, method) = gm472_use(&mut conn, "src/user_both.rs", "krate::user_both", "krate::both", "T");
+    link_all(&mut conn).unwrap();
+    assert!(!edge_target(&conn, &method).1);
+}

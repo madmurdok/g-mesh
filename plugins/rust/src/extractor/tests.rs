@@ -917,3 +917,88 @@ pub fn take(holder: Holder) -> u8 { let Holder { inner } = holder; inner }
         keys.contains(&(container("krate::store"), TargetKey::QualifiedName("store::Holder::inner".into())))
     );
 }
+
+// --- GM-472: members used through a `pub use` ---------------------------------
+
+/// The GM-472 fixture, as source: `a` declares `T` with a field `f` and a
+/// method `m`; `named` republishes it by a named `pub use` (and once more
+/// under an alias), `glob` by `pub use crate::a::*`, and `outer` globs
+/// `named`, so reaching `T` from `outer` is a two-hop chain. Each `user_*`
+/// file uses `T.f` (a struct literal) and `T::m` (a path call) through one of
+/// those paths. `core/src/graph/symbol_links/tests.rs`' GM-472 tests replay
+/// exactly the rows asserted here through the linker.
+fn gm472_crate() -> Crate {
+    Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod named;\npub mod glob;\npub mod outer;\npub mod user_named;\npub mod user_glob;\npub mod user_renamed;\npub mod user_outer;\n"),
+        ("src/a.rs", "pub struct T {\n    pub f: u32,\n}\n\nimpl T {\n    pub fn m(&self) -> u32 {\n        self.f\n    }\n}\n"),
+        ("src/named.rs", "pub use crate::a::T;\npub use crate::a::T as Renamed;\n"),
+        ("src/glob.rs", "pub use crate::a::*;\n"),
+        ("src/outer.rs", "pub use crate::named::*;\n"),
+        ("src/user_named.rs", "use crate::named::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+        ("src/user_glob.rs", "use crate::glob::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+        ("src/user_renamed.rs", "use crate::named::Renamed;\n\npub fn run() -> u32 {\n    let t = Renamed { f: 1 };\n    Renamed::m(&t)\n}\n"),
+        ("src/user_outer.rs", "use crate::outer::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+    ])
+}
+
+/// GM-472 S1, the plugin half of the reproduction: what the Rust plugin
+/// sends for a member used through a re-export. The address names the
+/// *re-exporting* module (where the `use` says `T` lives) by
+/// `qualifiedName`, and that module declares no `T` - only a `reexport`
+/// node publishing it. This is correct per-file output and stays as it is;
+/// the linker is what has to follow the re-export (see
+/// docs/architecture/gm-472-reexport-links.md).
+#[test]
+fn gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module() {
+    let krate = gm472_crate();
+
+    let a = krate.extract("src/a.rs");
+    assert_eq!(a.node("a::T.f").native_kind.as_deref(), Some("field"));
+    assert_eq!(a.node("a::T::m").native_kind.as_deref(), Some("method"));
+
+    let named = krate.extract("src/named.rs");
+    let reexports: Vec<_> = named
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("reexport"))
+        .map(|node| (node.name.clone(), named.target_of(node)))
+        .collect();
+    assert_eq!(
+        reexports,
+        vec![
+            ("T".to_string(), (container("krate::a"), TargetKey::Name("T".into()))),
+            ("Renamed".to_string(), (container("krate::a"), TargetKey::Name("T".into()))),
+        ]
+    );
+    let glob = krate.extract("src/glob.rs");
+    assert_eq!(
+        glob.target_of(glob.placeholder("reexport", "*")),
+        (container("krate::a"), TargetKey::Name("*".into()))
+    );
+    let outer = krate.extract("src/outer.rs");
+    assert_eq!(
+        outer.target_of(outer.placeholder("reexport", "*")),
+        (container("krate::named"), TargetKey::Name("*".into()))
+    );
+
+    for (file, module, head) in [
+        ("src/user_named.rs", "named", "T"),
+        ("src/user_glob.rs", "glob", "T"),
+        ("src/user_renamed.rs", "named", "Renamed"),
+        ("src/user_outer.rs", "outer", "T"),
+    ] {
+        let user = krate.extract(file);
+        let scope = container(&format!("krate::{module}"));
+        assert_eq!(
+            user.target_of(user.placeholder("pending_symbol", "f")),
+            (scope.clone(), TargetKey::QualifiedName(format!("{module}::{head}.f"))),
+            "{file}: the field, by qualifiedName in the module the `use` named"
+        );
+        assert_eq!(
+            user.target_of(user.placeholder("pending_symbol", "m")),
+            (scope, TargetKey::QualifiedName(format!("{module}::{head}::m"))),
+            "{file}: the method, the same way"
+        );
+    }
+}
