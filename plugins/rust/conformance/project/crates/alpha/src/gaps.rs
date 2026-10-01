@@ -57,3 +57,42 @@ pub fn platform() -> &'static str {
 pub fn measure<S: crate::prelude::Shape>(shape: &S) -> u8 {
     shape.area()
 }
+
+// GAP 4 - inherent methods by a partial path, beside struct fields.
+// `Ledger` is a node (`Type`, `struct`), `settle` is one (`Function`,
+// `method`, qualifiedName `gaps::Ledger::settle`), and so is each named field
+// (`Variable`, `field`, `gaps::Ledger.all_unresolved`). The gap is
+// `find_definition("Ledger::settle")`: a qualifiedName is matched whole, never
+// by a suffix, and a Rust one always starts at the module path.
+// `internals::tally` and `internals::peek` are the field uses from another
+// file: a struct literal, and a read through a variable receiver that only
+// the semantic tier resolves. `inner` is both a field (`gaps::Ledger.inner`)
+// and a getter method (`gaps::Ledger::inner`): calls reach the method, field
+// uses reach the field, and neither takes the other's edges.
+
+/// A struct with fields and an inherent method.
+pub struct Ledger {
+    /// Whether every row is unresolved.
+    pub all_unresolved: bool,
+    /// What cut the page short, if anything.
+    pub truncated_by: Option<u8>,
+    /// A field with a getter of the same name.
+    pub inner: u8,
+}
+
+impl Ledger {
+    /// An inherent method that reads both fields.
+    pub fn settle(&self) -> bool {
+        self.all_unresolved && self.truncated_by.is_none()
+    }
+
+    /// The getter named like its field.
+    pub fn inner(&self) -> u8 {
+        self.inner
+    }
+
+    /// A same-file call to the getter.
+    pub fn bump(&self) -> u8 {
+        self.inner() + 1
+    }
+}

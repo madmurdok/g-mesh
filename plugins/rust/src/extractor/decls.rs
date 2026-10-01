@@ -10,6 +10,7 @@
 //! | `type A = …` | `Type` | `type_alias` | `A` |
 //! | `trait Tr` | `Type` | `trait` | `Tr` |
 //! | `const C` / `static S` | `Variable` | `const` / `static` | `C` / `S` |
+//! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T.f` |
 //! | `macro_rules! m` | `Function` | `macro` | `m` |
 //! | `mod m` | `Module` | `module` | `m` |
 //! | `impl T { fn m }` | `Function` | `method` | `T::m` |
@@ -19,9 +20,12 @@
 //!
 //! A `macro_rules!` is a `Function` because that is the kind core's linker
 //! demands of a `CALLS` target, and `m!()` is a call in every sense a caller
-//! cares about. Struct fields and enum variants are *not* nodes: the design
-//! doc's "Member-level privacy is not modelled" applies to the members
-//! themselves, and nothing in the tool surface addresses one.
+//! cares about. Enum variants and tuple-struct fields are *not* nodes: a
+//! variant's fields would hang off a variant that is not one, and `.0` has
+//! no name a query could carry. A named field is registered in the file
+//! model by its `T.f` tail only, never by its bare name, so a bare
+//! identifier written in the module cannot resolve to a field, and a method
+//! `T::f` of the same name keeps its own key, node and `qualifiedName`.
 //!
 //! `qualifiedName` prefixes each of those with the module path
 //! ([`keys`](super::keys), Decision 2), and the id is derived from it, so two
@@ -118,6 +122,14 @@ impl BlockCtx {
     pub(crate) fn tail(&self, name: &str) -> String {
         format!("{}::{}", self.prefix, name)
     }
+}
+
+/// A named field's full name within its module: `T.f`. The `.` keeps it
+/// apart from `T::f`, the address of an associated item of the same name -
+/// a getter named after its field is common, and the two must never share a
+/// `qualifiedName`, a node id or a file-model key.
+pub(crate) fn field_tail(type_name: &str, field: &str) -> String {
+    format!("{type_name}.{field}")
 }
 
 /// A member's full name within its module, whether or not it is in a block.
@@ -295,8 +307,45 @@ impl Declarer<'_, '_> {
                 let own = block
                     .and_then(|block| block.inherited.clone())
                     .unwrap_or_else(|| self.item_visibility(item, module));
-                self.declare(item, module, block, node_kind, native_kind, own);
+                let declared = self.declare(item, module, block, node_kind, native_kind, own);
+                if declared.is_some() && matches!(kind, "struct_item" | "union_item") {
+                    self.fields(item, module);
+                }
             }
+        }
+    }
+
+    /// The named fields of a `struct`/`union`, each a `Variable`/`field` node
+    /// named [`field_tail`] (`T.f`) within the module.
+    /// A tuple struct's `ordered_field_declaration_list` has no names and
+    /// declares nothing.
+    fn fields(&mut self, item: Node, module: &ModuleCtx) {
+        let Some(type_name) = item_name(item, self.source) else { return };
+        let Some(body) = item.child_by_field_name("body") else { return };
+        if body.kind() != "field_declaration_list" {
+            return;
+        }
+        let mut cursor = body.walk();
+        for field in body.named_children(&mut cursor) {
+            if field.kind() != "field_declaration" {
+                continue;
+            }
+            let Some(name) = item_name(field, self.source) else { continue };
+            let tail = field_tail(type_name, name);
+            let own = visibility(field, module, self.source);
+            let mut spec = NodeSpec::new(
+                NodeKind::Variable,
+                name.to_string(),
+                module.qualified(&tail),
+                self.emitter.positions().range(field),
+            )
+            .native_kind("field")
+            .visibility(own.clone())
+            .in_container(module.key.clone(), module.parent.clone());
+            spec.signature = signature(field, self.source);
+            spec.doc_comment = outer_doc_comment(field, self.source);
+            let id = self.emitter.declare(spec, is_public(&own));
+            self.model.declare_member(&module.key, &tail, DeclRef { id, kind: NodeKind::Variable });
         }
     }
 

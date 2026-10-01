@@ -671,3 +671,87 @@ contains = ["no symbol named 'nosuchname' found"]
 # pipeline disabled (`expectations.rs`'s `EvalContext`), so the semantic
 # rung cannot offer neighbours here and this refusal is deterministic rather
 # than model-dependent.
+
+# --- struct fields and inherent methods ------------------------------------
+#
+# `gaps.rs` GAP 4, `internals::tally`, `internals::peek` and
+# `internals::read_inner`. A named field is a `Variable`/`field` node,
+# `gaps::Ledger.<field>`, beside the inherent method `gaps::Ledger::settle`:
+# `.` before a field, `::` before an associated item, so a getter named like
+# its field (`inner`) is a second node, not the same address. Reverting the
+# extractor's field emission turns the field `[[definition]]` and the field
+# `[[references]]` into refusals.
+
+[[definition]]
+symbol = "gaps::Ledger::settle"
+# The inherent method is a node under its full module-qualified name; whatever
+# becomes of partial paths, this spelling must keep resolving.
+expect = ["crates/alpha/src/gaps.rs:gaps::Ledger::settle"]
+
+[[refusal]]
+tool = "definition"
+symbol = "Ledger::settle"
+# The same method by `Type::method` is neither a whole qualifiedName nor a
+# bare name, so every rung misses. A suffix rung in the resolver would turn
+# this into an answer; until then it is a refusal.
+contains = ["no symbol named 'Ledger::settle' found"]
+
+[[definition]]
+symbol = "all_unresolved"
+# A field by its bare name, the spelling an agent types.
+expect = ["crates/alpha/src/gaps.rs:gaps::Ledger.all_unresolved"]
+
+[[references]]
+symbol = "gaps::Ledger.truncated_by"
+file = "crates/alpha/src/gaps.rs"
+# Structural only: `self.truncated_by` inside `impl Ledger` (same file) and
+# the struct literal's field in `internals::tally` (a qualifiedName-keyed
+# placeholder into `gaps`, linked).
+expect = [
+    "crates/alpha/src/gaps.rs:gaps::Ledger::settle",
+    "crates/alpha/src/internals.rs:internals::tally",
+]
+
+[[references]]
+symbol = "gaps::Ledger.all_unresolved"
+file = "crates/alpha/src/gaps.rs"
+# `internals::peek` reads the field through a variable receiver and nothing
+# else, so its row exists only once rust-analyzer answers that open site:
+# without the semantic tier this entry fails on that one missing row.
+expect = [
+    "crates/alpha/src/gaps.rs:gaps::Ledger::settle",
+    "crates/alpha/src/internals.rs:internals::peek",
+    "crates/alpha/src/internals.rs:internals::tally",
+]
+# Measured with rust-analyzer: internals.rs carries two edges, one from
+# `tally` and one from `peek`; `tally`'s trailing read adds no second edge
+# beside its literal's.
+files = [
+    "crates/alpha/src/gaps.rs:1",
+    "crates/alpha/src/internals.rs:2",
+]
+tier = "semantic"
+
+[[callers]]
+symbol = "gaps::Ledger::inner"
+# The getter, not the field of the same name: `bump`'s `self.inner()` (same
+# file) and `read_inner`'s `crate::gaps::Ledger::inner(ledger)` (a
+# qualifiedName placeholder into `gaps`, linked). If field and method shared
+# an address, `self.inner()` would bind to the field and this page would be
+# empty.
+expect = [
+    "crates/alpha/src/gaps.rs:gaps::Ledger::bump",
+    "crates/alpha/src/internals.rs:internals::read_inner",
+]
+
+[[references]]
+symbol = "gaps::Ledger.inner"
+file = "crates/alpha/src/gaps.rs"
+# The field, not the getter: the getter's own `self.inner` (an edge from the
+# method to the field, never from the field to itself) and the struct
+# literal's `inner: 0` in another file (a qualifiedName placeholder, linked
+# only while exactly one node in `gaps` answers `gaps::Ledger.inner`).
+expect = [
+    "crates/alpha/src/gaps.rs:gaps::Ledger::inner",
+    "crates/alpha/src/internals.rs:internals::tally",
+]
