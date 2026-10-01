@@ -20,3 +20,8 @@ pub fn tally() -> bool {
     let ledger = crate::gaps::Ledger { all_unresolved: true, truncated_by: None };
     ledger.settle() && ledger.all_unresolved
 }
+
+/// A field read through a variable receiver, and nothing else.
+pub fn peek(ledger: &crate::gaps::Ledger) -> bool {
+    ledger.all_unresolved
+}

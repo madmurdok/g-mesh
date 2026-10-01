@@ -11,6 +11,8 @@
 //! | `a::b::f()` | a `name` key in the container `a::b` resolves to |
 //! | `T::f()`, `Self::f()`, `self.f()` | a `qualifiedName` key - `…::T::f` - in the container `T` lives in |
 //! | `x.m()` | nothing: an open site for the semantic tier |
+//! | `self.f`, `T { f: .. }`, `T { f, .. }` | a `qualifiedName` key - `…::T::f` - like `self.m()` |
+//! | `x.f` | nothing: an open site for the semantic tier |
 //!
 //! The split between the second and third rows is the naming convention
 //! ([`looks_like_type`](super::syntax::looks_like_type)), and the reason they
@@ -34,6 +36,8 @@
 //! `rust-analyzer` (GM-290) can. It is recorded for:
 //!
 //!  - **`x.m()`** - a receiver call, the case open sites exist for.
+//!  - **`x.f`** - a field read through a receiver whose type this tier does
+//!    not know (anything but `self` inside an `impl`).
 //!  - **A call whose path does not resolve**: a bare name that is neither
 //!    declared here nor imported (it came through a glob import, or the
 //!    prelude), an associated function on a generic parameter (`T::new()`),
@@ -148,12 +152,23 @@ impl Bodies<'_, '_> {
                 self.visit_children(node, module, block, from);
                 self.scopes.pop();
             }
-            // `p.x` - the field name is not a symbol this index carries, so
-            // only the receiver is walked.
-            "field_expression" => {
-                if let Some(value) = node.child_by_field_name("value") {
-                    self.visit(value, module, block, from);
+            "field_expression" => self.field_access(node, module, block, from),
+            "struct_expression" => {
+                if let (Some(name), Some(body)) =
+                    (node.child_by_field_name("name"), node.child_by_field_name("body"))
+                {
+                    self.struct_fields(name, body, module, block, from);
                 }
+                self.visit_children(node, module, block, from);
+            }
+            // Reached only through a parameter list, which is walked like code;
+            // every other pattern is bound, and its fields are found by
+            // `pattern_fields` at the binding site.
+            "struct_pattern" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.struct_fields(ty, node, module, block, from);
+                }
+                self.visit_children(node, module, block, from);
             }
             "identifier" => self.bare_use(node, module, block, from, None, EdgeKind::References),
             "scoped_identifier" => self.path_use(node, module, block, from, None, EdgeKind::References),
@@ -386,6 +401,7 @@ impl Bodies<'_, '_> {
             }
         }
         if let Some(pattern) = node.child_by_field_name("pattern") {
+            self.pattern_fields(pattern, module, block, from);
             self.scopes.bind_pattern(pattern, self.source);
         }
     }
@@ -393,6 +409,7 @@ impl Bodies<'_, '_> {
     fn closure(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         self.scopes.push();
         if let Some(parameters) = node.child_by_field_name("parameters") {
+            self.pattern_fields(parameters, module, block, from);
             self.scopes.bind_parameters(parameters, self.source);
         }
         self.visit_children_except(node, &[node.child_by_field_name("parameters")], module, block, from);
@@ -405,6 +422,7 @@ impl Bodies<'_, '_> {
         }
         self.scopes.push();
         if let Some(pattern) = node.child_by_field_name("pattern") {
+            self.pattern_fields(pattern, module, block, from);
             self.scopes.bind_pattern(pattern, self.source);
         }
         if let Some(body) = node.child_by_field_name("body") {
@@ -451,6 +469,7 @@ impl Bodies<'_, '_> {
             self.visit(value, module, block, from);
         }
         if let Some(pattern) = condition.child_by_field_name("pattern") {
+            self.pattern_fields(pattern, module, block, from);
             self.scopes.bind_pattern(pattern, self.source);
         }
     }
@@ -466,6 +485,7 @@ impl Bodies<'_, '_> {
                 if Some(child) == guard {
                     continue;
                 }
+                self.pattern_fields(child, module, block, from);
                 self.scopes.bind_pattern(child, self.source);
             }
         }
@@ -525,6 +545,132 @@ impl Bodies<'_, '_> {
         }
         self.visit(value, module, block, from);
         self.open_site(from, field, name, module, OpenSiteKind::ReceiverCall, EdgeKind::Calls);
+    }
+
+    /// `x.f` read as a value. `self.f` inside an `impl T` is `T::f`, the same
+    /// address `self.m()` takes; any other receiver's type is unknown here,
+    /// so the field becomes an open site. `x.0` names nothing.
+    fn field_access(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
+        let Some(value) = node.child_by_field_name("value") else { return };
+        let field = node.child_by_field_name("field").filter(|field| field.kind() == "field_identifier");
+        let Some(field) = field else {
+            self.visit(value, module, block, from);
+            return;
+        };
+        let name = text(field, self.source);
+        if value.kind() == "self" {
+            if let Some(block) = block.filter(|block| block.family != Family::TraitDecl) {
+                let (container, type_name) = self.type_address(&block.self_type, module);
+                let bound = self.member_of(&container, &type_name, name, module);
+                self.emit(bound, EdgeKind::References, from, field, module, OpenSiteKind::Reference);
+                return;
+            }
+        }
+        self.visit(value, module, block, from);
+        self.open_site(from, field, name, module, OpenSiteKind::Reference, EdgeKind::References);
+    }
+
+    /// Every field named in a struct literal or struct pattern (`list`), as
+    /// a reference to `T::f` of the type `name` resolves to. A type that does
+    /// not resolve to a struct this tier can address - an enum variant
+    /// (`E::V { .. }`), a generic parameter, another crate's type, a name
+    /// from a glob import - names no field node, and emits nothing.
+    fn struct_fields(
+        &mut self,
+        name: Node,
+        list: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+        from: &str,
+    ) {
+        let Some((container, type_name)) = self.struct_address(name, module, block) else { return };
+        let mut cursor = list.walk();
+        let fields: Vec<Node> = list
+            .named_children(&mut cursor)
+            .filter_map(|entry| match entry.kind() {
+                "field_initializer" => entry.child_by_field_name("field"),
+                "field_pattern" => entry.child_by_field_name("name"),
+                "shorthand_field_initializer" => {
+                    let mut inner = entry.walk();
+                    let found = entry.named_children(&mut inner).find(|child| child.kind() == "identifier");
+                    found
+                }
+                _ => None,
+            })
+            .filter(|field| {
+                matches!(field.kind(), "field_identifier" | "shorthand_field_identifier" | "identifier")
+            })
+            .collect();
+        for field in fields {
+            let bound = self.member_of(&container, &type_name, text(field, self.source), module);
+            self.emit(bound, EdgeKind::References, from, field, module, OpenSiteKind::Reference);
+        }
+    }
+
+    /// The struct fields destructured anywhere inside a bound pattern. Only
+    /// the fields: a pattern's type is not referenced (see `scope`'s module
+    /// doc), and this keeps it that way.
+    fn pattern_fields(&mut self, pattern: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
+        if pattern.kind() == "struct_pattern" {
+            if let Some(ty) = pattern.child_by_field_name("type") {
+                self.struct_fields(ty, pattern, module, block, from);
+            }
+        }
+        let mut cursor = pattern.walk();
+        let children: Vec<Node> = pattern.named_children(&mut cursor).collect();
+        for child in children {
+            self.pattern_fields(child, module, block, from);
+        }
+    }
+
+    /// The `(container, type name)` a struct literal's or pattern's type path
+    /// addresses, or `None` when it cannot be a struct of this project.
+    fn struct_address(
+        &self,
+        name: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+    ) -> Option<(String, String)> {
+        let name = if name.kind() == "generic_type_with_turbofish" {
+            name.child_by_field_name("type")?
+        } else {
+            name
+        };
+        let segments = flatten_path(name, self.source)?;
+        let tail = path_tail(&segments)?;
+        if segments.len() == 1 {
+            if tail == "Self" {
+                let block = block.filter(|block| block.family != Family::TraitDecl)?;
+                return Some(self.type_address(&block.self_type, module));
+            }
+            if self.scopes.binds(tail) {
+                return None;
+            }
+            if self.model.lookup_name(&module.key, tail, Some(NodeKind::Type)).is_some() {
+                return Some((module.key.clone(), tail.to_string()));
+            }
+            return match self.model.lookup_import(&module.key, tail) {
+                Some(Import::Item { container, name }) => Some((container.clone(), name.clone())),
+                _ => None,
+            };
+        }
+        let qualifier = segments[segments.len() - 2].name();
+        if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
+            return None;
+        }
+        match resolve_module_path(&segments[..segments.len() - 1], module, self.model, self.project) {
+            PathTarget::Container(container) => Some((container, tail.to_string())),
+            PathTarget::ExternalCrate(_) | PathTarget::Unresolved => None,
+        }
+    }
+
+    /// Where an impl's self type lives: an imported type's own module,
+    /// otherwise this one.
+    fn type_address(&self, type_name: &str, module: &ModuleCtx) -> (String, String) {
+        match self.model.lookup_import(&module.key, type_name) {
+            Some(Import::Item { container, name }) => (container.clone(), name.clone()),
+            _ => (module.key.clone(), type_name.to_string()),
+        }
     }
 
     fn macro_invocation(&mut self, node: Node, module: &ModuleCtx, from: &str) {

@@ -58,15 +58,15 @@ pub fn measure<S: crate::prelude::Shape>(shape: &S) -> u8 {
     shape.area()
 }
 
-// GAP 4 - struct fields, and inherent methods by a partial path.
-// `Ledger` is a node (`Type`, `struct`) and `settle` is one (`Function`,
-// `method`, qualifiedName `gaps::Ledger::settle`). Its two fields are not:
-// `decls::node_kinds` has no arm for a `field_declaration`, and
-// `bodies::visit` walks only the receiver of `ledger.all_unresolved`. So
-// `find_definition("all_unresolved")` refuses, and so does
-// `find_definition("Ledger::settle")` - a qualifiedName is matched whole,
-// never by a suffix, and a Rust one always starts at the module path.
-// `internals::tally` is the use from another file.
+// GAP 4 - inherent methods by a partial path, beside struct fields.
+// `Ledger` is a node (`Type`, `struct`), `settle` is one (`Function`,
+// `method`, qualifiedName `gaps::Ledger::settle`), and so is each named field
+// (`Variable`, `field`, `gaps::Ledger::all_unresolved`). The gap is
+// `find_definition("Ledger::settle")`: a qualifiedName is matched whole, never
+// by a suffix, and a Rust one always starts at the module path.
+// `internals::tally` and `internals::peek` are the field uses from another
+// file: a struct literal, and a read through a variable receiver that only
+// the semantic tier resolves.
 
 /// A struct with fields and an inherent method.
 pub struct Ledger {

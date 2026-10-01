@@ -1,8 +1,8 @@
 # GM-450: Rust struct fields and inherent methods by qualified name
 
-Status: S1 (design + reproduction). **Needs owner review before S2**: the
-proposal adds nodes to the index (a new `nativeKind`, no SQL schema change)
-and grows the embedded set and the semantic pass's open sites.
+Status: fields implemented as proposed below, including the semantic open
+sites for `x.f` (owner decision, 2026-10-01). Partial qualified-name lookup
+(`Type::method`) is a separate resolver task.
 
 ## Reproduction
 

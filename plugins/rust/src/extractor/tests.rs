@@ -743,14 +743,15 @@ fn an_orphan_file_is_indexed_under_its_synthetic_container() {
     assert_eq!(node.container_parent, None);
 }
 
-// --- struct fields: current behaviour (docs/architecture/gm-450-rust-fields.md) -
+// --- struct fields (docs/architecture/gm-450-rust-fields.md) -------------------
 
-/// CURRENT BEHAVIOUR, not the intended one: a struct's fields are
-/// not nodes, an inherent method's qualifiedName starts at its module path,
-/// and a field read or written from another file is no edge at all - only the
-/// struct name in the literal is. Fails once fields are emitted.
+/// A named field is a `Variable`/`field` node named `T::f` within its module,
+/// beside the inherent methods; tuple-struct and enum-variant fields are not
+/// nodes. Its uses are references: `self.f` in the impl and a literal's or
+/// pattern's field names by address, `x.f` on any other receiver as an open
+/// site for the semantic tier.
 #[test]
-fn struct_fields_are_not_nodes_yet() {
+fn struct_fields_are_nodes_and_their_uses_are_references() {
     let krate = Crate::new(&[
         ("src/lib.rs", "pub mod store;\npub mod user;\n"),
         (
@@ -760,43 +761,88 @@ pub struct Ledger {
     /// Whether every row is unresolved.
     pub all_unresolved: bool,
     pub truncated_by: Option<u8>,
+    secret: u8,
 }
+pub struct Pair(pub u8, u8);
+pub enum Shape { Square { side: u8 } }
 impl Ledger {
     pub fn settle(&self) -> bool { self.all_unresolved && self.truncated_by.is_none() }
 }
+pub fn truncated_by() {}
+pub fn pick() -> fn() { truncated_by }
 "#,
         ),
         (
             "src/user.rs",
             r#"
+use crate::store::Ledger;
 pub fn tally() -> bool {
     let ledger = crate::store::Ledger { all_unresolved: true, truncated_by: None };
     ledger.settle() && ledger.all_unresolved
+}
+pub fn drain(ledger: Ledger) -> Option<u8> {
+    let Ledger { truncated_by, .. } = ledger;
+    truncated_by
 }
 "#,
         ),
     ]);
     let store = krate.extract("src/store.rs");
-    assert_eq!(store.node("store::Ledger").native_kind.as_deref(), Some("struct"));
+    let field = store.node("store::Ledger::all_unresolved");
+    assert_eq!((field.kind, field.native_kind.as_deref()), (NodeKind::Variable, Some("field")));
+    assert_eq!(field.name, "all_unresolved");
+    assert_eq!(field.signature.as_deref(), Some("pub all_unresolved: bool"));
+    assert_eq!(field.doc_comment.as_deref(), Some("Whether every row is unresolved."));
+    assert_eq!(field.visibility, Visibility::Public);
+    assert_eq!(field.container.as_deref(), store.node("store::Ledger::settle").container.as_deref());
+    assert_eq!(store.node("store::Ledger::truncated_by").native_kind.as_deref(), Some("field"));
+    assert_eq!(store.node("store::Ledger::secret").visibility, Visibility::Container("krate::store".into()));
     assert_eq!(store.node("store::Ledger::settle").native_kind.as_deref(), Some("method"));
-    // The `Type::method` spelling an agent tends to type is not a
-    // qualifiedName: the module path is part of it.
-    assert!(store.find("Ledger::settle").is_none(), "{:#?}", store.names());
-    for field in ["all_unresolved", "truncated_by"] {
-        assert!(
-            store.0.nodes.iter().all(|node| node.name != field),
-            "field {field} became a node: {:#?}",
-            store.names()
-        );
-    }
-    // `self.all_unresolved` inside `settle` produces no edge onto a field.
-    assert!(store.targets(EdgeKind::References, "store::Ledger::settle").is_empty());
+    let fields: Vec<_> =
+        store.0.nodes.iter().filter(|node| node.native_kind.as_deref() == Some("field")).collect();
+    assert_eq!(fields.len(), 3, "only Ledger's named fields: {:#?}", store.names());
+
+    // `self.f` inside `impl Ledger` lands on the field, same file.
+    assert_eq!(
+        store.targets(EdgeKind::References, "store::Ledger::settle"),
+        vec!["store::Ledger::all_unresolved", "store::Ledger::truncated_by"]
+    );
+    // A field is never a bare name: `truncated_by` here is the free function.
+    assert_eq!(store.targets(EdgeKind::References, "store::pick"), vec!["store::truncated_by"]);
 
     let user = krate.extract("src/user.rs");
-    // The literal's type is a reference; its fields, and the trailing
-    // `ledger.all_unresolved` read, are nothing.
+    // The literal's type, and its two fields by qualifiedName in `store`.
+    let tally = user.targets(EdgeKind::References, "user::tally");
     assert_eq!(
-        user.targets(EdgeKind::References, "user::tally"),
-        vec!["pending_symbol krate::store::Ledger"]
+        tally,
+        vec![
+            "pending_symbol krate::store::Ledger",
+            "pending_symbol krate::store::store::Ledger::all_unresolved",
+            "pending_symbol krate::store::store::Ledger::truncated_by",
+        ]
+    );
+    for name in ["all_unresolved", "truncated_by"] {
+        let placeholder = user.placeholder("pending_symbol", name);
+        assert_eq!(
+            user.target_of(placeholder),
+            (container("krate::store"), TargetKey::QualifiedName(format!("store::Ledger::{name}")))
+        );
+    }
+    // The trailing `ledger.all_unresolved` read is a question for the
+    // semantic tier, at the field name.
+    let reads: Vec<_> = user
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.kind == OpenSiteKind::Reference && site.name == "all_unresolved")
+        .collect();
+    assert_eq!(reads.len(), 1, "{:#?}", user.0.open_sites);
+    assert_eq!(reads[0].edge_kind, EdgeKind::References);
+    // A destructuring pattern names the field too.
+    assert!(
+        user.targets(EdgeKind::References, "user::drain")
+            .contains(&"pending_symbol krate::store::store::Ledger::truncated_by".to_string()),
+        "{:?}",
+        user.targets(EdgeKind::References, "user::drain")
     );
 }
