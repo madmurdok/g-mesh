@@ -1039,10 +1039,11 @@ mod tests {
     /// No stamp before a switch, and none on front answers after one: a call
     /// answered by the front, then `tools/list` after the switch, cross as
     /// the daemon sent them; only the sub-project's `tools/call` answer is
-    /// stamped.
+    /// stamped, and another method's answer from the sub-project is not.
     ///
-    /// Control: drop the `*served != router.root` condition in `settle`: id
-    /// 7, answered by the front before any switch, is stamped.
+    /// Controls: drop the `*served != router.root` condition in `settle`: id
+    /// 7, answered by the front before any switch, is stamped. Drop the
+    /// `in_flight.method == "tools/call"` condition: id 10 is stamped.
     #[test]
     fn only_sub_project_tool_answers_are_stamped() {
         let mut session = Session::start();
@@ -1065,6 +1066,15 @@ mod tests {
         assert_eq!(a.expect("tools/call")["id"], 9);
         a.answer(9);
         assert_eq!(first_text(&session.recv()), "g-mesh: answered from project a.");
+
+        // Any other method the sub-project answers crosses unchanged, even
+        // when its result happens to carry a `content` array.
+        session.send(json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/read", "params": {} }));
+        assert_eq!(a.expect("resources/read")["id"], 10);
+        let read =
+            json!({ "jsonrpc": "2.0", "id": 10, "result": { "content": [{ "type": "text", "text": "r" }] } });
+        a.reply(read.clone());
+        assert_eq!(session.recv(), read);
     }
 
     /// A tool error from a sub-project is stamped like a success; a JSON-RPC
