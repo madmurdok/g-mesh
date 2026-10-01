@@ -87,4 +87,9 @@ Owner, 2026-10-01: "хорошо, берем structured".
   RSS, measured on one laptop with a wide wall-clock spread; it misses the
   pass-time gate (0.68x against 0.60x).
 - **Follow-ups.** Re-check the text form after any model adaptation (GM-436),
-  and re-run it on the larger eval when it exists (GM-460).
+  and re-run it on the larger eval when it exists (GM-460). Check whether
+  `PIPELINE_EPOCH` must change with the text format at all, since cache keys
+  already hash the text; the bump here re-embeds unchanged texts too
+  (GM-467). Calibrate name-query floors for `find_definition`'s semantic
+  rung, which now refuses more for Rust (0.57 against its 0.555 name-query
+  calibration) (GM-468).
