@@ -765,7 +765,7 @@ pub(crate) mod test_support {
 
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use anyhow::Result;
 
@@ -773,12 +773,13 @@ pub(crate) mod test_support {
     use crate::embedding::cache;
     use crate::embedding::model::{EMBEDDING_DIM, ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 
-    /// How many times the fake model was loaded, and how many texts it
+    /// How many times the fake model was loaded, and which texts it
     /// embedded, across every pipeline sharing these counters.
     #[derive(Clone, Default)]
     pub(crate) struct Counters {
         loads: Arc<AtomicUsize>,
         embeds: Arc<AtomicUsize>,
+        received: Arc<Mutex<Vec<String>>>,
     }
 
     impl Counters {
@@ -789,15 +790,22 @@ pub(crate) mod test_support {
         pub(crate) fn embeds(&self) -> usize {
             self.embeds.load(Ordering::SeqCst)
         }
+
+        /// Every text the fake model was handed, in order.
+        pub(crate) fn received(&self) -> Vec<String> {
+            self.received.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
     }
 
     struct FakeEmbedder {
         embeds: Arc<AtomicUsize>,
+        received: Arc<Mutex<Vec<String>>>,
     }
 
     impl Embedder for FakeEmbedder {
         fn embed(&self, text: &str) -> Result<Vec<f32>> {
             self.embeds.fetch_add(1, Ordering::SeqCst);
+            self.received.lock().unwrap_or_else(PoisonError::into_inner).push(text.to_string());
             Ok(fake_vector(text))
         }
     }
@@ -829,7 +837,10 @@ pub(crate) mod test_support {
             model_dir,
             move |_dir| {
                 counters.loads.fetch_add(1, Ordering::SeqCst);
-                Ok(Box::new(FakeEmbedder { embeds: Arc::clone(&counters.embeds) }) as Box<dyn Embedder>)
+                Ok(Box::new(FakeEmbedder {
+                    embeds: Arc::clone(&counters.embeds),
+                    received: Arc::clone(&counters.received),
+                }) as Box<dyn Embedder>)
             },
             cache,
         )
@@ -1542,16 +1553,17 @@ mod tests {
         assert_ne!(bits(&fake_vector("a")), bits(&fake_vector("b")));
     }
 
-    /// `PIPELINE_EPOCH` is part of every cache key's fingerprint and must
-    /// change whenever `text_to_embed`'s output does, or the cache serves
-    /// vectors for text formatted the old way. This pins the two together:
-    /// a format change fails here until the epoch is bumped and the digest
-    /// below updated with it.
+    /// `TEXT_FORM_TAG` is part of every stored vector's `embeddingVersion`
+    /// and must change whenever `text_to_embed`'s output does, or the project
+    /// indexes keep vectors made from text formatted the old way. This pins
+    /// the two together: a format change fails here until the tag is changed
+    /// and the digest below updated with it. `PIPELINE_EPOCH` stays as it is:
+    /// the cache key is the text itself.
     ///
     /// Control: change `full_text`'s separator, or `structured_doc`'s rules
     /// (e.g. stop dropping `# Examples`), and this fails.
     #[test]
-    fn the_pipeline_epoch_is_pinned_to_the_text_format() {
+    fn the_text_form_tag_is_pinned_to_the_text_format() {
         use sha2::{Digest, Sha256};
         let inputs: [(Option<&str>, Option<&str>); 7] = [
             (Some("  Reads a file.  "), Some(" fn read(path: &Path) -> String ")),
@@ -1568,9 +1580,80 @@ mod tests {
         }
         let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
-            (crate::embedding::cache::PIPELINE_EPOCH, digest.as_str()),
-            (2, "e01665d9df57555d954646f4c91bee489f90d6e07648c9acc4e72a2632d9bb89"),
-            "text_to_embed's output changed: bump PIPELINE_EPOCH and update this digest"
+            (crate::embedding::model::TEXT_FORM_TAG, digest.as_str()),
+            ("structured", "e01665d9df57555d954646f4c91bee489f90d6e07648c9acc4e72a2632d9bb89"),
+            "text_to_embed's output changed: change TEXT_FORM_TAG and update this digest"
         );
+    }
+
+    /// Every text the model receives is cached under the hash of exactly
+    /// that text, and nothing else is cached: the key and the inference
+    /// input are one string.
+    ///
+    /// Control: in `compute`, pass the model a rewritten text (e.g.
+    /// `model.embed(&format!("passage: {text}"))`) while the key stays
+    /// `text_hash(text)`, and this fails.
+    #[test]
+    fn the_cache_key_is_the_hash_of_the_text_the_model_receives() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let settings = cache_at(dir.path());
+        fake_pipeline(&model_dir, Some(settings.clone()), &counters)
+            .compute(&diff_of(4), &mut EmbedStats::default());
+
+        let received = counters.received();
+        assert_eq!(received.len(), 4);
+        let mut expected: Vec<Hash> = received.iter().map(|text| cache::text_hash(text)).collect();
+        expected.sort();
+
+        let conn = rusqlite::Connection::open(&settings.path).unwrap();
+        let mut keys: Vec<Hash> = conn
+            .prepare("SELECT text_hash FROM entries")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|key| <Hash>::try_from(key.unwrap().as_slice()).unwrap())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, expected, "the cache must key each vector by the text the model embedded");
+    }
+
+    /// A text-format change re-plans every node under a new
+    /// `embeddingVersion`, but the cache still answers each text that came
+    /// out the same: only the changed text is embedded again.
+    ///
+    /// Control: make the fingerprint depend on the `embeddingVersion` (e.g.
+    /// fold the pipeline's `version` into `identify`'s `cache::fingerprint`
+    /// call, the rule `PIPELINE_EPOCH` used to follow) and the second run
+    /// embeds all 5.
+    #[test]
+    fn across_a_text_format_change_only_the_changed_text_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let before = diff_of(5);
+
+        let old_format = Counters::default();
+        fake_pipeline(&model_dir, Some(cache_at(dir.path())), &old_format)
+            .compute(&before, &mut EmbedStats::default());
+        assert_eq!(old_format.embeds(), 5);
+
+        let mut after = diff_of(5);
+        after.upsert_nodes[2].doc_comment = Some("Does thing 2, formatted the new way.".to_string());
+        let new_format = Counters::default();
+        let mut pipeline = fake_pipeline(&model_dir, Some(cache_at(dir.path())), &new_format);
+        let old_version = pipeline.version.clone();
+        pipeline.version = format!("{old_version}+next-text-form");
+
+        let mut stats = EmbedStats::default();
+        let computed = pipeline.compute(&after, &mut stats);
+        let changed = &after.upsert_nodes[2];
+        let changed_text =
+            text_to_embed(changed.doc_comment.as_deref(), changed.signature.as_deref()).unwrap();
+        assert_eq!(new_format.received(), [changed_text]);
+        assert_eq!((stats.texts, stats.hits, stats.embedded), (5, 4, 1));
+        for entry in &computed {
+            assert_eq!(bits(&entry.embedding), bits(&fake_vector(&entry.text)), "{}", entry.node_id);
+        }
     }
 }
