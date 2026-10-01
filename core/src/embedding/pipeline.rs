@@ -1625,7 +1625,7 @@ mod tests {
     ///
     /// Control: make the fingerprint depend on the `embeddingVersion` (e.g.
     /// fold the pipeline's `version` into `identify`'s `cache::fingerprint`
-    /// call, the rule `PIPELINE_EPOCH` used to follow) and the second run
+    /// call) and the second run
     /// embeds all 5.
     #[test]
     fn across_a_text_format_change_only_the_changed_text_misses() {
