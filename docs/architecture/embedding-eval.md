@@ -380,6 +380,28 @@ condition: at this size it cannot show an improvement.
 - **Query latency**: median wall time of embedding the 500 queries, one by
   one, in the same process.
 
+#### Predicted pass time (cost model): validated, not adopted
+
+`g-mesh debug-embed-eval cost calibrate` times embed calls in short cool
+bursts and fits `t(n) = a + b*n + c*n^2` per token count. `cost predict`
+then sums `t` over a variant's texts and gives its pass-time ratio to a
+reference. The rule for adopting it: **D9's C-win pass-time term may use the
+predicted ratio instead of measured passes only if, on every clean measured
+round, predicted and measured ratios (same round, same pair) agree within
+0.05 at most, and a flat (cost per text) and a linear-only control visibly
+disagree.** Max RSS, model size and query latency stay measured in every
+case.
+
+The validation does not hold
+([gm-466-cost-model.md](../results/gm-466-cost-model.md); curve
+`eval/embedding/work/runs-gm466/rel.curve.json`, int8, this laptop). Over 16
+measured pairs the error is max 0.094 and median 0.047. The linear control
+is about as close (max 0.099), and only the flat control disagrees (max
+0.436). The measured rounds themselves disagree by up to 0.110 for the same
+pair. So **the D9 rule is unchanged**: the pass-time term is measured as
+above. The predicted ratios may be reported beside it as context, never as
+the gate value.
+
 ## Code facts this relies on (from g-mesh, 2026-09-26)
 
 - `text_to_embed` is defined at `core/src/embedding/pipeline.rs:719`,
