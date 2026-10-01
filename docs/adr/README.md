@@ -81,3 +81,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0010 | [search_code: a below-floor name query is told `noMatch`, a below-floor prose query `lowSimilarity`](0010-search-code-low-similarity-on-prose.md) | Accepted |
 | 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Accepted |
 | 0012 | [Embedded text: the doc comment trimmed to its prose outline](0012-embedded-text-structured.md) | Accepted |
+| 0013 | [Score cursor: the score travels as its f64 bits](0013-score-cursor-bits.md) | Accepted |

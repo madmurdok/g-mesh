@@ -73,9 +73,11 @@ Owner, 2026-10-01: "хорошо, берем structured".
   (`<model>+int8+structured` for the default model, `<model>+structured` for
   any other), so backfill and the workspace swap re-embed every stored
   vector once, in the background. `search_code` serves a mix of old and new
-  vectors until that pass completes. `PIPELINE_EPOCH` is bumped to 2 under
-  ADR 0007's rule, so the machine-wide cache does not serve those texts from
-  before either.
+  vectors until that pass completes. `PIPELINE_EPOCH` was bumped to 2 under
+  ADR 0007's rule at the time, so the machine-wide cache did not serve the
+  unchanged texts either. That bump was a cost, not a correctness
+  requirement: the cache key is the text itself, and ADR 0007 no longer
+  ties the epoch to the text format.
 - **New python and rust floors.** `find_definition`'s semantic rung reads the
   same table; rust's 0.57 is 0.015 above the fp32 name-query calibration, the
   one place that rung now leans toward refusing.
@@ -87,9 +89,8 @@ Owner, 2026-10-01: "хорошо, берем structured".
   RSS, measured on one laptop with a wide wall-clock spread; it misses the
   pass-time gate (0.68x against 0.60x).
 - **Follow-ups.** Re-check the text form after any model adaptation (GM-436),
-  and re-run it on the larger eval when it exists (GM-460). Check whether
-  `PIPELINE_EPOCH` must change with the text format at all, since cache keys
-  already hash the text; the bump here re-embeds unchanged texts too
-  (GM-467). Calibrate name-query floors for `find_definition`'s semantic
+  and re-run it on the larger eval when it exists (GM-460). Whether
+  `PIPELINE_EPOCH` must change with the text format: it need not, see
+  ADR 0007 (GM-467). Calibrate name-query floors for `find_definition`'s semantic
   rung, which now refuses more for Rust (0.57 against its 0.555 name-query
   calibration) (GM-468).

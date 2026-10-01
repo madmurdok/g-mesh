@@ -58,10 +58,14 @@ assert identical vectors across separately loaded models).
 - **Model fingerprint:** `sha256` over a canonical record of
   `sha256(model.onnx)`, `sha256(tokenizer.json)`,
   `max_sequence_length`, `EMBEDDING_DIM`, a `PIPELINE_EPOCH` constant
-  (pooling/normalization/`text_to_embed` format; bumped by hand when that
-  code changes) and the `ort` crate version (`=2.0.0-rc.9`,
-  `Cargo.toml:99`; an ONNX Runtime upgrade may change floating-point
-  results). Not the g-mesh version: an upgrade's generation-mismatch wipe is
+  (the code between the text handed to the model and the stored vector:
+  tokenizer call options, truncation and padding parameters, graph inputs,
+  session options, pooling, normalization, and any rewrite of the text
+  inside `embed`; bumped by hand when that code changes), the `ort` crate
+  version (`=2.0.0-rc.9`, `Cargo.toml:99`; an ONNX Runtime upgrade may
+  change floating-point results) and the `tokenizers` crate version (pinned
+  exactly in `core/Cargo.toml`; another release may normalize,
+  pre-tokenize or truncate the same text differently). Not the g-mesh version: an upgrade's generation-mismatch wipe is
   exactly the reindex the cache should serve. Not the config name: two names
   for the same bytes share vectors, one name for different bytes does not.
 - **Cost of the fingerprint:** hashing the 612 MiB `model.onnx` takes
@@ -71,6 +75,17 @@ assert identical vectors across separately loaded models).
   Rejected: trusting the pinned digest when sizes match (a
   `G_MESH_MODEL_DIR` export of the same size would alias), and keying on
   the config name only (today's weakness).
+- **What the epoch does not version:** `text_to_embed`'s output format. The
+  key hashes exactly the string `compute` passes to the model, so a format
+  change cannot make a cached vector stale; it changes the key of every text
+  it actually changes. Such a change is versioned by `TEXT_FORM_TAG` in
+  `embeddingVersion`, which makes backfill and the workspace swap re-plan
+  every stored vector; the cache then answers each unchanged text and embeds
+  only the changed ones. Bumping the epoch for a format change would re-embed
+  every text on the machine for nothing: on the 3.16 -> 3.17 text change,
+  an estimated 79% of g-mesh's re-embed time (252 s of 318 s) and 83% across
+  the six eval corpora (469 s of 564 s), +-10 points, assuming a warm cache
+  (`docs/architecture/gm-467-epoch-rule.md`, section 4).
 
 ### 2. Location and storage
 - `$G_MESH_HOME/embedding-cache/cache.sqlite` (default `~/.g-mesh/...`).
@@ -177,6 +192,10 @@ calls; the byte-identity tests use the real model (`load_real_pipeline`,
 | byte identity | real model: cached vs fresh `to_bits()` equal for every node; `search_code` top-10 ids and distances equal, cache on vs `off` | flip one mantissa bit in the decoder -> inequality |
 | concurrent writers | 4 processes on one cache, overlapping keys: no error, every key present once, identical bytes | drop `busy_timeout` / `OR IGNORE` -> busy or constraint errors surface |
 | cache failure degrades | cache file is garbage, or a writer holds `BEGIN EXCLUSIVE`: indexing succeeds, all vectors stored | propagate the open/busy error -> indexing fails |
+| key is the model's input | every text the fake model receives is cached under its own hash, and nothing else is | pass the model a prefixed text while keying the unprefixed one -> key set differs |
+| text-format change | new `embeddingVersion`, one node's text changed: 1 call, N-1 hits | fold the `embeddingVersion` into the fingerprint -> N calls |
+| text form pinned | `TEXT_FORM_TAG` and a digest of `text_to_embed`'s output for fixed inputs | change `full_text`'s separator -> digest differs |
+| tokenizers version | `TOKENIZERS_VERSION` equals the manifest's exact pin and `Cargo.lock`'s resolution, and is in the fingerprint record | loosen the pin, change the constant, or drop it from the record |
 
 ## Consequences
 - A warm reindex embeds only changed texts: the measured 510-604s of
@@ -188,10 +207,17 @@ calls; the byte-identity tests use the real model (`load_real_pipeline`,
   byte-identity test is what keeps that assumption checked.
 - A new shared file in `G_MESH_HOME` that several daemons write; the GC and
   corruption handling are new code that must never fail indexing.
-- `PIPELINE_EPOCH` is a manual invariant: changing `text_to_embed` or
-  pooling without bumping it serves stale vectors. A test pins the epoch to
-  a hash of `text_to_embed`'s output for fixed inputs, so a format change
-  fails it.
+- `PIPELINE_EPOCH` is a manual invariant: changing the tokenizer call
+  options, the graph inputs, the session options, pooling or normalization,
+  or rewriting the text inside `embed` (for example a "passage:" prefix),
+  without bumping it serves stale vectors. No test catches a rewrite inside
+  `embed`: it happens after the key is taken.
+- `TEXT_FORM_TAG` is the invariant for the text format: changing
+  `text_to_embed`'s output without changing the tag leaves project indexes
+  holding vectors of the old text. A test pins the tag to a hash of
+  `text_to_embed`'s output for fixed inputs, so a format change fails it.
+- Adding the `tokenizers` version to the fingerprint changed every
+  fingerprint once: the first index after that upgrade refills the cache.
 - Follow-up: delete-first in `workspace_reindex.rs:276` (above).
 
 ## Owner's answers
@@ -206,3 +232,7 @@ calls; the byte-identity tests use the real model (`load_real_pipeline`,
 5. Delete-first in workspace reindex is its own task in the same batch.
 6. `g-mesh status` does not report the cache; the per-unit log lines are
    enough for now.
+7. `PIPELINE_EPOCH` does not change with `text_to_embed`'s format; it stays
+   at 2 (`docs/architecture/gm-467-epoch-rule.md`).
+8. The `tokenizers` version is part of the fingerprint, like `ort`'s, and is
+   pinned exactly; the one refill this costs is accepted.

@@ -114,7 +114,9 @@ sqlite-vec = "0.1.9"
 # Hugging Face tokenizers, for the BPE `tokenizer.json` that ships with the
 # embedding model. `progressbar`/`esaxx_fast` are training-side extras we never
 # use; `onig` is kept because the model's ByteLevel pre-tokenizer is regex-based.
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# Pinned exactly: the version is part of the embedding cache's fingerprint
+# (`embedding::cache::TOKENIZERS_VERSION`), so an upgrade is deliberate.
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 toml = "0.8"
 # The HTTP client behind `g-mesh model fetch` (src/cli/model.rs) - the one and
