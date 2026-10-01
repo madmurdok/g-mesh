@@ -793,8 +793,6 @@ fn decode_score_cursor(raw: &str) -> Result<ScoreCursor> {
 /// similarity score (descending) then `id` as a tiebreaker. `base_sql` must
 /// project `score` (REAL) and `id` (unique) columns; `map_row` reads
 /// whatever columns the caller needs, plus `score`/`id` for cursor state.
-/// Not yet called by any tool (search_code lands with the Embeddings epic)
-/// but exercised directly in tests so the ordering rule is proven now.
 pub fn paginate_by_score<T>(
     conn: &Connection,
     base_sql: &str,
