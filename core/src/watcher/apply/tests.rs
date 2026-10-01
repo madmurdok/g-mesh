@@ -1,7 +1,8 @@
 use super::*;
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::types::{
-    EdgeKind, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
+    EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
+    TargetScope, Visibility, WireEdge, WireNode,
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -52,6 +53,8 @@ fn canned_node(id: &str) -> WireNode {
         container: None,
         container_parent: None,
         target: None,
+        alias_paths: Vec::new(),
+        qualified_path: None,
     }
 }
 
@@ -166,7 +169,7 @@ fn a_wire_nodes_declaration_list_becomes_storage_records() {
         },
     ]);
 
-    let record = to_node_record(node);
+    let record = to_node_record(node, &mut PathWarnings::default());
 
     assert_eq!(
         record.declarations,
@@ -193,7 +196,7 @@ fn a_wire_nodes_declaration_list_becomes_storage_records() {
     );
     // And an ordinary node still says "no declarations", which `apply_diff`
     // reads as "one" - the same thing an absent field on the wire means.
-    assert!(to_node_record(canned_node("n2")).declarations.is_empty());
+    assert!(to_node_record(canned_node("n2"), &mut PathWarnings::default()).declarations.is_empty());
 }
 
 #[test]
@@ -225,9 +228,10 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
         scope: TargetScope::Container("github.com/x/app/server".to_string()),
         key: TargetKey::QualifiedName("Server.Close".to_string()),
         from_container: Some("github.com/x/app/client".to_string()),
+        key_path: None,
     });
 
-    let record = to_node_record(node);
+    let record = to_node_record(node, &mut PathWarnings::default());
 
     assert!(!record.exported, "container visibility is never Public");
     assert_eq!(record.visibility, "container");
@@ -245,7 +249,7 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
 /// and an ordinary (non-placeholder) node carries no target at all.
 #[test]
 fn to_node_record_maps_public_visibility_and_leaves_target_absent_for_an_ordinary_node() {
-    let record = to_node_record(canned_node("n1"));
+    let record = to_node_record(canned_node("n1"), &mut PathWarnings::default());
     assert!(record.exported);
     assert_eq!(record.visibility, "public");
     assert_eq!(record.visibility_container, None);
@@ -1063,4 +1067,192 @@ fn an_incomplete_per_file_pass_clears_nothing() {
     per_file_pass_over_a(&conn, true);
 
     assert_eq!(pending_state(&conn), (1, vec!["a.rs".to_string(), "b.rs".to_string()]));
+}
+
+fn path_of(first: &str, rest: &[(&str, &str)]) -> QualifiedPath {
+    rest.iter().fold(QualifiedPath::root(first), |path, (sep, name)| path.child(*sep, *name))
+}
+
+/// `canned_node` (`mod::foo`) with its path and the alias `alias::foo`.
+fn pathed_node(id: &str, alias: &str) -> WireNode {
+    WireNode {
+        qualified_path: Some(path_of("mod", &[("::", "foo")])),
+        alias_paths: vec![path_of(alias, &[("::", "foo")])],
+        ..canned_node(id)
+    }
+}
+
+fn suffixes(conn: &IndexStore, node_id: &str) -> Vec<String> {
+    conn.lock()
+        .unwrap()
+        .prepare("SELECT suffix FROM qualified_suffixes WHERE nodeId = ?1 ORDER BY suffix")
+        .unwrap()
+        .query_map([node_id], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn a_valid_path_and_alias_reach_the_record_without_a_warning() {
+    let mut warnings = PathWarnings::default();
+    let record = to_node_record(pathed_node("n1", "Alias"), &mut warnings);
+
+    assert_eq!(record.qualified_path, Some(path_of("mod", &[("::", "foo")])));
+    assert_eq!(record.alias_paths, vec![path_of("Alias", &[("::", "foo")])]);
+    assert!(warnings.emitted.is_empty());
+}
+
+/// A path that does not join back to `qualifiedName` is dropped with its
+/// aliases and one warning per file; the node itself is kept unchanged.
+/// Control: return the wire path unchecked from `checked_paths` (the bad path
+/// reaches the record, no warning).
+#[test]
+fn a_path_that_does_not_join_back_is_dropped_with_a_warning_and_the_node_kept() {
+    let mut warnings = PathWarnings::default();
+    let bad =
+        WireNode { qualified_path: Some(path_of("mod", &[(".", "foo")])), ..pathed_node("n1", "Alias") };
+
+    let record = to_node_record(bad, &mut warnings);
+    assert_eq!(record.id, "n1");
+    assert_eq!(record.qualified_name, "mod::foo");
+    assert_eq!(record.qualified_path, None);
+    assert!(record.alias_paths.is_empty(), "a bad path takes its aliases with it");
+    assert_eq!(warnings.emitted.len(), 1);
+    assert!(warnings.emitted[0].contains("src/lib.rs") && warnings.emitted[0].contains("qualifiedPath"));
+
+    let also_bad = WireNode { qualified_path: Some(QualifiedPath::root("x")), ..canned_node("n2") };
+    to_node_record(also_bad, &mut warnings);
+    assert_eq!(warnings.emitted.len(), 1, "one warning per file");
+    let other_file = WireNode {
+        qualified_path: Some(QualifiedPath::root("x")),
+        file_path: "src/other.rs".to_string(),
+        ..canned_node("n3")
+    };
+    to_node_record(other_file, &mut warnings);
+    assert_eq!(warnings.emitted.len(), 2, "another file warns again");
+}
+
+/// An alias that breaks a rule is dropped alone. Control: keep every alias
+/// in `checked_paths` (the one-segment alias survives).
+#[test]
+fn a_bad_alias_is_dropped_alone() {
+    let mut warnings = PathWarnings::default();
+    let node = WireNode {
+        alias_paths: vec![QualifiedPath::root("foo"), path_of("Alias", &[("::", "foo")])],
+        ..pathed_node("n1", "unused")
+    };
+
+    let record = to_node_record(node, &mut warnings);
+    assert_eq!(record.qualified_path, Some(path_of("mod", &[("::", "foo")])));
+    assert_eq!(record.alias_paths, vec![path_of("Alias", &[("::", "foo")])]);
+    assert_eq!(warnings.emitted.len(), 1);
+}
+
+/// A `keyPath` that does not join back to its key is dropped; the target is
+/// kept. Control: copy `target.key_path` without `check_key_path`.
+#[test]
+fn a_bad_key_path_is_dropped_and_the_target_kept() {
+    let mut warnings = PathWarnings::default();
+    let target = |key_path| PlaceholderTarget {
+        scope: TargetScope::File("src/b.rs".to_string()),
+        key: TargetKey::QualifiedName("a::T.f".to_string()),
+        from_container: None,
+        key_path: Some(key_path),
+    };
+    let good =
+        WireNode { target: Some(target(path_of("a", &[("::", "T"), (".", "f")]))), ..canned_node("p1") };
+    let bad =
+        WireNode { target: Some(target(path_of("a", &[("::", "T"), ("::", "f")]))), ..canned_node("p2") };
+
+    let good = to_node_record(good, &mut warnings).target.unwrap();
+    let bad = to_node_record(bad, &mut warnings).target.unwrap();
+    assert_eq!(good.key_path, Some(path_of("a", &[("::", "T"), (".", "f")])));
+    assert_eq!((bad.key.as_str(), bad.key_path), ("a::T.f", None));
+    assert_eq!(warnings.emitted.len(), 1);
+}
+
+/// A node in the shape every plugin sends today (no path keys) indexes with
+/// a NULL path, no suffix rows and no warning, and its row equals a record
+/// built the old way.
+#[test]
+fn an_old_shape_node_indexes_exactly_as_before() {
+    let line = r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"mod::foo","filePath":"src/lib.rs","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"visibility":"public","language":"rust"}"#;
+    let node: WireNode = serde_json::from_str(line).unwrap();
+    let mut warnings = PathWarnings::default();
+    let record = to_node_record(node, &mut warnings);
+    assert!(warnings.emitted.is_empty());
+    assert_eq!((record.qualified_path.as_ref(), record.alias_paths.len()), (None, 0));
+
+    let mut conn = setup_conn();
+    apply_diff(&mut conn, &Diff { upsert_nodes: vec![record], ..Default::default() }).unwrap();
+    let conn = IndexStore::new(conn);
+    assert_eq!(count(&conn, "qualified_suffixes"), 0);
+    let stored: Option<String> = conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT qualifiedPath FROM nodes WHERE id = 'n1'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, None);
+    let found =
+        crate::graph::queries::find_by_qualified_name(&conn.lock().unwrap(), "mod::foo", None).unwrap();
+    assert_eq!(found.len(), 1);
+}
+
+/// Sends `diff` as a reparse of `src/lib.rs` through `apply_file_change`.
+fn reparse(conn: &IndexStore, id: i64, diff: FileChangeDiff) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let request_id = RequestId::Number(id);
+    let response = FileChangeResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        incomplete: false,
+        incomplete_reason: None,
+        id: request_id.clone(),
+        result: diff,
+    };
+    let plugin = spawn_stub_plugin(
+        plugin_reader,
+        plugin_writer,
+        "src/lib.rs",
+        request_id.clone(),
+        response,
+        Some(FileChangeDiff::default()),
+    );
+    apply_file_change(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        conn,
+        "src/lib.rs",
+        request_id,
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        TEST_TIMEOUT,
+        true,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap();
+}
+
+/// An incremental reparse that re-sends a node with another alias replaces
+/// its suffix rows, and one that deletes a node removes them. Control: drop
+/// `qualified_path`/`alias_paths` from `to_node_record`'s result (no rows at
+/// all after the first reparse).
+#[test]
+fn an_incremental_reparse_rebuilds_suffix_rows() {
+    let conn = IndexStore::new(setup_conn());
+    let upsert = |nodes| FileChangeDiff { upsert_nodes: nodes, ..Default::default() };
+
+    reparse(&conn, 1, upsert(vec![pathed_node("n1", "A"), pathed_node("n2", "B")]));
+    assert_eq!(suffixes(&conn, "n1"), vec!["A::foo"]);
+    assert_eq!(suffixes(&conn, "n2"), vec!["B::foo"]);
+
+    reparse(
+        &conn,
+        2,
+        FileChangeDiff { delete_node_ids: vec!["n2".to_string()], ..upsert(vec![pathed_node("n1", "C")]) },
+    );
+    assert_eq!(suffixes(&conn, "n1"), vec!["C::foo"]);
+    assert_eq!(count(&conn, "qualified_suffixes"), 1, "n2's rows went with it");
 }

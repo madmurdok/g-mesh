@@ -175,7 +175,165 @@ pub struct PlaceholderTarget {
     /// (every language today), same as [`WireNode::container`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_container: Option<String>,
+    /// The segments of a [`TargetKey::QualifiedName`] key, joining back to
+    /// that key exactly (see [`QualifiedPath`]). Absent for a `name` key, and
+    /// for a plugin that sends no paths; core then treats the key as a single
+    /// opaque string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<QualifiedPath>,
 }
+
+/// One segment of a [`QualifiedPath`]: the separator text that joins it to
+/// the segment before it, and its name. `sep` is absent on the first segment
+/// and present, non-empty, on every later one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathSegment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep: Option<String>,
+    pub name: String,
+}
+
+/// A qualified name as the plugin's own segments, each carrying the
+/// separator the language writes before it. Core only ever concatenates
+/// separators and names; it never splits a string into segments.
+///
+/// Joined (`display`), a valid path equals the display string it accompanies
+/// (`qualifiedName`, or a placeholder's `qualifiedName` key). The element
+/// rules are [`QualifiedPath::check`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QualifiedPath(pub Vec<PathSegment>);
+
+/// Characters no segment may contain: storage joins segments with U+001F.
+pub const PATH_FORBIDDEN_CHARS: [char; 2] = ['\u{1f}', '\0'];
+
+impl QualifiedPath {
+    /// A one-segment path.
+    pub fn root(name: impl Into<String>) -> Self {
+        Self(vec![PathSegment { sep: None, name: name.into() }])
+    }
+
+    /// This path extended by one segment written after `sep`.
+    pub fn child(&self, sep: impl Into<String>, name: impl Into<String>) -> Self {
+        let mut segments = self.0.clone();
+        segments.push(PathSegment { sep: Some(sep.into()), name: name.into() });
+        Self(segments)
+    }
+
+    pub fn segments(&self) -> &[PathSegment] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every separator and name concatenated in order.
+    pub fn display(&self) -> String {
+        self.suffix_from(0)
+    }
+
+    /// All segments but the last, or `None` for a path of fewer than two.
+    pub fn head(&self) -> Option<QualifiedPath> {
+        (self.0.len() >= 2).then(|| Self(self.0[..self.0.len() - 1].to_vec()))
+    }
+
+    pub fn last(&self) -> Option<&PathSegment> {
+        self.0.last()
+    }
+
+    /// The display text of the segments from `start` on: `start`'s name,
+    /// then each later segment's separator and name. Empty past the end.
+    pub fn suffix_from(&self, start: usize) -> String {
+        let mut text = String::new();
+        for (i, segment) in self.0.iter().enumerate().skip(start) {
+            if i > start {
+                text.push_str(segment.sep.as_deref().unwrap_or(""));
+            }
+            text.push_str(&segment.name);
+        }
+        text
+    }
+
+    /// The element rules every path obeys: at least one segment, no empty
+    /// name, no separator on the first segment, a non-empty separator on
+    /// every later one, and no [`PATH_FORBIDDEN_CHARS`] anywhere.
+    pub fn check(&self) -> Result<(), PathError> {
+        if self.0.is_empty() {
+            return Err(PathError::Empty);
+        }
+        for (i, segment) in self.0.iter().enumerate() {
+            if segment.name.is_empty() {
+                return Err(PathError::EmptyName(i));
+            }
+            match (i, segment.sep.as_deref()) {
+                (0, Some(_)) => return Err(PathError::SeparatorOnFirstSegment),
+                (0, None) => {}
+                (_, None | Some("")) => return Err(PathError::MissingSeparator(i)),
+                (_, Some(_)) => {}
+            }
+            let text = [segment.sep.as_deref().unwrap_or(""), segment.name.as_str()];
+            if text.iter().any(|part| part.contains(PATH_FORBIDDEN_CHARS)) {
+                return Err(PathError::ForbiddenChar(i));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`QualifiedPath::check`], plus: joined, the path equals `display`.
+    pub fn check_joins_to(&self, display: &str) -> Result<(), PathError> {
+        self.check()?;
+        let joined = self.display();
+        if joined != display {
+            return Err(PathError::DoesNotJoin { joined, expected: display.to_string() });
+        }
+        Ok(())
+    }
+}
+
+/// Why a [`QualifiedPath`] breaks a rule. Segment indices are from 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathError {
+    Empty,
+    EmptyName(usize),
+    SeparatorOnFirstSegment,
+    MissingSeparator(usize),
+    ForbiddenChar(usize),
+    DoesNotJoin { joined: String, expected: String },
+    LastNameIsNotName { last: String, name: String },
+    AliasTooShort,
+    AliasEqualsPath,
+    KeyPathOnNameKey,
+    AliasWithoutPath,
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathError::Empty => write!(f, "the path has no segments"),
+            PathError::EmptyName(i) => write!(f, "segment {i} has an empty name"),
+            PathError::SeparatorOnFirstSegment => write!(f, "the first segment carries a separator"),
+            PathError::MissingSeparator(i) => write!(f, "segment {i} has no separator"),
+            PathError::ForbiddenChar(i) => write!(f, "segment {i} contains U+001F or NUL"),
+            PathError::DoesNotJoin { joined, expected } => {
+                write!(f, "the path joins to {joined:?}, not {expected:?}")
+            }
+            PathError::LastNameIsNotName { last, name } => {
+                write!(f, "the last segment is {last:?}, not the node's name {name:?}")
+            }
+            PathError::AliasTooShort => write!(f, "an alias path has fewer than two segments"),
+            PathError::AliasEqualsPath => write!(f, "an alias path equals the node's qualifiedPath"),
+            PathError::KeyPathOnNameKey => write!(f, "a keyPath accompanies a name key"),
+            PathError::AliasWithoutPath => write!(f, "an alias path was sent without a qualifiedPath"),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
 
 /// One declaration of a symbol written as several - an overload signature
 /// beside its implementation, an interface or a namespace merged across
@@ -260,6 +418,66 @@ pub struct WireNode {
     /// not be derived from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<PlaceholderTarget>,
+    /// `qualifiedName` as segments, for a declaration: it joins back to
+    /// `qualified_name` and its last name is `name`. Absent for placeholders,
+    /// `File` nodes and any plugin that sends no paths. Never part of the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_path: Option<QualifiedPath>,
+    /// Other spellings of this same declaration (a Rust trait-impl method
+    /// written without its `<X as T>` segment, say). Each obeys
+    /// [`QualifiedPath::check`], has at least two segments, ends in `name`
+    /// and differs from `qualified_path`, which must be present; none need
+    /// join to `qualified_name`. Only feeds partial-path lookup: never stored
+    /// on the node, printed or hashed into an id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alias_paths: Vec<QualifiedPath>,
+}
+
+impl WireNode {
+    /// The declaration-path rules beyond [`QualifiedPath::check`]: joins to
+    /// `qualified_name` and ends in `name`. `Ok` when there is no path.
+    pub fn check_qualified_path(&self) -> Result<(), PathError> {
+        let Some(path) = &self.qualified_path else { return Ok(()) };
+        path.check_joins_to(&self.qualified_name)?;
+        self.check_ends_in_name(path)
+    }
+
+    /// The rules for one of [`WireNode::alias_paths`].
+    pub fn check_alias_path(&self, alias: &QualifiedPath) -> Result<(), PathError> {
+        if self.qualified_path.is_none() {
+            return Err(PathError::AliasWithoutPath);
+        }
+        alias.check()?;
+        if alias.len() < 2 {
+            return Err(PathError::AliasTooShort);
+        }
+        if self.qualified_path.as_ref() == Some(alias) {
+            return Err(PathError::AliasEqualsPath);
+        }
+        self.check_ends_in_name(alias)
+    }
+
+    fn check_ends_in_name(&self, path: &QualifiedPath) -> Result<(), PathError> {
+        match path.last() {
+            Some(last) if last.name == self.name => Ok(()),
+            last => Err(PathError::LastNameIsNotName {
+                last: last.map(|segment| segment.name.clone()).unwrap_or_default(),
+                name: self.name.clone(),
+            }),
+        }
+    }
+}
+
+impl PlaceholderTarget {
+    /// `key_path` joins back to a `qualifiedName` key, and is absent for a
+    /// `name` key. `Ok` when there is no path.
+    pub fn check_key_path(&self) -> Result<(), PathError> {
+        let Some(path) = &self.key_path else { return Ok(()) };
+        match &self.key {
+            TargetKey::QualifiedName(key) => path.check_joins_to(key),
+            TargetKey::Name(_) => Err(PathError::KeyPathOnNameKey),
+        }
+    }
 }
 
 /// Bulk-transfer wire shape for a single graph edge (one NDJSON line).
@@ -484,6 +702,8 @@ mod tests {
             container: None,
             container_parent: None,
             target: None,
+            alias_paths: Vec::new(),
+            qualified_path: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -584,7 +804,10 @@ mod tests {
                 scope: TargetScope::Container("github.com/x/app/server".to_string()),
                 key: TargetKey::QualifiedName("Server.Close".to_string()),
                 from_container: Some("github.com/x/app/client".to_string()),
+                key_path: None,
             }),
+            alias_paths: Vec::new(),
+            qualified_path: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -642,6 +865,8 @@ mod tests {
             container: None,
             container_parent: None,
             target: None,
+            alias_paths: Vec::new(),
+            qualified_path: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -845,6 +1070,8 @@ mod tests {
                 container: None,
                 container_parent: None,
                 target: None,
+                alias_paths: Vec::new(),
+                qualified_path: None,
             }],
             delete_node_ids: vec!["n2".to_string()],
             upsert_edges: vec![WireEdge {
@@ -934,5 +1161,97 @@ mod tests {
         let serialized = serde_json::to_string(&handshake).unwrap();
         let round_tripped: Handshake = serde_json::from_str(&serialized).unwrap();
         assert_eq!(handshake, round_tripped);
+    }
+
+    const OLD_SHAPE_NODE: &str = r#"{"id":"n1","kind":"Function","name":"read","qualifiedName":"m::S::read","filePath":"src/m.rs","range":{"start":{"line":1,"col":0},"end":{"line":3,"col":1}},"visibility":"public","language":"rust","hasSyntaxErrors":false}"#;
+
+    fn path(first: &str, rest: &[(&str, &str)]) -> QualifiedPath {
+        rest.iter().fold(QualifiedPath::root(first), |path, (sep, name)| path.child(*sep, *name))
+    }
+
+    /// A node without path keys still parses, has no paths, and serializes
+    /// back to the very same bytes. Control: drop `skip_serializing_if` on
+    /// `alias_paths` (an `"aliasPaths":[]` key appears).
+    #[test]
+    fn an_old_shape_node_parses_and_round_trips_byte_identically() {
+        let node: WireNode = serde_json::from_str(OLD_SHAPE_NODE).unwrap();
+        assert_eq!((node.qualified_path.as_ref(), node.alias_paths.len()), (None, 0));
+        assert_eq!(serde_json::to_string(&node).unwrap(), OLD_SHAPE_NODE);
+        assert_eq!(node.check_qualified_path(), Ok(()));
+    }
+
+    /// The wire spelling: segments are `{sep, name}` objects with `sep`
+    /// omitted on the first; `keyPath` sits in the target.
+    #[test]
+    fn paths_use_the_documented_wire_shape() {
+        let line = OLD_SHAPE_NODE.replace(
+            r#""hasSyntaxErrors":false}"#,
+            r#""hasSyntaxErrors":false,"qualifiedPath":[{"name":"m"},{"sep":"::","name":"S"},{"sep":"::","name":"read"}],"aliasPaths":[[{"name":"T"},{"sep":"::","name":"read"}]]}"#,
+        );
+        let node: WireNode = serde_json::from_str(&line).unwrap();
+        assert_eq!(node.qualified_path, Some(path("m", &[("::", "S"), ("::", "read")])));
+        assert_eq!(node.alias_paths, vec![path("T", &[("::", "read")])]);
+        assert_eq!(serde_json::to_string(&node).unwrap(), line);
+
+        let target: PlaceholderTarget = serde_json::from_str(
+            r#"{"scope":{"file":"b.rs"},"key":{"qualifiedName":"a::T.f"},"keyPath":[{"name":"a"},{"sep":"::","name":"T"},{"sep":".","name":"f"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(target.key_path, Some(path("a", &[("::", "T"), (".", "f")])));
+        assert_eq!(target.check_key_path(), Ok(()));
+    }
+
+    #[test]
+    fn a_path_joins_its_own_separators_and_reports_each_broken_rule() {
+        let p = path("a", &[("::", "T"), (".", "f")]);
+        assert_eq!(p.display(), "a::T.f");
+        assert_eq!(p.suffix_from(1), "T.f");
+        assert_eq!(p.head(), Some(path("a", &[("::", "T")])));
+        assert_eq!(p.last().map(|s| s.name.as_str()), Some("f"));
+        assert_eq!(p.check_joins_to("a::T.f"), Ok(()));
+        assert!(matches!(p.check_joins_to("a::T::f"), Err(PathError::DoesNotJoin { .. })));
+
+        let segment = |sep: Option<&str>, name: &str| PathSegment {
+            sep: sep.map(str::to_string),
+            name: name.to_string(),
+        };
+        assert_eq!(QualifiedPath(vec![]).check(), Err(PathError::Empty));
+        assert_eq!(
+            QualifiedPath(vec![segment(Some("::"), "a")]).check(),
+            Err(PathError::SeparatorOnFirstSegment)
+        );
+        assert_eq!(
+            QualifiedPath(vec![segment(None, "a"), segment(None, "b")]).check(),
+            Err(PathError::MissingSeparator(1))
+        );
+        assert_eq!(
+            QualifiedPath(vec![segment(None, "a"), segment(Some(""), "b")]).check(),
+            Err(PathError::MissingSeparator(1))
+        );
+        assert_eq!(QualifiedPath(vec![segment(None, "")]).check(), Err(PathError::EmptyName(0)));
+        assert_eq!(path("a", &[("::", "b\u{1f}")]).check(), Err(PathError::ForbiddenChar(1)));
+    }
+
+    #[test]
+    fn a_nodes_path_and_aliases_end_in_its_name() {
+        let mut node: WireNode = serde_json::from_str(OLD_SHAPE_NODE).unwrap();
+        node.alias_paths = vec![path("T", &[("::", "read")])];
+        assert_eq!(node.check_alias_path(&node.alias_paths[0]), Err(PathError::AliasWithoutPath));
+
+        node.qualified_path = Some(path("m", &[("::", "S"), ("::", "read")]));
+        assert_eq!(node.check_qualified_path(), Ok(()));
+        assert_eq!(node.check_alias_path(&path("T", &[("::", "read")])), Ok(()));
+        assert_eq!(node.check_alias_path(&QualifiedPath::root("read")), Err(PathError::AliasTooShort));
+        assert_eq!(
+            node.check_alias_path(&path("m", &[("::", "S"), ("::", "read")])),
+            Err(PathError::AliasEqualsPath)
+        );
+        assert!(matches!(
+            node.check_alias_path(&path("T", &[("::", "write")])),
+            Err(PathError::LastNameIsNotName { .. })
+        ));
+
+        node.name = "other".to_string();
+        assert!(matches!(node.check_qualified_path(), Err(PathError::LastNameIsNotName { .. })));
     }
 }

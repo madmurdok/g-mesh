@@ -16,6 +16,7 @@
 //! the peer with `std::io::pipe()` plus a thread, exactly like
 //! `jsonrpc.rs`'s own pipe-based tests do.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
@@ -24,8 +25,9 @@ use anyhow::{bail, Context, Result};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PlaceholderTarget, RequestId,
-    SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode, JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PathError, PlaceholderTarget,
+    QualifiedPath, RequestId, SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode,
+    JSONRPC_VERSION,
 };
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
@@ -415,7 +417,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         );
     }
 
-    let diff = to_storage_diff(response.result);
+    let diff = to_storage_diff(response.result, &mut PathWarnings::default());
     store.apply_diff_linked(&diff, method)?;
 
     hold_compute_open_for_tests();
@@ -480,21 +482,79 @@ fn method_name(message: &ControlMessage) -> &'static str {
 /// storage layer's flat `start_line`/`start_col`/`end_line`/`end_col`
 /// fields. `delete_node_ids`/`delete_edge_ids` pass through unchanged since
 /// both sides already agree on `Vec<String>`.
-fn to_storage_diff(wire: FileChangeDiff) -> Diff {
+fn to_storage_diff(wire: FileChangeDiff, warnings: &mut PathWarnings) -> Diff {
     Diff {
-        upsert_nodes: wire.upsert_nodes.into_iter().map(to_node_record).collect(),
+        upsert_nodes: wire.upsert_nodes.into_iter().map(|node| to_node_record(node, warnings)).collect(),
         delete_node_ids: wire.delete_node_ids,
         upsert_edges: wire.upsert_edges.into_iter().map(to_edge_record).collect(),
         delete_edge_ids: wire.delete_edge_ids,
     }
 }
 
+/// Warns about a plugin's invalid paths at most once per (language, file),
+/// so a plugin that gets every path in a file wrong logs one line for it.
+#[derive(Debug, Default)]
+pub(crate) struct PathWarnings {
+    warned: HashSet<(String, String)>,
+    /// Every line written, for tests.
+    pub(crate) emitted: Vec<String>,
+}
+
+impl PathWarnings {
+    fn warn(&mut self, node: &WireNode, what: &str, error: &PathError) {
+        if !self.warned.insert((node.language.clone(), node.file_path.clone())) {
+            return;
+        }
+        let line = format!(
+            "g-mesh daemon: the {} plugin sent an invalid {what} for {:?} in {}: {error}; \
+             dropped it and kept the node (later invalid paths in this file are dropped without a warning)",
+            node.language, node.qualified_name, node.file_path
+        );
+        eprintln!("{line}");
+        self.emitted.push(line);
+    }
+}
+
+/// The node's paths that pass their rules. A `qualifiedPath` that fails
+/// drops with all its aliases; an alias that fails, including one sent
+/// without a `qualifiedPath`, drops alone. The node itself is always kept.
+fn checked_paths(
+    node: &WireNode,
+    warnings: &mut PathWarnings,
+) -> (Option<QualifiedPath>, Vec<QualifiedPath>) {
+    if let Err(error) = node.check_qualified_path() {
+        warnings.warn(node, "qualifiedPath", &error);
+        return (None, Vec::new());
+    }
+    let aliases = node
+        .alias_paths
+        .iter()
+        .filter(|alias| match node.check_alias_path(alias) {
+            Ok(()) => true,
+            Err(error) => {
+                warnings.warn(node, "aliasPaths entry", &error);
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    (node.qualified_path.clone(), aliases)
+}
+
 /// Wire node -> storage record. Shared with the cold-start bulk index
 /// (`daemon::bulk_index`), which ingests the very same `WireNode` shape off
 /// an NDJSON stream instead of out of a diff response - the two paths must
 /// never disagree about how a wire node becomes a row.
-pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
+pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> NodeRecord {
     let (visibility, visibility_container) = to_storage_visibility(&node.visibility);
+    let (qualified_path, alias_paths) = checked_paths(&node, warnings);
+    let key_path = node.target.as_ref().and_then(|target| match target.check_key_path() {
+        Ok(()) => target.key_path.clone(),
+        Err(error) => {
+            warnings.warn(&node, "keyPath", &error);
+            None
+        }
+    });
     NodeRecord {
         id: node.id,
         kind: format!("{:?}", node.kind),
@@ -519,7 +579,7 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
         // on the container's `containers.parentKey` - it describes the
         // container, not this member, so it has no `nodes` column of its own.
         container_parent: node.container_parent,
-        target: node.target.as_ref().map(to_placeholder_target_record),
+        target: node.target.as_ref().map(|target| to_placeholder_target_record(target, key_path)),
         doc_comment: node.doc_comment,
         language: node.language,
         native_kind: node.native_kind,
@@ -541,6 +601,8 @@ pub(crate) fn to_node_record(node: WireNode) -> NodeRecord {
                 has_body: declaration.has_body,
             })
             .collect(),
+        qualified_path,
+        alias_paths,
     }
 }
 
@@ -564,7 +626,11 @@ fn to_storage_visibility(visibility: &Visibility) -> (String, Option<String>) {
 /// so `storage::write::apply_diff` fills `placeholder_targets.fromFile` from
 /// `NodeRecord.file_path` directly rather than threading it through this
 /// record - see that table's own DDL comment.
-fn to_placeholder_target_record(target: &PlaceholderTarget) -> PlaceholderTargetRecord {
+/// `key_path` is the target's own, already checked by the caller.
+fn to_placeholder_target_record(
+    target: &PlaceholderTarget,
+    key_path: Option<QualifiedPath>,
+) -> PlaceholderTargetRecord {
     let (scope_kind, scope) = match &target.scope {
         TargetScope::File(path) => ("file".to_string(), path.clone()),
         TargetScope::Container(key) => ("container".to_string(), key.clone()),
@@ -579,6 +645,7 @@ fn to_placeholder_target_record(target: &PlaceholderTarget) -> PlaceholderTarget
         key_kind,
         key,
         from_container: target.from_container.clone(),
+        key_path,
     }
 }
 

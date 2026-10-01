@@ -37,6 +37,7 @@ fn creates_all_tables_and_indexes() {
             "nodes",
             "pending_reindex",
             "placeholder_targets",
+            "qualified_suffixes",
             "semantic_pending",
             "semantic_pending_files",
             "vectors",
@@ -57,9 +58,31 @@ fn creates_all_tables_and_indexes() {
         "idx_edges_fromId",
         "idx_edges_toId",
         "idx_targets_scope",
+        "idx_qualified_suffixes_nodeId",
     ] {
         assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
     }
+}
+
+/// A partial-path lookup is one seek of the suffix table's own primary key,
+/// and a per-node delete uses the nodeId index. Control: drop
+/// `idx_qualified_suffixes_nodeId` (the delete plan scans).
+#[test]
+fn qualified_suffix_lookups_and_deletes_use_an_index() {
+    let conn = setup();
+    let plan = |sql: &str| -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ")
+    };
+    let lookup = plan("SELECT nodeId FROM qualified_suffixes WHERE suffix = 'T::m'");
+    assert!(lookup.contains("USING PRIMARY KEY (suffix=?)"), "{lookup}");
+    let delete = plan("DELETE FROM qualified_suffixes WHERE nodeId = 'n1'");
+    assert!(delete.contains("USING COVERING INDEX idx_qualified_suffixes_nodeId"), "{delete}");
 }
 
 #[test]

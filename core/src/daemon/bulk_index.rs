@@ -25,7 +25,7 @@ use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
 use crate::storage::write::Diff;
-use crate::watcher::apply::{to_edge_record, to_node_record};
+use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
 use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
@@ -348,11 +348,12 @@ pub(crate) fn ingest<R: BufRead>(reader: R, ctx: &mut WalkContext<'_>) -> Result
 fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContext<'_>) -> Result<()> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
+    let mut path_warnings = PathWarnings::default();
 
     for item in NdjsonReader::new(reader) {
         match item {
             Ok(BulkItem::Node(node)) => {
-                let record = to_node_record(*node);
+                let record = to_node_record(*node, &mut path_warnings);
                 // A `File` node is the plugin saying it parsed that file - the
                 // one statement `run`'s baselines may rest on. Other kinds'
                 // `filePath` need not be a file this walk read.
@@ -460,6 +461,8 @@ mod tests {
             container: None,
             container_parent: None,
             target: None,
+            alias_paths: Vec::new(),
+            qualified_path: None,
         })
         .unwrap()
     }

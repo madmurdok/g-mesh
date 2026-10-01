@@ -95,6 +95,8 @@ mod tests {
             container: None,
             container_parent: None,
             target: None,
+            alias_paths: Vec::new(),
+            qualified_path: None,
         })
         .unwrap()
     }

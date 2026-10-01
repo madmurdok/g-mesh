@@ -116,7 +116,8 @@ use crate::cli::plugin_check::session::{
 use crate::daemon::manifest::PluginManifest;
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::protocol::conformance::{
-    placeholder_target_violation, plugin_emitted_container_violation, PLACEHOLDER_NATIVE_KINDS,
+    placeholder_target_violation, plugin_emitted_container_violation, qualified_path_violation,
+    PLACEHOLDER_NATIVE_KINDS,
 };
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, WireEdge, WireNode};
@@ -293,7 +294,9 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
             match &line.item {
                 Err(err) => findings.push(format!("bulk run 1, NDJSON line {}: {err}", line.line_no)),
                 Ok(BulkItem::Node(node)) => {
-                    if let Some(message) = placeholder_target_violation(node) {
+                    for message in
+                        placeholder_target_violation(node).into_iter().chain(qualified_path_violation(node))
+                    {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
                 }
@@ -315,7 +318,9 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
     }
     for (step, diff) in answered {
         for node in &diff.upsert_nodes {
-            if let Some(message) = placeholder_target_violation(node) {
+            for message in
+                placeholder_target_violation(node).into_iter().chain(qualified_path_violation(node))
+            {
                 findings.push(format!("{step}: {message}"));
             }
         }

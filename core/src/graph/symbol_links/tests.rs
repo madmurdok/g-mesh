@@ -146,6 +146,7 @@ fn target(
         key_kind: key_kind.to_string(),
         key: key.to_string(),
         from_container: from.map(str::to_string),
+        key_path: None,
     }
 }
 
