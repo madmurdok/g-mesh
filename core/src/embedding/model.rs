@@ -112,8 +112,10 @@ const DEFAULT_WEIGHTS_TAG: &str = "int8";
 /// [`embedding_version`]: `embedding::text::text_to_embed`'s. Changed
 /// whenever that function's output changes for any node, so every vector made
 /// from the old text is owed a re-embed, under any model. Vectors from the
-/// untrimmed doc comment carry no text tag.
-const TEXT_FORM_TAG: &str = "structured";
+/// untrimmed doc comment carry no text tag. The embedding cache needs no
+/// change with it: its key is the text itself, so the re-embed misses only
+/// for the texts that changed.
+pub(crate) const TEXT_FORM_TAG: &str = "structured";
 
 /// The `embeddingVersion` a pipeline configured with `model_name` stores its
 /// vectors under: the default model's name plus [`DEFAULT_WEIGHTS_TAG`], or
