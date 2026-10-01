@@ -46,6 +46,16 @@
 //! worth having: a project whose model was not available at index time (or
 //! whose weights simply had not been fetched yet) gets embedded on the next
 //! restart that finds one, with no reindex required.
+//!
+//! # A vector from another model is owed too
+//!
+//! A node whose `vectors` row carries an `embeddingVersion` other than the
+//! pipeline's is a candidate as well, the same rule
+//! `storage::language_swap::plan_embeddings` applies to a reindex. That is
+//! how a change of pinned weights (`embedding::model::embedding_version`)
+//! reaches an existing index: every old row is
+//! re-embedded by this pass on the next start, with no reindex and no schema
+//! change, and `vectors::insert` overwrites it in place.
 
 use rusqlite::{Connection, Result as SqlResult};
 
@@ -118,7 +128,8 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
     }
 
     store.unit(Unit::Backfill, |store| {
-        let candidates = match store.step(|conn| count_candidates(conn)) {
+        let version = embedding.embedding_version();
+        let candidates = match store.step(|conn| count_candidates(conn, version)) {
             Ok(count) => count,
             Err(err) => {
                 eprintln!(
@@ -135,7 +146,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let mut after_id: Option<String> = None;
 
         loop {
-            let page = match store.step(|conn| fetch_candidate_page(conn, after_id.as_deref(), PAGE_SIZE)) {
+            let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
                 Ok(page) => page,
                 Err(err) => {
                     eprintln!(
@@ -183,14 +194,16 @@ fn to_node_record((id, doc_comment, signature): Candidate) -> NodeRecord {
 }
 
 /// Total rows this pass owes the project right now: every node with
-/// embeddable text (a doc comment or a signature) and no `vectors` row yet.
+/// embeddable text (a doc comment or a signature) and no `vectors` row yet,
+/// or one made under an `embeddingVersion` other than `version`.
 /// Mirrors [`fetch_candidate_page`]'s own `WHERE` clause exactly - this is
 /// the unpaged count of the same set that query pages through.
-fn count_candidates(conn: &Connection) -> SqlResult<i64> {
+fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE v.nodeId IS NULL AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL)",
-        [],
+         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL)",
+        [version],
         |row| row.get(0),
     )
 }
@@ -199,16 +212,22 @@ fn count_candidates(conn: &Connection) -> SqlResult<i64> {
 /// start, if `None`), ordered by `id` so paging never revisits or skips a
 /// row regardless of how many pages have already run - see this module's own
 /// "Termination" doc section.
-fn fetch_candidate_page(conn: &Connection, after_id: Option<&str>, limit: i64) -> SqlResult<Vec<Candidate>> {
+fn fetch_candidate_page(
+    conn: &Connection,
+    version: &str,
+    after_id: Option<&str>,
+    limit: i64,
+) -> SqlResult<Vec<Candidate>> {
     let mut stmt = conn.prepare(
         "SELECT n.id, n.docComment, n.signature FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE v.nodeId IS NULL AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
+         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
          AND n.id > ?1 ORDER BY n.id LIMIT ?2",
     )?;
     // Every real node id is a non-empty string, so `id > ''` is true for all
     // of them - the same query serves both "from the very start" (`after_id`
     // is `None`) and "strictly after the last page's id" with one statement.
-    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit], |row| {
+    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })?;
     rows.collect()
@@ -293,13 +312,52 @@ mod tests {
         )
         .unwrap();
 
-        let count = count_candidates(&conn).unwrap();
+        let count = count_candidates(&conn, "v1").unwrap();
         assert_eq!(count, 2, "only `documented` and `signed_only` are owed an embedding");
 
-        let page = fetch_candidate_page(&conn, None, 256).unwrap();
+        let page = fetch_candidate_page(&conn, "v1", None, 256).unwrap();
         let mut ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["documented", "signed_only"]);
+    }
+
+    /// A vector made under another `embeddingVersion` is owed a re-embed:
+    /// this is how a change of pinned weights or of the embedded text form
+    /// reaches an existing index. A row tagged with the bare model name (fp32
+    /// weights) or with `<model>+int8` (the untrimmed text) is a candidate for
+    /// the pipeline's version; a row already carrying it is not.
+    ///
+    /// *Control:* drop `OR v.embeddingVersion != ?` from either query, and
+    /// neither old row is a candidate; drop `TEXT_FORM_TAG` from
+    /// `embedding_version`, and `embedded_from_full_text` is not one.
+    #[test]
+    fn a_vector_from_another_embedding_version_is_owed_a_re_embed() {
+        let mut conn = open_conn();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    node("embedded_by_fp32", Some("does a thing"), None),
+                    node("embedded_by_int8", Some("does another thing"), None),
+                    node("embedded_from_full_text", Some("does a third thing"), None),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let model = crate::config::EmbeddingConfig::default().model;
+        let current = crate::embedding::model::embedding_version(&model);
+        assert_ne!(current, model, "the default model's version must not be the fp32 weights' bare name");
+        let zeros = [0.0; crate::embedding::EMBEDDING_DIM];
+        crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, &model).unwrap();
+        crate::storage::vectors::insert(&conn, "embedded_by_int8", &zeros, &current).unwrap();
+        crate::storage::vectors::insert(&conn, "embedded_from_full_text", &zeros, &format!("{model}+int8"))
+            .unwrap();
+
+        assert_eq!(count_candidates(&conn, &current).unwrap(), 2);
+        let page = fetch_candidate_page(&conn, &current, None, 256).unwrap();
+        let ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["embedded_by_fp32", "embedded_from_full_text"]);
     }
 
     /// Keyset pagination visits each node exactly once across several pages,
@@ -322,7 +380,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut after_id: Option<String> = None;
         loop {
-            let page = fetch_candidate_page(&conn, after_id.as_deref(), 2).unwrap();
+            let page = fetch_candidate_page(&conn, "v1", after_id.as_deref(), 2).unwrap();
             if page.is_empty() {
                 break;
             }

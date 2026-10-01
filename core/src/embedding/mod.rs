@@ -20,6 +20,7 @@ pub mod backfill;
 pub mod cache;
 pub mod model;
 pub mod pipeline;
+pub(crate) mod text;
 
 pub use model::{cosine_similarity, default_model_dir, resolve_model_dir, EmbeddingModel, EMBEDDING_DIM};
 pub use pipeline::{CacheSettings, EmbedStats, EmbeddingPipeline};

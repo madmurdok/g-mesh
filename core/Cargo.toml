@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "3.16.0"
+version = "3.17.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -128,7 +128,7 @@ toml = "0.8"
 # certificate validation does not depend on the host having a usable CA bundle
 # either; `proxy-from-env` keeps `HTTPS_PROXY` working for anyone behind a
 # corporate proxy, which curl would have honored for free. `gzip` (a default) is
-# off: the payload is 612 MiB of already-incompressible ONNX weights.
+# off: the payload is 154 MiB of already-incompressible ONNX weights.
 #
 # 2.x rather than 3.x on purpose: `ort-sys`'s build script already pulls ureq 2
 # into this tree, so this reuses that subtree instead of compiling a second

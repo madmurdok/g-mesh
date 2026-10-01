@@ -1,0 +1,142 @@
+[
+ {
+  "rule": "fenced code",
+  "source": "g-mesh 1a38c1415477d6b7eea01496edef3474",
+  "doc": "The id scheme is a cross-plugin contract, and this is where it is held to\none.\n\n`ids`' module doc specifies the scheme in bytes. That specification is\nworth nothing unless the two implementations that exist agree on it, so\nevery case below pins this crate's answer against the id\n`plugins/typescript`'s own `nodeIdFor`/`edgeIdFor`\n(`plugins/typescript/src/extract.ts`) produced for the same tuple, on\n2026-09-16, by calling those functions directly on the built plugin:\n\n```text\nnode -e 'const e = require(\"./plugins/typescript/dist/src/extract.js\");\n         console.log(e.nodeIdFor(\"src/overloads.ts\", \"Function\", \"parse\", \"function\"))'\n```\n\nThe values are *recorded*, not recomputed by this test. Recomputing would\nmake the test pass whenever both implementations change together, which is\nexactly the failure it exists to catch - and would make the Rust test\nsuite depend on a Node toolchain and a built TS plugin.\n\nThe first case is independently corroborated: it is the very id in\n`wire`'s own `OVERLOADED_NODE_LINE` constant, a line copied out of the TS\nplugin's real `--bulk-index` output long before this crate existed.\n\n**`plugins/go` must produce these same ids.** The Go plugin is being built\nin parallel and is not on this branch; when it lands, this table is the\none it has to reproduce - `crypto/sha256` over the same NUL-joined fields,\nhex, first 32 characters.",
+  "signature": null,
+  "expected": "The id scheme is a cross-plugin contract, and this is where it is held to\none."
+ },
+ {
+  "rule": "fenced code",
+  "source": "g-mesh 442f9ca33fd70ed3c60507ce944d374c",
+  "doc": "Decision 1: the lexical scope stack, and why a structural extractor\ncannot do without one.\n\n# The trap\n\nEvery edge this plugin emits for a bare name starts by asking \"is this\nname a declaration somewhere else\". If nothing tracks *local* bindings,\nthe answer for\n\n```rust,ignore\nfn run(config: Config) {\n    let parse = 1;\n    helper(parse);\n}\n```\n\nis that `parse` is a name the module might declare, and the extractor\nemits a module-scoped placeholder for a local integer. Core then links it\nto whatever the module really calls `parse` - a function, a module, a\nconstant - and `find_references` reports a use that does not exist. This\nis not a hypothetical: it is the shape every structural extractor gets\nwrong first, and the reason it is worth its own module is that the fix has\nto be *complete*. One unhandled binding form is one silent class of wrong\nedges.\n\n# What is tracked\n\nA stack of frames. Anything that can introduce a name pushes one, and\nevery name a pattern binds goes into the top frame:\n\n - function, method and closure parameters, including `self`;\n - `let` bindings (after their own initializer has been visited, so that\n   `let x = x;` still refers to the outer `x`);\n - `for` patterns, `match` arm patterns, `if let`/`while let` patterns;\n - generic type parameters and const generics, on functions, impls,\n   traits and type declarations - so that `T` in `fn f<T>(t: T)` is never\n   mistaken for a type the project declares;\n - every block, so a binding leaves scope with its block.\n\nLifetimes are not tracked: they live in a namespace of their own that no\nedge this plugin emits ever addresses.\n\n# What it does when it is unsure\n\n[`Scopes::binds`] answering `true` means \"do not emit an edge for this\nname\". Every binding form above adds names; nothing ever removes one\nexcept leaving its frame. So the failure direction is *over*-binding - a\nname shadowed more widely than Rust would shadow it - which costs a\nmissing edge. That is the standing rule (`graph::symbol_links`: \"a missing\nedge beats a wrong one\") and it is why, for instance, a `tuple_struct_pattern`'s\nown type (`Some(x)`, `Point(a, b)`) is skipped rather than resolved: the\nvariant it names is worth an edge in principle, but telling a unit variant\nfrom a binding needs name resolution, and guessing either way here would\ntrade a missing edge for a wrong one.",
+  "signature": null,
+  "expected": "Decision 1: the lexical scope stack, and why a structural extractor\ncannot do without one.\n\n# The trap\n\nEvery edge this plugin emits for a bare name starts by asking \"is this\nname a declaration somewhere else\". If nothing tracks *local* bindings,\nthe answer for\n\n# What is tracked\n\nA stack of frames. Anything that can introduce a name pushes one, and\nevery name a pattern binds goes into the top frame:\n\nLifetimes are not tracked: they live in a namespace of their own that no\nedge this plugin emits ever addresses.\n\n# What it does when it is unsure"
+ },
+ {
+  "rule": "fenced code",
+  "source": "g-mesh 48a7fcff1c6e1998524882b51778df70",
+  "doc": "The argv that runs `script` on *this process's own* JS runtime, whichever\nshape the plugin is in. Callers pair it with `process.execPath`:\n\n```ts\nspawn(process.execPath, nodeRuntimeArgv(tsserverPath, flags), { ... })\n```\n\nIn a dev checkout that is exactly the `node <script> <args>` this replaced.\nIn the bundle it prefixes [`RUN_NODE_FLAG`], which the same executable\nunwraps in [`runNodeScript`].",
+  "signature": "nodeRuntimeArgv(script: string, args: readonly string[] = []): string[]",
+  "expected": "The argv that runs `script` on *this process's own* JS runtime, whichever\nshape the plugin is in. Callers pair it with `process.execPath`:\n\nIn a dev checkout that is exactly the `node <script> <args>` this replaced.\nIn the bundle it prefixes [`RUN_NODE_FLAG`], which the same executable\nunwraps in [`runNodeScript`].\n\nnodeRuntimeArgv(script: string, args: readonly string[] = []): string[]"
+ },
+ {
+  "rule": "indented code",
+  "source": "g-mesh 01f57973a1b017d6eea437c3e615a0f8",
+  "doc": "GM-393: one over-long input must not be able to cost the daemon gigabytes.\n\nBulk-indexing g-mesh's own repository drove the daemon to 15.3 GB max RSS,\nagainst ~0.2 GB for the same walk with no model loaded. The cause was the\nembedding step's input length, not the walk: self-attention's working\nmemory grows with the square of the token count, `EmbeddingModel::load`\nused to truncate at the model's full 8192 tokens, and ONNX Runtime's CPU\narena keeps whatever the largest run needed. One 8192-token doc comment\nwas enough (see `embedding::model::DEFAULT_MAX_SEQUENCE_LENGTH` for the\nmeasurements).\n\nThis test is its own file, and the only test in it, on purpose: it reads\nthe process-wide peak RSS (`getrusage`), which any other test running in\nthe same process would pollute. Cargo runs each integration-test file as\nits own binary.\n\n# Real model weights\n\n`#[ignore]`d for the same reason every other weight-dependent test is (see\n`tests/embedding_generation_pipeline.rs`): CI and a fresh checkout have no\n~600 MiB model on disk. Run it explicitly:\n\n    g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)\n    cargo test -p g-mesh --release --test embedding_peak_memory -- --ignored\n\n`--release` only for speed; on pre-fix code the over-long input alone took\n~65 s in a release build.",
+  "signature": null,
+  "expected": "GM-393: one over-long input must not be able to cost the daemon gigabytes.\n\n# Real model weights\n\n`#[ignore]`d for the same reason every other weight-dependent test is (see\n`tests/embedding_generation_pipeline.rs`): CI and a fresh checkout have no\n~600 MiB model on disk. Run it explicitly:\n\n`--release` only for speed; on pre-fix code the over-long input alone took\n~65 s in a release build."
+ },
+ {
+  "rule": "indented code",
+  "source": "g-mesh 39de0b4a435b35db256a7bdb0965263f",
+  "doc": "collectImports emits one placeholder node and one IMPORTS edge per import\nspecifier, and records what each one binds.\n\n# The three import forms, each decided and each documented\n\n  - **An alias** (`import f \"fmt\"`) binds the alias. Nothing else changes:\n    the placeholder still addresses the import path, because that is what\n    the file depends on.\n  - **A blank import** (`import _ \"net/http/pprof\"`) binds nothing, and\n    still gets its placeholder and its IMPORTS edge. The dependency is\n    completely real - it is the *only* thing such an import expresses -\n    and `get_dependencies` would be wrong to omit it. What it cannot do is\n    make a name available, so no use site can ever reach it.\n  - **A dot import** (`import . \"pkg\"`) binds every exported name of the\n    imported package into this file, invisibly. That makes every bare name\n    in the file ambiguous between \"this package\" and \"the dot-imported\n    one\", and a structural tier has no way to tell them apart: the set of\n   ...",
+  "signature": "func (e *extractor) collectImports(file *ast.File)",
+  "expected": "collectImports emits one placeholder node and one IMPORTS edge per import\nspecifier, and records what each one binds.\n\n# The three import forms, each decided and each documented\n\nfunc (e *extractor) collectImports(file *ast.File)"
+ },
+ {
+  "rule": "indented code",
+  "source": "g-mesh 70e723e4d540276f2ad637d9082a3a4f",
+  "doc": "Resolves a path prefix to the container it names - \"Decision 4\" of this\ntask, and the single rule every `use`, every path call and every\n`impl … for` clause goes through.\n\nThe rules, in the order they are tried, are Rust's own:\n\n 1. `crate::…` starts at the crate root, `self::…` at the asking module,\n    `super::…` one module up per `super`.\n 2. A bare first segment naming a crate this project models is that\n    crate's root. This is the case that makes a workspace's crates see\n    each other, and it comes first because that is what edition 2018+\n    means by a bare path.\n 3. A bare first segment naming a `mod` item of the asking module is that\n    child module. Edition 2015 wrote `use` paths this way, and a *path\n    call* (`helpers::run()`) is written this way in every edition.\n 4. A bare first segment bound by one of the asking module's own `use`\n    items, and spelled like a module rather than a type, continues from\n    wherever that `use` pointed: `use crate::a::b;` then `b::f()`.\n 5. Anything else whose first segment is an identifier is taken to be an\n    external crate; anything else at all is unresolved.\n\nA prefix that resolves to a container this project does not actually hold\nis not an error here and never becomes one: core looks the key up among\nthe containers the index really has, finds nothing, and leaves the edge\nunresolved.",
+  "signature": "pub(crate) fn resolve_module_path( segments: &[Seg<'_>], module: &ModuleCtx, names: &impl ModuleNames, project: &ProjectContext, ) -> PathTarget",
+  "expected": "Resolves a path prefix to the container it names - \"Decision 4\" of this\ntask, and the single rule every `use`, every path call and every\n`impl … for` clause goes through.\n\nThe rules, in the order they are tried, are Rust's own:\n\npub(crate) fn resolve_module_path( segments: &[Seg<'_>], module: &ModuleCtx, names: &impl ModuleNames, project: &ProjectContext, ) -> PathTarget"
+ },
+ {
+  "rule": "headings",
+  "source": "g-mesh 07f4690f47f74e170f0260946c2ab332",
+  "doc": "The thin layer between tree-sitter-python's concrete syntax tree and the\nquestions the rest of this extractor asks of it: what does this dotted\nname spell, what is this definition's docstring, what is its rendered\nsignature (decorators and all), and which definition does a\n`decorated_definition` wrap.\n\n# Why a segment list rather than a string\n\nAlmost every decision this plugin makes about an edge starts with \"what\ndoes this dotted name mean here\": `a.b.f()`, `mod.Thing`, `self.method()`,\n`from a.b import name`. Written out as a string, every one of those has to\nbe re-split at `.` by whoever reads it - and the split is not innocent,\nbecause Python spells three different things with the same dot. `a.b` is a\nmodule path in an `import` statement, an attribute access in an\nexpression, and part of a *relative* path when a leading run of dots\nprecedes it. [`dotted_segments`] answers once, in the grammar's own terms:\nit returns segments only for shapes that really are a chain of plain\nidentifiers, and `None` for everything else.\n\n# What \"no path\" means\n\n[`dotted_segments`] returns `None` for anything it cannot render as a\n`.`-joined chain of identifiers: a subscript (`registry[\"name\"].run`), a\ncall result (`factory().run`), a literal's method (`\"\".join`), a\nparenthesised expression. That is deliberately the same answer as \"I do\nnot know\", and every caller treats it that way - it emits no edge, or\nrecords an open site for a future semantic tier. A guess here would be a\nwrong edge, which this project ranks below a missing one.\n\n# Docstrings, and why they are not comments\n\nPython has no doc-comment syntax. `# like this` is a comment the compiler\ndiscards; the documentation of a module, class or function is its\n**first statement**, when that statement is a string literal, and it\nsurvives into `__doc__` at runtime. So [`docstring`] reads exactly that -\nthe first statement of a body - and nothing above the definition is ever\nread as documentation. A `#` comment sitting above a `def` documents it to\na human and to nothing else, and treating it as a `docComment` would put\ntext in the index that Python itself does not consider the symbol's\ndocumentation.",
+  "signature": null,
+  "expected": "The thin layer between tree-sitter-python's concrete syntax tree and the\nquestions the rest of this extractor asks of it: what does this dotted\nname spell, what is this definition's docstring, what is its rendered\nsignature (decorators and all), and which definition does a\n`decorated_definition` wrap.\n\n# Why a segment list rather than a string\n\n# What \"no path\" means\n\n# Docstrings, and why they are not comments"
+ },
+ {
+  "rule": "headings",
+  "source": "g-mesh 09efdf7691929ed96e326f54b8a571a5",
+  "doc": "Records one implementor of `anchor`, if `location` is a declaration this\nindex holds. `false` means it is not one - which is a question for the\ncaller, not an error.\n\n`for_file` is the file whose question produced this, and it is the\nanchor's, never the implementor's: see [`Ask::Implementor`].\n\n# Only a `Type` implements anything (GM-361)\n\n[`SdkIndex::node_at`] answers with the **smallest node containing** the\nposition, which is not the same as \"the declaration written there\". An\n`impl` header inside an inline module is contained by that module's own\nnode and by nothing smaller, so the sweep recorded the *module* as an\nimplementor: measured on ripgrep,\n`find_implementations(\"Sink\")` carried a row\n`sink::sinks @ crates/searcher/src/sink.rs:516`, which is\n`pub mod sinks { … }`, alongside the three types declared inside it.\n\nA module implements nothing, in any language this bridge serves, so a\nnode that is not a [`NodeKind::Type`] is refused here. Refused, not\ndropped: `false` is exactly the signal that sends an\n[`Ask::Implementation`] answer to its second hop, which asks the server\nwhat is written at that position and gets the implementing declaration -\nthe same path an `impl` header at a file's top level already took, where\n`node_at` found only the `File` node.",
+  "signature": "fn record_implementor( answers: &mut Answers, index: &SdkIndex, roots: [&Path; 2], encoding: PositionEncoding, anchor: &str, for_file: &RelPath, location: &ServerLocation, ) -> bool",
+  "expected": "Records one implementor of `anchor`, if `location` is a declaration this\nindex holds. `false` means it is not one - which is a question for the\ncaller, not an error.\n\n`for_file` is the file whose question produced this, and it is the\nanchor's, never the implementor's: see [`Ask::Implementor`].\n\n# Only a `Type` implements anything (GM-361)\n\nfn record_implementor( answers: &mut Answers, index: &SdkIndex, roots: [&Path; 2], encoding: PositionEncoding, anchor: &str, for_file: &RelPath, location: &ServerLocation, ) -> bool"
+ },
+ {
+  "rule": "headings",
+  "source": "g-mesh 0c4b101067eebda1da9d99e4d722663a",
+  "doc": "The two-tier idle lifecycle, driven through a real daemon with both\ntimeouts shortened (`daemon::lifecycle`'s `G_MESH_*_IDLE_MS` overrides) so\nan hour and a day fit inside a test run.\n\nNothing here fakes a timer or calls the supervisor directly: the whole\nclaim being tested is about processes - one that has to exit while the\nother carries on, and a queue that has to survive in between - and that is\nonly observable from outside them. So the assertions are made against pids,\npid files, the socket, the index's own rows, and the one log line the\ndaemon prints when it wakes its plugin.\n\n# Why the daemon's stderr is read\n\n\"Replays only the queued dirty files, not a full rescan\" cannot be settled\nfrom the index alone: a rescan and a one-file replay leave the same rows\nbehind, since a rescan would re-derive every *other* file to exactly what\nit already was. What distinguishes them is which files the plugin was asked\nabout, and the daemon says so out loud on the wake path - so this test\nreads that line and asserts on the exact list, rather than on a count that\ncould be right for the wrong reason.",
+  "signature": null,
+  "expected": "The two-tier idle lifecycle, driven through a real daemon with both\ntimeouts shortened (`daemon::lifecycle`'s `G_MESH_*_IDLE_MS` overrides) so\nan hour and a day fit inside a test run.\n\n# Why the daemon's stderr is read"
+ },
+ {
+  "rule": "long later paragraph",
+  "source": "g-mesh 00183ac831ac0d5311813fb9cf8d90d4",
+  "doc": "The machine-wide embedding cache: one SQLite file under\n`$G_MESH_HOME/embedding-cache/`, shared by every daemon and CLI process on\nthe machine, mapping `sha256(text)` under a model fingerprint to the\nvector that model produced for that text. The design, and what was\nrejected, is ADR 0007 (`docs/adr/0007-embedding-cache.md`).\n\nInvariants this module relies on:\n\n- A vector is a pure function of the fingerprint and the text, so the\n  same key always carries the same bytes. That is what makes\n  `INSERT OR IGNORE` between racing writers harmless, and what makes a\n  cached vector interchangeable with a fresh one. [`PIPELINE_EPOCH`] and\n  [`ORT_VERSION`] are part of the fingerprint for exactly that reason.\n- Every error is returned to the caller, never panicked on: the pipeline\n  treats a failed lookup as an all-miss batch and a failed insert as a\n  dropped batch, so the cache can never fail indexing.",
+  "signature": null,
+  "expected": "The machine-wide embedding cache: one SQLite file under\n`$G_MESH_HOME/embedding-cache/`, shared by every daemon and CLI process on\nthe machine, mapping `sha256(text)` under a model fingerprint to the\nvector that model produced for that text. The design, and what was\nrejected, is ADR 0007 (`docs/adr/0007-embedding-cache.md`).\n\nInvariants this module relies on:"
+ },
+ {
+  "rule": "long later paragraph",
+  "source": "g-mesh 00d6c6e3a5fedc4c54fe1f6bfe0d0f9a",
+  "doc": "Acceptance test for generic-type references, over the whole real chain: a\nreal MCP client, the real shim, a real daemon, a real cold-start bulk index\ndriven by the real JS/TS plugin, and `find_references` answering off what\nthat produced.\n\nUnlike `namespace_import_resolution.rs`/`ambiguous_reexport_linking.rs`,\nthere is no semantic pass to wait on here: the generics-scope task\n(b25d0f4b) found this was a syntax-visibility gap in the tree-sitter\nextraction pass itself, not a type-inference problem, and the fix\n(`plugins/typescript/src/extract.ts`, `// --- generic types ---`) is purely\nstructural. So the new edges are already in the index the moment\n`wait_until_indexed` returns, exactly like `reexport_linking.rs`.\n\n`plugins/typescript/test/extract.test.ts`'s own `// --- generic types ---`\nsection proves these facts at the extractor's unit level; this file proves\nthe same facts are visible through the real MCP tool surface, which is the\ngap this test closes.\n\nRequires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs\n`npm run build` there whenever this crate is built.",
+  "signature": null,
+  "expected": "Acceptance test for generic-type references, over the whole real chain: a\nreal MCP client, the real shim, a real daemon, a real cold-start bulk index\ndriven by the real JS/TS plugin, and `find_references` answering off what\nthat produced.\n\nRequires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs\n`npm run build` there whenever this crate is built."
+ },
+ {
+  "rule": "long later paragraph",
+  "source": "g-mesh 0100221a42aab4e6228c5a2138213faf",
+  "doc": "Unit tests for the extractor, one per shape the task names.\n\nEvery one of them runs against a **real** [`ProjectContext`] built from a\nreal (temporary) crate on disk, rather than against\n`ProjectContext::default()`. That is not thoroughness for its own sake:\nthe default model places every file as an *orphan*, whose container key is\n`orphan:<path>` and whose crate root is itself - so `crate::`,\n`pub(crate)` and every cross-module address would be tested in the one\nconfiguration where they are all degenerate, and a test suite that passed\nwould say nothing about the case the plugin actually runs in.",
+  "signature": null,
+  "expected": "Unit tests for the extractor, one per shape the task names."
+ },
+ {
+  "rule": "google labels",
+  "source": "written",
+  "doc": "Parses the text.\n\nArgs:\n    text: the input.\n\nReturns:\n    The tree.\n\nRaises:\n    ValueError: when bad.",
+  "signature": "def parse(text)",
+  "expected": "Parses the text.\n\ndef parse(text)"
+ },
+ {
+  "rule": "jsdoc tags",
+  "source": "written",
+  "doc": "Calculates the deltas.\n\n@param prev - Previous.\n@param next - Next.\n@returns The delta.",
+  "signature": "function deltas(prev, next)",
+  "expected": "Calculates the deltas.\n\nfunction deltas(prev, next)"
+ },
+ {
+  "rule": "rest fields",
+  "source": "written",
+  "doc": "Sends the request.\n\n:param request: The request.\n:param timeout: How long\n    to wait.\n:rtype: Response",
+  "signature": "def send(self, request, timeout=None)",
+  "expected": "Sends the request.\n\ndef send(self, request, timeout=None)"
+ },
+ {
+  "rule": "doctest and usage",
+  "source": "written",
+  "doc": "The adapter.\n\nUsage::\n\n  >>> import requests\n  >>> s = requests.Session()\n\n>>> s.mount('https://', a)",
+  "signature": "class HTTPAdapter(BaseAdapter)",
+  "expected": "The adapter.\n\nclass HTTPAdapter(BaseAdapter)"
+ },
+ {
+  "rule": "link-only lines",
+  "source": "written",
+  "doc": "Reads it.\n\nSee: <https://example.com/wsl>\n\nMore in [`None`].\n[`None`]: https://example.com/option\nhttps://example.com/x",
+  "signature": "fn read()",
+  "expected": "Reads it.\n\nMore in [`None`].\n\nfn read()"
+ },
+ {
+  "rule": "code only, no signature",
+  "source": "written",
+  "doc": "```\nfn main() {}\n```",
+  "signature": null,
+  "expected": "```\nfn main() {}\n```"
+ },
+ {
+  "rule": "code only, with signature",
+  "source": "written",
+  "doc": "```\nfn main() {}\n```",
+  "signature": "fn main()",
+  "expected": "fn main()"
+ },
+ {
+  "rule": "signature only",
+  "source": "written",
+  "doc": null,
+  "signature": "fn f()",
+  "expected": "fn f()"
+ }
+]

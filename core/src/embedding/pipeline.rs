@@ -62,7 +62,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::EmbeddingConfig;
 use crate::embedding::cache::{self, EmbeddingCache, Hash, OpenError};
-use crate::embedding::model::{default_model_dir, EmbeddingModel, ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
+use crate::embedding::model::{
+    check_default_weights, default_model_dir, embedding_version, EmbeddingModel, ONNX_FILE_NAME,
+    TOKENIZER_FILE_NAME,
+};
+use crate::embedding::text::text_to_embed;
 use crate::storage::vectors;
 use crate::storage::write::Diff;
 
@@ -160,9 +164,10 @@ pub struct EmbedStats {
 /// A lazily-resolved embedding model plus the version string stored rows are
 /// tagged with, held for as long as the daemon runs.
 ///
-/// `version` is `config.embedding.model` - the project's *configured* choice.
-/// [`apply`](Self::apply) keeps `meta.embedding_model` mirroring this same
-/// value on every call (see `storage::schema::set_embedding_model`), so a
+/// `version` is [`embedding_version`] of `config.embedding.model` - the
+/// project's *configured* choice, plus which pinned weights of it for the
+/// default model (ADR 0011). [`apply`](Self::apply) keeps
+/// `meta.embedding_model` mirroring this same value on every call (see `storage::schema::set_embedding_model`), so a
 /// project's vector rows and its `meta` row always agree on which model
 /// produced them.
 ///
@@ -171,6 +176,13 @@ pub struct EmbedStats {
 /// never while taking another lock.
 pub struct EmbeddingPipeline {
     config: EmbeddingConfig,
+    /// [`embedding_version`] of `config.model`, computed once.
+    version: String,
+    /// Whether the directory must hold the default model's pinned weights
+    /// ([`check_default_weights`]) before it counts as available or loads:
+    /// true for the default model, false for any other and for a test's own
+    /// loader.
+    pinned_weights: bool,
     /// `None`: `default_model_dir(config.model)`.
     model_dir: Option<PathBuf>,
     loader: Loader,
@@ -198,10 +210,18 @@ impl EmbeddingPipeline {
     }
 
     fn build(config: &EmbeddingConfig, model_dir: Option<PathBuf>, cache: CacheSlot) -> Self {
+        let pinned_weights = config.model == EmbeddingConfig::default().model;
         Self {
             config: config.clone(),
+            version: embedding_version(&config.model),
+            pinned_weights,
             model_dir,
-            loader: Box::new(|dir| Ok(Box::new(EmbeddingModel::load(dir)?) as Box<dyn Embedder>)),
+            loader: Box::new(move |dir| {
+                if pinned_weights {
+                    check_default_weights(dir)?;
+                }
+                Ok(Box::new(EmbeddingModel::load(dir)?) as Box<dyn Embedder>)
+            }),
             model: OnceLock::new(),
             cache: Mutex::new(cache),
         }
@@ -234,6 +254,7 @@ impl EmbeddingPipeline {
         };
         let mut pipeline = Self::build(&EmbeddingConfig::default(), Some(model_dir.to_path_buf()), slot);
         pipeline.loader = Box::new(loader);
+        pipeline.pinned_weights = false;
         pipeline
     }
 
@@ -267,7 +288,7 @@ impl EmbeddingPipeline {
 
     /// The `embeddingVersion` this pipeline tags every vector it stores with.
     pub(crate) fn embedding_version(&self) -> &str {
-        &self.config.model
+        &self.version
     }
 
     /// Cheap check for whether the embedding backfill pass
@@ -288,13 +309,24 @@ impl EmbeddingPipeline {
     /// resolve to. `false` from either path means [`model`](Self::model)
     /// would return `None` if called right now; `true` is not a promise it
     /// will *succeed* (the files could still be corrupt), only that there is
-    /// something worth the load's cost.
+    /// something worth the load's cost. For the default model that includes
+    /// the size check the load itself makes first ([`check_default_weights`]),
+    /// so fp32 weights read as unavailable here too.
     pub fn is_available(&self) -> bool {
         if let Some(loaded) = self.model.get() {
             return loaded.is_some();
         }
         let Ok(dir) = self.model_dir() else { return false };
-        model_files_exist(&dir)
+        self.loadable_files(&dir)
+    }
+
+    /// Whether `dir` holds model files the loader would accept: both files
+    /// present and, for the default model, its pinned weights
+    /// ([`check_default_weights`]). The one gate for everything that uses the
+    /// weights without loading them - availability and the cache's
+    /// fingerprint - so neither trusts a file the load itself refuses.
+    fn loadable_files(&self, dir: &Path) -> bool {
+        model_files_exist(dir) && (!self.pinned_weights || check_default_weights(dir).is_ok())
     }
 
     /// Embeds a free-text query (`search_code`'s input) with the same model
@@ -505,8 +537,11 @@ impl EmbeddingPipeline {
     fn open_cache(&self, settings: &CacheSettings) -> Result<Option<ActiveCache>, ()> {
         let Ok(dir) = self.model_dir() else { return Ok(None) };
         // Without the model's files there is nothing to fingerprint, and no
-        // model to have produced a cached vector either.
-        if !model_files_exist(&dir) {
+        // model to have produced a cached vector either. Weights the loader
+        // refuses (an fp32 `model.onnx` under the default model) are not
+        // fingerprinted: their cached vectors would be stored under the int8
+        // `embeddingVersion`, and backfill would never re-embed them.
+        if !self.loadable_files(&dir) {
             return Ok(None);
         }
         let mut cache = match EmbeddingCache::open(&settings.path) {
@@ -584,15 +619,13 @@ impl EmbeddingPipeline {
         if computed.is_empty() {
             return;
         }
-        if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.config.model) {
+        if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.version) {
             eprintln!("g-mesh daemon: failed to record the active embedding model ({err:#})");
         }
         for entry in computed {
             match current_embeddable_text(conn, &entry.node_id) {
                 Ok(Some(current_text)) if current_text == entry.text => {
-                    if let Err(err) =
-                        vectors::insert(conn, &entry.node_id, &entry.embedding, &self.config.model)
-                    {
+                    if let Err(err) = vectors::insert(conn, &entry.node_id, &entry.embedding, &self.version) {
                         eprintln!(
                             "g-mesh daemon: failed to store the embedding for node {} ({err:#}) - it is \
                              left unembedded",
@@ -709,25 +742,6 @@ fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<St
     Ok(row.and_then(|(doc_comment, signature)| text_to_embed(doc_comment.as_deref(), signature.as_deref())))
 }
 
-/// Builds the text a node's doc comment and signature embed as, or `None` if
-/// there is nothing worth embedding.
-///
-/// `None` for both inputs, or for both trimming to nothing, are the same
-/// case: nothing to say about this symbol beyond what its name already
-/// carries, so no row is written at all rather than one embedding an empty
-/// or whitespace-only string.
-pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
-    let doc_comment = doc_comment.map(str::trim).filter(|s| !s.is_empty());
-    let signature = signature.map(str::trim).filter(|s| !s.is_empty());
-
-    match (doc_comment, signature) {
-        (Some(doc), Some(sig)) => Some(format!("{doc}\n\n{sig}")),
-        (Some(doc), None) => Some(doc.to_string()),
-        (None, Some(sig)) => Some(sig.to_string()),
-        (None, None) => None,
-    }
-}
-
 /// Embeds one node's doc comment/signature and stores the result, or does
 /// nothing if there is no embeddable text - the acceptance criterion that a
 /// node with neither must not embed an empty string.
@@ -829,6 +843,80 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
+    /// bytes: the weight check reads a length, never the bytes.
+    fn sized_model_dir(onnx_size: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join(ONNX_FILE_NAME)).unwrap().set_len(onnx_size).unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), b"{}").unwrap();
+        dir
+    }
+
+    /// The default model's `embeddingVersion` names its int8 weights and the
+    /// structured text form, so a vector the fp32 weights stored under the
+    /// bare model name, or one the untrimmed text made under `<model>+int8`,
+    /// is owed a re-embed (`embedding::backfill`'s
+    /// `a_vector_from_another_embedding_version_is_owed_a_re_embed`). Any
+    /// other model carries the text form too: its old vectors embedded the
+    /// untrimmed text as well.
+    ///
+    /// *Control:* make `embedding_version` return the model name unchanged,
+    /// or drop `TEXT_FORM_TAG` from it, and this fails.
+    #[test]
+    fn the_embedding_version_names_the_weights_and_the_text_form() {
+        let model = EmbeddingConfig::default().model;
+        let pipeline = EmbeddingPipeline::disabled();
+        assert_eq!(pipeline.embedding_version(), format!("{model}+int8+structured"));
+        assert_ne!(pipeline.embedding_version(), model, "fp32 vectors were tagged with the bare name");
+        assert_ne!(
+            pipeline.embedding_version(),
+            format!("{model}+int8"),
+            "untrimmed-text vectors carry this"
+        );
+
+        let other = EmbeddingConfig { model: "some-other-model".to_string() };
+        assert_eq!(EmbeddingPipeline::load(&other).embedding_version(), "some-other-model+structured");
+    }
+
+    /// An fp32 `model.onnx` is neither available nor loaded for the default
+    /// model: loading it would tag fp32 vectors
+    /// with the int8 version, and nothing would re-embed them after the
+    /// weights were replaced. The pinned size is available.
+    ///
+    /// *Control:* drop the `check_default_weights` call from the default
+    /// loader and from `is_available`: the fp32-sized directory reads as
+    /// available, and its load fails on the ONNX bytes instead, without
+    /// naming `g-mesh model fetch`.
+    #[test]
+    fn fp32_weights_are_not_loaded_for_the_default_model() {
+        let fp32 = sized_model_dir(641_517_466);
+        let pipeline = EmbeddingPipeline::build(
+            &EmbeddingConfig::default(),
+            Some(fp32.path().to_path_buf()),
+            CacheSlot::Off,
+        );
+        assert!(!pipeline.is_available(), "the fp32 file must not count as the default model");
+        let err = match (pipeline.loader)(fp32.path()) {
+            Ok(_) => panic!("the fp32 file must not load"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("g-mesh model fetch"), "{err}");
+        assert!(err.contains("641517466 bytes"), "{err}");
+
+        let int8 = sized_model_dir(crate::embedding::model::DEFAULT_ONNX_SIZE);
+        let pipeline = EmbeddingPipeline::build(
+            &EmbeddingConfig::default(),
+            Some(int8.path().to_path_buf()),
+            CacheSlot::Off,
+        );
+        assert!(pipeline.is_available(), "the pinned size is the default model");
+
+        // Another model's weights are not g-mesh's to pin.
+        let other = EmbeddingConfig { model: "some-other-model".to_string() };
+        let pipeline = EmbeddingPipeline::build(&other, Some(fp32.path().to_path_buf()), CacheSlot::Off);
+        assert!(pipeline.is_available());
+    }
 
     #[test]
     fn a_node_with_only_a_doc_comment_embeds_the_doc_comment_alone() {
@@ -1128,6 +1216,44 @@ mod tests {
         }
     }
 
+    /// A warm cache built from weights the default model refuses (not the
+    /// pinned size, as an fp32 `model.onnx` left over from 3.16 is) serves
+    /// nothing to the default pipeline: no vector is computed, and nothing is
+    /// stored under the int8 `embeddingVersion`.
+    ///
+    /// Control: drop the `check_default_weights` half of `loadable_files`
+    /// from `open_cache`'s early return (test `model_files_exist` alone) and
+    /// the pinned pipeline serves all 3 cached vectors and stores them.
+    #[test]
+    fn a_warm_cache_of_refused_weights_serves_nothing_to_the_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "fp32 weights");
+        assert_ne!(
+            std::fs::metadata(model_dir.join(ONNX_FILE_NAME)).unwrap().len(),
+            crate::embedding::model::DEFAULT_ONNX_SIZE
+        );
+        let diff = diff_of(3);
+
+        let counters = Counters::default();
+        fake_pipeline(&model_dir, Some(cache_at(dir.path())), &counters)
+            .compute(&diff, &mut EmbedStats::default());
+        assert_eq!(counters.embeds(), 3, "the cache is warm for these weights");
+
+        let pinned = EmbeddingPipeline::build(
+            &EmbeddingConfig::default(),
+            Some(model_dir.clone()),
+            CacheSlot::Unopened(Some(cache_at(dir.path()))),
+        );
+        let conn = index_with(&diff);
+        let mut stats = EmbedStats::default();
+        let computed = pinned.compute(&diff, &mut stats);
+        pinned.store(&conn, &computed);
+
+        assert_eq!(computed.len(), 0, "cached vectors of refused weights must not be served");
+        assert_eq!((stats.texts, stats.hits), (0, 0));
+        assert_eq!(vector_count(&conn), 0, "nothing is stored under {}", pinned.embedding_version());
+    }
+
     /// Same texts under a second fingerprint: nothing is shared.
     ///
     /// Control: drop the fingerprint from the key (e.g. make
@@ -1422,16 +1548,19 @@ mod tests {
     /// a format change fails here until the epoch is bumped and the digest
     /// below updated with it.
     ///
-    /// Control: change `text_to_embed`'s separator and this fails.
+    /// Control: change `full_text`'s separator, or `structured_doc`'s rules
+    /// (e.g. stop dropping `# Examples`), and this fails.
     #[test]
     fn the_pipeline_epoch_is_pinned_to_the_text_format() {
         use sha2::{Digest, Sha256};
-        let inputs: [(Option<&str>, Option<&str>); 5] = [
+        let inputs: [(Option<&str>, Option<&str>); 7] = [
             (Some("  Reads a file.  "), Some(" fn read(path: &Path) -> String ")),
             (Some("Reads a file."), None),
             (None, Some("fn read()")),
             (Some(" \n"), Some("\tfn x()")),
             (None, None),
+            (Some("Reads a file.\n\n# Examples\n\n```\nread(p);\n```\n\n@param p path"), Some("fn read(p)")),
+            (Some("```\nread(p);\n```"), None),
         ];
         let mut hasher = Sha256::new();
         for (doc, signature) in inputs {
@@ -1440,7 +1569,7 @@ mod tests {
         let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             (crate::embedding::cache::PIPELINE_EPOCH, digest.as_str()),
-            (1, "fa199d7fbc4ca707c83707eac28bd687701c737343d062ff19b7400590b19440"),
+            (2, "e01665d9df57555d954646f4c91bee489f90d6e07648c9acc4e72a2632d9bb89"),
             "text_to_embed's output changed: bump PIPELINE_EPOCH and update this digest"
         );
     }

@@ -25,7 +25,7 @@
 //!
 //! # Where the weights come from
 //!
-//! They are not vendored - `model.onnx` alone is ~610 MiB, which has no
+//! They are not vendored - `model.onnx` alone is ~154 MiB, which has no
 //! business in a git repo. This module *reads* an already-present model
 //! directory and never downloads anything; fetching is a separate, explicit
 //! step so that no g-mesh code path can quietly reach the network. For the
@@ -35,9 +35,15 @@
 //! ```text
 //! https://huggingface.co/jinaai/jina-embeddings-v2-base-code
 //!   revision 516f4baf13dec4ddddda8631e019b5737c8bc250
-//!   onnx/model.onnx  -> <model dir>/model.onnx
-//!   tokenizer.json   -> <model dir>/tokenizer.json
+//!   onnx/model_quantized.onnx -> <model dir>/model.onnx
+//!   tokenizer.json            -> <model dir>/tokenizer.json
 //! ```
+//!
+//! The int8 quantization, not the fp32 `onnx/model.onnx`
+//! (`docs/adr/0011-embedding-model-int8.md`). It is written as `model.onnx`:
+//! the loader's file name is the same for every encoder it loads (the
+//! embedding eval harness included), so only the fetcher knows which export
+//! of the repository it came from.
 //!
 //! `g-mesh model fetch` (see [`crate::cli::model`]) does exactly that, into the
 //! directory [`resolve_model_dir`] resolves to - it is a user-typed command,
@@ -78,6 +84,72 @@ use tokenizers::TruncationParams;
 /// out.
 pub(crate) const ONNX_FILE_NAME: &str = "model.onnx";
 pub(crate) const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
+
+/// The default model's weights file inside its repository at
+/// `cli::model::MODEL_REVISION`: the int8 export (ADR 0011). Written to
+/// [`ONNX_FILE_NAME`] in the model directory.
+pub(crate) const DEFAULT_ONNX_REMOTE_PATH: &str = "onnx/model_quantized.onnx";
+
+/// Byte size of [`DEFAULT_ONNX_REMOTE_PATH`] at the pinned revision, from the
+/// downloaded file (and Hugging Face's `x-linked-size` for it).
+pub(crate) const DEFAULT_ONNX_SIZE: u64 = 161_895_621;
+
+/// SHA-256 of [`DEFAULT_ONNX_REMOTE_PATH`] at the pinned revision, computed
+/// from the downloaded file and matching Hugging Face's LFS `x-linked-etag`
+/// for it. `g-mesh model fetch` verifies every download against it.
+pub(crate) const DEFAULT_ONNX_SHA256: &str =
+    "ed45870251c9f0cf656e78aab0d37a23489066df8a222bb1c8caf8a45f2cb16d";
+
+/// Which weights of the default model its vectors are tagged with, as part of
+/// [`embedding_version`]. Changed whenever the pinned weights change, so every
+/// vector the old weights made is owed a re-embed: `embedding::backfill` and
+/// `storage::language_swap` both re-embed a row whose `embeddingVersion` is
+/// not the pipeline's. Vectors from the fp32 weights carry the bare model
+/// name.
+const DEFAULT_WEIGHTS_TAG: &str = "int8";
+
+/// Which text form every model's vectors are tagged with, as part of
+/// [`embedding_version`]: `embedding::text::text_to_embed`'s. Changed
+/// whenever that function's output changes for any node, so every vector made
+/// from the old text is owed a re-embed, under any model. Vectors from the
+/// untrimmed doc comment carry no text tag.
+const TEXT_FORM_TAG: &str = "structured";
+
+/// The `embeddingVersion` a pipeline configured with `model_name` stores its
+/// vectors under: the default model's name plus [`DEFAULT_WEIGHTS_TAG`], or
+/// any other model's name as configured (its weights are not g-mesh's to
+/// pin), then [`TEXT_FORM_TAG`].
+pub(crate) fn embedding_version(model_name: &str) -> String {
+    if model_name == crate::config::EmbeddingConfig::default().model {
+        format!("{model_name}+{DEFAULT_WEIGHTS_TAG}+{TEXT_FORM_TAG}")
+    } else {
+        format!("{model_name}+{TEXT_FORM_TAG}")
+    }
+}
+
+/// Whether `model_dir`'s weights are the default model's pinned ones, by size.
+///
+/// A stat, not a digest: the case it exists for is an fp32 `model.onnx`
+/// (641,517,466 bytes) in the default model's directory, which size alone
+/// tells apart, and the daemon asks this before every load. A missing
+/// file is not this check's business: [`EmbeddingModel::load`] reports it.
+/// Loading the old weights anyway would tag fp32 vectors with the int8
+/// [`embedding_version`], and nothing would ever re-embed them.
+pub(crate) fn check_default_weights(model_dir: &Path) -> Result<()> {
+    let path = model_dir.join(ONNX_FILE_NAME);
+    let Ok(meta) = std::fs::metadata(&path) else { return Ok(()) };
+    if meta.len() != DEFAULT_ONNX_SIZE {
+        bail!(
+            "{} is {} bytes, not the {DEFAULT_ONNX_SIZE} bytes of the pinned weights (g-mesh switched \
+             to the int8 model; this is likely the fp32 file it replaced).\n\
+             Replace it: g-mesh model fetch --dir {}",
+            path.display(),
+            meta.len(),
+            model_dir.display()
+        );
+    }
+    Ok(())
+}
 
 /// ONNX graph input/output names. BERT-style encoders exported by
 /// `transformers` use exactly these; they are addressed by name rather than by
@@ -362,7 +434,7 @@ impl EmbeddingModel {
 /// L2-normalizes.
 ///
 /// Split out from [`EmbeddingModel::embed`] so the arithmetic that decides
-/// what a vector *means* can be tested without 610 MiB of weights on disk.
+/// what a vector *means* can be tested without 154 MiB of weights on disk.
 fn pool(
     pooling: Pooling,
     dimension: usize,
@@ -439,7 +511,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// `~/.g-mesh/` is already where g-mesh keeps everything else it owns (indexes
 /// and config), and models are per-machine rather than per-project - the same
-/// 610 MiB should not be downloaded once per indexed repository - so they sit
+/// 154 MiB should not be downloaded once per indexed repository - so they sit
 /// beside `projects/` rather than inside it.
 ///
 /// Deliberately anchored to the real home even when `G_MESH_HOME`
@@ -447,7 +519,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// override exists so a test run stops writing project directories into the
 /// developer's home, and weights are an immutable per-machine cache rather
 /// than per-run state. Moving them with it would turn every isolated run into
-/// a 612 MiB download. Use `G_MESH_MODEL_DIR` to move them on purpose.
+/// a 154 MiB download. Use `G_MESH_MODEL_DIR` to move them on purpose.
 pub fn default_model_dir(model_name: &str) -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(MODEL_DIR_ENV) {
         return Ok(PathBuf::from(dir));
@@ -624,7 +696,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests that need the real weights
     //
-    // These are `#[ignore]`d because they need ~610 MiB of model files that
+    // These are `#[ignore]`d because they need ~154 MiB of model files that
     // are not in the repo, and they take seconds rather than milliseconds. To
     // run them:
     //

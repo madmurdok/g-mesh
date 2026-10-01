@@ -211,8 +211,15 @@ minutes at load average ~200, which is a moving index, not a stable arm.
 
 
 That is `jina-embeddings-v2-base-code` (Apache-2.0), pinned to revision
-`516f4baf13dec4ddddda8631e019b5737c8bc250`, and `model.onnx` alone is ~612 MiB
-— which is why it is neither vendored nor downloaded behind your back. Each
+`516f4baf13dec4ddddda8631e019b5737c8bc250`, in its int8 quantization
+(`onnx/model_quantized.onnx`, saved as `model.onnx`, ~154 MiB; embedding peaks
+at about 0.8 GB of RSS) — which is why it is neither vendored nor downloaded
+behind your back. Releases before 3.17.0 shipped the fp32 export (~612 MiB, about
+1.6 GB of RSS while embedding); int8 matched it on retrieval and in an
+agent-level check ([ADR 0011](docs/adr/0011-embedding-model-int8.md)). If you
+fetched the fp32 weights before, run `g-mesh model fetch` again: it replaces a
+`model.onnx` of the wrong size, the daemon will not load the old one, and
+every stored vector is re-embedded once in the background. Each
 file is checked against a pinned SHA-256 and only then moved into place, so an
 interrupted download leaves a `.partial` you can delete, never a truncated
 `model.onnx` that loads as garbage. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
@@ -642,6 +649,14 @@ signatures, ranked by similarity. It is the one tool with a prerequisite —
 the embedding model above — and the one whose top hit is a ranked guess
 rather than a resolved graph answer.
 
+What gets embedded is each symbol's doc comment trimmed to its prose — the
+summary, headings and short paragraphs; code examples, parameter and return
+lists and link-only lines dropped — then its signature
+([ADR 0012](docs/adr/0012-embedded-text-structured.md)). An index whose
+vectors embedded the whole doc comment is re-embedded once, in the
+background, on upgrade; until that finishes `search_code` ranks a mix of old
+and new vectors.
+
 ## Known limits
 
 **Computed `import()`/`require()` specifiers.** `import(\`./plugins/${name}/index.js\`)`
@@ -669,7 +684,7 @@ this repository's own test suite uses to stop writing into the developer's
 state (see "Run tests"), and it makes a sandboxed or throwaway g-mesh possible
 without touching your real one. It does *not* move the embedding model —
 that is a per-machine cache with its own `G_MESH_MODEL_DIR`, and moving it
-would mean re-downloading 612 MiB — nor `~/.g-mesh/bin`, which belongs to the
+would mean re-downloading 154 MiB — nor `~/.g-mesh/bin`, which belongs to the
 installer, not to the binary.
 
 Embedding vectors are also cached machine-wide, in
@@ -1007,7 +1022,7 @@ reformat that made the check passable is listed in `.git-blame-ignore-revs`, so
 
 Still only local, deliberately:
 
-- **The embedding-weights tests**, which stay `#[ignore]`d. 612 MiB per runner
+- **The embedding-weights tests**, which stay `#[ignore]`d. 154 MiB per runner
   on four runners is not a cost worth paying to check that a download works.
 - **The benchmarks** (`g-mesh-bench`), which cost model spend per run.
 
@@ -1029,7 +1044,7 @@ nothing here is copyleft.
 
 **The embedding model is not part of this repository.** `search_code` needs a
 model directory that you fetch yourself (see "Embedding model" above —
-`model.onnx` alone is ~610 MiB, which is why it is not vendored). The default
+`model.onnx` alone is ~154 MiB, which is why it is not vendored). The default
 model, `jina-embeddings-v2-base-code`, is Apache-2.0, so redistributing it
 inside a machine image or container is permitted under its own terms; if you
 point g-mesh at a different model, check that model's license yourself.
