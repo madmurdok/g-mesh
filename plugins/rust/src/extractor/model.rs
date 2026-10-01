@@ -84,7 +84,7 @@ impl FileModel {
         }
     }
 
-    /// Records a declaration under its full `tail` only (`T::f` for a struct
+    /// Records a declaration under its full `tail` only (`T.f` for a struct
     /// field). A field's bare name is never a path in Rust - it is reached
     /// only through a value or a type - so a bare identifier written in the
     /// module must not resolve to it.

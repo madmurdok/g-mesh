@@ -745,7 +745,7 @@ fn an_orphan_file_is_indexed_under_its_synthetic_container() {
 
 // --- struct fields (docs/architecture/gm-450-rust-fields.md) -------------------
 
-/// A named field is a `Variable`/`field` node named `T::f` within its module,
+/// A named field is a `Variable`/`field` node named `T.f` within its module,
 /// beside the inherent methods; tuple-struct and enum-variant fields are not
 /// nodes. Its uses are references: `self.f` in the impl and a literal's or
 /// pattern's field names by address, `x.f` on any other receiver as an open
@@ -788,15 +788,15 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
         ),
     ]);
     let store = krate.extract("src/store.rs");
-    let field = store.node("store::Ledger::all_unresolved");
+    let field = store.node("store::Ledger.all_unresolved");
     assert_eq!((field.kind, field.native_kind.as_deref()), (NodeKind::Variable, Some("field")));
     assert_eq!(field.name, "all_unresolved");
     assert_eq!(field.signature.as_deref(), Some("pub all_unresolved: bool"));
     assert_eq!(field.doc_comment.as_deref(), Some("Whether every row is unresolved."));
     assert_eq!(field.visibility, Visibility::Public);
     assert_eq!(field.container.as_deref(), store.node("store::Ledger::settle").container.as_deref());
-    assert_eq!(store.node("store::Ledger::truncated_by").native_kind.as_deref(), Some("field"));
-    assert_eq!(store.node("store::Ledger::secret").visibility, Visibility::Container("krate::store".into()));
+    assert_eq!(store.node("store::Ledger.truncated_by").native_kind.as_deref(), Some("field"));
+    assert_eq!(store.node("store::Ledger.secret").visibility, Visibility::Container("krate::store".into()));
     assert_eq!(store.node("store::Ledger::settle").native_kind.as_deref(), Some("method"));
     let fields: Vec<_> =
         store.0.nodes.iter().filter(|node| node.native_kind.as_deref() == Some("field")).collect();
@@ -805,7 +805,7 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     // `self.f` inside `impl Ledger` lands on the field, same file.
     assert_eq!(
         store.targets(EdgeKind::References, "store::Ledger::settle"),
-        vec!["store::Ledger::all_unresolved", "store::Ledger::truncated_by"]
+        vec!["store::Ledger.all_unresolved", "store::Ledger.truncated_by"]
     );
     // A field is never a bare name: `truncated_by` here is the free function.
     assert_eq!(store.targets(EdgeKind::References, "store::pick"), vec!["store::truncated_by"]);
@@ -817,15 +817,15 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
         tally,
         vec![
             "pending_symbol krate::store::Ledger",
-            "pending_symbol krate::store::store::Ledger::all_unresolved",
-            "pending_symbol krate::store::store::Ledger::truncated_by",
+            "pending_symbol krate::store::store::Ledger.all_unresolved",
+            "pending_symbol krate::store::store::Ledger.truncated_by",
         ]
     );
     for name in ["all_unresolved", "truncated_by"] {
         let placeholder = user.placeholder("pending_symbol", name);
         assert_eq!(
             user.target_of(placeholder),
-            (container("krate::store"), TargetKey::QualifiedName(format!("store::Ledger::{name}")))
+            (container("krate::store"), TargetKey::QualifiedName(format!("store::Ledger.{name}")))
         );
     }
     // The trailing `ledger.all_unresolved` read is a question for the
@@ -841,8 +841,79 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     // A destructuring pattern names the field too.
     assert!(
         user.targets(EdgeKind::References, "user::drain")
-            .contains(&"pending_symbol krate::store::store::Ledger::truncated_by".to_string()),
+            .contains(&"pending_symbol krate::store::store::Ledger.truncated_by".to_string()),
         "{:?}",
         user.targets(EdgeKind::References, "user::drain")
+    );
+}
+
+/// A getter named like its field: the field is `T.f`, the method `T::f`, two
+/// nodes under two keys. Calls - `self.f()`, `Self::f(..)`, `T::f(..)` from
+/// another file - reach the method; `self.f`, a literal's and a pattern's
+/// field names reach the field; the method's own body is attributed to the
+/// method, so the field has no outgoing edge at all.
+#[test]
+fn a_getter_named_like_its_field_keeps_its_calls_and_the_field_keeps_its_references() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub struct Holder {
+    pub inner: u8,
+}
+impl Holder {
+    pub fn inner(&self) -> u8 { self.inner }
+    pub fn twice(&self) -> u8 { self.inner() + Self::inner(self) }
+}
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+use crate::store::Holder;
+pub fn make() -> Holder { Holder { inner: 1 } }
+pub fn get(holder: &Holder) -> u8 { Holder::inner(holder) }
+pub fn take(holder: Holder) -> u8 { let Holder { inner } = holder; inner }
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    let field = store.node("store::Holder.inner");
+    let method = store.node("store::Holder::inner");
+    assert_eq!((field.kind, field.native_kind.as_deref()), (NodeKind::Variable, Some("field")));
+    assert_eq!((method.kind, method.native_kind.as_deref()), (NodeKind::Function, Some("method")));
+    assert_ne!(field.id, method.id);
+
+    // The getter's body is the getter's: one reference, to the field.
+    assert_eq!(store.targets(EdgeKind::References, "store::Holder::inner"), vec!["store::Holder.inner"]);
+    let field_id = field.id.clone();
+    let out_of_field: Vec<_> = store.0.edges.iter().filter(|edge| edge.from_id == field_id).collect();
+    assert!(out_of_field.is_empty(), "a field has no body: {out_of_field:#?}");
+    // Both calls in `twice` reach the method, never the field.
+    let mut calls = store.targets(EdgeKind::Calls, "store::Holder::twice");
+    calls.dedup();
+    assert_eq!(calls, vec!["store::Holder::inner"]);
+    assert!(store.targets(EdgeKind::References, "store::Holder::twice").is_empty());
+
+    let user = krate.extract("src/user.rs");
+    let field_ref = "pending_symbol krate::store::store::Holder.inner".to_string();
+    let method_ref = "pending_symbol krate::store::store::Holder::inner".to_string();
+    assert!(user.targets(EdgeKind::References, "user::make").contains(&field_ref));
+    assert!(user.targets(EdgeKind::References, "user::take").contains(&field_ref));
+    assert_eq!(user.targets(EdgeKind::Calls, "user::get"), vec![method_ref]);
+    assert!(!user.targets(EdgeKind::References, "user::get").contains(&field_ref));
+    let keys: Vec<_> = user
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("pending_symbol") && node.name == "inner")
+        .map(|node| user.target_of(node))
+        .collect();
+    assert!(
+        keys.contains(&(container("krate::store"), TargetKey::QualifiedName("store::Holder.inner".into())))
+    );
+    assert!(
+        keys.contains(&(container("krate::store"), TargetKey::QualifiedName("store::Holder::inner".into())))
     );
 }

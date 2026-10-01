@@ -10,7 +10,7 @@
 //! | `type A = …` | `Type` | `type_alias` | `A` |
 //! | `trait Tr` | `Type` | `trait` | `Tr` |
 //! | `const C` / `static S` | `Variable` | `const` / `static` | `C` / `S` |
-//! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T::f` |
+//! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T.f` |
 //! | `macro_rules! m` | `Function` | `macro` | `m` |
 //! | `mod m` | `Module` | `module` | `m` |
 //! | `impl T { fn m }` | `Function` | `method` | `T::m` |
@@ -23,8 +23,9 @@
 //! cares about. Enum variants and tuple-struct fields are *not* nodes: a
 //! variant's fields would hang off a variant that is not one, and `.0` has
 //! no name a query could carry. A named field is registered in the file
-//! model by its `T::f` tail only, never by its bare name, so a bare
-//! identifier written in the module cannot resolve to a field.
+//! model by its `T.f` tail only, never by its bare name, so a bare
+//! identifier written in the module cannot resolve to a field, and a method
+//! `T::f` of the same name keeps its own key, node and `qualifiedName`.
 //!
 //! `qualifiedName` prefixes each of those with the module path
 //! ([`keys`](super::keys), Decision 2), and the id is derived from it, so two
@@ -121,6 +122,14 @@ impl BlockCtx {
     pub(crate) fn tail(&self, name: &str) -> String {
         format!("{}::{}", self.prefix, name)
     }
+}
+
+/// A named field's full name within its module: `T.f`. The `.` keeps it
+/// apart from `T::f`, the address of an associated item of the same name -
+/// a getter named after its field is common, and the two must never share a
+/// `qualifiedName`, a node id or a file-model key.
+pub(crate) fn field_tail(type_name: &str, field: &str) -> String {
+    format!("{type_name}.{field}")
 }
 
 /// A member's full name within its module, whether or not it is in a block.
@@ -307,7 +316,7 @@ impl Declarer<'_, '_> {
     }
 
     /// The named fields of a `struct`/`union`, each a `Variable`/`field` node
-    /// named `T::f` within the module - the same shape as an inherent method.
+    /// named [`field_tail`] (`T.f`) within the module.
     /// A tuple struct's `ordered_field_declaration_list` has no names and
     /// declares nothing.
     fn fields(&mut self, item: Node, module: &ModuleCtx) {
@@ -322,7 +331,7 @@ impl Declarer<'_, '_> {
                 continue;
             }
             let Some(name) = item_name(field, self.source) else { continue };
-            let tail = format!("{type_name}::{name}");
+            let tail = field_tail(type_name, name);
             let own = visibility(field, module, self.source);
             let mut spec = NodeSpec::new(
                 NodeKind::Variable,

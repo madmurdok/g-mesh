@@ -107,14 +107,16 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // page is empty in both arms, which is the hazard that entry exists to record.
 // Includes the struct-field and `Type::method` entries at the end of the
 // file: two `[[definition]]`s, one `[[refusal]]` and two `[[references]]`, one
-// of which (the field read through a variable receiver) is semantic.
-const EXPECTATIONS: usize = 27;
+// of which (the field read through a variable receiver) is semantic, plus the
+// getter-named-like-its-field pair: one `[[callers]]` for the method and one
+// `[[references]]` for the field.
+const EXPECTATIONS: usize = 29;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of
 // the usages in shapes.rs are the semantic tier's. That fixture entry's own
 // comment has the measurement and what arm 2 gives up for it.
-// 7 with `[[references]] gaps::Ledger::all_unresolved`, whose
+// 7 with `[[references]] gaps::Ledger.all_unresolved`, whose
 // `internals::peek` row is a field read only rust-analyzer resolves.
 const SEMANTIC_EXPECTATIONS: usize = 7;
 

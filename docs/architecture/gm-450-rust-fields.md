@@ -2,7 +2,9 @@
 
 Status: fields implemented as proposed below, including the semantic open
 sites for `x.f` (owner decision, 2026-10-01). Partial qualified-name lookup
-(`Type::method`) is a separate resolver task.
+(`Type::method`) is a separate resolver task. A field's qualifiedName is
+`<module path>::T.field`, not `::T::field` as first proposed (owner
+decision, 2026-10-01; see "Why `T.f`" below).
 
 ## Reproduction
 
@@ -78,8 +80,9 @@ also a cross-language inconsistency the owner should accept knowingly.
 ### Fields
 
 - **Node**: `kind` `Variable`, `nativeKind` `field`, `name` the field name,
-  qualifiedName `<module path>::T::field`, the same shape as an inherent
-  method (`store::Ledger::all_unresolved` beside `store::Ledger::settle`).
+  qualifiedName `<module path>::T.field` (`store::Ledger.all_unresolved`
+  beside the inherent method `store::Ledger::settle`); the file model keys
+  it by the tail `T.field`.
   `Variable` is the existing kind for named values (`const`, `static`,
   `assoc_const`); no `NodeKind` variant is added (`wire/src/lib.rs:77-83`
   stays five kinds).
@@ -92,16 +95,41 @@ also a cross-language inconsistency the owner should accept knowingly.
 - **Signature**: `pub all_unresolved: bool` (the field's own text), doc
   comment as for any item.
 - **Uses** (`REFERENCES` edges):
-  - structural: `self.f` inside `impl T` binds to `T::f` the way
-    `receiver_call` binds `self.m()` (`bodies.rs:512-528`); `T { f: .. }` and
-    `T { f, .. }` bind to `<resolved T>::f`, through the same placeholder
-    path a cross-file `T::m` call takes;
+  - structural: `self.f` inside `impl T` binds to `T.f` in the container
+    `self.m()` would address; `T { f: .. }` and `T { f, .. }` bind to
+    `<resolved T>.f`, through the same qualifiedName placeholder path a
+    cross-file `T::m` call takes;
   - semantic: `x.f` with an unknown receiver becomes an
     `OpenSiteKind::Reference` open site. The SDK's LSP bridge already asks
     `textDocument/definition` for every non-implementation open site and maps
     the answer through `SdkIndex::node_at` (`plugins/sdk/src/lsp/bridge.rs:
     155-170`), so rust-analyzer's answer lands on the new field node with no
     bridge change.
+
+#### Why `T.f`
+
+The first cut named a field `T::f`, the shape of an inherent method. A getter
+named like its field (`inner` and `fn inner()`) then had the same
+qualifiedName as the field; g-mesh's own code has 50 such pairs. The fresh
+verify slice measured three consequences, each from that one shared key:
+
+- the file model keeps the first declaration under a tail, and the struct
+  usually precedes its `impl`, so `self.inner()` bound to the *field*: 34
+  method calls in g-mesh moved off the method, which then showed 0 callers;
+- a method body's edges are attributed by the same tail lookup, so the
+  getter's body was attributed to the field (`self.inner` became a
+  field-to-field self-loop);
+- core's linker resolves a qualifiedName placeholder to the one candidate
+  that fits; `REFERENCES` accepts any kind, so a cross-file struct-literal
+  field met two candidates (field and method) and stayed unresolved.
+
+Rust's own syntax already separates the two namespaces: an associated item
+is reached by a path (`T::f`), a field only through a value (`x.f`). So a
+field takes `.` and an associated item keeps `::`, and no field can share a
+qualifiedName, a node id or a file-model key with a method, constant or
+type alias of `T`. Method calls (`self.f()`, `T::f(..)`, `Self::f(..)`)
+look up `T::f`; field reads, literal fields and pattern fields look up
+`T.f`.
 
 ### Inherent methods by `Type::method`
 

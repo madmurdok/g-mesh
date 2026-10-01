@@ -17,8 +17,13 @@ pub fn published() -> u8 {
 
 /// The cross-file use of `gaps::Ledger`'s fields and inherent method.
 pub fn tally() -> bool {
-    let ledger = crate::gaps::Ledger { all_unresolved: true, truncated_by: None };
+    let ledger = crate::gaps::Ledger { all_unresolved: true, truncated_by: None, inner: 0 };
     ledger.settle() && ledger.all_unresolved
+}
+
+/// A cross-file call to the getter named like its field, by path.
+pub fn read_inner(ledger: &crate::gaps::Ledger) -> u8 {
+    crate::gaps::Ledger::inner(ledger)
 }
 
 /// A field read through a variable receiver, and nothing else.

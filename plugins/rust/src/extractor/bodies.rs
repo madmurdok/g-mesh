@@ -11,7 +11,7 @@
 //! | `a::b::f()` | a `name` key in the container `a::b` resolves to |
 //! | `T::f()`, `Self::f()`, `self.f()` | a `qualifiedName` key - `…::T::f` - in the container `T` lives in |
 //! | `x.m()` | nothing: an open site for the semantic tier |
-//! | `self.f`, `T { f: .. }`, `T { f, .. }` | a `qualifiedName` key - `…::T::f` - like `self.m()` |
+//! | `self.f`, `T { f: .. }`, `T { f, .. }` | a `qualifiedName` key - `…::T.f` - in the container `T` lives in |
 //! | `x.f` | nothing: an open site for the semantic tier |
 //!
 //! The split between the second and third rows is the naming convention
@@ -61,7 +61,7 @@ use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey, 
 use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
-use crate::extractor::decls::{impl_block, member_tail, trait_block, BlockCtx, Family};
+use crate::extractor::decls::{field_tail, impl_block, member_tail, trait_block, BlockCtx, Family};
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{qualified_in, resolve_module_path, visibility, ModuleCtx, PathTarget};
 use crate::extractor::model::{FileModel, Import};
@@ -547,8 +547,8 @@ impl Bodies<'_, '_> {
         self.open_site(from, field, name, module, OpenSiteKind::ReceiverCall, EdgeKind::Calls);
     }
 
-    /// `x.f` read as a value. `self.f` inside an `impl T` is `T::f`, the same
-    /// address `self.m()` takes; any other receiver's type is unknown here,
+    /// `x.f` read as a value. `self.f` inside an `impl T` is the field `T.f`
+    /// of the type `self.m()` addresses; any other receiver's type is unknown here,
     /// so the field becomes an open site. `x.0` names nothing.
     fn field_access(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         let Some(value) = node.child_by_field_name("value") else { return };
@@ -561,7 +561,7 @@ impl Bodies<'_, '_> {
         if value.kind() == "self" {
             if let Some(block) = block.filter(|block| block.family != Family::TraitDecl) {
                 let (container, type_name) = self.type_address(&block.self_type, module);
-                let bound = self.member_of(&container, &type_name, name, module);
+                let bound = self.field_of(&container, &type_name, name, module);
                 self.emit(bound, EdgeKind::References, from, field, module, OpenSiteKind::Reference);
                 return;
             }
@@ -571,7 +571,7 @@ impl Bodies<'_, '_> {
     }
 
     /// Every field named in a struct literal or struct pattern (`list`), as
-    /// a reference to `T::f` of the type `name` resolves to. A type that does
+    /// a reference to the field `T.f` of the type `name` resolves to. A type that does
     /// not resolve to a struct this tier can address - an enum variant
     /// (`E::V { .. }`), a generic parameter, another crate's type, a name
     /// from a glob import - names no field node, and emits nothing.
@@ -602,7 +602,7 @@ impl Bodies<'_, '_> {
             })
             .collect();
         for field in fields {
-            let bound = self.member_of(&container, &type_name, text(field, self.source), module);
+            let bound = self.field_of(&container, &type_name, text(field, self.source), module);
             self.emit(bound, EdgeKind::References, from, field, module, OpenSiteKind::Reference);
         }
     }
@@ -931,14 +931,23 @@ impl Bodies<'_, '_> {
     /// when this file makes it and as a `qualifiedName` placeholder
     /// otherwise.
     fn member_of(&self, container: &str, type_name: &str, member: &str, module: &ModuleCtx) -> Bound {
-        let tail = format!("{type_name}::{member}");
-        if let Some(decl) = self.model.lookup_tail(container, &tail) {
+        self.tail_in(container, &format!("{type_name}::{member}"), member, module)
+    }
+
+    /// The address of the named field `T.field` in `container`, the same way
+    /// as [`member_of`](Self::member_of) - never a same-named method.
+    fn field_of(&self, container: &str, type_name: &str, field: &str, module: &ModuleCtx) -> Bound {
+        self.tail_in(container, &field_tail(type_name, field), field, module)
+    }
+
+    fn tail_in(&self, container: &str, tail: &str, member: &str, module: &ModuleCtx) -> Bound {
+        if let Some(decl) = self.model.lookup_tail(container, tail) {
             return Bound::Here(decl.id.clone());
         }
         Bound::There {
             target: container_target(
                 container,
-                TargetKey::QualifiedName(qualified_in(container, &tail)),
+                TargetKey::QualifiedName(qualified_in(container, tail)),
                 &module.key,
             ),
             name: member.to_string(),
