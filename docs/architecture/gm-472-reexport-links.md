@@ -232,6 +232,29 @@ about 1,500 s. In the Rust linker it is a rounding error. Placeholders whose
 scope has no re-export pay one keyed `hops` lookup each (2,870 here,
 memoized per scope).
 
+### Measured after S6
+
+`g-mesh reindex` (semantic passes and embeddings on) of the tree at
+`389c36b`, once with the build before this change (`3ebcf4c`) and once with
+it, same plugins (`G_MESH_PLUGIN_ROOTS_OVERRIDE`), separate `G_MESH_HOME`s.
+Both indexes have 20,444 nodes and 52,467 edges with identical edge ids.
+
+| | before | after |
+|---|---|---|
+| `CALLS` resolved / total | 11,443 / 14,182 | 11,591 / 14,182 |
+| `REFERENCES` resolved / total | 12,316 / 14,174 | 12,578 / 14,174 |
+| unresolved `qualifiedName`-keyed usage edges | 3,492 | 3,082 |
+
+**410 edges newly link**: 261 field `REFERENCES`, 148 method `CALLS`, and 1
+method `REFERENCES` (`QualifiedPath::head` passed as a function value). By
+scope: `g_mesh::protocol::types` 193, `g_mesh_plugin_sdk` 120,
+`g_mesh_plugin_sdk::lsp` 65, `g_mesh::embedding` 32. No edge that was
+resolved before is unresolved or points elsewhere after. S1's 375 was
+simulated on an older, smaller tree (`0344cf3`, 17,716 nodes).
+Wall time (`real 1909.93`/`855.38`, `user 3307.61`/`2254.66`, load average
+64 to 168) is dominated by the semantic pass and embeddings under load and
+says nothing about the linker.
+
 ## Interplay with GM-469
 
 GM-469 (branch `feat/GM-469-qualified-name-suffix-rung`, design only) adds a
