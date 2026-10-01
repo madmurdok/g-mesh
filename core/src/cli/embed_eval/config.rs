@@ -89,16 +89,16 @@ pub enum Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TextForm {
-    /// `text_to_embed`'s output, what production embeds.
+    /// The whole doc comment, then the signature (`embedding::text::full_text`).
     #[default]
     Full,
     /// The doc comment cut at its first blank line, then the signature, in
-    /// `text_to_embed`'s layout.
+    /// `full_text`'s layout.
     FirstParagraph,
-    /// The doc comment trimmed to its prose outline by
-    /// `structured::structured_doc` (summary, headings, short paragraphs; no
-    /// code, parameter lists or link lines), then the signature, in
-    /// `text_to_embed`'s layout.
+    /// What production embeds: `embedding::text::text_to_embed`, the doc
+    /// comment trimmed to its prose outline (summary, headings, short
+    /// paragraphs; no code, parameter lists or link lines), then the
+    /// signature.
     Structured,
 }
 

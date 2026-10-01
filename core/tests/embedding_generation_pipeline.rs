@@ -232,8 +232,8 @@ fn indexing_a_fixture_file_embeds_its_documented_symbols() {
         .unwrap();
     // sqlite-vec's packed format: 4 bytes per f32 dimension.
     assert_eq!(embedding_len, (g_mesh::embedding::EMBEDDING_DIM as i64) * 4);
-    // The default model's version names its pinned int8 weights.
-    assert_eq!(version, format!("{}+int8", g_mesh::config::EmbeddingConfig::default().model));
+    // The default model's version names its pinned int8 weights and the text form.
+    assert_eq!(version, format!("{}+int8+structured", g_mesh::config::EmbeddingConfig::default().model));
 }
 
 /// GM-395's slice 1 acceptance criterion: a structural-only walk
@@ -278,7 +278,7 @@ fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
 
     let recorded: Option<String> =
         conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
-    let expected = format!("{}+int8", g_mesh::config::EmbeddingConfig::default().model);
+    let expected = format!("{}+int8+structured", g_mesh::config::EmbeddingConfig::default().model);
     assert_eq!(recorded.as_deref(), Some(expected.as_str()));
 }
 

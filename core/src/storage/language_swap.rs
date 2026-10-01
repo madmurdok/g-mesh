@@ -40,7 +40,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::embedding::pipeline::{text_to_embed, ComputedEmbedding};
+use crate::embedding::pipeline::ComputedEmbedding;
+use crate::embedding::text::text_to_embed;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::schema;

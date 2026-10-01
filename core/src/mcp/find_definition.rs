@@ -524,9 +524,12 @@ fn is_module_specifier(name: &str) -> bool {
 /// Calibrated on name queries alone (149 go, 145 python, 143 rust, 291
 /// typescript positives against 150-300 absent-name negatives each), the
 /// floor that keeps this rung's false refusals at or under 3% is 0.648 for
-/// go, 0.628 for python, 0.555 for rust and 0.538 for typescript. The shared
-/// table ships 0.59 / 0.57 / 0.55 / 0.50 - at or below every one of those.
-/// **Every deviation is in the direction of offering candidates rather than
+/// go, 0.628 for python, 0.555 for rust and 0.538 for typescript (fp32
+/// model, untrimmed text). The shared table ships 0.57 / 0.59 / 0.57 / 0.53:
+/// below those for go, python and typescript, and 0.015 above for rust, the
+/// one language where this rung leans toward refusing; that table was not
+/// re-calibrated on name queries for the shipped model and text. **The
+/// intended deviation is toward offering candidates rather than
 /// refusing**, which is the direction this rung's own argument asks for: a
 /// labelled "did you mean" is cheap and a refusal is what GM-234 existed to
 /// stop. Concretely, on TypeScript name queries the old 0.60 wrongly refused

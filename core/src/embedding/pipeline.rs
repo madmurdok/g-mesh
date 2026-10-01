@@ -66,6 +66,7 @@ use crate::embedding::model::{
     check_default_weights, default_model_dir, embedding_version, EmbeddingModel, ONNX_FILE_NAME,
     TOKENIZER_FILE_NAME,
 };
+use crate::embedding::text::text_to_embed;
 use crate::storage::vectors;
 use crate::storage::write::Diff;
 
@@ -741,25 +742,6 @@ fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<St
     Ok(row.and_then(|(doc_comment, signature)| text_to_embed(doc_comment.as_deref(), signature.as_deref())))
 }
 
-/// Builds the text a node's doc comment and signature embed as, or `None` if
-/// there is nothing worth embedding.
-///
-/// `None` for both inputs, or for both trimming to nothing, are the same
-/// case: nothing to say about this symbol beyond what its name already
-/// carries, so no row is written at all rather than one embedding an empty
-/// or whitespace-only string.
-pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
-    let doc_comment = doc_comment.map(str::trim).filter(|s| !s.is_empty());
-    let signature = signature.map(str::trim).filter(|s| !s.is_empty());
-
-    match (doc_comment, signature) {
-        (Some(doc), Some(sig)) => Some(format!("{doc}\n\n{sig}")),
-        (Some(doc), None) => Some(doc.to_string()),
-        (None, Some(sig)) => Some(sig.to_string()),
-        (None, None) => None,
-    }
-}
-
 /// Embeds one node's doc comment/signature and stores the result, or does
 /// nothing if there is no embeddable text - the acceptance criterion that a
 /// node with neither must not embed an empty string.
@@ -871,22 +853,30 @@ mod tests {
         dir
     }
 
-    /// The default model's `embeddingVersion` names its int8 weights, so a
-    /// vector the fp32 weights stored under the bare model name is owed a
-    /// re-embed (`embedding::backfill`'s
-    /// `a_vector_from_another_embedding_version_is_owed_a_re_embed`).
+    /// The default model's `embeddingVersion` names its int8 weights and the
+    /// structured text form, so a vector the fp32 weights stored under the
+    /// bare model name, or one the untrimmed text made under `<model>+int8`,
+    /// is owed a re-embed (`embedding::backfill`'s
+    /// `a_vector_from_another_embedding_version_is_owed_a_re_embed`). Any
+    /// other model carries the text form too: its old vectors embedded the
+    /// untrimmed text as well.
     ///
     /// *Control:* make `embedding_version` return the model name unchanged,
-    /// and this fails.
+    /// or drop `TEXT_FORM_TAG` from it, and this fails.
     #[test]
-    fn the_default_models_embedding_version_names_the_int8_weights() {
+    fn the_embedding_version_names_the_weights_and_the_text_form() {
         let model = EmbeddingConfig::default().model;
         let pipeline = EmbeddingPipeline::disabled();
-        assert_eq!(pipeline.embedding_version(), format!("{model}+int8"));
+        assert_eq!(pipeline.embedding_version(), format!("{model}+int8+structured"));
         assert_ne!(pipeline.embedding_version(), model, "fp32 vectors were tagged with the bare name");
+        assert_ne!(
+            pipeline.embedding_version(),
+            format!("{model}+int8"),
+            "untrimmed-text vectors carry this"
+        );
 
         let other = EmbeddingConfig { model: "some-other-model".to_string() };
-        assert_eq!(EmbeddingPipeline::load(&other).embedding_version(), "some-other-model");
+        assert_eq!(EmbeddingPipeline::load(&other).embedding_version(), "some-other-model+structured");
     }
 
     /// An fp32 `model.onnx` is neither available nor loaded for the default
@@ -1558,16 +1548,19 @@ mod tests {
     /// a format change fails here until the epoch is bumped and the digest
     /// below updated with it.
     ///
-    /// Control: change `text_to_embed`'s separator and this fails.
+    /// Control: change `full_text`'s separator, or `structured_doc`'s rules
+    /// (e.g. stop dropping `# Examples`), and this fails.
     #[test]
     fn the_pipeline_epoch_is_pinned_to_the_text_format() {
         use sha2::{Digest, Sha256};
-        let inputs: [(Option<&str>, Option<&str>); 5] = [
+        let inputs: [(Option<&str>, Option<&str>); 7] = [
             (Some("  Reads a file.  "), Some(" fn read(path: &Path) -> String ")),
             (Some("Reads a file."), None),
             (None, Some("fn read()")),
             (Some(" \n"), Some("\tfn x()")),
             (None, None),
+            (Some("Reads a file.\n\n# Examples\n\n```\nread(p);\n```\n\n@param p path"), Some("fn read(p)")),
+            (Some("```\nread(p);\n```"), None),
         ];
         let mut hasher = Sha256::new();
         for (doc, signature) in inputs {
@@ -1576,7 +1569,7 @@ mod tests {
         let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             (crate::embedding::cache::PIPELINE_EPOCH, digest.as_str()),
-            (1, "fa199d7fbc4ca707c83707eac28bd687701c737343d062ff19b7400590b19440"),
+            (2, "e01665d9df57555d954646f4c91bee489f90d6e07648c9acc4e72a2632d9bb89"),
             "text_to_embed's output changed: bump PIPELINE_EPOCH and update this digest"
         );
     }

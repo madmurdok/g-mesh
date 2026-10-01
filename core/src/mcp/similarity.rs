@@ -130,10 +130,11 @@
 //! | typescript | 0.50 | 2.4% | 70.9% | **8.1%** / 92.5% |
 //!
 //! Those are the fp32 model's floors and rates. g-mesh ships the int8
-//! weights with their own fitted floors, go / python / rust / typescript
-//! **0.57 / 0.57 / 0.55 / 0.53** (`docs/adr/0011-embedding-model-int8.md`,
-//! fit in `docs/results/gm-398-model-comparison.md`); [`floor`] holds them.
-//! The argument above for one floor per language holds for both.
+//! weights embedding the structured doc-comment text, with that pair's own
+//! fitted floors, go / python / rust / typescript **0.57 / 0.59 / 0.57 /
+//! 0.53** (`docs/adr/0012-embedded-text-structured.md`, fit in
+//! `docs/results/gm-465-structured-trim.md`); [`floor`] holds them. The
+//! argument above for one floor per language holds for both.
 //!
 //! Averaging these into one number would cost TypeScript a false "nothing
 //! matched" on one search in twelve - which is precisely the "a guarantee
@@ -279,12 +280,13 @@ const DEFAULT_FLOOR: f64 = 0.53;
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
 pub(crate) fn floor(language: &str) -> f64 {
-    // The int8 model's fitted floors (ADR 0011). Held-out false alarm at
-    // each, go / python / rust / typescript: 29.4 / 10.0 / 14.3 / 7.7%.
+    // The int8 model's fitted floors on the structured text (ADR 0012).
+    // Held-out false alarm on authored queries at each, go / python / rust /
+    // typescript: 29.4 / 0.0 / 20.0 / 8.0%.
     match language {
         "go" => 0.57,
-        "python" => 0.57,
-        "rust" => 0.55,
+        "python" => 0.59,
+        "rust" => 0.57,
         // The lowest of the four: DEFAULT_FLOOR must equal it.
         "typescript" => 0.53,
         _ => DEFAULT_FLOOR,
@@ -477,7 +479,7 @@ mod tests {
 
     /// The per-language table is the point, not decoration: one score, four
     /// languages, two verdicts. 0.54 clears TypeScript's 0.53 and misses
-    /// Rust's 0.55, Python's 0.57 and Go's 0.57.
+    /// Rust's 0.57, Python's 0.59 and Go's 0.57.
     #[test]
     fn one_score_is_a_match_in_one_language_and_not_in_another() {
         assert_eq!(verdict("readFile", None, &[hit(0.54, "typescript")]), None);
@@ -489,15 +491,15 @@ mod tests {
         }
     }
 
-    /// The shipped floors are the int8 model's fitted ones (ADR 0011), the
-    /// floors its confirmatory gates and agent-level check ran at.
+    /// The shipped floors are the ones fitted for the int8 model on the
+    /// structured text (ADR 0012), the floors its D9 gates ran at.
     ///
-    /// *Control:* restore the fp32 floors (go 0.59, typescript 0.50, default
-    /// 0.50) and this fails.
+    /// *Control:* restore the untrimmed text's floors (python 0.57, rust
+    /// 0.55) and this fails.
     #[test]
-    fn the_shipped_floors_are_the_int8_models() {
+    fn the_shipped_floors_are_the_structured_texts() {
         let shipped: Vec<f64> = ["go", "python", "rust", "typescript"].iter().map(|l| floor(l)).collect();
-        assert_eq!(shipped, vec![0.57, 0.57, 0.55, 0.53]);
+        assert_eq!(shipped, vec![0.57, 0.59, 0.57, 0.53]);
         assert_eq!(floor("kotlin"), 0.53);
     }
 

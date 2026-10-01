@@ -123,7 +123,7 @@ token_type_ids = false
 text = "first-paragraph"
 
 # GM-465: "structured" keeps the doc's summary, headings and short prose and
-# drops code, parameter lists and link lines (core/src/cli/embed_eval/structured.rs).
+# drops code, parameter lists and link lines (core/src/embedding/text.rs).
 [[variant]]
 name = "jina-v2-base-code-int8-structured"
 arm = "model"

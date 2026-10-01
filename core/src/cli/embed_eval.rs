@@ -8,8 +8,9 @@
 //!   model off) to `work/<corpus>.sqlite`, after checking the checkout is at
 //!   the pinned revision, and record its sha256. Every variant reads the same
 //!   snapshot, so only the model varies between arms.
-//! - `run`: embed every node text `text_to_embed` produces (the crate's own
-//!   function, which is why this lives in the crate) and every query with one
+//! - `run`: embed every node text the variant's text form produces (the
+//!   `structured` form is production's own `text_to_embed`, which is why this
+//!   lives in the crate) and every query with one
 //!   variant, rank brute force by cosine, and write `manifest.json`,
 //!   `vectors.bin`, `query_vectors.bin`, `rankings.jsonl` and `timings.json`
 //!   under `<out>/<variant>/<corpus>/`.
@@ -30,7 +31,6 @@ mod metrics;
 mod progress;
 mod queries;
 mod rng;
-mod structured;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 use crate::embedding::model::{
     cosine_similarity, EmbeddingModel, EncoderSpec, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
-use crate::embedding::pipeline::text_to_embed;
+use crate::embedding::text::{full_text, text_to_embed};
 
 use config::{Arm, ContextForm, CorporaFile, Role, TextForm, Variant, VariantsFile};
 use metrics::{Bound, Floors, Outcome, KEPT_HITS};
@@ -223,9 +223,9 @@ struct SnapshotRecord {
     indexer_version: Option<String>,
 }
 
-/// One node of the snapshot. `text` is `text_to_embed`'s output; only nodes
+/// One node of the snapshot. `text` is `full_text`'s output; only nodes
 /// with text are ranking candidates, exactly as the `vectors` join makes them
-/// in `search_code`.
+/// in `search_code` (`text_to_embed` is `Some` exactly when `full_text` is).
 #[derive(Debug, Clone)]
 struct Node {
     id: String,
@@ -251,14 +251,9 @@ impl Node {
         match form {
             TextForm::Full => self.text.clone(),
             TextForm::FirstParagraph => {
-                text_to_embed(self.doc.as_deref().map(first_paragraph), self.signature.as_deref())
+                full_text(self.doc.as_deref().map(first_paragraph), self.signature.as_deref())
             }
-            // A doc that trims to nothing and no signature would leave the
-            // node with no text; it falls back to the full text instead.
-            TextForm::Structured => {
-                let doc = self.doc.as_deref().map(structured::structured_doc);
-                text_to_embed(doc.as_deref(), self.signature.as_deref()).or_else(|| self.text.clone())
-            }
+            TextForm::Structured => text_to_embed(self.doc.as_deref(), self.signature.as_deref()),
         }
     }
 }
@@ -302,7 +297,7 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
                 container: row.get(9)?,
                 start_line: row.get(10)?,
                 end_line: row.get(11)?,
-                text: text_to_embed(doc.as_deref(), signature.as_deref()),
+                text: full_text(doc.as_deref(), signature.as_deref()),
                 doc,
                 signature,
             })
@@ -1545,7 +1540,7 @@ fn parity(args: &ParityArgs) -> Result<()> {
     );
     if production_rows as usize != manifest.node_count {
         failures.push(format!(
-            "production embedded {production_rows} nodes, the harness ranks {}: text_to_embed selection differs",
+            "production embedded {production_rows} nodes, the harness ranks {}: text selection differs",
             manifest.node_count
         ));
     }
@@ -1624,7 +1619,7 @@ mod tests {
             container: None,
             start_line: 1,
             end_line: 1,
-            text: text_to_embed(Some("Short.\n\nLong tail."), Some("fn f()")),
+            text: full_text(Some("Short.\n\nLong tail."), Some("fn f()")),
             doc: Some("Short.\n\nLong tail.".into()),
             signature: Some("fn f()".into()),
         };
@@ -1644,7 +1639,7 @@ mod tests {
             container: None,
             start_line: 1,
             end_line: 1,
-            text: text_to_embed(doc, signature),
+            text: full_text(doc, signature),
             doc: doc.map(Into::into),
             signature: signature.map(Into::into),
         }
@@ -1653,8 +1648,8 @@ mod tests {
     /// The structured form trims the doc and appends the signature in
     /// `text_to_embed`'s layout, and is `Some` exactly when `text` is.
     /// Control: making the `Structured` arm return `self.text.clone()` fails
-    /// the first assertion; dropping its `.or_else(..)` fallback fails the
-    /// code-only one.
+    /// the first assertion; dropping `embedding::text::text_to_embed`'s
+    /// `.or_else(..)` fallback fails the code-only one.
     #[test]
     fn structured_form_trims_the_doc_before_the_signature() {
         let doc = "Short.\n\n# Examples\n\n```\nf();\n```\n\n@param x y";
@@ -1674,6 +1669,24 @@ mod tests {
             Some("fn f()")
         );
         assert_eq!(node(None, None).text_for(TextForm::Structured), None);
+    }
+
+    /// The eval's `structured` form is the text production embeds, node for
+    /// node, on the real and written docs of `embedding::text`'s fixture; and
+    /// `full` is still the untrimmed text the stored `full` runs embedded.
+    /// Control: giving the `Structured` arm its own trim (e.g.
+    /// `full_text(self.doc.as_deref().map(first_paragraph), ..)`) fails the
+    /// first two assertions; making `load_nodes`/`node` fill `text` with
+    /// `text_to_embed` fails the third.
+    #[test]
+    fn the_structured_form_is_the_production_text() {
+        for case in crate::embedding::text::tests::fixture() {
+            let (doc, signature, label) = (case.doc.as_deref(), case.signature.as_deref(), case.label());
+            let node = node(doc, signature);
+            assert_eq!(node.text_for(TextForm::Structured), text_to_embed(doc, signature), "{label}");
+            assert_eq!(node.text_for(TextForm::Structured), case.expected, "{label}");
+            assert_eq!(node.text_for(TextForm::Full), full_text(doc, signature), "{label}");
+        }
     }
 
     /// A default `text` leaves the fingerprint of every run made before the

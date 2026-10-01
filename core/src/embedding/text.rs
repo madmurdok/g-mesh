@@ -1,9 +1,16 @@
-//! The `structured` text form - a doc comment trimmed to its prose
-//! outline before the signature is appended.
+//! The text a symbol is embedded as: its doc comment trimmed to its prose
+//! outline (the `structured` form), then its signature. Why this form and
+//! not the whole doc comment is ADR 0012
+//! (`docs/adr/0012-embedded-text-structured.md`).
 //!
-//! Deterministic and purely syntactic: no model, no network. The input is a
-//! stored doc comment (comment markers already stripped by the indexer); the
-//! rules apply in this order:
+//! [`text_to_embed`] is the one function production embeds with, and the
+//! eval harness's `structured` text form calls it too, so the two cannot
+//! drift. [`full_text`] is the untrimmed layout, kept for the eval's `full`
+//! and `first-paragraph` forms and as the fallback below.
+//!
+//! [`structured_doc`] is deterministic and purely syntactic: no model, no
+//! network. The input is a stored doc comment (comment markers already
+//! stripped by the indexer); the rules apply in this order:
 //!
 //! 1. **Fenced code** - a line whose trimmed text starts with ` ``` ` or
 //!    `~~~` opens a fence, the next line starting with the same marker closes
@@ -43,12 +50,12 @@
 /// The "short prose" cap: a paragraph after the first is kept only when its
 /// text (lines joined by `\n`, ends trimmed) is at most this many `char`s,
 /// about two and a half wrapped lines of doc prose.
-pub(super) const SHORT_PARAGRAPH_CHARS: usize = 200;
+const SHORT_PARAGRAPH_CHARS: usize = 200;
 
 /// Section names whose heading, or label line, drops the section: the
 /// parameter/return/error lists and the examples. Lowercase, without the
 /// trailing `:`.
-pub(super) const DROPPED_SECTIONS: &[&str] = &[
+const DROPPED_SECTIONS: &[&str] = &[
     "arguments",
     "args",
     "parameters",
@@ -65,9 +72,41 @@ pub(super) const DROPPED_SECTIONS: &[&str] = &[
     "usage",
 ];
 
+/// The text `doc_comment` and `signature` embed as, or `None` if there is
+/// nothing worth embedding.
+///
+/// The doc comment is trimmed by [`structured_doc`], then laid out by
+/// [`full_text`]. A doc comment that trims to nothing on a node with no
+/// signature falls back to the untrimmed text, so the set of nodes with a
+/// vector is exactly the set [`full_text`] gives one: the trim changes what
+/// a node embeds as, never whether it is embedded.
+pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
+    let trimmed = doc_comment.map(structured_doc);
+    full_text(trimmed.as_deref(), signature).or_else(|| full_text(doc_comment, signature))
+}
+
+/// The whole doc comment, a blank line, then the signature; either alone when
+/// the other is absent; `None` when both are.
+///
+/// `None` for both inputs, or for both trimming to nothing, are the same
+/// case: nothing to say about this symbol beyond what its name already
+/// carries, so no row is written at all rather than one embedding an empty
+/// or whitespace-only string.
+pub(crate) fn full_text(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
+    let doc_comment = doc_comment.map(str::trim).filter(|s| !s.is_empty());
+    let signature = signature.map(str::trim).filter(|s| !s.is_empty());
+
+    match (doc_comment, signature) {
+        (Some(doc), Some(sig)) => Some(format!("{doc}\n\n{sig}")),
+        (Some(doc), None) => Some(doc.to_string()),
+        (None, Some(sig)) => Some(sig.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// `doc` trimmed by the rules in this module's doc; empty when nothing
 /// survives (a doc that is only code, say).
-pub(super) fn structured_doc(doc: &str) -> String {
+pub(crate) fn structured_doc(doc: &str) -> String {
     let mut kept: Vec<String> = Vec::new();
     let mut have_summary = false;
     // The level of the dropped heading whose section is being skipped.
@@ -215,10 +254,76 @@ fn is_link_only(line: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Every test names its control: the code change that must make it fail.
+
+    /// One case of the fixture `eval/embedding/gm423_text_fixture.py`
+    /// writes: a real g-mesh doc comment or a written one, with the text the
+    /// Python port of these rules builds for it.
+    #[derive(serde::Deserialize)]
+    pub(crate) struct Case {
+        rule: String,
+        source: String,
+        pub(crate) doc: Option<String>,
+        pub(crate) signature: Option<String>,
+        pub(crate) expected: Option<String>,
+    }
+
+    impl Case {
+        pub(crate) fn label(&self) -> String {
+            format!("{} ({})", self.rule, self.source)
+        }
+    }
+
+    pub(crate) fn fixture() -> Vec<Case> {
+        serde_json::from_str(include_str!("testdata/structured_text.json")).unwrap()
+    }
+
+    /// Production's text equals the Python port's on real doc comments and on
+    /// every rule, so the eval runs scored with either describe what ships.
+    /// Control: making `text_to_embed` return `full_text(doc_comment,
+    /// signature)` fails every trimmed case.
+    #[test]
+    fn matches_the_python_port_on_the_fixture() {
+        let cases = fixture();
+        assert!(cases.len() >= 20, "fixture has {} cases", cases.len());
+        for case in cases {
+            let text = text_to_embed(case.doc.as_deref(), case.signature.as_deref());
+            assert_eq!(text, case.expected, "{}", case.label());
+        }
+    }
+
+    /// The embedded text is the structured doc, then the signature: fenced
+    /// code, a Google-style `Args:` section, a dropped `# Examples` heading
+    /// and a long later paragraph all go; the summary, a kept heading and a
+    /// short paragraph stay. Control: making `text_to_embed` return
+    /// `full_text(doc_comment, signature)` fails it.
+    #[test]
+    fn text_to_embed_embeds_the_structured_doc_before_the_signature() {
+        let long = "word ".repeat(60);
+        let doc = format!(
+            "Opens the file.\n\n```\nlet f = open(p);\n```\n\nArgs:\n    path: where.\n\n{long}\n\n# Safety\n\nCall once.\n\n# Examples\n\nIt opens."
+        );
+        assert_eq!(
+            text_to_embed(Some(&doc), Some("fn open(path: &Path)")).as_deref(),
+            Some("Opens the file.\n\n# Safety\n\nCall once.\n\nfn open(path: &Path)")
+        );
+    }
+
+    /// A doc that trims to nothing still embeds: alone, as its untrimmed self;
+    /// with a signature, as the signature. So the trim never changes which
+    /// nodes get a vector. Control: dropping `text_to_embed`'s `.or_else(..)`
+    /// fails the first assertion.
+    #[test]
+    fn a_doc_that_trims_to_nothing_keeps_its_node_embeddable() {
+        let code = "```\nfn main() {}\n```";
+        assert_eq!(text_to_embed(Some(code), None).as_deref(), Some(code));
+        assert_eq!(text_to_embed(Some(code), Some("fn main()")).as_deref(), Some("fn main()"));
+        assert_eq!(text_to_embed(None, None), None);
+        assert_eq!(text_to_embed(Some(" \n"), Some("\t")), None);
+    }
 
     /// Control: making `structured_doc` return `doc.trim().to_string()`
     /// fails this and every drop test below.

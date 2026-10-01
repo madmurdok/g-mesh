@@ -322,12 +322,14 @@ mod tests {
     }
 
     /// A vector made under another `embeddingVersion` is owed a re-embed:
-    /// this is how a change of pinned weights reaches an existing index. A
-    /// row tagged with the bare model name (fp32 weights) is a candidate for
-    /// the int8 pipeline's version; a row already carrying it is not.
+    /// this is how a change of pinned weights or of the embedded text form
+    /// reaches an existing index. A row tagged with the bare model name (fp32
+    /// weights) or with `<model>+int8` (the untrimmed text) is a candidate for
+    /// the pipeline's version; a row already carrying it is not.
     ///
     /// *Control:* drop `OR v.embeddingVersion != ?` from either query, and
-    /// `embedded_by_fp32` is no longer a candidate.
+    /// neither old row is a candidate; drop `TEXT_FORM_TAG` from
+    /// `embedding_version`, and `embedded_from_full_text` is not one.
     #[test]
     fn a_vector_from_another_embedding_version_is_owed_a_re_embed() {
         let mut conn = open_conn();
@@ -337,6 +339,7 @@ mod tests {
                 upsert_nodes: vec![
                     node("embedded_by_fp32", Some("does a thing"), None),
                     node("embedded_by_int8", Some("does another thing"), None),
+                    node("embedded_from_full_text", Some("does a third thing"), None),
                 ],
                 ..Default::default()
             },
@@ -348,11 +351,13 @@ mod tests {
         let zeros = [0.0; crate::embedding::EMBEDDING_DIM];
         crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, &model).unwrap();
         crate::storage::vectors::insert(&conn, "embedded_by_int8", &zeros, &current).unwrap();
+        crate::storage::vectors::insert(&conn, "embedded_from_full_text", &zeros, &format!("{model}+int8"))
+            .unwrap();
 
-        assert_eq!(count_candidates(&conn, &current).unwrap(), 1);
+        assert_eq!(count_candidates(&conn, &current).unwrap(), 2);
         let page = fetch_candidate_page(&conn, &current, None, 256).unwrap();
         let ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["embedded_by_fp32"]);
+        assert_eq!(ids, vec!["embedded_by_fp32", "embedded_from_full_text"]);
     }
 
     /// Keyset pagination visits each node exactly once across several pages,
