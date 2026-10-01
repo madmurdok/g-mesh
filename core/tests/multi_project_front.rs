@@ -143,7 +143,7 @@ async fn call(
 }
 
 fn text_of(result: &CallToolResult) -> String {
-    result.content.iter().filter_map(|block| block.as_text()).map(|text| text.text.as_str()).collect()
+    texts_of(result).concat()
 }
 
 #[tokio::test]
@@ -252,13 +252,19 @@ fn guidance_of(result: &CallToolResult, project: &Path) -> String {
     text.split_once("would receive it:\n\n").map(|(_, guidance)| guidance.to_string()).unwrap_or_default()
 }
 
+/// The text items of a tool result, in order.
+fn texts_of(result: &CallToolResult) -> Vec<&str> {
+    result.content.iter().filter_map(|block| block.as_text()).map(|text| text.text.as_str()).collect()
+}
+
 /// Names in a `get_file_outline` answer, or `None` for an error / non-JSON
-/// answer.
+/// answer. The outline is the last text item: a switched session's answer
+/// starts with a line naming the project that answered it.
 fn outline_names(result: &CallToolResult) -> Option<Vec<String>> {
     if result.is_error == Some(true) {
         return None;
     }
-    let outline: serde_json::Value = serde_json::from_str(&text_of(result)).ok()?;
+    let outline: serde_json::Value = serde_json::from_str(texts_of(result).last()?).ok()?;
     Some(
         outline["results"]
             .as_array()?
@@ -294,6 +300,12 @@ async fn selecting_a_project_switches_the_session() {
         outline_names(&outline),
         Some(vec!["b".to_string()]),
         "b.ts's outline must come from b's daemon:\n{}",
+        text_of(&outline)
+    );
+    assert_eq!(
+        texts_of(&outline).first(),
+        Some(&"g-mesh: answered from project b."),
+        "{}",
         text_of(&outline)
     );
 
