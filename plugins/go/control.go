@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 )
 
@@ -168,18 +169,11 @@ func (s *pluginState) openSitesFor(relPath string) []openSite {
 	return s.files[relPath].openSites
 }
 
-// nodesEqual compares two wire nodes by value, including the placeholder
-// target behind the one pointer field.
+// nodesEqual compares two wire nodes by value, following the placeholder
+// target pointer and the path slices. A path is either absent or non-empty,
+// so DeepEqual's nil-versus-empty distinction never separates equal nodes.
 func nodesEqual(a, b wireNode) bool {
-	if a.Target == nil || b.Target == nil {
-		if a.Target != b.Target {
-			return false
-		}
-	} else if *a.Target != *b.Target {
-		return false
-	}
-	a.Target, b.Target = nil, nil
-	return a == b
+	return reflect.DeepEqual(a, b)
 }
 
 // handleSemanticPass answers a semanticPass request - per-file or

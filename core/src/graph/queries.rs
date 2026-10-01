@@ -159,6 +159,11 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         // own doc comment for why a record read this way must not be written
         // straight back.
         declarations: Vec::new(),
+        qualified_path: row
+            .get::<_, Option<String>>("qualifiedPath")?
+            .as_deref()
+            .and_then(crate::storage::qualified_path::decode),
+        alias_paths: Vec::new(),
     })
 }
 
@@ -588,6 +593,21 @@ pub fn find_by_qualified_name(
         None => stmt.query_map(params![qualified_name], map_node_row)?,
     };
     rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by qualifiedName")
+}
+
+/// The declarations one of whose stored partial paths (`qualified_suffixes`,
+/// `storage::schema`) is exactly `suffix`, ordered by id. The query is
+/// matched as given: never split, normalized or matched as a pattern. A
+/// whole `qualifiedName` is not a stored suffix of its own node, so this
+/// complements [`find_by_qualified_name`] rather than repeating it.
+pub fn find_by_qualified_suffix(conn: &Connection, suffix: &str) -> Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("n.");
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT n.* FROM qualified_suffixes s JOIN nodes n ON n.id = s.nodeId \
+         WHERE s.suffix = ?1 AND {declaration} ORDER BY n.id"
+    ))?;
+    let rows = stmt.query_map(params![suffix], map_node_row)?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to look up nodes by qualified suffix")
 }
 
 /// The distinct specifiers of the *import placeholders* a spelling matches,
@@ -1192,5 +1212,35 @@ mod tests {
         let found = find_files_ending_in_dir(&conn, "pkg", &entry_points(&["mod.rs"]), 5).unwrap();
 
         assert_eq!(found.first().map(|n| n.file_path.as_str()), Some("workspace/pkg/mod.rs"));
+    }
+
+    /// A partial path finds its declaration by exact equality only, through
+    /// the path or an alias, never a placeholder; a whole `qualifiedName`
+    /// stays rung 2's, and its lookup is unchanged. Control: drop the
+    /// `declaration_only` filter (the placeholder is returned too).
+    #[test]
+    fn a_partial_path_finds_its_declaration_by_exact_suffix() {
+        use crate::protocol::types::QualifiedPath;
+        let mut conn = setup();
+        let path = QualifiedPath::root("m").child("::", "<S as Read>").child("::", "read");
+        let mut method = NodeRecord::new("n1", "Function", "read", path.display(), "src/m.rs", "rust");
+        method.qualified_path = Some(path);
+        method.alias_paths = vec![QualifiedPath::root("S").child("::", "read")];
+        let mut placeholder = NodeRecord::new("p1", "Module", "read", "x.rs#S::read", "src/x.rs", "rust");
+        placeholder.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        placeholder.qualified_path = Some(QualifiedPath::root("y").child("::", "S").child("::", "read"));
+        write::apply_diff(&mut conn, &Diff { upsert_nodes: vec![method, placeholder], ..Default::default() })
+            .unwrap();
+
+        let ids = |query: &str| -> Vec<String> {
+            find_by_qualified_suffix(&conn, query).unwrap().into_iter().map(|node| node.id).collect()
+        };
+        assert_eq!(ids("<S as Read>::read"), vec!["n1"]);
+        assert_eq!(ids("S::read"), vec!["n1"], "the alias, and not the placeholder's own S::read");
+        for miss in ["m::<S as Read>::read", "s::read", "S.read", "::read", "%::read", "read"] {
+            assert!(ids(miss).is_empty(), "{miss}");
+        }
+        let whole = find_by_qualified_name(&conn, "m::<S as Read>::read", None).unwrap();
+        assert_eq!(whole.into_iter().map(|node| node.id).collect::<Vec<_>>(), vec!["n1"]);
     }
 }

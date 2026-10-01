@@ -22,6 +22,7 @@ import {
   type ExtractOptions,
   type ExtractResult,
   type ParsedTree,
+  type PathSegment,
   type PlaceholderTarget,
   type SymbolDeclaration,
 } from "./extract";
@@ -199,7 +200,24 @@ function nodesEqual(a: ExtractedNode, b: ExtractedNode): boolean {
     a.nativeKind === b.nativeKind &&
     a.hasSyntaxErrors === b.hasSyntaxErrors &&
     declarationsEqual(a.declarations, b.declarations) &&
-    targetsEqual(a.target, b.target)
+    targetsEqual(a.target, b.target) &&
+    pathsEqual(a.qualifiedPath, b.qualifiedPath)
+  );
+}
+
+/**
+ * `qualifiedPath` compared by value. One `qualifiedName` can come from two
+ * paths (`namespace A.B` is one segment, `namespace A { namespace B }` two),
+ * so equal names do not imply equal paths.
+ */
+function pathsEqual(
+  a: readonly PathSegment[] | undefined,
+  b: readonly PathSegment[] | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    a.length === b.length &&
+    a.every((segment, index) => segment.sep === b[index].sep && segment.name === b[index].name)
   );
 }
 

@@ -15,6 +15,7 @@ import {
   isSupportedFile,
   type ExtractedEdge,
   type ExtractedNode,
+  type PathSegment,
   type PlaceholderTarget,
   type SymbolDeclaration,
   type Visibility,
@@ -92,6 +93,9 @@ export interface WireNode {
   kind: ExtractedNode["kind"];
   name: string;
   qualifiedName: string;
+  /** See `ExtractedNode.qualifiedPath` - passed through unchanged, present
+   * only on a declaration. */
+  qualifiedPath?: readonly PathSegment[];
   filePath: string;
   range: WireRange;
   signature: string | null;
@@ -146,6 +150,7 @@ export function toWireNode(node: ExtractedNode): WireNode {
   // sees no new property either. `target` follows the same convention.
   if (node.declarations !== undefined) wire.declarations = node.declarations;
   if (node.target !== undefined) wire.target = node.target;
+  if (node.qualifiedPath !== undefined) wire.qualifiedPath = node.qualifiedPath;
   return wire;
 }
 

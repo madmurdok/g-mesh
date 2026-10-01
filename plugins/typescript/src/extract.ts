@@ -210,6 +210,9 @@ export interface ExtractedNode {
   kind: NodeKind;
   name: string;
   qualifiedName: string;
+  /** The segments `qualifiedName` joins from - declarations only; see
+   * [`PathSegment`]. Absent on File and placeholder nodes. */
+  qualifiedPath?: readonly PathSegment[];
   filePath: string;
   startLine: number;
   startCol: number;
@@ -632,12 +635,13 @@ export function extractIncremental(
 // --- walk -------------------------------------------------------------
 
 /**
- * Lexical context threaded through the walk. `prefix` builds qualifiedName;
+ * Lexical context threaded through the walk. `prefix` is the path that
+ * qualifiedName and qualifiedPath are built under;
  * `namespacePrefix` is the subset of it that a bare (unqualified) name can
  * resolve against - class members need `this.`/`Class.` and so are excluded.
  */
 interface Scope {
-  readonly prefix: string;
+  readonly prefix: readonly PathSegment[];
   readonly namespacePrefix: string;
   /**
    * Names bound by the enclosing function/block chain - parameters, locals,
@@ -812,6 +816,52 @@ function qualify(prefix: string, name: string, separator: MemberSeparator = ".")
   return prefix.length === 0 ? name : `${prefix}${separator}${name}`;
 }
 
+/**
+ * One element of a declaration's `qualifiedPath` - mirrors core's wire
+ * `PathSegment`. `sep` is absent on the first segment and present on every
+ * later one; a name that itself starts with `#` (a `#private` member) keeps
+ * that `#` in `name`, so `C##priv` is `C`, then `#` + `#priv`.
+ */
+export interface PathSegment {
+  sep?: string;
+  name: string;
+}
+
+/** The `qualifiedName` a path spells: each `sep` and `name`, concatenated. */
+export function joinPath(path: readonly PathSegment[]): string {
+  return path.map((segment) => (segment.sep ?? "") + segment.name).join("");
+}
+
+/**
+ * [`qualify`] over segments: the declaration's path and the display string it
+ * joins to, built together so the two cannot disagree.
+ */
+function qualifiedIn(
+  prefix: readonly PathSegment[],
+  name: string,
+  separator: MemberSeparator = ".",
+): { qualifiedName: string; qualifiedPath: readonly PathSegment[] } {
+  const qualifiedPath =
+    prefix.length === 0 ? [{ name }] : [...prefix, { sep: separator, name }];
+  return { qualifiedName: joinPath(qualifiedPath), qualifiedPath };
+}
+
+/**
+ * Whether core accepts `path` for a node named `name`: non-empty, no empty
+ * name, a non-empty `sep` on every segment but the first, no U+001F or NUL,
+ * and ending in `name`. A path that fails is not sent, so the node keeps its
+ * `qualifiedName` and gets no suffix rows.
+ */
+function isSendablePath(path: readonly PathSegment[], name: string): boolean {
+  if (path.length === 0 || path[path.length - 1].name !== name) return false;
+  return path.every(
+    (segment, index) =>
+      segment.name.length > 0 &&
+      (index === 0 ? segment.sep === undefined : (segment.sep ?? "").length > 0) &&
+      !/[\u001f\u0000]/.test(segment.name + (segment.sep ?? "")),
+  );
+}
+
 const CLASS_TYPES = new Set(["class_declaration", "abstract_class_declaration", "class"]);
 
 /**
@@ -883,6 +933,9 @@ interface NodeParams {
   kind: NodeKind;
   name: string;
   qualifiedName: string;
+  /** Declarations only, and always joining to `qualifiedName`: see
+   * [`qualifiedIn`]. File and placeholder nodes have none. */
+  qualifiedPath?: readonly PathSegment[];
   /** The syntax node the declaration spans, and the source of its range. */
   at: SyntaxNode;
   nativeKind?: string;
@@ -990,7 +1043,7 @@ class Extractor {
     });
 
     const scope: Scope = {
-      prefix: "",
+      prefix: [],
       namespacePrefix: "",
       locals: null,
       typeParameters: null,
@@ -1073,6 +1126,9 @@ class Extractor {
     if (params.signature !== undefined) node.signature = params.signature;
     if (params.docComment !== undefined) node.docComment = params.docComment;
     if (params.nativeKind !== undefined) node.nativeKind = params.nativeKind;
+    if (params.qualifiedPath !== undefined && isSendablePath(params.qualifiedPath, params.name)) {
+      node.qualifiedPath = params.qualifiedPath;
+    }
     if (params.target !== undefined) node.target = params.target;
 
     this.nodes.set(id, node);
@@ -1646,7 +1702,7 @@ class Extractor {
       const fn = this.declareSymbol({
         kind: "Function",
         name: "default",
-        qualifiedName: qualify(scope.prefix, "default"),
+        ...qualifiedIn(scope.prefix, "default"),
         at: value,
         nativeKind: value.type,
         signature: functionSignature("default", value),
@@ -1673,7 +1729,8 @@ class Extractor {
   ): void {
     const nameNode = node.childForFieldName("name");
     const name = nameNode?.text ?? "default"; // `export default class {}`
-    const qualifiedName = qualify(scope.prefix, name);
+    const qualified = qualifiedIn(scope.prefix, name);
+    const { qualifiedName } = qualified;
     const body = node.childForFieldName("body");
     const heritage = node.children.find((child) => child.type === "class_heritage");
     const supertypeNames = heritage ? heritageNames(heritage) : [];
@@ -1693,7 +1750,7 @@ class Extractor {
     const classNode = this.declareSymbol({
       kind: "Type",
       name,
-      qualifiedName,
+      ...qualified,
       at: node,
       nativeKind: node.type === "abstract_class_declaration" ? "abstract_class" : "class",
       docComment: docCommentFor(outer),
@@ -1706,7 +1763,7 @@ class Extractor {
 
     const memberScope: Scope = typeParameterScope(node, {
       ...scope,
-      prefix: qualifiedName,
+      prefix: qualified.qualifiedPath,
       enclosingCallerId: null,
       enclosingSymbolId: classNode.id,
       enclosingTypeQName: qualifiedName,
@@ -1725,7 +1782,8 @@ class Extractor {
   ): void {
     const nameNode = node.childForFieldName("name");
     if (!nameNode) return;
-    const qualifiedName = qualify(scope.prefix, nameNode.text);
+    const qualified = qualifiedIn(scope.prefix, nameNode.text);
+    const { qualifiedName } = qualified;
     const body = node.childForFieldName("body");
 
     if (scope.insideFunction) {
@@ -1736,7 +1794,7 @@ class Extractor {
     const typeNode = this.declareSymbol({
       kind: "Type",
       name: nameNode.text,
-      qualifiedName,
+      ...qualified,
       at: node,
       nativeKind: "interface",
       docComment: docCommentFor(outer),
@@ -1751,7 +1809,7 @@ class Extractor {
 
     const memberScope: Scope = typeParameterScope(node, {
       ...scope,
-      prefix: qualifiedName,
+      prefix: qualified.qualifiedPath,
       enclosingCallerId: null,
       enclosingSymbolId: typeNode.id,
       enclosingTypeQName: qualifiedName,
@@ -1778,7 +1836,7 @@ class Extractor {
     const aliasNode = this.declareSymbol({
       kind: "Type",
       name: nameNode.text,
-      qualifiedName: qualify(scope.prefix, nameNode.text),
+      ...qualifiedIn(scope.prefix, nameNode.text),
       at: node,
       nativeKind: "type_alias",
       docComment: docCommentFor(outer),
@@ -1799,12 +1857,13 @@ class Extractor {
   ): void {
     const nameNode = node.childForFieldName("name");
     if (!nameNode || scope.insideFunction) return;
-    const qualifiedName = qualify(scope.prefix, nameNode.text);
+    const qualified = qualifiedIn(scope.prefix, nameNode.text);
+    const { qualifiedName } = qualified;
     // Enum members are values inside the type, below symbol granularity.
     this.declareSymbol({
       kind: "Type",
       name: nameNode.text,
-      qualifiedName,
+      ...qualified,
       at: node,
       nativeKind: "enum",
       docComment: docCommentFor(outer),
@@ -1855,11 +1914,12 @@ class Extractor {
       return;
     }
 
-    const qualifiedName = qualify(scope.prefix, name);
+    const qualified = qualifiedIn(scope.prefix, name);
+    const { qualifiedName } = qualified;
     const moduleNode = this.declareSymbol({
       kind: "Module",
       name,
-      qualifiedName,
+      ...qualified,
       at: node,
       nativeKind: node.type === "module" ? "ambient_module" : "namespace",
       docComment: docCommentFor(outer),
@@ -1869,7 +1929,7 @@ class Extractor {
     if (!body) return;
     this.visitChildren(body, {
       ...scope,
-      prefix: qualifiedName,
+      prefix: qualified.qualifiedPath,
       namespacePrefix: qualifiedName,
       enclosingSymbolId: moduleNode.id,
       enclosingTypeQName: null,
@@ -1894,7 +1954,7 @@ class Extractor {
     const fn = this.declareSymbol({
       kind: "Function",
       name: nameNode.text,
-      qualifiedName: qualify(scope.prefix, nameNode.text),
+      ...qualifiedIn(scope.prefix, nameNode.text),
       at: node,
       nativeKind: node.type === "generator_function_declaration" ? "generator_function" : "function",
       signature: functionSignature(nameNode.text, node),
@@ -1917,7 +1977,7 @@ class Extractor {
     const method = this.declareSymbol({
       kind: "Function",
       name,
-      qualifiedName: qualify(scope.prefix, name, isStatic ? "." : "#"),
+      ...qualifiedIn(scope.prefix, name, isStatic ? "." : "#"),
       at: node,
       nativeKind: methodNativeKind(node, name, isStatic),
       signature: functionSignature(name, node),
@@ -1947,7 +2007,7 @@ class Extractor {
     const fn = this.declareSymbol({
       kind: "Function",
       name: nameNode.text,
-      qualifiedName: qualify(scope.prefix, nameNode.text, isStatic ? "." : "#"),
+      ...qualifiedIn(scope.prefix, nameNode.text, isStatic ? "." : "#"),
       at: node,
       nativeKind: value.type,
       signature: functionSignature(nameNode.text, value),
@@ -1983,7 +2043,7 @@ class Extractor {
         const fn = this.declareSymbol({
           kind: "Function",
           name: nameNode.text,
-          qualifiedName: qualify(scope.prefix, nameNode.text),
+          ...qualifiedIn(scope.prefix, nameNode.text),
           at: declarator,
           nativeKind: value.type,
           signature: functionSignature(nameNode.text, value),
@@ -1997,7 +2057,7 @@ class Extractor {
       const variable = this.declareSymbol({
         kind: "Variable",
         name: nameNode.text,
-        qualifiedName: qualify(scope.prefix, nameNode.text),
+        ...qualifiedIn(scope.prefix, nameNode.text),
         at: declarator,
         nativeKind: keyword?.type ?? "var",
         docComment: docCommentFor(outer),
@@ -2020,7 +2080,7 @@ class Extractor {
   private visitFunctionBody(node: SyntaxNode, scope: Scope, fn: ExtractedNode): void {
     this.visitFunctionParts(node, {
       ...scope,
-      prefix: fn.qualifiedName,
+      prefix: fn.qualifiedPath ?? [],
       enclosingCallerId: fn.id,
       enclosingSymbolId: fn.id,
       insideFunction: true,

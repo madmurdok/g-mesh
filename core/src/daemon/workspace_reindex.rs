@@ -998,8 +998,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::protocol::types::{
-        EdgeKind, NodeKind, PlaceholderTarget, Position, Range, SourceTier, TargetKey, TargetScope,
-        Visibility, WireDeclaration, WireEdge, WireNode,
+        EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
+        TargetScope, Visibility, WireDeclaration, WireEdge, WireNode,
     };
     use crate::storage::write::EdgeRecord;
 
@@ -1021,6 +1021,8 @@ mod tests {
             container: None,
             container_parent: None,
             target: None,
+            alias_paths: Vec::new(),
+            qualified_path: None,
         }
     }
 
@@ -1106,13 +1108,14 @@ mod tests {
             .unwrap()
     }
 
-    const GRAPH_TABLES: [&str; 6] = [
+    const GRAPH_TABLES: [&str; 7] = [
         "SELECT * FROM nodes ORDER BY id",
         "SELECT * FROM edges ORDER BY id",
         "SELECT nodeId, hex(embedding), embeddingVersion FROM vectors ORDER BY nodeId",
         "SELECT * FROM containers ORDER BY nodeId",
         "SELECT * FROM declarations ORDER BY nodeId, ordinal",
         "SELECT * FROM placeholder_targets ORDER BY nodeId",
+        "SELECT * FROM qualified_suffixes ORDER BY nodeId, suffix",
     ];
     const FLAG_TABLES: [&str; 2] =
         ["SELECT * FROM language_state ORDER BY language", "SELECT bulkIndexedAt, semanticPassAt FROM meta"];
@@ -1183,6 +1186,8 @@ mod tests {
                 signature: Some("fn alpha-n2()".to_string()),
                 has_body: true,
             }]),
+            qualified_name: "pkg::T::alpha-n2".to_string(),
+            qualified_path: Some(QualifiedPath::root("pkg").child("::", "T").child("::", "alpha-n2")),
             ..wire_node("alpha-n2", "src/b.alpha-src")
         };
         let placeholder = WireNode {
@@ -1192,6 +1197,7 @@ mod tests {
                 scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
                 key: TargetKey::Name("thing".to_string()),
                 from_container: None,
+                key_path: None,
             }),
             ..wire_node("alpha-p2", "src/b.alpha-src")
         };
@@ -1214,6 +1220,7 @@ mod tests {
                 ("declarations", "nodeId"),
                 ("placeholder_targets", "nodeId"),
                 ("vectors", "nodeId"),
+                ("qualified_suffixes", "nodeId"),
             ] {
                 assert!(
                     count(
@@ -1246,7 +1253,7 @@ mod tests {
             0,
             "no edge may outlive an endpoint"
         );
-        for table in ["declarations", "placeholder_targets", "vectors", "containers"] {
+        for table in ["declarations", "placeholder_targets", "vectors", "containers", "qualified_suffixes"] {
             assert_eq!(
                 count(
                     &guard,
@@ -1744,6 +1751,7 @@ mod tests {
                 scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
                 key: TargetKey::QualifiedName("elsewhere::gone".to_string()),
                 from_container: None,
+                key_path: None,
             }),
             ..wire_node(id, "src/a.alpha-src")
         }

@@ -471,7 +471,15 @@ pub struct WireNode {
     pub container_parent: Option<String>,     // parent key of `container`, sent with members
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<PlaceholderTarget>,    // required iff nativeKind is a placeholder kind
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_path: Option<QualifiedPath>, // qualifiedName as segments, declarations only
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alias_paths: Vec<QualifiedPath>,       // other spellings of the declaration
 }
+
+// [{"name": "a"}, {"sep": "::", "name": "T"}, {"sep": ".", "name": "f"}]
+pub struct QualifiedPath(pub Vec<PathSegment>);
+pub struct PathSegment { pub sep: Option<String>, pub name: String }
 
 #[serde(rename_all = "camelCase")]
 pub enum Visibility { Public, File, Container(String) }
@@ -481,6 +489,8 @@ pub struct PlaceholderTarget {
     pub key: TargetKey,                       // { "name": "foo" } | { "qualifiedName": "Server.Close" }
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<QualifiedPath>,      // segments of a qualifiedName key
 }
 
 pub struct WireEdge {
@@ -489,6 +499,25 @@ pub struct WireEdge {
     pub engine: String,
 }
 ```
+
+`qualifiedPath`, `aliasPaths` and `keyPath` are optional, so they need no
+protocol bump: a plugin that sends none behaves exactly as before. When sent,
+each obeys these rules, which `protocol::conformance` and `g-mesh plugin
+check` (`shape`) enforce:
+
+- a path is non-empty, no `name` is empty, the first segment has no `sep`,
+  every later `sep` is non-empty, and nothing contains U+001F or NUL;
+- `qualifiedPath` joins (each `sep` then `name`, in order) to exactly
+  `qualifiedName`, and its last `name` is the node's `name`;
+- each alias ends in `name`, has at least two segments, differs from
+  `qualifiedPath`, and is sent only with a `qualifiedPath`; it need not join
+  to `qualifiedName`;
+- `keyPath` joins to its `qualifiedName` key and is absent for a `name` key.
+
+At ingest core drops a path that breaks a rule (with its aliases, for a
+`qualifiedPath`), keeps the node and logs one warning per plugin and file.
+Paths never enter ids or tool output. Decision and storage:
+[ADR 0015](../adr/0015-qualified-name-segments.md).
 
 The control messages are unchanged apart from two additions. `fileChanged` and
 `semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff.
