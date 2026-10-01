@@ -21,11 +21,16 @@
 //! to the eval directory (`--eval-dir`, default `eval/embedding`).
 
 mod bm25;
+mod churn;
 mod config;
+mod context;
+mod cost;
 mod decision;
 mod metrics;
+mod progress;
 mod queries;
 mod rng;
+mod structured;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -44,7 +49,7 @@ use crate::embedding::model::{
 };
 use crate::embedding::pipeline::text_to_embed;
 
-use config::{Arm, CorporaFile, Role, TextForm, Variant, VariantsFile};
+use config::{Arm, ContextForm, CorporaFile, Role, TextForm, Variant, VariantsFile};
 use metrics::{Bound, Floors, Outcome, KEPT_HITS};
 use queries::{hex, Query};
 use rng::Rng;
@@ -59,6 +64,12 @@ pub enum EmbedEvalCommand {
     Report(ReportArgs),
     /// Compare the harness's reference ranking with production `search_code`.
     Parity(ParityArgs),
+    /// Count the embedded texts synthetic edits invalidate, per variant.
+    Churn(churn::ChurnArgs),
+    /// The embedding cost model: calibrate latency per token count, predict
+    /// a variant's pass time from it.
+    #[command(subcommand)]
+    Cost(cost::CostCommand),
 }
 
 #[derive(Debug, Args)]
@@ -143,6 +154,8 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Run(args) => run_variant(&args),
         EmbedEvalCommand::Report(args) => report(&args),
         EmbedEvalCommand::Parity(args) => parity(&args),
+        EmbedEvalCommand::Churn(args) => churn::run(&args),
+        EmbedEvalCommand::Cost(command) => cost::run(&command),
     }
 }
 
@@ -213,12 +226,19 @@ struct SnapshotRecord {
 /// One node of the snapshot. `text` is `text_to_embed`'s output; only nodes
 /// with text are ranking candidates, exactly as the `vectors` join makes them
 /// in `search_code`.
+#[derive(Debug, Clone)]
 struct Node {
     id: String,
     kind: String,
+    name: String,
     qualified_name: String,
     file_path: String,
     language: String,
+    native_kind: Option<String>,
+    /// The module path (empty for TypeScript).
+    container: Option<String>,
+    start_line: i64,
+    end_line: i64,
     text: Option<String>,
     doc: Option<String>,
     signature: Option<String>,
@@ -232,6 +252,12 @@ impl Node {
             TextForm::Full => self.text.clone(),
             TextForm::FirstParagraph => {
                 text_to_embed(self.doc.as_deref().map(first_paragraph), self.signature.as_deref())
+            }
+            // A doc that trims to nothing and no signature would leave the
+            // node with no text; it falls back to the full text instead.
+            TextForm::Structured => {
+                let doc = self.doc.as_deref().map(structured::structured_doc);
+                text_to_embed(doc.as_deref(), self.signature.as_deref()).or_else(|| self.text.clone())
             }
         }
     }
@@ -258,7 +284,8 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
         Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_context(|| format!("failed to open {}", db.display()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, kind, qualifiedName, filePath, language, docComment, signature FROM nodes ORDER BY id",
+        "SELECT id, kind, qualifiedName, filePath, language, docComment, signature, name, nativeKind, \
+         container, startLine, endLine FROM nodes ORDER BY id",
     )?;
     let nodes = stmt
         .query_map([], |row| {
@@ -267,9 +294,14 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
             Ok(Node {
                 id: row.get(0)?,
                 kind: row.get(1)?,
+                name: row.get(7)?,
                 qualified_name: row.get(2)?,
                 file_path: row.get(3)?,
                 language: row.get(4)?,
+                native_kind: row.get(8)?,
+                container: row.get(9)?,
+                start_line: row.get(10)?,
+                end_line: row.get(11)?,
                 text: text_to_embed(doc.as_deref(), signature.as_deref()),
                 doc,
                 signature,
@@ -400,6 +432,52 @@ struct RankingLine {
     /// `(node id, score)`, best first, at most `KEPT_HITS`.
     hits: Vec<(String, f64)>,
     top_language: Option<String>,
+    /// Whether the expected symbols have a doc comment; absent for a query
+    /// with none, and in runs stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_doc: Option<TargetDoc>,
+    /// The query shares a sub-token (length >= 4, D3's rule) with an
+    /// expected symbol's file path or parent name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_overlap: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TargetDoc {
+    Doc,
+    Sig,
+    Mixed,
+}
+
+/// `targetDoc` and `pathOverlap` of a query over its expected nodes; both
+/// `None` when it has none. They depend on the snapshot and the query only,
+/// never on the variant.
+fn query_labels(
+    query: &str,
+    expected: &[usize],
+    nodes: &[Node],
+    parents: &[Option<context::Parent>],
+) -> (Option<TargetDoc>, Option<bool>) {
+    if expected.is_empty() {
+        return (None, None);
+    }
+    let documented =
+        expected.iter().filter(|&&i| nodes[i].doc.as_deref().is_some_and(|d| !d.trim().is_empty())).count();
+    let target_doc = match documented {
+        0 => TargetDoc::Sig,
+        n if n == expected.len() => TargetDoc::Doc,
+        _ => TargetDoc::Mixed,
+    };
+    let words = queries::words(query);
+    let overlap = expected.iter().any(|&i| {
+        let mut tokens = queries::sub_tokens(&nodes[i].file_path);
+        for name in parents[i].iter().flat_map(|p| &p.names) {
+            tokens.extend(queries::sub_tokens(name));
+        }
+        tokens.iter().any(|t| words.contains(t))
+    });
+    (Some(target_doc), Some(overlap))
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -417,15 +495,18 @@ fn fingerprint(variant: &Variant) -> String {
     hex(&Sha256::digest(fingerprint_text(variant).as_bytes()))
 }
 
-/// The variant's `Debug` form, without the `text` field when it is the
-/// default: a default `text` must leave the fingerprints of runs stored
-/// before the field existed valid.
+/// The variant's `Debug` form, without the `context` and `text` fields when
+/// they are the default: a default must leave the fingerprints of runs
+/// stored before the field existed valid.
 fn fingerprint_text(variant: &Variant) -> String {
-    let debug = format!("{variant:?}");
-    match variant.text {
-        TextForm::Full => debug.replacen(", text: Full }", " }", 1),
-        _ => debug,
+    let mut debug = format!("{variant:?}");
+    if variant.context == ContextForm::None {
+        debug = debug.replacen(", context: None }", " }", 1);
     }
+    if variant.text == TextForm::Full {
+        debug = debug.replacen(", text: Full }", " }", 1);
+    }
+    debug
 }
 
 fn run_dir(args: &RunArgs, variant: &str, corpus: &str) -> PathBuf {
@@ -483,7 +564,20 @@ fn shuffle_words(text: &str, rng: &mut Rng) -> String {
     words.join(" ")
 }
 
-fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
+/// The ranking candidates (nodes with text, by index) and the text `run`
+/// embeds for each under `variant`'s text form and context, before the
+/// encoder's document prefix. `cost predict` counts exactly these.
+fn candidate_texts(nodes: &[Node], variant: &Variant, arm_seed: u64) -> (Vec<usize>, Vec<String>) {
+    let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
+    let mut all_texts = context::embed_texts(nodes, variant.text, variant.context, arm_seed);
+    let texts = candidates.iter().map(|&i| all_texts[i].take().unwrap()).collect();
+    (candidates, texts)
+}
+
+/// The model's tokenizer with no padding and no truncation: it counts the
+/// tokens (special ones included) `EmbeddingModel` truncates to
+/// `max_sequence_length`.
+fn plain_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
     let path = model_dir.join(TOKENIZER_FILE_NAME);
     let mut tokenizer = tokenizers::Tokenizer::from_file(&path)
         .map_err(|err| anyhow::anyhow!("failed to load tokenizer {}: {err}", path.display()))?;
@@ -491,6 +585,11 @@ fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
     tokenizer
         .with_truncation(None)
         .map_err(|err| anyhow::anyhow!("failed to clear tokenizer truncation: {err}"))?;
+    Ok(tokenizer)
+}
+
+fn token_shares(model_dir: &Path, texts: &[&str]) -> Result<(f64, f64)> {
+    let tokenizer = plain_tokenizer(model_dir)?;
     let mut over_512 = 0usize;
     let mut over_1024 = 0usize;
     for text in texts {
@@ -571,10 +670,8 @@ fn run_corpus(
     let eval_dir = &args.dir.eval_dir;
     let snapshot_sha = verified_snapshot(eval_dir, corpora, corpus)?;
     let nodes = load_nodes(&snapshot_path(eval_dir, corpus))?;
-    let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
+    let (candidates, owned_texts) = candidate_texts(&nodes, variant, variants.settings.arm_seed);
     let candidate_of: HashMap<usize, usize> = candidates.iter().enumerate().map(|(c, &i)| (i, c)).collect();
-    let owned_texts: Vec<String> =
-        candidates.iter().map(|&i| nodes[i].text_for(variant.text).unwrap()).collect();
     let texts: Vec<&str> = owned_texts.iter().map(String::as_str).collect();
     let node_ids_sha = {
         let mut h = Sha256::new();
@@ -665,17 +762,31 @@ fn run_corpus(
         let vectors = match variant.arm {
             Arm::Model => {
                 let (base, _, model) = encoder.unwrap();
+                let mut progress = progress::stderr(&variant.name, corpus, "embed", texts.len());
                 texts
                     .iter()
-                    .map(|t| model.embed(&format!("{}{t}", base.document_prefix)))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let v = model.embed(&format!("{}{t}", base.document_prefix));
+                        progress.tick(i + 1);
+                        v
+                    })
                     .collect::<Result<Vec<_>>>()?
             }
             Arm::WordsShuffled => {
                 let (base, _, model) = encoder.unwrap();
+                let mut progress = progress::stderr(&variant.name, corpus, "embed", texts.len());
                 texts
                     .iter()
-                    .map(|t| {
-                        model.embed(&format!("{}{}", base.document_prefix, shuffle_words(t, &mut arm_rng)))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let v = model.embed(&format!(
+                            "{}{}",
+                            base.document_prefix,
+                            shuffle_words(t, &mut arm_rng)
+                        ));
+                        progress.tick(i + 1);
+                        v
                     })
                     .collect::<Result<Vec<_>>>()?
             }
@@ -708,7 +819,16 @@ fn run_corpus(
     let started = Instant::now();
     let scores_per_query: Vec<Vec<f64>> = if variant.arm == Arm::Bm25 {
         let index = bm25::Bm25::new(texts.iter().copied());
-        queries.iter().map(|q| index.scores(&q.text)).collect()
+        let mut progress = progress::stderr(&variant.name, corpus, "score", queries.len());
+        queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let scores = index.scores(&q.text);
+                progress.tick(i + 1);
+                scores
+            })
+            .collect()
     } else {
         let query_vectors: Vec<Vec<f32>> = if same_queries && dir.join("query_vectors.bin").exists() {
             read_vectors(&dir.join("query_vectors.bin"), queries.len(), dimension)?
@@ -717,10 +837,12 @@ fn run_corpus(
                 Arm::Model | Arm::WordsShuffled => {
                     let (base, _, model) = encoder.unwrap();
                     let mut out = Vec::with_capacity(queries.len());
+                    let mut progress = progress::stderr(&variant.name, corpus, "query", queries.len());
                     for q in &queries {
                         let t = Instant::now();
                         out.push(model.embed(&format!("{}{}", base.query_prefix, q.text))?);
                         timings.query_embed_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                        progress.tick(out.len());
                     }
                     out
                 }
@@ -734,16 +856,27 @@ fn run_corpus(
             write_vectors(&dir.join("query_vectors.bin"), &vectors)?;
             vectors
         };
+        let mut progress = progress::stderr(&variant.name, corpus, "score", query_vectors.len());
         query_vectors
             .iter()
-            .map(|qv| node_vectors.iter().map(|nv| f64::from(cosine_similarity(qv, nv))).collect())
+            .enumerate()
+            .map(|(i, qv)| {
+                let scores = node_vectors.iter().map(|nv| f64::from(cosine_similarity(qv, nv))).collect();
+                progress.tick(i + 1);
+                scores
+            })
             .collect()
     };
 
+    let parents = context::parents(&nodes);
     let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join("rankings.jsonl"))?);
     for ((q, scores), expected) in queries.iter().zip(&scores_per_query).zip(&expected) {
         let top = top_hits(scores);
+        let expected_nodes: Vec<usize> = expected.iter().map(|&c| candidates[c]).collect();
+        let (target_doc, path_overlap) = query_labels(&q.text, &expected_nodes, &nodes, &parents);
         let line = RankingLine {
+            target_doc,
+            path_overlap,
             id: q.id.clone(),
             expected: expected.iter().map(|&c| nodes[candidates[c]].id.clone()).collect(),
             top_language: top.first().map(|&c| nodes[candidates[c]].language.clone()),
@@ -814,6 +947,98 @@ struct ArmRun {
     manifests: Vec<Manifest>,
     /// Per scored positive: (language, |E|, candidate count), for D7's chance level.
     chance_inputs: Vec<(String, usize, usize)>,
+    /// The split labels its rankings carry, by query id.
+    labels: Labels,
+}
+
+/// `(targetDoc, pathOverlap)` by query id.
+type Labels = HashMap<String, (Option<TargetDoc>, Option<bool>)>;
+
+/// The descriptive splits of recall@10 and MRR; never gated.
+const SPLITS: [&str; 5] =
+    ["targetDoc=doc", "targetDoc=sig", "targetDoc=mixed", "pathOverlap=true", "pathOverlap=false"];
+
+fn in_split(split: &str, labels: &Labels, query_id: &str) -> bool {
+    let (doc, overlap) = labels.get(query_id).copied().unwrap_or((None, None));
+    match split {
+        "targetDoc=doc" => doc == Some(TargetDoc::Doc),
+        "targetDoc=sig" => doc == Some(TargetDoc::Sig),
+        "targetDoc=mixed" => doc == Some(TargetDoc::Mixed),
+        "pathOverlap=true" => overlap == Some(true),
+        "pathOverlap=false" => overlap == Some(false),
+        _ => unreachable!("unknown split {split}"),
+    }
+}
+
+/// Every arm's labels in one map, so an arm stored before the labels
+/// existed (the reference) splits by the labels of the arms that carry
+/// them. The labels depend on the snapshot and the queries only, so two
+/// arms that disagree are an error.
+fn merged_labels(arms: &[ArmRun]) -> Result<Labels> {
+    let mut merged = Labels::new();
+    for arm in arms {
+        for (id, &label) in &arm.labels {
+            match merged.get(id) {
+                Some(&seen) if seen != label => {
+                    bail!("query {id} has labels {seen:?} in one run and {label:?} in {}", arm.name)
+                }
+                _ => {
+                    merged.insert(id.clone(), label);
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Each split's size and pooled recall@10 and MRR for one arm.
+fn split_summary(arm: &ArmRun, labels: &Labels) -> serde_json::Value {
+    let o = &arm.outcomes;
+    let splits: serde_json::Map<String, serde_json::Value> = SPLITS
+        .iter()
+        .map(|&split| {
+            let keep = |x: &Outcome| in_split(split, labels, &x.query_id);
+            let r10 = recall_groups(o, 10, keep);
+            let mrr = metrics::group_by_language(
+                o,
+                |x| metrics::is_scored_positive(x) && keep(x),
+                Outcome::reciprocal_rank,
+            );
+            let n: usize = r10.values().map(Vec::len).sum();
+            (
+                split.to_string(),
+                json!({"n": n, "recall@10": metrics::pooled_mean(&r10), "mrr": metrics::pooled_mean(&mrr)}),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(splits)
+}
+
+/// Each split's paired recall@10 and MRR deltas (`arm - reference`) with
+/// their bootstrap bounds.
+fn split_deltas(
+    reference: &ArmRun,
+    arm: &ArmRun,
+    labels: &Labels,
+    settings: &config::Settings,
+) -> Result<serde_json::Value> {
+    let bound = |g: &metrics::Groups| {
+        bound_of(g, settings).map(|b| json!({"point": b.point, "lower": b.lower, "upper": b.upper}))
+    };
+    let mut out = serde_json::Map::new();
+    for split in SPLITS {
+        let keep = |x: &Outcome| metrics::is_scored_positive(x) && in_split(split, labels, &x.query_id);
+        let recall =
+            metrics::paired_deltas(&reference.outcomes, &arm.outcomes, keep, |x| Some(x.hit_at(10)))?;
+        let mrr =
+            metrics::paired_deltas(&reference.outcomes, &arm.outcomes, keep, |x| Some(x.reciprocal_rank()))?;
+        let n: usize = recall.values().map(Vec::len).sum();
+        out.insert(
+            split.to_string(),
+            json!({"n": n, "recall@10Delta": bound(&recall), "mrrDelta": bound(&mrr)}),
+        );
+    }
+    Ok(serde_json::Value::Object(out))
 }
 
 fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmRun> {
@@ -826,6 +1051,7 @@ fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmR
     let mut outcomes = Vec::new();
     let mut manifests = Vec::new();
     let mut chance_inputs = Vec::new();
+    let mut labels = Labels::new();
     let mut corpus_dirs: Vec<PathBuf> = std::fs::read_dir(run)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.join("rankings.jsonl").exists())
@@ -851,6 +1077,9 @@ fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmR
             let q = by_id.get(line.id.as_str()).with_context(|| format!("unknown query {}", line.id))?;
             let first_expected_rank =
                 line.hits.iter().position(|(id, _)| line.expected.contains(id)).map(|p| p + 1);
+            if line.target_doc.is_some() || line.path_overlap.is_some() {
+                labels.insert(line.id.clone(), (line.target_doc, line.path_overlap));
+            }
             if q.positive() && !q.mechanical {
                 chance_inputs.push((q.language.clone(), line.expected.len(), manifest.node_count));
             }
@@ -872,7 +1101,7 @@ fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmR
     if outcomes.is_empty() {
         bail!("{} holds no rankings", run.display());
     }
-    Ok(ArmRun { name, variant, outcomes, manifests, chance_inputs })
+    Ok(ArmRun { name, variant, outcomes, manifests, chance_inputs, labels })
 }
 
 fn bound_of(groups: &metrics::Groups, settings: &config::Settings) -> Option<Bound> {
@@ -992,6 +1221,7 @@ fn report(args: &ReportArgs) -> Result<()> {
     let settings = &variants.settings;
     let arms: Vec<ArmRun> =
         args.runs.iter().map(|r| load_arm(eval_dir, &variants, r)).collect::<Result<_>>()?;
+    let labels = merged_labels(&arms)?;
     let reference_name = args.reference.as_deref().unwrap_or(&settings.reference);
     let reference = arms
         .iter()
@@ -1086,6 +1316,7 @@ fn report(args: &ReportArgs) -> Result<()> {
         let (floors, false_alarm, floor_detail) = floors_and_rates(arm);
         let mut entry = summary(arm, settings);
         entry["floors"] = floor_detail;
+        entry["splits"] = split_summary(arm, &labels);
         entry["discordanceVsReference@10"] =
             json!(metrics::discordance(&reference.outcomes, &arm.outcomes, 10));
 
@@ -1162,6 +1393,7 @@ fn report(args: &ReportArgs) -> Result<()> {
             for key in ["falseAlarmDeltaByLanguage", "falseAlarmDelta"] {
                 entry[key] = false_alarm_report[key].clone();
             }
+            entry["splitDeltas"] = split_deltas(reference, arm, &labels, settings)?;
             verdicts.push((arm.name.clone(), verdict));
         }
         arms_json.insert(arm.name.clone(), entry);
@@ -1384,15 +1616,64 @@ mod tests {
         let node = Node {
             id: "n".into(),
             kind: "Function".into(),
+            name: "f".into(),
             qualified_name: "f".into(),
             file_path: "f.rs".into(),
             language: "rust".into(),
+            native_kind: Some("function".into()),
+            container: None,
+            start_line: 1,
+            end_line: 1,
             text: text_to_embed(Some("Short.\n\nLong tail."), Some("fn f()")),
             doc: Some("Short.\n\nLong tail.".into()),
             signature: Some("fn f()".into()),
         };
         assert_eq!(node.text_for(TextForm::Full).as_deref(), Some("Short.\n\nLong tail.\n\nfn f()"));
         assert_eq!(node.text_for(TextForm::FirstParagraph).as_deref(), Some("Short.\n\nfn f()"));
+    }
+
+    fn node(doc: Option<&str>, signature: Option<&str>) -> Node {
+        Node {
+            id: "n".into(),
+            kind: "Function".into(),
+            name: "f".into(),
+            qualified_name: "f".into(),
+            file_path: "f.rs".into(),
+            language: "rust".into(),
+            native_kind: Some("function".into()),
+            container: None,
+            start_line: 1,
+            end_line: 1,
+            text: text_to_embed(doc, signature),
+            doc: doc.map(Into::into),
+            signature: signature.map(Into::into),
+        }
+    }
+
+    /// The structured form trims the doc and appends the signature in
+    /// `text_to_embed`'s layout, and is `Some` exactly when `text` is.
+    /// Control: making the `Structured` arm return `self.text.clone()` fails
+    /// the first assertion; dropping its `.or_else(..)` fallback fails the
+    /// code-only one.
+    #[test]
+    fn structured_form_trims_the_doc_before_the_signature() {
+        let doc = "Short.\n\n# Examples\n\n```\nf();\n```\n\n@param x y";
+        assert_eq!(
+            node(Some(doc), Some("fn f()")).text_for(TextForm::Structured).as_deref(),
+            Some("Short.\n\nfn f()")
+        );
+        // Absent doc: the signature alone, as in the full form.
+        assert_eq!(node(None, Some("fn f()")).text_for(TextForm::Structured).as_deref(), Some("fn f()"));
+        // A doc of only code and no signature falls back to the full text
+        // rather than dropping the node from the candidate set.
+        let code = "```\nf();\n```";
+        assert_eq!(node(Some(code), None).text_for(TextForm::Structured).as_deref(), Some(code));
+        // A doc of only code with a signature: the signature alone.
+        assert_eq!(
+            node(Some(code), Some("fn f()")).text_for(TextForm::Structured).as_deref(),
+            Some("fn f()")
+        );
+        assert_eq!(node(None, None).text_for(TextForm::Structured), None);
     }
 
     /// A default `text` leaves the fingerprint of every run made before the
@@ -1425,6 +1706,34 @@ mod tests {
             dimension = 768
             max_tokens = 1024
             text = "first-paragraph"
+
+            [[variant]]
+            name = "s"
+            arm = "model"
+            role = "cost"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+            text = "structured"
+
+            [[variant]]
+            name = "n"
+            arm = "model"
+            role = "quality"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+            text = "first-paragraph"
+            context = "none"
+
+            [[variant]]
+            name = "c"
+            arm = "model"
+            role = "quality"
+            pooling = "mean"
+            dimension = 768
+            max_tokens = 1024
+            context = "path-parent"
             "#,
         )
         .unwrap();
@@ -1433,6 +1742,63 @@ mod tests {
         assert!(plain.ends_with("reference: None }"), "{plain}");
         let cut = fingerprint_text(file.get("p").unwrap());
         assert!(cut.ends_with("text: FirstParagraph }"), "{cut}");
+        let structured = fingerprint_text(file.get("s").unwrap());
+        assert!(structured.ends_with("text: Structured }"), "{structured}");
+        let explicit_none = fingerprint_text(file.get("n").unwrap());
+        assert!(!explicit_none.contains("context:"), "{explicit_none}");
+        assert!(explicit_none.ends_with("text: FirstParagraph }"), "{explicit_none}");
+        let context = fingerprint_text(file.get("c").unwrap());
+        assert!(context.ends_with("text: Full, context: PathParent }"), "{context}");
+    }
+
+    /// Controls: counting a whitespace-only doc as documented makes the
+    /// second query `mixed`; dropping the parent names from the tokens makes
+    /// the third `false`.
+    #[test]
+    fn query_labels_split_on_docs_and_path_or_parent_words() {
+        use context::test_node;
+        let mut nodes = vec![
+            test_node("1", "Type", "struct", "m::Session", "src/transport/pool.rs", "rust", None),
+            test_node(
+                "2",
+                "Function",
+                "method",
+                "m::Session::send",
+                "src/transport/pool.rs",
+                "rust",
+                Some("fn send()"),
+            ),
+            test_node("3", "Function", "function", "m::free", "src/misc.rs", "rust", Some("fn free()")),
+        ];
+        nodes[1].doc = Some("Sends it.".into());
+        nodes[2].doc = Some("  \n ".into());
+        let parents = context::parents(&nodes);
+        assert_eq!(query_labels("anything", &[], &nodes, &parents), (None, None));
+        assert_eq!(
+            query_labels("send over the transport", &[1], &nodes, &parents),
+            (Some(TargetDoc::Doc), Some(true))
+        );
+        assert_eq!(query_labels("send", &[1, 2], &nodes, &parents), (Some(TargetDoc::Mixed), Some(false)));
+        assert_eq!(query_labels("free", &[2], &nodes, &parents), (Some(TargetDoc::Sig), Some(false)));
+        assert_eq!(query_labels("the session sends", &[1], &nodes, &parents).1, Some(true));
+    }
+
+    /// The fingerprints of the stored int8 and first-paragraph runs
+    /// (`variantFingerprint` in their manifests), so neither the `context`
+    /// field nor anything else invalidates them. Control: removing the
+    /// `context: None` strip in `fingerprint_text` fails both.
+    #[test]
+    fn stored_runs_keep_their_fingerprints() {
+        let file = VariantsFile::parse(include_str!("../../../eval/embedding/variants.toml")).unwrap();
+        let fp = |name: &str| fingerprint(file.get(name).unwrap());
+        assert_eq!(
+            fp("jina-v2-base-code-int8"),
+            "d560cf97145365a4b8ba7d04a3a8c2bbecf1ba5e7995a1a97acfc6b15fa292c1"
+        );
+        assert_eq!(
+            fp("jina-v2-base-code-int8-first-paragraph"),
+            "d2c1917980ead9fb44ddecaad600d9b881f18b5bfc84f7495ae7f30de6a822af"
+        );
     }
 
     /// Words are permuted, not dropped or altered. Control: returning the
