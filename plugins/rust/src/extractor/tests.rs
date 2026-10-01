@@ -941,13 +941,11 @@ fn gm472_crate() -> Crate {
     ])
 }
 
-/// GM-472 S1, the plugin half of the reproduction: what the Rust plugin
-/// sends for a member used through a re-export. The address names the
-/// *re-exporting* module (where the `use` says `T` lives) by
-/// `qualifiedName`, and that module declares no `T` - only a `reexport`
-/// node publishing it. This is correct per-file output and stays as it is;
-/// the linker is what has to follow the re-export (see
-/// docs/architecture/gm-472-reexport-links.md).
+/// The plugin half of a member used through a re-export. The address names
+/// the *re-exporting* module (where the `use` says `T` lives) by
+/// `qualifiedName`, with its `keyPath`, and that module declares no `T` -
+/// only a `reexport` node publishing it. The linker follows the re-export
+/// from the path's head (docs/architecture/gm-472-reexport-links.md).
 #[test]
 fn gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module() {
     let krate = gm472_crate();
@@ -1000,6 +998,19 @@ fn gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module(
             (scope, TargetKey::QualifiedName(format!("{module}::{head}::m"))),
             "{file}: the method, the same way"
         );
+        // The segments core splits into head and member: never the string.
+        for (member, sep) in [("f", "."), ("m", "::")] {
+            let path = user.placeholder("pending_symbol", member).target.as_ref().unwrap().key_path.as_ref();
+            assert_eq!(
+                path.map(segments),
+                Some(vec![
+                    (String::new(), module.to_string()),
+                    ("::".to_string(), head.to_string()),
+                    (sep.to_string(), member.to_string()),
+                ]),
+                "{file}: the keyPath of {member}"
+            );
+        }
     }
 }
 

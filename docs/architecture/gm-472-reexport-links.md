@@ -1,8 +1,11 @@
 # GM-472: qualifiedName references through re-exports
 
-Status: design (S1), for owner review. The change is in core's linker
-(`graph::symbol_links`) and applies to every language that sends
-`qualifiedName` keys. No product code changes in this slice.
+Status: implemented (S6), on the segment model of GM-474
+([ADR 0015](../adr/0015-qualified-name-segments.md)). The change is in core's
+linker (`graph::symbol_links`) and applies to every language that sends
+`qualifiedName` keys **with a `keyPath`**. Sections "Problem" to "Cost" are
+S1's analysis; S1 split the key string, which the segment model replaces
+(Option C below states the rule as implemented).
 
 ## Problem, reproduced
 
@@ -16,8 +19,7 @@ walks re-exports for `name` keys only (`Resolver::resolve`,
 `core/src/graph/symbol_links.rs`: "a qualifiedName names a declaration, never
 a pass-through"). The edge stays unresolved.
 
-Fixtures. Each asserts **current** behaviour and is labelled so; S2 flips
-the `gm472_current_*` ones:
+Fixtures (S1 recorded the gap; S6 flipped them to the fixed behaviour):
 
 - `plugins/rust/src/extractor/tests.rs`,
   `gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module`
@@ -29,23 +31,32 @@ the `gm472_current_*` ones:
   each path. The test asserts the emitted rows: re-export nodes with a
   `name` target, and the member placeholders keyed
   `<reexporting module>::<head>.f` / `::<head>::m` in the re-exporting
-  module. This output is correct per-file and stays as it is.
+  module, each with its `keyPath` (`named`, `::T`, `.f`). This output is
+  correct per-file and stays as it is.
 - `core/src/graph/symbol_links/tests.rs`, `gm472_*` (the same rows through
-  the real linker SQL):
+  the real linker SQL). Each test's doc comment names its control.
   - `gm472_control_a_member_addressed_at_its_own_module_links`: the same
-    declarations addressed at `krate::a` link (2 edges). This is the control:
-    it proves the unresolved rows below fail on the re-export hop and nothing
-    else.
-  - `gm472_current_members_through_a_reexport_stay_unresolved`: named, alias,
-    glob, and glob-over-named give 8 edges and 0 links. In the same index the
-    head `T` **by name** through `outer` does link to `a::T`, so the walk
-    exists. A qualifiedName key is never given it.
-  - `gm472_current_a_late_declaration_does_not_link_through_a_reexport`: the
-    `link_diff` half. Declarations arriving after the usage do not wake the
-    placeholder.
-  - `gm472_a_glob_cycle_terminates_and_links_nothing` and
-    `gm472_two_globs_offering_one_head_stay_unresolved` must pass before and
-    after the change.
+    declarations addressed at `krate::a` link (2 edges), so a failure below
+    is the re-export hop and nothing else.
+  - `gm472_members_through_a_reexport_link_to_the_declaration`: named,
+    alias, glob, and glob-over-named: all 8 edges link (S1: 0).
+  - `gm472_a_key_without_a_key_path_is_not_split`: the same rows without
+    `keyPath` stay unresolved (an old plugin keeps today's behaviour).
+  - `gm472_a_late_declaration_links_through_a_reexport`,
+    `gm472_a_late_named_reexport_links_the_members_behind_it`,
+    `gm472_a_late_member_links_through_a_reexport_of_its_unchanged_head`:
+    the `link_diff` half, one per trigger (S1: 0 links).
+  - `gm472_a_glob_cycle_terminates_and_links_only_what_leaves_it`: a pure
+    glob cycle links nothing; the same cycle with an exit to `krate::a`
+    links through it.
+  - `gm472_two_globs_offering_one_head_stay_unresolved`: two heads, only one
+    with `m`: nothing links.
+  - `link_all_and_link_diff_agree_on_the_same_end_state` carries the GM-472
+    rows (head and field in one diff, the method as a later edit, each
+    re-exporting module, four users and one without `keyPath`).
+- `core/tests/reexport_member_linking.rs`: the Rust fixture plus a Python
+  package (`from .mod import *` in `__init__`, `Cls.method()` from a user)
+  through the real plugin binaries, wire, write path and linker.
 
 ## How re-exports are represented today
 
@@ -90,22 +101,20 @@ that `protocol::types` re-exports `ControlMessage` from `g_mesh_wire`, and it
 must not read other files. This is exactly why core owns the re-export walk.
 
 **B. Wire hint: the plugin tells core where the head ends.** Add a member
-key kind, for example `{member: {head: "T", tail: "::m"}}`. Exact, but it is a
-protocol change across the SDK, three plugins and conformance, for
-information core can already read off the key. Keep it as the fallback if B'
-below ever proves ambiguous.
+key kind, for example `{member: {head: "T", tail: "::m"}}`. Superseded by
+GM-474's `keyPath`, which carries the same information for every
+`qualifiedName` key without a new key kind.
 
-**C. Core: split the key, walk the head by name, re-key the member
-(recommended).** For a `qualifiedName` placeholder that finds **nothing** in
-its scope:
+**C. Core: split the segments, walk the head by name, re-key the member
+(implemented).** For a `qualifiedName` placeholder that finds **nothing** in
+its scope and carries a `keyPath` of at least two segments:
 
-1. **Split.** Every non-bare `qualifiedName` ends in `<sep><name>`. GM-469's
-   census found zero exceptions across five indexes. For a placeholder,
-   `name` is the member (`f`, `m`, `method`). Strip `<sep><member>` off the
-   key. The last `::`/`.` segment of what remains is the **head** (`T`).
-   Splitting on `#` is avoided for the head because Rust raw identifiers
-   (`r#type`) contain it, and no language that sends `qualifiedName` keys
-   uses `#` as a separator.
+1. **Split the segments, never the string.** The **head** is every segment
+   but the last; the name walked is the head's last name (`T` in `named`,
+   `::T`, `.f`). The **member** is the last segment with its separator
+   (`.f`). A key with no `keyPath` (a plugin that sends no paths, or a
+   stored path that does not decode) is not split: it is looked up whole,
+   as before.
 2. **Walk the head by name.** Resolve `(scope, name = head)` with the
    existing breadth-first re-export walk, unchanged: named hops follow
    renames (`Renamed` -> `T`), globs pass the name through, the visited set
@@ -117,7 +126,7 @@ its scope:
    use anyway, and picking the one that happens to have an `m` would be a
    guess.
 4. **Re-key and look up once.** The new key is `head.qualifiedName +
-   <sep><member>` (`a::T` + `::m`), looked up with the existing exact
+   member.sep + member.name` (`a::T` + `::m`), looked up with the existing exact
    `qualifiedName` query in the head's own scope (its container, or its file
    when it has none). Visibility and the kind filter are as today, and
    "exactly one" is required. No further walking: a member is declared with
@@ -125,37 +134,52 @@ its scope:
 
 This does not need core to know any language's path convention. Rust's
 `<module path>::T` and Python's `Cls` (no module) both work, because the new
-key is built from the head's own stored `qualifiedName`, not recomputed. It
-is also not GM-469's suffix match: every step is an exact lookup, so "a
-missing edge beats a wrong one" holds.
+key is built from the head's own stored `qualifiedName` and the separator
+the plugin put on the member segment, so a field reference (`.f`) can never
+re-key onto a same-named method (`::f`). It is also not GM-469's suffix
+match: every step is an exact lookup, so "a missing edge beats a wrong one"
+holds.
 
-Known limit: the impl-in-another-module case. `impl T` written in a module
-other than `T`'s gives methods a different `qualifiedName` prefix. The direct
-(non-re-exported) address has the same limit today, so this change does not
-make it worse.
+Known limits:
+
+- The impl-in-another-module case. `impl T` written in a module other than
+  `T`'s gives methods a different `qualifiedName` prefix. The direct
+  (non-re-exported) address has the same limit, so this change does not
+  make it worse.
+- A head of more than one name past the scope. Only the head's **last** name
+  is walked. That is right for Rust (`<module path>::T`, where the module
+  path is the scope) and for Python's `Cls.method`. A Python key
+  `Outer.Inner.m` through `import *` walks `Inner` alone, so a different
+  class's nested `Inner` in the re-exported module could answer. No such
+  case exists on g-mesh; a key that needs it would want the plugin to say
+  which segment the scope publishes.
 
 ### `link_diff` (incremental)
 
-Today `seeds` → `republished_addresses` → `waiting_placeholders` match
-`placeholder_targets.key` by **string equality**. A `qualifiedName`
+`seeds` → `republished_addresses` → `waiting_placeholders` match
+`placeholder_targets.key` by **string equality**, so a `qualifiedName`
 placeholder keyed `named::T::m` is never woken by `a::T::m` appearing, or by
-a `pub use` of `T` appearing in `named`. Two additions, both keyed by
-`idx_targets_scope`:
+a `pub use` of `T` appearing in `named`. Two triggers were added (the
+seventh in `link_diff`'s doc):
 
-- For every republished address `(scope, n)` at depth >= 1 (and every re-export
-  seed's own `(scope, published)`), also take the `qualifiedName`-keyed
-  placeholders scoped at `scope` whose parsed head is `n`. Use a scope range
-  scan, filtered in memory by the same split as step 1.
-- An exact seed for a **member** (`a::T::m` new or changed): strip
-  `<sep><name>` to get the head's qualifiedName (`a::T`). Look the head up
-  by that exact qualifiedName in the member's container, which takes one
-  indexed query. Then feed the head's `(scope, name)` through
-  `republished_addresses` and apply the rule above, keeping only
-  placeholders whose member is this node's `name`.
+- `waiting_on_a_head`: for every address `republished_addresses` returns
+  (the seeds themselves included), also take the `qualifiedName`-keyed
+  placeholders scoped there whose decoded `keyPath` head name is that
+  address's name. One scope scan per distinct scope on `idx_targets_scope`'s
+  leading columns, filtered in memory. Over-inclusive, like every trigger.
+- `heads_of_members`: a declaration in the diff with a `qualifiedPath` of at
+  least two segments is a possible member. Its head's `qualifiedName` is
+  `qualifiedPath` without its last segment, joined (`a::T`). The head is
+  looked up by that exact `qualifiedName` beside the member (one
+  `idx_nodes_qualifiedName` query), and the head's `(scope, name)` seeds
+  join the name seeds, so the walk and the trigger above wake what waits on
+  it. This covers an edit that adds a method while `T` itself is unchanged
+  and so not in the diff.
 
 A `*` re-export appearing already wakes every placeholder in its scope
 (`whole_scope`), whatever the key kind. `link_all_and_link_diff_agree_on_the_same_end_state`
-gets a GM-472 diff added so the two paths are held to the same answer.
+carries the GM-472 rows, so the two paths are held to the same answer over
+102 diff orders.
 
 ### Provenance
 
@@ -222,17 +246,15 @@ its anchor via GM-469, and the uses written through `protocol::types` show
 up because of GM-472. Neither blocks the other, and neither changes the
 other's tests.
 
-## For the owner to decide
+## Owner decisions (2026-10-01)
 
-1. **Core rule C, generic across languages (recommended) vs. wire hint B.**
-   C changes Python's results too (`from .mod import *` in an `__init__`),
-   which is intended but is a second language's behaviour change. The
-   Python conformance must then gain a case.
-2. **Ambiguous head = no link** (recommended), even when only one of the
-   heads has the member.
-3. **Incremental scope:** ship the `link_diff` triggers in the same task
-   (recommended, otherwise an edit leaves the index different from a
-   reindex), or full-pass only with a follow-up.
+1. **Core rule C, on GM-474's segments.** No string is parsed; a key with
+   no `keyPath` behaves as before. Python's `from .mod import *` in an
+   `__init__` is covered by `core/tests/reexport_member_linking.rs`.
+2. **Ambiguous head = no link**, even when only one of the heads has the
+   member.
+3. **`link_diff` triggers ship in this task**, so full and incremental
+   reindex give the same links.
 4. **External-crate `pub use`** (`pub use serde::Serialize`) and crate-alias
    re-exports (`pub use g_mesh_wire as wire`) are out of scope. They are a
    plugin path-resolution question, not a linker one.
