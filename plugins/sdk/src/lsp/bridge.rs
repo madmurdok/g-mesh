@@ -1009,6 +1009,7 @@ fn address_of(node: &WireNode, from_container: Option<String>) -> PlaceholderTar
         },
         key: TargetKey::QualifiedName(node.qualified_name.clone()),
         from_container,
+        key_path: node.qualified_path.clone(),
     }
 }
 
@@ -1810,6 +1811,7 @@ mod tests {
                 scope: TargetScope::File("b.toy".into()),
                 key: TargetKey::Name("x".into()),
                 from_container: None,
+                key_path: None,
             },
             range,
         );
@@ -1840,6 +1842,13 @@ mod tests {
         node.container = None;
         let target = address_of(&node, None);
         assert_eq!(target.scope, TargetScope::File("src/greet.rs".to_string()));
+        assert_eq!(target.key_path, None, "no path on the declaration, none on the key");
+
+        let path = g_mesh_wire::QualifiedPath::root("greet").child("::", "Greeter");
+        node.qualified_path = Some(path.clone());
+        let target = address_of(&node, None);
+        assert_eq!(target.key_path, Some(path));
+        assert_eq!(target.check_key_path(), Ok(()));
     }
 
     /// **GM-378.** Two sites of one file addressing one declaration are one

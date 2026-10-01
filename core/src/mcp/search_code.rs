@@ -267,6 +267,23 @@ pub(crate) fn top_k_for_eval(
     Ok(page.results.into_iter().map(|row| (row.symbol_id, row.score)).collect())
 }
 
+/// [`handle`] on the blocking pool. Query inference (and the model's load on
+/// first use) and the store read block their thread for as long as they
+/// take; on an async worker that would stall every other call the daemon is
+/// serving. Dropping the returned future (a cancelled call) does not stop
+/// the blocking work: it runs to completion and its answer is discarded.
+pub(super) async fn handle_off_worker(
+    store: Arc<IndexStore>,
+    embedding: Arc<EmbeddingPipeline>,
+    hints: SessionHints,
+    params: SearchCodeParams,
+    coverage: Option<Coverage>,
+) -> Result<CallToolResult, ErrorData> {
+    tokio::task::spawn_blocking(move || handle(&store, &embedding, &hints, params, coverage.as_ref()))
+        .await
+        .map_err(|e| internal_error("search_code task failed", e.into()))?
+}
+
 /// Answers one `search_code` call. `coverage` is `Some` when the embedding
 /// pass is still owed: the page is then ranked from the stored vectors, led
 /// by a note, marked `partial`, carries no floor verdict, and its cursor is

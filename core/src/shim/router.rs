@@ -42,6 +42,18 @@
 //! still owes answers has the shim answer each of them with an error, so the
 //! client never waits on a request nobody will answer.
 //!
+//! # Before initialize
+//!
+//! A daemon ends a connection whose first message is not `initialize`, so
+//! nothing reaches it before the client's `initialize` does. Until then the
+//! shim answers each request itself: `ping` with an empty result, any other
+//! method with JSON-RPC -32601 (Method not found), which is how a client
+//! probing for a newer protocol era (`server/discover`) learns to fall back
+//! to `initialize`. Notifications, responses and unparsable frames sent
+//! before `initialize` are dropped. A `ping` sent after `initialize` but
+//! before `notifications/initialized` is answered by the shim too, since the
+//! daemon accepts nothing but that notification in between.
+//!
 //! # Who writes stdout
 //!
 //! Only the thread running [`serve`]. Every upstream reader hands it whole
@@ -362,6 +374,9 @@ impl Shared {
 
     fn on_client_frame(&self, frame: Vec<u8>) {
         let (kind, request) = classify(&frame);
+        if self.answered_before_session(&kind, request.as_ref()) {
+            return;
+        }
         // The upstream a cancelled request went to, when it owes nothing else
         // once the cancel is sent.
         let mut cancelled_on = None;
@@ -424,6 +439,39 @@ impl Shared {
         if let Some(upstream) = cancelled_on {
             self.lock().release_if_drained(upstream);
         }
+    }
+
+    /// Handles a client frame that must not reach a daemon yet (see the
+    /// module docs, "Before initialize"). Returns whether it did.
+    fn answered_before_session(&self, kind: &ClientFrame, request: Option<&(Value, String)>) -> bool {
+        let (initialize_sent, initialized_sent) = {
+            let router = self.lock();
+            (router.init_frame.is_some(), router.initialized_frame.is_some())
+        };
+        if initialized_sent || matches!(kind, ClientFrame::Initialize) {
+            return false;
+        }
+        let answer = match request {
+            Some((id, method)) if method == "ping" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            }
+            Some(_) if initialize_sent => return false,
+            Some((id, method)) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {method}") },
+            }),
+            None if initialize_sent => return false,
+            None => {
+                eprintln!(
+                    "g-mesh mcp-shim: dropped a client frame that is not a request, sent before initialize"
+                );
+                return true;
+            }
+        };
+        let _ =
+            self.events.send(Event::Frame(serde_json::to_vec(&answer).expect("a Value always serializes")));
+        true
     }
 
     /// Passes a front frame through, or - for the answer to a
@@ -715,12 +763,13 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(2);
 
-    /// A scripted daemon. It answers `initialize` (with instructions naming
-    /// its root) and `select_project` (with a switch directive to
-    /// `<root>/<project>`) itself, and hands every other frame to the test,
-    /// which answers through [`Fake::answer`]. Like the real daemon, it takes
-    /// a half-close as "client gone" and closes its side: whatever it has not
-    /// answered by then is never answered.
+    /// A scripted daemon. Like the real daemon, it ends the connection when
+    /// its first frame is not `initialize`. It answers `initialize` (with
+    /// instructions naming its root) and `select_project` (with a switch
+    /// directive to `<root>/<project>`) itself, and hands every other frame
+    /// to the test, which answers through [`Fake::answer`]. Like the real
+    /// daemon, it takes a half-close as "client gone" and closes its side:
+    /// whatever it has not answered by then is never answered.
     struct Fake {
         root: PathBuf,
         got: mpsc::Receiver<Value>,
@@ -738,8 +787,14 @@ mod tests {
             let (auto, served) = (Arc::clone(&writer), root.clone());
             thread::spawn(move || {
                 let mut input = BufReader::new(to_daemon_r);
+                let mut initialized = false;
                 while let Ok(Some(frame)) = read_ndjson_frame(&mut input) {
                     let message: Value = serde_json::from_slice(&frame).unwrap();
+                    if !initialized && message["method"] != "initialize" {
+                        auto.lock().unwrap().take();
+                        return;
+                    }
+                    initialized = true;
                     let reply = match message["method"].as_str() {
                         Some("initialize") => Some(json!({
                             "jsonrpc": "2.0",
@@ -832,6 +887,13 @@ mod tests {
 
     impl Session {
         fn start() -> Self {
+            let mut session = Self::open();
+            session.initialize();
+            session
+        }
+
+        /// A session the client has not initialized yet.
+        fn open() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
             std::fs::create_dir(root.join("a")).unwrap();
@@ -859,11 +921,13 @@ mod tests {
                     }
                 }
             });
-            let mut session = Self { root, client, out, front, daemons, session, _dir: dir };
-            session.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
-            assert_eq!(session.recv()["id"], 0);
-            session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-            session
+            Self { root, client, out, front, daemons, session, _dir: dir }
+        }
+
+        fn initialize(&mut self) {
+            self.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
+            assert_eq!(self.recv()["id"], 0);
+            self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         }
 
         fn send(&mut self, message: Value) {
@@ -1168,5 +1232,42 @@ mod tests {
         );
         assert!(text.contains("Its result, if any, was not received"), "{text}");
         session.session.join().unwrap().expect("the session ends when its daemon does");
+    }
+
+    /// A request before `initialize` is refused by the shim with -32601 and
+    /// the same id, a ping is answered, a notification is dropped, and none
+    /// of them reaches the daemon: the session then initializes and serves
+    /// as usual.
+    ///
+    /// Control: remove the `answered_before_session` early return in
+    /// `on_client_frame`: the frames are forwarded, the daemon ends the
+    /// connection, and the probe is answered -32603 instead.
+    #[test]
+    fn a_request_before_initialize_is_refused_and_the_session_continues() {
+        let mut session = Session::open();
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/early" }));
+        session.send(json!({
+            "jsonrpc": "2.0",
+            "id": "server-discover-probe-1",
+            "method": "server/discover",
+            "params": {},
+        }));
+        let refused = session.recv();
+        assert_eq!(refused["id"], "server-discover-probe-1");
+        assert_eq!(refused["error"]["code"], -32601, "{refused}");
+        session.send(json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }));
+        let pong = session.recv();
+        assert_eq!((&pong["id"], &pong["result"]), (&json!(5), &json!({})), "{pong}");
+
+        session.initialize();
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let early: Vec<Value> = std::iter::from_fn(|| session.front.got.recv_timeout(WAIT).ok())
+            .take_while(|message| message["method"] != "tools/list")
+            .filter(|message| message["method"] != "notifications/initialized")
+            .collect();
+        assert!(early.is_empty(), "the daemon got frames sent before initialize: {early:?}");
+        session.front.reply(json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }));
+        let listed = session.recv();
+        assert_eq!((&listed["id"], &listed["result"]["tools"]), (&json!(1), &json!([])), "{listed}");
     }
 }

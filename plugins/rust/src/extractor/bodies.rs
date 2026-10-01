@@ -57,13 +57,15 @@
 //! site budget with questions whose answers are not in the index anyway. A
 //! type this project declares is reachable through a `use`, which resolves.
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey, Visibility};
+use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, QualifiedPath, TargetKey, Visibility};
 use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
-use crate::extractor::decls::{field_tail, impl_block, member_tail, trait_block, BlockCtx, Family};
+use crate::extractor::decls::{field_tail_path, impl_block, member_tail, trait_block, BlockCtx, Family};
 use crate::extractor::emit::{container_target, Emitter};
-use crate::extractor::keys::{qualified_in, resolve_module_path, visibility, ModuleCtx, PathTarget};
+use crate::extractor::keys::{
+    qualified_in, qualified_path_in, resolve_module_path, visibility, ModuleCtx, PathTarget,
+};
 use crate::extractor::model::{FileModel, Import};
 use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::{
@@ -931,27 +933,27 @@ impl Bodies<'_, '_> {
     /// when this file makes it and as a `qualifiedName` placeholder
     /// otherwise.
     fn member_of(&self, container: &str, type_name: &str, member: &str, module: &ModuleCtx) -> Bound {
-        self.tail_in(container, &format!("{type_name}::{member}"), member, module)
+        self.tail_in(container, &QualifiedPath::root(type_name).child("::", member), member, module)
     }
 
     /// The address of the named field `T.field` in `container`, the same way
     /// as [`member_of`](Self::member_of) - never a same-named method.
     fn field_of(&self, container: &str, type_name: &str, field: &str, module: &ModuleCtx) -> Bound {
-        self.tail_in(container, &field_tail(type_name, field), field, module)
+        self.tail_in(container, &field_tail_path(type_name, field), field, module)
     }
 
-    fn tail_in(&self, container: &str, tail: &str, member: &str, module: &ModuleCtx) -> Bound {
-        if let Some(decl) = self.model.lookup_tail(container, tail) {
+    fn tail_in(&self, container: &str, tail: &QualifiedPath, member: &str, module: &ModuleCtx) -> Bound {
+        if let Some(decl) = self.model.lookup_tail(container, &tail.display()) {
             return Bound::Here(decl.id.clone());
         }
-        Bound::There {
-            target: container_target(
-                container,
-                TargetKey::QualifiedName(qualified_in(container, tail)),
-                &module.key,
-            ),
-            name: member.to_string(),
-        }
+        let key_path = qualified_path_in(container, tail);
+        let mut target = container_target(
+            container,
+            TargetKey::QualifiedName(qualified_in(container, &tail.display())),
+            &module.key,
+        );
+        target.key_path = Some(key_path);
+        Bound::There { target, name: member.to_string() }
     }
 
     // --- emission -------------------------------------------------------------
@@ -1102,10 +1104,10 @@ impl Bodies<'_, '_> {
         block: Option<&BlockCtx>,
     ) -> Option<String> {
         let name = block.map(|block| block.prefix.clone())?;
-        let mut spec = NodeSpec::new(
+        let mut spec = NodeSpec::with_path(
             NodeKind::Type,
             name.clone(),
-            module.qualified(&name),
+            module.qualified_path(&QualifiedPath::root(name.clone())),
             self.emitter.positions().range(item),
         )
         .native_kind("impl")

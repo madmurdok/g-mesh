@@ -913,3 +913,81 @@ fn an_orphan_files_declarations_are_indexed_under_its_synthetic_container() {
     // An orphan has no package for a relative import to resolve against.
     assert!(graph.targets(EdgeKind::Imports, "tools/generate.py").is_empty());
 }
+
+// --- qualifiedPath ------------------------------------------------------------
+
+/// The segments of a path as `(sep, name)` pairs, `""` for the first.
+fn segments(path: &g_mesh_plugin_sdk::wire::QualifiedPath) -> Vec<(String, String)> {
+    path.segments()
+        .iter()
+        .map(|segment| (segment.sep.clone().unwrap_or_default(), segment.name.clone()))
+        .collect()
+}
+
+fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    items.iter().map(|(sep, name)| (sep.to_string(), name.to_string())).collect()
+}
+
+/// Every declaration carries a `qualifiedPath` that joins back to its
+/// `qualifiedName` and ends in its name; the `File` node and placeholders
+/// carry none, and no node has an alias; every `qualifiedName`-keyed
+/// placeholder carries a `keyPath` that joins back to its key.
+fn assert_paths_are_well_formed(graph: &Graph) {
+    const PATHLESS: [&str; 4] = ["pending_symbol", "reexport", "resolved_module", "external_module"];
+    for node in &graph.0.nodes {
+        assert!(node.alias_paths.is_empty(), "{node:#?}");
+        let pathless = node.kind == NodeKind::File
+            || node.native_kind.as_deref().is_some_and(|native| PATHLESS.contains(&native));
+        if pathless {
+            assert_eq!(node.qualified_path, None, "{node:#?}");
+        } else {
+            assert!(node.qualified_path.is_some(), "a declaration without a path: {node:#?}");
+            assert_eq!(node.check_qualified_path(), Ok(()), "{node:#?}");
+        }
+        if let Some(target) = &node.target {
+            match &target.key {
+                TargetKey::QualifiedName(_) => assert!(target.key_path.is_some(), "{node:#?}"),
+                TargetKey::Name(_) => assert_eq!(target.key_path, None, "{node:#?}"),
+            }
+            assert_eq!(target.check_key_path(), Ok(()), "{node:#?}");
+        }
+    }
+}
+
+/// One `.`-separated segment per enclosing definition: a module-level
+/// function is one segment, a method `C.m`, a nested class's method
+/// `Outer.Inner.m`; the module announcement is its dotted key; a class
+/// qualifier's key is split the same way.
+#[test]
+fn every_declaration_carries_its_lexical_path_as_segments() {
+    let tree = tree(&[(
+        "pkg/sub/deep.py",
+        "from pkg.base import Base\n\nLIMIT = 3\n\ndef top():\n    def inner():\n        pass\n    return Base.describe(None)\n\nclass Outer:\n    class Inner:\n        def m(self):\n            pass\n",
+    )]);
+    let graph = tree.extract("pkg/sub/deep.py");
+    assert_paths_are_well_formed(&graph);
+    let path_of =
+        |qualified_name: &str| segments(graph.node(qualified_name).qualified_path.as_ref().unwrap());
+
+    assert_eq!(path_of("top"), pairs(&[("", "top")]));
+    assert_eq!(path_of("LIMIT"), pairs(&[("", "LIMIT")]));
+    assert_eq!(path_of("top.inner"), pairs(&[("", "top"), (".", "inner")]));
+    assert_eq!(path_of("Outer.Inner.m"), pairs(&[("", "Outer"), (".", "Inner"), (".", "m")]));
+    assert_eq!(path_of("pkg.sub.deep"), pairs(&[("", "pkg"), (".", "sub"), (".", "deep")]));
+
+    let key_paths: Vec<_> = graph
+        .0
+        .nodes
+        .iter()
+        .filter_map(|node| node.target.as_ref()?.key_path.as_ref())
+        .map(segments)
+        .collect();
+    assert_eq!(key_paths, vec![pairs(&[("", "Base"), (".", "describe")])]);
+
+    let base = tree.extract("pkg/base.py");
+    assert_paths_are_well_formed(&base);
+    assert_eq!(
+        segments(base.node("Base.describe").qualified_path.as_ref().unwrap()),
+        pairs(&[("", "Base"), (".", "describe")])
+    );
+}
