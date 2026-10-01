@@ -82,3 +82,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Accepted |
 | 0012 | [Embedded text: the doc comment trimmed to its prose outline](0012-embedded-text-structured.md) | Accepted |
 | 0013 | [Score cursor: the score travels as its f64 bits](0013-score-cursor-bits.md) | Accepted |
+| 0014 | [A switched session's tool results name the project that answered](0014-answering-project-stamp.md) | Accepted |
