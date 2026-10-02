@@ -140,7 +140,7 @@ variables mirror install.sh's:
 ```powershell
 irm .../install.ps1 | iex; Install-GMesh -Version 2.7.0     # pin a release
 irm .../install.ps1 | iex; Install-GMesh -InstallDir C:\opt\g-mesh
-irm .../install.ps1 | iex; Install-GMesh -NoModifyPath        # leave PATH alone
+$env:G_MESH_NO_MODIFY_PATH = '1'; irm .../install.ps1 | iex  # leave PATH alone
 $env:G_MESH_VERSION = '2.7.0'; pwsh scripts/install.ps1
 ```
 

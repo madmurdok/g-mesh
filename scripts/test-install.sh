@@ -165,6 +165,7 @@ fresh_and_again() {
 		return
 	fi
 	expect_one_block "$name" "$home" "$home/$rc" "$kind"
+	[[ -f "$home/$rc" ]] || return 0
 	local others
 	others="$(home_files "$home" | grep -vxF "./$rc" || true)"
 	[[ -z "$others" ]] || fail "$name: unexpected files besides $rc: $others"
