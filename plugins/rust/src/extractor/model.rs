@@ -84,6 +84,14 @@ impl FileModel {
         }
     }
 
+    /// Records a declaration under its full `tail` only (`T.f` for a struct
+    /// field). A field's bare name is never a path in Rust - it is reached
+    /// only through a value or a type - so a bare identifier written in the
+    /// module must not resolve to it.
+    pub(crate) fn declare_member(&mut self, container: &str, tail: &str, decl: DeclRef) {
+        self.by_tail.entry((container.to_string(), tail.to_string())).or_insert(decl);
+    }
+
     /// The one declaration of `name` in `container` that fits `want`, or
     /// `None` when there is no such declaration or more than one.
     pub(crate) fn lookup_name(

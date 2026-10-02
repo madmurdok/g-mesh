@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::graph::containers;
+use crate::protocol::types::QualifiedPath;
+use crate::storage::qualified_path;
 
 /// One declaration of a symbol that has several - a row of the `declarations`
 /// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
@@ -42,6 +44,9 @@ pub struct PlaceholderTargetRecord {
     pub key_kind: String,
     pub key: String,
     pub from_container: Option<String>,
+    /// The segments of a `qualifiedName` key; `None` for a `name` key or a
+    /// plugin that sends no paths.
+    pub key_path: Option<QualifiedPath>,
 }
 
 pub struct NodeRecord {
@@ -120,6 +125,14 @@ pub struct NodeRecord {
     /// and drop the rows. Nothing does that today; a future reader that needs
     /// the list should load it explicitly.
     pub declarations: Vec<DeclarationRecord>,
+    /// `qualified_name` as the plugin's segments, already checked at ingest
+    /// to join back to it. Read and written (`nodes.qualifiedPath`).
+    pub qualified_path: Option<QualifiedPath>,
+    /// Other spellings of this declaration, already checked at ingest.
+    /// **Write-side only**, like `declarations`: they exist in storage only
+    /// as `qualified_suffixes` rows, a read leaves this empty, and
+    /// [`apply_diff`] replaces the node's rows from it on every upsert.
+    pub alias_paths: Vec<QualifiedPath>,
 }
 
 impl NodeRecord {
@@ -157,6 +170,8 @@ impl NodeRecord {
             native_kind: None,
             has_syntax_errors: false,
             declarations: Vec::new(),
+            qualified_path: None,
+            alias_paths: Vec::new(),
         }
     }
 }
@@ -315,14 +330,16 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             .context("failed to delete a node's declarations")?;
         tx.execute("DELETE FROM placeholder_targets WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's placeholder target")?;
+        tx.execute("DELETE FROM qualified_suffixes WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's qualified suffixes")?;
         tx.execute("DELETE FROM vectors WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's embedding")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
     }
     for node in &diff.upsert_nodes {
         tx.execute(
-            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container, qualifiedPath)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 name = excluded.name,
@@ -339,7 +356,8 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 language = excluded.language,
                 nativeKind = excluded.nativeKind,
                 hasSyntaxErrors = excluded.hasSyntaxErrors,
-                container = excluded.container",
+                container = excluded.container,
+                qualifiedPath = excluded.qualifiedPath",
             // `exported` is deliberately absent from both the column list and
             // the `SET` clause: it is a `GENERATED ALWAYS` column
             // (`storage::schema`'s DDL) and SQLite refuses to `INSERT`/
@@ -365,6 +383,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 node.native_kind,
                 node.has_syntax_errors,
                 node.container,
+                node.qualified_path.as_ref().map(qualified_path::encode),
             ],
         )
         .context("failed to upsert node")?;
@@ -402,6 +421,19 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             .context("failed to insert a declaration")?;
         }
 
+        // A node's suffix rows are replaced wholesale on every upsert, so a
+        // path or alias that changed leaves no stale spelling behind.
+        tx.prepare_cached("DELETE FROM qualified_suffixes WHERE nodeId = ?1")
+            .context("failed to prepare the qualified suffix replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's qualified suffixes")?;
+        for suffix in qualified_path::suffixes(node.qualified_path.as_ref(), &node.alias_paths) {
+            tx.prepare_cached("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES (?1, ?2)")
+                .context("failed to prepare the qualified suffix insert")?
+                .execute(params![suffix, node.id])
+                .context("failed to insert a qualified suffix")?;
+        }
+
         // `placeholder_targets` is replaced wholesale too, and for the same
         // "describes how this node is written *now*" reason: a re-upserted
         // placeholder whose target changed (a reparse that resolves the
@@ -422,8 +454,8 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         if let Some(target) = &node.target {
             tx.prepare_cached(
                 "INSERT INTO placeholder_targets
-                    (nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .context("failed to prepare the placeholder target insert")?
             .execute(params![
@@ -439,6 +471,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 // convention (`graph::symbol_links`' module doc) - see
                 // `placeholder_targets.fromFile`'s own DDL comment.
                 node.file_path,
+                target.key_path.as_ref().map(qualified_path::encode),
             ])
             .context("failed to insert a placeholder target")?;
         }
@@ -779,6 +812,7 @@ mod tests {
             key_kind: "name".to_string(),
             key: key.to_string(),
             from_container: None,
+            key_path: None,
         }
     }
 
@@ -1027,5 +1061,111 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(count(&conn, "nodes"), 0, "node upsert must not survive a rolled-back transaction");
         assert_eq!(count(&conn, "edges"), 0);
+    }
+
+    fn qpath(first: &str, rest: &[(&str, &str)]) -> QualifiedPath {
+        rest.iter().fold(QualifiedPath::root(first), |path, (sep, name)| path.child(*sep, *name))
+    }
+
+    /// `n1` is `<S as Read>::read` in module `m`, with the alias `m::S::read`.
+    fn trait_impl_method(alias_type: &str) -> NodeRecord {
+        let path = qpath("m", &[("::", "<S as Read>"), ("::", "read")]);
+        let mut node = NodeRecord::new("n1", "Function", "read", path.display(), "src/m.rs", "rust");
+        node.qualified_path = Some(path);
+        node.alias_paths = vec![qpath("m", &[("::", alias_type), ("::", "read")])];
+        node
+    }
+
+    fn suffixes_of(conn: &Connection, node_id: &str) -> Vec<String> {
+        conn.prepare("SELECT suffix FROM qualified_suffixes WHERE nodeId = ?1 ORDER BY suffix")
+            .unwrap()
+            .query_map(params![node_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A node's path and alias become its suffix rows, and its path round-trips
+    /// through `nodes.qualifiedPath`. Control: drop the suffix insert loop in
+    /// `apply_diff` (no rows), or the `qualifiedPath` parameter (`None` read back).
+    #[test]
+    fn a_node_with_a_path_and_an_alias_writes_its_suffix_rows() {
+        let mut conn = setup();
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![trait_impl_method("S")], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(suffixes_of(&conn, "n1"), vec!["<S as Read>::read", "S::read", "m::S::read"]);
+        let read_back = crate::graph::queries::get_node(&conn, "n1").unwrap().unwrap();
+        assert_eq!(read_back.qualified_path, Some(qpath("m", &[("::", "<S as Read>"), ("::", "read")])));
+        assert!(read_back.alias_paths.is_empty(), "aliases are write-side only");
+    }
+
+    /// Re-upserting a node replaces its suffix rows. Control: drop the
+    /// `DELETE FROM qualified_suffixes` before the insert loop (the old
+    /// alias's rows stay).
+    #[test]
+    fn re_upserting_a_node_replaces_its_suffix_rows() {
+        let mut conn = setup();
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![trait_impl_method("S")], ..Default::default() })
+            .unwrap();
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![trait_impl_method("T")], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(suffixes_of(&conn, "n1"), vec!["<S as Read>::read", "T::read", "m::T::read"]);
+    }
+
+    /// A node with no path writes no suffix rows and a NULL path, exactly as
+    /// before paths existed.
+    #[test]
+    fn a_node_without_a_path_writes_no_suffix_rows() {
+        let mut conn = setup();
+        let node = NodeRecord::new("n1", "Function", "read", "m::S::read", "src/m.rs", "rust");
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![node], ..Default::default() }).unwrap();
+
+        assert_eq!(count(&conn, "qualified_suffixes"), 0);
+        let stored: Option<String> =
+            conn.query_row("SELECT qualifiedPath FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, None);
+    }
+
+    /// With foreign keys off, as on the daemon's connection, deleting a node
+    /// deletes its suffix rows. Control: drop the `DELETE FROM
+    /// qualified_suffixes` in `apply_diff`'s delete loop (three rows remain
+    /// after the delete).
+    #[test]
+    fn deleting_a_node_takes_its_suffix_rows_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![trait_impl_method("S")], ..Default::default() })
+            .unwrap();
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["n1".to_string()], ..Default::default() })
+            .unwrap();
+        assert_eq!(count(&conn, "qualified_suffixes"), 0);
+
+        let successor = NodeRecord::new("n1", "Function", "read", "other", "src/m.rs", "rust");
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![successor], ..Default::default() }).unwrap();
+        assert!(crate::graph::queries::find_by_qualified_suffix(&conn, "S::read").unwrap().is_empty());
+    }
+
+    /// A placeholder's `keyPath` is stored encoded beside its key.
+    /// Control: drop the `keyPath` parameter from the target insert (NULL).
+    #[test]
+    fn a_placeholder_targets_key_path_is_stored() {
+        let mut conn = setup();
+        let mut target = file_scoped_target("src/b.rs", "a::T.f");
+        target.key_kind = "qualifiedName".to_string();
+        target.key_path = Some(qpath("a", &[("::", "T"), (".", "f")]));
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: vec![placeholder("p1", "src/a.rs", target)], ..Default::default() },
+        )
+        .unwrap();
+
+        let stored: Option<String> = conn
+            .query_row("SELECT keyPath FROM placeholder_targets WHERE nodeId = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("a\u{1f}::\u{1f}T\u{1f}.\u{1f}f"));
     }
 }

@@ -21,6 +21,18 @@
 //! every frame crosses byte-for-byte, as it did before this module existed; a
 //! frame that fails to parse is forwarded raw.
 //!
+//! # Which project answered
+//!
+//! Every agent on one client connection shares the session's selection, and
+//! the shim cannot tell them apart, so one agent's `select_project` reroutes
+//! another's later calls. A `tools/call` result that a sub-project's daemon
+//! answers therefore starts with a text item naming that project, relative
+//! to the shim's root ([`answered_from`]): the root of the upstream the call
+//! was sent to, not the selection at the time the answer arrives. Such a
+//! result is parsed and re-serialized to add it. Front answers, JSON-RPC
+//! error responses, and answers the shim makes itself are not stamped (see
+//! `docs/adr/0014-answering-project-stamp.md`).
+//!
 //! # Every forwarded request is answered
 //!
 //! Each request forwarded upstream is recorded with the upstream it went to
@@ -29,6 +41,18 @@
 //! half-closed once its last one has passed. An upstream that ends while it
 //! still owes answers has the shim answer each of them with an error, so the
 //! client never waits on a request nobody will answer.
+//!
+//! # Before initialize
+//!
+//! A daemon ends a connection whose first message is not `initialize`, so
+//! nothing reaches it before the client's `initialize` does. Until then the
+//! shim answers each request itself: `ping` with an empty result, any other
+//! method with JSON-RPC -32601 (Method not found), which is how a client
+//! probing for a newer protocol era (`server/discover`) learns to fall back
+//! to `initialize`. Notifications, responses and unparsable frames sent
+//! before `initialize` are dropped. A `ping` sent after `initialize` but
+//! before `notifications/initialized` is answered by the shim too, since the
+//! daemon accepts nothing but that notification in between.
 //!
 //! # Who writes stdout
 //!
@@ -277,9 +301,11 @@ fn spawn_reader(shared: &Arc<Shared>, id: u64, mut reader: Box<dyn BufRead + Sen
     thread::spawn(move || {
         loop {
             match read_ndjson_frame(&mut reader) {
-                Ok(Some(frame)) => {
+                Ok(Some(mut frame)) => {
                     if let Some(answered) = response_id(&frame) {
-                        shared.settle(id, &answered);
+                        if let Some(stamp) = shared.settle(id, &answered) {
+                            frame = stamped(frame, &stamp);
+                        }
                     }
                     let frame = if is_front { shared.on_front_frame(frame) } else { Some(frame) };
                     if let Some(frame) = frame {
@@ -329,17 +355,28 @@ impl Shared {
         }
     }
 
-    /// Records that upstream `upstream` answered request `id`.
-    fn settle(&self, upstream: u64, id: &Value) {
+    /// Records that upstream `upstream` answered request `id`. Returns the
+    /// line the answer must start with: [`answered_from`] when it answers a
+    /// `tools/call` and `upstream` serves a sub-project, `None` otherwise.
+    fn settle(&self, upstream: u64, id: &Value) -> Option<String> {
         let mut router = self.lock();
-        if router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
-            router.pending.remove(id);
-            router.release_if_drained(upstream);
+        if !router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
+            return None;
         }
+        let in_flight = router.pending.remove(id)?;
+        router.release_if_drained(upstream);
+        let served = &router.upstream(upstream)?.root;
+        // The front serves the shim's root; a sub-project never does (a
+        // switch refuses the root itself).
+        (in_flight.method == "tools/call" && *served != router.root)
+            .then(|| answered_from(&router.root, served))
     }
 
     fn on_client_frame(&self, frame: Vec<u8>) {
         let (kind, request) = classify(&frame);
+        if self.answered_before_session(&kind, request.as_ref()) {
+            return;
+        }
         // The upstream a cancelled request went to, when it owes nothing else
         // once the cancel is sent.
         let mut cancelled_on = None;
@@ -404,6 +441,39 @@ impl Shared {
         }
     }
 
+    /// Handles a client frame that must not reach a daemon yet (see the
+    /// module docs, "Before initialize"). Returns whether it did.
+    fn answered_before_session(&self, kind: &ClientFrame, request: Option<&(Value, String)>) -> bool {
+        let (initialize_sent, initialized_sent) = {
+            let router = self.lock();
+            (router.init_frame.is_some(), router.initialized_frame.is_some())
+        };
+        if initialized_sent || matches!(kind, ClientFrame::Initialize) {
+            return false;
+        }
+        let answer = match request {
+            Some((id, method)) if method == "ping" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            }
+            Some(_) if initialize_sent => return false,
+            Some((id, method)) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {method}") },
+            }),
+            None if initialize_sent => return false,
+            None => {
+                eprintln!(
+                    "g-mesh mcp-shim: dropped a client frame that is not a request, sent before initialize"
+                );
+                return true;
+            }
+        };
+        let _ =
+            self.events.send(Event::Frame(serde_json::to_vec(&answer).expect("a Value always serializes")));
+        true
+    }
+
     /// Passes a front frame through, or - for the answer to a
     /// `select_project` call that carries a switch directive - performs the
     /// switch, sends the rewritten answer itself and returns `None`.
@@ -434,7 +504,10 @@ impl Shared {
         let (text, is_error) = match self.switch(&mut router, &target) {
             Ok((served, guidance)) => (
                 format!(
-                    "g-mesh: this session now serves {served}; file paths are relative to it. Guidance for \
+                    "g-mesh: this session now serves {served}; file paths are relative to it. Agents \
+                     sharing this connection share this choice, so each tool result from here on starts \
+                     with `g-mesh: answered from project <name>.`; if it names a project other than the \
+                     one you selected, call select_project again before using the result. Guidance for \
                      this project, as a session started in {served} would receive it:\n\n{guidance}",
                     served = served.display()
                 ),
@@ -575,6 +648,31 @@ impl Shared {
     }
 }
 
+/// The first text item of a `tools/call` result answered by the daemon
+/// serving `served`, a project below `root`.
+fn answered_from(root: &Path, served: &Path) -> String {
+    let relative = served.strip_prefix(root).unwrap_or(served);
+    let name: Vec<_> = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect();
+    format!("g-mesh: answered from project {}.", name.join("/"))
+}
+
+/// `frame` with `stamp` as the first text item of its tool result. A frame
+/// with no `result.content` array (a JSON-RPC error, or a frame that does not
+/// parse) is returned unchanged. A tool error (`isError`) is stamped too.
+fn stamped(frame: Vec<u8>, stamp: &str) -> Vec<u8> {
+    let Ok(mut message) = serde_json::from_slice::<Value>(&frame) else {
+        return frame;
+    };
+    let Some(content) = message.get_mut("result").and_then(|result| result.get_mut("content")) else {
+        return frame;
+    };
+    let Some(items) = content.as_array_mut() else {
+        return frame;
+    };
+    items.insert(0, json!({ "type": "text", "text": stamp }));
+    serde_json::to_vec(&message).expect("a Value always serializes")
+}
+
 fn error_result(id: &Value, text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -665,12 +763,13 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(2);
 
-    /// A scripted daemon. It answers `initialize` (with instructions naming
-    /// its root) and `select_project` (with a switch directive to
-    /// `<root>/<project>`) itself, and hands every other frame to the test,
-    /// which answers through [`Fake::answer`]. Like the real daemon, it takes
-    /// a half-close as "client gone" and closes its side: whatever it has not
-    /// answered by then is never answered.
+    /// A scripted daemon. Like the real daemon, it ends the connection when
+    /// its first frame is not `initialize`. It answers `initialize` (with
+    /// instructions naming its root) and `select_project` (with a switch
+    /// directive to `<root>/<project>`) itself, and hands every other frame
+    /// to the test, which answers through [`Fake::answer`]. Like the real
+    /// daemon, it takes a half-close as "client gone" and closes its side:
+    /// whatever it has not answered by then is never answered.
     struct Fake {
         root: PathBuf,
         got: mpsc::Receiver<Value>,
@@ -688,8 +787,14 @@ mod tests {
             let (auto, served) = (Arc::clone(&writer), root.clone());
             thread::spawn(move || {
                 let mut input = BufReader::new(to_daemon_r);
+                let mut initialized = false;
                 while let Ok(Some(frame)) = read_ndjson_frame(&mut input) {
                     let message: Value = serde_json::from_slice(&frame).unwrap();
+                    if !initialized && message["method"] != "initialize" {
+                        auto.lock().unwrap().take();
+                        return;
+                    }
+                    initialized = true;
                     let reply = match message["method"].as_str() {
                         Some("initialize") => Some(json!({
                             "jsonrpc": "2.0",
@@ -745,11 +850,14 @@ mod tests {
         }
 
         fn answer(&self, id: u64) {
-            let reply = json!({
+            self.reply(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": { "content": [{ "type": "text", "text": format!("answer from {}", self.root.display()) }] },
-            });
+            }));
+        }
+
+        fn reply(&self, reply: Value) {
             if let Some(writer) = self.writer.lock().unwrap().as_mut() {
                 write_ndjson_frame(writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
             }
@@ -779,6 +887,13 @@ mod tests {
 
     impl Session {
         fn start() -> Self {
+            let mut session = Self::open();
+            session.initialize();
+            session
+        }
+
+        /// A session the client has not initialized yet.
+        fn open() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
             std::fs::create_dir(root.join("a")).unwrap();
@@ -806,11 +921,13 @@ mod tests {
                     }
                 }
             });
-            let mut session = Self { root, client, out, front, daemons, session, _dir: dir };
-            session.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
-            assert_eq!(session.recv()["id"], 0);
-            session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-            session
+            Self { root, client, out, front, daemons, session, _dir: dir }
+        }
+
+        fn initialize(&mut self) {
+            self.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
+            assert_eq!(self.recv()["id"], 0);
+            self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         }
 
         fn send(&mut self, message: Value) {
@@ -901,7 +1018,7 @@ mod tests {
         a.answer(7);
         let answer = session.recv();
         assert_eq!(answer["id"], 7, "{answer}");
-        assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("answer from"), "{answer}");
+        assert!(answer["result"]["content"][1]["text"].as_str().unwrap().contains("answer from"), "{answer}");
         assert!(a.closes().is_empty(), "a still owes 8");
 
         session.call(9);
@@ -915,6 +1032,144 @@ mod tests {
         assert!(text.contains(&format!("the daemon serving {} ended", a.root.display())), "{text}");
         assert!(text.contains(&format!("(the session had switched to {})", b.root.display())), "{text}");
         assert!(text.contains("call the tool again"), "{text}");
+    }
+
+    /// The first text item of an answer, which a switched session's
+    /// sub-project answers carry as the answering project's name.
+    fn first_text(answer: &Value) -> &str {
+        answer["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text item: {answer}"))
+    }
+
+    /// Two agents sharing one client connection share one selection: agent
+    /// A selects `a`, agent B selects `b`, and A's next call is routed to
+    /// `b`. The answer says so in its first text item, so A can tell and
+    /// re-select. The JSON-RPC ids are the only thing telling the two agents
+    /// apart here, exactly as on a real shared connection.
+    ///
+    /// Control: make `settle` return `None` always: id 11's first text item
+    /// is `b`'s own answer, and the `answered from project b.` assertion
+    /// fails.
+    #[test]
+    fn another_agents_select_is_named_in_this_agents_answer() {
+        let mut session = Session::start();
+        // Agent A.
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(10);
+        assert_eq!(a.expect("tools/call")["id"], 10);
+        a.answer(10);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 10);
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
+
+        // Agent B, on the same connection.
+        let selected = session.select(2, "b");
+        assert!(selected.contains("call select_project again"), "{selected}");
+        let b = session.daemon();
+
+        // Agent A again: its call goes to b, and the answer says so.
+        session.call(11);
+        assert_eq!(b.expect("tools/call")["id"], 11);
+        b.answer(11);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 11, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project b.", "{answer}");
+        let served = answer["result"]["content"][1]["text"].as_str().unwrap();
+        assert_eq!(served, format!("answer from {}", b.root.display()), "the answer itself is untouched");
+    }
+
+    /// The stamp names the daemon a call was sent to, not the selection when
+    /// its answer arrives: a call sent to `a` and answered after a switch to
+    /// `b` names `a`.
+    ///
+    /// Control: in `settle`, take the stamp's root from `router.current()`
+    /// instead of `router.upstream(upstream)`: id 7 is stamped `b`.
+    #[test]
+    fn the_stamp_names_the_project_a_call_was_sent_to() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(7);
+        assert_eq!(a.expect("tools/call")["id"], 7);
+        session.select(2, "b");
+        let _b = session.daemon();
+
+        a.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
+    }
+
+    /// No stamp before a switch, and none on front answers after one: a call
+    /// answered by the front, then `tools/list` after the switch, cross as
+    /// the daemon sent them; only the sub-project's `tools/call` answer is
+    /// stamped, and another method's answer from the sub-project is not.
+    ///
+    /// Controls: drop the `*served != router.root` condition in `settle`: id
+    /// 7, answered by the front before any switch, is stamped. Drop the
+    /// `in_flight.method == "tools/call"` condition: id 10 is stamped.
+    #[test]
+    fn only_sub_project_tool_answers_are_stamped() {
+        let mut session = Session::start();
+        session.call(7);
+        assert_eq!(session.front.expect("tools/call")["id"], 7);
+        session.front.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), format!("answer from {}", session.root.display()), "{answer}");
+
+        session.select(1, "a");
+        let a = session.daemon();
+        session.send(json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" }));
+        assert_eq!(session.front.expect("tools/list")["id"], 8);
+        let listed = json!({ "jsonrpc": "2.0", "id": 8, "result": { "tools": [] } });
+        session.front.reply(listed.clone());
+        assert_eq!(session.recv(), listed);
+
+        session.call(9);
+        assert_eq!(a.expect("tools/call")["id"], 9);
+        a.answer(9);
+        assert_eq!(first_text(&session.recv()), "g-mesh: answered from project a.");
+
+        // Any other method the sub-project answers crosses unchanged, even
+        // when its result happens to carry a `content` array.
+        session.send(json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/read", "params": {} }));
+        assert_eq!(a.expect("resources/read")["id"], 10);
+        let read =
+            json!({ "jsonrpc": "2.0", "id": 10, "result": { "content": [{ "type": "text", "text": "r" }] } });
+        a.reply(read.clone());
+        assert_eq!(session.recv(), read);
+    }
+
+    /// A tool error from a sub-project is stamped like a success; a JSON-RPC
+    /// error response, which has no content to carry it, crosses unchanged.
+    /// The project's name is relative to the shim's root, `/`-separated.
+    ///
+    /// Control: in `stamped`, return `frame` unchanged when
+    /// `result.isError` is true: id 7's first text item is the error text.
+    #[test]
+    fn tool_errors_are_stamped_and_protocol_errors_are_not() {
+        let mut session = Session::start();
+        std::fs::create_dir_all(session.root.join("nested").join("inner")).unwrap();
+        session.select(1, "nested/inner");
+        let inner = session.daemon();
+        session.call(7);
+        session.call(8);
+        assert_eq!(inner.expect("tools/call")["id"], 7);
+        assert_eq!(inner.expect("tools/call")["id"], 8);
+        inner.reply(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": { "content": [{ "type": "text", "text": "no such symbol" }], "isError": true },
+        }));
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project nested/inner.", "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+
+        let error = json!({ "jsonrpc": "2.0", "id": 8, "error": { "code": -32602, "message": "bad" } });
+        inner.reply(error.clone());
+        assert_eq!(session.recv(), error);
     }
 
     /// A previous project's connection is half-closed once it owes nothing:
@@ -977,5 +1232,42 @@ mod tests {
         );
         assert!(text.contains("Its result, if any, was not received"), "{text}");
         session.session.join().unwrap().expect("the session ends when its daemon does");
+    }
+
+    /// A request before `initialize` is refused by the shim with -32601 and
+    /// the same id, a ping is answered, a notification is dropped, and none
+    /// of them reaches the daemon: the session then initializes and serves
+    /// as usual.
+    ///
+    /// Control: remove the `answered_before_session` early return in
+    /// `on_client_frame`: the frames are forwarded, the daemon ends the
+    /// connection, and the probe is answered -32603 instead.
+    #[test]
+    fn a_request_before_initialize_is_refused_and_the_session_continues() {
+        let mut session = Session::open();
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/early" }));
+        session.send(json!({
+            "jsonrpc": "2.0",
+            "id": "server-discover-probe-1",
+            "method": "server/discover",
+            "params": {},
+        }));
+        let refused = session.recv();
+        assert_eq!(refused["id"], "server-discover-probe-1");
+        assert_eq!(refused["error"]["code"], -32601, "{refused}");
+        session.send(json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }));
+        let pong = session.recv();
+        assert_eq!((&pong["id"], &pong["result"]), (&json!(5), &json!({})), "{pong}");
+
+        session.initialize();
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let early: Vec<Value> = std::iter::from_fn(|| session.front.got.recv_timeout(WAIT).ok())
+            .take_while(|message| message["method"] != "tools/list")
+            .filter(|message| message["method"] != "notifications/initialized")
+            .collect();
+        assert!(early.is_empty(), "the daemon got frames sent before initialize: {early:?}");
+        session.front.reply(json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }));
+        let listed = session.recv();
+        assert_eq!((&listed["id"], &listed["result"]["tools"]), (&json!(1), &json!([])), "{listed}");
     }
 }

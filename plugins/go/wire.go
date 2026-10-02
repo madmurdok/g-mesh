@@ -14,6 +14,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -30,7 +31,7 @@ const (
 	// golang.org/x/tools/go/packages) and its manifest's declared
 	// capabilities changed with it, which is exactly what a plugin version
 	// exists to say.
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 	languageName  = "go"
 )
 
@@ -147,6 +148,40 @@ type placeholderTarget struct {
 	// compares against a `container(...)`-visible candidate. Always set by
 	// this plugin: every Go file belongs to a package.
 	FromContainer string `json:"fromContainer,omitempty"`
+	// The segments of a `qualifiedName` key, joining back to it exactly.
+	// Absent for a `name` key.
+	KeyPath []pathSegment `json:"keyPath,omitempty"`
+}
+
+// pathSegment mirrors core's PathSegment: one element of a qualifiedPath or
+// keyPath. `sep` is empty (omitted) on the first segment and "." on every
+// later one - Go's only separator, as in `T.M`.
+type pathSegment struct {
+	Sep  string `json:"sep,omitempty"`
+	Name string `json:"name"`
+}
+
+// dotPath builds the path whose segments are `names` joined by ".", e.g.
+// `T`, `M` -> `T.M`. Its joinPath is the qualifiedName extract.go spells.
+func dotPath(names ...string) []pathSegment {
+	path := make([]pathSegment, len(names))
+	for i, name := range names {
+		path[i].Name = name
+		if i > 0 {
+			path[i].Sep = "."
+		}
+	}
+	return path
+}
+
+// joinPath is the display string a path spells: each sep and name, in order.
+func joinPath(path []pathSegment) string {
+	var b strings.Builder
+	for _, segment := range path {
+		b.WriteString(segment.Sep)
+		b.WriteString(segment.Name)
+	}
+	return b.String()
 }
 
 // wireNode mirrors core's WireNode, field for field and in the same order
@@ -175,6 +210,10 @@ type wireNode struct {
 	Container       string             `json:"container,omitempty"`
 	ContainerParent string             `json:"containerParent,omitempty"`
 	Target          *placeholderTarget `json:"target,omitempty"`
+	// qualifiedName as segments, on a declaration only: joins back to
+	// QualifiedName and ends in Name. Absent on File, import and placeholder
+	// nodes.
+	QualifiedPath []pathSegment `json:"qualifiedPath,omitempty"`
 }
 
 // wireEdge mirrors core's WireEdge. Unused by this scaffold's extractor (no

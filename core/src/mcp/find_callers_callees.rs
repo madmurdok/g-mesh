@@ -24,7 +24,7 @@ use crate::storage::write::NodeRecord;
 
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
-use super::{anchor, provenance, SymbolQueryParams};
+use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
 /// `resolved`. Direction-agnostic on purpose: `list_calls` doesn't know
@@ -340,9 +340,22 @@ pub(crate) fn handle_callers(
     hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    find_definition::resolve_lazily(embedding, |semantic| {
+        handle_callers_in(store, semantic, capabilities, hints, params.clone())
+    })
+}
+
+/// One pass of [`handle_callers`] - see [`find_definition::SemanticRung`].
+pub(crate) fn handle_callers_in(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
 
-    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
+    let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -418,15 +431,28 @@ pub(crate) fn handle_callers(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn handle_callees(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    find_definition::resolve_lazily(embedding, |semantic| {
+        handle_callees_in(store, semantic, capabilities, params.clone())
+    })
+}
+
+/// One pass of [`handle_callees`] - see [`find_definition::SemanticRung`].
+pub(crate) fn handle_callees_in(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
 
-    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
+    let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };

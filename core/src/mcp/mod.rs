@@ -48,13 +48,21 @@ mod instructions;
 mod provenance;
 mod search_code;
 #[cfg(test)]
+mod search_code_rerank_tests;
+#[cfg(test)]
 mod search_code_wait_tests;
 #[cfg(test)]
+mod search_code_worker_tests;
+#[cfg(test)]
 mod semantic_pending_tests;
+#[cfg(test)]
+mod semantic_rung_worker_tests;
 pub(crate) mod session_hints;
 mod similarity;
 mod source;
 mod tool_result;
+#[cfg(test)]
+mod tools_list_tests;
 
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.
@@ -112,6 +120,16 @@ pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
 /// small project's whole backfill or one file-change batch
 /// (`docs/architecture/gm-432-search-code-hang.md`).
 pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
+
+/// Upper bound on the serialized `tools/list` result in bytes, measured on a
+/// front's list (the eight tools plus `select_project`, a superset of what a
+/// project daemon lists). The counterpart of
+/// `instructions::INSTRUCTIONS_BYTE_CEILING` for tool names, descriptions and
+/// input schemas, which a client resends on every turn: growing past it is a
+/// behaviour change that needs a measured token effect, not a quiet edit. The
+/// headroom is kept smaller than the smallest tool's own entry, so a wording
+/// fix fits but a new tool or a batch of new parameters does not.
+pub const TOOLS_LIST_BYTE_CEILING: usize = 11_500;
 
 /// Reads a millisecond-valued env var, falling back to `default` when it is
 /// unset, empty or not a number. Read per call, so a test can change it
@@ -619,7 +637,13 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        find_definition::handle(&self.store, self.registry.project_root(), &self.embedding, params.0)
+        let store = Arc::clone(&self.store);
+        let project_root = self.registry.project_root().to_path_buf();
+        let params = params.0;
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_definition::handle_in(&store, &project_root, semantic, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -634,8 +658,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_references::handle(&self.store, &self.embedding, &capabilities, &self.hints, params.0)
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_references::handle_in(&store, semantic, &capabilities, &hints, params.clone())
+        })
+        .await
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -647,14 +675,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_callers_callees::handle_callers(
-            &self.store,
-            &self.embedding,
-            &capabilities,
-            &self.hints,
-            params.0,
-        )
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_callers_callees::handle_callers_in(&store, semantic, &capabilities, &hints, params.clone())
+        })
+        .await
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -666,8 +692,11 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_callers_callees::handle_callees(&self.store, &self.embedding, &capabilities, params.0)
+        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_callers_callees::handle_callees_in(&store, semantic, &capabilities, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -682,8 +711,11 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_implementations::dispatch(&self.store, &self.embedding, &capabilities, params.0)
+        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_implementations::dispatch_in(&store, semantic, &capabilities, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -729,7 +761,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "search_code",
-        description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Use it first for a \"find the code that does X\" prompt that names no symbol. Results are ranked by similarity, most relevant first. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
+        description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Use it first for a \"find the code that does X\" prompt that names no symbol. Results are ranked by relevance, most relevant first (a cross-encoder reorders the top 30); `score` is the embedding cosine. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
     )]
     async fn search_code(
         &self,
@@ -743,7 +775,14 @@ impl GMeshMcpServer {
             Ok(coverage) => coverage,
             Err(early) => return Ok(early),
         };
-        search_code::handle(&self.store, &self.embedding, &self.hints, params.0, coverage.as_ref())
+        search_code::handle_off_worker(
+            Arc::clone(&self.store),
+            Arc::clone(&self.embedding),
+            self.hints.clone(),
+            params.0,
+            coverage,
+        )
+        .await
     }
 }
 
@@ -766,7 +805,7 @@ impl ServerHandler for GMeshMcpServer {
 
 /// A symbol is addressable either by name or by where the cursor sits, because
 /// an agent reading code has one or the other, rarely both.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FindDefinitionParams {
     /// Name of the symbol to look up.
     pub symbol_name: Option<String>,
@@ -783,13 +822,14 @@ pub struct FindDefinitionParams {
 
 // Shared by find_references/find_callers/find_callees: they differ only in
 // which edges they walk, never in what the caller supplies.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead. Qualified name resolved first, then bare; an
-    /// ambiguous name returns ranked candidates to re-call with.
+    /// Anchor by name instead. Qualified name resolved first, then bare, then a
+    /// path tail (`Type::method`); an ambiguous name returns ranked candidates
+    /// to re-call with.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
@@ -803,13 +843,14 @@ pub struct SymbolQueryParams {
 // The first five fields must stay identical in name, type and semantics to
 // `SymbolQueryParams`'s: `find_implementations::dispatch` builds a
 // `SymbolQueryParams` from them to run the single-hop `handle`.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead. Qualified name resolved first, then bare; an
-    /// ambiguous name returns ranked candidates to re-call with.
+    /// Anchor by name instead. Qualified name resolved first, then bare, then a
+    /// path tail (`Type::method`); an ambiguous name returns ranked candidates
+    /// to re-call with.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page. Ignored when `transitive: true`,
     /// which continues via `resume_token`.

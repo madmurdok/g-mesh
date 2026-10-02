@@ -340,9 +340,16 @@ fn deleting_the_last_member_deletes_the_container_and_every_edge_into_it() {
         apply_diff(&mut conn, &delete(&["a"])).unwrap();
         assert_eq!(row(&conn, "go", "pkg").unwrap().member_count, 1, "fk={foreign_keys}");
 
+        let node_id = container_id("go", "pkg");
+        conn.execute("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES ('x::pkg', ?1)", [&node_id])
+            .unwrap();
         apply_diff(&mut conn, &delete(&["b"])).unwrap();
         assert_eq!(rows(&conn), vec![], "fk={foreign_keys}");
-        let node_id = container_id("go", "pkg");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM qualified_suffixes WHERE nodeId = '{node_id}'")),
+            0,
+            "fk={foreign_keys}: a deleted container's suffix rows go with it"
+        );
         assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM nodes WHERE id = '{node_id}'")), 0);
         assert_eq!(
             count(
@@ -570,9 +577,15 @@ fn the_wire_conversion_carries_container_parent_through_to_the_row() {
         container: Some("github.com/x/app/server".to_string()),
         container_parent: Some("github.com/x/app".to_string()),
         target: None,
+        alias_paths: Vec::new(),
+        qualified_path: None,
     };
     let mut conn = setup(false);
-    apply_diff(&mut conn, &upsert(vec![crate::watcher::apply::to_node_record(wire)])).unwrap();
+    apply_diff(
+        &mut conn,
+        &upsert(vec![crate::watcher::apply::to_node_record(wire, &mut Default::default())]),
+    )
+    .unwrap();
     assert_eq!(
         row(&conn, "go", "github.com/x/app/server").unwrap().parent_key.as_deref(),
         Some("github.com/x/app")

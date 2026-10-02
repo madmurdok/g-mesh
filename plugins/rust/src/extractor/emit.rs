@@ -310,6 +310,7 @@ pub(crate) fn container_target(container: &str, key: TargetKey, from_container: 
         scope: TargetScope::Container(container.to_string()),
         key,
         from_container: Some(from_container.to_string()),
+        key_path: None,
     }
 }
 

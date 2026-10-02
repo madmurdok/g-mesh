@@ -5,13 +5,14 @@
 //! Design: [ADR 0008](../../../docs/adr/0008-workspace-reindex-staging-swap.md).
 //!
 //! Every table keyed by one language's rows appears in both halves: `nodes`,
-//! `declarations`, `placeholder_targets`, `edges`, `containers` and
-//! `vectors`. A table missing from either keeps stale rows after a swap.
+//! `declarations`, `placeholder_targets`, `qualified_suffixes`, `edges`,
+//! `containers` and `vectors`. A table missing from either keeps stale rows
+//! after a swap.
 //!
 //! The unchanged-node rule decides whose edges a node gets. A node is
 //! unchanged when it is in both indexes with every `nodes` column equal and
-//! its `declarations` and `placeholder_targets` rows equal, which is exactly
-//! "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
+//! its `declarations`, `placeholder_targets` and `qualified_suffixes` rows
+//! equal, which is exactly "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
 //! its live outgoing edges, whatever their `source`, and gets none of
 //! staging's, so the swap neither downgrades what a semantic pass wrote nor
 //! brings back a structural edge the pass retracted. Two exceptions: a live
@@ -48,9 +49,11 @@ use crate::storage::schema;
 use crate::storage::write::{Diff, NodeRecord};
 
 const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
-     signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container";
+     signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container, \
+     qualifiedPath";
 const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody";
-const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile";
+const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
+const SUFFIX_COLUMNS: &str = "suffix, nodeId";
 const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration";
 const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
@@ -204,7 +207,11 @@ fn plan_attached(
     )?;
     // A node whose declarations or placeholder target differ is upserted too:
     // the swap replaces both child tables wholesale for every upserted node.
-    for (table, columns) in [("declarations", DECLARATION_COLUMNS), ("placeholder_targets", TARGET_COLUMNS)] {
+    for (table, columns) in [
+        ("declarations", DECLARATION_COLUMNS),
+        ("placeholder_targets", TARGET_COLUMNS),
+        ("qualified_suffixes", SUFFIX_COLUMNS),
+    ] {
         run(
             &format!(
                 "INSERT OR IGNORE INTO plan_upsert_nodes (id) SELECT nodeId FROM (
@@ -426,7 +433,7 @@ fn swap_attached(
             OR nodeId IN (SELECT id FROM staging.plan_text_changed)",
         "the stale vectors",
     )?;
-    for table in ["declarations", "placeholder_targets"] {
+    for table in ["declarations", "placeholder_targets", "qualified_suffixes"] {
         run(
             &format!(
                 "DELETE FROM {table} WHERE nodeId IN (SELECT id FROM staging.plan_delete_nodes)
@@ -471,6 +478,14 @@ fn swap_attached(
              WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
         ),
         "the placeholder targets",
+    )?;
+    run(
+        &format!(
+            "INSERT INTO qualified_suffixes ({SUFFIX_COLUMNS})
+             SELECT {SUFFIX_COLUMNS} FROM staging.qualified_suffixes
+             WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
+        ),
+        "the qualified suffixes",
     )?;
     run(
         &format!(
@@ -539,8 +554,8 @@ fn swap_attached(
 
 /// Deletes those of `ids` that are still pending-symbol placeholders of
 /// `language`, with their edges (either end), vectors, declarations,
-/// placeholder targets and container rows, in one transaction, and returns
-/// how many nodes went.
+/// placeholder targets, qualified suffixes and container rows, in one
+/// transaction, and returns how many nodes went.
 pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[String]) -> Result<usize> {
     let tx = conn.transaction().context("failed to start the placeholder sweep")?;
     let mut deleted = 0;
@@ -563,6 +578,7 @@ pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[
             "DELETE FROM vectors WHERE nodeId = ?1",
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
+            "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
             "DELETE FROM containers WHERE nodeId = ?1",
         ] {
             tx.execute(sql, params![id]).context("failed to delete a kept placeholder's rows")?;
@@ -811,5 +827,129 @@ mod tests {
 
         assert!(column(&live, "SELECT language FROM semantic_pending").is_empty());
         assert!(column(&live, "SELECT filePath FROM semantic_pending_files").is_empty());
+    }
+
+    fn qpath(first: &str, rest: &[(&str, &str)]) -> crate::protocol::types::QualifiedPath {
+        rest.iter().fold(crate::protocol::types::QualifiedPath::root(first), |path, (sep, name)| {
+            path.child(*sep, *name)
+        })
+    }
+
+    /// `read` in `module`, as `<S as Read>::read`, aliased as `<alias>::read`.
+    fn trait_impl_method(module: &str, alias: &str) -> NodeRecord {
+        let path = qpath(module, &[("::", "<S as Read>"), ("::", "read")]);
+        let mut node = NodeRecord::new("read", "Function", "read", path.display(), "src/a.rs", "rust");
+        node.qualified_path = Some(path);
+        node.alias_paths = vec![qpath(module, &[("::", alias), ("::", "read")])];
+        node
+    }
+
+    /// Live holds `live_node`, staging `staged_node` (same id); plans and
+    /// swaps, and returns live with the plan's counts.
+    fn swap_one(
+        live_node: NodeRecord,
+        staged_node: NodeRecord,
+    ) -> (tempfile::TempDir, Connection, PlanCounts) {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+        let mut live = open_staging(&live_path).unwrap();
+        live.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        apply_diff(&mut live, &Diff { upsert_nodes: vec![live_node], ..Default::default() }).unwrap();
+        let mut staging = open_staging(&staging_path).unwrap();
+        apply_diff(&mut staging, &Diff { upsert_nodes: vec![staged_node], ..Default::default() }).unwrap();
+        let planned = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        drop(staging);
+        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
+        (dir, live, planned.counts)
+    }
+
+    /// A node whose only change is an alias is re-swapped, and live ends with
+    /// staging's suffix rows. Control: drop `qualified_suffixes` from
+    /// `plan_attached`'s child-table loop (upsert count 0, old `S::read`
+    /// stays), or from `swap_attached`'s delete loop or its insert (rows
+    /// duplicated or missing).
+    #[test]
+    fn a_swap_carries_an_alias_only_change() {
+        let (_dir, live, counts) = swap_one(trait_impl_method("m", "S"), trait_impl_method("m", "T"));
+
+        assert_eq!(counts.upsert_nodes, 1, "the alias change alone marks the node upserted");
+        assert_eq!(
+            column(&live, "SELECT suffix FROM qualified_suffixes ORDER BY suffix"),
+            vec!["<S as Read>::read", "T::read", "m::T::read"]
+        );
+    }
+
+    /// A path change reaches live's `nodes.qualifiedPath`. Control: drop
+    /// `qualifiedPath` from `NODE_COLUMNS` (live keeps `m`'s path).
+    #[test]
+    fn a_swap_carries_a_path_change_into_the_node_row() {
+        let (_dir, live, _counts) = swap_one(trait_impl_method("m", "S"), trait_impl_method("n", "S"));
+
+        let stored = column(&live, "SELECT qualifiedPath FROM nodes WHERE id = 'read'").remove(0);
+        assert!(stored.starts_with("n\u{1f}"), "{stored:?}");
+    }
+
+    /// An unchanged node with a path is not re-swapped.
+    #[test]
+    fn an_unchanged_node_with_a_path_is_left_alone() {
+        let (_dir, live, counts) = swap_one(trait_impl_method("m", "S"), trait_impl_method("m", "S"));
+
+        assert_eq!(counts, PlanCounts::default());
+        assert_eq!(column(&live, "SELECT suffix FROM qualified_suffixes ORDER BY suffix").len(), 3);
+    }
+
+    /// A `qualifiedName`-keyed placeholder for `a::T.f`, its key path either
+    /// `a`, `::T`, `.f` (`split`) or `a`, `::T.f`; both join to the same key.
+    fn keyed_placeholder(split: bool) -> NodeRecord {
+        let mut node = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        node.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: "src/a.rs".to_string(),
+            key_kind: "qualifiedName".to_string(),
+            key: "a::T.f".to_string(),
+            from_container: None,
+            key_path: Some(if split {
+                qpath("a", &[("::", "T"), (".", "f")])
+            } else {
+                qpath("a", &[("::", "T.f")])
+            }),
+        });
+        node
+    }
+
+    /// A placeholder whose only change is its `keyPath` is re-swapped, and
+    /// live ends with staging's. Control: drop `keyPath` from
+    /// `TARGET_COLUMNS` (upsert count 0, live keeps the old path).
+    #[test]
+    fn a_swap_carries_a_key_path_only_change() {
+        let (_dir, live, counts) = swap_one(keyed_placeholder(false), keyed_placeholder(true));
+
+        assert_eq!(counts.upsert_nodes, 1, "the keyPath change alone marks the placeholder upserted");
+        assert_eq!(
+            column(&live, "SELECT keyPath FROM placeholder_targets WHERE nodeId = 'p1'"),
+            vec!["a\u{1f}::\u{1f}T\u{1f}.\u{1f}f"]
+        );
+    }
+
+    /// A swept placeholder takes any suffix rows under its id with it.
+    /// Control: drop the `qualified_suffixes` delete from
+    /// `delete_placeholders` (the row remains).
+    #[test]
+    fn deleting_a_kept_placeholder_takes_its_suffix_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_staging(&dir.path().join("index.db")).unwrap();
+        let mut placeholder = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        placeholder.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![placeholder], ..Default::default() }).unwrap();
+        conn.execute("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES ('x::f', 'p1')", []).unwrap();
+
+        assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
+        assert!(column(&conn, "SELECT suffix FROM qualified_suffixes").is_empty());
     }
 }

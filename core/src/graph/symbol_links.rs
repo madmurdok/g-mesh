@@ -111,7 +111,26 @@
 //! [`MAX_REEXPORT_DEPTH`] hops are spent. Shallowest wins: a scope that
 //! declares a name itself shadows what it re-exports under that name, as it
 //! does in the language. Only `name` keys walk; a `qualifiedName` names a
-//! declaration, never a pass-through.
+//! declaration, never a pass-through - except through its head, below.
+//!
+//! ## Members of a re-exported head
+//!
+//! `use crate::named::T; T::m()` is addressed by `qualifiedName`
+//! (`named::T::m`) at `named`, which declares no `T`: it re-exports one. A
+//! `qualifiedName` placeholder that finds nothing in its scope and carries a
+//! `keyPath` of at least two segments is split on those segments, never on
+//! its string: the **head** is every segment but the last, the **member** is
+//! the last one with its separator. The head's last name is walked by name
+//! through the scope's re-exports, exactly as a `name` key is (renames,
+//! globs, chains, the visited set, the depth cap, visibility against the
+//! original requester). Only a head found at depth 1 or deeper counts - a
+//! scope that declares the head itself simply lacks the member - and only
+//! exactly one visible head: two are refused, even when only one has the
+//! member. The member is then looked up once, by the exact `qualifiedName`
+//! `head.qualifiedName + sep + name` in the head's own scope (its container,
+//! or its file when it has none), and goes through the ordinary kind filter
+//! and exactly-one rule. A key with no `keyPath` is not split. Design:
+//! docs/architecture/gm-472-reexport-links.md.
 //!
 //! A re-export placeholder is two facts at once, and the row keeps them apart:
 //! its node's `name` is what the re-exporting scope *publishes*, and its
@@ -227,6 +246,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use crate::graph::containers;
 use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
+use crate::protocol::types::QualifiedPath;
+use crate::storage::qualified_path;
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a pending cross-file symbol with. Mirrors
@@ -448,6 +469,8 @@ struct Placeholder {
     id: String,
     scope: Scope,
     key: Key,
+    /// The segments of a `qualifiedName` key, when the plugin sent them.
+    key_path: Option<QualifiedPath>,
     requester: Requester,
 }
 
@@ -456,7 +479,14 @@ struct Placeholder {
 /// `LEFT JOIN`, so a placeholder with no target row still comes back - and is
 /// counted rather than silently invisible.
 const PLACEHOLDER_SELECT: &str = "SELECT n.id, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
-     t.fromContainer, t.fromFile FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
+     t.fromContainer, t.fromFile, t.keyPath FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
+
+/// The name a `qualifiedName` key's head is walked under: the second-to-last
+/// segment of its `keyPath`. `None` without a path of at least two segments.
+fn head_name(key_path: &QualifiedPath) -> Option<&str> {
+    let segments = key_path.segments();
+    (segments.len() >= 2).then(|| segments[segments.len() - 2].name.as_str())
+}
 
 /// `None` for a placeholder with no usable target: no row at all (an
 /// underivable legacy address), or one whose kinds this build does not know.
@@ -473,6 +503,8 @@ fn placeholder_from_row(row: &Row) -> rusqlite::Result<Option<Placeholder>> {
         return Ok(None);
     };
     let from_container: Option<String> = row.get(6)?;
+    // An undecodable path is no path: the key is then looked up whole.
+    let key_path = row.get::<_, Option<String>>(8)?.as_deref().and_then(qualified_path::decode);
     let (Some(scope), Some(key)) =
         (Scope::from_row(&scope_kind, scope, &language), Key::from_row(&key_kind, key))
     else {
@@ -482,6 +514,7 @@ fn placeholder_from_row(row: &Row) -> rusqlite::Result<Option<Placeholder>> {
         id,
         scope,
         key,
+        key_path,
         requester: Requester {
             file: from_file,
             container: from_container.filter(|key| !key.is_empty()),
@@ -532,7 +565,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 }
 
 /// Links what one just-applied diff could have changed, without rescanning
-/// the whole index. Six things can newly make a placeholder linkable:
+/// the whole index. Seven things can newly make a placeholder linkable:
 ///
 ///  1. a placeholder the diff itself added or re-targeted (the reindexed
 ///     file's own imports);
@@ -556,9 +589,17 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 ///     `crate::net::http` cannot see a `pub(crate)` item until
 ///     `crate::net`'s row (and its `parentKey`) exists, and in an incremental
 ///     build that row may arrive after the requester's own file. See
-///     [`requesters_below_new_containers`].
+///     [`requesters_below_new_containers`];
+///  7. a head or a member appearing for a `qualifiedName` placeholder that
+///     reaches the member through a re-export of the head (the module doc's
+///     "Members of a re-exported head"). A head is a declaration or
+///     re-export like the second, third and fifth triggers, so its
+///     republished addresses also wake the `qualifiedName` placeholders in
+///     those scopes whose `keyPath` head is that name ([`waiting_on_a_head`]);
+///     a member adds its head's addresses to the same walk
+///     ([`heads_of_members`]).
 ///
-/// The second, third and fifth are not looked up under their own address
+/// The second, third, fifth and seventh are not looked up under their own address
 /// alone. A placeholder reaching a symbol through a barrel is addressed at
 /// the *barrel*, so [`republished_addresses`] walks the re-export chains back
 /// up from what changed to every address that now answers differently - the
@@ -588,8 +629,10 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
         .map(|node| node.id.clone())
         .collect();
 
-    let (name_seeds, exact_seeds) = seeds(diff);
+    let (mut name_seeds, exact_seeds) = seeds(diff);
+    name_seeds.extend(heads_of_members(conn, diff)?);
     let mut addresses = republished_addresses(conn, name_seeds)?;
+    waiting_on_a_head(conn, &addresses, &mut ids)?;
     addresses.extend(exact_seeds);
     waiting_placeholders(conn, &addresses, &mut ids)?;
 
@@ -653,16 +696,9 @@ fn seeds(diff: &Diff) -> (Vec<Address>, Vec<Address>) {
         if !is_declaration(native_kind) {
             continue;
         }
-        let scopes = match node.visibility.as_str() {
-            VISIBILITY_PUBLIC | VISIBILITY_CONTAINER => {
-                Scope::of_node(&node.file_path, &node.language, node.container.as_deref())
-            }
-            VISIBILITY_FILE => {
-                Scope::container_of(&node.language, node.container.as_deref()).into_iter().collect()
-            }
-            _ => Vec::new(),
-        };
-        for scope in scopes {
+        for scope in
+            published_scopes(&node.visibility, &node.file_path, &node.language, node.container.as_deref())
+        {
             if node.qualified_name != node.name {
                 exact.push((scope.clone(), node.qualified_name.clone()));
             }
@@ -670,6 +706,121 @@ fn seeds(diff: &Diff) -> (Vec<Address>, Vec<Address>) {
         }
     }
     (named, exact)
+}
+
+/// The scopes a declaration with `visibility` is a seed under: those a
+/// placeholder could find it in *and* see it from (see [`seeds`]).
+fn published_scopes(visibility: &str, file: &str, language: &str, container: Option<&str>) -> Vec<Scope> {
+    match visibility {
+        VISIBILITY_PUBLIC | VISIBILITY_CONTAINER => Scope::of_node(file, language, container),
+        VISIBILITY_FILE => Scope::container_of(language, container).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// For every declaration in the diff with a `qualifiedPath` of at least two
+/// segments - a member - the `(scope, name)` seeds of its head, so that
+/// [`waiting_on_a_head`] wakes the placeholders that reach this member
+/// through a re-export of the head. The head is the declaration whose
+/// `qualifiedName` is the member's path without its last segment, looked up
+/// exactly beside the member (its container, or its file when it has none).
+/// A member is a declaration like any other, so its own address is already a
+/// seed in [`seeds`]; what is added here is the head's.
+fn heads_of_members(conn: &Connection, diff: &Diff) -> Result<Vec<Address>> {
+    const HEAD: &str = "SELECT filePath, language, container, name, visibility FROM nodes";
+    let declarations = declaration_only("");
+    let mut in_container = conn
+        .prepare(&format!(
+            "{HEAD} WHERE +language = ?1 AND +container = ?2 AND qualifiedName = ?3 AND {declarations}"
+        ))
+        .context("failed to prepare the member-head lookup")?;
+    let mut in_file = conn
+        .prepare(&format!("{HEAD} WHERE filePath = ?1 AND qualifiedName = ?2 AND {declarations}"))
+        .context("failed to prepare the member-head lookup")?;
+
+    let mut asked: HashSet<(Scope, String)> = HashSet::new();
+    let mut seeds = Vec::new();
+    for node in &diff.upsert_nodes {
+        if !is_declaration(node.native_kind.as_deref()) {
+            continue;
+        }
+        let Some(head) = node.qualified_path.as_ref().and_then(QualifiedPath::head) else {
+            continue;
+        };
+        let scope = Scope::container_of(&node.language, node.container.as_deref())
+            .unwrap_or_else(|| Scope::File(node.file_path.clone()));
+        let head = head.display();
+        if !asked.insert((scope.clone(), head.clone())) {
+            continue;
+        }
+        let map = |row: &Row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        };
+        let rows = match &scope {
+            Scope::Container { language, key } => in_container.query_map(params![language, key, head], map),
+            Scope::File(path) => in_file.query_map(params![path, head], map),
+        }
+        .context("failed to look up a member's head")?;
+        for row in rows {
+            let (file, language, container, name, visibility) =
+                row.context("failed to read a member's head")?;
+            for scope in published_scopes(&visibility, &file, &language, container.as_deref()) {
+                seeds.push((scope, name.clone()));
+            }
+        }
+    }
+    Ok(seeds)
+}
+
+/// Adds to `ids` every `qualifiedName` placeholder scoped at one of
+/// `addresses`' scopes whose `keyPath` head ([`head_name`]) is that address's
+/// name: the placeholders [`Resolver::through_head`] may now answer. Read by
+/// scope (`idx_targets_scope`'s leading columns) and filtered on the decoded
+/// path in memory; a `*` address is left to [`waiting_placeholders`], which
+/// already takes its whole scope.
+fn waiting_on_a_head(conn: &Connection, addresses: &[Address], ids: &mut BTreeSet<String>) -> Result<()> {
+    let mut by_scope: HashMap<&Scope, HashSet<&str>> = HashMap::new();
+    for (scope, name) in addresses {
+        if name != REEXPORT_ALL_NAME {
+            by_scope.entry(scope).or_default().insert(name.as_str());
+        }
+    }
+    if by_scope.is_empty() {
+        return Ok(());
+    }
+    let mut in_scope = conn
+        .prepare(&format!(
+            "SELECT t.nodeId, t.keyPath FROM placeholder_targets t JOIN nodes n ON n.id = t.nodeId \
+             WHERE t.scopeKind = ?1 AND t.scope = ?2 AND t.keyKind = '{KEY_QUALIFIED_NAME}' \
+               AND t.keyPath IS NOT NULL \
+               AND n.kind = ?3 AND n.nativeKind = ?4 AND (?5 IS NULL OR n.language = ?5)"
+        ))
+        .context("failed to prepare the waiting-member lookup")?;
+    for (scope, names) in by_scope {
+        let (scope_kind, scope, language) = scope.bind();
+        let rows = in_scope
+            .query_map(params![scope_kind, scope, MODULE_KIND, PENDING_SYMBOL_NATIVE_KIND, language], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed to look up placeholders waiting on a head")?;
+        for row in rows {
+            let (id, key_path) = row.context("failed to read a placeholder waiting on a head")?;
+            let waits = qualified_path::decode(&key_path)
+                .as_ref()
+                .and_then(head_name)
+                .is_some_and(|head| names.contains(head));
+            if waits {
+                ids.insert(id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Adds to `ids` every placeholder whose target is one of `addresses`. The
@@ -1067,6 +1218,8 @@ struct Candidate {
     language: String,
     visibility: String,
     visibility_container: Option<String>,
+    qualified_name: String,
+    container: Option<String>,
 }
 
 /// One re-export hop: the scope and key a re-export forwards to.
@@ -1093,8 +1246,8 @@ struct Resolver<'c> {
 
 impl<'c> Resolver<'c> {
     fn new(conn: &'c Connection) -> Result<Self> {
-        const CANDIDATE: &str =
-            "SELECT id, kind, filePath, language, visibility, visibilityContainer FROM nodes";
+        const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
+             qualifiedName, container FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key \
              FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
         // Unaliased: `CANDIDATE` selects from `nodes` directly.
@@ -1130,20 +1283,36 @@ impl<'c> Resolver<'c> {
 
     /// The nodes `placeholder` may be linked to: every visible declaration
     /// matching its key at the shallowest level of its scope's re-export
-    /// chains that has any, deduplicated.
-    ///
-    /// Breadth-first, so a name a scope both declares and re-exports resolves
-    /// to the declaration - the language's own rule. Bounded twice over: the
-    /// visited set makes a re-export cycle terminate, [`MAX_REEXPORT_DEPTH`]
-    /// bounds an acyclic chain, and both are needed since one does not imply
-    /// the other.
+    /// chains that has any, deduplicated - or, for a `qualifiedName` key that
+    /// finds nothing, the member of its re-exported head
+    /// ([`Resolver::through_head`]).
     ///
     /// Ambiguity is not resolved here. Several branches of a barrel can each
     /// answer, and they are all returned: the caller refuses to move an edge
     /// that more than one candidate fits, which is the same rule as for a name
     /// a single scope declares twice.
     fn resolve(&mut self, placeholder: &Placeholder) -> Result<Vec<Candidate>> {
-        let mut frontier: Vec<Hop> = vec![(placeholder.scope.clone(), placeholder.key.clone())];
+        let (candidates, _) = self.walk(&placeholder.scope, &placeholder.key, &placeholder.requester)?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+        match (&placeholder.key, &placeholder.key_path) {
+            (Key::QualifiedName(_), Some(key_path)) => self.through_head(placeholder, key_path),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The visible declarations matching `key` at the shallowest level of
+    /// `scope`'s re-export chains that has any, with that level's depth (0:
+    /// `scope` itself).
+    ///
+    /// Breadth-first, so a name a scope both declares and re-exports resolves
+    /// to the declaration - the language's own rule. Bounded twice over: the
+    /// visited set makes a re-export cycle terminate, [`MAX_REEXPORT_DEPTH`]
+    /// bounds an acyclic chain, and both are needed since one does not imply
+    /// the other.
+    fn walk(&mut self, scope: &Scope, key: &Key, requester: &Requester) -> Result<(Vec<Candidate>, usize)> {
+        let mut frontier: Vec<Hop> = vec![(scope.clone(), key.clone())];
         let mut visited: HashSet<Hop> = frontier.iter().cloned().collect();
 
         for depth in 0..=MAX_REEXPORT_DEPTH {
@@ -1153,16 +1322,14 @@ impl<'c> Resolver<'c> {
                 for candidate in self.declared(scope, key)? {
                     // The same node can be reached under its file *and* its
                     // container; it is still one candidate, not an ambiguity.
-                    if !seen.contains(&candidate.id)
-                        && self.visible(&candidate, scope, &placeholder.requester)?
-                    {
+                    if !seen.contains(&candidate.id) && self.visible(&candidate, scope, requester)? {
                         seen.insert(candidate.id.clone());
                         candidates.push(candidate);
                     }
                 }
             }
             if !candidates.is_empty() || depth == MAX_REEXPORT_DEPTH {
-                return Ok(candidates);
+                return Ok((candidates, depth));
             }
 
             let mut next = Vec::new();
@@ -1182,7 +1349,46 @@ impl<'c> Resolver<'c> {
             frontier = next;
         }
 
-        Ok(Vec::new())
+        Ok((Vec::new(), 0))
+    }
+
+    /// A `qualifiedName` key's member, reached through its head: the head's
+    /// last name walked by name from the placeholder's scope, then the member
+    /// looked up once by exact `qualifiedName` beside the head. Empty unless
+    /// exactly one visible head turns up at depth 1 or deeper - at depth 0 the
+    /// scope declares the head itself, so the member is simply not there.
+    fn through_head(
+        &mut self,
+        placeholder: &Placeholder,
+        key_path: &QualifiedPath,
+    ) -> Result<Vec<Candidate>> {
+        let (Some(head), Some(member)) = (head_name(key_path), key_path.last()) else {
+            return Ok(Vec::new());
+        };
+        let (heads, depth) =
+            self.walk(&placeholder.scope, &Key::Name(head.to_string()), &placeholder.requester)?;
+        let [head] = heads.as_slice() else {
+            return Ok(Vec::new()); // none, or ambiguous: a missing edge beats a wrong one
+        };
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+
+        let scope = Scope::container_of(&head.language, head.container.as_deref())
+            .unwrap_or_else(|| Scope::File(head.file_path.clone()));
+        let member_key = Key::QualifiedName(format!(
+            "{}{}{}",
+            head.qualified_name,
+            member.sep.as_deref().unwrap_or(""),
+            member.name
+        ));
+        let mut members = Vec::new();
+        for candidate in self.declared(&scope, &member_key)? {
+            if self.visible(&candidate, &scope, &placeholder.requester)? {
+                members.push(candidate);
+            }
+        }
+        Ok(members)
     }
 
     /// Every declaration in `scope` matching `key`, visible or not.
@@ -1200,6 +1406,8 @@ impl<'c> Resolver<'c> {
                 language: row.get(3)?,
                 visibility: row.get(4)?,
                 visibility_container: row.get(5)?,
+                qualified_name: row.get(6)?,
+                container: row.get(7)?,
             })
         };
         let rows = match (scope, key) {

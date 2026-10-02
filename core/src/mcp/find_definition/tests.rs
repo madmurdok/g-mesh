@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::EdgeRecord;
@@ -62,7 +63,7 @@ fn import_placeholder(id: &str, name: &str, specifier: &str, file: &str) -> Node
 }
 
 fn resolved_by_name(conn: &Connection, name: &str) -> Result<CallToolResult, ErrorData> {
-    by_name(conn, None, None, name, None)
+    by_name(conn, None, &SemanticRung::off(), name, None)
 }
 
 /// GM-367's measured gin case, in miniature: `context` is an import
@@ -404,10 +405,10 @@ fn an_exact_name_reports_the_rung_that_resolved_it() {
     upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
         .unwrap();
 
-    let by_qualified = json_body(&by_name(&conn, None, None, "pkg::run", None).unwrap());
+    let by_qualified = json_body(&by_name(&conn, None, &SemanticRung::off(), "pkg::run", None).unwrap());
     assert_eq!(by_qualified["resolvedBy"], "qualifiedName");
 
-    let by_bare = json_body(&by_name(&conn, None, None, "run", None).unwrap());
+    let by_bare = json_body(&by_name(&conn, None, &SemanticRung::off(), "run", None).unwrap());
     assert_eq!(by_bare["resolvedBy"], "name");
 }
 
@@ -430,7 +431,7 @@ fn a_name_only_a_file_carries_returns_that_files_declarations_as_candidates() {
     )
     .unwrap();
 
-    let body = json_body(&by_name(&conn, None, None, "DropdownMenuGroup", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "DropdownMenuGroup", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "fileName");
     // Not an ambiguity: these are not competing readings of one name, they
@@ -493,7 +494,7 @@ fn the_file_name_rung_offers_a_files_most_referenced_declaration_first() {
     referenced_decl(&mut conn, "MIMEXML", "Variable", "MIMEXML", "context.go", 11, 2);
     referenced_decl(&mut conn, "Context", "Type", "Context", "context.go", 100, 5);
 
-    let body = json_body(&by_name(&conn, None, None, "context", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "context", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "fileName");
     assert_eq!(body["results"][0]["qualifiedName"], "Context", "{body}");
@@ -516,7 +517,7 @@ fn a_file_whose_subject_is_also_its_first_declaration_is_unchanged() {
     referenced_decl(&mut conn, "TOML", "Type", "TOML", "render/toml.go", 20, 6);
     referenced_decl(&mut conn, "tomlBinding.Name", "Function", "tomlBinding.Name", "render/toml.go", 30, 0);
 
-    let body = json_body(&by_name(&conn, None, None, "toml", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "toml", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "fileName");
     assert_eq!(body["results"][0]["qualifiedName"], "TOML", "{body}");
@@ -534,7 +535,7 @@ fn a_file_with_no_inbound_edges_keeps_the_old_order() {
     referenced_decl(&mut conn, "write", "Function", "write", "index/disabled.go", 10, 0);
     referenced_decl(&mut conn, "read", "Function", "read", "index/disabled.go", 20, 0);
 
-    let body = json_body(&by_name(&conn, None, None, "disabled", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "disabled", None).unwrap());
 
     let listed: Vec<&str> =
         body["results"].as_array().unwrap().iter().map(|r| r["qualifiedName"].as_str().unwrap()).collect();
@@ -558,7 +559,7 @@ fn a_page_mixing_two_files_names_both_instead_of_the_first_rows_alone() {
     referenced_decl(&mut conn, "Stat", "Function", "Stat", "fs.go", 10, 3);
     referenced_decl(&mut conn, "Open", "Function", "Open", "internal/fs/fs.go", 12, 1);
 
-    let body = json_body(&by_name(&conn, None, None, "fs", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "fs", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "fileName");
     let paths: Vec<&str> =
@@ -587,7 +588,7 @@ fn a_single_file_page_keeps_the_unqualified_sentence() {
     referenced_decl(&mut conn, "Stat", "Function", "Stat", "fs.go", 10, 3);
     referenced_decl(&mut conn, "Open", "Function", "Open", "fs.go", 12, 1);
 
-    let body = json_body(&by_name(&conn, None, None, "fs", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "fs", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "fileName");
     let explanation = body["explanation"].as_str().expect("an explanation").to_string();
@@ -608,7 +609,7 @@ fn a_name_matching_neither_a_declaration_nor_a_file_is_still_refused() {
     upsert_node(&mut conn, NodeRecord::new("run", "Function", "run", "pkg::run", "src/run.rs", "rust"))
         .unwrap();
 
-    let result = by_name(&conn, None, None, "NoSuchThingAnywhere", None).unwrap();
+    let result = by_name(&conn, None, &SemanticRung::off(), "NoSuchThingAnywhere", None).unwrap();
 
     assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
 }
@@ -622,7 +623,7 @@ fn an_ambiguous_name_labels_its_page_as_the_ambiguity_it_is() {
         upsert_node(&mut conn, NodeRecord::new(id, "Function", "run", "run", file, "rust")).unwrap();
     }
 
-    let body = json_body(&by_name(&conn, None, None, "run", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "run", None).unwrap());
 
     assert_eq!(body["ambiguous"], true);
     assert_eq!(body["resolvedBy"], "nameAmbiguous");
@@ -634,7 +635,7 @@ fn a_unique_name_carries_no_ambiguity_explanation() {
     let mut conn = setup();
     upsert_node(&mut conn, NodeRecord::new("a", "Function", "run", "run", "a.rs", "rust")).unwrap();
 
-    let body = json_body(&by_name(&conn, None, None, "run", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "run", None).unwrap());
 
     assert!(body.get("explanation").is_none(), "{body}");
 }
@@ -679,7 +680,7 @@ fn ripgrep_regex_matchers() -> Connection {
 fn a_bare_name_does_not_resolve_to_whichever_declaration_sits_at_a_root() {
     let conn = ripgrep_regex_matchers();
 
-    let body = json_body(&by_name(&conn, None, None, "RegexMatcher", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "RegexMatcher", None).unwrap());
 
     assert_eq!(body["ambiguous"], true, "four declarations carry this name: {body}");
     assert_eq!(body["resolvedBy"], "nameAmbiguous");
@@ -703,7 +704,7 @@ fn a_bare_name_does_not_resolve_to_whichever_declaration_sits_at_a_root() {
 fn a_qualified_name_two_declarations_carry_is_an_ambiguity_not_a_miss() {
     let conn = ripgrep_regex_matchers();
 
-    let body = json_body(&by_name(&conn, None, None, "matcher::RegexMatcher", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "matcher::RegexMatcher", None).unwrap());
 
     assert_eq!(body["ambiguous"], true, "two declarations carry this qualifiedName: {body}");
     assert_eq!(body["resolvedBy"], "nameAmbiguous");
@@ -726,7 +727,7 @@ fn two_declarations_sharing_one_bare_qualified_name_are_ambiguous_exactly_as_bef
         upsert_node(&mut conn, node_with_span(id, "Binding", "Binding", file, (40, 0))).unwrap();
     }
 
-    let body = json_body(&by_name(&conn, None, None, "Binding", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "Binding", None).unwrap());
 
     assert_eq!(body["ambiguous"], true);
     assert_eq!(body["resolvedBy"], "nameAmbiguous");
@@ -753,7 +754,7 @@ fn a_lone_declaration_whose_qualified_name_is_bare_still_resolves_on_the_exact_r
     )
     .unwrap();
 
-    let body = json_body(&by_name(&conn, None, None, "getNonDeletedElements", None).unwrap());
+    let body = json_body(&by_name(&conn, None, &SemanticRung::off(), "getNonDeletedElements", None).unwrap());
 
     assert_eq!(body["resolvedBy"], "qualifiedName");
     assert_eq!(body["id"], "n1");
@@ -776,7 +777,7 @@ fn definition_of(name: &str, project_root: &std::path::Path, span: (i64, i64)) -
     let mut node = node_with_span("n1", name, &format!("pkg::{name}"), "a/lib.rs", (span.1, 0));
     node.start_line = span.0;
     upsert_node(&mut conn, node).unwrap();
-    json_body(&by_name(&conn, Some(project_root), None, name, None).unwrap())
+    json_body(&by_name(&conn, Some(project_root), &SemanticRung::off(), name, None).unwrap())
 }
 
 /// The point of the whole change: the answer to "where is this defined"
@@ -898,7 +899,7 @@ fn a_specifier_is_refused_tersely_even_though_it_would_out_score_the_threshold()
     insert_vector(&conn, "near", &[1.0, 0.0]);
 
     // Reached through the ladder, so this exercises the real miss path.
-    let result = by_name(&conn, None, None, "@excalidraw/element", None).unwrap();
+    let result = by_name(&conn, None, &SemanticRung::off(), "@excalidraw/element", None).unwrap();
 
     assert_eq!(error_text(&result), "g-mesh: no symbol named '@excalidraw/element' found");
 }
@@ -908,7 +909,7 @@ fn without_an_embedding_pipeline_the_answer_is_exactly_what_it_was_before() {
     let conn = setup_with_vectors();
     insert_vector(&conn, "near", &[1.0, 0.0]);
 
-    let result = by_name(&conn, None, None, "NoSuchThingAnywhere", None).unwrap();
+    let result = by_name(&conn, None, &SemanticRung::off(), "NoSuchThingAnywhere", None).unwrap();
 
     assert_eq!(error_text(&result), "g-mesh: no symbol named 'NoSuchThingAnywhere' found");
 }
@@ -962,4 +963,184 @@ fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
     assert_eq!(body["resolvedBy"], "semanticNeighbours", "the rung must name itself");
     assert_eq!(body["ambiguous"], false, "these are not competing readings of one name");
     assert_eq!(body["results"][0]["id"], "near", "the handle to re-query with must be present");
+}
+
+// --- rung 3.5: qualifiedName suffix --------------------------------------
+
+/// `head` joined to each `(sep, name)` in turn.
+fn qpath(head: &str, rest: &[(&str, &str)]) -> QualifiedPath {
+    rest.iter().fold(QualifiedPath::root(head), |path, (sep, name)| path.child(*sep, *name))
+}
+
+/// A declaration carrying its plugin's segments: named after the last one,
+/// qualified by their display, with `aliases` as the plugin would send them.
+fn path_decl(conn: &mut Connection, id: &str, kind: &str, path: QualifiedPath, aliases: Vec<QualifiedPath>) {
+    let name = path.last().unwrap().name.clone();
+    let mut node = NodeRecord::new(id, kind, name, path.display(), format!("{id}.rs"), "rust");
+    node.qualified_path = Some(path);
+    node.alias_paths = aliases;
+    upsert_node(conn, node).unwrap();
+}
+
+fn rust_fn(conn: &mut Connection, id: &str, head: &str, rest: &[(&str, &str)]) {
+    path_decl(conn, id, "Function", qpath(head, rest), Vec::new());
+}
+
+/// `count` inbound `CALLS` edges onto `id`, from fresh callers.
+fn called(conn: &mut Connection, id: &str, count: usize) {
+    for i in 0..count {
+        let caller = format!("{id}_caller{i}");
+        rust_fn(conn, &caller, &caller, &[]);
+        upsert_edge(
+            conn,
+            EdgeRecord::new(format!("{id}_call{i}"), &caller, id, "CALLS", "tree-sitter", true),
+        )
+        .unwrap();
+    }
+}
+
+/// `(id, resolvedBy)` of a resolution; panics on a refusal.
+fn answer(conn: &Connection, query: &str) -> (String, String) {
+    let body = json_body(&resolved_by_name(conn, query).unwrap());
+    (body["id"].as_str().unwrap_or_default().to_string(), body["resolvedBy"].as_str().unwrap().to_string())
+}
+
+fn refused(conn: &Connection, query: &str) -> bool {
+    error_text(&resolved_by_name(conn, query).unwrap()).contains(&format!("no symbol named '{query}' found"))
+}
+
+/// g-mesh's own shape: `read` is declared several times, so the bare name is
+/// ambiguous, and `IndexStore::read` is a stored suffix of exactly one.
+fn index_store_project() -> Connection {
+    let mut conn = setup();
+    rust_fn(&mut conn, "is_read", "storage", &[("::", "index_store"), ("::", "IndexStore"), ("::", "read")]);
+    rust_fn(&mut conn, "cr_read", "io", &[("::", "ChunkedReader"), ("::", "read")]);
+    rust_fn(&mut conn, "free_read", "config", &[("::", "read")]);
+    conn
+}
+
+/// **Control.** Remove the `by_qualified_name_suffix` arm from
+/// `resolve_symbol_name`: both spellings fall through to the refusal.
+#[test]
+fn a_partial_path_resolves_by_its_qualified_name_suffix() {
+    let conn = index_store_project();
+    for query in ["IndexStore::read", "index_store::IndexStore::read"] {
+        let body = json_body(&resolved_by_name(&conn, query).unwrap());
+        assert_eq!(body["id"], "is_read", "{query}: {body}");
+        assert_eq!(body["resolvedBy"], "qualifiedNameSuffix", "{query}: {body}");
+        assert_eq!(body["qualifiedName"], "storage::index_store::IndexStore::read", "{query}");
+    }
+}
+
+/// A suffix is whole segments: `Store` is not a segment of
+/// `...::IndexStore::read`.
+///
+/// **Control.** In `graph::queries::find_by_qualified_suffix`, replace
+/// `s.suffix = ?1` with `s.suffix LIKE '%' || ?1`: `Store::read` resolves to
+/// `is_read`.
+#[test]
+fn a_suffix_that_splits_a_segment_is_not_a_match() {
+    let conn = index_store_project();
+    assert!(refused(&conn, "Store::read"));
+}
+
+/// A Rust field is `module::T.f` and its getter `module::T::f`: each
+/// spelling reaches only its own node.
+///
+/// **Control.** Remove the `by_qualified_name_suffix` arm from
+/// `resolve_symbol_name`: both are refused. Make the lookup
+/// separator-insensitive (compare `replace(s.suffix, '.', '::')` to the
+/// query with the same replacement) and `Ledger.total` is an ambiguity.
+#[test]
+fn a_rust_field_suffix_matches_only_the_field() {
+    let mut conn = setup();
+    path_decl(&mut conn, "field", "Variable", qpath("gaps", &[("::", "Ledger"), (".", "total")]), Vec::new());
+    rust_fn(&mut conn, "getter", "gaps", &[("::", "Ledger"), ("::", "total")]);
+
+    assert_eq!(answer(&conn, "Ledger.total"), ("field".into(), "qualifiedNameSuffix".into()));
+    assert_eq!(answer(&conn, "Ledger::total"), ("getter".into(), "qualifiedNameSuffix".into()));
+}
+
+/// A trait-impl member's primary path names `<Square as Shape>`; the plugin's
+/// alias `shapes::Square::area` is what `Square::area` matches.
+///
+/// **Control.** Drop the `for alias in aliases` loop from
+/// `storage::qualified_path::suffixes`: `Square::area` is refused, while the
+/// primary-path suffix `<Square as Shape>::area` still resolves.
+#[test]
+fn a_trait_impl_member_is_found_through_its_alias() {
+    let mut conn = setup();
+    path_decl(
+        &mut conn,
+        "area",
+        "Function",
+        qpath("shapes", &[("::", "<Square as Shape>"), ("::", "area")]),
+        vec![qpath("shapes", &[("::", "Square"), ("::", "area")])],
+    );
+
+    assert_eq!(answer(&conn, "Square::area"), ("area".into(), "qualifiedNameSuffix".into()));
+    assert_eq!(answer(&conn, "<Square as Shape>::area"), ("area".into(), "qualifiedNameSuffix".into()));
+}
+
+/// Two impls of one self type both carry `Stream::read`: the same ranked
+/// page as an ambiguous name, most inbound edges first.
+///
+/// **Control.** Return `matched.remove(0)` for any non-empty match set in
+/// `by_qualified_name_suffix`: the page becomes a single resolution. Flip
+/// `paginate_by_score`'s `score DESC` and the order assertion fails.
+#[test]
+fn a_suffix_several_declarations_carry_is_a_ranked_ambiguity() {
+    let mut conn = setup();
+    for (id, module) in [("unix", "unix"), ("windows", "windows")] {
+        path_decl(
+            &mut conn,
+            id,
+            "Function",
+            qpath("ipc", &[("::", module), ("::", "<Stream as Read>"), ("::", "read")]),
+            vec![qpath("ipc", &[("::", module), ("::", "Stream"), ("::", "read")])],
+        );
+    }
+    called(&mut conn, "windows", 2);
+
+    let body = json_body(&resolved_by_name(&conn, "Stream::read").unwrap());
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["ambiguous"], true);
+    let ids: Vec<&str> =
+        body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["windows", "unix"], "inbound edge count descending");
+
+    // A candidate's own qualifiedName takes rung 2.
+    assert_eq!(answer(&conn, "ipc::unix::<Stream as Read>::read"), ("unix".into(), "qualifiedName".into()));
+}
+
+/// Queries rungs 1-3 answer keep their answer and label, even where another
+/// declaration also stores the same spelling as a suffix.
+///
+/// **Control.** Call `by_qualified_name_suffix` first in
+/// `resolve_symbol_name` and return its answer whenever it has one:
+/// `pkg_b::run` resolves to `n3` by `qualifiedNameSuffix`.
+#[test]
+fn a_query_the_earlier_rungs_answer_is_answered_as_before() {
+    let mut conn = setup();
+    rust_fn(&mut conn, "n2", "pkg_b", &[("::", "run")]);
+    rust_fn(&mut conn, "n3", "outer", &[("::", "pkg_b"), ("::", "run")]);
+    rust_fn(&mut conn, "solo", "pkg", &[("::", "only_one")]);
+
+    assert_eq!(answer(&conn, "pkg_b::run"), ("n2".into(), "qualifiedName".into()));
+    assert_eq!(answer(&conn, "only_one"), ("solo".into(), "name".into()));
+    let body = json_body(&resolved_by_name(&conn, "run").unwrap());
+    assert_eq!(body["resolvedBy"], "nameAmbiguous");
+}
+
+/// `_` is a `LIKE` wildcard; the suffix lookup is equality.
+///
+/// **Control.** In `graph::queries::find_by_qualified_suffix`, replace
+/// `s.suffix = ?1` with `s.suffix LIKE ?1`: `store::read_all` resolves to
+/// `x`.
+#[test]
+fn an_underscore_in_the_query_is_not_a_wildcard() {
+    let mut conn = setup();
+    rust_fn(&mut conn, "x", "app", &[("::", "store"), ("::", "readXall")]);
+    assert_eq!(answer(&conn, "store::readXall"), ("x".into(), "qualifiedNameSuffix".into()));
+    assert!(refused(&conn, "store::read_all"));
 }

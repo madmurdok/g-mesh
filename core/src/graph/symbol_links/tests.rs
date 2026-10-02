@@ -146,6 +146,7 @@ fn target(
         key_kind: key_kind.to_string(),
         key: key.to_string(),
         from_container: from.map(str::to_string),
+        key_path: None,
     }
 }
 
@@ -1671,6 +1672,30 @@ fn equivalence_fixture() -> (Vec<Diff>, Expected) {
     uses(&mut edges, RUST_RUN, "CALLS", &other, None);
     diffs.push(diff(vec![member(rust_other(), "Function", "othercrate::run", Vis::Public), other], edges));
 
+    // Rust members through re-exports: the head and its field in one diff,
+    // the method as a later edit of its own, each re-exporting module, and
+    // users through a named, an aliased, a glob and a chained re-export, plus
+    // one whose plugin sent no `keyPath`.
+    diffs.push(diff(vec![gm472_type(), gm472_field()], Vec::new()));
+    diffs.push(diff(vec![gm472_method()], Vec::new()));
+    diffs.push(diff(gm472_named(), Vec::new()));
+    diffs.push(diff(vec![gm472_glob()], Vec::new()));
+    diffs.push(diff(vec![gm472_outer()], Vec::new()));
+    for (file, user, module, head, paths) in [
+        ("src/user_named.rs", "krate::user_named", "krate::named", "T", true),
+        ("src/user_renamed.rs", "krate::user_renamed", "krate::named", "Renamed", true),
+        ("src/user_glob.rs", "krate::user_glob", "krate::glob", "T", true),
+        ("src/user_outer.rs", "krate::user_outer", "krate::outer", "T", true),
+        ("src/user_keyless.rs", "krate::user_keyless", "krate::named", "T", false),
+    ] {
+        let nodes = gm472_user(file, user, module, head, paths);
+        let (field, method) = if paths { (Some(GM472_F), Some(GM472_M)) } else { (None, None) };
+        let mut edges = Vec::new();
+        uses(&mut edges, &nodes[0].id, "REFERENCES", &nodes[1], field);
+        uses(&mut edges, &nodes[0].id, "CALLS", &nodes[2], method);
+        diffs.push(diff(nodes, edges));
+    }
+
     // Last, always: a second usage in caller.ts of an existing placeholder,
     // which the diff does not re-send.
     let reused = placeholder_node("caller.ts", "index.ts", "mutate");
@@ -1748,4 +1773,336 @@ fn link_all_and_link_diff_agree_on_the_same_end_state() {
         }
         assert_eq!(usage_edges(&incremental), reference, "diff order {order:?}");
     }
+}
+
+// --- GM-472: members reached through a re-export ---------------------------
+//
+// The rows below are what the Rust plugin sends for the GM-472 fixture,
+// asserted at the source level by `plugins/rust/src/extractor/tests.rs`'
+// `gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module`:
+// `krate::a` declares `T`, its field `T.f` and its method `T::m`; `named`
+// republishes `T` (also as `Renamed`), `glob` does `pub use crate::a::*`, and
+// `outer` globs `named`. Each user addresses `f` and `m` by qualifiedName, with
+// its `keyPath`, in the module its `use` named. See
+// docs/architecture/gm-472-reexport-links.md.
+
+const GM472_T: &str = "Type:src/a.rs:a::T";
+const GM472_F: &str = "Variable:src/a.rs:a::T.f";
+const GM472_M: &str = "Function:src/a.rs:a::T::m";
+
+fn gm472_at(file: &'static str, module: &'static str) -> At<'static> {
+    At { file, language: "rust", container: module, parent: Some("krate") }
+}
+
+/// A path from its first name and each later `(sep, name)`.
+fn gm472_path(first: &str, rest: &[(&str, &str)]) -> QualifiedPath {
+    rest.iter().fold(QualifiedPath::root(first), |path, (sep, name)| path.child(*sep, *name))
+}
+
+/// A re-export with an explicit id, for two `pub use` items in one module
+/// forwarding the same target under two names.
+fn gm472_reexport(at: At, published: &str, scope: &str, key: &str) -> NodeRecord {
+    let mut node = container_reexport(at, published, scope, key);
+    node.id = format!("{}:as:{published}", node.id);
+    node.qualified_name = node.id.clone();
+    node
+}
+
+/// A declaration of `krate::<module>` with its `qualifiedPath`, as the Rust
+/// plugin sends it: `<module>`, then each `(sep, name)` of `rest`.
+fn gm472_member(at: At, kind: &str, native_kind: &str, rest: &[(&str, &str)]) -> NodeRecord {
+    let path = gm472_path(at.container.trim_start_matches("krate::"), rest);
+    let mut node = member(at, kind, &path.display(), Vis::Public);
+    node.native_kind = Some(native_kind.to_string());
+    node.qualified_path = Some(path);
+    node
+}
+
+fn gm472_type() -> NodeRecord {
+    gm472_member(gm472_at("src/a.rs", "krate::a"), "Type", "struct", &[("::", "T")])
+}
+fn gm472_field() -> NodeRecord {
+    gm472_member(gm472_at("src/a.rs", "krate::a"), "Variable", "field", &[("::", "T"), (".", "f")])
+}
+fn gm472_method() -> NodeRecord {
+    gm472_member(gm472_at("src/a.rs", "krate::a"), "Function", "method", &[("::", "T"), ("::", "m")])
+}
+
+fn gm472_declarations() -> Vec<NodeRecord> {
+    vec![gm472_type(), gm472_field(), gm472_method()]
+}
+
+fn gm472_named() -> Vec<NodeRecord> {
+    vec![
+        gm472_reexport(gm472_at("src/named.rs", "krate::named"), "T", "krate::a", "T"),
+        gm472_reexport(gm472_at("src/named.rs", "krate::named"), "Renamed", "krate::a", "T"),
+    ]
+}
+fn gm472_glob() -> NodeRecord {
+    gm472_reexport(gm472_at("src/glob.rs", "krate::glob"), REEXPORT_ALL_NAME, "krate::a", REEXPORT_ALL_NAME)
+}
+fn gm472_outer() -> NodeRecord {
+    gm472_reexport(
+        gm472_at("src/outer.rs", "krate::outer"),
+        REEXPORT_ALL_NAME,
+        "krate::named",
+        REEXPORT_ALL_NAME,
+    )
+}
+
+fn gm472_reexports() -> Vec<NodeRecord> {
+    let mut nodes = gm472_named();
+    nodes.push(gm472_glob());
+    nodes.push(gm472_outer());
+    nodes
+}
+
+/// One user file's rows: `run`, and its placeholders for `<head>.f` and
+/// `<head>::m` addressed in `module` - with their `keyPath` when `paths`.
+fn gm472_user(
+    file: &'static str,
+    user: &'static str,
+    module: &str,
+    head: &str,
+    paths: bool,
+) -> Vec<NodeRecord> {
+    let at = gm472_at(file, user);
+    let run = member(at, "Function", &format!("{}::run", user.trim_start_matches("krate::")), Vis::Public);
+    let prefix = module.trim_start_matches("krate::");
+    let placeholder = |sep: &str, name: &str| {
+        let path = gm472_path(prefix, &[("::", head), (sep, name)]);
+        let mut node = container_placeholder(at, module, KEY_QUALIFIED_NAME, &path.display());
+        if paths {
+            node.target.as_mut().unwrap().key_path = Some(path);
+        }
+        node
+    };
+    vec![run, placeholder(".", "f"), placeholder("::", "m")]
+}
+
+/// `gm472_user`'s rows as one diff: `run` REFERENCES the field and CALLS the
+/// method. Returns the diff and `(field edge, method edge)`.
+fn gm472_user_diff(
+    file: &'static str,
+    user: &'static str,
+    module: &str,
+    head: &str,
+    paths: bool,
+) -> (Diff, (String, String)) {
+    let nodes = gm472_user(file, user, module, head, paths);
+    let field = usage_edge(&nodes[0].id, "REFERENCES", &nodes[1]);
+    let method = usage_edge(&nodes[0].id, "CALLS", &nodes[2]);
+    let ids = (field.id.clone(), method.id.clone());
+    (Diff { upsert_nodes: nodes, upsert_edges: vec![field, method], ..Default::default() }, ids)
+}
+
+/// Applies one user file, with paths. Returns `(field edge, method edge)`.
+fn gm472_use(
+    conn: &mut Connection,
+    file: &'static str,
+    user: &'static str,
+    module: &str,
+    head: &str,
+) -> (String, String) {
+    let (diff, edges) = gm472_user_diff(file, user, module, head, true);
+    apply_diff(conn, &diff).unwrap();
+    edges
+}
+
+/// Applies `diff` and links it incrementally.
+fn gm472_apply_and_link_diff(conn: &mut Connection, diff: &Diff) -> LinkSummary {
+    apply_diff(conn, diff).unwrap();
+    link_diff(conn, diff).unwrap()
+}
+
+fn gm472_assert_linked(conn: &Connection, (field, method): &(String, String)) {
+    assert_eq!(edge_target(conn, field), (GM472_F.to_string(), true), "{field}");
+    assert_eq!(edge_target(conn, method), (GM472_M.to_string(), true), "{method}");
+}
+
+fn gm472_assert_unresolved(conn: &Connection, (field, method): &(String, String)) {
+    assert!(!edge_target(conn, field).1, "{field}");
+    assert!(!edge_target(conn, method).1, "{method}");
+}
+
+/// Control for everything below: the same rows addressed straight at the
+/// declaring module link, so an unresolved edge further down is the
+/// re-export hop and nothing else about the fixture.
+#[test]
+fn gm472_control_a_member_addressed_at_its_own_module_links() {
+    let mut conn = setup();
+    upsert(&mut conn, gm472_declarations());
+    let edges = gm472_use(&mut conn, "src/user_direct.rs", "krate::user_direct", "krate::a", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 2 });
+    gm472_assert_linked(&conn, &edges);
+}
+
+/// A named `pub use`, its `as` alias, a glob, and a two-hop glob-over-named
+/// chain: all eight edges land on `a::T.f` / `a::T::m`, each by its own
+/// separator - the field never on the method or the reverse.
+///
+/// Control: make `Resolver::resolve` return the empty walk result instead of
+/// calling `through_head` - no edge links.
+#[test]
+fn gm472_members_through_a_reexport_link_to_the_declaration() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.extend(gm472_reexports());
+    upsert(&mut conn, nodes);
+    let edges = [
+        gm472_use(&mut conn, "src/user_named.rs", "krate::user_named", "krate::named", "T"),
+        gm472_use(&mut conn, "src/user_renamed.rs", "krate::user_renamed", "krate::named", "Renamed"),
+        gm472_use(&mut conn, "src/user_glob.rs", "krate::user_glob", "krate::glob", "T"),
+        gm472_use(&mut conn, "src/user_outer.rs", "krate::user_outer", "krate::outer", "T"),
+    ];
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 8 });
+    for pair in &edges {
+        gm472_assert_linked(&conn, pair);
+    }
+}
+
+/// A plugin that sends no `keyPath` keeps today's behaviour: its key is
+/// looked up whole and never split, so nothing links through a re-export.
+///
+/// Control: the same rows with their paths link (the test above), so the
+/// missing path is the only thing stopping them.
+#[test]
+fn gm472_a_key_without_a_key_path_is_not_split() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.extend(gm472_reexports());
+    upsert(&mut conn, nodes);
+    let (diff, edges) = gm472_user_diff("src/user_named.rs", "krate::user_named", "krate::named", "T", false);
+    apply_diff(&mut conn, &diff).unwrap();
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    gm472_assert_unresolved(&conn, &edges);
+}
+
+/// The incremental half, declarations last: the head and its members
+/// arriving after the usage and the re-exports wake the waiting placeholders
+/// at the re-exporting module, through a named and a two-hop chain alike.
+///
+/// Control: drop the `waiting_on_a_head` call from `link_diff` - 0 linked.
+#[test]
+fn gm472_a_late_declaration_links_through_a_reexport() {
+    let mut conn = setup();
+    gm472_apply_and_link_diff(&mut conn, &Diff { upsert_nodes: gm472_reexports(), ..Default::default() });
+    let named = gm472_use(&mut conn, "src/user_named.rs", "krate::user_named", "krate::named", "T");
+    let outer = gm472_use(&mut conn, "src/user_outer.rs", "krate::user_outer", "krate::outer", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 }, "nothing to link yet");
+
+    let declarations = Diff { upsert_nodes: gm472_declarations(), ..Default::default() };
+    assert_eq!(gm472_apply_and_link_diff(&mut conn, &declarations), LinkSummary { linked_edges: 4 });
+    gm472_assert_linked(&conn, &named);
+    gm472_assert_linked(&conn, &outer);
+}
+
+/// The incremental half, re-export last: a `pub use` appearing in the
+/// module the usage names makes its member placeholders answerable.
+///
+/// Control: drop the `waiting_on_a_head` call from `link_diff` - 0 linked.
+#[test]
+fn gm472_a_late_named_reexport_links_the_members_behind_it() {
+    let mut conn = setup();
+    upsert(&mut conn, gm472_declarations());
+    let edges = gm472_use(&mut conn, "src/user_named.rs", "krate::user_named", "krate::named", "T");
+    link_all(&mut conn).unwrap();
+    gm472_assert_unresolved(&conn, &edges);
+
+    let named = Diff { upsert_nodes: gm472_named(), ..Default::default() };
+    assert_eq!(gm472_apply_and_link_diff(&mut conn, &named), LinkSummary { linked_edges: 2 });
+    gm472_assert_linked(&conn, &edges);
+}
+
+/// The incremental half, member last: an edit that adds only the method
+/// (`T` itself unchanged, so not in the diff) links the call waiting on it
+/// through the re-export.
+///
+/// Control: drop the `heads_of_members` extension of the name seeds in
+/// `link_diff` - 0 linked.
+#[test]
+fn gm472_a_late_member_links_through_a_reexport_of_its_unchanged_head() {
+    let mut conn = setup();
+    let mut nodes = vec![gm472_type(), gm472_field()];
+    nodes.extend(gm472_reexports());
+    upsert(&mut conn, nodes);
+    let (field, method) = gm472_use(&mut conn, "src/user_glob.rs", "krate::user_glob", "krate::glob", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 }, "the field only");
+
+    let added = Diff { upsert_nodes: vec![gm472_method()], ..Default::default() };
+    assert_eq!(gm472_apply_and_link_diff(&mut conn, &added), LinkSummary { linked_edges: 1 });
+    gm472_assert_linked(&conn, &(field, method));
+}
+
+/// Two globs re-exporting each other terminate and link nothing; the same
+/// cycle with a way out to `krate::a` terminates and links through it.
+///
+/// Control (second half): make `Resolver::resolve` skip `through_head` - the
+/// edges through the cycle stay unresolved.
+#[test]
+fn gm472_a_glob_cycle_terminates_and_links_only_what_leaves_it() {
+    let cycle = |exit: bool| {
+        let mut conn = setup();
+        let mut nodes = gm472_declarations();
+        let (cyc_a, cyc_b) =
+            (gm472_at("src/cyc_a.rs", "krate::cyc_a"), gm472_at("src/cyc_b.rs", "krate::cyc_b"));
+        nodes.push(gm472_reexport(cyc_a, REEXPORT_ALL_NAME, "krate::cyc_b", REEXPORT_ALL_NAME));
+        nodes.push(gm472_reexport(cyc_b, REEXPORT_ALL_NAME, "krate::cyc_a", REEXPORT_ALL_NAME));
+        if exit {
+            nodes.push(gm472_reexport(cyc_b, REEXPORT_ALL_NAME, "krate::a", REEXPORT_ALL_NAME));
+        }
+        upsert(&mut conn, nodes);
+        let edges = gm472_use(&mut conn, "src/user_cyc.rs", "krate::user_cyc", "krate::cyc_a", "T");
+        let summary = link_all(&mut conn).unwrap();
+        (conn, edges, summary)
+    };
+
+    let (conn, edges, summary) = cycle(false);
+    assert_eq!(summary, LinkSummary { linked_edges: 0 });
+    gm472_assert_unresolved(&conn, &edges);
+
+    let (conn, edges, summary) = cycle(true);
+    assert_eq!(summary, LinkSummary { linked_edges: 2 });
+    gm472_assert_linked(&conn, &edges);
+}
+
+/// Two globs offering two different `T`s are ambiguous - Rust itself rejects
+/// the use - and the head links nothing, even though only `a::T` has an `m`.
+///
+/// Control: in `through_head`, take the member of every head instead of
+/// requiring exactly one - the call lands on `a::T::m`.
+#[test]
+fn gm472_two_globs_offering_one_head_stay_unresolved() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.push(gm472_member(gm472_at("src/b.rs", "krate::b"), "Type", "struct", &[("::", "T")]));
+    let both = gm472_at("src/both.rs", "krate::both");
+    nodes.push(gm472_reexport(both, REEXPORT_ALL_NAME, "krate::a", REEXPORT_ALL_NAME));
+    nodes.push(gm472_reexport(both, REEXPORT_ALL_NAME, "krate::b", REEXPORT_ALL_NAME));
+    upsert(&mut conn, nodes);
+    let edges = gm472_use(&mut conn, "src/user_both.rs", "krate::user_both", "krate::both", "T");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    gm472_assert_unresolved(&conn, &edges);
+}
+
+/// The head alone, by name through the same chain, links onto `a::T` - the
+/// walk the head of a qualifiedName key is given.
+#[test]
+fn gm472_the_head_by_name_links_through_the_same_chain() {
+    let mut conn = setup();
+    let mut nodes = gm472_declarations();
+    nodes.extend(gm472_reexports());
+    upsert(&mut conn, nodes);
+    let at = gm472_at("src/user_outer.rs", "krate::user_outer");
+    let run = member(at, "Function", "user_outer::run", Vis::Public);
+    let head = use_through(
+        &mut conn,
+        vec![run],
+        "Function:src/user_outer.rs:user_outer::run",
+        "REFERENCES",
+        container_placeholder(at, "krate::outer", KEY_NAME, "T"),
+    );
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &head), (GM472_T.to_string(), true));
 }

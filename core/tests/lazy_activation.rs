@@ -320,6 +320,8 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
         container: None,
         container_parent: None,
         target: None,
+        alias_paths: Vec::new(),
+        qualified_path: None,
     };
     let defines = WireEdge {
         id: "greet.py->greet".to_string(),

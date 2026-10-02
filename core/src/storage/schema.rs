@@ -65,7 +65,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Bumped to "9" when `language_state.semanticPassError` was added: the
 /// reason a language's last whole-project semantic pass failed, which
 /// `g-mesh status` shows. Nullable and reset by a wipe like its neighbours.
-pub const CURRENT_SCHEMA_VERSION: &str = "9";
+///
+/// "10" adds `nodes.qualifiedPath`, `placeholder_targets.keyPath` and the
+/// `qualified_suffixes` table (ADR 0015).
+pub const CURRENT_SCHEMA_VERSION: &str = "10";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -205,7 +208,12 @@ CREATE TABLE IF NOT EXISTS nodes (
     language             TEXT NOT NULL,
     nativeKind           TEXT,
     hasSyntaxErrors      INTEGER NOT NULL DEFAULT 0,
-    container            TEXT
+    container            TEXT,
+    -- The plugin's segments of `qualifiedName`, encoded as name0, then each
+    -- later segment's separator and name, all joined by U+001F
+    -- (`storage::qualified_path`). NULL when the plugin sent no valid path.
+    -- Joined without the U+001F it equals `qualifiedName`.
+    qualifiedPath        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_filePath ON nodes(filePath);
@@ -340,7 +348,10 @@ CREATE TABLE IF NOT EXISTS placeholder_targets (
     keyKind       TEXT NOT NULL CHECK (keyKind IN ('name', 'qualifiedName')),
     key           TEXT NOT NULL,
     fromContainer TEXT,
-    fromFile      TEXT NOT NULL
+    fromFile      TEXT NOT NULL,
+    -- The segments of a `qualifiedName` key, encoded like `nodes.qualifiedPath`.
+    -- NULL for a `name` key and for a plugin that sends no paths.
+    keyPath       TEXT
 );
 
 -- The shape every linker lookup needs: "placeholders waiting on (this scope
@@ -351,6 +362,26 @@ CREATE TABLE IF NOT EXISTS placeholder_targets (
 -- reads `key`, only `(scopeKind, scope)` - its own "new file"/"new container
 -- member" triggers - so it uses this index's leading columns.
 CREATE INDEX IF NOT EXISTS idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
+
+-- Every spelling by which a partial path finds a declaration: each suffix of
+-- its `qualifiedPath` that starts at segment 1 or later and keeps at least
+-- two segments, and each suffix of each of its alias paths that starts at
+-- segment 0 or later and keeps at least two segments, as display text
+-- (segment names joined by the path's own separators). The whole primary
+-- path is left out: it is `nodes.qualifiedName`. Matched by `suffix = ?`
+-- only, never by LIKE. A node with no path has no rows.
+--
+-- Written only by `storage::write::apply_diff`, which replaces a node's whole
+-- set on every upsert of it, and copied by `storage::language_swap`. Foreign
+-- keys are off on the daemon's connection, so every site that deletes a node
+-- deletes its rows here too; `idx_qualified_suffixes_nodeId` serves those
+-- deletes. See ADR 0015.
+CREATE TABLE IF NOT EXISTS qualified_suffixes (
+    suffix TEXT NOT NULL,
+    nodeId TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    PRIMARY KEY (suffix, nodeId)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_qualified_suffixes_nodeId ON qualified_suffixes(nodeId);
 
 -- Per-language index state - the roll-up `meta.bulkIndexedAt`/
 -- `semanticPassAt` are built from (design doc: Data Model > Per-language
@@ -1186,6 +1217,7 @@ fn wipe(conn: &Connection) -> Result<()> {
         // just the project-wide roll-up).
         "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
          DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
+         DROP TABLE IF EXISTS qualified_suffixes; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
          DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files;",

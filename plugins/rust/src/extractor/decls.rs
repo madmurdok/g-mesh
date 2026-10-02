@@ -10,6 +10,7 @@
 //! | `type A = …` | `Type` | `type_alias` | `A` |
 //! | `trait Tr` | `Type` | `trait` | `Tr` |
 //! | `const C` / `static S` | `Variable` | `const` / `static` | `C` / `S` |
+//! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T.f` |
 //! | `macro_rules! m` | `Function` | `macro` | `m` |
 //! | `mod m` | `Module` | `module` | `m` |
 //! | `impl T { fn m }` | `Function` | `method` | `T::m` |
@@ -19,9 +20,12 @@
 //!
 //! A `macro_rules!` is a `Function` because that is the kind core's linker
 //! demands of a `CALLS` target, and `m!()` is a call in every sense a caller
-//! cares about. Struct fields and enum variants are *not* nodes: the design
-//! doc's "Member-level privacy is not modelled" applies to the members
-//! themselves, and nothing in the tool surface addresses one.
+//! cares about. Enum variants and tuple-struct fields are *not* nodes: a
+//! variant's fields would hang off a variant that is not one, and `.0` has
+//! no name a query could carry. A named field is registered in the file
+//! model by its `T.f` tail only, never by its bare name, so a bare
+//! identifier written in the module cannot resolve to a field, and a method
+//! `T::f` of the same name keeps its own key, node and `qualifiedName`.
 //!
 //! `qualifiedName` prefixes each of those with the module path
 //! ([`keys`](super::keys), Decision 2), and the id is derived from it, so two
@@ -67,7 +71,7 @@
 //! "react"`, and the name it binds is remembered as external so that a later
 //! `Serialize::…` is not addressed at this project's own modules.
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, TargetKey, Visibility};
+use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, QualifiedPath, TargetKey, Visibility};
 use g_mesh_plugin_sdk::{NodeSpec, PlaceholderKind};
 use tree_sitter::Node;
 
@@ -106,6 +110,10 @@ pub(crate) struct BlockCtx {
     /// The trait impl's own prefix, so `self.m()` inside `impl Tr for T` can
     /// look for `<T as Tr>::m` before falling back to the inherent `T::m`.
     pub(crate) trait_prefix: Option<String>,
+    /// In a trait impl, the self type as a plain name (`X` for `<&'a X<T>
+    /// as Tr>`): the other spelling, `X::m`, a member is also found by.
+    /// `None` outside a trait impl and for a self type with no such name.
+    pub(crate) alias_prefix: Option<String>,
     pub(crate) family: Family,
     /// The visibility members take when they cannot state their own: a
     /// trait's items are as visible as the trait, and a trait impl's are
@@ -118,6 +126,56 @@ impl BlockCtx {
     pub(crate) fn tail(&self, name: &str) -> String {
         format!("{}::{}", self.prefix, name)
     }
+
+    /// [`BlockCtx::tail`] as segments: the prefix is one segment, so
+    /// `<T as Tr>` stays whole.
+    pub(crate) fn tail_path(&self, name: &str) -> QualifiedPath {
+        QualifiedPath::root(self.prefix.clone()).child("::", name)
+    }
+
+    /// The trait-impl alias of a member's tail, `X::m` for `<X as Tr>::m`.
+    pub(crate) fn alias_tail_path(&self, name: &str) -> Option<QualifiedPath> {
+        let alias = self.alias_prefix.as_ref()?;
+        Some(QualifiedPath::root(alias.clone()).child("::", name))
+    }
+}
+
+/// [`field_tail`] as segments: the field is written after `.`.
+pub(crate) fn field_tail_path(type_name: &str, field: &str) -> QualifiedPath {
+    QualifiedPath::root(type_name).child(".", field)
+}
+
+/// [`member_tail`] as segments.
+pub(crate) fn member_tail_path(block: Option<&BlockCtx>, name: &str) -> QualifiedPath {
+    match block {
+        Some(block) => block.tail_path(name),
+        None => QualifiedPath::root(name),
+    }
+}
+
+/// The plain name a trait impl's self type is also spelled by: references,
+/// `dyn`, lifetimes and generic arguments stripped (`&'a mut X<T>` is `X`,
+/// `dyn Tr` is `Tr`). `None` for a type with no single name - a tuple, an
+/// array, a slice, a pointer, a function type.
+fn alias_name(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "reference_type" => alias_name(node.child_by_field_name("type")?, source),
+        "dynamic_trait_type" => {
+            let mut cursor = node.walk();
+            let inner = node.named_children(&mut cursor).find(|child| child.kind() != "lifetime")?;
+            alias_name(inner, source)
+        }
+        "primitive_type" => Some(text(node, source).to_string()),
+        _ => flatten_path(node, source).as_deref().and_then(path_tail).map(str::to_string),
+    }
+}
+
+/// A named field's full name within its module: `T.f`. The `.` keeps it
+/// apart from `T::f`, the address of an associated item of the same name -
+/// a getter named after its field is common, and the two must never share a
+/// `qualifiedName`, a node id or a file-model key.
+pub(crate) fn field_tail(type_name: &str, field: &str) -> String {
+    format!("{type_name}.{field}")
 }
 
 /// A member's full name within its module, whether or not it is in a block.
@@ -187,8 +245,10 @@ pub(crate) fn impl_block(item: Node, source: &str) -> BlockCtx {
         Some(clause) => {
             let trait_name = type_name(clause, source);
             let prefix = format!("<{self_type} as {trait_name}>");
+            let alias_prefix = item.child_by_field_name("type").and_then(|node| alias_name(node, source));
             BlockCtx {
                 trait_prefix: Some(prefix.clone()),
+                alias_prefix,
                 prefix,
                 self_type,
                 family: Family::TraitImpl,
@@ -202,6 +262,7 @@ pub(crate) fn impl_block(item: Node, source: &str) -> BlockCtx {
             prefix: self_type.clone(),
             self_type,
             trait_prefix: None,
+            alias_prefix: None,
             family: Family::Inherent,
             inherited: None,
         },
@@ -216,6 +277,7 @@ pub(crate) fn trait_block(item: Node, source: &str, own: &Visibility) -> BlockCt
         prefix: name.clone(),
         self_type: name,
         trait_prefix: None,
+        alias_prefix: None,
         family: Family::TraitDecl,
         inherited: Some(own.clone()),
     }
@@ -295,8 +357,45 @@ impl Declarer<'_, '_> {
                 let own = block
                     .and_then(|block| block.inherited.clone())
                     .unwrap_or_else(|| self.item_visibility(item, module));
-                self.declare(item, module, block, node_kind, native_kind, own);
+                let declared = self.declare(item, module, block, node_kind, native_kind, own);
+                if declared.is_some() && matches!(kind, "struct_item" | "union_item") {
+                    self.fields(item, module);
+                }
             }
+        }
+    }
+
+    /// The named fields of a `struct`/`union`, each a `Variable`/`field` node
+    /// named [`field_tail`] (`T.f`) within the module.
+    /// A tuple struct's `ordered_field_declaration_list` has no names and
+    /// declares nothing.
+    fn fields(&mut self, item: Node, module: &ModuleCtx) {
+        let Some(type_name) = item_name(item, self.source) else { return };
+        let Some(body) = item.child_by_field_name("body") else { return };
+        if body.kind() != "field_declaration_list" {
+            return;
+        }
+        let mut cursor = body.walk();
+        for field in body.named_children(&mut cursor) {
+            if field.kind() != "field_declaration" {
+                continue;
+            }
+            let Some(name) = item_name(field, self.source) else { continue };
+            let tail = field_tail(type_name, name);
+            let own = visibility(field, module, self.source);
+            let mut spec = NodeSpec::with_path(
+                NodeKind::Variable,
+                name.to_string(),
+                module.qualified_path(&field_tail_path(type_name, name)),
+                self.emitter.positions().range(field),
+            )
+            .native_kind("field")
+            .visibility(own.clone())
+            .in_container(module.key.clone(), module.parent.clone());
+            spec.signature = signature(field, self.source);
+            spec.doc_comment = outer_doc_comment(field, self.source);
+            let id = self.emitter.declare(spec, is_public(&own));
+            self.model.declare_member(&module.key, &tail, DeclRef { id, kind: NodeKind::Variable });
         }
     }
 
@@ -340,11 +439,14 @@ impl Declarer<'_, '_> {
     ) -> Option<String> {
         let name = item_name(item, self.source)?.to_string();
         let tail = member_tail(block, &name);
-        let mut spec =
-            NodeSpec::new(kind, name.clone(), module.qualified(&tail), self.emitter.positions().range(item))
-                .native_kind(native_kind)
-                .visibility(own.clone())
-                .in_container(module.key.clone(), module.parent.clone());
+        let path = module.qualified_path(&member_tail_path(block, &name));
+        let mut spec = NodeSpec::with_path(kind, name.clone(), path, self.emitter.positions().range(item))
+            .native_kind(native_kind)
+            .visibility(own.clone())
+            .in_container(module.key.clone(), module.parent.clone());
+        if let Some(alias) = block.and_then(|block| block.alias_tail_path(&name)) {
+            spec = spec.alias(module.qualified_path(&alias));
+        }
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         let id = self.emitter.declare(spec, is_public(&own));
@@ -359,10 +461,10 @@ impl Declarer<'_, '_> {
         let Some(name) = item_name(item, self.source).map(str::to_string) else { return };
         let own = visibility(item, module, self.source);
         let child = module.child(&name);
-        let mut spec = NodeSpec::new(
+        let mut spec = NodeSpec::with_path(
             NodeKind::Module,
             name.clone(),
-            module.qualified(&name),
+            module.qualified_path(&QualifiedPath::root(name.clone())),
             self.emitter.positions().range(item),
         )
         .native_kind("module")

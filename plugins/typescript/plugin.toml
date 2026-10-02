@@ -28,7 +28,7 @@ protocol_version = 2
 # `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`,
 # both in core/src/daemon/manifest.rs. scripts/cut-release.sh re-checks it
 # directly at release time too, since neither test runs under --skip-tests.
-plugin_version = "2.2.0"
+plugin_version = "2.3.0"
 
 [plugin.spawn]
 command = "node"

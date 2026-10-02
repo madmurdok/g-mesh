@@ -760,18 +760,47 @@ pub fn paginate_defines(
     Ok(Page { results: rows, has_more, next_cursor, all_unresolved: false })
 }
 
+/// The score travels as its IEEE-754 bits, not as a JSON number: the keyset
+/// comparison needs the exact `f64` back, and a decimal round trip through
+/// `serde_json` is not exact for every value
+/// (ADR 0013, `docs/adr/0013-score-cursor-bits.md`).
 #[derive(Serialize, Deserialize)]
 struct ScoreCursor {
-    score: f64,
+    score_bits: u64,
     id: String,
+}
+
+/// The score cursor's earlier shape, decoded only to refuse it by name.
+#[derive(Deserialize)]
+struct LegacyScoreCursor {
+    #[allow(dead_code)]
+    score: f64,
+}
+
+fn decode_score_cursor(raw: &str) -> Result<ScoreCursor> {
+    decode_cursor(raw).or_else(|err| {
+        if decode_cursor::<LegacyScoreCursor>(raw).is_ok() {
+            anyhow::bail!(
+                "pagination cursor was issued by an older g-mesh version and cannot be continued; \
+                 repeat the query without a cursor"
+            );
+        }
+        Err(err)
+    })
+}
+
+/// A score cursor's `(score, id)`, for tests that compare cursors with a
+/// float tolerance instead of byte for byte (the score's bits differ
+/// across platforms in the last digits).
+#[cfg(test)]
+pub(crate) fn score_cursor_parts(raw: &str) -> Result<(f64, String)> {
+    decode_score_cursor(raw).map(|c| (f64::from_bits(c.score_bits), c.id))
 }
 
 /// Generic keyset pagination for `search_code`-shaped results, ordered by
 /// similarity score (descending) then `id` as a tiebreaker. `base_sql` must
 /// project `score` (REAL) and `id` (unique) columns; `map_row` reads
 /// whatever columns the caller needs, plus `score`/`id` for cursor state.
-/// Not yet called by any tool (search_code lands with the Embeddings epic)
-/// but exercised directly in tests so the ordering rule is proven now.
 pub fn paginate_by_score<T>(
     conn: &Connection,
     base_sql: &str,
@@ -780,7 +809,7 @@ pub fn paginate_by_score<T>(
     cursor: Option<&str>,
     map_row: impl Fn(&Row) -> rusqlite::Result<(T, f64, String)>,
 ) -> Result<Page<T>> {
-    let decoded: Option<ScoreCursor> = cursor.map(decode_cursor).transpose()?;
+    let decoded: Option<ScoreCursor> = cursor.map(decode_score_cursor).transpose()?;
 
     let n = params.len();
     let (has_cursor_idx, score_idx, id_idx, limit_idx) = (n + 1, n + 2, n + 3, n + 4);
@@ -794,7 +823,7 @@ pub fn paginate_by_score<T>(
     );
 
     let (has_cursor, cursor_score, cursor_id): (i64, f64, String) = match &decoded {
-        Some(c) => (1, c.score, c.id.clone()),
+        Some(c) => (1, f64::from_bits(c.score_bits), c.id.clone()),
         None => (0, 0.0, String::new()),
     };
     let limit = (page_size + 1) as i64;
@@ -816,7 +845,7 @@ pub fn paginate_by_score<T>(
 
     let next_cursor = has_more.then(|| {
         let (_, score, id) = rows.last().expect("has_more implies at least one row");
-        encode_cursor(&ScoreCursor { score: *score, id: id.clone() })
+        encode_cursor(&ScoreCursor { score_bits: score.to_bits(), id: id.clone() })
     });
 
     Ok(Page {
@@ -1240,6 +1269,101 @@ mod tests {
 
         assert_eq!(page.results, vec!["high", "mid", "low"]);
         assert!(!page.has_more);
+    }
+
+    /// Pages `count` rows all tied at `score` (plus one row above and one
+    /// below it) two at a time, returning ids in the order served. Stops
+    /// after a bounded number of pages so a cursor that loops fails the
+    /// test instead of hanging it.
+    fn page_through_ties(score: f64, count: usize) -> Vec<String> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE scored (id TEXT PRIMARY KEY, score REAL)").unwrap();
+        conn.execute(
+            "INSERT INTO scored VALUES ('above', ?1), ('below', ?2)",
+            params![score + 0.25, score - 0.25],
+        )
+        .unwrap();
+        for i in 0..count {
+            conn.execute("INSERT INTO scored VALUES (?1, ?2)", params![format!("t{i}"), score]).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..(count + 2) * 2 {
+            let page = paginate_by_score::<String>(
+                &conn,
+                "SELECT id, score FROM scored",
+                &[],
+                2,
+                cursor.as_deref(),
+                |row| Ok((row.get::<_, String>("id")?, row.get("score")?, row.get("id")?)),
+            )
+            .unwrap();
+            seen.extend(page.results);
+            if !page.has_more {
+                return seen;
+            }
+            cursor = page.next_cursor;
+        }
+        seen
+    }
+
+    fn expected_tie_order(count: usize) -> Vec<String> {
+        let mut ids: Vec<String> = (0..count).map(|i| format!("t{i}")).collect();
+        ids.sort();
+        std::iter::once("above".to_string()).chain(ids).chain(std::iter::once("below".to_string())).collect()
+    }
+
+    #[test]
+    fn tied_rows_at_a_score_json_decodes_higher_are_each_served_exactly_once() {
+        let score = 1.0 - 1.0 / 997.0;
+        let back: f64 = serde_json::from_slice(&serde_json::to_vec(&score).unwrap()).unwrap();
+        assert!(back > score, "precondition: {score} must decode higher through JSON, got {back}");
+
+        assert_eq!(page_through_ties(score, 5), expected_tie_order(5));
+    }
+
+    #[test]
+    fn tied_rows_at_a_score_json_decodes_lower_are_each_served_exactly_once() {
+        let score = 1.0 - 6.0 / 997.0;
+        let back: f64 = serde_json::from_slice(&serde_json::to_vec(&score).unwrap()).unwrap();
+        assert!(back < score, "precondition: {score} must decode lower through JSON, got {back}");
+
+        assert_eq!(page_through_ties(score, 5), expected_tie_order(5));
+    }
+
+    #[test]
+    fn tied_rows_at_an_exactly_representable_score_are_each_served_exactly_once() {
+        let back: f64 = serde_json::from_slice(&serde_json::to_vec(&0.5f64).unwrap()).unwrap();
+        assert_eq!(back, 0.5, "precondition: 0.5 must round-trip through JSON");
+        assert_eq!(page_through_ties(0.5, 5), expected_tie_order(5));
+    }
+
+    #[test]
+    fn a_score_cursor_in_the_earlier_json_number_shape_is_refused_by_name() {
+        #[derive(Serialize)]
+        struct EarlierScoreCursor {
+            score: f64,
+            id: String,
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE scored (id TEXT PRIMARY KEY, score REAL)").unwrap();
+        let earlier = encode_cursor(&EarlierScoreCursor { score: 0.5, id: "a".to_string() });
+
+        let err = paginate_by_score::<String>(
+            &conn,
+            "SELECT id, score FROM scored",
+            &[],
+            2,
+            Some(&earlier),
+            |row| Ok((row.get::<_, String>("id")?, row.get("score")?, row.get("id")?)),
+        )
+        .err()
+        .expect("an earlier-shape cursor must be refused");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("older g-mesh version"), "{message}");
+        assert!(message.contains("without a cursor"), "{message}");
     }
 
     #[derive(Serialize)]

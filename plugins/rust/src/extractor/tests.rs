@@ -742,3 +742,387 @@ fn an_orphan_file_is_indexed_under_its_synthetic_container() {
     assert_eq!(node.container.as_deref(), Some("orphan:src/loose.rs"));
     assert_eq!(node.container_parent, None);
 }
+
+// --- struct fields (docs/architecture/gm-450-rust-fields.md) -------------------
+
+/// A named field is a `Variable`/`field` node named `T.f` within its module,
+/// beside the inherent methods; tuple-struct and enum-variant fields are not
+/// nodes. Its uses are references: `self.f` in the impl and a literal's or
+/// pattern's field names by address, `x.f` on any other receiver as an open
+/// site for the semantic tier.
+#[test]
+fn struct_fields_are_nodes_and_their_uses_are_references() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub struct Ledger {
+    /// Whether every row is unresolved.
+    pub all_unresolved: bool,
+    pub truncated_by: Option<u8>,
+    secret: u8,
+}
+pub struct Pair(pub u8, u8);
+pub enum Shape { Square { side: u8 } }
+impl Ledger {
+    pub fn settle(&self) -> bool { self.all_unresolved && self.truncated_by.is_none() }
+}
+pub fn truncated_by() {}
+pub fn pick() -> fn() { truncated_by }
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+use crate::store::Ledger;
+pub fn tally() -> bool {
+    let ledger = crate::store::Ledger { all_unresolved: true, truncated_by: None };
+    ledger.settle() && ledger.all_unresolved
+}
+pub fn drain(ledger: Ledger) -> Option<u8> {
+    let Ledger { truncated_by, .. } = ledger;
+    truncated_by
+}
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    let field = store.node("store::Ledger.all_unresolved");
+    assert_eq!((field.kind, field.native_kind.as_deref()), (NodeKind::Variable, Some("field")));
+    assert_eq!(field.name, "all_unresolved");
+    assert_eq!(field.signature.as_deref(), Some("pub all_unresolved: bool"));
+    assert_eq!(field.doc_comment.as_deref(), Some("Whether every row is unresolved."));
+    assert_eq!(field.visibility, Visibility::Public);
+    assert_eq!(field.container.as_deref(), store.node("store::Ledger::settle").container.as_deref());
+    assert_eq!(store.node("store::Ledger.truncated_by").native_kind.as_deref(), Some("field"));
+    assert_eq!(store.node("store::Ledger.secret").visibility, Visibility::Container("krate::store".into()));
+    assert_eq!(store.node("store::Ledger::settle").native_kind.as_deref(), Some("method"));
+    let fields: Vec<_> =
+        store.0.nodes.iter().filter(|node| node.native_kind.as_deref() == Some("field")).collect();
+    assert_eq!(fields.len(), 3, "only Ledger's named fields: {:#?}", store.names());
+
+    // `self.f` inside `impl Ledger` lands on the field, same file.
+    assert_eq!(
+        store.targets(EdgeKind::References, "store::Ledger::settle"),
+        vec!["store::Ledger.all_unresolved", "store::Ledger.truncated_by"]
+    );
+    // A field is never a bare name: `truncated_by` here is the free function.
+    assert_eq!(store.targets(EdgeKind::References, "store::pick"), vec!["store::truncated_by"]);
+
+    let user = krate.extract("src/user.rs");
+    // The literal's type, and its two fields by qualifiedName in `store`.
+    let tally = user.targets(EdgeKind::References, "user::tally");
+    assert_eq!(
+        tally,
+        vec![
+            "pending_symbol krate::store::Ledger",
+            "pending_symbol krate::store::store::Ledger.all_unresolved",
+            "pending_symbol krate::store::store::Ledger.truncated_by",
+        ]
+    );
+    for name in ["all_unresolved", "truncated_by"] {
+        let placeholder = user.placeholder("pending_symbol", name);
+        assert_eq!(
+            user.target_of(placeholder),
+            (container("krate::store"), TargetKey::QualifiedName(format!("store::Ledger.{name}")))
+        );
+    }
+    // The trailing `ledger.all_unresolved` read is a question for the
+    // semantic tier, at the field name.
+    let reads: Vec<_> = user
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.kind == OpenSiteKind::Reference && site.name == "all_unresolved")
+        .collect();
+    assert_eq!(reads.len(), 1, "{:#?}", user.0.open_sites);
+    assert_eq!(reads[0].edge_kind, EdgeKind::References);
+    // A destructuring pattern names the field too.
+    assert!(
+        user.targets(EdgeKind::References, "user::drain")
+            .contains(&"pending_symbol krate::store::store::Ledger.truncated_by".to_string()),
+        "{:?}",
+        user.targets(EdgeKind::References, "user::drain")
+    );
+}
+
+/// A getter named like its field: the field is `T.f`, the method `T::f`, two
+/// nodes under two keys. Calls - `self.f()`, `Self::f(..)`, `T::f(..)` from
+/// another file - reach the method; `self.f`, a literal's and a pattern's
+/// field names reach the field; the method's own body is attributed to the
+/// method, so the field has no outgoing edge at all.
+#[test]
+fn a_getter_named_like_its_field_keeps_its_calls_and_the_field_keeps_its_references() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub struct Holder {
+    pub inner: u8,
+}
+impl Holder {
+    pub fn inner(&self) -> u8 { self.inner }
+    pub fn twice(&self) -> u8 { self.inner() + Self::inner(self) }
+}
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+use crate::store::Holder;
+pub fn make() -> Holder { Holder { inner: 1 } }
+pub fn get(holder: &Holder) -> u8 { Holder::inner(holder) }
+pub fn take(holder: Holder) -> u8 { let Holder { inner } = holder; inner }
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    let field = store.node("store::Holder.inner");
+    let method = store.node("store::Holder::inner");
+    assert_eq!((field.kind, field.native_kind.as_deref()), (NodeKind::Variable, Some("field")));
+    assert_eq!((method.kind, method.native_kind.as_deref()), (NodeKind::Function, Some("method")));
+    assert_ne!(field.id, method.id);
+
+    // The getter's body is the getter's: one reference, to the field.
+    assert_eq!(store.targets(EdgeKind::References, "store::Holder::inner"), vec!["store::Holder.inner"]);
+    let field_id = field.id.clone();
+    let out_of_field: Vec<_> = store.0.edges.iter().filter(|edge| edge.from_id == field_id).collect();
+    assert!(out_of_field.is_empty(), "a field has no body: {out_of_field:#?}");
+    // Both calls in `twice` reach the method, never the field.
+    let mut calls = store.targets(EdgeKind::Calls, "store::Holder::twice");
+    calls.dedup();
+    assert_eq!(calls, vec!["store::Holder::inner"]);
+    assert!(store.targets(EdgeKind::References, "store::Holder::twice").is_empty());
+
+    let user = krate.extract("src/user.rs");
+    let field_ref = "pending_symbol krate::store::store::Holder.inner".to_string();
+    let method_ref = "pending_symbol krate::store::store::Holder::inner".to_string();
+    assert!(user.targets(EdgeKind::References, "user::make").contains(&field_ref));
+    assert!(user.targets(EdgeKind::References, "user::take").contains(&field_ref));
+    assert_eq!(user.targets(EdgeKind::Calls, "user::get"), vec![method_ref]);
+    assert!(!user.targets(EdgeKind::References, "user::get").contains(&field_ref));
+    let keys: Vec<_> = user
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("pending_symbol") && node.name == "inner")
+        .map(|node| user.target_of(node))
+        .collect();
+    assert!(
+        keys.contains(&(container("krate::store"), TargetKey::QualifiedName("store::Holder.inner".into())))
+    );
+    assert!(
+        keys.contains(&(container("krate::store"), TargetKey::QualifiedName("store::Holder::inner".into())))
+    );
+}
+
+// --- GM-472: members used through a `pub use` ---------------------------------
+
+/// The GM-472 fixture, as source: `a` declares `T` with a field `f` and a
+/// method `m`; `named` republishes it by a named `pub use` (and once more
+/// under an alias), `glob` by `pub use crate::a::*`, and `outer` globs
+/// `named`, so reaching `T` from `outer` is a two-hop chain. Each `user_*`
+/// file uses `T.f` (a struct literal) and `T::m` (a path call) through one of
+/// those paths. `core/src/graph/symbol_links/tests.rs`' GM-472 tests replay
+/// exactly the rows asserted here through the linker.
+fn gm472_crate() -> Crate {
+    Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod named;\npub mod glob;\npub mod outer;\npub mod user_named;\npub mod user_glob;\npub mod user_renamed;\npub mod user_outer;\n"),
+        ("src/a.rs", "pub struct T {\n    pub f: u32,\n}\n\nimpl T {\n    pub fn m(&self) -> u32 {\n        self.f\n    }\n}\n"),
+        ("src/named.rs", "pub use crate::a::T;\npub use crate::a::T as Renamed;\n"),
+        ("src/glob.rs", "pub use crate::a::*;\n"),
+        ("src/outer.rs", "pub use crate::named::*;\n"),
+        ("src/user_named.rs", "use crate::named::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+        ("src/user_glob.rs", "use crate::glob::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+        ("src/user_renamed.rs", "use crate::named::Renamed;\n\npub fn run() -> u32 {\n    let t = Renamed { f: 1 };\n    Renamed::m(&t)\n}\n"),
+        ("src/user_outer.rs", "use crate::outer::T;\n\npub fn run() -> u32 {\n    let t = T { f: 1 };\n    T::m(&t)\n}\n"),
+    ])
+}
+
+/// The plugin half of a member used through a re-export. The address names
+/// the *re-exporting* module (where the `use` says `T` lives) by
+/// `qualifiedName`, with its `keyPath`, and that module declares no `T` -
+/// only a `reexport` node publishing it. The linker follows the re-export
+/// from the path's head (docs/architecture/gm-472-reexport-links.md).
+#[test]
+fn gm472_a_member_used_through_a_pub_use_is_addressed_at_the_reexporting_module() {
+    let krate = gm472_crate();
+
+    let a = krate.extract("src/a.rs");
+    assert_eq!(a.node("a::T.f").native_kind.as_deref(), Some("field"));
+    assert_eq!(a.node("a::T::m").native_kind.as_deref(), Some("method"));
+
+    let named = krate.extract("src/named.rs");
+    let reexports: Vec<_> = named
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("reexport"))
+        .map(|node| (node.name.clone(), named.target_of(node)))
+        .collect();
+    assert_eq!(
+        reexports,
+        vec![
+            ("T".to_string(), (container("krate::a"), TargetKey::Name("T".into()))),
+            ("Renamed".to_string(), (container("krate::a"), TargetKey::Name("T".into()))),
+        ]
+    );
+    let glob = krate.extract("src/glob.rs");
+    assert_eq!(
+        glob.target_of(glob.placeholder("reexport", "*")),
+        (container("krate::a"), TargetKey::Name("*".into()))
+    );
+    let outer = krate.extract("src/outer.rs");
+    assert_eq!(
+        outer.target_of(outer.placeholder("reexport", "*")),
+        (container("krate::named"), TargetKey::Name("*".into()))
+    );
+
+    for (file, module, head) in [
+        ("src/user_named.rs", "named", "T"),
+        ("src/user_glob.rs", "glob", "T"),
+        ("src/user_renamed.rs", "named", "Renamed"),
+        ("src/user_outer.rs", "outer", "T"),
+    ] {
+        let user = krate.extract(file);
+        let scope = container(&format!("krate::{module}"));
+        assert_eq!(
+            user.target_of(user.placeholder("pending_symbol", "f")),
+            (scope.clone(), TargetKey::QualifiedName(format!("{module}::{head}.f"))),
+            "{file}: the field, by qualifiedName in the module the `use` named"
+        );
+        assert_eq!(
+            user.target_of(user.placeholder("pending_symbol", "m")),
+            (scope, TargetKey::QualifiedName(format!("{module}::{head}::m"))),
+            "{file}: the method, the same way"
+        );
+        // The segments core splits into head and member: never the string.
+        for (member, sep) in [("f", "."), ("m", "::")] {
+            let path = user.placeholder("pending_symbol", member).target.as_ref().unwrap().key_path.as_ref();
+            assert_eq!(
+                path.map(segments),
+                Some(vec![
+                    (String::new(), module.to_string()),
+                    ("::".to_string(), head.to_string()),
+                    (sep.to_string(), member.to_string()),
+                ]),
+                "{file}: the keyPath of {member}"
+            );
+        }
+    }
+}
+
+/// The segments of a path as `(sep, name)` pairs, `""` for the first.
+fn segments(path: &g_mesh_plugin_sdk::wire::QualifiedPath) -> Vec<(String, String)> {
+    path.segments()
+        .iter()
+        .map(|segment| (segment.sep.clone().unwrap_or_default(), segment.name.clone()))
+        .collect()
+}
+
+/// Every declaration carries a `qualifiedPath` that joins back to its
+/// `qualifiedName` and ends in its name; placeholders, the `File` node and
+/// `external_module` nodes carry none; every `qualifiedName`-keyed
+/// placeholder carries a `keyPath` that joins back to its key.
+fn assert_paths_are_well_formed(graph: &Graph) {
+    const PATHLESS: [&str; 5] = ["pending_symbol", "reexport", "resolved_module", "external_module", "file"];
+    for node in &graph.0.nodes {
+        let pathless = node.kind == NodeKind::File
+            || node.native_kind.as_deref().is_some_and(|native| PATHLESS.contains(&native));
+        if pathless {
+            assert_eq!(node.qualified_path, None, "{node:#?}");
+            assert!(node.alias_paths.is_empty(), "{node:#?}");
+        } else {
+            assert!(node.qualified_path.is_some(), "a declaration without a path: {node:#?}");
+            assert_eq!(node.check_qualified_path(), Ok(()), "{node:#?}");
+            for alias in &node.alias_paths {
+                assert_eq!(node.check_alias_path(alias), Ok(()), "{node:#?}");
+            }
+        }
+        if let Some(target) = &node.target {
+            match &target.key {
+                TargetKey::QualifiedName(_) => assert!(target.key_path.is_some(), "{node:#?}"),
+                TargetKey::Name(_) => assert_eq!(target.key_path, None, "{node:#?}"),
+            }
+            assert_eq!(target.check_key_path(), Ok(()), "{node:#?}");
+        }
+    }
+}
+
+/// Module segments joined by `::`, a trait impl's `<X as T>` kept as one
+/// segment, a field after `.`, a raw identifier as written; a trait-impl
+/// member's only alias is the path with that segment replaced by the self
+/// type's plain name, and no other member has one.
+#[test]
+fn every_declaration_carries_its_qualified_name_as_segments() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        (
+            "src/store.rs",
+            r#"
+pub trait Show { fn show(&self) -> u8; }
+pub struct Holder<T> { pub inner: T }
+impl<T> Holder<T> {
+    pub fn inner(&self) -> u8 { 0 }
+}
+impl<'a, T> Show for &'a Holder<T> {
+    fn show(&self) -> u8 { 1 }
+}
+impl Show for (u8, u8) {
+    fn show(&self) -> u8 { 2 }
+}
+pub mod nested {
+    pub fn r#type() {}
+}
+"#,
+        ),
+        (
+            "src/user.rs",
+            r#"
+use crate::store::Holder;
+pub fn make() -> Holder<u8> { Holder { inner: 1 } }
+pub fn get(holder: &Holder<u8>) -> u8 { Holder::inner(holder) }
+"#,
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    assert_paths_are_well_formed(&store);
+    let user = krate.extract("src/user.rs");
+    assert_paths_are_well_formed(&user);
+
+    let pairs = |items: &[(&str, &str)]| -> Vec<(String, String)> {
+        items.iter().map(|(sep, name)| (sep.to_string(), name.to_string())).collect()
+    };
+    let path_of =
+        |qualified_name: &str| segments(store.node(qualified_name).qualified_path.as_ref().unwrap());
+
+    assert_eq!(path_of("store::Holder.inner"), pairs(&[("", "store"), ("::", "Holder"), (".", "inner")]));
+    assert_eq!(path_of("store::Holder::inner"), pairs(&[("", "store"), ("::", "Holder"), ("::", "inner")]));
+    assert_eq!(path_of("store::nested::r#type"), pairs(&[("", "store"), ("::", "nested"), ("::", "r#type")]));
+    let show = store.node("store::<&'a Holder<T> as Show>::show");
+    assert_eq!(
+        segments(show.qualified_path.as_ref().unwrap()),
+        pairs(&[("", "store"), ("::", "<&'a Holder<T> as Show>"), ("::", "show")])
+    );
+    let aliases: Vec<_> = show.alias_paths.iter().map(segments).collect();
+    assert_eq!(aliases, vec![pairs(&[("", "store"), ("::", "Holder"), ("::", "show")])]);
+
+    // A self type with no single name has no alias; an inherent method or
+    // a field never has one.
+    assert!(store.node("store::<(u8, u8) as Show>::show").alias_paths.is_empty());
+    assert!(store.node("store::Holder::inner").alias_paths.is_empty());
+    assert!(store.node("store::Holder.inner").alias_paths.is_empty());
+
+    // A cross-file field key and a method key keep their own last separator.
+    let key_paths: Vec<_> = user
+        .0
+        .nodes
+        .iter()
+        .filter_map(|node| node.target.as_ref()?.key_path.as_ref())
+        .map(segments)
+        .collect();
+    assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), (".", "inner")])), "{key_paths:?}");
+    assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), ("::", "inner")])), "{key_paths:?}");
+}

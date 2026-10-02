@@ -9,8 +9,14 @@
 //! - A vector is a pure function of the fingerprint and the text, so the
 //!   same key always carries the same bytes. That is what makes
 //!   `INSERT OR IGNORE` between racing writers harmless, and what makes a
-//!   cached vector interchangeable with a fresh one. [`PIPELINE_EPOCH`] and
-//!   [`ORT_VERSION`] are part of the fingerprint for exactly that reason.
+//!   cached vector interchangeable with a fresh one. [`PIPELINE_EPOCH`],
+//!   [`ORT_VERSION`] and [`TOKENIZERS_VERSION`] are part of the fingerprint
+//!   for exactly that reason.
+//! - The key hashes exactly the string the pipeline passes to the model.
+//!   How that string was put together (`text_to_embed`'s format) is not an
+//!   input of the vector, so a format change leaves every unchanged text's
+//!   key valid; `model::TEXT_FORM_TAG` re-plans the stored vectors, and only
+//!   the texts that actually changed miss.
 //! - Every error is returned to the caller, never panicked on: the pipeline
 //!   treats a failed lookup as an all-miss batch and a failed insert as a
 //!   dropped batch, so the cache can never fail indexing.
@@ -32,18 +38,29 @@ use crate::storage::vectors;
 /// says: every text is embedded, nothing is read or written.
 pub const CACHE_ENV: &str = "G_MESH_EMBEDDING_CACHE";
 
-/// Version of everything between the model's raw output and the stored
-/// vector that this crate owns: `text_to_embed`'s format, mean pooling and
-/// L2 normalization. Part of the fingerprint, so bumping it makes every
-/// cached vector unreachable. It must be bumped whenever that code changes;
-/// `pipeline`'s tests pin it to `text_to_embed`'s output so a format change
-/// cannot land without touching it.
+/// Version of the code this crate owns between the text handed to the model
+/// and the stored vector: the tokenizer call options (special tokens, the
+/// truncation parameters other than the length, padding off), the graph
+/// inputs, the session options, mean pooling and L2 normalization. Part of
+/// the fingerprint, so bumping it makes every cached vector unreachable. It
+/// must be bumped whenever that code changes, including any prefix or
+/// instruction added to the text inside the model's `embed`, since such a
+/// rewrite happens after the key is taken.
+///
+/// It does not version `text_to_embed`'s output: the key is the hash of that
+/// output, and a format change is versioned by `model::TEXT_FORM_TAG`.
 pub const PIPELINE_EPOCH: u32 = 2;
 
 /// The `ort` crate version the vectors were computed with - an ONNX Runtime
 /// upgrade may change floating-point results. Must equal the exact version
 /// `core/Cargo.toml` pins; a test reads the manifest to keep them in step.
 pub const ORT_VERSION: &str = "2.0.0-rc.9";
+
+/// The `tokenizers` crate version the vectors were computed with - another
+/// release may normalize, pre-tokenize or truncate the same text
+/// differently. Must equal the exact version `core/Cargo.toml` pins and
+/// `Cargo.lock` resolves; a test reads both to keep them in step.
+pub const TOKENIZERS_VERSION: &str = "0.23.1";
 
 const DIR_NAME: &str = "embedding-cache";
 const FILE_NAME: &str = "cache.sqlite";
@@ -104,14 +121,18 @@ pub(crate) fn text_hash(text: &str) -> Hash {
 /// The model fingerprint: SHA-256 over a canonical record of every input a
 /// vector depends on besides the text itself.
 pub(crate) fn fingerprint(onnx_sha256: &Hash, tokenizer_sha256: &Hash) -> Hash {
-    let record = format!(
+    Sha256::digest(fingerprint_record(onnx_sha256, tokenizer_sha256).as_bytes()).into()
+}
+
+/// The canonical record [`fingerprint`] hashes.
+fn fingerprint_record(onnx_sha256: &Hash, tokenizer_sha256: &Hash) -> String {
+    format!(
         "g-mesh embedding fingerprint\nmodel.onnx sha256={}\ntokenizer.json sha256={}\n\
          max_sequence_length={DEFAULT_MAX_SEQUENCE_LENGTH}\nembedding_dim={EMBEDDING_DIM}\n\
-         pipeline_epoch={PIPELINE_EPOCH}\nort={ORT_VERSION}\n",
+         pipeline_epoch={PIPELINE_EPOCH}\nort={ORT_VERSION}\ntokenizers={TOKENIZERS_VERSION}\n",
         hex(onnx_sha256),
         hex(tokenizer_sha256),
-    );
-    Sha256::digest(record.as_bytes()).into()
+    )
 }
 
 fn hex(hash: &Hash) -> String {
@@ -595,6 +616,50 @@ mod tests {
             .and_then(|rest| rest.strip_suffix('"'))
             .expect("core/Cargo.toml must pin `ort` to an exact version");
         assert_eq!(ORT_VERSION, pinned, "bump ORT_VERSION with the ort dependency");
+    }
+
+    /// The fingerprint names the `tokenizers` version the vectors came from;
+    /// it has to be the one the manifest pins exactly and the lockfile
+    /// resolves.
+    ///
+    /// Control: loosen the manifest back to `"0.23"`, or resolve another
+    /// version in `Cargo.lock`, or change `TOKENIZERS_VERSION`, and this
+    /// fails.
+    #[test]
+    fn the_fingerprints_tokenizers_version_is_the_one_the_manifest_pins_and_the_lockfile_resolves() {
+        let manifest = include_str!("../../Cargo.toml");
+        let pinned = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tokenizers = { version = \"="))
+            .and_then(|rest| rest.split('"').next())
+            .expect("core/Cargo.toml must pin `tokenizers` to an exact version");
+        assert_eq!(TOKENIZERS_VERSION, pinned, "bump TOKENIZERS_VERSION with the tokenizers dependency");
+
+        let lockfile = include_str!("../../../Cargo.lock");
+        let resolved: Vec<&str> = lockfile
+            .split("[[package]]")
+            .filter(|package| package.lines().any(|line| line.trim() == "name = \"tokenizers\""))
+            .filter_map(|package| {
+                package.lines().find_map(|line| line.trim().strip_prefix("version = \"")?.strip_suffix('"'))
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            [TOKENIZERS_VERSION],
+            "Cargo.lock must resolve exactly the fingerprinted version"
+        );
+    }
+
+    /// The fingerprint record names every version input, so changing any of
+    /// them changes the fingerprint.
+    ///
+    /// Control: drop `tokenizers={TOKENIZERS_VERSION}` from the record and
+    /// this fails.
+    #[test]
+    fn the_fingerprint_record_names_the_tokenizers_version() {
+        let record = fingerprint_record(&[1; 32], &[2; 32]);
+        assert!(record.contains(&format!("\ntokenizers={TOKENIZERS_VERSION}\n")), "{record}");
+        assert_eq!(fingerprint(&[1; 32], &[2; 32]), <Hash>::from(Sha256::digest(record.as_bytes())));
     }
 
     #[test]

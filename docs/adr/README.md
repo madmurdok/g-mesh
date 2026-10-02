@@ -46,6 +46,7 @@ place — read the doc itself for that detail.
 | — | Modular multi-language plugin system (plugin boundary, components, data model) | [`plugin-modularity.md`](../architecture/plugin-modularity.md#modular-multi-language-plugin-system) |
 | — | Plugin lifetime: plugins die with their daemon (GM-397) | [`plugin-lifetime.md`](../architecture/plugin-lifetime.md#plugin-lifetime-plugins-die-with-their-daemon-gm-397) |
 | — | Symbol resolution: a ladder inside the tool, not rules outside it | [`symbol-resolution-ladder.md`](../architecture/symbol-resolution-ladder.md#symbol-resolution-a-ladder-inside-the-tool-not-rules-outside-it) |
+| — | A qualifiedName-suffix rung in the resolution ladder (GM-469) | [`gm-469-qualified-name-suffix.md`](../architecture/gm-469-qualified-name-suffix.md#gm-469-a-qualifiedname-suffix-rung-in-the-resolution-ladder) |
 | — | Pushed context: an Aider-style repo map for g-mesh | [`pushed-context-repo-map.md`](../architecture/pushed-context-repo-map.md#pushed-context-an-aider-style-repo-map-for-g-mesh) |
 | — | Lazy indexing (GM-395): overall doc — see D1-D14 below for the individual decisions | [`lazy-indexing.md`](../architecture/lazy-indexing.md#lazy-indexing-gm-395) |
 | D1 | Where laziness lives: the daemon starts idle; the shim is unchanged in when it spawns | [`lazy-indexing.md#d1`](../architecture/lazy-indexing.md#d1-where-laziness-lives-the-daemon-starts-idle-the-shim-is-unchanged-in-when-it-spawns) |
@@ -81,3 +82,8 @@ Each decision made from here on gets its own file, added as a row here.
 | 0010 | [search_code: a below-floor name query is told `noMatch`, a below-floor prose query `lowSimilarity`](0010-search-code-low-similarity-on-prose.md) | Accepted |
 | 0011 | [Embedding model: switch to jina-v2-base-code int8](0011-embedding-model-int8.md) | Accepted |
 | 0012 | [Embedded text: the doc comment trimmed to its prose outline](0012-embedded-text-structured.md) | Accepted |
+| 0013 | [Score cursor: the score travels as its f64 bits](0013-score-cursor-bits.md) | Accepted |
+| 0014 | [A switched session's tool results name the project that answered](0014-answering-project-stamp.md) | Accepted |
+| 0015 | [qualifiedName is plugin-segmented; core never parses separators](0015-qualified-name-segments.md) | Accepted |
+| 0016 | [search_code: a cross-encoder reorders the top 30, the verdict stays the embedding's](0016-cross-encoder-rerank.md) | Accepted |
+| 0017 | [The semantic rung embeds off the async workers; plain store reads stay on them](0017-semantic-rung-off-the-worker.md) | Accepted |

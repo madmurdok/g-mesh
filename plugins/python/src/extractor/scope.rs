@@ -81,6 +81,7 @@
 
 use std::collections::HashSet;
 
+use g_mesh_plugin_sdk::wire::QualifiedPath;
 use tree_sitter::Node;
 
 use crate::extractor::syntax::text;
@@ -119,6 +120,18 @@ impl Frame {
     pub(crate) fn binds(&self, name: &str) -> bool {
         self.locals.contains(name)
     }
+}
+
+/// A `.`-joined path of identifiers (a frame path, a dotted module key, a
+/// member key built from them) as segments. `None` when a segment would be
+/// empty, which no path this plugin builds has.
+pub(crate) fn dotted_path(text: &str) -> Option<QualifiedPath> {
+    let mut names = text.split('.');
+    let mut path = QualifiedPath::root(names.next()?);
+    for name in names {
+        path = path.child(".", name);
+    }
+    path.check().is_ok().then_some(path)
 }
 
 /// The frames in scope at one point of a walk, innermost last.
@@ -165,6 +178,12 @@ impl Scopes {
         } else {
             format!("{path}.{name}")
         }
+    }
+
+    /// [`Scopes::child_path`] as segments, one per enclosing definition and
+    /// one for `name`, each written after `.`.
+    pub(crate) fn child_qualified_path(&self, name: &str) -> Option<QualifiedPath> {
+        dotted_path(&self.child_path(name))
     }
 
     /// The innermost frame's kind.
