@@ -44,6 +44,9 @@ On a first call, ~570 ms of that is the model load. The query embedding costs
 ## Consequences
 
 - A cold start no longer stalls other sessions behind the model load.
+- The vector scan (30–60 ms warm) still runs under the store lock, now on
+  the blocking pool rather than a worker: other sessions' store reads wait
+  for it, but their worker-only calls (`tools/list`) do not.
 - On the semantic path the structural rungs run twice. No other path pays
   anything, and no answer changes.
 - A future store query slow enough to matter on a worker brings plain reads

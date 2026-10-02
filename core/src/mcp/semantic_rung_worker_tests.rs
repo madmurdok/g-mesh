@@ -120,7 +120,9 @@ async fn another_session_is_served_while_a_semantic_rung_inference_is_blocked() 
         drop(resolving);
         result
     });
-    entered.await;
+    tokio::time::timeout(Duration::from_secs(30), entered)
+        .await
+        .expect("the semantic rung never reached the embedder");
     gate.open_after_watchdog();
 
     let outline = call(&other, "get_file_outline", json!({ "file_path": "a.rs" })).await;
@@ -165,7 +167,9 @@ async fn the_semantic_rung_embeds_with_no_store_lock_held() {
         drop(resolving);
         result
     });
-    entered.await;
+    tokio::time::timeout(Duration::from_secs(30), entered)
+        .await
+        .expect("the semantic rung never reached the embedder");
     gate.open_after_watchdog();
 
     let (taken, probe) = mpsc::channel();
