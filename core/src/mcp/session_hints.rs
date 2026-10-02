@@ -88,7 +88,7 @@ pub(crate) fn truncated_by(cause: &str) -> Option<&'static str> {
 }
 
 pub(crate) const SEARCH_HITS: &str =
-    "These hits are ranked by similarity, not resolved: once one plausibly matches, do one \
+    "These hits are ranked by relevance, not resolved: once one plausibly matches, do one \
      confirming read and stop, without rewording the query or grepping the repo.";
 
 #[cfg(test)]
