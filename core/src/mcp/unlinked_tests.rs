@@ -197,6 +197,11 @@ fn declaration(conn: &mut Connection, id: &str, kind: &str, segments: &[&str]) -
 /// A placeholder named `name` waiting on `key` (a one-segment key is a
 /// `name` key), called once from a function in `file`.
 fn unlinked_call(conn: &mut Connection, id: &str, file: &str, key: &[&str]) {
+    call_onto_placeholder(conn, id, file, key, false);
+}
+
+/// [`unlinked_call`] with the edge's `resolved` bit as given.
+fn call_onto_placeholder(conn: &mut Connection, id: &str, file: &str, key: &[&str], resolved: bool) {
     let caller = format!("{id}_caller");
     upsert_node(conn, NodeRecord::new(&caller, "Function", "c", format!("c::{id}"), file, "rust")).unwrap();
     let mut node = NodeRecord::new(
@@ -217,8 +222,24 @@ fn unlinked_call(conn: &mut Connection, id: &str, file: &str, key: &[&str]) {
         key_path: (key.len() > 1).then(|| path(key)),
     });
     upsert_node(conn, node).unwrap();
-    upsert_edge(conn, EdgeRecord::new(format!("{id}_e"), &caller, id, "CALLS", "tree-sitter", false))
+    upsert_edge(conn, EdgeRecord::new(format!("{id}_e"), &caller, id, "CALLS", "tree-sitter", resolved))
         .unwrap();
+}
+
+/// A plugin that marks an edge onto a placeholder `resolved: true` breaks the
+/// wire contract, but ingest stores the bit as sent. The edge is still on the
+/// placeholder, so the call is still unlinked and still counts.
+#[test]
+fn an_edge_left_on_a_placeholder_counts_whatever_its_resolved_bit_says() {
+    let mut conn = setup();
+    declaration(&mut conn, "ty", "Type", &["m", "P"]);
+    let anchor = declaration(&mut conn, "load", "Function", &["m", "P", "load"]);
+    call_onto_placeholder(&mut conn, "marked", "a.rs", &["x", "P", "load"], true);
+    let stored: bool =
+        conn.query_row("SELECT resolved FROM edges WHERE id = 'marked_e'", [], |row| row.get(0)).unwrap();
+    assert!(stored, "the fixture must reach the index with resolved = 1");
+
+    assert_eq!(probe(&conn, &anchor, &["CALLS"], &[]).expect("a candidate").count, 1);
 }
 
 #[test]

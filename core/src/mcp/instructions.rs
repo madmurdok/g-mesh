@@ -139,9 +139,9 @@ const P3: &str = "`resolved: false` marks the one thing the indexer could not se
 const P4_GENERIC: &str = "The one legitimate reason to grep afterward: a method call through a \
      variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
      lists for methods can under-report; bare function calls and this/super/qualified-type \
-     calls have no such gap; `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
+     calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
      project's first index, or a re-index after an upgrade, a tool call waits for the walk \
-     to finish before answering - slow, not wrong; do not abandon it for grep.";
+     to finish - slow, not wrong; do not abandon it for grep.";
 
 /// Every present language *resolves* receiver calls, so clause (1) says they
 /// bind to the declared or inferred type: an override's caller page
@@ -164,9 +164,9 @@ fn p4_named(list: &str) -> String {
         "The one legitimate reason to grep afterward: a method call through a \
          variable receiver (`x.foo()`) produces no edge in {list}, so caller/reference \
          lists for methods can under-report; bare function calls and this/super/qualified-type \
-         calls have no such gap; `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
+         calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
          project's first index, or a re-index after an upgrade, a tool call waits for the walk \
-         to finish before answering - slow, not wrong; do not abandon it for grep."
+         to finish - slow, not wrong; do not abandon it for grep."
     )
 }
 

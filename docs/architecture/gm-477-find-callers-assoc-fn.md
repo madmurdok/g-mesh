@@ -183,7 +183,7 @@ The owner decides between (a) and (b).
 The owner chose (b). Linking through `use super::*` (option a) is a separate
 backlog task.
 
-- `core/src/mcp/unlinked.rs`: `probe` finds unresolved usage edges into
+- `core/src/mcp/unlinked.rs`: `probe` finds usage edges still on
   `pending_symbol` placeholders of the anchor's language whose bare `name` is
   the anchor's. A key of two or more segments counts only when its
   second-to-last segment equals the anchor's; a one-segment key (or one with
@@ -194,9 +194,18 @@ backlog task.
   filesTruncated?, hint}`, shaped like `excludedReferences`. The field is
   absent when there is no candidate. `count` is uncapped; `files` is capped at
   20. The page bound reserves the field's bytes only when it is present.
-- Guidance P4 now reads "`hasMore: false` without `unlinkedUsages` is
-  exhaustive" (4 bytes longer; worst-case rendering still under the 1,900-byte
-  ceiling). `select_project` serves the same rendering.
+- Guidance P4 now reads "bare function calls and this/super/qualified-type
+  calls have no such gap, and for those `hasMore: false` without
+  `unlinkedUsages` is exhaustive". To stay under the 1,900-byte ceiling, the
+  wait sentence in P4 drops "before answering" (worst case 1,890 bytes).
+  `select_project` serves the same rendering.
+- The probe does not filter on `edges.resolved`. The linker sets
+  `resolved = 1` only while repointing an edge onto a declaration
+  (`graph/symbol_links.rs:1146`), but ingest stores a plugin's own bit as sent
+  (`storage/write.rs:481-498`; the "never `resolved: true` onto a
+  placeholder" rule is checked only by `g-mesh plugins check`,
+  `cli/plugin_check/checks.rs:395`). An edge still on a placeholder is
+  unlinked whatever its bit says.
 - Index: `idx_nodes_pending_name ON nodes(name) WHERE nativeKind =
   'pending_symbol'`, created by `schema::apply` on any current-version index,
   so no version bump or reindex. Without it the probe scans every node of the

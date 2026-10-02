@@ -131,9 +131,15 @@ pub(crate) fn probe(
     Some(UnlinkedUsages { count, files, files_truncated, hint: UNLINKED_USAGES_HINT })
 }
 
-/// `(usage's file, placeholder keyPath)` for every unresolved `edge_kinds`
-/// edge into a `pending_symbol` placeholder of the anchor's language whose
-/// bare name is the anchor's, under the `file_paths` scope.
+/// `(usage's file, placeholder keyPath)` for every `edge_kinds` edge into a
+/// `pending_symbol` placeholder of the anchor's language whose bare name is
+/// the anchor's, under the `file_paths` scope.
+///
+/// An edge still on a placeholder is unlinked whatever its `resolved` bit
+/// says: the linker sets `resolved = 1` only in the same update that repoints
+/// the edge onto a declaration, and ingest stores a plugin's own bit as sent,
+/// so a plugin that marks a placeholder edge resolved leaves `resolved = 1`
+/// on an edge nothing linked. The query therefore does not filter on it.
 fn candidate_rows(
     conn: &Connection,
     anchor: &NodeRecord,
@@ -168,7 +174,7 @@ fn candidate_sql(kinds: usize, paths: usize) -> String {
          JOIN edges e ON e.toId = t.id \
          JOIN nodes f ON f.id = e.fromId \
          WHERE t.name = ?1 AND t.language = ?2 AND t.nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}' \
-           AND e.resolved = 0 AND e.kind IN ({}) \
+           AND e.kind IN ({}) \
            AND {scope_filter}",
         kind_params.join(", ")
     )

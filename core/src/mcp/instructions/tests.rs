@@ -38,9 +38,9 @@ check this field, not just individual rows. Never set on an empty page.\n\n\
 The one legitimate reason to grep afterward: a method call through a \
 variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
 lists for methods can under-report; bare function calls and this/super/qualified-type \
-calls have no such gap; `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
+calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
 project's first index, or a re-index after an upgrade, a tool call waits for the walk \
-to finish before answering - slow, not wrong; do not abandon it for grep.\n\n\
+to finish - slow, not wrong; do not abandon it for grep.\n\n\
 Efficient usage: pass `symbol_name` directly to the four tools above instead \
 of calling find_definition first, and raise `limit` for symbols with many \
 results instead of paging.";
@@ -167,7 +167,7 @@ fn ts_only_is_byte_identical_to_the_original_string() {
         "a TypeScript-only project must read exactly what it did before GM-262"
     );
     // The measured length of the current rendering, not a re-derivation.
-    assert_eq!(rendered.len(), 1732, "this module's own current baseline, re-measured");
+    assert_eq!(rendered.len(), 1729, "this module's own current baseline, re-measured");
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn typescript_never_reaches_the_narrowed_rendering_however_its_pass_goes() {
 /// method's caller/reference lists can under-report, and never claims a
 /// method page is exhaustive. The reason it is left alone is the byte
 /// budget measured in that constant's doc: this rendering's worst case is
-/// already 1,860 of 1,900 bytes.
+/// already 1,857 of 1,900 bytes.
 #[test]
 fn a_mixed_project_keeps_the_named_open_gap_and_does_not_carry_the_narrowing() {
     let mut go_done = go_present(true);
@@ -525,8 +525,8 @@ fn fallback_wording_fits_under_the_ceiling() {
 /// Sixteen languages sufficed before GM-394; its shorter second clause
 /// (see [`P4_GENERIC`]'s own doc comment) freed up enough headroom that
 /// sixteen no longer overflows [`INSTRUCTIONS_BYTE_CEILING`] (measured:
-/// 1,840 bytes, under the 1,900 ceiling) - so the fixture below has
-/// twenty-eight, re-measured to overflow at 1,928 bytes, still standing in
+/// 1,837 bytes, under the 1,900 ceiling) - so the fixture below has
+/// twenty-eight, re-measured to overflow at 1,925 bytes, still standing in
 /// for "more than the design doc plans for" rather than a real count.
 #[test]
 fn a_present_list_too_long_to_name_falls_back_instead_of_exceeding_the_ceiling() {
