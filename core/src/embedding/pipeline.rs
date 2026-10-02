@@ -66,6 +66,7 @@ use crate::embedding::model::{
     check_default_weights, default_model_dir, embedding_version, EmbeddingModel, ONNX_FILE_NAME,
     TOKENIZER_FILE_NAME,
 };
+use crate::embedding::rerank::Reranker;
 use crate::embedding::text::text_to_embed;
 use crate::storage::vectors;
 use crate::storage::write::Diff;
@@ -188,6 +189,9 @@ pub struct EmbeddingPipeline {
     loader: Loader,
     model: OnceLock<Option<Box<dyn Embedder>>>,
     cache: Mutex<CacheSlot>,
+    /// `search_code`'s cross-encoder rerank, resolved like the model: on the
+    /// first call that asks.
+    reranker: Reranker,
 }
 
 impl EmbeddingPipeline {
@@ -224,6 +228,7 @@ impl EmbeddingPipeline {
             }),
             model: OnceLock::new(),
             cache: Mutex::new(cache),
+            reranker: Reranker::from_environment(),
         }
     }
 
@@ -236,6 +241,7 @@ impl EmbeddingPipeline {
     pub fn disabled() -> Self {
         let mut pipeline = Self::build(&EmbeddingConfig::default(), None, CacheSlot::Off);
         pipeline.model = OnceLock::from(None);
+        pipeline.reranker = Reranker::off();
         pipeline
     }
 
@@ -255,7 +261,20 @@ impl EmbeddingPipeline {
         let mut pipeline = Self::build(&EmbeddingConfig::default(), Some(model_dir.to_path_buf()), slot);
         pipeline.loader = Box::new(loader);
         pipeline.pinned_weights = false;
+        pipeline.reranker = Reranker::off();
         pipeline
+    }
+
+    /// This pipeline with `reranker` in place of its own.
+    #[cfg(test)]
+    pub(crate) fn with_reranker(mut self, reranker: Reranker) -> Self {
+        self.reranker = reranker;
+        self
+    }
+
+    /// `search_code`'s rerank.
+    pub(crate) fn reranker(&self) -> &Reranker {
+        &self.reranker
     }
 
     fn model_dir(&self) -> Result<PathBuf> {

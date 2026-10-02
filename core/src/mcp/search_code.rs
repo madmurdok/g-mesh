@@ -13,12 +13,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use base64::prelude::{Engine, BASE64_STANDARD};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::daemon::indexing_status::Phase;
+use crate::embedding::rerank::{self, Scorer};
+use crate::embedding::text::text_to_embed;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::storage::index_store::IndexStore;
@@ -29,8 +33,8 @@ use super::similarity;
 use super::tool_result::{error, internal_error, success};
 use super::{human_duration, SearchCodeParams};
 
-/// One matched symbol, ranked by similarity to the query.
-#[derive(Serialize)]
+/// One matched symbol, ranked by relevance to the query.
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SearchResult {
     pub(super) symbol_id: String,
@@ -42,7 +46,10 @@ pub(super) struct SearchResult {
     /// Cosine similarity to the query, in `[-1.0, 1.0]` (in practice close to
     /// `[0.0, 1.0]` for related code text - both sides are L2-normalized, so
     /// this is exactly `1 - cosine_distance`). Higher is more similar; this
-    /// is also the column `paginate_by_score` orders and pages by.
+    /// is also the column `paginate_by_score` orders and pages by. Within a
+    /// reranked window (`embedding::rerank`) the rows are ordered by the
+    /// cross-encoder's blend, so this score need not fall monotonically
+    /// there.
     pub(super) score: f64,
     /// The declaration's own `nodes.language`, read for
     /// [`super::similarity::floor`] and never serialized: the floor a row is
@@ -186,8 +193,9 @@ impl Coverage {
 }
 
 /// Marks a cursor issued on a partial page: `partial:<stored>:<cursor>`,
-/// where `<stored>` is the vector count the page was ranked from. The inner
-/// cursor is base64 and never contains `:`.
+/// where `<stored>` is the vector count the page was ranked from. `<stored>`
+/// never contains `:`, so the inner cursor is everything after its first
+/// `:` after the prefix (it may itself be a `rerank:` cursor).
 const PARTIAL_CURSOR_PREFIX: &str = "partial:";
 
 fn partial_cursor(stored: u64, cursor: &str) -> String {
@@ -289,6 +297,10 @@ pub(super) async fn handle_off_worker(
 /// by a note, marked `partial`, carries no floor verdict, and its cursor is
 /// refused once the stored vector count changes (the continuation would rank
 /// a different set).
+///
+/// Only a first, complete page is reranked (`embedding::rerank`), and its
+/// verdict is judged on the embedding order's page, so the verdict never
+/// depends on the rerank.
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
@@ -324,15 +336,29 @@ pub(super) fn handle(
     };
 
     let page_size = pagination::resolve_page_size(params.limit);
-    let page = search(&conn, &query_vector, page_size, cursor)
-        .map_err(|e| internal_error("failed to search code", e))?;
+    // A first, complete page reranks when the cross-encoder is on and
+    // loaded; every other call is ranked exactly as without a rerank.
+    let scorer = match (cursor, coverage) {
+        (None, None) => embedding.reranker().scorer(),
+        _ => None,
+    };
+    let ranked = match (scorer, cursor.and_then(split_rerank_cursor)) {
+        (Some(scorer), _) => {
+            first_page_reranked(&conn, embedding, scorer, &params.query, &query_vector, page_size)
+        }
+        (None, Some(rerank_cursor)) => continue_rerank(&conn, &query_vector, page_size, rerank_cursor),
+        (None, None) => search(&conn, &query_vector, page_size, cursor).map(Ranked::plain),
+    }
+    .map_err(|e| internal_error("failed to search code", e))?;
+    let Ranked { page, judged } = ranked;
+    let judged = judged.as_deref().unwrap_or(&page.results);
 
     let no_match = match coverage {
-        None => similarity::verdict(&params.query, cursor, &page.results),
-        Some(_) => similarity::partial_verdict(&params.query, cursor, &page.results),
+        None => similarity::verdict(&params.query, cursor, judged),
+        Some(_) => similarity::partial_verdict(&params.query, cursor, judged),
     };
     let low_similarity = match coverage {
-        None => similarity::low_similarity(&params.query, cursor, &page.results),
+        None => similarity::low_similarity(&params.query, cursor, judged),
         Some(_) => None,
     };
     let next_cursor = match coverage {
@@ -359,6 +385,181 @@ pub(super) fn handle(
             ContentBlock::json(&body)?,
         ])),
     }
+}
+
+/// A page ready to answer with, and the rows its verdict is judged on when
+/// those are not the page's own: a reranked first page is judged on the
+/// embedding order's page, the rows and the page size the verdict has
+/// always seen.
+struct Ranked {
+    page: pagination::Page<SearchResult>,
+    judged: Option<Vec<SearchResult>>,
+}
+
+impl Ranked {
+    fn plain(page: pagination::Page<SearchResult>) -> Self {
+        Self { page, judged: None }
+    }
+}
+
+/// Marks a cursor issued on a reranked first page whose window did not fit:
+/// `rerank:<base64 JSON RerankCursor>`.
+const RERANK_CURSOR_PREFIX: &str = "rerank:";
+
+/// What a page after a reranked first page continues from: the window rows
+/// not shown yet, in reranked order, then the embedding order after the
+/// window's last row.
+#[derive(Serialize, serde::Deserialize)]
+struct RerankCursor {
+    rest: Vec<String>,
+    /// [`search`]'s cursor at the window's last row; `None` when nothing
+    /// ranked after it.
+    after: Option<String>,
+}
+
+fn rerank_cursor(cursor: &RerankCursor) -> String {
+    let json = serde_json::to_vec(cursor).expect("a rerank cursor always serializes");
+    format!("{RERANK_CURSOR_PREFIX}{}", BASE64_STANDARD.encode(json))
+}
+
+/// The payload of a `rerank:` cursor; `None` for any other cursor.
+fn split_rerank_cursor(cursor: &str) -> Option<&str> {
+    cursor.strip_prefix(RERANK_CURSOR_PREFIX)
+}
+
+fn decode_rerank_cursor(payload: &str) -> anyhow::Result<RerankCursor> {
+    let bytes = BASE64_STANDARD.decode(payload).context("invalid rerank cursor encoding")?;
+    serde_json::from_slice(&bytes).context("invalid rerank cursor payload")
+}
+
+/// A first page with the window reranked (`embedding::rerank`): the
+/// embedding ranking's first `max(page_size, WINDOW)` rows, the first
+/// `WINDOW` of them reordered. A `page_size` under the window shows the
+/// first `page_size` reranked rows and hands out a `rerank:` cursor for the
+/// rest. When this call's scoring fails, the page is the plain one.
+fn first_page_reranked(
+    conn: &Connection,
+    embedding: &EmbeddingPipeline,
+    scorer: &dyn Scorer,
+    query: &str,
+    query_vector: &[f32],
+    page_size: usize,
+) -> anyhow::Result<Ranked> {
+    let mut window = search(conn, query_vector, page_size.max(rerank::WINDOW), None)?;
+    let reranked = window.results.len().min(rerank::WINDOW);
+    if reranked < 2 {
+        return search(conn, query_vector, page_size, None).map(Ranked::plain);
+    }
+    let texts = window_texts(conn, &window.results[..reranked])?;
+    let cosines: Vec<f64> = window.results[..reranked].iter().map(|row| row.score).collect();
+    let Some(order) = embedding.reranker().order(scorer, query, &texts, &cosines) else {
+        return search(conn, query_vector, page_size, None).map(Ranked::plain);
+    };
+
+    let judged = window.results[..page_size.min(window.results.len())].to_vec();
+    let mut rows: Vec<Option<SearchResult>> = window.results.drain(..).map(Some).collect();
+    let tail = rows.split_off(reranked);
+    let mut ordered: Vec<SearchResult> =
+        order.iter().map(|&i| rows[i].take().expect("the order is a permutation")).collect();
+    ordered.extend(tail.into_iter().flatten());
+
+    if ordered.len() <= page_size {
+        // The whole window is on this page: `search`'s own cursor, at the
+        // page's last embedding-order row, continues after the same set.
+        let page = pagination::Page { results: ordered, ..window };
+        return Ok(Ranked { page, judged: Some(judged) });
+    }
+    let rest = ordered.split_off(page_size).into_iter().map(|row| row.symbol_id).collect();
+    let next = rerank_cursor(&RerankCursor { rest, after: window.next_cursor.take() });
+    let page = pagination::Page { results: ordered, has_more: true, next_cursor: Some(next), ..window };
+    Ok(Ranked { page, judged: Some(judged) })
+}
+
+/// The text each row was embedded from, which is also what the
+/// cross-encoder reads: `text_to_embed` of the node's current doc comment
+/// and signature.
+fn window_texts(conn: &Connection, rows: &[SearchResult]) -> anyhow::Result<Vec<String>> {
+    let mut statement = conn.prepare_cached("SELECT docComment, signature FROM nodes WHERE id = ?1")?;
+    rows.iter()
+        .map(|row| {
+            let (doc_comment, signature): (Option<String>, Option<String>) = statement
+                .query_row([&row.symbol_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+                .unwrap_or_default();
+            Ok(text_to_embed(doc_comment.as_deref(), signature.as_deref()).unwrap_or_default())
+        })
+        .collect()
+}
+
+/// A page after a reranked first page: the window rows the cursor still
+/// holds, in its order, each re-read with its cosine recomputed and skipped
+/// if it no longer has a vector; then the embedding order after the window.
+/// No scoring runs here.
+fn continue_rerank(
+    conn: &Connection,
+    query_vector: &[f32],
+    page_size: usize,
+    payload: &str,
+) -> anyhow::Result<Ranked> {
+    let RerankCursor { rest, after } = decode_rerank_cursor(payload)?;
+    let mut results = rows_by_id(conn, query_vector, &rest)?;
+    if results.len() > page_size {
+        let remaining = results.split_off(page_size).into_iter().map(|row| row.symbol_id).collect();
+        let next = rerank_cursor(&RerankCursor { rest: remaining, after });
+        return Ok(Ranked::plain(pagination::Page {
+            results,
+            has_more: true,
+            next_cursor: Some(next),
+            all_unresolved: false,
+        }));
+    }
+    let page = match after {
+        None => pagination::Page { results, has_more: false, next_cursor: None, all_unresolved: false },
+        Some(after) if results.len() == page_size => {
+            pagination::Page { results, has_more: true, next_cursor: Some(after), all_unresolved: false }
+        }
+        Some(after) => {
+            let tail = search(conn, query_vector, page_size - results.len(), Some(&after))?;
+            results.extend(tail.results);
+            pagination::Page { results, ..tail }
+        }
+    };
+    Ok(Ranked::plain(page))
+}
+
+/// The rows for `ids` that still have a vector, in `ids`' order, scored as
+/// [`search`] scores them.
+fn rows_by_id(conn: &Connection, query_vector: &[f32], ids: &[String]) -> anyhow::Result<Vec<SearchResult>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql =
+        "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, n.language, \
+               (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
+               FROM vectors v JOIN nodes n ON n.id = v.nodeId \
+               WHERE v.nodeId IN (SELECT value FROM json_each(?2))";
+    let packed = pack(query_vector);
+    let ids_json = serde_json::to_string(ids)?;
+    let mut statement = conn.prepare(sql)?;
+    let mut found: std::collections::HashMap<String, SearchResult> = statement
+        .query_map(rusqlite::params![packed, ids_json], |row| {
+            let id: String = row.get("id")?;
+            Ok((
+                id.clone(),
+                SearchResult {
+                    symbol_id: id,
+                    qualified_name: row.get("qualifiedName")?,
+                    kind: row.get("kind")?,
+                    file_path: row.get("filePath")?,
+                    start_line: row.get("startLine")?,
+                    start_col: row.get("startCol")?,
+                    score: row.get("score")?,
+                    language: row.get("language")?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
 }
 
 /// `judged` is true when the page carries `noMatch` or `lowSimilarity`: the

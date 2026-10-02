@@ -195,9 +195,19 @@ from nowhere else in the codebase). Using the binary built in step 1
 ```bash
 g-mesh model fetch
 # -> ~/.g-mesh/models/jina-embeddings-v2-base-code/{model.onnx,tokenizer.json}
+# -> ~/.g-mesh/models/ms-marco-MiniLM-L6-v2/{model.onnx,tokenizer.json}   (the rerank model)
 
 g-mesh model status   # where the weights are expected, and whether they're there
 ```
+
+`model fetch` also downloads the cross-encoder `search_code` reranks with
+(see "Tools exposed"): `cross-encoder/ms-marco-MiniLM-L6-v2` at revision
+`233902d25c440f23af6f7d6e94d2946bac0bee0a`, its fp32 export
+(`onnx/model.onnx`, 91 MB), checked against a pinned SHA-256 like the
+embedding model, and again by the daemon when it loads it. `--no-rerank` skips
+it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
+embedding model's own directory, so it cannot also hold this one). Without it
+`search_code` keeps the embedding order and says so once in the daemon log.
 
 **If you are comparing two indexes, point `G_MESH_MODEL_DIR` at an empty
 directory in both arms.** Embedding generation, not indexing, dominates a
@@ -230,7 +240,8 @@ does not prevent.
 
 `G_MESH_MODEL_BASE_URL` points the download somewhere else — a mirror inside
 your network, or a GitHub release's assets, anything serving `model.onnx` and
-`tokenizer.json` side by side under one prefix. It is *prepended* to the
+`tokenizer.json` side by side under one prefix (and the rerank model's two
+under `<prefix>/ms-marco-MiniLM-L6-v2/`). It is *prepended* to the
 sources rather than replacing them, so an unreachable mirror costs a slower
 download instead of a failed one, and the output names every attempt: if you
 set this to keep traffic off the public internet, you will be told when it
@@ -645,9 +656,45 @@ defaults when a project or machine has never run either.
 structural, all available with no extra setup.
 
 Plus `search_code`: free-text semantic search over doc comments and
-signatures, ranked by similarity. It is the one tool with a prerequisite —
+signatures, ranked by relevance. It is the one tool with a prerequisite —
 the embedding model above — and the one whose top hit is a ranked guess
 rather than a resolved graph answer.
+
+**The rerank.** The embedding model's top 30 rows are reordered by a
+cross-encoder, `ms-marco-MiniLM-L6-v2`, which reads the query and each row's
+embedded text together: each row is ordered by the cross-encoder's logit plus
+80 × its cosine, ties keep the embedding order, and rows after the 30th keep
+the embedding order. On the held-out natural-language eval queries this raised
+recall@10 by 3.7 points and MRR by 0.047 over the embedding order alone
+([`docs/results/gm-443-recall-rerank.md`](docs/results/gm-443-recall-rerank.md),
+"GM-464 S1"). What does not change: the `score` each row carries is still the
+embedding cosine (so within the top 30 it need not fall monotonically), and
+`noMatch` / `lowSimilarity` are judged on the embedding order's own page, so
+the rerank never changes a verdict. Only a first page is reranked, and only
+once the embedding pass has finished; a page during the pass, and every
+continuation, is ranked as before. With `limit` under 30 the cursor carries
+the rest of the reranked top 30, so paging neither repeats nor skips a row.
+Design and trade-offs: [ADR 0016](docs/adr/0016-cross-encoder-rerank.md).
+
+*Cost:* the cross-encoder (91 MB on disk, ~87 MiB) loads on the first search
+that reranks and scores 30 pairs per first page on up to 4 CPU threads.
+Measured end to end through the daemon on g-mesh's own index, on a 4-core
+laptop ([`docs/results/gm-464-rerank-latency.md`](docs/results/gm-464-rerank-latency.md)):
+
+| `search_code` call | p50 | p95 | first call (fresh daemon) |
+|---|---|---|---|
+| rerank off | 65 ms | 85 ms | 0.7 s |
+| rerank on, 4 threads (default) | 510 ms | 805 ms | 1.5 s (includes the model load) |
+| rerank on, 1 thread | 1.1 s | 1.7 s | 2.8 s |
+
+Only a complete first page pays it; continuations and pages during the
+embedding pass cost what they did before.
+
+*Turning it off:* `[rerank] enabled = false` in the global
+`~/.g-mesh/config.toml`, or `G_MESH_RERANK=off` in the daemon's environment;
+either takes effect when the daemon restarts, and `search_code` then answers
+exactly as it did before the rerank existed. Not fetching the model (`model
+fetch --no-rerank`) has the same effect.
 
 What gets embedded is each symbol's doc comment trimmed to its prose — the
 summary, headings and short paragraphs; code examples, parameter and return
@@ -1047,4 +1094,8 @@ model directory that you fetch yourself (see "Embedding model" above —
 `model.onnx` alone is ~154 MiB, which is why it is not vendored). The default
 model, `jina-embeddings-v2-base-code`, is Apache-2.0, so redistributing it
 inside a machine image or container is permitted under its own terms; if you
-point g-mesh at a different model, check that model's license yourself.
+point g-mesh at a different model, check that model's license yourself. The
+rerank model, `cross-encoder/ms-marco-MiniLM-L6-v2`, is Apache-2.0 too; it was
+trained on the MS MARCO dataset, whose terms are for non-commercial research
+purposes. Those terms are on the training data, not a licence on the weights,
+but a cautious redistributor may want to read them.
