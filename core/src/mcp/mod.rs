@@ -55,6 +55,8 @@ mod search_code_wait_tests;
 mod search_code_worker_tests;
 #[cfg(test)]
 mod semantic_pending_tests;
+#[cfg(test)]
+mod semantic_rung_worker_tests;
 pub(crate) mod session_hints;
 mod similarity;
 mod source;
@@ -635,7 +637,13 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        find_definition::handle(&self.store, self.registry.project_root(), &self.embedding, params.0)
+        let store = Arc::clone(&self.store);
+        let project_root = self.registry.project_root().to_path_buf();
+        let params = params.0;
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_definition::handle_in(&store, &project_root, semantic, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -650,8 +658,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_references::handle(&self.store, &self.embedding, &capabilities, &self.hints, params.0)
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_references::handle_in(&store, semantic, &capabilities, &hints, params.clone())
+        })
+        .await
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -663,14 +675,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_callers_callees::handle_callers(
-            &self.store,
-            &self.embedding,
-            &capabilities,
-            &self.hints,
-            params.0,
-        )
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_callers_callees::handle_callers_in(&store, semantic, &capabilities, &hints, params.clone())
+        })
+        .await
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -682,8 +692,11 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_callers_callees::handle_callees(&self.store, &self.embedding, &capabilities, params.0)
+        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_callers_callees::handle_callees_in(&store, semantic, &capabilities, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -698,8 +711,11 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
             return Ok(early);
         }
-        let capabilities = self.capabilities();
-        find_implementations::dispatch(&self.store, &self.embedding, &capabilities, params.0)
+        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
+            find_implementations::dispatch_in(&store, semantic, &capabilities, params.clone())
+        })
+        .await
     }
 
     #[tool(
@@ -789,7 +805,7 @@ impl ServerHandler for GMeshMcpServer {
 
 /// A symbol is addressable either by name or by where the cursor sits, because
 /// an agent reading code has one or the other, rarely both.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FindDefinitionParams {
     /// Name of the symbol to look up.
     pub symbol_name: Option<String>,
@@ -806,7 +822,7 @@ pub struct FindDefinitionParams {
 
 // Shared by find_references/find_callers/find_callees: they differ only in
 // which edges they walk, never in what the caller supplies.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
@@ -827,7 +843,7 @@ pub struct SymbolQueryParams {
 // The first five fields must stay identical in name, type and semantics to
 // `SymbolQueryParams`'s: `find_implementations::dispatch` builds a
 // `SymbolQueryParams` from them to run the single-hop `handle`.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.

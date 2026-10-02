@@ -86,3 +86,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0014 | [A switched session's tool results name the project that answered](0014-answering-project-stamp.md) | Accepted |
 | 0015 | [qualifiedName is plugin-segmented; core never parses separators](0015-qualified-name-segments.md) | Accepted |
 | 0016 | [search_code: a cross-encoder reorders the top 30, the verdict stays the embedding's](0016-cross-encoder-rerank.md) | Accepted |
+| 0017 | [The semantic rung embeds off the async workers; plain store reads stay on them](0017-semantic-rung-off-the-worker.md) | Accepted |

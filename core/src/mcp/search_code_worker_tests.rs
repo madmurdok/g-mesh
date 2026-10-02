@@ -29,29 +29,29 @@ use crate::storage::vectors::{insert, register_extension};
 /// How long the gate stays shut if the test never opens it: long enough
 /// that a served call returns well before it, short enough that a stalled
 /// one fails the test instead of hanging it.
-const WATCHDOG: Duration = Duration::from_secs(5);
+pub(super) const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// Holds every inference until opened. `entered` fires once an inference is
 /// waiting on it.
 #[derive(Default)]
-struct Gate {
+pub(super) struct Gate {
     open: Mutex<bool>,
     opened: Condvar,
-    entered: Notify,
+    pub(super) entered: Notify,
 }
 
 impl Gate {
-    fn open(&self) {
+    pub(super) fn open(&self) {
         *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.opened.notify_all();
     }
 
-    fn is_open(&self) -> bool {
+    pub(super) fn is_open(&self) -> bool {
         *self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Opens the gate after [`WATCHDOG`] unless it was opened first.
-    fn open_after_watchdog(self: &Arc<Self>) {
+    pub(super) fn open_after_watchdog(self: &Arc<Self>) {
         let gate = Arc::clone(self);
         std::thread::spawn(move || {
             let open = gate.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -65,7 +65,7 @@ impl Gate {
     }
 }
 
-struct GatedEmbedder(Arc<Gate>);
+pub(super) struct GatedEmbedder(pub(super) Arc<Gate>);
 
 impl Embedder for GatedEmbedder {
     fn embed(&self, _text: &str) -> Result<Vec<f32>> {
@@ -76,7 +76,7 @@ impl Embedder for GatedEmbedder {
     }
 }
 
-async fn connect(server: GMeshMcpServer) -> RunningService<RoleClient, ()> {
+pub(super) async fn connect(server: GMeshMcpServer) -> RunningService<RoleClient, ()> {
     let (server_io, client_io) = tokio::io::duplex(1 << 20);
     tokio::spawn(async move {
         if let Ok(service) = server.serve(server_io).await {
@@ -86,7 +86,11 @@ async fn connect(server: GMeshMcpServer) -> RunningService<RoleClient, ()> {
     ().serve(client_io).await.expect("the client must initialize against the server")
 }
 
-async fn call(client: &RunningService<RoleClient, ()>, tool: &str, arguments: Value) -> CallToolResult {
+pub(super) async fn call(
+    client: &RunningService<RoleClient, ()>,
+    tool: &str,
+    arguments: Value,
+) -> CallToolResult {
     client
         .call_tool(
             CallToolRequestParams::new(tool.to_string())

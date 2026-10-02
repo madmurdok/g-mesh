@@ -25,7 +25,6 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::write::NodeRecord;
@@ -109,7 +108,7 @@ impl From<&NodeRecord> for AnchorInfo {
 
 pub(super) fn resolve(
     conn: &Connection,
-    embedding: Option<&EmbeddingPipeline>,
+    semantic: &find_definition::SemanticRung<'_>,
     params: &SymbolQueryParams,
 ) -> Anchor {
     // Mirrors `find_definition::handle`'s alternation check: both addressing
@@ -118,7 +117,7 @@ pub(super) fn resolve(
     match (params.symbol_id.as_deref(), params.symbol_name.as_deref()) {
         (Some(symbol_id), None) => by_id(conn, symbol_id),
         (None, Some(name)) => {
-            find_definition::resolve_symbol_name(conn, embedding, name, params.cursor.as_deref())
+            find_definition::resolve_symbol_name(conn, semantic, name, params.cursor.as_deref())
         }
         (Some(_), Some(_)) => error("g-mesh: give either `symbol_id` or `symbol_name`, not both").map(Err),
         (None, None) => {
@@ -201,7 +200,11 @@ mod tests {
     #[test]
     fn neither_addressing_mode_is_a_tool_level_error() {
         let conn = setup();
-        let result = expect_finished(resolve(&conn, None, &SymbolQueryParams::default()));
+        let result = expect_finished(resolve(
+            &conn,
+            &find_definition::SemanticRung::off(),
+            &SymbolQueryParams::default(),
+        ));
         let text = error_text(&result);
         assert!(text.contains("symbol_id"), "{text}");
         assert!(text.contains("symbol_name"), "{text}");
@@ -219,7 +222,7 @@ mod tests {
         };
         // Resolving both to the same node would still be a silent contract
         // violation, so it must fail rather than quietly prefer one.
-        let result = expect_finished(resolve(&conn, None, &params));
+        let result = expect_finished(resolve(&conn, &find_definition::SemanticRung::off(), &params));
         assert!(error_text(&result).contains("not both"));
     }
 
@@ -232,7 +235,7 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_name: Some("pkg_b::run".to_string()), ..Default::default() };
-        let node = expect_node(resolve(&conn, None, &params));
+        let node = expect_node(resolve(&conn, &find_definition::SemanticRung::off(), &params));
         assert_eq!(node.id, "n2", "a qualifiedName must resolve even while the bare name is ambiguous");
     }
 
@@ -255,7 +258,7 @@ mod tests {
 
         let params =
             SymbolQueryParams { symbol_name: Some("IndexStore::read".to_string()), ..Default::default() };
-        let resolved = expect_resolved(resolve(&conn, None, &params));
+        let resolved = expect_resolved(resolve(&conn, &find_definition::SemanticRung::off(), &params));
         assert_eq!(resolved.node.id, "n1");
         assert_eq!(resolved.by, find_definition::ResolvedBy::QualifiedNameSuffix);
     }

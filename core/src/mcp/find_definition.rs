@@ -2,6 +2,7 @@
 //! so that file stays pure tool-router wiring - this is where the actual
 //! "name or position -> node(s)" decision lives.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -360,6 +361,102 @@ pub(super) struct Resolved {
     pub(super) by: ResolvedBy,
 }
 
+/// How the ladder's last rung, [`by_semantic_neighbours`], gets its query
+/// vector.
+///
+/// Invariant: inference (and the model's load on first use) never runs under
+/// the store lock or on an async worker - every other session, `tools/list`
+/// included, would wait behind it. Nor does it run before the ladder, since
+/// most resolutions end on an earlier rung. So a handler runs in up to two
+/// passes, driven by [`resolve_lazily`] or, in the server,
+/// [`resolve_lazily_off_worker`]:
+///
+/// 1. [`Deferred`](Self::Deferred): the structural rungs run as always; if
+///    the ladder falls through to the semantic rung, the rung records the name
+///    and the pass's answer is discarded.
+/// 2. Only then, with the first pass's lock released, the name is embedded,
+///    and the handler runs again with [`Embedded`](Self::Embedded). It reads
+///    the index afresh, so the answer comes from one snapshot.
+///
+/// The cost on that path is the structural rungs read twice (a few indexed
+/// lookups); on every other path, nothing.
+pub(crate) enum SemanticRung<'a> {
+    /// First pass: reaching the rung records the name in `reached`.
+    Deferred { embedding: &'a EmbeddingPipeline, reached: Cell<Option<String>> },
+    /// Second pass: `name`'s query vector, embedded with no lock held. `None`
+    /// when the model could not embed it, which refuses as before.
+    Embedded { name: &'a str, query: Option<&'a [f32]> },
+}
+
+impl<'a> SemanticRung<'a> {
+    pub(crate) fn deferred(embedding: &'a EmbeddingPipeline) -> Self {
+        Self::Deferred { embedding, reached: Cell::new(None) }
+    }
+
+    /// A rung with no model behind it, for tests that pin the structural
+    /// ladder: it refuses where the semantic rung would answer.
+    #[cfg(test)]
+    pub(crate) fn off() -> SemanticRung<'static> {
+        static DISABLED: std::sync::LazyLock<EmbeddingPipeline> =
+            std::sync::LazyLock::new(EmbeddingPipeline::disabled);
+        SemanticRung::deferred(&DISABLED)
+    }
+
+    /// The name a [`Deferred`](Self::Deferred) pass stopped at the rung with,
+    /// if it did.
+    pub(crate) fn reached(&self) -> Option<String> {
+        match self {
+            Self::Deferred { reached, .. } => reached.take(),
+            Self::Embedded { .. } => None,
+        }
+    }
+}
+
+/// Runs `handler` with the semantic rung deferred, then - only if the ladder
+/// reached that rung - embeds the name with no lock held and runs it again
+/// with the vector (see [`SemanticRung`]). `handler` must take and release
+/// the store itself, so nothing is held between the passes. Synchronous: for
+/// callers already off the async workers (the CLI, tests).
+pub(crate) fn resolve_lazily(
+    embedding: &EmbeddingPipeline,
+    handler: impl Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData>,
+) -> Result<CallToolResult, ErrorData> {
+    let first = SemanticRung::deferred(embedding);
+    let answer = handler(&first)?;
+    let Some(name) = first.reached() else { return Ok(answer) };
+    let query = embedding.embed_query(&name);
+    handler(&SemanticRung::Embedded { name: &name, query: query.as_deref() })
+}
+
+/// [`resolve_lazily`] for the server: the first pass, plain store reads, runs
+/// on the async worker as every structural tool does; the inference and the
+/// second pass run on the blocking pool, so the model's load and the vector
+/// scan never stall the other calls the daemon is serving. As with
+/// `search_code::handle_off_worker`, dropping the future does not stop the
+/// blocking work.
+pub(super) async fn resolve_lazily_off_worker<H>(
+    embedding: Arc<EmbeddingPipeline>,
+    handler: H,
+) -> Result<CallToolResult, ErrorData>
+where
+    H: Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData> + Send + 'static,
+{
+    let name = {
+        let first = SemanticRung::deferred(&embedding);
+        let answer = handler(&first)?;
+        match first.reached() {
+            Some(name) => name,
+            None => return Ok(answer),
+        }
+    };
+    tokio::task::spawn_blocking(move || {
+        let query = embedding.embed_query(&name);
+        handler(&SemanticRung::Embedded { name: &name, query: query.as_deref() })
+    })
+    .await
+    .map_err(|e| internal_error("symbol resolution task failed", e.into()))?
+}
+
 /// Resolves a symbol name to the single node it names: an exact
 /// qualifiedName match is tried first as a fast path (this is how a caller
 /// re-queries a candidate it picked off a previous ambiguous page), then
@@ -431,7 +528,7 @@ pub(super) struct Resolved {
 /// bespoke enum so every call site is the same two-line `match`.
 pub(super) fn resolve_symbol_name(
     conn: &Connection,
-    embedding: Option<&EmbeddingPipeline>,
+    semantic: &SemanticRung<'_>,
     name: &str,
     cursor: Option<&str>,
 ) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
@@ -487,7 +584,7 @@ pub(super) fn resolve_symbol_name(
         }
         None => match by_qualified_name_suffix(conn, name, cursor)? {
             Some(answer) => Ok(answer),
-            None => by_file_name(conn, embedding, name),
+            None => by_file_name(conn, semantic, name),
         },
     }
 }
@@ -595,16 +692,41 @@ fn is_module_specifier(name: &str) -> bool {
 /// 11% / 26% / 24% of hopeless queries; a table fitted on names alone
 /// differs by one to three queries per language
 /// (`docs/results/gm-468-name-query-floors.md`).
+///
+/// # Never embeds itself
+///
+/// It runs under the store lock, so the query vector comes from outside: a
+/// [`SemanticRung::Deferred`] pass only notes that it got here, and the
+/// [`SemanticRung::Embedded`] pass that follows brings the vector.
 fn by_semantic_neighbours(
     conn: &Connection,
-    embedding: Option<&EmbeddingPipeline>,
+    semantic: &SemanticRung<'_>,
     name: &str,
 ) -> Option<Result<CallToolResult, ErrorData>> {
     if is_module_specifier(name) {
         return None;
     }
-    let query = embedding?.embed_query(name)?;
-    let page = super::search_code::search(conn, &query, SEMANTIC_CANDIDATES, None).ok()?;
+    let query = match semantic {
+        SemanticRung::Deferred { embedding, reached } => {
+            // A model already known to be absent embeds nothing, so there is
+            // no second pass to defer to: refuse now, as `embed_query`'s
+            // `None` would.
+            if embedding.known_unavailable() {
+                return None;
+            }
+            reached.set(Some(name.to_owned()));
+            // A placeholder the driver discards for the second pass's answer.
+            return None;
+        }
+        SemanticRung::Embedded { name: embedded, query } => {
+            debug_assert_eq!(*embedded, name, "the second pass resolves the name the first one stopped at");
+            if *embedded != name {
+                return None;
+            }
+            (*query)?
+        }
+    };
+    let page = super::search_code::search(conn, query, SEMANTIC_CANDIDATES, None).ok()?;
     let results: Vec<DefinitionCandidate> = page
         .results
         .into_iter()
@@ -732,7 +854,7 @@ fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolR
 /// the only one.
 fn by_file_name(
     conn: &Connection,
-    embedding: Option<&EmbeddingPipeline>,
+    semantic: &SemanticRung<'_>,
     name: &str,
 ) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
     const MAX_SUGGESTIONS: usize = 5;
@@ -748,7 +870,7 @@ fn by_file_name(
         // having nothing useful to say - no model, a specifier-shaped query,
         // nothing scoring high enough - so the terse refusal below stays the
         // answer in all of them.
-        return match by_semantic_neighbours(conn, embedding, name) {
+        return match by_semantic_neighbours(conn, semantic, name) {
             Some(page) => page.map(Err),
             None => error(format!("g-mesh: no symbol named '{name}' found")).map(Err),
         };
@@ -798,11 +920,11 @@ fn by_file_name(
 fn by_name(
     conn: &Connection,
     project_root: Option<&Path>,
-    embedding: Option<&EmbeddingPipeline>,
+    semantic: &SemanticRung<'_>,
     name: &str,
     cursor: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
-    match resolve_symbol_name(conn, embedding, name, cursor)? {
+    match resolve_symbol_name(conn, semantic, name, cursor)? {
         Ok(resolved) => {
             success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root))
         }
@@ -816,6 +938,16 @@ pub(crate) fn handle(
     embedding: &EmbeddingPipeline,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
+    resolve_lazily(embedding, |semantic| handle_in(store, project_root, semantic, params.clone()))
+}
+
+/// One pass of [`handle`] - see [`SemanticRung`].
+pub(super) fn handle_in(
+    store: &Arc<IndexStore>,
+    project_root: &Path,
+    semantic: &SemanticRung<'_>,
+    params: FindDefinitionParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
     // Defaults to on. The snippet is the point of the field - a caller who
     // wants coordinates alone has to say so, rather than every caller having
@@ -826,7 +958,7 @@ pub(crate) fn handle(
         (Some(file_path), Some(position), _) => {
             by_position(&conn, project_root, &file_path, position.line, position.col)
         }
-        (None, None, Some(name)) => by_name(&conn, project_root, Some(embedding), &name, params.cursor.as_deref()),
+        (None, None, Some(name)) => by_name(&conn, project_root, semantic, &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {
             error("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again")
         }

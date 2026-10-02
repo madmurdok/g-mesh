@@ -153,15 +153,28 @@ fn list_implementations(
     Ok(pagination::bound_page_leaving(rows, page.has_more, page.next_cursor, reserve))
 }
 
+#[cfg(test)]
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    find_definition::resolve_lazily(embedding, |semantic| {
+        handle_in(store, semantic, capabilities, params.clone())
+    })
+}
+
+/// The single-hop walk, one pass - see [`find_definition::SemanticRung`].
+fn handle_in(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
 
-    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
+    let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
@@ -487,9 +500,10 @@ fn continued(
     success(&walk)
 }
 
-/// The entry point `mod.rs` calls. Dispatches on `transitive`/`resume_token`
-/// and otherwise defers entirely to the unmodified single-hop [`handle`]:
-/// the non-transitive path here is not a reimplementation of that logic, it
+/// The tool's entry point, both passes of it ([`dispatch_in`] is one).
+/// Dispatches on `transitive`/`resume_token` and otherwise defers entirely to
+/// the unmodified single-hop [`handle_in`]: the non-transitive path here is
+/// not a reimplementation of that logic, it
 /// *is* that logic, called with a plain [`SymbolQueryParams`] built from this
 /// struct's shared fields - which is what makes the single-hop response
 /// byte-identical to what it was before this file gained a `transitive`
@@ -497,6 +511,18 @@ fn continued(
 pub(crate) fn dispatch(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    capabilities: &HashMap<String, Capabilities>,
+    params: FindImplementationsParams,
+) -> Result<CallToolResult, ErrorData> {
+    find_definition::resolve_lazily(embedding, |semantic| {
+        dispatch_in(store, semantic, capabilities, params.clone())
+    })
+}
+
+/// One pass of [`dispatch`] - see [`find_definition::SemanticRung`].
+pub(crate) fn dispatch_in(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
@@ -528,11 +554,11 @@ pub(crate) fn dispatch(
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
 
     if !transitive.unwrap_or(false) {
-        return handle(store, embedding, capabilities, symbol_params);
+        return handle_in(store, semantic, capabilities, symbol_params);
     }
 
     let conn = store.read();
-    let resolved = match anchor::resolve(&conn, Some(embedding), &symbol_params)? {
+    let resolved = match anchor::resolve(&conn, semantic, &symbol_params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
