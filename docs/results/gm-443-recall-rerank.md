@@ -1197,3 +1197,13 @@ latency.
 ```
 python3 eval/embedding/gm464_ce_structured.py --work <main checkout>/eval/embedding/work --k 30 --table out.md
 ```
+
+### GM-464 product-path latency (S8)
+
+Measured through the daemon on g-mesh's own index, release build, 4-core
+laptop, n = 180 calls per arm over two rounds: rerank off 65/85 ms p50/p95,
+rerank on at 4 threads 510/805 ms, at 1 thread 1123/1715 ms; the first rerank
+in a fresh daemon (model load) ~1.5 s at 4 threads. The p50 at 4 threads is
+2-3x the ~210 ms estimated above; the p95 is close to the ~700 ms estimate.
+Setup, gate, controls and per-round rows:
+[`gm-464-rerank-latency.md`](gm-464-rerank-latency.md).

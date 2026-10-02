@@ -203,7 +203,7 @@ g-mesh model status   # where the weights are expected, and whether they're ther
 `model fetch` also downloads the cross-encoder `search_code` reranks with
 (see "Tools exposed"): `cross-encoder/ms-marco-MiniLM-L6-v2` at revision
 `233902d25c440f23af6f7d6e94d2946bac0bee0a`, its fp32 export
-(`onnx/model.onnx`, ~87 MiB), checked against a pinned SHA-256 like the
+(`onnx/model.onnx`, 91 MB), checked against a pinned SHA-256 like the
 embedding model, and again by the daemon when it loads it. `--no-rerank` skips
 it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
 embedding model's own directory, so it cannot also hold this one). Without it
@@ -676,9 +676,19 @@ continuation, is ranked as before. With `limit` under 30 the cursor carries
 the rest of the reranked top 30, so paging neither repeats nor skips a row.
 Design and trade-offs: [ADR 0016](docs/adr/0016-cross-encoder-rerank.md).
 
-*Cost:* the cross-encoder loads on the first search that reranks (~87 MiB on
-disk) and scores 30 pairs per first page on up to 4 CPU threads. Latency in
-the product path: TBD (measured in GM-464 S5).
+*Cost:* the cross-encoder (91 MB on disk, ~87 MiB) loads on the first search
+that reranks and scores 30 pairs per first page on up to 4 CPU threads.
+Measured end to end through the daemon on g-mesh's own index, on a 4-core
+laptop ([`docs/results/gm-464-rerank-latency.md`](docs/results/gm-464-rerank-latency.md)):
+
+| `search_code` call | p50 | p95 | first call (fresh daemon) |
+|---|---|---|---|
+| rerank off | 65 ms | 85 ms | 0.7 s |
+| rerank on, 4 threads (default) | 510 ms | 805 ms | 1.5 s (includes the model load) |
+| rerank on, 1 thread | 1.1 s | 1.7 s | 2.8 s |
+
+Only a complete first page pays it; continuations and pages during the
+embedding pass cost what they did before.
 
 *Turning it off:* `[rerank] enabled = false` in the global
 `~/.g-mesh/config.toml`, or `G_MESH_RERANK=off` in the daemon's environment;

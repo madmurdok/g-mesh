@@ -57,7 +57,11 @@ the "weights are not vendored" rule).
 - The fetch grows by ~87 MiB. Installs that do not re-run `model fetch` keep
   the embedding order, and the daemon log says why once.
 - A first page costs one cross-encoder pass over 30 pairs; continuation pages
-  cost nothing extra. Latency is measured in GM-464 S5.
+  cost nothing extra. Measured in the product path on a 4-core laptop
+  (`docs/results/gm-464-rerank-latency.md`): p50/p95 510/805 ms at 4 threads
+  against 65/85 ms with the rerank off, 1.1/1.7 s at 1 thread; the first
+  rerank in a fresh daemon loads the model, ~1.5 s at 4 threads. The p50 is
+  above the ~210 ms GM-443 estimated.
 - Within the top 30 `score` no longer falls monotonically; the tool
   description says the score is the embedding cosine.
 - No stored state changes: vectors, `embeddingVersion`, the pipeline epoch
