@@ -520,7 +520,8 @@ Paths never enter ids or tool output. Decision and storage:
 [ADR 0015](../adr/0015-qualified-name-segments.md).
 
 The control messages are unchanged apart from two additions. `fileChanged` and
-`semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff.
+`semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff,
+with one optional field, `complete` (see the next section).
 
 - **New:** `workspaceChanged { filePath }`, a notification. It exists so a plugin
   can drop cached module or crate maps. Core follows it with the per-language
@@ -532,6 +533,36 @@ The control messages are unchanged apart from two additions. `fileChanged` and
   semantic tier is not suspended. The SDK starts the engine on it; readiness is
   still decided inside the pass. Measurements and the choice of trigger:
   [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
+
+### A `fileChanged` diff from a process with no baseline
+
+A plugin names a deleted id only if it remembers emitting it, and that memory
+is per process. The control process that answers `fileChanged` is not the one
+that ran the bulk walk, and a restart empties it. So a diff against "nothing"
+upserts the file and deletes nothing, and on its own it would leave the walk's
+rows for anything the file lost. Core closes that gap from its own rows
+(`core/src/storage/file_rows.rs`), in the same step that applies the diff:
+
+- **A file gone from disk.** When a `fileChanged` diff upserts nothing and the
+  file is not on disk, core deletes every node whose `filePath` is the file,
+  the edges out of them, and the file's `indexed_files` row. This needs
+  nothing from the plugin.
+- **`complete: true`.** An optional `FileChangeDiff` field, `fileChanged` only:
+  the upserts are the whole file. A plugin sets it when it has no baseline for
+  the file. Core then deletes the file's nodes the diff does not upsert, and
+  the edges out of the file's nodes it does not upsert, except a `semantic`
+  edge from a node that stays: the per-file semantic pass that follows the
+  reparse re-sends what it still resolves. Absent means `false`; there is no
+  `protocol_version` bump. The SDK (`diff_file` with no previous graph), the Go
+  plugin and the TypeScript plugin set it.
+
+A file owns its nodes (placeholders included: they carry the importer's
+path) and the edges out of them. Edges and placeholders in *other* files that
+point at a removed node keep the lazy behaviour `storage::write::apply_diff`
+and `graph::imports` document: they are repaired when that file is next
+reparsed. A plugin that answers a gone file should also forget its baseline
+for it, so a re-created file is a full (`complete`) extraction rather than a
+diff against text core no longer holds.
 
 ### Process lifetime: stdin is the lifeline (GM-397)
 

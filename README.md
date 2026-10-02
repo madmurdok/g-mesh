@@ -827,6 +827,10 @@ to each `fileChanged`, and to each `semanticPass` when the manifest declares
 `semantic_pass = true`. The wire types are the `g-mesh-wire` crate
 (`wire/src/lib.rs`, re-exported by core as `protocol::types`); the design,
 including what v2 adds, is `docs/architecture/multi-language-plugins.md`.
+A `fileChanged` answer from a process that has no baseline for the file (it
+never extracted it, or restarted since) carries `complete: true`, so core
+deletes what the file no longer has; a file gone from disk core cleans up on
+its own.
 
 ### In Rust: the plugin SDK
 

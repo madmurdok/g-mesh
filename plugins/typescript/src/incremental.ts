@@ -161,7 +161,9 @@ export interface FileDiff {
   hasSyntaxErrors: boolean;
   /**
    * True when there was no cached state for this file and the whole
-   * extraction is reported as added (see `reparseFile`).
+   * extraction is reported as added (see `reparseFile`). Sent to core as
+   * `complete`: the additions are the whole file, so core deletes what it
+   * still holds for the file beyond them.
    */
   fullExtraction: boolean;
 }
@@ -403,11 +405,12 @@ export function resetIncrementalState(): void {
  * only what changed.
  *
  * On a cache miss the file is parsed in full and the entire extraction comes
- * back as additions (`fullExtraction: true`) - the diff against "nothing" is
- * "everything", which is both the honest answer and the one that leaves the
- * core's graph correct without the caller having to seed anything first. So
- * this function is safe to call as the very first thing that ever touches a
- * file; it does not require a prior bulk index.
+ * back as additions (`fullExtraction: true`). The diff against "nothing"
+ * removes nothing, so it cannot by itself retire what core still holds for
+ * the file from another process (the bulk walk, or this plugin before a
+ * restart); `fullExtraction` travels to core as `complete`, and core deletes
+ * the file's stored rows the additions do not cover. So this function is safe
+ * to call as the very first thing that ever touches a file.
  *
  * On a hit the edit is derived from the cached text (`computeSourceEdit`),
  * applied to the cached tree, and the reparse reuses that tree. Identical
@@ -471,6 +474,28 @@ export async function reparseChangedFile(
   projectRoot: string,
   filePath: string,
 ): Promise<FileDiff> {
-  const sourceText = await fs.readFile(path.join(projectRoot, filePath), "utf8");
+  let sourceText: string;
+  try {
+    sourceText = await fs.readFile(path.join(projectRoot, filePath), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return removedFile(filePath);
+  }
   return reparseFile(filePath, sourceText, { resolveSpecifier: createProjectResolver(projectRoot) });
+}
+
+/**
+ * The diff for a file that is gone from disk: everything this process had for
+ * it is removed, and its state is forgotten, so a re-creation is a first
+ * sighting rather than a diff against a stale tree (identical text would
+ * otherwise answer an empty diff for a file whose rows core has deleted).
+ * With nothing cached the diff is empty and `fullExtraction`; core removes
+ * the rows of a file that is gone either way.
+ */
+export function removedFile(filePath: string): FileDiff {
+  const cached = fileStates.get(filePath);
+  fileStates.delete(filePath);
+  return cached === undefined
+    ? diffResults(filePath, EMPTY_RESULT, EMPTY_RESULT, true)
+    : diffResults(filePath, cached.result, EMPTY_RESULT, false);
 }
