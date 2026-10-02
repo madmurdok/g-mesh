@@ -31,7 +31,7 @@ const (
 	// golang.org/x/tools/go/packages) and its manifest's declared
 	// capabilities changed with it, which is exactly what a plugin version
 	// exists to say.
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 	languageName  = "go"
 )
 
