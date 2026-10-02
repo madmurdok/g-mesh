@@ -48,6 +48,8 @@ mod instructions;
 mod provenance;
 mod search_code;
 #[cfg(test)]
+mod search_code_rerank_tests;
+#[cfg(test)]
 mod search_code_wait_tests;
 #[cfg(test)]
 mod search_code_worker_tests;
