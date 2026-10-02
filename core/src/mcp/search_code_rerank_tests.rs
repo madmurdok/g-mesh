@@ -143,17 +143,118 @@ fn fake(dir: &Path) -> EmbeddingPipeline {
     fake_pipeline(&fake_model_dir(dir, "weights"), None, &Counters::default())
 }
 
-/// Compares `embedding`'s golden calls with [`GOLDEN`] byte for byte.
+/// How far a `score`, or a cursor's score, may drift from [`GOLDEN`]'s. The
+/// golden was captured on x86_64; the cosine differs around the 7th digit
+/// on aarch64 (GM-478), which no ranking in the fixture depends on.
+const SCORE_TOLERANCE: f64 = 1e-6;
+
+/// Compares `embedding`'s golden calls with [`GOLDEN`] structurally:
+/// everything exactly except scores, which may differ by
+/// [`SCORE_TOLERANCE`], including the ones cursors carry.
 pub(super) fn assert_matches_golden(embedding: &EmbeddingPipeline) {
-    let actual = golden_json(&golden_calls(embedding));
+    let calls = golden_calls(embedding);
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     if std::env::var_os(WRITE_GOLDEN_ENV).is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &actual).unwrap();
+        std::fs::write(&path, golden_json(&calls)).unwrap();
         return;
     }
-    let expected = std::fs::read_to_string(&path).unwrap();
-    assert!(actual == expected, "search_code output differs from {GOLDEN}:\n{actual}");
+    let expected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let labels: Vec<&str> = calls.iter().map(|(label, _)| label.as_str()).collect();
+    let mut golden_labels: Vec<&str> = expected.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut sorted = labels.clone();
+    sorted.sort_unstable();
+    golden_labels.sort_unstable();
+    assert_eq!(sorted, golden_labels, "search_code's golden calls differ from {GOLDEN}'s");
+    for (label, actual) in &calls {
+        if let Err(mismatch) = golden_diff(label, actual, &expected[label]) {
+            panic!("search_code output differs from {GOLDEN}: {mismatch}");
+        }
+    }
+}
+
+/// The first place `actual` differs from `expected`, as a readable line.
+/// A `text` string holding JSON is compared as JSON, a `score` within
+/// [`SCORE_TOLERANCE`], a `nextCursor` by its decoded parts.
+fn golden_diff(path: &str, actual: &serde_json::Value, expected: &serde_json::Value) -> Result<(), String> {
+    use serde_json::Value;
+    let differ = || format!("at {path}:\n  actual:   {actual}\n  expected: {expected}");
+    match (actual, expected) {
+        (Value::Object(a), Value::Object(e)) => {
+            let mut keys: Vec<&String> = a.keys().collect();
+            let mut golden_keys: Vec<&String> = e.keys().collect();
+            keys.sort_unstable();
+            golden_keys.sort_unstable();
+            if keys != golden_keys {
+                return Err(format!("{} (keys {keys:?} vs {golden_keys:?})", differ()));
+            }
+            for (key, value) in a {
+                let at = format!("{path}.{key}");
+                match (key.as_str(), value, &e[key]) {
+                    ("score", Value::Number(x), Value::Number(y)) => {
+                        let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                        if (x - y).abs() > SCORE_TOLERANCE {
+                            return Err(format!(
+                                "at {at}: score {x} vs golden {y}, beyond {SCORE_TOLERANCE}"
+                            ));
+                        }
+                    }
+                    ("nextCursor", Value::String(x), Value::String(y)) => cursor_diff(&at, x, y)?,
+                    ("text", Value::String(x), Value::String(y)) => {
+                        match (serde_json::from_str::<Value>(x), serde_json::from_str::<Value>(y)) {
+                            (Ok(x), Ok(y)) => golden_diff(&at, &x, &y)?,
+                            _ if x == y => {}
+                            _ => return Err(format!("at {at}:\n  actual:   {x:?}\n  expected: {y:?}")),
+                        }
+                    }
+                    (_, value, golden) => golden_diff(&at, value, golden)?,
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(a), Value::Array(e)) => {
+            for (i, (value, golden)) in a.iter().zip(e).enumerate() {
+                golden_diff(&format!("{path}[{i}]"), value, golden)?;
+            }
+            if a.len() == e.len() {
+                Ok(())
+            } else {
+                Err(format!("at {path}: {} items vs golden {}", a.len(), e.len()))
+            }
+        }
+        _ if actual == expected => Ok(()),
+        _ => Err(differ()),
+    }
+}
+
+/// Compares two cursors by what they decode to: ids exactly, scores within
+/// [`SCORE_TOLERANCE`].
+fn cursor_diff(path: &str, actual: &str, expected: &str) -> Result<(), String> {
+    use super::search_code::{cursor_parts, CursorParts};
+    fn same(a: &CursorParts, e: &CursorParts) -> bool {
+        match (a, e) {
+            (CursorParts::Score { score: x, id: a }, CursorParts::Score { score: y, id: e }) => {
+                a == e && (x - y).abs() <= SCORE_TOLERANCE
+            }
+            (CursorParts::Rerank { rest: a, after: x }, CursorParts::Rerank { rest: e, after: y }) => {
+                a == e
+                    && match (x, y) {
+                        (Some(x), Some(y)) => same(x, y),
+                        (x, y) => x.is_none() && y.is_none(),
+                    }
+            }
+            (CursorParts::Partial { stored: a, inner: x }, CursorParts::Partial { stored: e, inner: y }) => {
+                a == e && same(x, y)
+            }
+            _ => false,
+        }
+    }
+    match (cursor_parts(actual), cursor_parts(expected)) {
+        (Ok(a), Ok(e)) if same(&a, &e) => Ok(()),
+        (a, e) => Err(format!(
+            "at {path}: cursor {actual:?} vs golden {expected:?}\n  actual:   {a:?}\n  expected: {e:?}"
+        )),
+    }
 }
 
 /// Scores a row by its id alone: the stub's logit for `nXX` is `logit(XX)`.

@@ -789,6 +789,14 @@ fn decode_score_cursor(raw: &str) -> Result<ScoreCursor> {
     })
 }
 
+/// A score cursor's `(score, id)`, for tests that compare cursors with a
+/// float tolerance instead of byte for byte (the score's bits differ
+/// across platforms in the last digits).
+#[cfg(test)]
+pub(crate) fn score_cursor_parts(raw: &str) -> Result<(f64, String)> {
+    decode_score_cursor(raw).map(|c| (f64::from_bits(c.score_bits), c.id))
+}
+
 /// Generic keyset pagination for `search_code`-shaped results, ordered by
 /// similarity score (descending) then `id` as a tiebreaker. `base_sql` must
 /// project `score` (REAL) and `id` (unique) columns; `map_row` reads
