@@ -149,6 +149,22 @@ jobs:
           git ls-files '*.sh' | sed 's/^/  checking /'
           git ls-files -z '*.sh' | xargs -0 shellcheck -S style
 
+  # install.sh's PATH editing, run in throwaway HOMEs against a fake
+  # archive: no runner's real rc file is ever written (the script also
+  # checks that the real ones did not change). Both OSes, because the
+  # script runs under dash on Ubuntu and under macOS's sh and BSD tools.
+  installer:
+    name: install.sh PATH tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run scripts/test-install.sh
+        run: bash scripts/test-install.sh
+
   test:
     name: tests (${{ matrix.target }})
     needs: matrix
@@ -290,6 +306,57 @@ jobs:
           $found | Format-Table -AutoSize RuleName, Severity, Line, Message | Out-String -Width 200 | Write-Host
           Write-Host "::error file=scripts/install.ps1::PSScriptAnalyzer reported $($found.Count) finding(s)"
           exit 1
+
+      # Executes install.ps1's user-PATH editing against a throwaway user
+      # variable, never the runner's real Path. The function is lifted out of
+      # the script by its AST, since running the script would install. The
+      # default path through Install-GMesh (and -NoModifyPath) runs end to end
+      # in release.yml, which restores the real user Path afterwards.
+      - name: install.ps1 user PATH editing
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = (Resolve-Path 'scripts/install.ps1').Path
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+          $fn = $ast.Find({
+              param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-UserPathEntry'
+            }, $true)
+          if (-not $fn) { throw 'install.ps1 defines no Add-UserPathEntry' }
+          . ([scriptblock]::Create($fn.Extent.Text))
+
+          $name = 'G_MESH_CI_TEST_PATH'
+          $dir = 'C:\g-mesh-ci\bin'
+          $seed = '%USERPROFILE%\keep;C:\other'
+          $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          function Get-Raw { [string]$key.GetValue($name, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+          try {
+            $key.SetValue($name, $seed, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+
+            if (-not (Add-UserPathEntry -Dir $dir -Name $name)) { throw 'first call reported the entry as already present' }
+            $after = Get-Raw
+            if ($after -ne "$seed;$dir") { throw "after the first call: expected '$seed;$dir', got '$after'" }
+            if ($key.GetValueKind($name) -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+              throw "the value was rewritten as $($key.GetValueKind($name)), not REG_EXPAND_SZ - %VAR% entries would stop expanding"
+            }
+            Write-Host "PASS: appended once, %USERPROFILE% left unexpanded, kind still REG_EXPAND_SZ"
+
+            foreach ($again in @($dir, 'C:\G-MESH-CI\BIN\')) {
+              if (Add-UserPathEntry -Dir $again -Name $name) { throw "a second call with '$again' wrote again" }
+              $now = Get-Raw
+              if ($now -ne $after) { throw "a second call with '$again' changed the value to '$now'" }
+            }
+            Write-Host "PASS: a second call (same dir, or differing only in case and a trailing backslash) changes nothing"
+
+            $key.DeleteValue($name, $false)
+            if (-not (Add-UserPathEntry -Dir $dir -Name $name)) { throw 'call on a missing variable did not write' }
+            if ((Get-Raw) -ne $dir) { throw "on a missing variable: expected '$dir', got '$(Get-Raw)'" }
+            Write-Host "PASS: a missing variable is created holding just the directory"
+          } finally {
+            $key.DeleteValue($name, $false)
+            $key.Close()
+          }
 
       # Pinned, not `stable`, and this run is why: clippy gained a lint between
       # this pin and the runner's then-current stable, and it turned the gate

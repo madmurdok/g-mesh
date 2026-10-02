@@ -409,6 +409,18 @@ jobs:
 
           $installDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-installed'
           $foreignDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-foreign'
+          $optOutDir = Join-Path $env:RUNNER_TEMP 'g-mesh-install-smoke-optout'
+
+          # install.ps1 edits the user Path by default. The raw value and its
+          # kind are saved here and put back in `finally`, so this step leaves
+          # the runner's user Path exactly as it found it.
+          $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $savedUserPath = $envKey.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $savedUserPathKind = if ($null -ne $savedUserPath) { $envKey.GetValueKind('Path') } else { $null }
+          function Get-UserPathCount([string]$dir) {
+            $raw = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            @($raw -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ieq $dir.TrimEnd('\')) }).Count
+          }
 
           try {
             $ready = $false
@@ -455,6 +467,17 @@ jobs:
 
             Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
 
+            $count = Get-UserPathCount $installDir
+            if ($count -ne 1) {
+              throw "after a default install, the user Path holds $installDir $count time(s), expected 1"
+            }
+            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $installDir
+            $count = Get-UserPathCount $installDir
+            if ($count -ne 1) {
+              throw "after a second install, the user Path holds $installDir $count time(s), expected still 1"
+            }
+            Write-Host "PASS: a default install added $installDir to the user Path once, and a re-install left it at once"
+
             # GM-347: -Force, executed rather than reasoned about. A non-empty
             # directory with no g-mesh.exe in it must be refused without
             # -Force, with its contents left alone, and replaced with it.
@@ -479,7 +502,7 @@ jobs:
             }
             Write-Host "PASS: without -Force, install.ps1 refused the non-empty directory and left it intact ($refused)"
 
-            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $foreignDir -Force
+            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $foreignDir -Force -NoModifyPath
             if (-not (Test-Path -LiteralPath (Join-Path $foreignDir 'g-mesh.exe') -PathType Leaf)) {
               throw "install.ps1 -Force reported success but g-mesh.exe is not in $foreignDir"
             }
@@ -487,12 +510,35 @@ jobs:
               throw "install.ps1 -Force installed but left the directory's previous contents beside the new install"
             }
             Write-Host "PASS: with -Force, install.ps1 replaced the non-empty directory with a g-mesh install"
+            if ((Get-UserPathCount $foreignDir) -ne 0) {
+              throw "install.ps1 -NoModifyPath still added $foreignDir to the user Path"
+            }
+            Write-Host "PASS: -NoModifyPath left the user Path alone"
+
+            $env:G_MESH_NO_MODIFY_PATH = '1'
+            & (Join-Path $PWD 'scripts/install.ps1') -Version $version -InstallDir $optOutDir
+            Remove-Item Env:G_MESH_NO_MODIFY_PATH
+            if (-not (Test-Path -LiteralPath (Join-Path $optOutDir 'g-mesh.exe') -PathType Leaf)) {
+              throw "install.ps1 with G_MESH_NO_MODIFY_PATH=1 reported success but g-mesh.exe is not in $optOutDir"
+            }
+            if ((Get-UserPathCount $optOutDir) -ne 0) {
+              throw "install.ps1 with G_MESH_NO_MODIFY_PATH=1 still added $optOutDir to the user Path"
+            }
+            Write-Host "PASS: G_MESH_NO_MODIFY_PATH=1 left the user Path alone"
           } finally {
             if ($server -and -not $server.HasExited) {
               Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
             }
             Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $foreignDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $optOutDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:G_MESH_NO_MODIFY_PATH -ErrorAction SilentlyContinue
+            if ($null -ne $savedUserPath) {
+              $envKey.SetValue('Path', $savedUserPath, $savedUserPathKind)
+            } else {
+              $envKey.DeleteValue('Path', $false)
+            }
+            $envKey.Close()
             Remove-Item -LiteralPath $serveRoot -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item Env:G_MESH_DOWNLOAD_BASE -ErrorAction SilentlyContinue
           }
