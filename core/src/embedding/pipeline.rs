@@ -339,6 +339,15 @@ impl EmbeddingPipeline {
         self.loadable_files(&dir)
     }
 
+    /// Whether a load was already attempted and gave no model, so
+    /// [`embed_query`](Self::embed_query) would return `None` without
+    /// trying anything. Unlike [`is_available`](Self::is_available) this
+    /// touches no file: it reads the cached outcome only, and `false` says
+    /// nothing either way about a model not yet loaded.
+    pub(crate) fn known_unavailable(&self) -> bool {
+        matches!(self.model.get(), Some(None))
+    }
+
     /// Whether `dir` holds model files the loader would accept: both files
     /// present and, for the default model, its pinned weights
     /// ([`check_default_weights`]). The one gate for everything that uses the

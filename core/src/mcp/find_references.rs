@@ -20,7 +20,7 @@ use crate::storage::index_store::IndexStore;
 
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
-use super::{anchor, provenance, SymbolQueryParams};
+use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
 /// source". The extractor files each usage under exactly one of these and
@@ -170,9 +170,22 @@ pub(crate) fn handle(
     hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    find_definition::resolve_lazily(embedding, |semantic| {
+        handle_in(store, semantic, capabilities, hints, params.clone())
+    })
+}
+
+/// One pass of [`handle`] - see [`find_definition::SemanticRung`].
+pub(crate) fn handle_in(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
 
-    let resolved = match anchor::resolve(&conn, Some(embedding), &params)? {
+    let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
         Err(finished) => return Ok(finished),
     };
