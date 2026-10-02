@@ -24,6 +24,7 @@ use crate::storage::write::NodeRecord;
 
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
+use super::unlinked::{self, UnlinkedUsages};
 use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
@@ -199,6 +200,10 @@ struct CallerPage {
     /// nothing behind.
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
+    /// See [`UnlinkedUsages`] - calls that may target the anchor but that the
+    /// linker left on a placeholder. Absent when there is no candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked_usages: Option<UnlinkedUsages>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -388,11 +393,12 @@ pub(crate) fn handle_callers_in(
         })
         .collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let bounded = pagination::bound_page_reserving_two_tallies(
         rows,
         page.has_more,
         page.next_cursor,
-        tier.page_reserve(),
+        tier.page_reserve() + UnlinkedUsages::wire_len(&unlinked),
     );
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
@@ -402,13 +408,15 @@ pub(crate) fn handle_callers_in(
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
 
-    // Every file this response names: rows, the tally, the excluded tally.
+    // Every file this response names: rows, the tally, the excluded and
+    // unlinked tallies.
     let touched = bounded
         .results
         .iter()
         .map(|row| row.file_path.as_str())
         .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
-        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())));
+        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())))
+        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
     let has_file_row = bounded.results.iter().any(|row| row.kind == pagination::FILE_KIND);
     let hint = session_hints::join([
@@ -427,6 +435,7 @@ pub(crate) fn handle_callers_in(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
+        unlinked_usages: unlinked,
         provenance,
     })
 }

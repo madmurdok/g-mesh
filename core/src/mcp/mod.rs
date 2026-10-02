@@ -63,6 +63,7 @@ mod source;
 mod tool_result;
 #[cfg(test)]
 mod tools_list_tests;
+mod unlinked;
 
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.

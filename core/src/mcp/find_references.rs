@@ -20,6 +20,7 @@ use crate::storage::index_store::IndexStore;
 
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
+use super::unlinked::{self, UnlinkedUsages};
 use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
@@ -100,6 +101,10 @@ struct ReferencePage {
     /// this page's fields trigger; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
+    /// See [`UnlinkedUsages`] - usages that may target the anchor but that
+    /// the linker left on a placeholder. Absent when there is no candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked_usages: Option<UnlinkedUsages>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -199,6 +204,7 @@ pub(crate) fn handle_in(
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let unlinked = unlinked::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
     let page = list_references(
         &conn,
         &anchor.id,
@@ -206,7 +212,7 @@ pub(crate) fn handle_in(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
-        tier.page_reserve(),
+        tier.page_reserve() + UnlinkedUsages::wire_len(&unlinked),
     )
     .map_err(|e| internal_error("failed to find references", e))?;
 
@@ -216,12 +222,13 @@ pub(crate) fn handle_in(
     let files =
         pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
 
-    // Every file this response names: rows and the tally.
+    // Every file this response names: rows, the tally and the unlinked tally.
     let touched = page
         .results
         .iter()
         .map(|row| row.file_path.as_str())
-        .chain(files.iter().flatten().map(|tally| tally.path.as_str()));
+        .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
+        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
     let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
     let hint = session_hints::join([
@@ -239,6 +246,7 @@ pub(crate) fn handle_in(
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
+        unlinked_usages: unlinked,
         provenance,
     })
 }

@@ -55,6 +55,7 @@ fn creates_all_tables_and_indexes() {
         "idx_nodes_filePath",
         "idx_nodes_qualifiedName",
         "idx_nodes_container",
+        "idx_nodes_pending_name",
         "idx_edges_fromId",
         "idx_edges_toId",
         "idx_targets_scope",
