@@ -55,6 +55,10 @@ use crate::config::EmbeddingConfig;
 use crate::embedding::model::{
     DEFAULT_ONNX_REMOTE_PATH, DEFAULT_ONNX_SHA256, DEFAULT_ONNX_SIZE, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
+use crate::embedding::rerank::{
+    default_rerank_model_dir, RERANK_MODEL_REPO, RERANK_MODEL_REVISION, RERANK_ONNX_REMOTE_PATH,
+    RERANK_ONNX_SHA256, RERANK_ONNX_SIZE, RERANK_TOKENIZER_SHA256, RERANK_TOKENIZER_SIZE,
+};
 use crate::embedding::resolve_model_dir;
 
 /// The Hugging Face repository the default model comes from.
@@ -81,9 +85,10 @@ enum Source {
     /// Hugging Face, addressed the way it addresses itself: repository,
     /// revision, then the path inside the repository.
     Upstream,
-    /// Any host serving the two files side by side under one prefix - a
-    /// corporate mirror, a GitHub release's assets (which are flat under their
-    /// tag), or a directory served for a test.
+    /// Any host serving the embedding model's two files side by side under
+    /// one prefix - a corporate mirror, a GitHub release's assets (which are
+    /// flat under their tag), or a directory served for a test - and the
+    /// rerank model's two under `<prefix>/ms-marco-MiniLM-L6-v2/`.
     Flat(String),
 }
 
@@ -91,15 +96,17 @@ impl Source {
     fn url(&self, file: &RemoteFile) -> String {
         match self {
             Self::Upstream => {
-                format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{}", file.remote_path)
+                format!("https://huggingface.co/{}/resolve/{}/{}", file.repo, file.revision, file.remote_path)
             }
-            Self::Flat(base) => format!("{}/{}", base.trim_end_matches('/'), file.local_name),
+            Self::Flat(base) => {
+                format!("{}/{}{}", base.trim_end_matches('/'), file.flat_prefix, file.local_name)
+            }
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self, file: &RemoteFile) -> String {
         match self {
-            Self::Upstream => format!("{MODEL_REPO}@{}", &MODEL_REVISION[..7]),
+            Self::Upstream => format!("{}@{}", file.repo, &file.revision[..7]),
             Self::Flat(base) => base.clone(),
         }
     }
@@ -141,8 +148,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// single read, not the transfer.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One file of the model, with everything needed to verify it arrived intact.
+/// One file of a model, with everything needed to verify it arrived intact.
 struct RemoteFile {
+    /// The Hugging Face repository, and the pinned revision inside it.
+    repo: &'static str,
+    revision: &'static str,
+    /// Prepended to `local_name` on a [`Source::Flat`] mirror.
+    flat_prefix: &'static str,
     /// Path inside the model repository at [`MODEL_REVISION`].
     remote_path: &'static str,
     /// Name inside the model directory - taken from the loader's constants,
@@ -167,12 +179,18 @@ const FILES: [RemoteFile; 2] = [
     // The int8 export (docs/adr/0011-embedding-model-int8.md), written under
     // the loader's `model.onnx`.
     RemoteFile {
+        repo: MODEL_REPO,
+        revision: MODEL_REVISION,
+        flat_prefix: "",
         remote_path: DEFAULT_ONNX_REMOTE_PATH,
         local_name: ONNX_FILE_NAME,
         size: DEFAULT_ONNX_SIZE,
         sha256: DEFAULT_ONNX_SHA256,
     },
     RemoteFile {
+        repo: MODEL_REPO,
+        revision: MODEL_REVISION,
+        flat_prefix: "",
         remote_path: "tokenizer.json",
         local_name: TOKENIZER_FILE_NAME,
         size: 2_561_316,
@@ -180,12 +198,40 @@ const FILES: [RemoteFile; 2] = [
     },
 ];
 
+/// The rerank model's two files (`embedding::rerank`), the fp32 export at
+/// its pinned revision, in the same download order as [`FILES`].
+const RERANK_FILES: [RemoteFile; 2] = [
+    RemoteFile {
+        repo: RERANK_MODEL_REPO,
+        revision: RERANK_MODEL_REVISION,
+        flat_prefix: "ms-marco-MiniLM-L6-v2/",
+        remote_path: RERANK_ONNX_REMOTE_PATH,
+        local_name: ONNX_FILE_NAME,
+        size: RERANK_ONNX_SIZE,
+        sha256: RERANK_ONNX_SHA256,
+    },
+    RemoteFile {
+        repo: RERANK_MODEL_REPO,
+        revision: RERANK_MODEL_REVISION,
+        flat_prefix: "ms-marco-MiniLM-L6-v2/",
+        remote_path: "tokenizer.json",
+        local_name: TOKENIZER_FILE_NAME,
+        size: RERANK_TOKENIZER_SIZE,
+        sha256: RERANK_TOKENIZER_SHA256,
+    },
+];
+
 /// Runs `g-mesh model <subcommand>`.
 pub fn run(command: &ModelCommand) -> Result<()> {
     let stdout = std::io::stdout();
     match command {
-        ModelCommand::Fetch { dir } => fetch(dir.as_deref(), &mut stdout.lock()),
-        ModelCommand::Status { dir } => status(dir.as_deref(), &mut stdout.lock()),
+        ModelCommand::Fetch { dir, no_rerank } => {
+            let rerank_dir = if *no_rerank { None } else { Some(default_rerank_model_dir()?) };
+            fetch(dir.as_deref(), rerank_dir.as_deref(), &mut stdout.lock())
+        }
+        ModelCommand::Status { dir } => {
+            status(dir.as_deref(), Some(&default_rerank_model_dir()?), &mut stdout.lock())
+        }
     }
 }
 
@@ -315,7 +361,11 @@ fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> 
 /// is replaced: a `model.onnx` holding other weights (the fp32 export, at
 /// 641,517,466 bytes) must not pass for the pinned one. The replacement is downloaded and verified beside it and renamed
 /// over it only once verified, so a failed fetch leaves the old file intact.
-fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
+///
+/// `rerank_dir` is where the rerank model goes (`$G_MESH_RERANK_MODEL_DIR`,
+/// else `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`), or `None` to skip it
+/// (`--no-rerank`).
+fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
     // Before the directory is created, so a refused fetch leaves nothing
     // behind - the same posture the rest of this command already takes.
@@ -333,7 +383,29 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
         .build();
 
     let sources = sources();
-    for file in &FILES {
+    fetch_files(&agent, &dir, &FILES, &sources, out)?;
+    writeln!(out, "\nmodel ready in {}", dir.display())?;
+
+    if let Some(rerank_dir) = rerank_dir {
+        fs::create_dir_all(rerank_dir)
+            .with_context(|| format!("failed to create model directory {}", rerank_dir.display()))?;
+        writeln!(out, "\nrerank model directory: {}", rerank_dir.display())?;
+        fetch_files(&agent, rerank_dir, &RERANK_FILES, &sources, out)?;
+        writeln!(out, "\nrerank model ready in {}", rerank_dir.display())?;
+    }
+    Ok(())
+}
+
+/// Downloads each of `files` into `dir` unless it is already there at its
+/// pinned size.
+fn fetch_files(
+    agent: &ureq::Agent,
+    dir: &Path,
+    files: &[RemoteFile],
+    sources: &[Source],
+    out: &mut impl Write,
+) -> Result<()> {
+    for file in files {
         let dest = dir.join(file.local_name);
         match on_disk(&dest, file) {
             OnDisk::Pinned => {
@@ -354,13 +426,11 @@ fn fetch(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
             "downloading {} ({}) from {}",
             file.local_name,
             human_size(file.size),
-            sources[0].describe()
+            sources[0].describe(file)
         )?;
-        download(&agent, file, &dest, &sources, out)?;
+        download(agent, file, &dest, sources, out)?;
         writeln!(out, "  verified {}", file.local_name)?;
     }
-
-    writeln!(out, "\nmodel ready in {}", dir.display())?;
     Ok(())
 }
 
@@ -402,7 +472,9 @@ fn prepare_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf
 /// check is enough to catch the one damaged state this command can produce
 /// (a file restored from a truncated backup, say), and [`fetch`] verifies the
 /// digest at the only moment the bytes are actually in hand.
-fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
+///
+/// `rerank_dir`, when given, is reported the same way for the rerank model.
+fn status(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
     let dir = model_dir(explicit, &model)?;
     writeln!(out, "model:     {} (from {})", model.name, model.source.describe())?;
@@ -421,8 +493,34 @@ fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
         )?;
     }
 
+    let complete = report_files(&dir, &FILES, out)?;
+    if complete {
+        writeln!(out, "\nsemantic search can use this model.")?;
+    } else {
+        writeln!(out, "\nrun `g-mesh model fetch` to download it.")?;
+    }
+
+    if let Some(rerank_dir) = rerank_dir {
+        writeln!(out, "\nrerank model: {RERANK_MODEL_REPO}")?;
+        writeln!(out, "revision:  {RERANK_MODEL_REVISION}")?;
+        writeln!(out, "directory: {}", rerank_dir.display())?;
+        if report_files(rerank_dir, &RERANK_FILES, out)? {
+            writeln!(out, "\nsearch_code can rerank with this model (unless switched off: [rerank] enabled, G_MESH_RERANK=off).")?;
+        } else {
+            writeln!(
+                out,
+                "\nsearch_code keeps the embedding order; run `g-mesh model fetch` to download it."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One line per file of `files` in `dir`: present, missing or the wrong
+/// size. True when every file is present at its pinned size.
+fn report_files(dir: &Path, files: &[RemoteFile], out: &mut impl Write) -> Result<bool> {
     let mut complete = true;
-    for file in &FILES {
+    for file in files {
         let path = dir.join(file.local_name);
         match fs::metadata(&path) {
             Ok(meta) if meta.len() == file.size => {
@@ -444,13 +542,7 @@ fn status(explicit: Option<&Path>, out: &mut impl Write) -> Result<()> {
             }
         }
     }
-
-    if complete {
-        writeln!(out, "\nsemantic search can use this model.")?;
-    } else {
-        writeln!(out, "\nrun `g-mesh model fetch` to download it.")?;
-    }
-    Ok(())
+    Ok(complete)
 }
 
 /// Downloads one file to `<dest>.partial`, verifies it, and only then renames
@@ -483,7 +575,7 @@ fn download(
         match download_to_partial(agent, file, &partial, source) {
             Ok(()) => {
                 if !failures.is_empty() {
-                    writeln!(out, "  fetched from {} instead", source.describe())?;
+                    writeln!(out, "  fetched from {} instead", source.describe(file))?;
                 }
                 return fs::rename(&partial, dest).with_context(|| {
                     format!("failed to move {} into place as {}", partial.display(), dest.display())
@@ -494,8 +586,8 @@ fn download(
                 // to do, and the message about *why* the download failed is
                 // worth more than one about the leftover file.
                 let _ = fs::remove_file(&partial);
-                writeln!(out, "  {} failed: {err:#}", source.describe())?;
-                failures.push(format!("{}: {err:#}", source.describe()));
+                writeln!(out, "  {} failed: {err:#}", source.describe(file))?;
+                failures.push(format!("{}: {err:#}", source.describe(file)));
             }
         }
     }
@@ -550,9 +642,10 @@ fn download_to_partial(
     let digest = hex(&hasher.finalize());
     if digest != file.sha256 {
         bail!(
-            "{} does not match the pinned revision {MODEL_REVISION}: sha256 {digest}, expected {}. \
+            "{} does not match the pinned revision {}: sha256 {digest}, expected {}. \
              Nothing was written to the model directory.",
             file.local_name,
+            file.revision,
             file.sha256
         );
     }
@@ -693,6 +786,9 @@ mod tests {
 
     fn test_file() -> RemoteFile {
         RemoteFile {
+            repo: MODEL_REPO,
+            revision: MODEL_REVISION,
+            flat_prefix: "",
             remote_path: "onnx/model.onnx",
             local_name: "mirrored.bin",
             size: TEST_BODY.len() as u64,
@@ -759,13 +855,13 @@ mod tests {
 
     fn fetch_output(dir: &Path) -> String {
         let mut out = Vec::new();
-        fetch(Some(dir), &mut out).unwrap();
+        fetch(Some(dir), None, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
     fn status_output(dir: &Path) -> String {
         let mut out = Vec::new();
-        status(Some(dir), &mut out).unwrap();
+        status(Some(dir), None, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -914,6 +1010,73 @@ mod tests {
 
         assert_eq!(output.matches("already present").count(), 2, "{output}");
         assert!(!output.contains("downloading"), "{output}");
+    }
+
+    /// With both models already in place, `fetch` reports all four files and
+    /// downloads nothing; the rerank model lands in its own directory, never
+    /// in the embedding model's.
+    ///
+    /// *Control:* drop the rerank loop from `fetch`, and only two files are
+    /// reported.
+    #[test]
+    fn fetch_reports_the_rerank_model_in_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let rerank = tempfile::tempdir().unwrap();
+        for file in &FILES {
+            File::create(dir.path().join(file.local_name)).unwrap().set_len(file.size).unwrap();
+        }
+        for file in &RERANK_FILES {
+            File::create(rerank.path().join(file.local_name)).unwrap().set_len(file.size).unwrap();
+        }
+
+        let mut out = Vec::new();
+        fetch(Some(dir.path()), Some(rerank.path()), &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert_eq!(output.matches("already present").count(), 4, "{output}");
+        assert!(output.contains(&format!("rerank model ready in {}", rerank.path().display())), "{output}");
+        assert!(!output.contains("downloading"), "{output}");
+    }
+
+    #[test]
+    fn status_reports_a_missing_rerank_model_and_how_to_get_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let rerank = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        status(Some(dir.path()), Some(rerank.path()), &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains(RERANK_MODEL_REPO), "{output}");
+        assert!(output.contains(&rerank.path().display().to_string()), "{output}");
+        assert!(output.contains("search_code keeps the embedding order"), "{output}");
+    }
+
+    /// The rerank model is the fp32 export at the revision S1 scored, with
+    /// the sizes and digests of those files, and a flat mirror keeps it apart
+    /// from the embedding model's same-named files.
+    #[test]
+    fn the_pinned_rerank_model_is_the_fp32_export() {
+        let [onnx, tokenizer] = &RERANK_FILES;
+        assert_eq!(
+            (onnx.repo, onnx.revision),
+            ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a")
+        );
+        assert_eq!(
+            (onnx.remote_path, onnx.local_name, onnx.size),
+            ("onnx/model.onnx", ONNX_FILE_NAME, 91_011_230)
+        );
+        assert_eq!(onnx.sha256, "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a");
+        assert_eq!((tokenizer.local_name, tokenizer.size), (TOKENIZER_FILE_NAME, 711_396));
+        assert_eq!(tokenizer.sha256, "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
+        assert_eq!(onnx.flat_prefix, format!("{}/", crate::embedding::rerank::RERANK_MODEL_NAME));
+        assert_eq!(
+            Source::Flat("https://mirror.test/g".to_string()).url(onnx),
+            "https://mirror.test/g/ms-marco-MiniLM-L6-v2/model.onnx"
+        );
+        assert_eq!(
+            Source::Upstream.url(onnx),
+            "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/onnx/model.onnx"
+        );
     }
 
     /// An fp32 `model.onnx` in the model directory is not "already present":

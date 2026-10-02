@@ -745,7 +745,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "search_code",
-        description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Use it first for a \"find the code that does X\" prompt that names no symbol. Results are ranked by similarity, most relevant first. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
+        description = "Semantic search over the project's indexed symbols: find functions/types by what they do, described in free text, rather than by name or grep. Use it first for a \"find the code that does X\" prompt that names no symbol. Results are ranked by relevance, most relevant first (a cross-encoder reorders the top 30); `score` is the embedding cosine. Needs the project's embedding model to be available - if it errors saying semantic search is unavailable, fall back to the structural tools instead."
     )]
     async fn search_code(
         &self,

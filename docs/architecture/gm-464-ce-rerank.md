@@ -1,6 +1,7 @@
 # GM-464: cross-encoder rerank in `search_code`
 
-Status: design for GM-464/S2, awaiting the owner's review. No code change.
+Status: approved by the owner on 2026-10-02 (D1-D6 as recommended);
+implemented in GM-464/S3, recorded as [ADR 0016](../adr/0016-cross-encoder-rerank.md).
 
 Decided by the owner, not reopened here: ship F4. Take int8's top 30 and order
 them by `ce + 80 * cosine`, where `ce` is the raw logit of

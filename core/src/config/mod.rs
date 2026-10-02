@@ -10,8 +10,8 @@
 //!   root's hash - so this module does not invent a second way to find "the"
 //!   directory for a project, it reuses the one the index already lives in.
 //! - `~/.g-mesh/config.toml` - [`GlobalConfig`], settings that apply across
-//!   every project: the GC warning switch and threshold, and the
-//!   machine-wide embedding cache's switch and size bound.
+//!   every project: the GC warning switch and threshold, the machine-wide
+//!   embedding cache's switch and size bound, and the search rerank's switch.
 //!
 //! Neither file is ever inside a project's own git repo - both live under
 //! the user's home directory, the same as the index itself - so there is
@@ -149,6 +149,23 @@ pub struct GlobalConfig {
     pub cleanup: CleanupConfig,
     #[serde(rename = "embeddingCache")]
     pub embedding_cache: EmbeddingCacheConfig,
+    pub rerank: RerankConfig,
+}
+
+/// `[rerank]`: whether `search_code` reorders its top rows with the
+/// cross-encoder (`embedding::rerank`). The environment variable
+/// `G_MESH_RERANK=off` overrides `enabled`. Read once per daemon, on the
+/// first search that would rerank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RerankConfig {
+    pub enabled: bool,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// `[embeddingCache]`: the machine-wide embedding cache under
@@ -298,6 +315,17 @@ mod tests {
         assert_eq!(config.cleanup.idle_threshold_days, 90);
         assert!(config.embedding_cache.enabled);
         assert_eq!(config.embedding_cache.max_size_mb, 512);
+        assert!(config.rerank.enabled);
+    }
+
+    #[test]
+    fn a_hand_written_rerank_section_is_read_by_its_documented_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[rerank]\nenabled = false\n").unwrap();
+        let config: GlobalConfig = read_toml_or_default(&path).unwrap();
+        assert_eq!(config.rerank, RerankConfig { enabled: false });
+        assert_eq!(config.embedding_cache, EmbeddingCacheConfig::default());
     }
 
     #[test]
@@ -361,6 +389,7 @@ mod tests {
         let config = GlobalConfig {
             cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 },
             embedding_cache: EmbeddingCacheConfig { enabled: false, max_size_mb: 64 },
+            rerank: RerankConfig { enabled: false },
         };
         write_toml(&path, &config).unwrap();
 

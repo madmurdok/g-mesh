@@ -150,14 +150,20 @@ pub enum PluginsCommand {
 /// [`crate::cli::model`] for how that stays true.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// Download the embedding model's weights (~154 MiB) into the directory
-    /// the loader reads.
+    /// Download the embedding model's weights (~154 MiB) and the search
+    /// rerank model's (~87 MiB) into the directories their loaders read.
     Fetch {
-        /// Where to put the weights. Defaults to `$G_MESH_MODEL_DIR`, else
-        /// `~/.g-mesh/models/<model>` - the same resolution the loader uses,
-        /// so the two cannot disagree.
+        /// Where to put the embedding weights. Defaults to
+        /// `$G_MESH_MODEL_DIR`, else `~/.g-mesh/models/<model>` - the same
+        /// resolution the loader uses, so the two cannot disagree. The rerank
+        /// model goes to `$G_MESH_RERANK_MODEL_DIR`, else
+        /// `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Skip the rerank model; `search_code` then keeps the embedding
+        /// order.
+        #[arg(long)]
+        no_rerank: bool,
     },
     /// Report whether the weights are present, and where they are expected.
     Status {
@@ -336,7 +342,11 @@ mod tests {
     fn model_requires_a_subcommand_and_both_take_an_optional_dir() {
         assert!(matches!(
             command_of(&["model", "fetch"]),
-            Command::Model { command: ModelCommand::Fetch { dir: None } }
+            Command::Model { command: ModelCommand::Fetch { dir: None, no_rerank: false } }
+        ));
+        assert!(matches!(
+            command_of(&["model", "fetch", "--no-rerank"]),
+            Command::Model { command: ModelCommand::Fetch { dir: None, no_rerank: true } }
         ));
         assert!(matches!(
             command_of(&["model", "status"]),
@@ -344,7 +354,7 @@ mod tests {
         ));
 
         match command_of(&["model", "fetch", "--dir", "/tmp/weights"]) {
-            Command::Model { command: ModelCommand::Fetch { dir } } => {
+            Command::Model { command: ModelCommand::Fetch { dir, .. } } => {
                 assert_eq!(dir, Some(PathBuf::from("/tmp/weights")));
             }
             other => panic!("expected `model fetch`, got {other:?}"),
