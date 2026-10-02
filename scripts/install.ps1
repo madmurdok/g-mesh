@@ -27,6 +27,7 @@
         G_MESH_REPO           owner/repo (default: madmurdok/g-mesh)
         G_MESH_DOWNLOAD_BASE  base for <version-tag>/<asset> URLs
         G_MESH_LATEST_API     the releases/latest endpoint
+        G_MESH_NO_MODIFY_PATH set to anything but 0: same as -NoModifyPath
         GITHUB_TOKEN          if set, authenticates the API call (rate limits)
 
 .PARAMETER Version
@@ -45,13 +46,18 @@
 .PARAMETER Force
     Replace a non-empty install directory that does not look like an existing
     g-mesh install.
+
+.PARAMETER NoModifyPath
+    Do not add the install directory to the user PATH; print the command to
+    do it by hand instead. Same as $env:G_MESH_NO_MODIFY_PATH = '1'.
 #>
 [CmdletBinding()]
 param(
     [string]$Version = $(if ($env:G_MESH_VERSION) { $env:G_MESH_VERSION } else { '' }),
     [string]$InstallDir = $(if ($env:G_MESH_INSTALL_DIR) { $env:G_MESH_INSTALL_DIR } else { '' }),
     [string]$Target = $(if ($env:G_MESH_TARGET) { $env:G_MESH_TARGET } else { '' }),
-    [switch]$Force
+    [switch]$Force,
+    [switch]$NoModifyPath
 )
 
 Set-StrictMode -Version Latest
@@ -80,8 +86,19 @@ $ErrorActionPreference = 'Stop'
 # failure is silent and specific - it does not refuse to start, it starts and
 # then cannot index anything, which looks exactly like "no plugins
 # installed" until someone thinks to check the executable's actual path. So,
-# like install.sh, this script creates no shortcut and no alias; it prints
-# the one PATH line to add and touches no profile of yours.
+# like install.sh, this script creates no shortcut and no alias; it puts the
+# install directory itself on PATH instead (next section).
+#
+# ---------------------------------------------------------------------------
+# PATH: EDITED BY DEFAULT
+#
+# Same policy as install.sh, Windows mechanics: the install directory is
+# appended to the *user* PATH (HKCU\Environment, what
+# [Environment]::SetEnvironmentVariable(..., 'User') writes) unless it is
+# already on PATH, so re-installing changes nothing. New terminals pick it
+# up; the one running this script does not. The machine PATH and PowerShell
+# profiles are never touched. -NoModifyPath or $env:G_MESH_NO_MODIFY_PATH
+# opts out, and then the command to run by hand is printed instead.
 #
 # Default location: $env:USERPROFILE\.g-mesh\bin - the same layout choice
 # install.sh makes for the same reason: it is inside the directory g-mesh
@@ -135,7 +152,7 @@ $ErrorActionPreference = 'Stop'
 #
 #   $env:G_MESH_DOWNLOAD_BASE = 'http://127.0.0.1:8000'
 #   $env:G_MESH_INSTALL_DIR   = 'C:\Temp\g-mesh-test'
-#   pwsh scripts/install.ps1 -Version 2.7.0
+#   pwsh scripts/install.ps1 -Version 2.7.0 -NoModifyPath
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS SCRIPT DOES NOT PROVE
@@ -143,7 +160,7 @@ $ErrorActionPreference = 'Stop'
 # This installs the Windows artifact; it does not prove the Windows artifact
 # is correct. It downloads, verifies the checksum, unpacks, runs the binary
 # once (the same smoke test install.sh does - see Install-GMesh below), and
-# advises on PATH. None of that depends on what plugins\typescript\ contains
+# puts it on PATH. None of that depends on what plugins\typescript\ contains
 # internally - whether it is a Node SEA or, later, a native binary - only on
 # the archive's shape, which install.sh already establishes and this script
 # inherits unchanged. Proof that the artifact this script installs actually
@@ -352,13 +369,51 @@ function Test-InstallDir {
     }
 }
 
+# Appends $Dir to the user-scope variable $Name unless an entry equal to it
+# (ignoring case and a trailing backslash) is already there; returns $true
+# when it wrote. The raw registry value is read and written back as
+# REG_EXPAND_SZ so entries such as %USERPROFILE%\bin stay unexpanded:
+# [Environment]::GetEnvironmentVariable(..., 'User') would hand them back
+# expanded, and SetEnvironmentVariable would store the result as REG_SZ,
+# freezing every such entry. $Name exists so a test can point this at a
+# throwaway variable instead of the real Path.
+function Add-UserPathEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Dir,
+        [string]$Name = 'Path'
+    )
+    $want = $Dir.TrimEnd('\')
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        $current = [string]$key.GetValue($Name, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        foreach ($entry in ($current -split ';')) {
+            if ($entry -and ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $want)) {
+                return $false
+            }
+        }
+        $kept = $current.TrimEnd(';')
+        $new = if ($kept) { "$kept;$Dir" } else { $Dir }
+        $key.SetValue($Name, $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    }
+    finally {
+        $key.Close()
+    }
+    # SetEnvironmentVariable broadcasts WM_SETTINGCHANGE after its own write,
+    # which is what makes Explorer (and so every new terminal) re-read the
+    # user environment. Deleting a variable that does not exist is a no-op
+    # write that still triggers it.
+    [Environment]::SetEnvironmentVariable('G_MESH_INSTALL_BROADCAST', $null, 'User')
+    return $true
+}
+
 function Install-GMesh {
     [CmdletBinding()]
     param(
         [string]$Version = '',
         [string]$InstallDir = '',
         [string]$Target = '',
-        [switch]$Force
+        [switch]$Force,
+        [switch]$NoModifyPath
     )
 
     if (-not $InstallDir) {
@@ -531,30 +586,51 @@ function Install-GMesh {
         Write-Host "  plugins: $InstallDir\plugins\  (must stay beside the binary)"
         Write-Host ""
 
-        $pathEntries = $env:Path -split ';'
-        if ($pathEntries -contains $InstallDir) {
-            Write-Host "$InstallDir is already on your PATH. Try:"
-            Write-Host ""
-            Write-Host "  g-mesh --version"
+        # 'onpath' | 'optout' | 'added' | 'present' | 'failed'
+        $pathResult = 'optout'
+        $pathError = ''
+        $want = $InstallDir.TrimEnd('\')
+        $onPath = @($env:Path -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ieq $want) }).Count -gt 0
+        $optOut = $NoModifyPath -or ($env:G_MESH_NO_MODIFY_PATH -and $env:G_MESH_NO_MODIFY_PATH -ne '0')
+        if ($onPath) {
+            $pathResult = 'onpath'
         }
-        else {
-            # Unlike install.sh (which never edits a shell rc file because
-            # POSIX shells don't agree on one, and printing an export line is
-            # the portable answer), Windows has a single per-user PATH stored
-            # in the registry that every shell reads, and
-            # [Environment]::SetEnvironmentVariable is the standard,
-            # non-destructive way to append to it - it does not touch any
-            # shell profile file and takes effect in new sessions
-            # immediately, without a logout/logon. It still does not touch
-            # the *current* process's $env:Path, so this session needs the
-            # explicit line below too, same as install.sh's advice needs a
-            # `source`/new shell.
-            Write-Host "Add it to your PATH - this script does not edit shell profile files:"
-            Write-Host ""
-            Write-Host "  [Environment]::SetEnvironmentVariable('Path', `$env:Path + ';$InstallDir', 'User')"
-            Write-Host ""
-            Write-Host "Then, in a new terminal: g-mesh --version"
-            Write-Host "(Or, for this session only: `$env:Path += ';$InstallDir')"
+        elseif (-not $optOut) {
+            try {
+                $pathResult = if (Add-UserPathEntry -Dir $InstallDir) { 'added' } else { 'present' }
+            }
+            catch {
+                $pathResult = 'failed'
+                $pathError = $_.Exception.Message
+            }
+        }
+
+        switch ($pathResult) {
+            'onpath' {
+                Write-Host "$InstallDir is already on your PATH. Try:"
+                Write-Host ""
+                Write-Host "  g-mesh --version"
+            }
+            'added' {
+                Write-Host "Added $InstallDir to your user PATH."
+                Write-Host "Restart your shell (open a new terminal), then: g-mesh --version"
+                Write-Host "(Or, for this session only: `$env:Path += ';$InstallDir')"
+            }
+            'present' {
+                Write-Host "Your user PATH already contains $InstallDir (left unchanged)."
+                Write-Host "Restart your shell (open a new terminal), then: g-mesh --version"
+            }
+            default {
+                if ($pathResult -eq 'failed') {
+                    Write-Host "Could not update your user PATH ($pathError)."
+                }
+                Write-Host "Add it to your PATH:"
+                Write-Host ""
+                Write-Host "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$InstallDir', 'User')"
+                Write-Host ""
+                Write-Host "Then, in a new terminal: g-mesh --version"
+                Write-Host "(Or, for this session only: `$env:Path += ';$InstallDir')"
+            }
         }
         Write-Host ""
         Write-Host "Register it with Claude Code:"
@@ -564,7 +640,13 @@ function Install-GMesh {
         Write-Host "The seven structural tools work as-is. ``search_code`` additionally needs"
         Write-Host "the embedding model: g-mesh model fetch"
         Write-Host ""
-        Write-Host "To uninstall: Remove-Item -Recurse -Force $InstallDir"
+        if ($pathResult -eq 'added' -or $pathResult -eq 'present') {
+            Write-Host "To uninstall: Remove-Item -Recurse -Force $InstallDir, and remove"
+            Write-Host "$InstallDir from your user PATH (Settings > Edit environment variables for your account)"
+        }
+        else {
+            Write-Host "To uninstall: Remove-Item -Recurse -Force $InstallDir"
+        }
     }
     finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -579,4 +661,4 @@ function Install-GMesh {
 # X` (a checkout, not a pipe) reaches here through the same path, since
 # $Version/$InstallDir/$Target/$Force were already bound from the script's
 # own param() block above and Install-GMesh's defaults just forward them.
-Install-GMesh -Version $Version -InstallDir $InstallDir -Target $Target -Force:$Force
+Install-GMesh -Version $Version -InstallDir $InstallDir -Target $Target -Force:$Force -NoModifyPath:$NoModifyPath

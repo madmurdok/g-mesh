@@ -84,8 +84,23 @@ running executable, so a lone `g-mesh` copied onto your `PATH` is a binary that
 cannot index anything. That is also why the script creates no
 `/usr/local/bin/g-mesh` symlink — `std::env::current_exe()` does not resolve
 symlinks on macOS, so a symlinked g-mesh would hunt for its plugin beside the
-symlink and find nothing. Put the install directory itself on `PATH`; the
-script prints the line and edits no rc file of yours:
+symlink and find nothing. The install directory itself goes on `PATH`
+instead, and by default the script puts it there, the way rustup does: it
+appends one block, between `# >>> g-mesh installer >>>` and
+`# <<< g-mesh installer <<<`, to the rc file of the shell in `$SHELL`:
+
+| Shell | File |
+|---|---|
+| zsh | `~/.zshrc` |
+| bash | `~/.bashrc` on Linux, `~/.bash_profile` on macOS (or an existing `~/.bash_login`/`~/.profile` when there is no `~/.bash_profile`) |
+| fish | `~/.config/fish/conf.d/g-mesh.fish` (`fish_add_path`) |
+| anything else | `~/.profile` |
+
+Nothing is written when the directory is already on `PATH` or the block is
+already there, so re-running the installer changes nothing. The summary names
+the file it edited; restart your shell to pick it up. To keep your rc files
+untouched, pass `--no-modify-path` or set `G_MESH_NO_MODIFY_PATH=1`: the
+script then prints the line to add yourself:
 
 ```bash
 export PATH="$HOME/.g-mesh/bin:$PATH"
@@ -96,10 +111,13 @@ Flags go through the pipe with `sh -s --`, or as environment variables:
 ```bash
 curl -fsSL .../install.sh | sh -s -- --version 2.7.0          # pin a release
 curl -fsSL .../install.sh | sh -s -- --install-dir ~/opt/g-mesh
+curl -fsSL .../install.sh | sh -s -- --no-modify-path         # leave rc files alone
 G_MESH_VERSION=2.7.0 G_MESH_INSTALL_DIR=~/opt/g-mesh sh install.sh
 ```
 
-Uninstalling is `rm -rf ~/.g-mesh/bin` — settings, project indexes and the
+Uninstalling is `rm -rf ~/.g-mesh/bin`, plus deleting the
+`# >>> g-mesh installer >>>` block from your rc file (or
+`~/.config/fish/conf.d/g-mesh.fish`) — settings, project indexes and the
 embedding model live elsewhere under `~/.g-mesh` and survive it.
 
 **Windows is not supported by this script.** That target ships a `.zip`, which
@@ -122,10 +140,18 @@ variables mirror install.sh's:
 ```powershell
 irm .../install.ps1 | iex; Install-GMesh -Version 2.7.0     # pin a release
 irm .../install.ps1 | iex; Install-GMesh -InstallDir C:\opt\g-mesh
+irm .../install.ps1 | iex; Install-GMesh -NoModifyPath        # leave PATH alone
 $env:G_MESH_VERSION = '2.7.0'; pwsh scripts/install.ps1
 ```
 
-Uninstalling is `Remove-Item -Recurse -Force $env:USERPROFILE\.g-mesh\bin`.
+By default it also appends the install directory to your *user* `PATH`
+(once; a re-install leaves it as is), and new terminals pick it up.
+`-NoModifyPath` or `$env:G_MESH_NO_MODIFY_PATH = '1'` skips that and prints
+the command instead.
+
+Uninstalling is `Remove-Item -Recurse -Force $env:USERPROFILE\.g-mesh\bin`,
+plus removing that directory from your user `PATH` (Settings → *Edit
+environment variables for your account*).
 
 This installs the artifact; it does not by itself prove that artifact works
 end to end on Windows — that is GM-333 (a release-workflow step that runs
