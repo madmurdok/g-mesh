@@ -1038,3 +1038,162 @@ shipped floors.
 ### Owner's decision
 
 2026-09-30, verbatim: «да, норм»
+
+## GM-464 S1: F4 K=30 on the structured text
+
+3.17.0 embeds the structured text (ADR 0012) and refit the int8 floors to
+0.57 / 0.59 / 0.57 / 0.53. So F4's two inputs changed: int8's top-30 now
+comes from the structured vectors, and the cross-encoder could read either
+text. This re-runs S14's F4 (K=30) on the stored int8-structured runs
+(`work/runs-gm465/jina-v2-base-code-int8-structured`, same snapshots, node
+ids and queries as the fp32 run). Rows are ordered by ce-minilm + beta *
+int8 cosine. The verdict is int8-structured's own un-reranked top-1 cosine
+at the shipped floors (read from `similarity.rs`), and nothing is refit.
+"vs int8" now means vs int8-structured at the shipped floors.
+
+Cross-encoder scores are cached per (query, node text) in
+`work/rerank_cache/gm464-ce-minilm.<corpus>.<key>.json` and seeded from
+GM-443's pair cache. 1,461 of 15,625 nodes have a structured text that
+differs from the full text. 3,210 new pairs were scored, covering both texts
+over int8-structured's top-30. The machine was not idle (load 4-7), so no
+timings are reported here; latency is S5's job.
+
+### Controls
+
+- C1: the Python structured-text port (`gm423_token_lengths.form_text`)
+  reproduces all 20 cases of the Rust fixture
+  (`core/src/embedding/testdata/structured_text.json`).
+- C2: 120 cached full-text pairs were rescored and match the GM-443 cache
+  exactly (max|diff| 0).
+- C3: this script's F4 path, run on the old full-text int8 lists with the
+  old cache and the old floors, reproduces S14's F4 K=30 beta=80 row:
+  0.691 / 0.465, vs int8 +4.6 [+2.1] / +0.046 [+0.021], vs fp32 +5.8 [+2.4]
+  / +0.042 [+0.014].
+- C4: F4 with the rerank disabled equals int8-structured on every outcome
+  and every reported cell. F4's verdict equals int8-structured's on every
+  query, in every arm.
+- A second run (cache warm, 0 pairs scored) gave byte-identical tables.
+
+| variant | held-out NL r@10 [lo, hi] | held-out NL MRR [lo, hi] | name r@10 / MRR |
+|---|---|---|---|
+| jina fp32, full text (baseline, D6 floors) | 0.633 [0.582, 0.685] | 0.423 [0.379, 0.469] | 0.917 / 0.745 |
+| jina int8, full text (pre-3.17, old floors) | 0.645 [0.593, 0.697] | 0.419 [0.374, 0.464] | 0.915 / 0.750 |
+| int8-structured (no rerank, shipped floors) | 0.640 [0.587, 0.691] | 0.409 [0.366, 0.453] | 0.930 / 0.768 |
+| F4s K=30 beta=40, CE on structured text | 0.677 [0.626, 0.729] | 0.455 [0.408, 0.501] | 0.974 / 0.906 |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | 0.676 [0.625, 0.727] | 0.456 [0.409, 0.502] | 0.970 / 0.880 |
+| F4s K=30 beta=80, CE on full text | 0.682 [0.631, 0.732] | 0.463 [0.417, 0.509] | 0.969 / 0.875 |
+| GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3) | 0.691 [0.640, 0.742] | 0.465 [0.418, 0.511] | 0.963 / 0.862 |
+
+D9 gates vs jina fp32 (full text) at its D6 floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32, full text (baseline, D6 floors) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=16, py +0.0 n=21, ru +0.0 n=7, ty +0.0 n=27 |
+| jina int8, full text (pre-3.17, old floors) | +1.2 [-0.9] | -0.004 [-0.016] | go -1.6 | -1.4 [+1.0] | +2.1 [+6.2] | **Q5** | go +12.5 n=16, py +0.0 n=20, ru +0.0 n=6, ty -4.0 n=25 |
+| int8-structured (no rerank, shipped floors) | +0.7 [-1.6] | -0.014 [-0.028] | go -1.6 | -3.2 [-0.2] | +0.8 [+5.2] | **Q5** | go +12.5 n=16, py -5.3 n=19, ru +0.0 n=5, ty -4.0 n=25 |
+| F4s K=30 beta=40, CE on structured text | +4.4 [+0.3] | +0.032 [+0.000] | typescript -1.7 | -6.2 [-2.2] | -2.6 [+0.0] | pass | go +0.0 n=12, py -6.2 n=16, ru +0.0 n=6, ty -4.2 n=24 |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | +4.3 [+1.2] | +0.033 [+0.004] | typescript +1.7 | -6.2 [-2.3] | -2.5 [+0.0] | pass | go +0.0 n=12, py -6.2 n=16, ru +0.0 n=6, ty -3.8 n=26 |
+| F4s K=30 beta=80, CE on full text | +4.8 [+1.6] | +0.040 [+0.012] | typescript +1.7 | -6.2 [-2.3] | -2.4 [+0.0] | pass | go +0.0 n=12, py -5.9 n=17, ru +0.0 n=6, ty -3.8 n=26 |
+| GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3) | +5.8 [+2.4] | +0.042 [+0.014] | typescript +1.7 | -3.3 [+0.0] | -1.0 [+0.0] | pass | go +0.0 n=12, py +0.0 n=18, ru +0.0 n=6, ty -4.0 n=25 |
+
+D9 gates vs int8-structured (shipped) at the shipped floors
+
+| variant | Q1 Δr@10 [lo] | Q2 ΔMRR [lo] | Q3 worst | Q4 ΔCW [up] | Q5 ΔFA [up] | fails | Q5 per language (Δ, n) |
+|---|---|---|---|---|---|---|---|
+| jina fp32, full text (baseline, D6 floors) | -0.7 [-2.9] | +0.014 [+0.001] | python -2.1 | +3.2 [+6.2] | -0.8 [+3.4] | **Q4** | go -12.5 n=16, py +5.3 n=19, ru +0.0 n=5, ty +4.0 n=25 |
+| jina int8, full text (pre-3.17, old floors) | +0.5 [+0.0] | +0.010 [+0.000] | go +0.0 | +1.8 [+4.0] | +1.3 [+3.9] | **Q4,Q5** | go +0.0 n=17, py +5.3 n=19, ru +0.0 n=5, ty +0.0 n=25 |
+| int8-structured (no rerank, shipped floors) | +0.0 [+0.0] | +0.000 [+0.000] | go +0.0 | +0.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=17, py +0.0 n=19, ru +0.0 n=5, ty +0.0 n=25 |
+| F4s K=30 beta=40, CE on structured text | +3.8 [+0.5] | +0.046 [+0.017] | typescript -1.7 | -3.0 [+0.0] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=15, ru +0.0 n=5, ty +0.0 n=23 |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | +3.7 [+1.8] | +0.047 [+0.021] | typescript +1.7 | -3.0 [-0.2] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=15, ru +0.0 n=5, ty +0.0 n=25 |
+| F4s K=30 beta=80, CE on full text | +4.2 [+2.1] | +0.055 [+0.028] | typescript +1.7 | -3.0 [-0.4] | +0.0 [+0.0] | pass | go +0.0 n=13, py +0.0 n=16, ru +0.0 n=5, ty +0.0 n=25 |
+| GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3) | +5.1 [+2.5] | +0.056 [+0.029] | typescript +1.7 | -0.1 [+3.2] | +1.6 [+4.7] | **Q5** | go +0.0 n=13, py +6.2 n=16, ru +0.0 n=5, ty +0.0 n=25 |
+
+GM-434 columns (option a), at each row's own floors
+
+| variant | floors go/py/rs/ts | NL misled | NL CW pos | NL CW absent | name misled | name CW pos | name CW absent |
+|---|---|---|---|---|---|---|---|
+| jina fp32, full text (baseline, D6 floors) | 0.56 / 0.58 / 0.56 / 0.55 | 14% (10/71) | 53% (113/215) | 26% (12/46) | 1% (7/569) | 32% (283/879) | 20% (183/900) |
+| jina int8, full text (pre-3.17, old floors) | 0.57 / 0.57 / 0.55 / 0.53 | 14% (10/70) | 52% (111/215) | 22% (10/46) | 2% (9/577) | 32% (282/879) | 23% (204/900) |
+| int8-structured (no rerank, shipped floors) | 0.57 / 0.59 / 0.57 / 0.53 | 12% (8/66) | 50% (107/215) | 22% (10/46) | 2% (9/594) | 30% (263/879) | 20% (184/900) |
+| F4s K=30 beta=40, CE on structured text | 0.57 / 0.59 / 0.57 / 0.53 | 14% (11/77) | 46% (99/215) | 22% (10/46) | 3% (23/747) | 14% (124/879) | 20% (184/900) |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | 0.57 / 0.59 / 0.57 / 0.53 | 14% (11/77) | 46% (99/215) | 22% (10/46) | 3% (22/714) | 18% (156/879) | 20% (184/900) |
+| F4s K=30 beta=80, CE on full text | 0.57 / 0.59 / 0.57 / 0.53 | 16% (13/79) | 46% (99/215) | 22% (10/46) | 3% (21/706) | 19% (163/879) | 20% (184/900) |
+| GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3) | 0.57 / 0.57 / 0.55 / 0.53 | 17% (13/78) | 49% (106/215) | 22% (10/46) | 2% (16/695) | 19% (171/879) | 23% (204/900) |
+
+int8-structured recall@K on held-out NL (the ceiling of a K-row rerank), vs int8 full text
+
+| arm | K | pooled | go | python | rust | typescript |
+|---|---|---|---|---|---|---|
+| int8 full | 30 | 0.791 | 0.902 (55/61) | 0.830 (39/47) | 0.617 (29/47) | 0.817 (49/60) |
+| int8 structured | 30 | 0.771 | 0.885 (54/61) | 0.830 (39/47) | 0.553 (26/47) | 0.817 (49/60) |
+
+Flips among positives the verdict clears (int8-structured top right -> reranked top wrong / wrong -> right; n = cleared positives)
+
+| variant | queries | go | python | rust | typescript | total |
+|---|---|---|---|---|---|---|
+| F4s K=30 beta=40, CE on structured text | NL held-out | 2 / 3 (n=37) | 4 / 2 (n=37) | 0 / 5 (n=39) | 2 / 6 (n=52) | 8 / 16 (n=165) |
+| F4s K=30 beta=40, CE on structured text | name | 0 / 49 (n=144) | 1 / 19 (n=142) | 1 / 53 (n=290) | 1 / 21 (n=272) | 3 / 142 (n=848) |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | NL held-out | 2 / 2 (n=37) | 4 / 2 (n=37) | 0 / 5 (n=39) | 0 / 5 (n=52) | 6 / 14 (n=165) |
+| F4s K=30 beta=80 (FIT-tuned), CE on structured text | name | 0 / 39 (n=144) | 0 / 13 (n=142) | 1 / 38 (n=290) | 0 / 18 (n=272) | 1 / 108 (n=848) |
+| F4s K=30 beta=80, CE on full text | NL held-out | 2 / 3 (n=37) | 3 / 1 (n=37) | 0 / 5 (n=39) | 0 / 4 (n=52) | 5 / 13 (n=165) |
+| F4s K=30 beta=80, CE on full text | name | 0 / 39 (n=144) | 0 / 12 (n=142) | 2 / 36 (n=290) | 0 / 15 (n=272) | 2 / 102 (n=848) |
+
+Beta sweep at K=30 (CE on structured text): FIT-half objective and held-out point estimates
+
+| beta | FIT NL r@10 | FIT NL MRR | held-out NL r@10 | held-out NL MRR | name r@10 / MRR |
+|---|---|---|---|---|---|
+| 0 | 0.600 | 0.410 | 0.612 | 0.378 | 0.969 / 0.908 |
+| 1 | 0.603 | 0.414 | 0.612 | 0.385 | 0.969 / 0.909 |
+| 2.5 | 0.618 | 0.425 | 0.645 | 0.392 | 0.970 / 0.915 |
+| 5 | 0.637 | 0.438 | 0.651 | 0.401 | 0.971 / 0.921 |
+| 10 | 0.658 | 0.458 | 0.681 | 0.412 | 0.974 / 0.920 |
+| 20 | 0.658 | 0.472 | 0.672 | 0.438 | 0.973 / 0.917 |
+| 40 | 0.666 | 0.479 | 0.677 | 0.455 | 0.974 / 0.906 |
+| 80 | 0.676 | 0.497 | 0.676 | 0.456 | 0.970 / 0.880 |
+| 160 | 0.676 | 0.483 | 0.667 | 0.448 | 0.963 / 0.844 |
+| 320 | 0.655 | 0.462 | 0.653 | 0.429 | 0.951 / 0.815 |
+
+Paired, held-out NL: CE on full text minus CE on structured text (K=30, beta 80, same top-K)
+
+| Δr@10 [lo, hi] | ΔMRR [lo, hi] |
+|---|---|
+| +0.5 [+0.0, +1.6] | +0.008 [-0.003, +0.019] |
+
+### GM-464 reading
+
+**Go: F4 K=30 beta=80 ships on the structured text.** It passes every D9
+gate against both baselines:
+
+- vs int8-structured: r@10 +3.7 [+1.8], MRR +0.047 [+0.021], Q4 -3.0 [-0.2],
+  Q5 +0.0 [+0.0] (by construction).
+- vs fp32: +4.3 [+1.2], +0.033 [+0.004], Q4 -6.2 [-2.3], Q5 -2.5 [+0.0].
+
+The MRR gain is the same size as in GM-443 (+0.047 vs +0.046). The r@10 gain
+is a little smaller (+3.7 vs +4.6). The reason is the ceiling, not the
+rerank: int8-structured's held-out NL recall@30 is 0.771 against 0.791 for
+the full text. Rust accounts for the whole drop (0.553 vs 0.617; 26 vs 29
+of 47).
+
+Flips among cleared positives on held-out NL are 6 wrong / 14 right (GM-443:
+5 / 10). On names they are 1 / 108. NL CW absent stays at 22%, and NL misled
+on rank-1 positives is 14% (11/77) against int8-structured's 12% (8/66).
+
+**Beta 80 still fits.** It is the FIT-tuned value again (FIT r@10 0.676,
+MRR 0.497), and held-out NL is flat across 40-80 (0.677 / 0.455 at 40,
+0.676 / 0.456 at 80). Beta 40 buys name MRR (0.906 vs 0.880), but its Q1
+lower bound vs int8-structured drops to +0.5. 80 is kept.
+
+**CE input text (for the S2 design).** Feeding the cross-encoder the full
+text (doc + signature, as GM-443 did) over the same top-30 is not worse and
+may be slightly better. Paired against the structured text on held-out NL:
+r@10 +0.5 [+0.0, +1.6], MRR +0.008 [-0.003, +0.019]. Both pass. The
+difference is within the noise for MRR and at the edge for r@10. Either
+text passes, and the full text is what GM-443 measured. The choice
+(longer full-text inputs cost more CE time per pair) is S2's, with S5's
+latency.
+
+### GM-464 reproduce
+
+```
+python3 eval/embedding/gm464_ce_structured.py --work <main checkout>/eval/embedding/work --k 30 --table out.md
+```
