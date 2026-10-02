@@ -809,8 +809,9 @@ pub struct SymbolQueryParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead. Qualified name resolved first, then bare; an
-    /// ambiguous name returns ranked candidates to re-call with.
+    /// Anchor by name instead. Qualified name resolved first, then bare, then a
+    /// path tail (`Type::method`); an ambiguous name returns ranked candidates
+    /// to re-call with.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
@@ -829,8 +830,9 @@ pub struct FindImplementationsParams {
     /// Anchor symbol id from `find_definition`. Give this or `symbol_name`,
     /// never both.
     pub symbol_id: Option<String>,
-    /// Anchor by name instead. Qualified name resolved first, then bare; an
-    /// ambiguous name returns ranked candidates to re-call with.
+    /// Anchor by name instead. Qualified name resolved first, then bare, then a
+    /// path tail (`Type::method`); an ambiguous name returns ranked candidates
+    /// to re-call with.
     pub symbol_name: Option<String>,
     /// Opaque cursor from a previous page. Ignored when `transitive: true`,
     /// which continues via `resume_token`.

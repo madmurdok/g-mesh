@@ -46,6 +46,7 @@ place — read the doc itself for that detail.
 | — | Modular multi-language plugin system (plugin boundary, components, data model) | [`plugin-modularity.md`](../architecture/plugin-modularity.md#modular-multi-language-plugin-system) |
 | — | Plugin lifetime: plugins die with their daemon (GM-397) | [`plugin-lifetime.md`](../architecture/plugin-lifetime.md#plugin-lifetime-plugins-die-with-their-daemon-gm-397) |
 | — | Symbol resolution: a ladder inside the tool, not rules outside it | [`symbol-resolution-ladder.md`](../architecture/symbol-resolution-ladder.md#symbol-resolution-a-ladder-inside-the-tool-not-rules-outside-it) |
+| — | A qualifiedName-suffix rung in the resolution ladder (GM-469) | [`gm-469-qualified-name-suffix.md`](../architecture/gm-469-qualified-name-suffix.md#gm-469-a-qualifiedname-suffix-rung-in-the-resolution-ladder) |
 | — | Pushed context: an Aider-style repo map for g-mesh | [`pushed-context-repo-map.md`](../architecture/pushed-context-repo-map.md#pushed-context-an-aider-style-repo-map-for-g-mesh) |
 | — | Lazy indexing (GM-395): overall doc — see D1-D14 below for the individual decisions | [`lazy-indexing.md`](../architecture/lazy-indexing.md#lazy-indexing-gm-395) |
 | D1 | Where laziness lives: the daemon starts idle; the shim is unchanged in when it spawns | [`lazy-indexing.md#d1`](../architecture/lazy-indexing.md#d1-where-laziness-lives-the-daemon-starts-idle-the-shim-is-unchanged-in-when-it-spawns) |

@@ -235,4 +235,28 @@ mod tests {
         let node = expect_node(resolve(&conn, None, &params));
         assert_eq!(node.id, "n2", "a qualifiedName must resolve even while the bare name is ambiguous");
     }
+
+    /// The symbol tools share `find_definition`'s ladder, suffix rung
+    /// included. **Control.** Remove the `by_qualified_name_suffix` arm from
+    /// `find_definition::resolve_symbol_name`: this resolves to nothing.
+    #[test]
+    fn symbol_name_resolution_reaches_the_qualified_name_suffix_rung() {
+        use crate::protocol::types::QualifiedPath;
+        let mut conn = setup();
+        let path = QualifiedPath::root("storage")
+            .child("::", "index_store")
+            .child("::", "IndexStore")
+            .child("::", "read");
+        let mut read = NodeRecord::new("n1", "Function", "read", path.display(), "s.rs", "rust");
+        read.qualified_path = Some(path);
+        upsert_node(&mut conn, read).unwrap();
+        upsert_node(&mut conn, NodeRecord::new("n2", "Function", "read", "config::read", "c.rs", "rust"))
+            .unwrap();
+
+        let params =
+            SymbolQueryParams { symbol_name: Some("IndexStore::read".to_string()), ..Default::default() };
+        let resolved = expect_resolved(resolve(&conn, None, &params));
+        assert_eq!(resolved.node.id, "n1");
+        assert_eq!(resolved.by, find_definition::ResolvedBy::QualifiedNameSuffix);
+    }
 }
