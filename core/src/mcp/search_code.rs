@@ -432,6 +432,31 @@ fn decode_rerank_cursor(payload: &str) -> anyhow::Result<RerankCursor> {
     serde_json::from_slice(&bytes).context("invalid rerank cursor payload")
 }
 
+/// What a `search_code` cursor carries, decoded through the product's own
+/// decoders, for tests that compare cursors with a float tolerance (a score
+/// cursor holds the score's exact bits, which differ across platforms).
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) enum CursorParts {
+    Score { score: f64, id: String },
+    Rerank { rest: Vec<String>, after: Option<Box<CursorParts>> },
+    Partial { stored: u64, inner: Box<CursorParts> },
+}
+
+#[cfg(test)]
+pub(super) fn cursor_parts(cursor: &str) -> anyhow::Result<CursorParts> {
+    if let Some((stored, inner)) = split_partial_cursor(cursor) {
+        return Ok(CursorParts::Partial { stored, inner: Box::new(cursor_parts(inner)?) });
+    }
+    if let Some(payload) = split_rerank_cursor(cursor) {
+        let RerankCursor { rest, after } = decode_rerank_cursor(payload)?;
+        let after = after.as_deref().map(cursor_parts).transpose()?.map(Box::new);
+        return Ok(CursorParts::Rerank { rest, after });
+    }
+    let (score, id) = pagination::score_cursor_parts(cursor)?;
+    Ok(CursorParts::Score { score, id })
+}
+
 /// A first page with the window reranked (`embedding::rerank`): the
 /// embedding ranking's first `max(page_size, WINDOW)` rows, the first
 /// `WINDOW` of them reordered. A `page_size` under the window shows the
