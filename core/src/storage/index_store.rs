@@ -39,6 +39,7 @@ use rusqlite::Connection;
 use crate::embedding::pipeline::ComputedEmbedding;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::{imports, symbol_links};
+use crate::storage::file_rows::{self, FileScope};
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::write::{apply_diff, upsert_indexed_file, Diff};
 
@@ -356,6 +357,29 @@ impl Writer<'_> {
         let store = self.store;
         self.step(|conn| {
             apply_and_link(conn, diff, label)?;
+            store.claim(diff);
+            Ok(())
+        })
+    }
+
+    /// [`Self::apply_diff_linked`] for one file's `fileChanged` diff, which
+    /// is first widened by `scope` to retire the file's stored rows the
+    /// plugin did not name (`storage::file_rows`). A gone file also loses its
+    /// `indexed_files` row. All in one step.
+    pub fn apply_file_diff_linked(
+        &mut self,
+        diff: &mut Diff,
+        file_path: &str,
+        scope: FileScope,
+        label: &str,
+    ) -> Result<()> {
+        let store = self.store;
+        self.step(|conn| {
+            file_rows::widen(conn, file_path, scope, diff)?;
+            apply_and_link(conn, diff, label)?;
+            if scope == FileScope::Gone {
+                file_rows::delete_indexed_file(conn, file_path)?;
+            }
             store.claim(diff);
             Ok(())
         })

@@ -19,11 +19,36 @@ func TestHandleFileChangedEmitsOnFirstSightAndSuppressesAnUnchangedRepeat(t *tes
 	if len(first.UpsertNodes) != 2 || len(first.UpsertEdges) != 2 {
 		t.Fatalf("first fileChanged: %+v, want 2 node and 2 edge upserts (cold cache)", first)
 	}
+	if !first.Complete {
+		t.Fatalf("first fileChanged has no baseline, so it must say its upserts are the whole file")
+	}
 
 	second := state.handleFileChanged("a.go")
 	if len(second.UpsertNodes) != 0 || len(second.DeleteNodeIds) != 0 ||
 		len(second.UpsertEdges) != 0 || len(second.DeleteEdgeIds) != 0 {
 		t.Fatalf("second fileChanged over unchanged content: %+v, want an empty diff", second)
+	}
+	if second.Complete {
+		t.Fatalf("second fileChanged diffs against a baseline and must not be complete")
+	}
+}
+
+func TestCompleteIsOnTheWireOnlyWhenSet(t *testing.T) {
+	partial, err := json.Marshal(emptyDiff())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(partial, []byte("complete")) {
+		t.Fatalf("a partial diff must omit complete: %s", partial)
+	}
+	whole := emptyDiff()
+	whole.Complete = true
+	encoded, err := json.Marshal(whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"complete":true`)) {
+		t.Fatalf("a complete diff must say so: %s", encoded)
 	}
 }
 
@@ -178,6 +203,9 @@ func TestHandleFileChangedDeletedFileDeletesItsNode(t *testing.T) {
 	}
 	if len(diff.UpsertNodes) != 0 {
 		t.Fatalf("expected no upserts, got %v", diff.UpsertNodes)
+	}
+	if diff.Complete {
+		t.Fatalf("a delete against a baseline names its own deletes and is not complete")
 	}
 
 	// A second fileChanged on the still-deleted file must not repeat the

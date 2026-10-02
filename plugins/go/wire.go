@@ -31,7 +31,7 @@ const (
 	// golang.org/x/tools/go/packages) and its manifest's declared
 	// capabilities changed with it, which is exactly what a plugin version
 	// exists to say.
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.4.0"
 	languageName  = "go"
 )
 
@@ -237,6 +237,11 @@ type fileChangeDiff struct {
 	DeleteNodeIds []string   `json:"deleteNodeIds"`
 	UpsertEdges   []wireEdge `json:"upsertEdges"`
 	DeleteEdgeIds []string   `json:"deleteEdgeIds"`
+	// Complete says the upserts are the whole file: this process had no
+	// baseline for it, so it cannot name what the file no longer has, and
+	// core deletes the file's stored rows the upserts do not cover. Omitted
+	// when false, which is what core reads an absent field as.
+	Complete bool `json:"complete,omitempty"`
 }
 
 // emptyDiff returns a FileChangeDiff whose four lists are all present but

@@ -894,6 +894,8 @@ struct Driver<'a> {
     /// [`Driver::finish`] - see [`StderrCapture`].
     stderr: StderrCapture,
     conn: &'a IndexStore,
+    /// The project root the plugin was started on.
+    workspace: PathBuf,
     timeouts: RoundTripTimeouts,
     next_id: i64,
     session: Session,
@@ -965,8 +967,17 @@ pub(crate) fn run_session(
         marker: scratch.semantic_engine_marker(),
         marker_at_first_semantic_pass: None,
     };
-    let mut driver =
-        Driver { child, reader, writer, stderr, conn, timeouts, next_id: 1, session: Session::default() };
+    let mut driver = Driver {
+        child,
+        reader,
+        writer,
+        stderr,
+        conn,
+        workspace: scratch.workspace(),
+        timeouts,
+        next_id: 1,
+        session: Session::default(),
+    };
 
     if let Err(err) = driver.handshake(manifest) {
         driver.session.failure = Some(format!("handshake: {err:#}"));
@@ -1107,7 +1118,7 @@ impl Driver<'_> {
         self.next_id += 1;
         let embedding = EmbeddingPipeline::disabled();
         let result = {
-            let Driver { child, reader, writer, conn, timeouts, .. } = self;
+            let Driver { child, reader, writer, conn, workspace, timeouts, .. } = self;
             let mut kill = || {
                 let _ = child.kill();
             };
@@ -1118,6 +1129,7 @@ impl Driver<'_> {
                     reader,
                     writer,
                     conn,
+                    workspace,
                     file,
                     id,
                     &embedding,

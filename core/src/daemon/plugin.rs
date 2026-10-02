@@ -1513,6 +1513,7 @@ impl PluginProcess {
             reader,
             writer,
             conn,
+            &self.project_root,
             file_path,
             id,
             embedding,

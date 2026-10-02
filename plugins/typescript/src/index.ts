@@ -40,6 +40,8 @@ interface WireFileChangeDiff {
   deleteNodeIds: string[];
   upsertEdges: WireEdge[];
   deleteEdgeIds: string[];
+  /** The upserts are the whole file; absent means false. */
+  complete?: boolean;
 }
 
 function toWireFileChangeDiff(diff: FileDiff): WireFileChangeDiff {
@@ -48,6 +50,7 @@ function toWireFileChangeDiff(diff: FileDiff): WireFileChangeDiff {
     deleteNodeIds: diff.removedNodes.map((node) => node.id),
     upsertEdges: diff.addedEdges,
     deleteEdgeIds: diff.removedEdges.map((edge) => edge.id),
+    ...(diff.fullExtraction ? { complete: true } : {}),
   };
 }
 
@@ -66,12 +69,11 @@ const EMPTY_WIRE_DIFF: WireFileChangeDiff = {
  * content - but core isn't waiting on a response, so failures are logged
  * only, never surfaced.
  *
- * Core always waits for a response to a request it sent (see
- * `watcher::apply::apply_file_change` on the Rust side), so a reparse
- * failure on the request path still must answer with *something* - an
- * empty diff is a safe no-op or, most often, an early sign the file was
- * deleted out from under the plugin, which the next change (if any)
- * self-corrects.
+ * A file that is gone answers with what this process had for it, removed
+ * (`removedFile`). Core always waits for a response to a request it sent
+ * (see `watcher::apply::apply_file_change` on the Rust side), so any other
+ * reparse failure on the request path still answers with *something*: an
+ * empty diff, a safe no-op.
  */
 async function handleFileChanged(projectRoot: string, filePath: string, id: ControlEnvelope["id"]): Promise<void> {
   log(`file changed: ${filePath}`);

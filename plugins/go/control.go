@@ -98,6 +98,7 @@ func (s *pluginState) handleFileChanged(relPath string) fileChangeDiff {
 		// leaves neither nodes nor edges behind.
 		previous, had := s.files[relPath]
 		if !had {
+			diff.Complete = true
 			return diff
 		}
 		for id := range previous.edges {
@@ -113,7 +114,8 @@ func (s *pluginState) handleFileChanged(relPath string) fileChangeDiff {
 	}
 
 	graph := extractFile(s.workspace, relPath, content)
-	previous := s.files[relPath]
+	previous, had := s.files[relPath]
+	diff.Complete = !had
 
 	next := cachedFile{
 		nodes:     make(map[string]wireNode, len(graph.nodes)),
