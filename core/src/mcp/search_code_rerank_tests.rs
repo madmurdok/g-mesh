@@ -447,3 +447,109 @@ fn a_partial_page_is_not_reranked() {
         "the same stub reorders a complete page: {complete}"
     );
 }
+
+/// One case of `embedding/testdata/rerank_parity.json`: the Python
+/// reference's query and window, each row with the text it scored.
+#[derive(serde::Deserialize)]
+struct ParityCase {
+    #[serde(rename = "queryId")]
+    query_id: String,
+    query: String,
+    rows: Vec<ParityRow>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParityRow {
+    id: String,
+    doc_comment: Option<String>,
+    signature: Option<String>,
+    text: String,
+    cosine: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct Parity {
+    cases: Vec<ParityCase>,
+}
+
+/// Every `(query, texts)` the handler handed the scorer; scores all zero,
+/// so the blend keeps the embedding order.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<ScoringCall>>>);
+
+/// One scoring call: the query and the window's texts, in window order.
+type ScoringCall = (String, Vec<String>);
+
+impl Scorer for Capture {
+    fn score(&self, query: &str, texts: &[String]) -> anyhow::Result<Vec<f32>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).push((query.to_string(), texts.to_vec()));
+        Ok(vec![0.0; texts.len()])
+    }
+}
+
+/// A store holding one parity case's window: each row's own doc comment
+/// and signature, its vector at the reference's cosine.
+fn store_for_parity(case: &ParityCase) -> Arc<IndexStore> {
+    register_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for row in &case.rows {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
+             language, docComment, signature)
+             VALUES (?1, 'Function', ?1, ?1, 'a.src', 1, 0, 3, 1, 'typescript', ?2, ?3)",
+            rusqlite::params![row.id, row.doc_comment, row.signature],
+        )
+        .unwrap();
+        insert(&conn, &row.id, &vector_at(&case.query, row.cosine), "v1").unwrap();
+    }
+    Arc::new(IndexStore::new(conn))
+}
+
+/// The product path feeds the cross-encoder exactly the (query, text)
+/// pairs the Python reference scored: for every parity case, the handler's
+/// own window texts, matched to rows through the page it returns, equal
+/// the fixture's stored `text`. This ties `window_texts` to the fixture
+/// that `the_real_model_reproduces_the_reference_logits_and_order` checks
+/// the model against (that test builds its texts itself).
+///
+/// *Control:* have `window_texts` call `full_text` instead of
+/// `text_to_embed` (49 of the fixture's 540 rows then differ).
+#[test]
+fn the_handler_scores_the_texts_the_reference_scored() {
+    let parity: Parity =
+        serde_json::from_str(include_str!("../embedding/testdata/rerank_parity.json")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for case in &parity.cases {
+        let capture = Capture::default();
+        let scorer = capture.clone();
+        let lines = Lines::default();
+        let reranker = Reranker::with_parts(
+            || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+            move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
+            lines.sink(),
+        );
+        let embedding = fake(dir.path()).with_reranker(reranker);
+        let store = store_for_parity(case);
+        let window = case.rows.len() as u32;
+        let page = body(&call(&store, &embedding, &case.query, Some(window), None));
+
+        let calls = capture.0.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{}: one scoring call", case.query_id);
+        let (query, texts) = &calls[0];
+        assert_eq!(query, &case.query, "{}", case.query_id);
+        let ids: Vec<&str> =
+            page["results"].as_array().unwrap().iter().map(|r| r["symbolId"].as_str().unwrap()).collect();
+        assert_eq!((ids.len(), texts.len()), (case.rows.len(), case.rows.len()), "{}", case.query_id);
+        for (id, text) in ids.iter().zip(texts) {
+            let row = case.rows.iter().find(|row| row.id == *id).unwrap();
+            assert_eq!(
+                text, &row.text,
+                "{} {id}: the text scored differs from the reference's",
+                case.query_id
+            );
+        }
+        assert_eq!(lines.count(), 0, "{}", case.query_id);
+    }
+}

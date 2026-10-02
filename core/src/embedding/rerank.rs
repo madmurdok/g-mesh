@@ -130,8 +130,11 @@ pub fn blended_order(logits: &[f32], cosines: &[f64]) -> Option<Vec<usize>> {
         return None;
     }
     let mut order: Vec<usize> = (0..blended.len()).collect();
-    // A stable sort: equal blends keep the embedding order.
-    order.sort_by(|&a, &b| blended[b].partial_cmp(&blended[a]).expect("every blend is finite"));
+    // Equal blends keep the embedding order by an explicit tiebreak on the
+    // window position, not by the sort's stability: real windows do tie.
+    order.sort_by(|&a, &b| {
+        blended[b].partial_cmp(&blended[a]).expect("every blend is finite").then(a.cmp(&b))
+    });
     Some(order)
 }
 
@@ -454,6 +457,26 @@ mod tests {
         // 0 + 80 * 0.5 == 20 + 80 * 0.25 == 40 exactly.
         let order = blended_order(&[0.0, 20.0, 0.0, 20.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
         assert_eq!(order, vec![4, 0, 1, 2, 3]);
+    }
+
+    /// A full window of exact ties, scattered so that the sort has to move
+    /// rows across them: each tie keeps the window order. Under 21 rows
+    /// std's unstable sort is an insertion sort and keeps ties anyway, so
+    /// [`ties_keep_the_embedding_order`] alone cannot see an unstable sort.
+    ///
+    /// *Control:* drop the `.then(a.cmp(&b))` tiebreak and switch to
+    /// `sort_unstable_by`; std's (deterministic) unstable sort then reorders
+    /// these ties. The test pins the order, not the sort: with the tiebreak,
+    /// any sort gives it.
+    #[test]
+    fn ties_across_a_full_window_keep_the_embedding_order() {
+        // Three exact blend levels: 40, 50, 60 (logit 10k + 80 * 0.5).
+        let logits: Vec<f32> = (0..WINDOW).map(|i| (i % 3) as f32 * 10.0).collect();
+        let cosines = vec![0.5; WINDOW];
+        let order = blended_order(&logits, &cosines).unwrap();
+        let expected: Vec<usize> =
+            [2, 1, 0].iter().flat_map(|&level| (0..WINDOW).filter(move |i| i % 3 == level)).collect();
+        assert_eq!(order, expected);
     }
 
     #[test]
