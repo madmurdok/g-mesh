@@ -195,7 +195,14 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                         )
                     })
                     .context(ReindexFailed)?;
-                store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
+                // A file deleted while the plugin answered has had its rows,
+                // `indexed_files` included, retired by the reindex; writing a
+                // baseline for it would resurrect that row.
+                let gone = matches!(fs::metadata(project_root.join(file_path)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound);
+                if !gone {
+                    store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
+                }
                 Ok(if had_prior_record {
                     StalenessOutcome::ReindexedViaHashMismatch
                 } else {
@@ -586,6 +593,61 @@ mod tests {
         assert!(invoked_rx.try_recv().is_ok(), "plugin transport must have been invoked");
         assert_eq!(count(&conn, "nodes"), 1);
         assert_eq!(count(&conn, "indexed_files"), 1);
+    }
+
+    #[test]
+    fn a_file_deleted_while_the_plugin_answers_gets_no_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let file_path_on_disk = tmp.path().join("src/lib.rs");
+        fs::write(&file_path_on_disk, b"fn foo() {}").unwrap();
+        let conn = IndexStore::new(setup_conn());
+
+        let (mut plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+        let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+
+        // Deletes the file after `decide` has stat'ed and hashed it, then
+        // answers that request and any that follow with an empty diff.
+        let to_delete = file_path_on_disk.clone();
+        let plugin = std::thread::spawn(move || {
+            let mut buf_reader = BufReader::new(&mut plugin_reader);
+            let mut first = true;
+            while let Some(request) = read_message::<ControlEnvelope, _>(&mut buf_reader).unwrap() {
+                if first {
+                    fs::remove_file(&to_delete).unwrap();
+                    first = false;
+                }
+                let response = FileChangeResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: request.id.expect("every request carries an id"),
+                    result: FileChangeDiff::default(),
+                    incomplete: false,
+                    incomplete_reason: None,
+                };
+                write_message(&mut plugin_writer, &response).unwrap();
+            }
+        });
+
+        let mut buf_reader = BufReader::new(core_reader);
+        ensure_fresh(
+            &mut buf_reader,
+            &mut core_writer,
+            &conn,
+            tmp.path(),
+            "src/lib.rs",
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            true,
+            &mut on_timeout_must_not_fire,
+        )
+        .unwrap();
+        drop(core_writer);
+        plugin.join().unwrap();
+
+        assert!(!file_path_on_disk.exists());
+        assert_eq!(count(&conn, "indexed_files"), 0, "a deleted file must not get a baseline row");
     }
 
     #[test]
