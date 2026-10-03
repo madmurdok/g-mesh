@@ -153,15 +153,16 @@ no node, so (b) alone would drop trait-impl methods, which are the most
 common untyped targets. A free function never qualifies: `x.f()` cannot
 reach a free `f` in Rust, so its rows would be pure noise.
 
-**When the marker applies at all.** Skip it when the anchor language's
-receiver-call gap is closed. That uses the same predicate as
-`instructions::has_open_receiver_gap`: `receiver_calls_structural ==
-Resolved`, or `receiver_calls == Resolved` and
-`language_semantic_pass_done`. After a completed semantic pass, every open
-site was answered. The answers are edges, and the leftover rows are the
-calls that landed elsewhere, so counting them would be pure noise. An
-incomplete pass is recorded as not done (GM-289), so the marker stays.
-`Pending` (after a workspace reindex) keeps the marker.
+**When the marker applies at all.** There is no language-level gate (owner
+decision D3, below). A completed semantic pass can still leave sites
+unanswered (GM-485's own miss came from a cold pass recorded as done; see
+GM-487), so a gate on `language_semantic_pass_done` would hide the marker in
+exactly the case it exists for. Instead each row is dropped once the
+semantic tier has answered *that* call: the caller already has a semantic
+edge to some node whose bare name is the row's name, wherever it landed.
+After a complete pass the marker therefore disappears on its own; after a
+partial one it keeps the calls that are still open. The method-anchor and
+language checks below still apply.
 
 **Rows counted.**
 
@@ -173,6 +174,9 @@ WHERE u.name = ?name AND f.language = ?lang
   AND NOT EXISTS (SELECT 1 FROM edges e
                   WHERE e.fromId = u.nodeId AND e.toId = ?anchorId
                     AND e.kind IN (?kinds…))
+  AND NOT EXISTS (SELECT 1 FROM edges e JOIN nodes t ON t.id = e.toId
+                  WHERE e.fromId = u.nodeId AND e.source = 'semantic'
+                    AND t.name = u.name)   -- answered by the semantic tier
 GROUP BY f.filePath
 ```
 
@@ -355,7 +359,8 @@ Line numbers are 1-based at 5aa6db7.
   fail.
 - With the `language_swap` entries removed, a swap test must keep a stale
   row.
-- With the gate removed, a "pass done" test must show the marker.
+- With the "answered by the semantic tier" filter removed, a row whose call
+  has a semantic edge to another same-named target must still be counted.
 
 ## Cross-file answers and where they came from
 
@@ -380,3 +385,15 @@ Line numbers are 1-based at 5aa6db7.
   `bound_page_reserving_two_tallies` (callers only), `tally_edge_files`,
   `tally_is_worth_sending`, `excluded_references` (callers only) and
   `session_hints::join` (`find_callees` on each).
+
+## Owner decisions (approved)
+
+Approved by the owner, verbatim: "да, хорошо".
+
+- **D1.** The node field `untypedCalls` plus a child table, not a separate record kind.
+- **D2.** Rust only for now; the SDK fold is opt-in per extractor.
+- **D3.** No gate on a completed semantic pass. A row is dropped when the
+  semantic tier has answered that call (a semantic edge from the caller to
+  any node with the row's name), so a partial pass keeps the marker honest.
+- **D4.** Two sibling fields, `unlinkedUsages` and `untypedReceiverCalls`.
+- **D5.** `count` is the number of calling functions, not call sites.
