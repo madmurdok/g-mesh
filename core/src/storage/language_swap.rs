@@ -963,4 +963,60 @@ mod tests {
         assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
         assert!(column(&conn, "SELECT suffix FROM qualified_suffixes").is_empty());
     }
+
+    /// `run`, calling `names` through untyped receivers.
+    fn untyped_caller(names: &[&str]) -> NodeRecord {
+        let mut node = NodeRecord::new("run", "Function", "run", "m::run", "src/a.rs", "rust");
+        node.untyped_calls = names.iter().map(|name| name.to_string()).collect();
+        node
+    }
+
+    /// A node whose only change is its untyped calls is re-swapped, and live
+    /// ends with exactly staging's rows. Controls: drop `untyped_calls` from
+    /// `plan_attached`'s child-table loop (upsert count 0, live keeps `m`);
+    /// from `swap_attached`'s delete loop (the insert of `n` hits the primary
+    /// key, or `m` stays); or its insert (live has no rows).
+    #[test]
+    fn a_swap_carries_an_untyped_calls_only_change() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m", "n"]), untyped_caller(&["n", "o"]));
+
+        assert_eq!(counts.upsert_nodes, 1, "the untyped-call change alone marks the node upserted");
+        assert_eq!(column(&live, "SELECT name FROM untyped_calls ORDER BY name"), vec!["n", "o"]);
+    }
+
+    /// Losing every untyped call is a change too, and leaves no rows.
+    /// Control: drop `untyped_calls` from `plan_attached` (upsert count 0,
+    /// both rows stay).
+    #[test]
+    fn a_swap_carries_the_loss_of_every_untyped_call() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m", "n"]), untyped_caller(&[]));
+
+        assert_eq!(counts.upsert_nodes, 1);
+        assert!(column(&live, "SELECT name FROM untyped_calls").is_empty());
+    }
+
+    /// An unchanged node with untyped calls is not re-swapped.
+    #[test]
+    fn an_unchanged_node_with_untyped_calls_is_left_alone() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m"]), untyped_caller(&["m"]));
+
+        assert_eq!(counts, PlanCounts::default());
+        assert_eq!(column(&live, "SELECT name FROM untyped_calls"), vec!["m"]);
+    }
+
+    /// A swept placeholder takes any untyped-call rows under its id with it.
+    /// Control: drop the `untyped_calls` delete from `delete_placeholders`
+    /// (the row remains).
+    #[test]
+    fn deleting_a_kept_placeholder_takes_its_untyped_call_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_staging(&dir.path().join("index.db")).unwrap();
+        let mut placeholder = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        placeholder.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![placeholder], ..Default::default() }).unwrap();
+        conn.execute("INSERT INTO untyped_calls (name, nodeId) VALUES ('m', 'p1')", []).unwrap();
+
+        assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
+        assert!(column(&conn, "SELECT name FROM untyped_calls").is_empty());
+    }
 }

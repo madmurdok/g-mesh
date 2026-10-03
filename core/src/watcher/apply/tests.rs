@@ -1283,6 +1283,56 @@ fn an_incremental_reparse_rebuilds_suffix_rows() {
     assert_eq!(count(&conn, "qualified_suffixes"), 1, "n2's rows went with it");
 }
 
+/// `canned_node` calling `names` through untyped receivers.
+fn untyped_node(id: &str, names: &[&str]) -> WireNode {
+    WireNode { untyped_calls: names.iter().map(|name| name.to_string()).collect(), ..canned_node(id) }
+}
+
+fn untyped_rows(conn: &IndexStore) -> Vec<(String, String)> {
+    conn.lock()
+        .unwrap()
+        .prepare("SELECT nodeId, name FROM untyped_calls ORDER BY nodeId, name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// A reparse that re-sends a node replaces its
+/// untyped-call rows, one that re-sends it without the key clears them, and
+/// one that deletes a node removes them - no stale row survives. Control:
+/// drop `untyped_calls: node.untyped_calls` from `to_node_record` (no rows
+/// at all after the first reparse).
+#[test]
+fn an_incremental_reparse_replaces_untyped_call_rows() {
+    let conn = IndexStore::new(setup_conn());
+    let row = |id: &str, name: &str| (id.to_string(), name.to_string());
+
+    reparse(
+        &conn,
+        1,
+        FileChangeDiff {
+            upsert_nodes: vec![untyped_node("n1", &["m", "n"]), untyped_node("n2", &["m"])],
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped_rows(&conn), vec![row("n1", "m"), row("n1", "n"), row("n2", "m")]);
+
+    reparse(
+        &conn,
+        2,
+        FileChangeDiff {
+            upsert_nodes: vec![untyped_node("n1", &["o"]), untyped_node("n2", &[])],
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped_rows(&conn), vec![row("n1", "o")], "replaced, and cleared by an absent key");
+
+    reparse(&conn, 3, FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() });
+    assert!(untyped_rows(&conn).is_empty(), "a deleted node's rows go with it");
+}
+
 // --- rows core retires for a file: gone, or answered in full -------------
 
 fn node_in(id: &str, file_path: &str) -> WireNode {

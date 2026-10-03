@@ -343,12 +343,20 @@ fn deleting_the_last_member_deletes_the_container_and_every_edge_into_it() {
         let node_id = container_id("go", "pkg");
         conn.execute("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES ('x::pkg', ?1)", [&node_id])
             .unwrap();
+        conn.execute("INSERT INTO untyped_calls (name, nodeId) VALUES ('m', ?1)", [&node_id]).unwrap();
         apply_diff(&mut conn, &delete(&["b"])).unwrap();
         assert_eq!(rows(&conn), vec![], "fk={foreign_keys}");
         assert_eq!(
             count(&conn, &format!("SELECT COUNT(*) FROM qualified_suffixes WHERE nodeId = '{node_id}'")),
             0,
             "fk={foreign_keys}: a deleted container's suffix rows go with it"
+        );
+        // Control: drop the `untyped_calls` delete from
+        // `delete_container` (the fk=false run keeps the row).
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM untyped_calls WHERE nodeId = '{node_id}'")),
+            0,
+            "fk={foreign_keys}: a deleted container's untyped-call rows go with it"
         );
         assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM nodes WHERE id = '{node_id}'")), 0);
         assert_eq!(

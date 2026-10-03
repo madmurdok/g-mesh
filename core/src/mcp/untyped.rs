@@ -113,3 +113,7 @@ fn is_method(conn: &Connection, anchor: &NodeRecord) -> bool {
     let segments = anchor.qualified_path.as_ref().map(|path| path.segments());
     unlinked::is_type_member(conn, anchor, segments)
 }
+
+#[cfg(test)]
+#[path = "untyped_tests.rs"]
+mod tests;

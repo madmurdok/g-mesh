@@ -276,6 +276,79 @@ fn a_project_named_use_shadows_the_parents_glob_for_a_test_module() {
     assert!(caller_names(&fixture.callers("user::x::P::load")).is_empty());
 }
 
+// --- `untypedReceiverCalls`, end to end through the rust plugin ---
+
+/// `src/user.rs` declaring the method `W::frob` and a free `frob`, and
+/// declaring `caller` (`src/user/caller.rs`, `caller` below).
+const UNTYPED_USER: &str = "pub mod caller;\n\npub struct W;\n\nimpl W {\n    pub fn frob(&self) {}\n}\n\n\
+     pub fn frob() {}\n";
+
+/// Receiver shapes the structural tier leaves untyped: `w.frob()` on a closure parameter and on a
+/// call chain. Neither produces an edge to `W::frob`.
+const UNTYPED_CALLER: &str = "use super::W;\n\n\
+     pub fn each(ws: Vec<W>) {\n    ws.iter().for_each(|w| w.frob());\n}\n\n\
+     pub fn chain(ws: Vec<W>) {\n    ws.first().unwrap().frob();\n}\n";
+
+/// The same two functions, each also calling `frob` on a typed parameter,
+/// so each already has an edge to `W::frob`.
+const TYPED_TOO_CALLER: &str = "use super::W;\n\n\
+     pub fn each(ws: Vec<W>, x: &W) {\n    x.frob();\n    ws.iter().for_each(|w| w.frob());\n}\n\n\
+     pub fn chain(ws: Vec<W>, x: &W) {\n    x.frob();\n    ws.first().unwrap().frob();\n}\n";
+
+/// The acceptance case: on a method page with no row for them, untyped
+/// receiver calls named like it mark both pages with the caller's file, two
+/// calling functions. Controls: drop `graph.record_untyped_receiver_calls()`
+/// from the rust plugin's `Emitter::new`, `untyped_calls` from core's
+/// `to_node_record`, or the `untyped::probe` call from either handler (no
+/// field).
+#[test]
+fn untyped_receiver_calls_mark_a_methods_callers_and_references_pages() {
+    let fixture = Fixture::with_files(UNTYPED_USER, &[("src/user/caller.rs", UNTYPED_CALLER)]);
+
+    let callers = fixture.callers("user::W::frob");
+    assert!(caller_names(&callers).is_empty(), "neither shape links: {callers}");
+    assert_eq!(callers["hasMore"], false, "{callers}");
+    assert_eq!(callers["untypedReceiverCalls"]["count"], 2, "{callers}");
+    assert_eq!(
+        callers["untypedReceiverCalls"]["files"],
+        serde_json::json!([{ "path": "src/user/caller.rs", "refs": 2 }])
+    );
+    assert!(callers["untypedReceiverCalls"]["hint"].as_str().unwrap().contains("receiver"), "{callers}");
+    assert!(callers.get("unlinkedUsages").is_none(), "an untyped call is not an unlinked usage: {callers}");
+
+    let references = fixture.references("user::W::frob");
+    assert_eq!(references["untypedReceiverCalls"]["count"], 2, "{references}");
+}
+
+/// A free fn of the same name is not reachable through `x.frob()`, so its
+/// page carries no marker. Control: make `untyped::is_method` return true
+/// for every `Function`.
+#[test]
+fn a_free_function_named_like_an_untyped_call_carries_no_marker() {
+    let fixture = Fixture::with_files(UNTYPED_USER, &[("src/user/caller.rs", UNTYPED_CALLER)]);
+
+    let callers = fixture.callers("user::frob");
+    assert!(callers.get("untypedReceiverCalls").is_none(), "{callers}");
+}
+
+/// The acceptance control: when every function with an untyped `frob` call
+/// already has an edge to `W::frob`, it is a row, and the marker is absent.
+/// Control: drop the first `NOT EXISTS` (the edge to the anchor) from
+/// `untyped::candidate_sql` (the marker counts both callers).
+#[test]
+fn the_marker_is_absent_when_every_candidate_already_calls_the_method() {
+    let fixture = Fixture::with_files(UNTYPED_USER, &[("src/user/caller.rs", TYPED_TOO_CALLER)]);
+
+    let callers = fixture.callers("user::W::frob");
+    let mut names = caller_names(&callers);
+    names.sort();
+    assert_eq!(names, ["user::caller::chain", "user::caller::each"], "{callers}");
+    assert!(callers.get("untypedReceiverCalls").is_none(), "{callers}");
+
+    let references = fixture.references("user::W::frob");
+    assert!(references.get("untypedReceiverCalls").is_none(), "{references}");
+}
+
 fn path(segments: &[&str]) -> QualifiedPath {
     QualifiedPath(
         segments

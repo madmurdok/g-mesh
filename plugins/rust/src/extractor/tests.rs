@@ -755,6 +755,35 @@ pub fn closure(ps: Vec<P>) { ps.iter().for_each(|p| p.m()); }
     assert!(sites.iter().all(|site| site.replaces.is_none()), "{sites:#?}");
 }
 
+/// The Rust extractor opts into reporting untyped receiver calls, so
+/// a call through an untyped closure parameter or a call chain reaches core
+/// as the enclosing fn's `untypedCalls` (closures are not nodes), sorted and
+/// deduplicated, while a typed receiver call, which already has its edge,
+/// is not reported. Control: drop `graph.record_untyped_receiver_calls()`
+/// from `Emitter::new` (`closure` and `chain` carry nothing).
+#[test]
+fn untyped_receiver_calls_reach_the_enclosing_fn_and_typed_ones_do_not() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P { pub fn m(&self) {} pub fn n(&self) {} }
+pub fn closure(ps: Vec<P>) { ps.iter().for_each(|p| { p.n(); p.m(); p.m(); }); }
+pub fn chain(ps: Vec<P>) { ps.first().unwrap().m(); }
+pub fn typed(p: P) { p.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+
+    // `iter`/`for_each` are untyped too: `Vec`'s methods, from another crate.
+    assert_eq!(graph.node("closure").untyped_calls, ["for_each", "iter", "m", "n"]);
+    assert!(graph.node("chain").untyped_calls.contains(&"m".to_string()), "{:?}", graph.node("chain"));
+    assert_eq!(graph.targets(EdgeKind::Calls, "typed"), vec!["P::m"]);
+    assert!(graph.node("typed").untyped_calls.is_empty(), "{:?}", graph.node("typed").untyped_calls);
+    let json = serde_json::to_string(graph.node("typed")).unwrap();
+    assert!(!json.contains("untypedCalls"), "{json}");
+}
+
 /// GM-485's own shape: a local typed by the return type of a method, which
 /// is typed by the parameter it is called on.
 #[test]

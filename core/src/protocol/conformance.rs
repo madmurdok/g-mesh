@@ -261,6 +261,32 @@ mod tests {
         assert!(report.violations[0].message.contains("container"), "{:?}", report.violations);
     }
 
+    const UNTYPED_FUNCTION: &str = "{\"id\":\"n1\",\"kind\":\"Function\",\"name\":\"run\",\"qualifiedName\":\"m::run\",\"filePath\":\"a.rs\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"rust\",\"untypedCalls\":[\"m\"]}\n";
+
+    /// `untypedCalls` on a `Function` (or `File`) node is conformant;
+    /// on any other kind, or with an empty name, it is a violation naming the
+    /// node. Controls: return `None` from `untyped_calls_violation` (no
+    /// violation), or drop its chain from `node_shape_violations` (same);
+    /// widen the kind check to every kind (the `Type` line passes).
+    #[test]
+    fn untyped_calls_belong_on_a_file_or_function_node_and_name_something() {
+        let report = check_bulk_output(UNTYPED_FUNCTION.as_bytes());
+        assert!(report.is_conformant(), "{:?}", report.violations);
+        let file = UNTYPED_FUNCTION.replace("\"kind\":\"Function\"", "\"kind\":\"File\"");
+        assert!(check_bulk_output(file.as_bytes()).is_conformant());
+
+        let on_a_type = UNTYPED_FUNCTION.replace("\"kind\":\"Function\"", "\"kind\":\"Type\"");
+        let report = check_bulk_output(on_a_type.as_bytes());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("untypedCalls"), "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("n1"), "{:?}", report.violations);
+
+        let empty_name = UNTYPED_FUNCTION.replace("[\"m\"]", "[\"m\",\"\"]");
+        let report = check_bulk_output(empty_name.as_bytes());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("empty name"), "{:?}", report.violations);
+    }
+
     #[test]
     fn well_formed_control_frame_is_conformant() {
         let frame = b"Content-Length: 72\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"reindex\",\"params\":{\"filePath\":\"a.ts\"}}";

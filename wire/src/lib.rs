@@ -1289,4 +1289,25 @@ mod tests {
         node.name = "other".to_string();
         assert!(matches!(node.check_qualified_path(), Err(PathError::LastNameIsNotName { .. })));
     }
+
+    /// `untyped_calls` travels as `untypedCalls`, after every other
+    /// key, and an empty list sends no key at all, so a node that reports
+    /// none is byte-identical to the old shape. Controls: rename the field's
+    /// serde key (the line no longer parses into the list); drop its
+    /// `skip_serializing_if` (an `"untypedCalls":[]` key appears).
+    #[test]
+    fn untyped_calls_use_the_documented_key_and_are_omitted_when_empty() {
+        let line = OLD_SHAPE_NODE.replace(
+            r#""hasSyntaxErrors":false}"#,
+            r#""hasSyntaxErrors":false,"untypedCalls":["frob","m"]}"#,
+        );
+        let node: WireNode = serde_json::from_str(&line).unwrap();
+        assert_eq!(node.untyped_calls, vec!["frob".to_string(), "m".to_string()]);
+        assert_eq!(serde_json::to_string(&node).unwrap(), line);
+
+        let empty = WireNode { untyped_calls: Vec::new(), ..node };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("untypedCalls"), "{json}");
+        assert_eq!(json, OLD_SHAPE_NODE);
+    }
 }

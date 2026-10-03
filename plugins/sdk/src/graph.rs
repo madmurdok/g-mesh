@@ -835,4 +835,74 @@ mod tests {
         assert_eq!(graph.nodes[0].alias_paths, vec![alias]);
         assert_eq!(graph.nodes[0].check_qualified_path(), Ok(()));
     }
+
+    /// An open site in `from_id` named `name`, of `kind`, replacing `replaces`.
+    fn site(from_id: &str, name: &str, kind: OpenSiteKind, replaces: Option<&str>) -> OpenSite {
+        OpenSite {
+            from_id: from_id.to_string(),
+            position: Position { line: 1, col: 0 },
+            name: name.to_string(),
+            kind,
+            edge_kind: EdgeKind::Calls,
+            from_container: None,
+            replaces: replaces.map(str::to_string),
+        }
+    }
+
+    /// A file node, a function and a type, each with untyped receiver calls,
+    /// plus a typed receiver call and an unresolved reference in the function.
+    fn graph_with_open_sites(opt_in: bool) -> (FileGraph, String, String, String) {
+        let mut graph = builder();
+        if opt_in {
+            graph.record_untyped_receiver_calls();
+        }
+        let file = graph.file_node(range(0, 9));
+        let function = graph.add_node(NodeSpec::new(NodeKind::Function, "f", "f", range(1, 4)));
+        let ty = graph.add_node(NodeSpec::new(NodeKind::Type, "T", "T", range(5, 8)));
+        for open in [
+            site(&function, "zeta", OpenSiteKind::ReceiverCall, None),
+            site(&function, "alpha", OpenSiteKind::ReceiverCall, None),
+            site(&function, "zeta", OpenSiteKind::ReceiverCall, None),
+            site(&function, "typed", OpenSiteKind::ReceiverCall, Some("e-typed")),
+            site(&function, "bare", OpenSiteKind::Reference, None),
+            site(&file, "top", OpenSiteKind::ReceiverCall, None),
+            site(&ty, "inner", OpenSiteKind::ReceiverCall, None),
+        ] {
+            graph.open_site(open);
+        }
+        (graph.finish(), file, function, ty)
+    }
+
+    fn untyped_of<'g>(graph: &'g FileGraph, id: &str) -> &'g [String] {
+        &graph.nodes.iter().find(|node| node.id == id).unwrap().untyped_calls
+    }
+
+    /// Reporting is opt-in, so a plugin that has not opted in sends
+    /// no `untypedCalls`, which core reads as "not reported". The open sites
+    /// themselves are untouched. Control: default `record_untyped` to `true`
+    /// in `FileGraphBuilder::new` (`f` gets names).
+    #[test]
+    fn without_the_opt_in_no_node_carries_untyped_calls() {
+        let (graph, _file, _function, _ty) = graph_with_open_sites(false);
+
+        assert!(graph.nodes.iter().all(|node| node.untyped_calls.is_empty()), "{:#?}", graph.nodes);
+        assert_eq!(graph.open_sites.len(), 7, "the sites still go to the semantic engine");
+    }
+
+    /// With the opt-in, each untyped receiver call lands on its `from_id`
+    /// node, sorted and deduplicated; a typed one (with `replaces`), a site
+    /// of another kind, and a site in a node that is neither `File` nor
+    /// `Function` do not. Controls: drop `names.sort()` (`zeta` first);
+    /// drop `names.dedup()` (`zeta` twice); drop `site.replaces.is_none()`
+    /// (`typed` appears); drop the `ReceiverCall` check (`bare` appears);
+    /// drop the `File | Function` check (`T` gets `inner`).
+    #[test]
+    fn the_opt_in_folds_untyped_receiver_calls_onto_their_file_or_function_node() {
+        let (graph, file, function, ty) = graph_with_open_sites(true);
+
+        assert_eq!(untyped_of(&graph, &function), ["alpha", "zeta"]);
+        assert_eq!(untyped_of(&graph, &file), ["top"]);
+        assert!(untyped_of(&graph, &ty).is_empty(), "a Type node takes none: {:?}", untyped_of(&graph, &ty));
+        assert_eq!(graph.open_sites.len(), 7, "folding keeps the sites for the semantic engine");
+    }
 }

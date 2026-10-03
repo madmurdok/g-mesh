@@ -767,3 +767,28 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
     assert!(rendered.contains("This folder holds 2+ projects"), "{rendered}");
     assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
 }
+
+/// The eight-language worst case still names every gapped language
+/// and points at `untypedReceiverCalls` when nothing is prefixed, but under a
+/// cold-start line the body is built against the ceiling less the no-path
+/// line and falls back to [`p4_fallback`], whatever the root's length.
+/// Control: build `cold_start`'s body with `build(present)` again (a
+/// 103-byte root renders the named body under the no-path line, over the
+/// ceiling).
+#[test]
+fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
+    let named = build(&worst_case_present());
+    assert!(named.contains("`untypedReceiverCalls`"), "{named}");
+    assert_ne!(named, assemble(&p4_fallback()));
+    let fallback = assemble(&p4_fallback());
+    println!("named {} bytes, fallback {} bytes", named.len(), fallback.len());
+
+    for walking in [false, true] {
+        for root_len in [10, 103, 600] {
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, &worst_case_present());
+            println!("walking={walking} root={root_len}: {} bytes", rendered.len());
+            assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+            assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");
+        }
+    }
+}

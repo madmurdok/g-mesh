@@ -88,6 +88,50 @@ fn qualified_suffix_lookups_and_deletes_use_an_index() {
     assert!(delete.contains("USING COVERING INDEX idx_qualified_suffixes_nodeId"), "{delete}");
 }
 
+/// The marker's `name = ?` lookup seeks the table's primary key, and
+/// a per-node delete uses the nodeId index. Controls: drop
+/// `idx_untyped_calls_nodeId` (the delete plan scans); reorder the primary
+/// key to `(nodeId, name)` (the lookup scans).
+#[test]
+fn untyped_call_lookups_and_deletes_use_an_index() {
+    let conn = setup();
+    let plan = |sql: &str| -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ")
+    };
+    let lookup = plan("SELECT nodeId FROM untyped_calls WHERE name = 'm'");
+    assert!(lookup.contains("USING PRIMARY KEY (name=?)"), "{lookup}");
+    let delete = plan("DELETE FROM untyped_calls WHERE nodeId = 'n1'");
+    assert!(delete.contains("USING COVERING INDEX idx_untyped_calls_nodeId"), "{delete}");
+}
+
+/// A version-mismatch wipe drops `untyped_calls` with the rest of
+/// the graph, so no row outlives the nodes it names. Control: drop `DROP
+/// TABLE IF EXISTS untyped_calls` from `wipe` (`CREATE TABLE IF NOT EXISTS`
+/// keeps the old row).
+#[test]
+fn a_version_mismatch_wipe_drops_the_untyped_calls() {
+    let conn = setup();
+    // Off, as on the daemon's connection: with them on, dropping `nodes`
+    // would cascade into the table and the control could not fail.
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    conn.execute("INSERT INTO untyped_calls (name, nodeId) VALUES ('m', 'n1')", []).unwrap();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '10', ?1, CURRENT_TIMESTAMP)",
+        rusqlite::params![GENERATION],
+    )
+    .unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 10 is not current");
+    let rows: i64 = conn.query_row("SELECT COUNT(*) FROM untyped_calls", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows, 0);
+}
+
 #[test]
 fn nodes_round_trip() {
     let conn = setup();
