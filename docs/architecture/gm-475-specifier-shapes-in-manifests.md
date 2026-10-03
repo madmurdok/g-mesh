@@ -51,6 +51,7 @@ contains = ["/"]
 | rust | `@` | `/` | S7 |
 | python | `@` | `/` | S7 |
 | python | `.` (added) | | S9 |
+| typescript | `node:` (added) | | GM-481, see `gm-481-node-specifiers.md` |
 
 ### Can a symbol of each language contain these? (measured)
 

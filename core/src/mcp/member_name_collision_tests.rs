@@ -19,7 +19,7 @@ use crate::daemon::bulk_index;
 use crate::daemon::manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::embedding::EmbeddingPipeline;
 use crate::mcp::session_hints::SessionHints;
-use crate::mcp::{find_references, SymbolQueryParams};
+use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -125,6 +125,37 @@ impl Walked {
                 assert_eq!(row["resolved"], serde_json::json!(true), "{qualified_name}: {row}");
                 let from = row["qualifiedName"].as_str().or(row["filePath"].as_str()).unwrap_or_default();
                 (row["referenceKind"].as_str().unwrap_or_default().to_string(), from.to_string())
+            })
+            .collect()
+    }
+
+    /// `qualified_name`'s callers through `find_callers`, as qualified names,
+    /// asserting every row is resolved and the page is complete.
+    fn callers(&self, qualified_name: &str) -> BTreeSet<String> {
+        let params = SymbolQueryParams {
+            symbol_id: Some(self.declaration(qualified_name)),
+            limit: Some(200),
+            ..Default::default()
+        };
+        let body = json_body(
+            &find_callers_callees::handle_callers(
+                &self.store,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                &HashMap::<String, Capabilities>::new(),
+                &SessionHints::default(),
+                params,
+            )
+            .unwrap(),
+        );
+        assert_ne!(body["hasMore"], serde_json::json!(true), "{qualified_name}");
+        body["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{qualified_name}: no results array in {body}"))
+            .iter()
+            .map(|row| {
+                assert_eq!(row["resolved"], serde_json::json!(true), "{qualified_name}: {row}");
+                row["qualifiedName"].as_str().unwrap_or_default().to_string()
             })
             .collect()
     }
@@ -242,6 +273,46 @@ fn rust_a_module_scoped_name_lands_on_the_free_fn_beside_a_same_named_member() {
         walked.exact_usages("m::U::z"),
         usages(&[("CALLS", "m::U::both"), ("CALLS", "user::use_members")])
     );
+}
+
+/// A free `fn y` called bare from its own file, beside an inherent method
+/// and a trait method `y`: the plugin binds the call to the free fn itself,
+/// and the methods keep exactly their type-qualified callers.
+///
+/// Control: in the Rust plugin's `Declarer::declare` (`extractor::decls`),
+/// record an associated item with `model.declare` like a free item - `m::y`
+/// loses `m::local` and `m::T::call_y`.
+#[test]
+fn rust_a_same_file_bare_call_lands_on_the_free_fn_beside_same_named_methods() {
+    let walked = Walked::new(
+        "rust",
+        ".rs",
+        &[
+            ("Cargo.toml", "[package]\nname = \"krate\"\nversion = \"0.1.0\"\n"),
+            ("src/lib.rs", "pub mod m;\n"),
+            (
+                "src/m.rs",
+                r#"
+pub struct T;
+impl T {
+    pub fn y(&self) -> u32 { 1 }
+    pub fn call_y(&self) -> u32 { y() + T::y(self) }
+}
+pub trait Tr {
+    fn y() -> u32;
+}
+impl Tr for T {
+    fn y() -> u32 { 3 }
+}
+pub fn y() -> u32 { 2 }
+pub fn local() -> u32 { y() + <T as Tr>::y() }
+"#,
+            ),
+        ],
+    );
+
+    assert_eq!(walked.callers("m::y"), BTreeSet::from(["m::T::call_y".to_string(), "m::local".to_string()]));
+    assert_eq!(walked.callers("m::T::y"), BTreeSet::from(["m::T::call_y".to_string()]));
 }
 
 /// A trait-impl method is named `<S as Tr>::y`, whose parent is no type;
