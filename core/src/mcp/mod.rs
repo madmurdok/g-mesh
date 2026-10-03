@@ -45,6 +45,8 @@ pub mod front;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
 mod instructions;
+#[cfg(test)]
+mod member_name_collision_tests;
 mod provenance;
 mod search_code;
 #[cfg(test)]

@@ -2106,3 +2106,207 @@ fn gm472_the_head_by_name_links_through_the_same_chain() {
     link_all(&mut conn).unwrap();
     assert_eq!(edge_target(&conn, &head), (GM472_T.to_string(), true));
 }
+
+// --- a type member and a free declaration of one name in one module --------
+//
+// Members live in their module's container beside the free declarations, so
+// a name key addressed at the module finds both. A name in a module scope
+// never denotes a member: the one non-member is linked, and anything else
+// stays ambiguous.
+
+const A_FREE_F: &str = "Function:src/a.rs:a::f";
+const A_FREE_M: &str = "Function:src/a.rs:a::m";
+
+fn module_a() -> At<'static> {
+    gm472_at("src/a.rs", "krate::a")
+}
+
+/// `fn <name>` declared at the top of `krate::a`, in `at`'s file.
+fn free_fn(at: At, name: &str) -> NodeRecord {
+    gm472_member(at, "Function", "function", &[("::", name)])
+}
+
+/// `krate::user::run`'s `kind` usage of `name`, addressed at `scope` by name.
+/// Returns the edge id.
+fn use_by_name(conn: &mut Connection, kind: &str, scope: &str, name: &str) -> String {
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    use_through(
+        conn,
+        vec![run],
+        "Function:src/user.rs:user::run",
+        kind,
+        container_placeholder(at, scope, KEY_NAME, name),
+    )
+}
+
+/// Control for the rest of this section: with no member of the name around,
+/// the free fn links on its own.
+#[test]
+fn a_free_fn_with_no_same_named_member_links() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), free_fn(module_a(), "f")]);
+    let edge = use_by_name(&mut conn, "REFERENCES", "krate::a", "f");
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (A_FREE_F.to_string(), true));
+}
+
+/// A field `T.f` and `fn f`: the `REFERENCES` a `use a::f` sends lands on
+/// the fn. Control: return `Ok(None)` at the top of
+/// `Resolver::sole_non_member` - the edge stays on its placeholder.
+#[test]
+fn a_name_beside_a_same_named_field_lands_on_the_free_fn() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_field(), free_fn(module_a(), "f")]);
+    let edge = use_by_name(&mut conn, "REFERENCES", "krate::a", "f");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), (A_FREE_F.to_string(), true));
+}
+
+/// A method `T::m` and `fn m`: both a call and a reference by name land on
+/// the fn, and the method keeps nothing it did not have. Control: as above.
+#[test]
+fn a_name_beside_a_same_named_method_lands_on_the_free_fn() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), free_fn(module_a(), "m")]);
+    let call = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    let reference = use_by_name(&mut conn, "REFERENCES", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 2 });
+    assert_eq!(edge_target(&conn, &call), (A_FREE_M.to_string(), true));
+    assert_eq!(edge_target(&conn, &reference), (A_FREE_M.to_string(), true));
+}
+
+/// The incremental pass runs the same rule. Control: as above.
+#[test]
+fn a_diff_links_a_name_beside_a_same_named_method_to_the_free_fn() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), free_fn(module_a(), "m")]);
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    let placeholder = container_placeholder(at, "krate::a", KEY_NAME, "m");
+    let edge = usage_edge(&run.id, "CALLS", &placeholder);
+    let edge_id = edge.id.clone();
+    let diff = Diff { upsert_nodes: vec![run, placeholder], upsert_edges: vec![edge], ..Default::default() };
+    assert_eq!(gm472_apply_and_link_diff(&mut conn, &diff), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge_id), (A_FREE_M.to_string(), true));
+}
+
+/// A name reached through a `pub use` hop (a `name` key walked into the
+/// declaring module) gets the same rule at the depth it lands. Control: as
+/// above.
+#[test]
+fn a_reexported_name_beside_a_same_named_method_lands_on_the_free_fn() {
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![
+            gm472_type(),
+            gm472_method(),
+            free_fn(module_a(), "m"),
+            gm472_reexport(gm472_at("src/named.rs", "krate::named"), "m", "krate::a", "m"),
+        ],
+    );
+    let edge = use_by_name(&mut conn, "CALLS", "krate::named", "m");
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (A_FREE_M.to_string(), true));
+}
+
+/// The receiver type is looked up in the member's container, not its file:
+/// a Go method may be declared in another file of its type's package.
+/// Control: look the type up by the candidate's file (`type_in_file`) for
+/// every candidate - the edge stays on its placeholder.
+#[test]
+fn a_member_whose_type_is_in_another_file_of_the_container_is_still_a_member() {
+    let mut conn = setup();
+    let types = gm472_member(gm472_at("src/a_types.rs", "krate::a"), "Type", "struct", &[("::", "T")]);
+    upsert(&mut conn, vec![types, gm472_method(), free_fn(module_a(), "m")]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (A_FREE_M.to_string(), true));
+}
+
+/// A field and a method of one name are both members: nothing singles one
+/// out, and the edge stays unresolved.
+#[test]
+fn a_name_matching_only_members_stays_unresolved() {
+    let mut conn = setup();
+    let getter = gm472_member(module_a(), "Function", "method", &[("::", "T"), ("::", "f")]);
+    upsert(&mut conn, vec![gm472_type(), gm472_field(), getter]);
+    let edge = use_by_name(&mut conn, "REFERENCES", "krate::a", "f");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "a field and a method of one name: a name key must refuse");
+}
+
+/// Two free fns of one name beside a member are still two candidates.
+/// Control: link the first non-member instead of requiring exactly one in
+/// `Resolver::sole_non_member` - the edge lands on one of them.
+#[test]
+fn two_free_fns_of_one_name_stay_unresolved_beside_a_member() {
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![
+            gm472_type(),
+            gm472_method(),
+            free_fn(module_a(), "m"),
+            free_fn(gm472_at("src/a_cfg.rs", "krate::a"), "m"),
+        ],
+    );
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "two free fns: a name key must refuse");
+}
+
+/// A candidate is a member only when its path's parent is a declared
+/// `Type`: with `a::T` declared as a function, `a::T::m` is as good as
+/// `a::m`. Control: drop the `kind` condition from `type_in_container` - the
+/// edge lands on `a::m`.
+#[test]
+fn a_path_parent_that_is_not_a_type_does_not_make_a_member() {
+    let mut conn = setup();
+    let not_a_type = free_fn(module_a(), "T");
+    upsert(&mut conn, vec![not_a_type, gm472_method(), free_fn(module_a(), "m")]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1);
+}
+
+/// A trait-impl method's own path parent is no type (`a::<T as Tr>::m`);
+/// its alias `a::T::m` makes it a member. Beside an inherent `T::m` there
+/// is then no non-member, and the edge stays unresolved. Control: drop the
+/// alias-suffix loop from `Resolver::is_type_member` - the edge lands on
+/// the trait-impl method.
+#[test]
+fn a_trait_impl_method_is_a_member_through_its_alias() {
+    let mut conn = setup();
+    let mut trait_impl =
+        gm472_member(module_a(), "Function", "trait_impl_method", &[("::", "<T as Tr>"), ("::", "m")]);
+    trait_impl.alias_paths = vec![gm472_path("a", &[("::", "T"), ("::", "m")])];
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), trait_impl]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "two methods of `T`: a name key must refuse");
+}
+
+/// A `qualifiedName` key gets no tie-break: a member and a non-member under
+/// one qualifiedName stay ambiguous. Control: drop the `Key::Name` check at
+/// the top of `Resolver::sole_non_member` - the edge lands on the
+/// non-member.
+#[test]
+fn a_qualified_name_key_matching_a_member_and_a_non_member_stays_unresolved() {
+    let mut conn = setup();
+    let mut no_path = member(gm472_at("src/a_other.rs", "krate::a"), "Function", "a::T::m", Vis::Public);
+    no_path.qualified_path = None;
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), no_path]);
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    let edge = use_through(
+        &mut conn,
+        vec![run],
+        "Function:src/user.rs:user::run",
+        "CALLS",
+        container_placeholder(at, "krate::a", KEY_QUALIFIED_NAME, "a::T::m"),
+    );
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "a qualifiedName key must refuse two declarations");
+}
