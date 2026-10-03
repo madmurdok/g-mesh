@@ -1394,23 +1394,25 @@ impl<'c> Resolver<'c> {
                 let Key::Name(name) = key else {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
+                let mut hops = self.hops(scope, name)?;
+                // A named row shadows the scope's `*` rows, even when it leads
+                // nowhere (an external crate's item) and even when this
+                // requester may not follow it: in rustc the shadowed glob item
+                // is not in the scope at all, so a missing edge beats the
+                // wrong one a glob would give.
+                if hops.iter().any(|hop| hop.named) {
+                    hops.retain(|hop| hop.named);
+                }
                 let mut followed = Vec::new();
-                for hop in self.hops(scope, name)? {
-                    // Checked before `visited` and before shadowing: a row
-                    // this requester may not follow must neither hide another
-                    // row reaching the same step nor shadow a glob.
+                for hop in hops {
+                    // Checked before `visited`: a row this requester may not
+                    // follow must not hide another row reaching the same step.
                     if let Some((language, container)) = &hop.restricted_to {
                         if !self.sees(requester, language, container.as_deref())? {
                             continue;
                         }
                     }
                     followed.push(hop);
-                }
-                // A named row shadows the scope's `*` rows, even when it leads
-                // nowhere (an external crate's item): a missing edge beats the
-                // wrong one a glob would give.
-                if followed.iter().any(|hop| hop.named) {
-                    followed.retain(|hop| hop.named);
                 }
                 for hop in followed {
                     if visited.insert(hop.to.clone()) {
