@@ -373,7 +373,7 @@ exclude_dirs = ["node_modules", "dist"]
 entry_points = ["index"]
 
 [plugin.non_symbol_queries]
-starts_with = ["@"]
+starts_with = ["@", "node:"]
 contains = ["/"]
 EOF
 
