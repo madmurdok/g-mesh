@@ -2270,3 +2270,43 @@ fn a_path_parent_that_is_not_a_type_does_not_make_a_member() {
     assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
     assert!(!edge_target(&conn, &edge).1);
 }
+
+/// A trait-impl method's own path parent is no type (`a::<T as Tr>::m`);
+/// its alias `a::T::m` makes it a member. Beside an inherent `T::m` there
+/// is then no non-member, and the edge stays unresolved. Control: drop the
+/// alias-suffix loop from `Resolver::is_type_member` - the edge lands on
+/// the trait-impl method.
+#[test]
+fn a_trait_impl_method_is_a_member_through_its_alias() {
+    let mut conn = setup();
+    let mut trait_impl =
+        gm472_member(module_a(), "Function", "trait_impl_method", &[("::", "<T as Tr>"), ("::", "m")]);
+    trait_impl.alias_paths = vec![gm472_path("a", &[("::", "T"), ("::", "m")])];
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), trait_impl]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "two methods of `T`: a name key must refuse");
+}
+
+/// A `qualifiedName` key gets no tie-break: a member and a non-member under
+/// one qualifiedName stay ambiguous. Control: drop the `Key::Name` check at
+/// the top of `Resolver::sole_non_member` - the edge lands on the
+/// non-member.
+#[test]
+fn a_qualified_name_key_matching_a_member_and_a_non_member_stays_unresolved() {
+    let mut conn = setup();
+    let mut no_path = member(gm472_at("src/a_other.rs", "krate::a"), "Function", "a::T::m", Vis::Public);
+    no_path.qualified_path = None;
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), no_path]);
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    let edge = use_through(
+        &mut conn,
+        vec![run],
+        "Function:src/user.rs:user::run",
+        "CALLS",
+        container_placeholder(at, "krate::a", KEY_QUALIFIED_NAME, "a::T::m"),
+    );
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1, "a qualifiedName key must refuse two declarations");
+}

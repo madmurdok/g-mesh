@@ -1257,6 +1257,7 @@ struct Resolver<'c> {
     reexports_in_container: Statement<'c>,
     type_in_file: Statement<'c>,
     type_in_container: Statement<'c>,
+    suffixes_of: Statement<'c>,
     declared: HashMap<(Scope, Key), Vec<Candidate>>,
     hops: HashMap<(Scope, String), Vec<Hop>>,
     /// `(language, container)` -> that container plus its parent chain.
@@ -1304,6 +1305,7 @@ impl<'c> Resolver<'c> {
                 "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND +language = ?2 AND +container = ?3 \
                  AND +kind = '{TYPE_KIND}' LIMIT 1"
             ))?,
+            suffixes_of: prepare("SELECT suffix FROM qualified_suffixes WHERE nodeId = ?1".to_string())?,
             declared: HashMap::new(),
             hops: HashMap::new(),
             visible_from: HashMap::new(),
@@ -1450,38 +1452,67 @@ impl<'c> Resolver<'c> {
         Ok(non_member)
     }
 
-    /// Whether `candidate` is a member of a type: its `qualifiedPath` minus
-    /// the last segment is the qualifiedName of a `Type` declared in the same
-    /// container (the same language and container key), or in the same file
-    /// when it has no container. A candidate without a path of at least two
-    /// segments is not one. The container, not the file, is what a Go method
-    /// shares with its receiver type, which may be declared in another file
-    /// of the package.
+    /// Whether `candidate` is a member of a type: its `qualifiedPath`, or one
+    /// of its alias paths, minus the last segment is the qualifiedName of a
+    /// `Type` declared in the same container (the same language and container
+    /// key), or in the same file when it has no container. A candidate
+    /// without a path of at least two segments is not one.
+    ///
+    /// The container, not the file, is what a Go method shares with its
+    /// receiver type, which may be declared in another file of the package.
+    /// An alias is what names a member whose own path's parent is no type:
+    /// a Rust trait-impl method is `m::<S as Tr>::y`, with the alias
+    /// `m::S::y`. Aliases are stored only as `qualified_suffixes` text, and
+    /// an alias suffix that starts at segment 0 is the whole alias, so its
+    /// parent is that text minus the candidate's own last separator and
+    /// name - a concatenation undone, never a split.
     fn is_type_member(&mut self, candidate: &Candidate) -> Result<bool> {
         if let Some(known) = self.type_members.get(&candidate.id) {
             return Ok(*known);
         }
-        let parent = candidate
-            .qualified_path
-            .as_deref()
-            .and_then(qualified_path::decode)
-            .and_then(|path| path.head())
-            .map(|head| head.display());
-        let member = match (parent, candidate.container.as_deref()) {
-            (None, _) => false,
-            (Some(parent), Some(container)) => self
-                .type_in_container
-                .query_row(params![parent, candidate.language, container], |_| Ok(()))
-                .optional()
-                .context("failed to look up a candidate's enclosing type")?
-                .is_some(),
-            (Some(parent), None) => self
-                .type_in_file
-                .query_row(params![parent, candidate.file_path], |_| Ok(()))
-                .optional()
-                .context("failed to look up a candidate's enclosing type")?
-                .is_some(),
+        let Some(path) = candidate.qualified_path.as_deref().and_then(qualified_path::decode) else {
+            self.type_members.insert(candidate.id.clone(), false);
+            return Ok(false);
         };
+        let (Some(head), Some(last)) = (path.head(), path.last()) else {
+            self.type_members.insert(candidate.id.clone(), false);
+            return Ok(false);
+        };
+        let tail = format!("{}{}", last.sep.as_deref().unwrap_or(""), last.name);
+        let own_suffixes: HashSet<String> = (1..path.len()).map(|start| path.suffix_from(start)).collect();
+        let mut parents = vec![head.display()];
+        let suffixes: Vec<String> = self
+            .suffixes_of
+            .query_map(params![candidate.id], |row| row.get(0))
+            .context("failed to read a candidate's alias suffixes")?
+            .collect::<rusqlite::Result<_>>()
+            .context("failed to collect a candidate's alias suffixes")?;
+        for suffix in suffixes {
+            if own_suffixes.contains(&suffix) {
+                continue; // a suffix of the candidate's own path, not an alias
+            }
+            if let Some(parent) = suffix.strip_suffix(&tail).filter(|parent| !parent.is_empty()) {
+                parents.push(parent.to_string());
+            }
+        }
+
+        let mut member = false;
+        for parent in parents {
+            let found = match candidate.container.as_deref() {
+                Some(container) => self
+                    .type_in_container
+                    .query_row(params![parent, candidate.language, container], |_| Ok(()))
+                    .optional(),
+                None => {
+                    self.type_in_file.query_row(params![parent, candidate.file_path], |_| Ok(())).optional()
+                }
+            }
+            .context("failed to look up a candidate's enclosing type")?;
+            if found.is_some() {
+                member = true;
+                break;
+            }
+        }
         self.type_members.insert(candidate.id.clone(), member);
         Ok(member)
     }

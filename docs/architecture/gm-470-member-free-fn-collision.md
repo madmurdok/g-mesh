@@ -137,6 +137,14 @@ A Go method may be declared in another file of its receiver type's package;
 a same-file lookup would leave those collisions dropped. For Rust and Python
 a container is one file, so the two lookups agree there.
 
+A member is also recognised through an **alias path**. A Rust trait-impl
+method is `m::<S as Tr>::y`; its parent is no type, but the plugin already
+sends the alias `m::S::y`, stored as a `qualified_suffixes` row. Core takes
+that row minus the candidate's own last separator and name and checks it
+for a `Type`, so it never parses `<S as Tr>`. Without this, an inherent `S::y`
+and a trait-impl `y` beside a re-exported `y` sent `m::y()` to the trait-impl
+method.
+
 Not covered, and out of scope here: the Rust plugin binds a **same-file**
 bare call (`y()` inside `m.rs`) itself (`extractor::model::lookup_name`),
 with the same "several fit, drop it" rule. With a method `T::y` beside

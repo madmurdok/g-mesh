@@ -93,6 +93,22 @@ impl Walked {
         )
     }
 
+    /// What each `kind` edge from `from` points at, as `(qualifiedName,
+    /// nativeKind)` - a placeholder shows up as `pending_symbol`.
+    fn targets_of(&self, from: &str, kind: &str) -> BTreeSet<(String, String)> {
+        let from = self.declaration(from);
+        self.store
+            .with(|conn| -> rusqlite::Result<_> {
+                let mut stmt = conn.prepare(
+                    "SELECT n.qualifiedName, COALESCE(n.nativeKind, '') FROM edges e JOIN nodes n ON n.id = e.toId \
+                     WHERE e.fromId = ?1 AND e.kind = ?2",
+                )?;
+                let rows = stmt.query_map([from.as_str(), kind], |row| Ok((row.get(0)?, row.get(1)?)))?.collect();
+                rows
+            })
+            .unwrap()
+    }
+
     /// `qualified_name`'s usages as `(edge kind, using symbol or file)`,
     /// asserting the page is exact: every row resolved, no `unlinkedUsages`.
     fn exact_usages(&self, qualified_name: &str) -> BTreeSet<(String, String)> {
@@ -223,6 +239,73 @@ fn rust_a_module_scoped_name_lands_on_the_free_fn_beside_a_same_named_member() {
     assert_eq!(
         walked.exact_usages("m::U::z"),
         usages(&[("CALLS", "m::U::both"), ("CALLS", "user::use_members")])
+    );
+}
+
+/// A trait-impl method is named `<S as Tr>::y`, whose parent is no type;
+/// its alias `m::S::y` is what makes it a member.
+const RUST_TRAIT_M: &str = r#"
+pub struct S;
+impl S {
+    pub fn y() {}
+}
+impl crate::other::Tr for S {
+    fn y() {}
+}
+"#;
+
+const RUST_TRAIT_OTHER: &str = "pub trait Tr {\n    fn y();\n}\n\npub fn y() {}\n";
+
+/// `m` re-exports `other::y` and holds an inherent and a trait-impl method
+/// `y`: both are members, so `m::y()` has no candidate to link to in `m`
+/// and stays unresolved - it must not land on the trait-impl method.
+///
+/// Control: drop the alias-suffix loop from `Resolver::is_type_member`
+/// (`graph::symbol_links`) - the call lands on `m::<S as Tr>::y`.
+#[test]
+fn rust_a_name_beside_an_inherent_and_a_trait_impl_method_lands_on_neither() {
+    let walked = Walked::new(
+        "rust",
+        ".rs",
+        &[
+            ("Cargo.toml", "[package]\nname = \"krate\"\nversion = \"0.1.0\"\n"),
+            ("src/lib.rs", "pub mod m;\npub mod other;\npub mod user;\n"),
+            ("src/m.rs", &format!("pub use crate::other::y;\n{RUST_TRAIT_M}")),
+            ("src/other.rs", RUST_TRAIT_OTHER),
+            ("src/user.rs", "pub fn call() {\n    crate::m::y();\n}\n"),
+        ],
+    );
+
+    let targets = walked.targets_of("user::call", "CALLS");
+    assert!(
+        targets.iter().all(|(_, native_kind)| native_kind == "pending_symbol"),
+        "m::y() must stay unresolved: {targets:?}"
+    );
+    assert_eq!(targets.len(), 1, "{targets:?}");
+}
+
+/// A free `fn y` beside a trait-impl method `y`: the free fn is the one
+/// non-member.
+///
+/// Control: as above - both candidates count as non-members and the call
+/// stays unresolved.
+#[test]
+fn rust_a_name_beside_a_trait_impl_method_lands_on_the_free_fn() {
+    let walked = Walked::new(
+        "rust",
+        ".rs",
+        &[
+            ("Cargo.toml", "[package]\nname = \"krate\"\nversion = \"0.1.0\"\n"),
+            ("src/lib.rs", "pub mod m;\npub mod other;\npub mod user;\n"),
+            ("src/m.rs", "pub struct S;\nimpl crate::other::Tr for S {\n    fn y() {}\n}\npub fn y() {}\n"),
+            ("src/other.rs", "pub trait Tr {\n    fn y();\n}\n"),
+            ("src/user.rs", "pub fn call() {\n    crate::m::y();\n}\n"),
+        ],
+    );
+
+    assert_eq!(
+        walked.targets_of("user::call", "CALLS"),
+        BTreeSet::from([("m::y".to_string(), "function".to_string())])
     );
 }
 
