@@ -268,7 +268,7 @@ fn an_external_named_use_shadows_the_parents_glob_for_a_test_module() {
 /// that also provides a `P`: the test module's call links `m`'s `P`.
 ///
 /// Control: drop the named-shadowing step of `Resolver::walk` (the
-/// `followed.retain(|hop| hop.named)` block) - two answers, no caller.
+/// `hops.retain(|hop| hop.named)` block) - two answers, no caller.
 #[test]
 fn a_project_named_use_shadows_the_parents_glob_for_a_test_module() {
     let fixture = Fixture::new(&tests_calling(&glob_of_x_declaring("use crate::m::P;", "P"), "P"));

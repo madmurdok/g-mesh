@@ -2576,7 +2576,7 @@ fn gm479_user_glob_of_x() -> NodeRecord {
 /// so the call stays unresolved rather than linking `x::Error::new`.
 ///
 /// Control: drop the named-shadowing step of `Resolver::walk` (the
-/// `followed.retain(|hop| hop.named)` block) - the call links
+/// `hops.retain(|hop| hop.named)` block) - the call links
 /// `x::Error::new`.
 #[test]
 fn gm479_an_external_named_use_shadows_a_glob_and_leaves_the_call_unresolved() {
@@ -2589,7 +2589,7 @@ fn gm479_an_external_named_use_shadows_a_glob_and_leaves_the_call_unresolved() {
 /// call links `y::Error::new`, not `x`'s.
 ///
 /// Control: drop the named-shadowing step of `Resolver::walk` (the
-/// `followed.retain(|hop| hop.named)` block) - `x` and `y` answer at the
+/// `hops.retain(|hop| hop.named)` block) - `x` and `y` answer at the
 /// same depth and the call stays unresolved.
 #[test]
 fn gm479_a_project_named_use_shadows_a_glob_and_links_its_own_item() {
