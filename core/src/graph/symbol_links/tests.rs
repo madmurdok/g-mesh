@@ -2598,17 +2598,19 @@ fn gm479_a_project_named_use_shadows_a_glob_and_links_its_own_item() {
     assert_eq!(edge_target(&conn, &edge), ("Function:src/y.rs:y::Error::new".to_string(), true));
 }
 
-/// A named row the requester may not follow shadows nothing: `user` has the
-/// private `use crate::y::Error;` and a `pub use crate::x::*;`. The sibling
-/// `other`, globbing `user`, cannot follow the private row, so the public
-/// glob answers it with `x::Error::new`; the test module, which can, gets
-/// `y::Error::new`.
+/// A named row shadows the scope's globs even for a requester that may not
+/// follow it: `user` has the private `use crate::y::Error;` and a
+/// `pub use crate::x::*;`. In rustc the explicit import hides `x::Error` from
+/// `user`'s namespace, so the sibling `other`, globbing `user`, cannot reach
+/// any `Error` (it does not compile) and its call stays unresolved rather
+/// than linking `x::Error::new`. The test module, which may follow the
+/// private row, gets `y::Error::new`.
 ///
-/// Control: in `Resolver::walk`, apply the named-shadowing step to every row
-/// of `hops` before the `restricted_to` check - `other`'s call stays
-/// unresolved.
+/// Control: in `Resolver::walk`, apply the named-shadowing step only to the
+/// rows left after the `restricted_to` check - `other`'s call links
+/// `x::Error::new`.
 #[test]
-fn gm479_a_named_row_the_requester_cannot_follow_shadows_no_glob() {
+fn gm479_a_named_row_shadows_globs_even_for_a_requester_that_cannot_follow_it() {
     let named = gm479_private(gm479_user(), "Error", "krate::y", "Error");
     let public_glob = container_reexport(gm479_user(), REEXPORT_ALL_NAME, "krate::x", REEXPORT_ALL_NAME);
     let mut conn = setup();
@@ -2626,6 +2628,6 @@ fn gm479_a_named_row_the_requester_cannot_follow_shadows_no_glob() {
         apply_diff(&mut conn, &diff).unwrap();
     }
     link_all(&mut conn).unwrap();
-    assert_eq!(edge_target(&conn, &other_edge), ("Function:src/x.rs:x::Error::new".to_string(), true));
+    assert!(!edge_target(&conn, &other_edge).1, "{:?}", edge_target(&conn, &other_edge));
     assert_eq!(edge_target(&conn, &tests_edge), ("Function:src/y.rs:y::Error::new".to_string(), true));
 }
