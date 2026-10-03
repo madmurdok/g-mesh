@@ -732,6 +732,12 @@ impl PluginRegistry {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
     }
 
+    /// Every discovered language's `[plugin.non_symbol_queries]`, for the
+    /// semantic rung. Fixed for the daemon's lifetime, as discovery is.
+    pub(crate) fn query_shapes(&self) -> crate::mcp::query_shapes::QueryShapes {
+        crate::mcp::query_shapes::QueryShapes::from_manifests(self.discovered.manifests.values())
+    }
+
     /// Whether `language`'s manifest declares both `semantic_pass` and
     /// `semantic_prepare` - the plugins `daemon::semantic` tells about an
     /// owed pass before asking for it. Answered from the manifest, so it

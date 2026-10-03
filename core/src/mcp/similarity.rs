@@ -85,9 +85,10 @@
 //! A score that high on an index the query has nothing to do with is proof
 //! that the number describes the query's shape, not the corpus.
 //!
-//! [`find_definition::is_module_specifier`](super::find_definition) makes the
-//! same check and deliberately makes it differently: its input is a symbol
-//! name, so `contains('/')` is enough. This tool's input is free text, where
+//! `find_definition`'s semantic rung makes the same check
+//! ([`QueryShapes`](super::query_shapes::QueryShapes), from each plugin's
+//! declared shapes) and deliberately makes it differently: its input is a
+//! symbol name, so `contains('/')` is enough. This tool's input is free text, where
 //! `"serialize/deserialize the config"` is an ordinary query - hence the
 //! whitespace guard here. Measured across every arm of the sweep,
 //! [`is_specifier_query`] fires on 35 of the 70 junk queries (package
@@ -296,7 +297,7 @@ pub(crate) fn floor(language: &str) -> f64 {
 /// Whether `query` is a specifier rather than a description of behaviour.
 ///
 /// Three conditions, and the whitespace one is the whole difference from
-/// `find_definition::is_module_specifier`: that predicate judges a symbol
+/// `find_definition`'s semantic rung: its shapes judge a symbol
 /// name, where a `/` can only be a path separator, while this one judges free
 /// text, where `"serialize/deserialize the config"` is a perfectly ordinary
 /// thing to search for. Measured over the whole sweep this fires on 35 of the
@@ -540,7 +541,7 @@ mod tests {
 
     /// Free text is this tool's input, so the guard may not fire on a `/`
     /// that a person wrote inside a sentence. This is the whole reason the
-    /// predicate is not `find_definition::is_module_specifier`.
+    /// predicate is not the semantic rung's shapes.
     #[test]
     fn a_slash_inside_a_phrase_is_not_a_specifier() {
         assert!(!is_specifier_query("serialize/deserialize the config"));

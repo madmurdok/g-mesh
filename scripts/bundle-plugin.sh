@@ -358,7 +358,7 @@ args = []
 [plugin.languages]
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 
-# Same capabilities/workspace declarations as the repo's own
+# Same capabilities/workspace/non_symbol_queries declarations as the repo's own
 # plugins/typescript/plugin.toml - see that file's comments for the full
 # rationale behind each value; this is the installed copy of the same facts
 # about the same plugin binary, not a second decision.
@@ -371,6 +371,10 @@ receiver_calls_structural = "unresolved"
 watch_files = []
 exclude_dirs = ["node_modules", "dist"]
 entry_points = ["index"]
+
+[plugin.non_symbol_queries]
+starts_with = ["@"]
+contains = ["/"]
 EOF
 
 	# A bundle that cannot even introduce itself is not worth packaging. Run

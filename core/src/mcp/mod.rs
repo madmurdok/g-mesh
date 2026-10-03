@@ -48,6 +48,7 @@ mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
 mod provenance;
+pub(crate) mod query_shapes;
 mod search_code;
 #[cfg(test)]
 mod search_code_rerank_tests;
@@ -197,6 +198,7 @@ pub struct GMeshMcpServer {
     core_activity: Arc<CoreActivity>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
+    shapes: Arc<query_shapes::QueryShapes>,
     hints: session_hints::SessionHints,
     tool_router: ToolRouter<Self>,
 }
@@ -210,12 +212,14 @@ impl GMeshMcpServer {
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
+        let shapes = Arc::new(registry.query_shapes());
         Self {
             store,
             registry,
             core_activity,
             indexing,
             embedding,
+            shapes,
             hints: session_hints::SessionHints::default(),
             tool_router: Self::tool_router(),
         }
@@ -643,9 +647,11 @@ impl GMeshMcpServer {
         let store = Arc::clone(&self.store);
         let project_root = self.registry.project_root().to_path_buf();
         let params = params.0;
-        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
-            find_definition::handle_in(&store, &project_root, semantic, params.clone())
-        })
+        find_definition::resolve_lazily_off_worker(
+            Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
+            move |semantic| find_definition::handle_in(&store, &project_root, semantic, params.clone()),
+        )
         .await
     }
 
@@ -663,9 +669,13 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
-            find_references::handle_in(&store, semantic, &capabilities, &hints, params.clone())
-        })
+        find_definition::resolve_lazily_off_worker(
+            Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
+            move |semantic| {
+                find_references::handle_in(&store, semantic, &capabilities, &hints, params.clone())
+            },
+        )
         .await
     }
 
@@ -680,9 +690,19 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
-            find_callers_callees::handle_callers_in(&store, semantic, &capabilities, &hints, params.clone())
-        })
+        find_definition::resolve_lazily_off_worker(
+            Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
+            move |semantic| {
+                find_callers_callees::handle_callers_in(
+                    &store,
+                    semantic,
+                    &capabilities,
+                    &hints,
+                    params.clone(),
+                )
+            },
+        )
         .await
     }
 
@@ -696,9 +716,13 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
-        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
-            find_callers_callees::handle_callees_in(&store, semantic, &capabilities, params.clone())
-        })
+        find_definition::resolve_lazily_off_worker(
+            Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
+            move |semantic| {
+                find_callers_callees::handle_callees_in(&store, semantic, &capabilities, params.clone())
+            },
+        )
         .await
     }
 
@@ -715,9 +739,13 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
-        find_definition::resolve_lazily_off_worker(Arc::clone(&self.embedding), move |semantic| {
-            find_implementations::dispatch_in(&store, semantic, &capabilities, params.clone())
-        })
+        find_definition::resolve_lazily_off_worker(
+            Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
+            move |semantic| {
+                find_implementations::dispatch_in(&store, semantic, &capabilities, params.clone())
+            },
+        )
         .await
     }
 

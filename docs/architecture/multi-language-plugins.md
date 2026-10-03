@@ -417,6 +417,14 @@ exclude_dirs = ["vendor", "testdata"]
 # File or directory names a miss-path lookup treats as a container's entry point.
 entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: ["index"]
 
+[plugin.non_symbol_queries]
+# Query shapes that are never this language's symbols. Literal, case-sensitive.
+# A query that starts with any `starts_with` entry or contains any `contains`
+# entry has this language's semantic candidates set aside - and only this
+# language's. Absent: this language refuses nothing.
+starts_with = ["@"]
+contains = ["/"]
+
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
 # Absent means the plugin has no language server behind its semantic tier.
@@ -453,6 +461,19 @@ RA_LOG = "error"
 [plugin.semantic.initialization_options]   # passed to `initialize` verbatim
 cachePriming = { enable = false }
 ```
+
+`[plugin.non_symbol_queries]` is read by `find_definition`'s semantic rung
+(the last rung of every name-resolving tool). For each candidate the rung
+drops it when the query has one of the shapes its *own* language declares, so
+a plugin can only ever affect its own language's answers. When every
+discovered language refuses the query, the rung stops before embedding it.
+Core holds no shape of its own, and there is no default list: a plugin that
+declares nothing refuses nothing. Validation, as hard errors naming the
+manifest path: an empty string (it would match every query) and an unknown key
+in the table (so a misspelt `start_with` fails loudly). The four shipped
+plugins declare `starts_with = ["@"]` and `contains = ["/"]`.
+`g-mesh plugins list` and `g-mesh plugins check` print the declaration.
+Decision: [ADR 0018](../adr/0018-non-symbol-query-shapes.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest

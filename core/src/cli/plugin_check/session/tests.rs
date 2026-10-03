@@ -24,6 +24,7 @@ fn fake_workspace_plugin_manifest(command: PathBuf) -> PluginManifest {
         manifest_dir: PathBuf::from("/dev/null"),
         capabilities: Capabilities::default(),
         workspace: WorkspaceConfig::default(),
+        non_symbol_queries: Default::default(),
     }
 }
 

@@ -17,6 +17,7 @@ use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::query_shapes::QueryShapes;
 use super::similarity;
 use super::source;
 use super::tool_result::{error, internal_error, success};
@@ -380,26 +381,36 @@ pub(super) struct Resolved {
 ///
 /// The cost on that path is the structural rungs read twice (a few indexed
 /// lookups); on every other path, nothing.
+///
+/// Both passes carry the discovered languages' [`QueryShapes`], which decide
+/// which queries and candidates the rung sets aside.
 pub(crate) enum SemanticRung<'a> {
     /// First pass: reaching the rung records the name in `reached`.
-    Deferred { embedding: &'a EmbeddingPipeline, reached: Cell<Option<String>> },
+    Deferred { embedding: &'a EmbeddingPipeline, shapes: &'a QueryShapes, reached: Cell<Option<String>> },
     /// Second pass: `name`'s query vector, embedded with no lock held. `None`
     /// when the model could not embed it, which refuses as before.
-    Embedded { name: &'a str, query: Option<&'a [f32]> },
+    Embedded { name: &'a str, query: Option<&'a [f32]>, shapes: &'a QueryShapes },
 }
 
 impl<'a> SemanticRung<'a> {
-    pub(crate) fn deferred(embedding: &'a EmbeddingPipeline) -> Self {
-        Self::Deferred { embedding, reached: Cell::new(None) }
+    pub(crate) fn deferred(embedding: &'a EmbeddingPipeline, shapes: &'a QueryShapes) -> Self {
+        Self::Deferred { embedding, shapes, reached: Cell::new(None) }
     }
 
     /// A rung with no model behind it, for tests that pin the structural
-    /// ladder: it refuses where the semantic rung would answer.
+    /// ladder: it refuses where the semantic rung would answer. It carries
+    /// the shipped plugins' shapes.
     #[cfg(test)]
     pub(crate) fn off() -> SemanticRung<'static> {
         static DISABLED: std::sync::LazyLock<EmbeddingPipeline> =
             std::sync::LazyLock::new(EmbeddingPipeline::disabled);
-        SemanticRung::deferred(&DISABLED)
+        SemanticRung::deferred(&DISABLED, QueryShapes::shipped())
+    }
+
+    fn shapes(&self) -> &'a QueryShapes {
+        match self {
+            Self::Deferred { shapes, .. } | Self::Embedded { shapes, .. } => shapes,
+        }
     }
 
     /// The name a [`Deferred`](Self::Deferred) pass stopped at the rung with,
@@ -419,13 +430,14 @@ impl<'a> SemanticRung<'a> {
 /// callers already off the async workers (the CLI, tests).
 pub(crate) fn resolve_lazily(
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     handler: impl Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData>,
 ) -> Result<CallToolResult, ErrorData> {
-    let first = SemanticRung::deferred(embedding);
+    let first = SemanticRung::deferred(embedding, shapes);
     let answer = handler(&first)?;
     let Some(name) = first.reached() else { return Ok(answer) };
     let query = embedding.embed_query(&name);
-    handler(&SemanticRung::Embedded { name: &name, query: query.as_deref() })
+    handler(&SemanticRung::Embedded { name: &name, query: query.as_deref(), shapes })
 }
 
 /// [`resolve_lazily`] for the server: the first pass, plain store reads, runs
@@ -436,13 +448,14 @@ pub(crate) fn resolve_lazily(
 /// blocking work.
 pub(super) async fn resolve_lazily_off_worker<H>(
     embedding: Arc<EmbeddingPipeline>,
+    shapes: Arc<QueryShapes>,
     handler: H,
 ) -> Result<CallToolResult, ErrorData>
 where
     H: Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData> + Send + 'static,
 {
     let name = {
-        let first = SemanticRung::deferred(&embedding);
+        let first = SemanticRung::deferred(&embedding, &shapes);
         let answer = handler(&first)?;
         match first.reached() {
             Some(name) => name,
@@ -451,7 +464,7 @@ where
     };
     tokio::task::spawn_blocking(move || {
         let query = embedding.embed_query(&name);
-        handler(&SemanticRung::Embedded { name: &name, query: query.as_deref() })
+        handler(&SemanticRung::Embedded { name: &name, query: query.as_deref(), shapes: &shapes })
     })
     .await
     .map_err(|e| internal_error("symbol resolution task failed", e.into()))?
@@ -491,33 +504,15 @@ where
 /// on both counts and is reached by the same first arm of the match below,
 /// unchanged.
 ///
-/// # The specifier guard on the second arm is gone, because it is now dead (GM-367)
+/// # No specifier guard on the second arm
 ///
-/// GM-360 added `if !is_module_specifier(name)` to the `qualifiedName` arm
-/// for one reason: gin's `net/http` was the qualifiedName of 63
-/// `external_module` import placeholders, so without it a package name was
-/// answered with a page of 20 rows that are not declarations. GM-367 removed
-/// those rows from `graph::queries`' lookups instead, one layer down, which
-/// is where the problem always was - and with them gone, nothing this guard
-/// could catch reaches it.
-///
-/// Measured on the three probe indexes (gin, ripgrep, requests - schema 8,
-/// indexer 2) and on a fourth, older excalidraw one: after the exclusion, no
-/// specifier-shaped spelling is the `qualifiedName` of two or more
-/// declarations, in any of them. The reason is structural rather than a
-/// property of these four codebases - every declaration whose qualifiedName
-/// contains `/` or starts with `@` is a `File` node, and a file path is
-/// unique within a project by construction, so `exact.len() >= 2` cannot
-/// arise for a specifier-shaped query at all. The guard's arm is never
-/// entered, so its condition is never evaluated.
-///
-/// It is removed rather than left as a belt-and-braces second defence,
-/// because a guard that cannot fire still reads as the place the problem is
-/// handled, and the next person to work here would have to re-derive that it
-/// is not. `is_module_specifier` itself stays: its *other* caller,
-/// [`by_semantic_neighbours`], is where shape genuinely decides something
-/// a score cannot (`@excalidraw/element` scores 0.699 against an index it has
-/// nothing to do with).
+/// The `qualifiedName` arm needs no check for specifier-shaped names.
+/// Import placeholders are excluded from `graph::queries`' lookups, and
+/// every remaining declaration whose qualifiedName contains `/` or starts
+/// with `@` is a `File` node, whose path is unique within a project. So
+/// `exact.len() >= 2` cannot arise for a specifier-shaped query, and a
+/// guard there could never fire. The shape check lives where it decides
+/// something a score cannot: [`by_semantic_neighbours`].
 ///
 /// `Ok(Ok(node))` is that node. `Ok(Err(result))` is a finished response the
 /// caller must return unchanged - the ranked candidate page when the name is
@@ -628,45 +623,6 @@ fn by_qualified_name_suffix(
 /// first in 19 of 21 cases, so a long list would be payload without value.
 const SEMANTIC_CANDIDATES: usize = 3;
 
-/// Whether `name` is a module specifier rather than a symbol name.
-///
-/// Checked *before* the score, because the score cannot catch this. Package
-/// specifiers are the only kind of junk query that approaches the threshold -
-/// `@excalidraw/element` scores 0.699 - and the reason is structural: only doc
-/// comments and signatures are embedded, so a specifier has nothing to match
-/// and similarity is computed against unrelated text. The same string scores
-/// 0.566 against an index where that package does not exist at all, which is
-/// the proof that the score describes the query's shape and not the corpus.
-///
-/// Raising the threshold to 0.70 would exclude it too, and cost 42 points of
-/// recall to do so. This costs nothing, and specifiers already have a rung of
-/// their own - `get_dependencies`' path matching.
-///
-/// # Why this is a spelling rule and not a lookup
-///
-/// Every specifier the index stores is answered before this check is made:
-/// a file path is a `File` node's `qualifiedName` and resolves at the first
-/// rung, and an import placeholder's specifier is answered by
-/// [`import_only_refusal`]. Of the stored module keys, only a container key
-/// (`containers.key`) gets this far. So "the query equals a stored module key
-/// or file path" would decide almost nothing here, and the specifiers this
-/// check exists for are exactly the ones no table holds: a relative
-/// specifier such as `./extract.js`, which the index records only as the file
-/// it resolves to, and a package this project never imports. A lookup cannot
-/// recognise either; replaced by one, both go on to the semantic rung and are
-/// offered whatever clears the floor. Measured on the TypeScript plugin's own
-/// sources, that turned 55 of 401 queries' refusals into candidate pages, 47
-/// of them import specifiers written in those sources; on the Go plugin's
-/// sources, 1 of 335, a synthetic `./extract`
-/// (`docs/architecture/gm-474-qualified-name-segments.md`, section 3.5).
-///
-/// The cost of the rule is the other direction: a symbol-name query that
-/// starts with `@` or contains `/` but is not a specifier (`@Component`) is
-/// refused here instead of being offered neighbours.
-fn is_module_specifier(name: &str) -> bool {
-    name.starts_with('@') || name.contains('/')
-}
-
 /// The rung between "no file carries this name either" and a refusal: ask the
 /// semantic index, and offer what it returns as *candidates*.
 ///
@@ -693,9 +649,49 @@ fn is_module_specifier(name: &str) -> bool {
 /// # When it stays silent
 ///
 /// No model (`embed_query` is `None` on a machine that never downloaded the
-/// 154 MiB weights), a specifier-shaped query, or nothing scoring above its
-/// language's [`similarity::floor`]: all three fall through to the terse
-/// refusal this rung was added in front of, never to an error.
+/// 154 MiB weights), a query every discovered language declares is never its
+/// symbol, or nothing scoring above its language's [`similarity::floor`]
+/// once each language's own refused shapes are set aside: all three fall
+/// through to the terse refusal this rung was added in front of, never to an
+/// error.
+///
+/// # Shapes that are never a symbol
+///
+/// Each plugin declares, in `[plugin.non_symbol_queries]`, the query shapes
+/// that are never its language's symbols ([`QueryShapes`]). A candidate of
+/// language L is dropped when the query has one of L's shapes, next to the
+/// floor; when every discovered language refuses the query, the rung stops
+/// before the query is embedded. Core knows no shape itself
+/// (`docs/adr/0018-non-symbol-query-shapes.md`).
+///
+/// This is checked by shape, not by score, because the score cannot catch
+/// it. Package specifiers are the only kind of junk query that approaches
+/// the threshold - `@excalidraw/element` scores 0.699 - and the reason is
+/// structural: only doc comments and signatures are embedded, so a specifier
+/// has nothing to match and similarity is computed against unrelated text.
+/// The same string scores 0.566 against an index where that package does not
+/// exist at all, which is the proof that the score describes the query's
+/// shape and not the corpus. Raising the threshold to 0.70 would exclude it
+/// too, and cost 42 points of recall to do so. Specifiers already have a
+/// rung of their own - `get_dependencies`' path matching.
+///
+/// It is a spelling rule and not a lookup. Every specifier the index stores
+/// is answered before this rung: a file path is a `File` node's
+/// `qualifiedName` and resolves at the first rung, and an import
+/// placeholder's specifier is answered by [`import_only_refusal`]. Of the
+/// stored module keys, only a container key (`containers.key`) gets this
+/// far. The specifiers the shapes exist for are exactly the ones no table
+/// holds: a relative specifier such as `./extract.js`, which the index
+/// records only as the file it resolves to, and a package this project never
+/// imports. Measured on the TypeScript plugin's own sources, a lookup in
+/// place of the shapes turned 55 of 401 queries' refusals into candidate
+/// pages, 47 of them import specifiers written in those sources; on the Go
+/// plugin's sources, 1 of 335, a synthetic `./extract`
+/// (`docs/architecture/gm-474-qualified-name-segments.md`, section 3.5).
+///
+/// The cost is the other direction: a symbol-name query with a refused shape
+/// that is not a specifier (`@Component`) is refused instead of being
+/// offered neighbours.
 ///
 /// # The floor is shared with `search_code`
 ///
@@ -725,11 +721,12 @@ fn by_semantic_neighbours(
     semantic: &SemanticRung<'_>,
     name: &str,
 ) -> Option<Result<CallToolResult, ErrorData>> {
-    if is_module_specifier(name) {
+    let shapes = semantic.shapes();
+    if shapes.refused_by_all(name) {
         return None;
     }
     let query = match semantic {
-        SemanticRung::Deferred { embedding, reached } => {
+        SemanticRung::Deferred { embedding, reached, .. } => {
             // A model already known to be absent embeds nothing, so there is
             // no second pass to defer to: refuse now, as `embed_query`'s
             // `None` would.
@@ -740,7 +737,7 @@ fn by_semantic_neighbours(
             // A placeholder the driver discards for the second pass's answer.
             return None;
         }
-        SemanticRung::Embedded { name: embedded, query } => {
+        SemanticRung::Embedded { name: embedded, query, .. } => {
             debug_assert_eq!(*embedded, name, "the second pass resolves the name the first one stopped at");
             if *embedded != name {
                 return None;
@@ -752,7 +749,7 @@ fn by_semantic_neighbours(
     let results: Vec<DefinitionCandidate> = page
         .results
         .into_iter()
-        .filter(|hit| hit.score >= similarity::floor(&hit.language))
+        .filter(|hit| hit.score >= similarity::floor(&hit.language) && !shapes.refuses(&hit.language, name))
         .map(DefinitionCandidate::from)
         .collect();
     if results.is_empty() {
@@ -958,9 +955,10 @@ pub(crate) fn handle(
     store: &Arc<IndexStore>,
     project_root: &Path,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
-    resolve_lazily(embedding, |semantic| handle_in(store, project_root, semantic, params.clone()))
+    resolve_lazily(embedding, shapes, |semantic| handle_in(store, project_root, semantic, params.clone()))
 }
 
 /// One pass of [`handle`] - see [`SemanticRung`].
