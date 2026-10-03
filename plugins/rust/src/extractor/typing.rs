@@ -250,6 +250,10 @@ mod tests {
         assert_eq!(name(&ty), "Result");
         let args: Vec<&str> = ty.args.iter().map(|arg| name(arg.as_ref().unwrap())).collect();
         assert_eq!(args, ["T", "E"]);
+        // A lifetime written as an argument of its own, not inside a `&`.
+        let ty = written("fn f<'a>() -> W<'a, T, E> {}").unwrap();
+        let args: Vec<&str> = ty.args.iter().map(|arg| name(arg.as_ref().unwrap())).collect();
+        assert_eq!(args, ["T", "E"]);
     }
 
     #[test]
