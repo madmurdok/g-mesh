@@ -59,7 +59,10 @@ silence every other language.
   syntax: a prose query (whitespace inside the trimmed text) is never a
   specifier, so `"serialize/deserialize the config"` is judged by its score.
 - The four shipped plugins (TypeScript, Go, Rust, Python) declare `@` and `/`.
-  No function, type or member of any of them is spelled with either.
+  No function, type or member of any of them is spelled with either. Python
+  also declares a leading `.`, a relative import (`.models`, `..pkg.mod`): no
+  Python name starts with one. Such a query sets aside Python candidates and
+  rows only; TypeScript, Go and Rust candidates are still offered.
 
 ## Consequences
 

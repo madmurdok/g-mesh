@@ -655,6 +655,29 @@ mod tests {
         assert_eq!(verdict(&shapes, "src/lib.ts", None, &high), None, "the accepting row clears its floor");
     }
 
+    /// The shipped Python manifest refuses a leading `.` (a relative import);
+    /// no other shipped language does. A Python-only page is a specifier page,
+    /// a page with a TypeScript row that clears its floor says nothing, and an
+    /// empty page says nothing because not every language refuses the query.
+    ///
+    /// Control: remove `"."` from `plugins/python/plugin.toml`'s `starts_with`
+    /// - the Python-only page gets no specifier verdict and this fails.
+    #[test]
+    fn with_the_shipped_shapes_a_relative_import_is_refused_by_python_rows_only() {
+        let python = [hit(0.90, "python")];
+        let mixed = [hit(0.90, "python"), hit(0.60, "typescript")];
+
+        for query in [".models", "..pkg.mod"] {
+            assert_eq!(
+                verdict(shipped(), query, None, &python).map(|v| v.reason),
+                Some(NoMatchReason::QueryIsAPathOrPackage),
+                "{query}"
+            );
+            assert_eq!(verdict(shipped(), query, None, &mixed), None, "{query}");
+            assert_eq!(verdict(shipped(), query, None, &[]), None, "{query}");
+        }
+    }
+
     /// An empty page is a specifier page only when every discovered language
     /// refuses the query.
     #[test]

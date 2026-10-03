@@ -1015,6 +1015,32 @@ fn a_candidate_is_dropped_by_its_own_languages_shapes() {
     assert_eq!(error_text(&result), "g-mesh: no symbol named 'getX' found");
 }
 
+/// With the shipped declarations a relative import (`.models`) is refused by
+/// Python alone: it still reaches the rung, the Python hit is dropped though
+/// it scores 1.0, and the Rust hit beside it is offered.
+///
+/// Control: remove `"."` from `plugins/python/plugin.toml`'s `starts_with` -
+/// the Python hit is offered too and this fails.
+#[test]
+fn with_the_shipped_shapes_a_relative_import_drops_only_python_candidates() {
+    let mut conn = setup_with_vectors();
+    upsert_node(&mut conn, NodeRecord::new("py", "Function", "near", "pkg.near", "a.py", "python")).unwrap();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+    insert_vector(&conn, "py", &[1.0, 0.0]);
+
+    let embedding = unloaded_pipeline();
+    let rung = SemanticRung::deferred(&embedding, QueryShapes::shipped());
+    by_name(&conn, None, &rung, ".models", None).unwrap();
+    assert_eq!(rung.reached().as_deref(), Some(".models"), "not every language refuses it");
+
+    let body = json_body(&with_a_matching_vector(&conn, ".models"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours", "{body}");
+    let ids: Vec<&str> =
+        body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["near"], "{body}");
+}
+
 /// With no declarations at all, nothing is refused by shape: core holds no
 /// fallback list of its own.
 ///

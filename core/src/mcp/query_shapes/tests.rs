@@ -56,13 +56,16 @@ fn a_plugin_without_the_table_keeps_refused_by_all_false() {
 }
 
 /// The committed manifests declare what the design table says: every shipped
-/// plugin refuses a leading `@` and any `/`, and nothing else.
+/// plugin refuses a leading `@` and any `/`, Python also a leading `.` (a
+/// relative import), and nothing else.
 ///
 /// Control: delete the `[plugin.non_symbol_queries]` table from any one
-/// shipped `plugin.toml` - its entry comes back empty and this fails.
+/// shipped `plugin.toml`, or the `"."` from Python's - its entry comes back
+/// different and this fails.
 #[test]
 fn the_shipped_manifests_declare_at_and_slash() {
-    for language in ["typescript", "go", "rust", "python"] {
+    for language in ["typescript", "go", "rust"] {
         assert_eq!(QueryShapes::shipped().get(language), Some(&shapes(&["@"], &["/"])), "{language}");
     }
+    assert_eq!(QueryShapes::shipped().get("python"), Some(&shapes(&["@", "."], &["/"])));
 }
