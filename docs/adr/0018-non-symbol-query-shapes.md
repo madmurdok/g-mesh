@@ -68,8 +68,10 @@ silence every other language.
 
 - Core holds no language's syntax for this rung, and a new language adds no
   core code.
-- With the shipped declarations every language refuses the same shapes, so
-  answers are unchanged.
+- With the shipped declarations every language refuses `@` and `/`, so
+  answers to those queries are unchanged. Python also refuses a leading `.`,
+  which changes only relative-import queries such as `.models`: Python
+  candidates are no longer offered for them.
 - When only some languages refuse a query, it is embedded where it was not
   before: that can be the first model load, and it adds latency.
 - A candidate page can hold fewer than three candidates when one language's
