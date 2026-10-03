@@ -237,6 +237,45 @@ fn a_test_module_calls_a_type_its_parent_declares() {
     assert_linked_callers(&fixture, "user::D::load", &["user::tests::loads"]);
 }
 
+/// `pub mod x` declaring `<head>::load`, beside a `use self::x::*;` placed
+/// below the parent's named `use` line `named`.
+fn glob_of_x_declaring(named: &str, head: &str) -> String {
+    format!(
+        "{named}\nuse self::x::*;\n\npub mod x {{\n    pub struct {head};\n\n    impl {head} {{\n        \
+         pub fn load(c: u32) {{\n            let _ = c;\n        }}\n    }}\n}}\n"
+    )
+}
+
+/// The parent's explicit `use std::fmt::Error;` shadows its `use self::x::*;`
+/// for the test module too: the call is not linked to `x::Error::load`, and
+/// that page says it is not exact. Without the `use`, the glob links it.
+///
+/// Control: make `Declarer::use_leaf` emit no row for an external named
+/// `use` - `user::tests::loads` becomes a caller of `user::x::Error::load`.
+#[test]
+fn an_external_named_use_shadows_the_parents_glob_for_a_test_module() {
+    let fixture =
+        Fixture::new(&tests_calling(&glob_of_x_declaring("use std::fmt::Error;", "Error"), "Error"));
+    let page = fixture.callers("user::x::Error::load");
+    assert!(caller_names(&page).is_empty(), "{page}");
+    assert!(page["unlinkedUsages"]["count"].as_u64().unwrap() >= 1, "{page}");
+
+    let without_the_use = Fixture::new(&tests_calling(&glob_of_x_declaring("", "Error"), "Error"));
+    assert_linked_callers(&without_the_use, "user::x::Error::load", &["user::tests::loads"]);
+}
+
+/// The parent's explicit `use crate::m::P;` shadows its `use self::x::*;`
+/// that also provides a `P`: the test module's call links `m`'s `P`.
+///
+/// Control: drop the named-shadowing step of `Resolver::walk` (the
+/// `followed.retain(|hop| hop.named)` block) - two answers, no caller.
+#[test]
+fn a_project_named_use_shadows_the_parents_glob_for_a_test_module() {
+    let fixture = Fixture::new(&tests_calling(&glob_of_x_declaring("use crate::m::P;", "P"), "P"));
+    assert_linked_callers(&fixture, "m::inner::P::load", &["user::tests::loads"]);
+    assert!(caller_names(&fixture.callers("user::x::P::load")).is_empty());
+}
+
 fn path(segments: &[&str]) -> QualifiedPath {
     QualifiedPath(
         segments
