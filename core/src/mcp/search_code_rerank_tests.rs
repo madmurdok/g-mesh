@@ -663,3 +663,40 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         assert_eq!(lines.count(), 0, "{}", case.query_id);
     }
 }
+
+/// `search_code` never applies a strip prefix (GM-482, decision D4): an
+/// `@`-query is embedded and answered as typed, exactly as with no
+/// `[plugin.symbol_query_prefixes]` declared anywhere.
+///
+/// Control: in `search_code::handle`, embed the first rewrite's remainder
+/// (`shapes.rewrites(&params.query).first().map_or(params.query.as_str(),
+/// |(_, rest)| *rest)`) in place of `params.query` - the stripping arm embeds
+/// `Component`, its page differs from the other arm's, and this fails.
+#[test]
+fn search_code_embeds_a_prefixed_query_as_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_for(
+        "@Component",
+        &[
+            Row { id: "Component".to_string(), language: "typescript", cosine: 0.9 },
+            Row { id: "other".to_string(), language: "python", cosine: 0.5 },
+        ],
+    );
+    let stripping = QueryShapes::shipped();
+    let base = stripping.clone().with_strip("typescript", &[]).with_strip("python", &[]);
+    assert_ne!(stripping.rewrites("@Component"), base.rewrites("@Component"), "the arms must differ");
+
+    let run = |shapes: &QueryShapes| {
+        let counters = Counters::default();
+        let embedding = fake_pipeline(&fake_model_dir(dir.path(), "weights"), None, &counters);
+        let params = SearchCodeParams { query: "@Component".to_string(), cursor: None, limit: None };
+        let result = handle(&store, &embedding, shapes, &SessionHints::default(), params, None).unwrap();
+        (body(&result), counters.received())
+    };
+    let (with_strip, embedded) = run(stripping);
+    let (without_strip, embedded_base) = run(&base);
+
+    assert_eq!(embedded, vec!["@Component".to_string()]);
+    assert_eq!(embedded, embedded_base);
+    assert_eq!(with_strip, without_strip);
+}

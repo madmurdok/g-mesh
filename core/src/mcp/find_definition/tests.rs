@@ -1546,3 +1546,157 @@ fn the_original_query_wins_over_a_rewrite() {
     assert_eq!(body["id"], "literal", "{body}");
     assert!(body.get("queriedAs").is_none(), "{body}");
 }
+
+/// A TypeScript declaration stored with `path`, named after its last segment.
+fn ts_path_decl(conn: &mut Connection, id: &str, path: QualifiedPath) {
+    let name = path.last().unwrap().name.clone();
+    let mut node = NodeRecord::new(id, "Function", name, path.display(), format!("{id}.ts"), "typescript");
+    node.qualified_path = Some(path);
+    upsert_node(conn, node).unwrap();
+}
+
+/// The remainder resolves on the rewrite's own exact-qualifiedName rung,
+/// where the declaration's qualifiedName is not its name - a class member
+/// spelled `@Widget.size`.
+///
+/// Control: delete the `exact.len() == 1 && exact[0].0.name != exact[0].1`
+/// early return from `by_stripped_prefix` - `Widget.size` is then no
+/// declaration's name and has no stored suffix, so the query is refused and
+/// this fails.
+#[test]
+fn a_rewrite_resolves_on_the_exact_qualified_name_rung() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "method", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["id"], "method", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedName", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+}
+
+/// Two declarations carry the remainder as their qualifiedName: the
+/// rewrite's answer is the page over the qualifiedName column, labelled with
+/// the name it looked up.
+///
+/// Controls: drop the `(_, 2..) => Some(NameColumn::QualifiedName)` arm from
+/// `by_stripped_prefix`'s `ambiguous_over` - the query is refused and this
+/// fails; or pass `None` for `page_label` to `CandidatePage::ambiguous` -
+/// `queriedAs` is missing and this fails.
+#[test]
+fn a_rewrite_ambiguous_over_qualified_names_is_a_labelled_page() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "a", "size", "Widget.size", "typescript");
+    ts_decl(&mut conn, "b", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["ambiguous"], true, "{body}");
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+    assert_eq!(ids(&body), vec!["a", "b"], "{body}");
+}
+
+/// Two declarations store the remainder as a qualifiedName suffix: the
+/// rewrite's answer is the suffix rung's page, labelled with the name it
+/// looked up.
+///
+/// Controls: in `by_stripped_prefix`'s suffix `match`, answer the `_` arm
+/// with `answer(suffixed.remove(0), ResolvedBy::QualifiedNameSuffix)` - one
+/// declaration resolves and this fails; or pass `None` for `page_label` -
+/// `queriedAs` is missing and this fails.
+#[test]
+fn a_rewrite_ambiguous_at_the_suffix_rung_is_a_labelled_page() {
+    let mut conn = setup();
+    ts_path_decl(&mut conn, "a", qpath("a", &[(".", "Widget"), (".", "size")]));
+    ts_path_decl(&mut conn, "b", qpath("b", &[(".", "Widget"), (".", "size")]));
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["ambiguous"], true, "{body}");
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+    assert_eq!(ids(&body), vec!["a", "b"], "{body}");
+}
+
+/// The query as typed wins on the name rung: a declaration literally named
+/// `@Component` resolves even though the rewrite would find `Component`.
+///
+/// Control: call `by_stripped_prefix` before `queries::find_by_name` in
+/// `resolve_symbol_name` (returning its answer when it has one) - `deco`
+/// resolves with `queriedAs` and this fails.
+#[test]
+fn the_original_query_wins_over_a_rewrite_on_the_name_rung() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "literal", "@Component", "deco.@Component", "typescript");
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Component").unwrap());
+
+    assert_eq!(body["id"], "literal", "{body}");
+    assert_eq!(body["resolvedBy"], "name", "{body}");
+    assert!(body.get("queriedAs").is_none(), "{body}");
+}
+
+/// The query as typed wins on the suffix rung: a declaration storing
+/// `@Widget.size` as a suffix resolves even though the rewrite would find
+/// `Widget.size` by its exact qualifiedName.
+///
+/// Control: swap the order of `by_qualified_name_suffix` and
+/// `by_stripped_prefix` in `resolve_symbol_name` - `rewritten` resolves with
+/// `queriedAs` and this fails.
+#[test]
+fn the_original_query_wins_over_a_rewrite_on_the_suffix_rung() {
+    let mut conn = setup();
+    ts_path_decl(&mut conn, "literal", qpath("deco", &[(".", "@Widget"), (".", "size")]));
+    ts_decl(&mut conn, "rewritten", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["id"], "literal", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedNameSuffix", "{body}");
+    assert!(body.get("queriedAs").is_none(), "{body}");
+}
+
+/// A rewritten ambiguous page continues through its cursor: the second page
+/// holds exactly the remainder and still says what was looked up.
+///
+/// Control: pass `None` in place of `cursor` to `find_candidates_by_name` in
+/// `by_stripped_prefix` - the second call returns the first page again and
+/// this fails.
+#[test]
+fn a_rewritten_page_continues_through_its_cursor() {
+    let mut conn = setup();
+    let total = CANDIDATE_PAGE_SIZE + 1;
+    for i in 0..total {
+        ts_decl(&mut conn, &format!("c{i:02}"), "Component", &format!("m{i}.Component"), "typescript");
+    }
+    let store = Arc::new(IndexStore::new(conn));
+    let page = |cursor: Option<String>| {
+        let params = FindDefinitionParams {
+            symbol_name: Some("@Component".to_string()),
+            file_path: None,
+            position: None,
+            cursor,
+            include_source: None,
+        };
+        json_body(
+            &handle(&store, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params)
+                .unwrap(),
+        )
+    };
+
+    let first = page(None);
+    assert_eq!(first["queriedAs"], "Component", "{first}");
+    assert_eq!(first["results"].as_array().unwrap().len(), CANDIDATE_PAGE_SIZE, "{first}");
+    assert_eq!(first["hasMore"], true, "{first}");
+    let second = page(Some(first["nextCursor"].as_str().unwrap().to_string()));
+
+    assert_eq!(second["queriedAs"], "Component", "{second}");
+    assert_eq!(second["results"].as_array().unwrap().len(), 1, "{second}");
+    assert_eq!(second["hasMore"], false, "{second}");
+    let mut all: Vec<&str> = ids(&first).into_iter().chain(ids(&second)).collect();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), total, "every candidate exactly once across both pages");
+}
