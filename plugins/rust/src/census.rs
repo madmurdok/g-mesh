@@ -88,6 +88,9 @@ pub(crate) struct Data {
     pub unresolved_not_under_glob: u64,
     /// Module keys of the file being extracted that carry a glob `use`.
     globbed_modules: BTreeSet<String>,
+    /// Typed receiver calls, by where the receiver's type came from, whether
+    /// an unwrap produced it, and whether the edge is same-file.
+    pub typed_receivers: BTreeMap<(crate::extractor::Origin, bool, bool), u64>,
 }
 
 thread_local! {
@@ -156,6 +159,13 @@ pub(crate) fn note_glob(module_key: &str) {
     DATA.with(|data| {
         data.borrow_mut().globbed_modules.insert(module_key.to_string());
     });
+}
+
+pub(crate) fn typed_receiver(origin: crate::extractor::Origin, unwrapped: bool, here: bool) {
+    if !ON.with(|on| *on.borrow()) {
+        return;
+    }
+    DATA.with(|data| *data.borrow_mut().typed_receivers.entry((origin, unwrapped, here)).or_default() += 1);
 }
 
 pub(crate) fn start_file() {
@@ -246,6 +256,9 @@ mod run {
             println!("CENSUS-META\tbridge_questions_asking\t{}", data.questions);
             println!("CENSUS-META\tunresolved_under_glob\t{}", data.unresolved_under_glob);
             println!("CENSUS-META\tunresolved_not_under_glob\t{}", data.unresolved_not_under_glob);
+            for ((origin, unwrapped, here), count) in &data.typed_receivers {
+                println!("CENSUS-TYPED\t{origin:?}\tunwrapped={unwrapped}\tsame_file={here}\t{count}");
+            }
             for ((reason, ctx), count) in &data.counts {
                 println!("CENSUS-COUNT\t{reason:?}\t{ctx:?}\t{count}");
             }

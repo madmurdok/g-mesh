@@ -49,10 +49,10 @@ impl Square {
         Self::new(1)
     }
 
-    /// Called two resolving ways below - `scale`'s `self.perimeter()` and
-    /// `total_perimeter_via_path`'s `Square::perimeter(square)` - and one
-    /// gapped way, `total_perimeter`'s `square.perimeter()`. See that
-    /// function's own doc comment for what the three-way split is for.
+    /// Called three ways below - `scale`'s `self.perimeter()`,
+    /// `total_perimeter_via_path`'s `Square::perimeter(square)` and
+    /// `total_perimeter`'s `square.perimeter()` through a typed parameter -
+    /// all three resolved by the structural tier.
     pub fn perimeter(&self) -> u8 {
         self.side * 4
     }
@@ -91,23 +91,17 @@ impl Quiet for Circle {
     }
 }
 
-/// A receiver call: `square.area()` gets **no** edge, only an open site, and
-/// the semantic tier (GM-290) is what turns it into one.
+/// A receiver call through a typed parameter whose method is a trait impl's:
+/// the structural tier addresses it as `Square::area`, which names nothing,
+/// and the semantic tier is what finds `<Square as Shape>::area`.
 pub fn total(square: &Square) -> u8 {
     square.area()
 }
 
-/// The receiver-call gap, made airtight rather than merely asserted: this
-/// function's `square.perimeter()` is a receiver call on a local variable,
-/// exactly like `total`'s `square.area()` above, and gets no edge either.
-/// `Square::scale` and `total_perimeter_via_path` below reach the *same*
-/// `perimeter` declaration through the two call shapes this tier does
-/// resolve - so `conformance/expect.toml`'s `[[callers]]` entry for
-/// `shapes::Square::perimeter` can list exactly those two and omit this
-/// function, which is what turns "the receiver call is missing" into a real
-/// assertion: if a receiver call ever started resolving, this function
-/// would show up in that entry's actual set and the check would fail on the
-/// unexpected extra, not pass by never having been asked.
+/// A receiver call through a parameter whose type is written here, on an
+/// inherent method: the structural tier addresses it as `Square::perimeter`
+/// and finds it. `conformance/expect.toml`'s `[[callers]]` entry for
+/// `shapes::Square::perimeter` counts this call once, whichever tiers ran.
 pub fn total_perimeter(square: &Square) -> u8 {
     square.perimeter()
 }

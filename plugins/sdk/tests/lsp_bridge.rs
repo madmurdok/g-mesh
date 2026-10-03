@@ -205,6 +205,15 @@ fn budgets() -> Budgets {
 /// The two-file index this module's doc describes: `a.toy` declares `add`,
 /// `b.toy` calls it through a receiver it cannot resolve.
 fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
+    let (index, caller, _) = fixture_with_structural_edge(scratch, false);
+    (index, caller)
+}
+
+/// [`fixture`], where `b.toy` may also carry a structural `CALLS` edge for
+/// the site, onto a placeholder addressed differently from the one an answer
+/// produces, and the site names that edge in `replaces`. Returns the edge's
+/// id when there is one.
+fn fixture_with_structural_edge(scratch: &Scratch, structural: bool) -> (SdkIndex, String, Option<String>) {
     scratch.write("src/a.toy", A_TOY);
     scratch.write("src/b.toy", B_TOY);
 
@@ -232,6 +241,20 @@ fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
             .in_container("pkg", None)
             .public(),
     );
+    let replaces = structural.then(|| {
+        let placeholder = builder.add_placeholder(
+            g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
+            "add",
+            g_mesh_plugin_sdk::wire::PlaceholderTarget {
+                scope: TargetScope::Container("pkg".to_string()),
+                key: TargetKey::QualifiedName("Receiver::add".to_string()),
+                from_container: Some("pkg".to_string()),
+                key_path: None,
+            },
+            range(1, SITE_CHAR_COL, 1, SITE_CHAR_COL + 3),
+        );
+        builder.placeholder_edge(EdgeKind::Calls, &caller, &placeholder)
+    });
     builder.open_site(OpenSite {
         from_id: caller.clone(),
         position: Position { line: 1, col: SITE_CHAR_COL },
@@ -239,11 +262,11 @@ fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
         kind: OpenSiteKind::ReceiverCall,
         edge_kind: EdgeKind::Calls,
         from_container: Some("pkg".to_string()),
-        replaces: None,
+        replaces: replaces.clone(),
     });
     index.insert(b, B_TOY.to_string(), builder.finish());
 
-    (index, caller)
+    (index, caller, replaces)
 }
 
 fn range(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Range {
@@ -333,6 +356,31 @@ fn a_definition_becomes_a_semantic_edge() {
     assert_eq!(target.scope, TargetScope::Container("pkg".to_string()));
     assert_eq!(target.key, TargetKey::QualifiedName("add".to_string()), "exact, never a bare name");
     assert_eq!(target.from_container.as_deref(), Some("pkg"), "who is asking, for the visibility check");
+}
+
+/// A site whose structural edge reaches the answered declaration through a
+/// differently addressed placeholder: the answer's own edge has another id,
+/// so the structural edge is retracted, and the call is left with exactly
+/// one `CALLS` edge rather than one per tier.
+#[test]
+fn an_answer_for_a_site_with_a_structural_edge_leaves_one_edge_for_the_call() {
+    let scratch = Scratch::new("replaces");
+    let (index, caller, replaces) = fixture_with_structural_edge(&scratch, true);
+    let structural = replaces.expect("the fixture wrote a structural edge");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 0 },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "{:#?}", answer.diff);
+    assert_eq!(edges[0].from_id, caller);
+    assert_ne!(edges[0].id, structural);
+    assert_eq!(answer.diff.delete_edge_ids, vec![structural], "the structural edge is retracted");
 }
 
 /// The other half of decision 3: a server that negotiates a *different* unit
