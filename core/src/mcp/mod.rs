@@ -809,6 +809,7 @@ impl GMeshMcpServer {
         search_code::handle_off_worker(
             Arc::clone(&self.store),
             Arc::clone(&self.embedding),
+            Arc::clone(&self.shapes),
             self.hints.clone(),
             params.0,
             coverage,

@@ -473,6 +473,10 @@ manifest path: an empty string (it would match every query) and an unknown key
 in the table (so a misspelt `start_with` fails loudly). The four shipped
 plugins declare `starts_with = ["@"]` and `contains = ["/"]`.
 `g-mesh plugins list` and `g-mesh plugins check` print the declaration.
+`search_code` reads the same table for its `noMatch` verdict: a first page is
+`queryIsAPathOrPackage` when every row's language refuses the query (an empty
+page: every discovered language), a refused row on a mixed page counts as below
+its floor, and a prose query is never refused. Rows are never dropped.
 Decision: [ADR 0018](../adr/0018-non-symbol-query-shapes.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and

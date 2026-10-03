@@ -10,7 +10,7 @@ offers semantic neighbours for a name nothing declares. Core refused it for
 any query that started with `@` or contained `/`: an import specifier such
 as `@excalidraw/element` scores 0.699 against unrelated code, above every
 floor, because only doc comments and signatures are embedded. That rule was
-TypeScript and Go import syntax written into core, and `search_code` holds a
+TypeScript and Go import syntax written into core, and `search_code` held a
 second copy of it (`similarity::is_specifier_query`).
 
 A lookup of stored module keys cannot replace the rule. The specifiers that
@@ -50,6 +50,14 @@ silence every other language.
   rule restricting which characters a shape may use.
 - The map is built once per daemon from the discovered manifests and carried
   to the rung on `SemanticRung`.
+- `search_code` reads the same map for its page-level verdict, judging each
+  row by its own language. A first page with rows gets the specifier verdict
+  (`QueryIsAPathOrPackage`) only when every row's language refuses the query;
+  an empty first page gets it when every discovered language does. On a mixed
+  page a refused row counts as below its floor. No row is dropped, and the
+  verdict stays one per page. Core keeps one rule that is not language
+  syntax: a prose query (whitespace inside the trimmed text) is never a
+  specifier, so `"serialize/deserialize the config"` is judged by its score.
 - The four shipped plugins (TypeScript, Go, Rust, Python) declare `@` and `/`.
   No function, type or member of any of them is spelled with either.
 
@@ -69,8 +77,6 @@ silence every other language.
   later.
 - `plugin.toml` is fingerprinted, so adding the table rebuilds each index
   once.
-- `search_code` still has its own copy of the two shapes until it moves onto
-  these declarations.
 - Follow-up: TypeScript's `node:` prefix.
 
 ## Alternatives considered
