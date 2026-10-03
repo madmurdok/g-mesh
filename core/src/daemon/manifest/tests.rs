@@ -1174,3 +1174,104 @@ fn rejects_a_strip_prefix_missing_from_starts_with() {
     assert!(message.contains("[plugin.symbol_query_prefixes]"), "{message}");
     assert!(message.contains("[plugin.non_symbol_queries] starts_with"), "{message}");
 }
+
+// -----------------------------------------------------------------
+// `[plugin.reexports] named_shadows_glob`
+// -----------------------------------------------------------------
+
+fn with_reexports(table: &str) -> String {
+    format!("{}\n[plugin.reexports]\n{table}\n", well_formed_toml())
+}
+
+/// Absent means no shadowing; `true` parses; `link_rules` collects exactly
+/// the languages that declare it.
+///
+/// Controls: build `read_manifest`'s result with `reexports:
+/// Default::default()` - the `true` manifest reads false; remove
+/// `#[serde(default)]` from `RawPlugin::reexports` - the manifest without the
+/// table no longer loads; drop the `filter` from `link_rules` - `python`
+/// (declaring nothing) gets the rule.
+#[test]
+fn parses_reexports_and_defaults_to_no_shadowing() {
+    let (_absent_root, absent) = plugin_dir("python", &well_formed_toml());
+    let absent = read_manifest(&absent).unwrap();
+    assert_eq!(absent.reexports, ReexportRules::default());
+    assert!(!absent.reexports.named_shadows_glob);
+
+    let (_false_root, explicit_false) = plugin_dir("python", &with_reexports("named_shadows_glob = false"));
+    assert!(!read_manifest(&explicit_false).unwrap().reexports.named_shadows_glob);
+
+    let (_true_root, declared) = plugin_dir("python", &with_reexports("named_shadows_glob = true"));
+    let declared = read_manifest(&declared).unwrap();
+    assert!(declared.reexports.named_shadows_glob);
+
+    let renamed = |language: &str, manifest: &PluginManifest| PluginManifest {
+        language: language.to_string(),
+        ..manifest.clone()
+    };
+    let rules = link_rules([&renamed("rust", &declared), &renamed("python", &absent)]);
+    assert_eq!(rules, LinkRules::with_named_shadows_glob(["rust"]));
+    assert!(rules.named_shadows_glob("rust"));
+    assert!(!rules.named_shadows_glob("python"));
+}
+
+/// A misspelt key would otherwise be silently ignored and shadow nothing.
+///
+/// Control: remove `#[serde(deny_unknown_fields)]` from `ReexportRules` - the
+/// manifest loads and this fails.
+#[test]
+fn rejects_an_unknown_key_in_reexports() {
+    let (_root, dir) = plugin_dir("python", &with_reexports("named_shadow_glob = true"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+    assert!(message.contains("named_shadow_glob"), "{message}");
+}
+
+/// The checked-in manifests declare the rule for Rust and TypeScript and not
+/// for Python or Go (ADR 0020), so the rules the daemon builds from them are
+/// exactly those two.
+///
+/// Control: remove `[plugin.reexports]` from `plugins/rust/plugin.toml` (or
+/// add it to `plugins/python/plugin.toml`) - this fails.
+#[test]
+fn the_checked_in_manifests_declare_glob_shadowing_for_rust_and_typescript_only() {
+    let plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+    let manifests: Vec<PluginManifest> = ["rust", "typescript", "python", "go"]
+        .iter()
+        .map(|language| read_manifest(&plugins.join(language)).unwrap())
+        .collect();
+    for manifest in &manifests {
+        let expected = matches!(manifest.language.as_str(), "rust" | "typescript");
+        assert_eq!(manifest.reexports.named_shadows_glob, expected, "{}", manifest.language);
+    }
+    assert_eq!(link_rules(&manifests), LinkRules::with_named_shadows_glob(["rust", "typescript"]));
+}
+
+/// `scripts/bundle-plugin.sh` writes the installed TypeScript manifest by
+/// hand; it must declare the rule the repo's manifest does, or a release
+/// install links TypeScript barrels differently from a checkout.
+///
+/// Control: delete `[plugin.reexports]` from the script's heredoc - this fails.
+#[test]
+fn the_bundled_typescript_manifest_declares_glob_shadowing_too() {
+    #[derive(Deserialize)]
+    struct Outer {
+        plugin: Inner,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        #[serde(default)]
+        reexports: ReexportRules,
+    }
+    let script = include_str!("../../../../scripts/bundle-plugin.sh");
+    let start =
+        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
+    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
+    let bundled: Outer = toml::from_str(&script[start..start + len]).expect("the bundled manifest parses");
+
+    let repo = read_manifest(&bundled_typescript_plugin_dir()).unwrap();
+    assert!(bundled.plugin.reexports.named_shadows_glob);
+    assert_eq!(bundled.plugin.reexports, repo.reexports);
+}
