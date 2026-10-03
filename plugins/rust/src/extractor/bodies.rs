@@ -27,8 +27,9 @@
 //! only `name` keys walk re-export chains (`graph::symbol_links`: "a
 //! `qualifiedName` names a declaration, never a pass-through"), and
 //! `a::b::f()` where `a::b` re-exports `f` from somewhere else is ordinary
-//! Rust. A module-qualified name is ambiguous only when one module holds a
-//! free `fn f` *and* a method `f`, which is rare and fails to a missing edge.
+//! Rust. A module-qualified name finds two declarations when one module holds
+//! a free `fn f` *and* a field or method `f`; core's linker then keeps the
+//! free fn, since a module-scoped name never denotes a type member.
 //!
 //! # Decision 7: what becomes an open site
 //!

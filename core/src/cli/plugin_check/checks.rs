@@ -859,6 +859,7 @@ mod tests {
             manifest_dir: PathBuf::from("/plugins/fake"),
             capabilities: Capabilities { semantic_pass, ..Capabilities::default() },
             workspace: WorkspaceConfig::default(),
+            non_symbol_queries: Default::default(),
         }
     }
 

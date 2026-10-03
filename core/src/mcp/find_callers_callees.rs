@@ -22,8 +22,10 @@ use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
+use super::unlinked::{self, UnlinkedUsages};
 use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
@@ -199,6 +201,10 @@ struct CallerPage {
     /// nothing behind.
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
+    /// See [`UnlinkedUsages`] - calls that may target the anchor but that the
+    /// linker left on a placeholder. Absent when there is no candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked_usages: Option<UnlinkedUsages>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -336,11 +342,12 @@ struct CalleePage {
 pub(crate) fn handle_callers(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, |semantic| {
+    find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_callers_in(store, semantic, capabilities, hints, params.clone())
     })
 }
@@ -388,11 +395,12 @@ pub(crate) fn handle_callers_in(
         })
         .collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let bounded = pagination::bound_page_reserving_two_tallies(
         rows,
         page.has_more,
         page.next_cursor,
-        tier.page_reserve(),
+        tier.page_reserve() + UnlinkedUsages::wire_len(&unlinked),
     );
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
@@ -402,13 +410,15 @@ pub(crate) fn handle_callers_in(
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
 
-    // Every file this response names: rows, the tally, the excluded tally.
+    // Every file this response names: rows, the tally, the excluded and
+    // unlinked tallies.
     let touched = bounded
         .results
         .iter()
         .map(|row| row.file_path.as_str())
         .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
-        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())));
+        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())))
+        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
     let has_file_row = bounded.results.iter().any(|row| row.kind == pagination::FILE_KIND);
     let hint = session_hints::join([
@@ -427,6 +437,7 @@ pub(crate) fn handle_callers_in(
         all_unresolved: bounded.all_unresolved,
         hint,
         excluded_references: excluded,
+        unlinked_usages: unlinked,
         provenance,
     })
 }
@@ -435,10 +446,11 @@ pub(crate) fn handle_callers_in(
 pub(crate) fn handle_callees(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, |semantic| {
+    find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_callees_in(store, semantic, capabilities, params.clone())
     })
 }
@@ -583,6 +595,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &rust_with_a_semantic_tier(),
             &SessionHints::default(),
             params,
@@ -616,6 +629,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &rust_with_a_semantic_tier(),
             &SessionHints::default(),
             params,
@@ -643,6 +657,7 @@ mod tests {
         let result = handle_callees(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &rust_with_a_semantic_tier(),
             params,
         )
@@ -678,6 +693,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -696,6 +712,7 @@ mod tests {
         let result = handle_callees(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             params,
         )
@@ -738,6 +755,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -784,6 +802,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -819,6 +838,7 @@ mod tests {
             &handle_callers(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -853,6 +873,7 @@ mod tests {
             &handle_callers(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -909,6 +930,7 @@ mod tests {
             &handle_callers(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -947,6 +969,7 @@ mod tests {
             &handle_callees(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 params,
             )
@@ -973,6 +996,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -1012,6 +1036,7 @@ mod tests {
             &handle_callers(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1032,6 +1057,7 @@ mod tests {
         let result = handle_callees(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             params,
         )
@@ -1052,6 +1078,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
@@ -1067,6 +1094,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
@@ -1086,6 +1114,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
@@ -1099,6 +1128,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
             )
@@ -1135,6 +1165,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
@@ -1166,6 +1197,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1200,6 +1232,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 by_name,
@@ -1215,6 +1248,7 @@ mod tests {
                 &handle_callers(
                     &conn,
                     &EmbeddingPipeline::disabled(),
+                    QueryShapes::shipped(),
                     &no_capabilities(),
                     &SessionHints::default(),
                     requalified
@@ -1238,6 +1272,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1255,6 +1290,7 @@ mod tests {
         let result = handle_callers(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -1271,6 +1307,7 @@ mod tests {
         let result = handle_callees(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             params,
         )
@@ -1371,6 +1408,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1399,6 +1437,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
@@ -1409,6 +1448,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams {
@@ -1458,6 +1498,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1499,6 +1540,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
@@ -1516,6 +1558,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
             )
@@ -1539,6 +1582,7 @@ mod tests {
             &handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
@@ -1551,6 +1595,7 @@ mod tests {
             &handle_callees(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
             )
@@ -1586,8 +1631,14 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result =
-                handle_callees(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
+            let result = handle_callees(
+                &conn,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["calleeSymbolId"].as_str().unwrap().to_string()));
@@ -1628,8 +1679,15 @@ mod tests {
     fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(store, &EmbeddingPipeline::disabled(), &no_capabilities(), hints, params)
-                .unwrap(),
+            &handle_callers(
+                store,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                &no_capabilities(),
+                hints,
+                params,
+            )
+            .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }
@@ -1692,7 +1750,14 @@ mod tests {
     fn callee_hint(store: &Arc<IndexStore>) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callees(store, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap(),
+            &handle_callees(
+                store,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                &no_capabilities(),
+                params,
+            )
+            .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }

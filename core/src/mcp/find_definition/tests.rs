@@ -196,9 +196,14 @@ fn ambiguous_bare_name_returns_both_as_ranked_candidates() {
         cursor: None,
         include_source: None,
     };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &no_sources(),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "both same-named symbols must come back as candidates");
@@ -232,8 +237,14 @@ fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
         include_source: None,
     };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &no_sources(),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            params,
+        )
+        .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
     assert_eq!(body["filePath"], "target.ts");
@@ -260,8 +271,14 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
         include_source: None,
     };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &no_sources(),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            params,
+        )
+        .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null);
     assert_eq!(body["id"], "n1");
@@ -281,9 +298,14 @@ fn file_and_position_query_returns_a_single_node_not_a_list() {
         cursor: None,
         include_source: None,
     };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &no_sources(),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n1");
     assert_eq!(body["qualifiedName"], "pkg_a::run");
@@ -306,9 +328,14 @@ fn qualified_name_requery_returns_the_exact_node() {
         cursor: None,
         include_source: None,
     };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &no_sources(),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n2");
     assert_eq!(body["qualifiedName"], "pkg_b::run");
@@ -324,9 +351,14 @@ fn no_match_is_a_tool_level_error() {
         cursor: None,
         include_source: None,
     };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &no_sources(),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        params,
+    )
+    .unwrap();
     assert!(error_text(&result).contains("does_not_exist"));
 }
 
@@ -340,9 +372,14 @@ fn neither_name_nor_position_is_a_tool_level_error() {
         cursor: None,
         include_source: None,
     };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &no_sources(), &EmbeddingPipeline::disabled(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &no_sources(),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        params,
+    )
+    .unwrap();
     assert!(error_text(&result).contains("symbol_name"));
 }
 
@@ -367,7 +404,9 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
         cursor: None,
         include_source: None,
     };
-    let first = handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), first_params).unwrap();
+    let first =
+        handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), first_params)
+            .unwrap();
     let first_body = json_body(&first);
     let first_results = first_body["results"].as_array().unwrap();
     assert_eq!(first_results.len(), CANDIDATE_PAGE_SIZE);
@@ -381,7 +420,9 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
         cursor: Some(cursor),
         include_source: None,
     };
-    let second = handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), second_params).unwrap();
+    let second =
+        handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), second_params)
+            .unwrap();
     let second_body = json_body(&second);
     let second_results = second_body["results"].as_array().unwrap();
     assert_eq!(second_results.len(), 1, "the one remaining candidate must land on the second page");
@@ -816,10 +857,19 @@ fn include_source_false_leaves_the_response_exactly_as_it_was() {
     };
 
     let opted_out = json_body(
-        &handle(&conn, project.path(), &EmbeddingPipeline::disabled(), params(Some(false))).unwrap(),
+        &handle(
+            &conn,
+            project.path(),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            params(Some(false)),
+        )
+        .unwrap(),
     );
-    let default_on =
-        json_body(&handle(&conn, project.path(), &EmbeddingPipeline::disabled(), params(None)).unwrap());
+    let default_on = json_body(
+        &handle(&conn, project.path(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params(None))
+            .unwrap(),
+    );
 
     assert!(opted_out["source"].is_null(), "include_source: false must omit it");
     assert!(!default_on["source"].is_null(), "omitting the flag must default to on");
@@ -878,30 +928,176 @@ fn setup_with_vectors() -> Connection {
     conn
 }
 
-#[test]
-fn a_specifier_shaped_query_is_declined_before_the_score_is_consulted() {
-    // No embedding pipeline at all, so if the guard did not fire first
-    // this would still return None - which is why the guard is asserted
-    // directly rather than through the tool.
-    assert!(is_module_specifier("@excalidraw/math"), "a scoped package is a specifier");
-    assert!(is_module_specifier("packages/element/src/index.ts"), "a path is a specifier");
-    assert!(!is_module_specifier("DropdownMenuGroup"), "a plain identifier is not");
-    assert!(!is_module_specifier("AppState"), "nor is a type name");
+/// A pipeline whose model is not yet known to be missing, so a deferred pass
+/// that reaches the rung records the name. It never loads: only the
+/// `Embedded` pass embeds, and these tests drive the deferred one.
+fn unloaded_pipeline() -> EmbeddingPipeline {
+    EmbeddingPipeline::with_loader(
+        Path::new("/nonexistent-model-dir"),
+        |_: &Path| -> anyhow::Result<_> { panic!("a deferred pass never loads the model") },
+        None,
+    )
 }
 
-/// The measured reason this guard exists: `@excalidraw/element` scores
+fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::daemon::manifest::NonSymbolShapes {
+    crate::daemon::manifest::NonSymbolShapes {
+        starts_with: starts_with.iter().map(|s| s.to_string()).collect(),
+        contains: contains.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// With the shipped declarations every language refuses `@` and `/`, so the
+/// first pass stops at the rung without asking for the query to be embedded.
+/// A plain name on the same pipeline does ask, which shows the pipeline
+/// would have embedded.
+///
+/// Control: remove the `refused_by_all` check in `by_semantic_neighbours` -
+/// every specifier is then recorded in `reached`.
+#[test]
+fn with_the_shipped_shapes_a_specifier_is_refused_before_it_is_embedded() {
+    let conn = setup_with_vectors();
+    let embedding = unloaded_pipeline();
+
+    for query in ["@excalidraw/math", "packages/element/src/index.ts", "./extract.js", "@Component"] {
+        let rung = SemanticRung::deferred(&embedding, QueryShapes::shipped());
+        by_name(&conn, None, &rung, query, None).unwrap();
+        assert_eq!(rung.reached(), None, "{query} must not be embedded");
+    }
+    let rung = SemanticRung::deferred(&embedding, QueryShapes::shipped());
+    by_name(&conn, None, &rung, "DropdownMenuGroup", None).unwrap();
+    assert_eq!(rung.reached().as_deref(), Some("DropdownMenuGroup"), "a plain name reaches the rung");
+}
+
+/// The second pass of the ladder with a query vector identical to `near`'s,
+/// so the semantic rung scores 1.0 and answers whenever it is consulted.
+fn with_a_matching_vector(conn: &Connection, name: &str) -> CallToolResult {
+    with_a_matching_vector_and(conn, QueryShapes::shipped(), name)
+}
+
+fn with_a_matching_vector_and(conn: &Connection, shapes: &QueryShapes, name: &str) -> CallToolResult {
+    let query = [1.0_f32, 0.0];
+    by_name(conn, None, &SemanticRung::Embedded { name, query: Some(&query), shapes }, name, None).unwrap()
+}
+
+/// A language's shapes only ever remove that language's candidates. The
+/// fixture's hit is Rust; another language declares `get`, so `getX` is not
+/// refused by every language and the Rust hit, whose language declares
+/// nothing, is still offered.
+///
+/// Control: make `QueryShapes::refuses` ignore its `language` (refuse when
+/// any language's shapes match) - the Rust hit is dropped and this fails.
+#[test]
+fn another_languages_shapes_never_remove_this_languages_candidates() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+    let map = QueryShapes::of(&[("fake", shapes(&["get"], &[])), ("rust", shapes(&[], &[]))]);
+
+    let body = json_body(&with_a_matching_vector_and(&conn, &map, "getX"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours", "{body}");
+    assert_eq!(body["results"][0]["id"], "near", "{body}");
+}
+
+/// The per-candidate filter: Rust refuses `get` and another language does
+/// not, so the query is embedded, and the Rust hit, though it scores 1.0,
+/// is dropped by its own language's shapes.
+///
+/// Control: remove `&& !shapes.refuses(&hit.language, name)` from the filter
+/// in `by_semantic_neighbours` - the Rust hit is offered and this fails.
+#[test]
+fn a_candidate_is_dropped_by_its_own_languages_shapes() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+    let map = QueryShapes::of(&[("fake", shapes(&[], &[])), ("rust", shapes(&["get"], &[]))]);
+
+    let result = with_a_matching_vector_and(&conn, &map, "getX");
+
+    assert_eq!(error_text(&result), "g-mesh: no symbol named 'getX' found");
+}
+
+/// With the shipped declarations a relative import (`.models`) is refused by
+/// Python alone: it still reaches the rung, the Python hit is dropped though
+/// it scores 1.0, and the Rust hit beside it is offered.
+///
+/// Control: remove `"."` from `plugins/python/plugin.toml`'s `starts_with` -
+/// the Python hit is offered too and this fails.
+#[test]
+fn with_the_shipped_shapes_a_relative_import_drops_only_python_candidates() {
+    let mut conn = setup_with_vectors();
+    upsert_node(&mut conn, NodeRecord::new("py", "Function", "near", "pkg.near", "a.py", "python")).unwrap();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+    insert_vector(&conn, "py", &[1.0, 0.0]);
+
+    let embedding = unloaded_pipeline();
+    let rung = SemanticRung::deferred(&embedding, QueryShapes::shipped());
+    by_name(&conn, None, &rung, ".models", None).unwrap();
+    assert_eq!(rung.reached().as_deref(), Some(".models"), "not every language refuses it");
+
+    let body = json_body(&with_a_matching_vector(&conn, ".models"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours", "{body}");
+    let ids: Vec<&str> =
+        body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["near"], "{body}");
+}
+
+/// With no declarations at all, nothing is refused by shape: core holds no
+/// fallback list of its own.
+///
+/// Control: put `|| name.starts_with('@') || name.contains('/')` back into
+/// `by_semantic_neighbours`' first check - this is refused and fails.
+#[test]
+fn without_declarations_a_specifier_shaped_query_is_answered_by_score() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+
+    let body = json_body(&with_a_matching_vector_and(&conn, &QueryShapes::default(), "@excalidraw/element"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours", "{body}");
+}
+
+/// The measured reason these shapes exist: `@excalidraw/element` scores
 /// 0.699 - above the threshold - while being junk, because only doc
 /// comments and signatures are embedded and a specifier has nothing to
-/// match. Score alone cannot catch it, so shape has to.
+/// match. Score alone cannot catch it, so the guard has to. None of these
+/// spellings is stored anywhere in the index, which is why a lookup of
+/// stored module keys and file paths could not refuse them: a package the
+/// project never imports, a relative specifier, and a path.
 #[test]
 fn a_specifier_is_refused_tersely_even_though_it_would_out_score_the_threshold() {
     let conn = setup_with_vectors();
     insert_vector(&conn, "near", &[1.0, 0.0]);
 
-    // Reached through the ladder, so this exercises the real miss path.
-    let result = by_name(&conn, None, &SemanticRung::off(), "@excalidraw/element", None).unwrap();
+    for query in ["@excalidraw/element", "./extract.js", "packages/element/src/index.ts"] {
+        let result = with_a_matching_vector(&conn, query);
+        assert_eq!(error_text(&result), format!("g-mesh: no symbol named '{query}' found"));
+    }
+}
 
-    assert_eq!(error_text(&result), "g-mesh: no symbol named '@excalidraw/element' found");
+/// The fixture's own control: on the same index and vector, a name with no
+/// specifier's spelling reaches the rung and is answered by it, so the
+/// refusals around it are the guard's doing and not the fixture's.
+#[test]
+fn a_plain_unknown_name_reaches_the_semantic_rung_on_the_same_fixture() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+
+    let body = json_body(&with_a_matching_vector(&conn, "NoSuchThingAnywhere"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours");
+    assert_eq!(body["results"][0]["id"], "near");
+}
+
+/// What the spelling rule costs: a symbol-name query that starts with `@`
+/// but is no specifier is refused rather than offered neighbours.
+#[test]
+fn a_non_specifier_with_a_specifiers_spelling_is_refused_too() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+
+    let result = with_a_matching_vector(&conn, "@Component");
+
+    assert_eq!(error_text(&result), "g-mesh: no symbol named '@Component' found");
 }
 
 #[test]

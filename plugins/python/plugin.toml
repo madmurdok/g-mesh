@@ -38,7 +38,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.18.0"
+plugin_version = "3.19.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
@@ -197,3 +197,14 @@ entry_points = ["__init__"]
 # bundles typeshed, so leaving it in the walk means indexing 5,205 `.pyi`
 # stubs as if they were the project's own declarations.
 exclude_dirs = [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-packages", "node_modules"]
+
+[plugin.non_symbol_queries]
+# Query shapes that are never a Python symbol: core sets aside this language's
+# semantic candidates for such a query, and no other language's
+# (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
+# `@` starts a scoped package or a decorator, `/` is a path or package
+# separator, and a leading `.` is a relative import (`.models`,
+# `..pkg.mod`); no Python function, type or member name contains `@` or
+# `/`, or starts with `.`.
+starts_with = ["@", "."]
+contains = ["/"]

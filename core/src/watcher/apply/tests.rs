@@ -24,6 +24,17 @@ fn on_timeout_must_not_fire() {
     panic!("on_timeout fired in a test whose stub plugin always answers - the stub or the timeout is broken");
 }
 
+/// A project root on which every file these tests name exists, so a diff that
+/// upserts nothing is not read as the file being gone.
+fn project_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    for file in ["src/lib.rs", "src/unchanged.rs"] {
+        std::fs::write(root.path().join(file), "").unwrap();
+    }
+    root
+}
+
 fn setup_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -298,6 +309,7 @@ fn file_change_diff_is_committed_to_sqlite() {
                 to_declaration: None,
             }],
             delete_edge_ids: vec![],
+            complete: false,
         },
     };
 
@@ -315,6 +327,7 @@ fn file_change_diff_is_committed_to_sqlite() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -389,6 +402,7 @@ fn diff_with_deletes_removes_rows() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -434,6 +448,7 @@ fn mismatched_response_id_is_rejected() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -477,6 +492,7 @@ fn empty_diff_response_is_a_safe_no_op() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/unchanged.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -636,6 +652,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -683,6 +700,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -739,6 +757,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        project_root().path(),
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -1201,6 +1220,11 @@ fn an_old_shape_node_indexes_exactly_as_before() {
 
 /// Sends `diff` as a reparse of `src/lib.rs` through `apply_file_change`.
 fn reparse(conn: &IndexStore, id: i64, diff: FileChangeDiff) {
+    reparse_in(conn, project_root().path(), id, diff);
+}
+
+/// [`reparse`] of `src/lib.rs` against `root`, which may lack the file.
+fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChangeDiff) {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
     let request_id = RequestId::Number(id);
@@ -1223,6 +1247,7 @@ fn reparse(conn: &IndexStore, id: i64, diff: FileChangeDiff) {
         &mut BufReader::new(core_reader),
         &mut core_writer,
         conn,
+        root,
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -1255,4 +1280,111 @@ fn an_incremental_reparse_rebuilds_suffix_rows() {
     );
     assert_eq!(suffixes(&conn, "n1"), vec!["C::foo"]);
     assert_eq!(count(&conn, "qualified_suffixes"), 1, "n2's rows went with it");
+}
+
+// --- rows core retires for a file: gone, or answered in full -------------
+
+fn node_in(id: &str, file_path: &str) -> WireNode {
+    WireNode { file_path: file_path.to_string(), ..canned_node(id) }
+}
+
+fn semantic_edge(id: &str, from: &str, to: &str) -> WireEdge {
+    WireEdge {
+        source: SourceTier::Semantic,
+        engine: "types".to_string(),
+        resolved: true,
+        ..unresolved_edge(id, from, to)
+    }
+}
+
+fn ids(conn: &IndexStore, sql: &str) -> Vec<String> {
+    let guard = conn.lock().unwrap();
+    let mut stmt = guard.prepare(sql).unwrap();
+    let rows =
+        stmt.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<Vec<String>>>().unwrap();
+    rows
+}
+
+/// `src/lib.rs` holds `n1`, `n2` and a placeholder `p`, with a syntactic
+/// edge `s12` and semantic edges `m1p` (from `n1`) and `m2p` (from `n2`);
+/// `src/other.rs` holds `o`, with `o1` into `n1`. `src/lib.rs` has an
+/// `indexed_files` row. Foreign keys are off, as on the daemon's connection:
+/// `o1` outlives the node it points into.
+fn seeded_store() -> IndexStore {
+    let mut raw = setup_conn();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let seed = FileChangeDiff {
+        upsert_nodes: vec![
+            node_in("n1", "src/lib.rs"),
+            node_in("n2", "src/lib.rs"),
+            node_in("p", "src/lib.rs"),
+            node_in("o", "src/other.rs"),
+        ],
+        upsert_edges: vec![
+            unresolved_edge("s12", "n1", "n2"),
+            semantic_edge("m1p", "n1", "p"),
+            semantic_edge("m2p", "n2", "p"),
+            unresolved_edge("o1", "o", "n1"),
+        ],
+        ..Default::default()
+    };
+    apply_diff(&mut raw, &to_storage_diff(seed, &mut PathWarnings::default())).unwrap();
+    crate::storage::write::upsert_indexed_file(&raw, "src/lib.rs", 1, "hash").unwrap();
+    crate::storage::write::upsert_indexed_file(&raw, "src/other.rs", 1, "hash").unwrap();
+    IndexStore::new(raw)
+}
+
+#[test]
+fn a_file_gone_from_disk_loses_every_row_it_owns_though_the_plugin_named_none() {
+    let conn = seeded_store();
+    reparse_in(&conn, tempfile::tempdir().unwrap().path(), 1, FileChangeDiff::default());
+
+    assert_eq!(ids(&conn, "SELECT id FROM nodes ORDER BY id"), vec!["o"]);
+    // `o1` points into a deleted node from another file: left for that
+    // file's next reparse.
+    assert_eq!(ids(&conn, "SELECT id FROM edges ORDER BY id"), vec!["o1"]);
+    assert_eq!(ids(&conn, "SELECT filePath FROM indexed_files"), vec!["src/other.rs"]);
+}
+
+#[test]
+fn an_empty_answer_for_a_file_still_on_disk_deletes_nothing() {
+    let conn = seeded_store();
+    reparse(&conn, 1, FileChangeDiff::default());
+
+    assert_eq!(count(&conn, "nodes"), 4);
+    assert_eq!(count(&conn, "edges"), 4);
+    assert_eq!(count(&conn, "indexed_files"), 2);
+}
+
+#[test]
+fn a_complete_answer_retires_what_it_does_not_upsert_but_keeps_semantic_edges_of_surviving_nodes() {
+    let conn = seeded_store();
+    reparse(
+        &conn,
+        1,
+        FileChangeDiff {
+            upsert_nodes: vec![node_in("n1", "src/lib.rs")],
+            complete: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(ids(&conn, "SELECT id FROM nodes ORDER BY id"), vec!["n1", "o"]);
+    // `s12` is structural and not re-sent; `m2p` leaves a deleted node; `m1p`
+    // is the semantic pass's, from a node that stays, and waits for it.
+    assert_eq!(ids(&conn, "SELECT id FROM edges ORDER BY id"), vec!["m1p", "o1"]);
+    assert_eq!(count(&conn, "indexed_files"), 2);
+}
+
+#[test]
+fn a_partial_answer_deletes_only_what_it_names() {
+    let conn = seeded_store();
+    reparse(
+        &conn,
+        1,
+        FileChangeDiff { upsert_nodes: vec![node_in("n1", "src/lib.rs")], ..Default::default() },
+    );
+
+    assert_eq!(count(&conn, "nodes"), 4);
+    assert_eq!(count(&conn, "edges"), 4);
 }

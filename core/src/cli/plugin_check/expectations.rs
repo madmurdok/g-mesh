@@ -606,6 +606,7 @@ use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
+use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{
     find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
@@ -804,6 +805,9 @@ pub(crate) struct EvalContext<'a> {
     /// plugin; built from `manifest.capabilities` rather than from a
     /// registry, since the kit discovers no registry.
     pub(crate) capabilities: &'a HashMap<String, Capabilities>,
+    /// The manifest's own `[plugin.non_symbol_queries]`, keyed by language,
+    /// for the same reason as `capabilities`.
+    pub(crate) shapes: &'a QueryShapes,
 }
 
 /// Runs every expectation in `expect`, in file order, and returns one
@@ -910,6 +914,7 @@ impl SymbolTool {
             SymbolTool::Callers => find_callers_callees::handle_callers(
                 ctx.conn,
                 ctx.embedding,
+                ctx.shapes,
                 ctx.capabilities,
                 &SessionHints::default(),
                 params,
@@ -917,6 +922,7 @@ impl SymbolTool {
             SymbolTool::References => find_references::handle(
                 ctx.conn,
                 ctx.embedding,
+                ctx.shapes,
                 ctx.capabilities,
                 &SessionHints::default(),
                 params,
@@ -926,6 +932,7 @@ impl SymbolTool {
                 find_implementations::dispatch(
                     ctx.conn,
                     ctx.embedding,
+                    ctx.shapes,
                     ctx.capabilities,
                     FindImplementationsParams {
                         symbol_id,
@@ -955,7 +962,7 @@ fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome
         cursor: None,
         include_source: Some(false),
     };
-    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, params))
+    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, ctx.shapes, params))
 }
 
 fn eval_symbol_expectation(

@@ -199,6 +199,7 @@ fn manifest_for(dir: &Path, ignore: &[&str]) -> PluginManifest {
         // comment - so the conservative defaults are fine here too.
         capabilities: Capabilities::default(),
         workspace: WorkspaceConfig::default(),
+        non_symbol_queries: Default::default(),
     }
 }
 

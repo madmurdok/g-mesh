@@ -417,6 +417,14 @@ exclude_dirs = ["vendor", "testdata"]
 # File or directory names a miss-path lookup treats as a container's entry point.
 entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: ["index"]
 
+[plugin.non_symbol_queries]
+# Query shapes that are never this language's symbols. Literal, case-sensitive.
+# A query that starts with any `starts_with` entry or contains any `contains`
+# entry has this language's semantic candidates set aside - and only this
+# language's. Absent: this language refuses nothing.
+starts_with = ["@"]
+contains = ["/"]
+
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
 # Absent means the plugin has no language server behind its semantic tier.
@@ -453,6 +461,24 @@ RA_LOG = "error"
 [plugin.semantic.initialization_options]   # passed to `initialize` verbatim
 cachePriming = { enable = false }
 ```
+
+`[plugin.non_symbol_queries]` is read by `find_definition`'s semantic rung
+(the last rung of every name-resolving tool). For each candidate the rung
+drops it when the query has one of the shapes its *own* language declares, so
+a plugin can only ever affect its own language's answers. When every
+discovered language refuses the query, the rung stops before embedding it.
+Core holds no shape of its own, and there is no default list: a plugin that
+declares nothing refuses nothing. Validation, as hard errors naming the
+manifest path: an empty string (it would match every query) and an unknown key
+in the table (so a misspelt `start_with` fails loudly). The four shipped
+plugins declare `starts_with = ["@"]` and `contains = ["/"]`; Python also
+declares a leading `.` (`starts_with = ["@", "."]`), a relative import.
+`g-mesh plugins list` and `g-mesh plugins check` print the declaration.
+`search_code` reads the same table for its `noMatch` verdict: a first page is
+`queryIsAPathOrPackage` when every row's language refuses the query (an empty
+page: every discovered language), a refused row on a mixed page counts as below
+its floor, and a prose query is never refused. Rows are never dropped.
+Decision: [ADR 0018](../adr/0018-non-symbol-query-shapes.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest
@@ -520,7 +546,8 @@ Paths never enter ids or tool output. Decision and storage:
 [ADR 0015](../adr/0015-qualified-name-segments.md).
 
 The control messages are unchanged apart from two additions. `fileChanged` and
-`semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff.
+`semanticPass` keep their shapes, and the `FileChangeDiff` answer is the same diff,
+with one optional field, `complete` (see the next section).
 
 - **New:** `workspaceChanged { filePath }`, a notification. It exists so a plugin
   can drop cached module or crate maps. Core follows it with the per-language
@@ -532,6 +559,36 @@ The control messages are unchanged apart from two additions. `fileChanged` and
   semantic tier is not suspended. The SDK starts the engine on it; readiness is
   still decided inside the pass. Measurements and the choice of trigger:
   [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
+
+### A `fileChanged` diff from a process with no baseline
+
+A plugin names a deleted id only if it remembers emitting it, and that memory
+is per process. The control process that answers `fileChanged` is not the one
+that ran the bulk walk, and a restart empties it. So a diff against "nothing"
+upserts the file and deletes nothing, and on its own it would leave the walk's
+rows for anything the file lost. Core closes that gap from its own rows
+(`core/src/storage/file_rows.rs`), in the same step that applies the diff:
+
+- **A file gone from disk.** When a `fileChanged` diff upserts nothing and the
+  file is not on disk, core deletes every node whose `filePath` is the file,
+  the edges out of them, and the file's `indexed_files` row. This needs
+  nothing from the plugin.
+- **`complete: true`.** An optional `FileChangeDiff` field, `fileChanged` only:
+  the upserts are the whole file. A plugin sets it when it has no baseline for
+  the file. Core then deletes the file's nodes the diff does not upsert, and
+  the edges out of the file's nodes it does not upsert, except a `semantic`
+  edge from a node that stays: the per-file semantic pass that follows the
+  reparse re-sends what it still resolves. Absent means `false`; there is no
+  `protocol_version` bump. The SDK (`diff_file` with no previous graph), the Go
+  plugin and the TypeScript plugin set it.
+
+A file owns its nodes (placeholders included: they carry the importer's
+path) and the edges out of them. Edges and placeholders in *other* files that
+point at a removed node keep the lazy behaviour `storage::write::apply_diff`
+and `graph::imports` document: they are repaired when that file is next
+reparsed. A plugin that answers a gone file should also forget its baseline
+for it, so a re-created file is a full (`complete`) extraction rather than a
+diff against text core no longer holds.
 
 ### Process lifetime: stdin is the lifeline (GM-397)
 

@@ -1,6 +1,7 @@
 //! The `pending` provenance block (ADR 0009) on the four edge-walking tools,
 //! through their real handlers.
 
+use crate::mcp::query_shapes::QueryShapes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -113,6 +114,7 @@ fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Va
     let result = find_callers_callees::handle_callers(
         store,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &rust_with_a_semantic_tier(),
         &SessionHints::default(),
         params,
@@ -125,6 +127,7 @@ fn callees(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
     let result = find_callers_callees::handle_callees(
         store,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &rust_with_a_semantic_tier(),
         by_id(id),
     )
@@ -136,6 +139,7 @@ fn references(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
     let result = find_references::handle(
         store,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &rust_with_a_semantic_tier(),
         &SessionHints::default(),
         by_id(id),
@@ -148,6 +152,7 @@ fn implementations(store: &Arc<IndexStore>, params: FindImplementationsParams) -
     let result = find_implementations::dispatch(
         store,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &rust_with_a_semantic_tier(),
         params,
     )

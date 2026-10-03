@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +30,7 @@ use crate::protocol::types::{
     QualifiedPath, RequestId, SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode,
     JSONRPC_VERSION,
 };
+use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
 use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
@@ -87,6 +89,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &IndexStore,
+    project_root: &Path,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -100,6 +103,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
             reader,
             writer,
             store,
+            project_root,
             file_path,
             request_id,
             embedding,
@@ -117,6 +121,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &mut Writer<'_>,
+    project_root: &Path,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -134,6 +139,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         writer,
         store,
         ControlMessage::FileChanged { file_path: file_path.clone() },
+        Some(project_root),
         request_id.clone(),
         embedding,
         file_changed_timeout,
@@ -234,6 +240,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         writer,
         store,
         ControlMessage::SemanticPass { file_paths: file_paths.clone() },
+        None,
         request_id,
         embedding,
         timeout,
@@ -395,6 +402,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     writer: &mut W,
     store: &mut Writer<'_>,
     message: ControlMessage,
+    project_root: Option<&Path>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
     timeout: Duration,
@@ -417,8 +425,15 @@ fn round_trip<R: BufRead + Send, W: Write>(
         );
     }
 
-    let diff = to_storage_diff(response.result, &mut PathWarnings::default());
-    store.apply_diff_linked(&diff, method)?;
+    let complete = response.result.complete;
+    let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
+    match (&request.message, project_root) {
+        (ControlMessage::FileChanged { file_path }, Some(root)) => {
+            let scope = file_scope(root, file_path, &diff, complete);
+            store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
+        }
+        _ => store.apply_diff_linked(&diff, method)?,
+    }
 
     hold_compute_open_for_tests();
 
@@ -436,6 +451,24 @@ fn round_trip<R: BufRead + Send, W: Write>(
         incomplete_reason: response.incomplete_reason,
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
     })
+}
+
+/// What a `fileChanged` answer says about its file as a whole: gone when it
+/// upserts nothing and the file is not on disk, complete when the plugin says
+/// so, otherwise a change against what the plugin last sent. The disk is read
+/// after the plugin answered; a file re-created in between gets its own
+/// change event.
+fn file_scope(project_root: &Path, file_path: &str, diff: &Diff, complete: bool) -> FileScope {
+    let upserts_nothing = diff.upsert_nodes.is_empty() && diff.upsert_edges.is_empty();
+    let gone = upserts_nothing
+        && matches!(std::fs::metadata(project_root.join(file_path)), Err(err) if err.kind() == std::io::ErrorKind::NotFound);
+    if gone {
+        FileScope::Gone
+    } else if complete {
+        FileScope::Complete
+    } else {
+        FileScope::Partial
+    }
 }
 
 /// Test-only: holds this round trip open between its commit step and its

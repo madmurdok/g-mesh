@@ -47,8 +47,34 @@
 # but NOT on macOS, where it returns the path the process was invoked through.
 # A symlinked g-mesh on macOS would look for its plugin in `/usr/local/bin/
 # plugins/`, find nothing, and fail to index - measured, not assumed. This
-# script therefore never creates a symlink; it prints the one `PATH` line to
-# add instead, and touches no shell rc file on its own.
+# script therefore never creates a symlink; it puts the install directory
+# itself on `PATH` instead (next section).
+#
+# ---------------------------------------------------------------------------
+# PATH: EDITED BY DEFAULT, RUSTUP-STYLE
+#
+# So that `g-mesh` is found right after installing, the script appends one
+# marker-delimited block to the rc file of the shell in $SHELL:
+#
+#   zsh     ~/.zshrc
+#   bash    ~/.bashrc on Linux; ~/.bash_profile on macOS (Terminal starts a
+#           login shell there). If ~/.bash_profile does not exist yet but
+#           ~/.bash_login or ~/.profile does, that file is used instead:
+#           creating ~/.bash_profile would make bash stop reading them.
+#   fish    ~/.config/fish/conf.d/g-mesh.fish ($XDG_CONFIG_HOME is honoured),
+#           using fish_add_path
+#   other   ~/.profile
+#
+# The block is delimited by `# >>> g-mesh installer >>>` and
+# `# <<< g-mesh installer <<<`; deleting those lines and what is between them
+# undoes it. Nothing is written when the install directory is already on
+# PATH, or when the block is already in the file (so re-installing changes
+# nothing). The file is only ever appended to, never rewritten, so a
+# symlinked dotfile stays a symlink. If the append fails (a read-only rc
+# file), the install still succeeds and the old advice is printed.
+#
+# Opt out with --no-modify-path or G_MESH_NO_MODIFY_PATH=1: then no file is
+# touched and the script prints the `export PATH` line to add by hand.
 #
 # Default location: ~/.g-mesh/bin - inside the directory g-mesh already owns
 # (config, project indexes and the embedding model live under ~/.g-mesh), so
@@ -102,7 +128,10 @@
 #
 #   G_MESH_DOWNLOAD_BASE=http://127.0.0.1:8000 \
 #   G_MESH_INSTALL_DIR=/tmp/g-mesh-test \
-#     sh scripts/install.sh --version 2.7.0
+#     sh scripts/install.sh --version 2.7.0 --no-modify-path
+#
+# scripts/test-install.sh does the same against a fake archive, in a
+# throwaway HOME, to test the PATH editing above.
 #
 # Environment:
 #   G_MESH_VERSION        version to install (same name build-targets.sh uses)
@@ -111,6 +140,7 @@
 #   G_MESH_REPO           owner/repo (default: madmurdok/g-mesh)
 #   G_MESH_DOWNLOAD_BASE  base for <version-tag>/<asset> URLs
 #   G_MESH_LATEST_API     the releases/latest endpoint
+#   G_MESH_NO_MODIFY_PATH set to anything but 0: leave shell rc files alone
 #   GITHUB_TOKEN          if set, authenticates the API call (rate limits)
 # ---------------------------------------------------------------------------
 
@@ -123,6 +153,10 @@ INSTALL_DIR="${G_MESH_INSTALL_DIR:-${HOME:-}/.g-mesh/bin}"
 VERSION="${G_MESH_VERSION:-}"
 TARGET="${G_MESH_TARGET:-}"
 FORCE=0
+case "${G_MESH_NO_MODIFY_PATH:-}" in
+'' | 0) MODIFY_PATH=1 ;;
+*) MODIFY_PATH=0 ;;
+esac
 
 # The three platforms this script can install. The fourth supported target,
 # x86_64-pc-windows-msvc, is deliberately not here - see the header.
@@ -144,6 +178,7 @@ have() {
 usage() {
 	cat <<'EOF'
 usage: install.sh [--version X.Y.Z] [--install-dir DIR] [--target TRIPLE] [--force]
+                  [--no-modify-path]
 
   --version X.Y.Z    install this release instead of the latest published one
   --install-dir DIR  install root (default: ~/.g-mesh/bin); the binary and its
@@ -152,6 +187,9 @@ usage: install.sh [--version X.Y.Z] [--install-dir DIR] [--target TRIPLE] [--for
   --target TRIPLE    override platform detection (advanced/testing)
   --force            replace a non-empty install directory that does not look
                      like an existing g-mesh install
+  --no-modify-path   do not add the install directory to PATH in your shell's
+                     rc file (same as G_MESH_NO_MODIFY_PATH=1); print the line
+                     to add by hand instead
   -h, --help         this message
 
 Installs macOS (Intel/Apple Silicon) and x86_64 Linux (glibc 2.34+) builds.
@@ -388,6 +426,154 @@ check_install_dir() {
 }
 
 # ---------------------------------------------------------------------------
+# PATH editing - see the header's PATH section for the policy.
+
+PATH_BLOCK_START='# >>> g-mesh installer >>>'
+PATH_BLOCK_END='# <<< g-mesh installer <<<'
+
+# Prints the rc file for the shell in $SHELL. Bash on macOS is decided by the
+# target being installed rather than by asking uname again: it is the same
+# answer, and it lets scripts/test-install.sh exercise both cases on one host.
+rc_file_for_shell() {
+	case "$(basename "${SHELL:-sh}")" in
+	zsh) echo "$HOME/.zshrc" ;;
+	bash)
+		case "$TARGET" in
+		*-apple-darwin)
+			# A login shell reads the first of these three that exists, so
+			# creating ~/.bash_profile beside an existing ~/.profile would
+			# silently stop bash from reading ~/.profile.
+			for _f in .bash_profile .bash_login .profile; do
+				if [ -e "$HOME/$_f" ]; then
+					echo "$HOME/$_f"
+					return 0
+				fi
+			done
+			echo "$HOME/.bash_profile"
+			;;
+		*) echo "$HOME/.bashrc" ;;
+		esac
+		;;
+	fish)
+		case "${XDG_CONFIG_HOME:-}" in
+		/*) echo "$XDG_CONFIG_HOME/fish/conf.d/g-mesh.fish" ;;
+		*) echo "$HOME/.config/fish/conf.d/g-mesh.fish" ;;
+		esac
+		;;
+	*) echo "$HOME/.profile" ;;
+	esac
+}
+
+# The line that puts INSTALL_DIR on PATH, in the dialect of the file it goes
+# into. Single-quoted, so nothing in the path is expanded when the rc file is
+# sourced; modify_path refuses a path that itself contains a single quote.
+path_line_for() {
+	case "$1" in
+	*.fish) echo "fish_add_path -g '$INSTALL_DIR'" ;;
+	*) echo "export PATH='$INSTALL_DIR':\"\$PATH\"" ;;
+	esac
+}
+
+# Sets PATH_RESULT to what happened, and PATH_RC to the rc file involved (if
+# any):
+#   onpath   INSTALL_DIR is already on PATH - nothing to do
+#   optout   --no-modify-path / G_MESH_NO_MODIFY_PATH
+#   unsafe   INSTALL_DIR contains a quote or a newline; not written
+#   present  PATH_RC already has our block for INSTALL_DIR - left unchanged
+#   stale    PATH_RC has our block, for another directory - left unchanged
+#   added    the block was appended to PATH_RC
+#   failed   PATH_RC could not be written
+# Never dies: the install itself has already succeeded by the time this runs.
+modify_path() {
+	PATH_RC=''
+	case ":$PATH:" in
+	*":$INSTALL_DIR:"*)
+		PATH_RESULT=onpath
+		return 0
+		;;
+	esac
+	if [ "$MODIFY_PATH" -ne 1 ]; then
+		PATH_RESULT=optout
+		return 0
+	fi
+	case "$INSTALL_DIR" in
+	*"'"* | *'
+'*)
+		PATH_RESULT=unsafe
+		return 0
+		;;
+	esac
+	if [ -z "${HOME:-}" ]; then
+		PATH_RESULT=failed
+		return 0
+	fi
+	PATH_RC="$(rc_file_for_shell)"
+	_line="$(path_line_for "$PATH_RC")"
+	if [ -f "$PATH_RC" ] && grep -qF "$PATH_BLOCK_START" "$PATH_RC"; then
+		if grep -qxF "$_line" "$PATH_RC"; then
+			PATH_RESULT=present
+		else
+			PATH_RESULT=stale
+		fi
+		return 0
+	fi
+	if ! mkdir -p "$(dirname "$PATH_RC")" 2>/dev/null; then
+		PATH_RESULT=failed
+		return 0
+	fi
+	# Appended, never rewritten: a symlinked dotfile stays a symlink. A file
+	# whose last line has no newline gets one first, so the marker does not
+	# end up glued to the user's last line.
+	_sep=''
+	if [ -s "$PATH_RC" ]; then
+		_sep='
+'
+		[ -z "$(tail -c 1 "$PATH_RC")" ] || _sep='
+
+'
+	fi
+	if {
+		printf '%s' "$_sep"
+		echo "$PATH_BLOCK_START"
+		echo "# Added by g-mesh's install.sh. Delete this block to undo it."
+		echo "$_line"
+		echo "$PATH_BLOCK_END"
+	} 2>/dev/null >>"$PATH_RC"; then
+		PATH_RESULT=added
+	else
+		PATH_RESULT=failed
+	fi
+}
+
+# PATH_RC as a person would write it: ~/.zshrc rather than /Users/x/.zshrc.
+rc_display() {
+	case "$PATH_RC" in
+	"$HOME"/*)
+		# shellcheck disable=SC2088 # printed for a human, not expanded
+		echo "~${PATH_RC#"$HOME"}"
+		;;
+	*) echo "$PATH_RC" ;;
+	esac
+}
+
+# The manual advice: the line to add by hand, and where.
+print_path_advice() {
+	_rc='your shell profile'
+	# The tildes below are deliberate and must not become $HOME: this
+	# string is printed for a human to read, as the trailing comment on a
+	# sample `export PATH` line.
+	# shellcheck disable=SC2088
+	case "$(basename "${SHELL:-sh}")" in
+	zsh) _rc="~/.zshrc" ;;
+	bash) _rc="~/.bashrc (macOS: ~/.bash_profile)" ;;
+	fish) _rc="~/.config/fish/config.fish - there, use: fish_add_path $INSTALL_DIR" ;;
+	esac
+	echo "Add it to your PATH:"
+	echo
+	echo "  export PATH=\"$INSTALL_DIR:\$PATH\"      # in $_rc"
+	echo
+	echo "Then: g-mesh --version"
+}
 
 main() {
 	while [ $# -gt 0 ]; do
@@ -411,6 +597,7 @@ main() {
 			;;
 		--target=*) TARGET="${1#--target=}" ;;
 		--force) FORCE=1 ;;
+		--no-modify-path) MODIFY_PATH=0 ;;
 		-h | --help)
 			usage
 			return 0
@@ -537,31 +724,43 @@ this binary."
 	echo "  plugins: $INSTALL_DIR/plugins/  (must stay beside the binary)"
 	echo
 
-	case ":$PATH:" in
-	*":$INSTALL_DIR:"*)
+	modify_path
+	case "$PATH_RESULT" in
+	onpath)
 		echo "$INSTALL_DIR is already on your PATH. Try:"
 		echo
 		echo "  g-mesh --version"
 		;;
+	added)
+		echo "Added $INSTALL_DIR to your PATH in $(rc_display)."
+		echo "Restart your shell (or open a new terminal), then: g-mesh --version"
+		;;
+	present)
+		echo "$(rc_display) already puts $INSTALL_DIR on your PATH (left unchanged)."
+		echo "Restart your shell (or open a new terminal), then: g-mesh --version"
+		;;
+	stale)
+		echo "$(rc_display) already has a g-mesh PATH block, but for another directory;"
+		echo "it was left alone. Change the line inside it to:"
+		echo
+		echo "  $(path_line_for "$PATH_RC")"
+		echo
+		echo "Then restart your shell and run: g-mesh --version"
+		;;
+	unsafe)
+		echo "The install directory contains a quote or a newline, so no rc file was edited."
+		print_path_advice
+		;;
+	failed)
+		if [ -n "$PATH_RC" ]; then
+			echo "Could not write $(rc_display), so your PATH was not changed."
+		else
+			echo "HOME is not set, so your PATH was not changed."
+		fi
+		print_path_advice
+		;;
 	*)
-		_rc='your shell profile'
-		# The tildes below are deliberate and must not become $HOME: this
-		# string is printed for a human to read, as the trailing comment on
-		# a sample `export PATH` line. "~/.zshrc" is how a person refers to
-		# that file; expanding it to /Users/someone/.zshrc would make the
-		# advice longer and no clearer, and this script never opens any of
-		# these paths - it says outright that it does not edit rc files.
-		# shellcheck disable=SC2088
-		case "$(basename "${SHELL:-sh}")" in
-		zsh) _rc="~/.zshrc" ;;
-		bash) _rc="~/.bashrc (macOS: ~/.bash_profile)" ;;
-		fish) _rc="~/.config/fish/config.fish - there, use: fish_add_path $INSTALL_DIR" ;;
-		esac
-		echo "Add it to your PATH - this script does not edit shell rc files:"
-		echo
-		echo "  export PATH=\"$INSTALL_DIR:\$PATH\"      # in $_rc"
-		echo
-		echo "Then: g-mesh --version"
+		print_path_advice
 		;;
 	esac
 	echo
@@ -572,7 +771,18 @@ this binary."
 	echo "The seven structural tools work as-is. \`search_code\` additionally needs"
 	echo "the embedding model: g-mesh model fetch"
 	echo
-	echo "To uninstall: rm -rf $INSTALL_DIR"
+	case "$PATH_RESULT" in
+	added | present | stale)
+		case "$PATH_RC" in
+		*.fish) echo "To uninstall: rm -rf $INSTALL_DIR; rm $(rc_display)" ;;
+		*)
+			echo "To uninstall: rm -rf $INSTALL_DIR, and delete the"
+			echo "'$PATH_BLOCK_START' block from $(rc_display)"
+			;;
+		esac
+		;;
+	*) echo "To uninstall: rm -rf $INSTALL_DIR" ;;
+	esac
 }
 
 main "$@"

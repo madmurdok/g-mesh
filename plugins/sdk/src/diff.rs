@@ -54,12 +54,15 @@ use crate::graph::FileGraph;
 ///
 /// `previous` is `None` for a file this process has never extracted - a cold
 /// control-plane process, or a file only the bulk walk ever saw. The diff
-/// against nothing is everything, which is both the honest answer and the one
-/// that leaves core's graph correct with nothing seeded first.
+/// against nothing upserts everything and deletes nothing, so on its own it
+/// cannot retire what core still holds for the file from an earlier process.
+/// It is therefore marked `complete`: core deletes the file's stored rows the
+/// upserts do not cover.
 ///
 /// A deleted file is `next = &FileGraph::default()`: every id the plugin had
 /// for it is deleted and nothing is upserted.
 pub fn diff_file(previous: Option<&FileGraph>, next: &FileGraph) -> FileChangeDiff {
+    let complete = previous.is_none();
     let empty = FileGraph::default();
     let previous = previous.unwrap_or(&empty);
 
@@ -98,6 +101,7 @@ pub fn diff_file(previous: Option<&FileGraph>, next: &FileGraph) -> FileChangeDi
             .filter(|edge| previous_edges.get(edge.id.as_str()).is_none_or(|before| *before != *edge))
             .cloned()
             .collect(),
+        complete,
     }
 }
 
@@ -151,6 +155,15 @@ mod tests {
         assert_eq!(diff.upsert_edges.len(), after.edges.len());
         assert!(diff.delete_node_ids.is_empty());
         assert!(diff.delete_edge_ids.is_empty());
+        assert!(diff.complete, "a diff against no baseline is the whole file");
+    }
+
+    #[test]
+    fn a_diff_against_a_baseline_is_not_complete() {
+        let before = graph(&[("a", 1, 4)]);
+        let after = graph(&[("a", 1, 4), ("b", 2, 4)]);
+        assert!(!diff_file(Some(&before), &after).complete);
+        assert!(!diff_file(Some(&before), &FileGraph::default()).complete);
     }
 
     #[test]

@@ -28,6 +28,7 @@ use crate::graph::pagination;
 use crate::storage::index_store::IndexStore;
 use crate::storage::vectors::pack;
 
+use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
 use super::tool_result::{error, internal_error, success};
@@ -283,13 +284,16 @@ pub(crate) fn top_k_for_eval(
 pub(super) async fn handle_off_worker(
     store: Arc<IndexStore>,
     embedding: Arc<EmbeddingPipeline>,
+    shapes: Arc<QueryShapes>,
     hints: SessionHints,
     params: SearchCodeParams,
     coverage: Option<Coverage>,
 ) -> Result<CallToolResult, ErrorData> {
-    tokio::task::spawn_blocking(move || handle(&store, &embedding, &hints, params, coverage.as_ref()))
-        .await
-        .map_err(|e| internal_error("search_code task failed", e.into()))?
+    tokio::task::spawn_blocking(move || {
+        handle(&store, &embedding, &shapes, &hints, params, coverage.as_ref())
+    })
+    .await
+    .map_err(|e| internal_error("search_code task failed", e.into()))?
 }
 
 /// Answers one `search_code` call. `coverage` is `Some` when the embedding
@@ -304,6 +308,7 @@ pub(super) async fn handle_off_worker(
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     hints: &SessionHints,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
@@ -354,11 +359,11 @@ pub(super) fn handle(
     let judged = judged.as_deref().unwrap_or(&page.results);
 
     let no_match = match coverage {
-        None => similarity::verdict(&params.query, cursor, judged),
-        Some(_) => similarity::partial_verdict(&params.query, cursor, judged),
+        None => similarity::verdict(shapes, &params.query, cursor, judged),
+        Some(_) => similarity::partial_verdict(shapes, &params.query, cursor, judged),
     };
     let low_similarity = match coverage {
-        None => similarity::low_similarity(&params.query, cursor, judged),
+        None => similarity::low_similarity(shapes, &params.query, cursor, judged),
         Some(_) => None,
     };
     let next_cursor = match coverage {
@@ -718,7 +723,9 @@ mod tests {
         let embedding = EmbeddingPipeline::disabled();
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
+        let result =
+            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+                .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
 
@@ -734,7 +741,9 @@ mod tests {
         let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-        let result = handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap();
+        let result =
+            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+                .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
         std::env::remove_var(MODEL_DIR_ENV);
     }
@@ -783,9 +792,13 @@ mod tests {
         let matched = search(&conn, &[1.0, 0.0], 10, None).unwrap();
         let missed = search(&conn, &[0.0, 1.0], 10, None).unwrap();
 
-        assert_eq!(super::super::similarity::verdict("readFile", None, &matched.results), None);
-        let verdict = super::super::similarity::verdict("readFile", None, &missed.results)
-            .expect("a page scoring 0.0 cannot be a match");
+        assert_eq!(
+            super::super::similarity::verdict(QueryShapes::shipped(), "readFile", None, &matched.results),
+            None
+        );
+        let verdict =
+            super::super::similarity::verdict(QueryShapes::shipped(), "readFile", None, &missed.results)
+                .expect("a page scoring 0.0 cannot be a match");
         let body: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&SearchPage {
                 results: missed.results,
@@ -827,8 +840,9 @@ mod tests {
         insert(&conn, "ts", &[1.0, 0.0], "v1").unwrap();
         let missed = search(&conn, &[0.0, 1.0], 10, None).unwrap();
 
-        let no_match = similarity::verdict("reads a file", None, &missed.results);
-        let low_similarity = similarity::low_similarity("reads a file", None, &missed.results);
+        let no_match = similarity::verdict(QueryShapes::shipped(), "reads a file", None, &missed.results);
+        let low_similarity =
+            similarity::low_similarity(QueryShapes::shipped(), "reads a file", None, &missed.results);
         let body: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&SearchPage {
                 results: missed.results,
@@ -886,16 +900,34 @@ mod tests {
         );
 
         assert!(
-            super::super::similarity::verdict("readFile", None, &first.results).is_some(),
+            super::super::similarity::verdict(QueryShapes::shipped(), "readFile", None, &first.results)
+                .is_some(),
             "the control: the first page of this same search is a no"
         );
         assert_eq!(
-            super::super::similarity::verdict("readFile", Some(&cursor), &second.results),
+            super::super::similarity::verdict(
+                QueryShapes::shipped(),
+                "readFile",
+                Some(&cursor),
+                &second.results
+            ),
             None,
             "a continuation is never judged"
         );
-        assert!(similarity::low_similarity("reads a file", None, &first.results).is_some(), "prose control");
-        assert_eq!(similarity::low_similarity("reads a file", Some(&cursor), &second.results), None);
+        assert!(
+            similarity::low_similarity(QueryShapes::shipped(), "reads a file", None, &first.results)
+                .is_some(),
+            "prose control"
+        );
+        assert_eq!(
+            similarity::low_similarity(
+                QueryShapes::shipped(),
+                "reads a file",
+                Some(&cursor),
+                &second.results
+            ),
+            None
+        );
     }
 
     /// Task #50's acceptance criterion, end to end: a free-text query
@@ -943,7 +975,10 @@ mod tests {
             query: "load the contents of a file from the filesystem".to_string(),
             ..Default::default()
         };
-        let body = json_body(&handle(&conn, &embedding, &SessionHints::default(), params, None).unwrap());
+        let body = json_body(
+            &handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+                .unwrap(),
+        );
 
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both embedded symbols must come back");

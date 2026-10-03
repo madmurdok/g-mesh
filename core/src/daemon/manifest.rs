@@ -175,6 +175,48 @@ pub struct WorkspaceConfig {
     pub entry_points: Vec<String>,
 }
 
+/// `[plugin.non_symbol_queries]`: query shapes that are never a symbol of
+/// this plugin's language. Literal and case-sensitive. Core sets aside this
+/// language's semantic candidates for a query that matches, and only this
+/// language's (`mcp::query_shapes`); an absent table refuses nothing. Why
+/// shapes are declared here rather than known to core:
+/// `docs/adr/0018-non-symbol-query-shapes.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonSymbolShapes {
+    /// A query starting with any of these is not one of this language's symbols.
+    #[serde(default)]
+    pub starts_with: Vec<String>,
+    /// A query containing any of these is not one of this language's symbols.
+    #[serde(default)]
+    pub contains: Vec<String>,
+}
+
+impl NonSymbolShapes {
+    /// Whether `query` has one of these shapes.
+    pub fn matches(&self, query: &str) -> bool {
+        self.starts_with.iter().any(|prefix| query.starts_with(prefix.as_str()))
+            || self.contains.iter().any(|infix| query.contains(infix.as_str()))
+    }
+
+    /// `starts_with=@ contains=/`, or `none`, as `g-mesh plugins list` and
+    /// `g-mesh plugins check` print it. A key with no entries is left out.
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.starts_with.is_empty() {
+            parts.push(format!("starts_with={}", self.starts_with.join(",")));
+        }
+        if !self.contains.is_empty() {
+            parts.push(format!("contains={}", self.contains.join(",")));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
 /// One plugin directory's fully resolved manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifest {
@@ -203,6 +245,8 @@ pub struct PluginManifest {
     /// Parsed `[plugin.workspace]`, or [`WorkspaceConfig::default`] if the table
     /// is absent.
     pub workspace: WorkspaceConfig,
+    /// Parsed `[plugin.non_symbol_queries]`, or empty if the table is absent.
+    pub non_symbol_queries: NonSymbolShapes,
 }
 
 impl PluginManifest {
@@ -215,9 +259,11 @@ impl PluginManifest {
 }
 
 /// Reads and validates `<dir>/plugin.toml`. Hard error on malformed TOML
-/// (including an unknown `receiver_calls` value), a missing field, `language`
-/// not equal to `dir`'s name, an unknown `protocol_version`, or an invalid
-/// `watch_files` glob. Every error names the manifest path; the `language` and
+/// (including an unknown `receiver_calls` value or an unknown key in
+/// `[plugin.non_symbol_queries]`), a missing field, `language` not equal to
+/// `dir`'s name, an unknown `protocol_version`, an invalid `watch_files`
+/// glob, or an empty string in `[plugin.non_symbol_queries]` (which would
+/// match every query). Every error names the manifest path; the `language` and
 /// `protocol_version` errors also name the declared and expected values.
 pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
@@ -274,6 +320,8 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    validate_non_symbol_queries(&plugin.non_symbol_queries, &manifest_path)?;
+
     Ok(PluginManifest {
         language: plugin.language,
         protocol_version: plugin.protocol_version,
@@ -289,7 +337,43 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
             exclude_dirs: plugin.workspace.exclude_dirs,
             entry_points: plugin.workspace.entry_points,
         },
+        non_symbol_queries: plugin.non_symbol_queries,
     })
+}
+
+/// An empty string is a prefix and an infix of every query, so it would
+/// refuse every query for this language.
+fn validate_non_symbol_queries(shapes: &NonSymbolShapes, manifest_path: &Path) -> Result<()> {
+    for (key, values) in [("starts_with", &shapes.starts_with), ("contains", &shapes.contains)] {
+        if values.iter().any(String::is_empty) {
+            bail!(
+                "plugin manifest at {} declares an empty string in [plugin.non_symbol_queries] {} - \
+                 it would match every query",
+                manifest_path.display(),
+                key,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `[plugin.non_symbol_queries]` table of a manifest's text, validated as
+/// [`read_manifest`] validates it. For callers that hold a manifest's text but
+/// not its directory, such as one embedded with `include_str!`.
+#[cfg(test)]
+pub(crate) fn non_symbol_queries_of(contents: &str) -> Result<NonSymbolShapes> {
+    #[derive(Deserialize)]
+    struct Outer {
+        plugin: Inner,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        #[serde(default)]
+        non_symbol_queries: NonSymbolShapes,
+    }
+    let outer: Outer = toml::from_str(contents).context("failed to parse plugin manifest")?;
+    validate_non_symbol_queries(&outer.plugin.non_symbol_queries, Path::new("<embedded>"))?;
+    Ok(outer.plugin.non_symbol_queries)
 }
 
 /// Discovery's output: every plugin found, keyed by language, plus the
@@ -559,6 +643,9 @@ struct RawPlugin {
     /// `[plugin.workspace]` is optional - see [`RawWorkspace`].
     #[serde(default)]
     workspace: RawWorkspace,
+    /// Optional; absent refuses nothing.
+    #[serde(default)]
+    non_symbol_queries: NonSymbolShapes,
 }
 
 #[derive(Debug, Deserialize)]

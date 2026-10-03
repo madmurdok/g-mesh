@@ -65,9 +65,14 @@ fn setup_chain() -> Connection {
 fn find_implementations_of_interface_returns_exactly_class_a_not_class_b() {
     let conn = setup_chain();
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        &no_capabilities(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     let results = body["results"].as_array().unwrap();
     assert_eq!(
@@ -135,9 +140,14 @@ fn zero_implementations_is_an_empty_page_not_an_error() {
         .unwrap();
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        &no_capabilities(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     assert_eq!(body["results"].as_array().unwrap().len(), 0);
     assert_eq!(body["hasMore"], false);
@@ -158,8 +168,14 @@ fn a_page_where_every_implementor_is_unresolved_is_flagged_all_unresolved() {
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap(),
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -189,8 +205,14 @@ fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved()
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap(),
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
     assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
@@ -203,8 +225,14 @@ fn the_single_hop_response_echoes_the_resolved_anchor() {
     let conn = setup_chain();
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap(),
     );
     assert_eq!(body["anchor"]["id"], "interface");
     assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
@@ -224,8 +252,10 @@ fn a_fresh_transitive_walk_echoes_the_resolved_anchor() {
         transitive: Some(true),
         ..Default::default()
     };
-    let body =
-        json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &dispatch(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
     assert_eq!(body["anchor"]["id"], "interface");
     assert_eq!(body["anchor"]["qualifiedName"], "pkg::Iface");
     // The rung travels with the anchor, and this path is where it was
@@ -248,8 +278,10 @@ fn a_transitive_walk_reports_the_rung_that_reached_its_anchor() {
         transitive: Some(true),
         ..Default::default()
     };
-    let body =
-        json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &dispatch(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
     assert_eq!(body["anchor"]["id"], "interface");
     assert_eq!(body["anchor"]["resolvedBy"], "qualifiedName", "resolved by qualifiedName, not by id");
 }
@@ -315,6 +347,7 @@ fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
         &handle(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
         )
@@ -324,6 +357,7 @@ fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
         &handle(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             SymbolQueryParams { symbol_name: Some("Iface".to_string()), ..Default::default() },
         )
@@ -351,9 +385,14 @@ fn an_unambiguous_symbol_name_anchors_the_walk_without_a_symbol_id() {
 fn unknown_symbol_id_is_a_tool_level_error() {
     let conn = setup();
     let params = SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        &no_capabilities(),
+        params,
+    )
+    .unwrap();
     assert!(error_text(&result).contains("does_not_exist"));
 }
 
@@ -414,9 +453,14 @@ fn an_implementor_both_tiers_found_is_one_row_not_two() {
     }
 
     let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-    let result =
-        handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap();
+    let result = handle(
+        &Arc::new(IndexStore::new(conn)),
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        &no_capabilities(),
+        params,
+    )
+    .unwrap();
     let body = json_body(&result);
     let mut ids: Vec<&str> = body["results"]
         .as_array()
@@ -487,7 +531,10 @@ fn a_custom_limit_returns_more_than_the_default_page_in_one_call() {
 
     let params =
         SymbolQueryParams { symbol_id: Some("target".to_string()), limit: Some(25), ..Default::default() };
-    let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &handle(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
     assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
     assert_eq!(body["hasMore"], false);
 }
@@ -514,7 +561,10 @@ fn a_file_anchor_carries_a_hint_pointing_at_get_dependencies() {
     let conn = Arc::new(IndexStore::new(conn));
 
     let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
-    let body = json_body(&handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &handle(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
 
     let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
     assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");
@@ -537,8 +587,14 @@ fn a_normal_symbol_anchor_never_carries_a_hint_field() {
 
     let params = SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() };
     let body = json_body(
-        &handle(&Arc::new(IndexStore::new(conn)), &EmbeddingPipeline::disabled(), &no_capabilities(), params)
-            .unwrap(),
+        &handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            &no_capabilities(),
+            params,
+        )
+        .unwrap(),
     );
     assert!(
         body.get("hint").is_none(),
@@ -570,7 +626,9 @@ fn handle_paginates_across_cursor_continuation() {
             cursor: cursor.clone(),
             ..Default::default()
         };
-        let result = handle(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap();
+        let result =
+            handle(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+                .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap().clone();
         seen.extend(results.iter().map(|r| r["implementingSymbolId"].as_str().unwrap().to_string()));
@@ -601,6 +659,7 @@ fn dispatch_without_transitive_answers_byte_identically_to_the_unmodified_single
         &handle(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             SymbolQueryParams { symbol_id: Some("interface".to_string()), ..Default::default() },
         )
@@ -610,6 +669,7 @@ fn dispatch_without_transitive_answers_byte_identically_to_the_unmodified_single
         &dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
         )
@@ -638,6 +698,7 @@ fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_singl
         &dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             FindImplementationsParams { symbol_id: Some("interface".to_string()), ..Default::default() },
         )
@@ -650,6 +711,7 @@ fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_singl
         &dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             FindImplementationsParams {
                 symbol_id: Some("interface".to_string()),
@@ -665,6 +727,7 @@ fn transitive_true_reaches_the_whole_hierarchy_while_false_or_absent_stays_singl
         &dispatch(
             &conn,
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             FindImplementationsParams {
                 symbol_id: Some("interface".to_string()),
@@ -725,8 +788,10 @@ fn a_max_depth_cut_reports_frontier_nodes_to_re_root_on() {
         max_depth: Some(2),
         ..Default::default()
     };
-    let body =
-        json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &dispatch(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
 
     let reached: Vec<(String, u64)> = body["results"]
         .as_array()
@@ -876,6 +941,7 @@ fn resume_token_alongside_an_anchor_or_transitive_is_a_tool_level_error() {
     let with_symbol_id = dispatch(
         &conn,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &no_capabilities(),
         FindImplementationsParams {
             symbol_id: Some("interface".to_string()),
@@ -889,6 +955,7 @@ fn resume_token_alongside_an_anchor_or_transitive_is_a_tool_level_error() {
     let with_symbol_name = dispatch(
         &conn,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &no_capabilities(),
         FindImplementationsParams {
             symbol_name: Some("Iface".to_string()),
@@ -902,6 +969,7 @@ fn resume_token_alongside_an_anchor_or_transitive_is_a_tool_level_error() {
     let with_transitive_only = dispatch(
         &conn,
         &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
         &no_capabilities(),
         FindImplementationsParams {
             transitive: Some(true),
@@ -940,8 +1008,10 @@ fn a_file_anchor_hint_still_fires_in_transitive_mode() {
         transitive: Some(true),
         ..Default::default()
     };
-    let body =
-        json_body(&dispatch(&conn, &EmbeddingPipeline::disabled(), &no_capabilities(), params).unwrap());
+    let body = json_body(
+        &dispatch(&conn, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), &no_capabilities(), params)
+            .unwrap(),
+    );
 
     let hint = body["hint"].as_str().expect("a File-anchored transitive call must still carry a hint");
     assert!(hint.contains("get_dependencies"), "the hint must point at get_dependencies: {hint}");

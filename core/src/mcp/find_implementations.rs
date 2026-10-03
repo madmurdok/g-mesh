@@ -35,6 +35,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::query_shapes::QueryShapes;
 use super::session_hints;
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
@@ -157,10 +158,11 @@ fn list_implementations(
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, |semantic| {
+    find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_in(store, semantic, capabilities, params.clone())
     })
 }
@@ -511,10 +513,11 @@ fn continued(
 pub(crate) fn dispatch(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, |semantic| {
+    find_definition::resolve_lazily(embedding, shapes, |semantic| {
         dispatch_in(store, semantic, capabilities, params.clone())
     })
 }

@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0013`). Use this
+zero-padded, incrementing — the next free number is `0019`). Use this
 template:
 
 ```markdown
@@ -47,6 +47,7 @@ place — read the doc itself for that detail.
 | — | Plugin lifetime: plugins die with their daemon (GM-397) | [`plugin-lifetime.md`](../architecture/plugin-lifetime.md#plugin-lifetime-plugins-die-with-their-daemon-gm-397) |
 | — | Symbol resolution: a ladder inside the tool, not rules outside it | [`symbol-resolution-ladder.md`](../architecture/symbol-resolution-ladder.md#symbol-resolution-a-ladder-inside-the-tool-not-rules-outside-it) |
 | — | A qualifiedName-suffix rung in the resolution ladder (GM-469) | [`gm-469-qualified-name-suffix.md`](../architecture/gm-469-qualified-name-suffix.md#gm-469-a-qualifiedname-suffix-rung-in-the-resolution-ladder) |
+| — | A type member and a same-named free fn in one module: the linker keeps the free fn (GM-470) | [`gm-470-member-free-fn-collision.md`](../architecture/gm-470-member-free-fn-collision.md#recommendation-fix-it-in-core-as-a-tie-break) |
 | — | Pushed context: an Aider-style repo map for g-mesh | [`pushed-context-repo-map.md`](../architecture/pushed-context-repo-map.md#pushed-context-an-aider-style-repo-map-for-g-mesh) |
 | — | Lazy indexing (GM-395): overall doc — see D1-D14 below for the individual decisions | [`lazy-indexing.md`](../architecture/lazy-indexing.md#lazy-indexing-gm-395) |
 | D1 | Where laziness lives: the daemon starts idle; the shim is unchanged in when it spawns | [`lazy-indexing.md#d1`](../architecture/lazy-indexing.md#d1-where-laziness-lives-the-daemon-starts-idle-the-shim-is-unchanged-in-when-it-spawns) |
@@ -87,3 +88,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0015 | [qualifiedName is plugin-segmented; core never parses separators](0015-qualified-name-segments.md) | Accepted |
 | 0016 | [search_code: a cross-encoder reorders the top 30, the verdict stays the embedding's](0016-cross-encoder-rerank.md) | Accepted |
 | 0017 | [The semantic rung embeds off the async workers; plain store reads stay on them](0017-semantic-rung-off-the-worker.md) | Accepted |
+| 0018 | [Plugins declare the query shapes that are never their symbols](0018-non-symbol-query-shapes.md) | Accepted |

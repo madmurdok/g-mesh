@@ -224,6 +224,11 @@ CREATE INDEX IF NOT EXISTS idx_nodes_qualifiedName ON nodes(qualifiedName);
 -- can collide as bare strings), so every lookup of "this container's
 -- members" has to filter on both columns together, never `container` alone.
 CREATE INDEX IF NOT EXISTS idx_nodes_container ON nodes(language, container);
+-- Placeholders by bare name, for `find_callers`/`find_references` to find the
+-- unlinked usages that may belong to a declaration (`mcp::unlinked`). Partial,
+-- so it costs only placeholder rows; a query uses it only when it spells
+-- `nativeKind = 'pending_symbol'` as this literal, not as a bound parameter.
+CREATE INDEX IF NOT EXISTS idx_nodes_pending_name ON nodes(name) WHERE nativeKind = 'pending_symbol';
 
 -- One row per declaration of a symbol that has more than one - overload
 -- signatures beside their implementation, an interface or a namespace written

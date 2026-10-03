@@ -628,6 +628,18 @@ pub struct FileChangeDiff {
     pub upsert_edges: Vec<WireEdge>,
     #[serde(default)]
     pub delete_edge_ids: Vec<String>,
+    /// **`fileChanged` only:** `upsertNodes`/`upsertEdges` are the whole
+    /// file, not a change against what this process last sent. A plugin sets
+    /// it when it has no baseline for the file (a cold process, a restart, a
+    /// file it never extracted), because it cannot then name what the file
+    /// no longer has. Core deletes the file's stored nodes the diff does not
+    /// upsert, and their non-`semantic` outgoing edges likewise
+    /// (`core::storage::file_rows`).
+    ///
+    /// Absent means `false`: the diff names its own deletes. Ignored on a
+    /// `semanticPass` answer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub complete: bool,
 }
 
 /// Minimal JSON-RPC 2.0 response envelope carrying a `FileChangeDiff` -
@@ -1085,9 +1097,11 @@ mod tests {
                 to_declaration: None,
             }],
             delete_edge_ids: vec!["e2".to_string()],
+            complete: true,
         };
 
         let json = serde_json::to_string(&diff).unwrap();
+        assert!(json.contains("\"complete\":true"));
         assert!(json.contains("\"upsertNodes\""));
         assert!(json.contains("\"deleteNodeIds\""));
         assert!(json.contains("\"upsertEdges\""));
@@ -1103,6 +1117,16 @@ mod tests {
         let json = serde_json::to_string(&diff).unwrap();
         let round_tripped: FileChangeDiff = serde_json::from_str(&json).unwrap();
         assert_eq!(diff, round_tripped);
+    }
+
+    #[test]
+    fn file_change_diff_without_complete_reads_as_partial_and_omits_it() {
+        let diff: FileChangeDiff = serde_json::from_str(
+            r#"{"upsertNodes":[],"deleteNodeIds":[],"upsertEdges":[],"deleteEdgeIds":[]}"#,
+        )
+        .unwrap();
+        assert!(!diff.complete);
+        assert!(!serde_json::to_string(&diff).unwrap().contains("complete"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! blocked, the daemon still serves other calls and other lock takers, and the
 //! answers are the ones the ladder gave before.
 
+use crate::mcp::query_shapes::QueryShapes;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -18,7 +19,7 @@ use super::search_code_worker_tests::{call, connect, Gate, GatedEmbedder};
 use super::{find_definition, FindDefinitionParams, GMeshMcpServer};
 use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::manifest::DiscoveredPlugins;
+use crate::daemon::manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
@@ -70,6 +71,15 @@ fn pipeline(
 }
 
 fn server(dir: &Path, store: Arc<IndexStore>, embedding: Arc<EmbeddingPipeline>) -> GMeshMcpServer {
+    server_with(dir, store, embedding, DiscoveredPlugins::default())
+}
+
+fn server_with(
+    dir: &Path,
+    store: Arc<IndexStore>,
+    embedding: Arc<EmbeddingPipeline>,
+    discovered: DiscoveredPlugins,
+) -> GMeshMcpServer {
     let root = dir.join("project");
     let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();
@@ -79,7 +89,7 @@ fn server(dir: &Path, store: Arc<IndexStore>, embedding: Arc<EmbeddingPipeline>)
     let registry = Arc::new(PluginRegistry::new(
         &root,
         state,
-        DiscoveredPlugins::default(),
+        discovered,
         None,
         None,
         Arc::new(EmbeddingPipeline::disabled()),
@@ -220,7 +230,10 @@ async fn the_ladder_answers_as_before_on_exact_suffix_and_semantic_rungs() {
             cursor: None,
             include_source: Some(false),
         };
-        let direct = body(&find_definition::handle(&store, Path::new("."), &embedding, params).unwrap());
+        let direct = body(
+            &find_definition::handle(&store, Path::new("."), &embedding, QueryShapes::shipped(), params)
+                .unwrap(),
+        );
 
         assert_eq!(served["resolvedBy"], rung, "{query}: {served}");
         let served_id =
@@ -265,8 +278,6 @@ async fn no_embedding_happens_when_an_earlier_rung_resolves() {
         ("find_callees", "Stream::read"),
         ("find_references", "pkg::run"),
         ("find_implementations", "run"),
-        // A specifier never reaches inference either.
-        ("find_definition", "@scope/pkg"),
     ] {
         call(&client, tool, json!({ "symbol_name": query })).await;
     }
@@ -274,4 +285,39 @@ async fn no_embedding_happens_when_an_earlier_rung_resolves() {
 
     call(&client, "find_references", json!({ "symbol_name": UNNAMED })).await;
     assert_eq!(count.load(Ordering::SeqCst), 1, "the semantic rung embeds its query once");
+}
+
+/// The server reads each discovered plugin's `[plugin.non_symbol_queries]`
+/// and hands it to the rung: with the fixture's only language refusing `@`,
+/// a scoped package is refused without being embedded, while a plain name
+/// on the same server still is.
+///
+/// Control: in `GMeshMcpServer::new`, build `shapes` as
+/// `QueryShapes::default()` instead of from the registry - the specifier is
+/// embedded and offered the fixture's 1.0 hit, and both assertions on it fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_applies_the_discovered_plugins_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let embedded = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&embedded);
+    let embedding = pipeline(dir.path(), move || Box::new(CountingEmbedder(Arc::clone(&counter))));
+    let rust = PluginManifest {
+        language: "rust".to_string(),
+        non_symbol_queries: NonSymbolShapes { starts_with: vec!["@".into()], contains: vec!["/".into()] },
+        ..crate::daemon::plugin::bundled_manifest()
+    };
+    let discovered = DiscoveredPlugins {
+        manifests: [("rust".to_string(), rust)].into_iter().collect(),
+        routing: [(".rs".to_string(), "rust".to_string())].into_iter().collect(),
+    };
+    let server = server_with(dir.path(), Arc::new(IndexStore::new(fixture())), embedding, discovered);
+    let client = connect(server).await;
+
+    let refused = call(&client, "find_definition", json!({ "symbol_name": "@scope/pkg" })).await;
+    assert_eq!(refused.is_error, Some(true), "{:?}", refused.content);
+    assert_eq!(embedded.load(Ordering::SeqCst), 0, "a refused shape is never embedded");
+
+    let plain = body(&call(&client, "find_definition", json!({ "symbol_name": UNNAMED })).await);
+    assert_eq!(plain["resolvedBy"], "semanticNeighbours", "{plain}");
+    assert!(embedded.load(Ordering::SeqCst) > 0, "the same server embeds a plain name");
 }

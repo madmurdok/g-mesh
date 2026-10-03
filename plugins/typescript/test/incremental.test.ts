@@ -499,6 +499,48 @@ test("reparseChangedFile reads the project-relative path and keys state by it", 
   }
 });
 
+test("a deleted file removes what this process had and forgets it, so a re-creation is a full extraction", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-incr-"));
+  try {
+    resetIncrementalState();
+    const abs = path.join(root, FILE);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, BASE, "utf8");
+    const first = await reparseChangedFile(root, FILE);
+
+    await fs.rm(abs);
+    const gone = await reparseChangedFile(root, FILE);
+    assert.deepEqual(
+      gone.removedNodes.map((n) => n.id).sort(),
+      first.addedNodes.map((n) => n.id).sort(),
+    );
+    assert.equal(gone.removedEdges.length, first.addedEdges.length);
+    assert.equal(gone.addedNodes.length, 0);
+    assert.equal(hasCachedFile(FILE), false);
+
+    // Identical text restored: core deleted the file's rows, so the answer
+    // must carry all of them again rather than "nothing changed".
+    await fs.writeFile(abs, BASE, "utf8");
+    const restored = await reparseChangedFile(root, FILE);
+    assert.equal(restored.fullExtraction, true);
+    assert.equal(restored.addedNodes.length, first.addedNodes.length);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a deleted file with nothing cached answers an empty full extraction", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-incr-"));
+  try {
+    resetIncrementalState();
+    const diff = await reparseChangedFile(root, FILE);
+    assert.equal(isEmptyDiff(diff), true);
+    assert.equal(diff.fullExtraction, true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("reparseChangedFile resolves relative imports against the project on disk", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "gmesh-incr-"));
   try {
