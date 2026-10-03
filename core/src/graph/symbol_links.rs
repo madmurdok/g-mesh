@@ -61,6 +61,12 @@
 //!     ambiguity to refuse" is the normal case, not a licence to pick one if a
 //!     plugin ever sends two declarations under one qualifiedName.
 //!
+//!     One exception, under a `name` key only: when several fit and exactly
+//!     one of them is not a type member (its qualifiedPath's parent is a
+//!     `Type` of its container), that one is linked. A name in a module scope
+//!     never denotes a field or method, which plugins store in the module's
+//!     container beside the free declarations ([`Resolver::sole_non_member`]).
+//!
 //! ## Visibility
 //!
 //!  - `public` - visible from anywhere.
@@ -162,7 +168,8 @@
 //!
 //!  - the scope is not in the index, or offers no visible such name - directly
 //!    or through any re-export chain short enough to follow;
-//!  - several visible nodes fit and the edge kind does not single one out;
+//!  - several visible nodes fit and neither the edge kind nor the type-member
+//!    exception (contract step 4) singles one out;
 //!  - the only fits are of the wrong kind for the edge;
 //!  - the placeholder has no target row at all - a legacy v1 address
 //!    `derive_legacy_target` could not read. It is left exactly as it is and
@@ -284,6 +291,7 @@ const DEFAULT_EXPORT_NAME: &str = "default";
 const MAX_REEXPORT_DEPTH: usize = 8;
 
 const MODULE_KIND: &str = "Module";
+const TYPE_KIND: &str = "Type";
 
 /// `placeholder_targets.scopeKind` / `keyKind` values and `nodes.visibility`
 /// values, as `storage::schema`'s CHECK constraints spell them.
@@ -1171,15 +1179,23 @@ fn link(conn: &mut Connection, pending: Pending) -> Result<LinkSummary> {
                 let Some(required) = required_target_kind(&edge_kind) else {
                     continue; // not a usage edge - nothing here linked it, so nothing here moves it
                 };
-                let mut fitting = candidates.iter().filter(|candidate| match required {
-                    Some(required) => candidate.kind == required,
-                    None => true,
-                });
-                let target_id = match (fitting.next(), fitting.next()) {
-                    (Some(candidate), None) => candidate.id.clone(),
-                    // Nothing of the right kind, or several equally good
-                    // candidates: a missing edge beats a wrong one.
-                    _ => continue,
+                let fitting: Vec<&Candidate> = candidates
+                    .iter()
+                    .filter(|candidate| match required {
+                        Some(required) => candidate.kind == required,
+                        None => true,
+                    })
+                    .collect();
+                let target_id = match fitting.as_slice() {
+                    [candidate] => candidate.id.clone(),
+                    // Nothing of the right kind: a missing edge beats a wrong one.
+                    [] => continue,
+                    several => match resolver.sole_non_member(&placeholder.key, several)? {
+                        Some(candidate) => candidate.id.clone(),
+                        // Several equally good candidates: a missing edge
+                        // beats a wrong one.
+                        None => continue,
+                    },
                 };
 
                 summary.linked_edges += repoint
@@ -1220,6 +1236,8 @@ struct Candidate {
     visibility_container: Option<String>,
     qualified_name: String,
     container: Option<String>,
+    /// `nodes.qualifiedPath`, still encoded: only an ambiguity decodes it.
+    qualified_path: Option<String>,
 }
 
 /// One re-export hop: the scope and key a re-export forwards to.
@@ -1237,17 +1255,21 @@ struct Resolver<'c> {
     in_container_by_qualified_name: Statement<'c>,
     reexports_in_file: Statement<'c>,
     reexports_in_container: Statement<'c>,
+    type_in_file: Statement<'c>,
+    type_in_container: Statement<'c>,
     declared: HashMap<(Scope, Key), Vec<Candidate>>,
     hops: HashMap<(Scope, String), Vec<Hop>>,
     /// `(language, container)` -> that container plus its parent chain.
     visible_from: HashMap<(String, String), HashSet<String>>,
+    /// Candidate id -> whether it is a type member ([`Resolver::is_type_member`]).
+    type_members: HashMap<String, bool>,
     untargeted_reexports: HashSet<String>,
 }
 
 impl<'c> Resolver<'c> {
     fn new(conn: &'c Connection) -> Result<Self> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
-             qualifiedName, container FROM nodes";
+             qualifiedName, container, qualifiedPath FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key \
              FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
         // Unaliased: `CANDIDATE` selects from `nodes` directly.
@@ -1274,9 +1296,18 @@ impl<'c> Resolver<'c> {
                 "{REEXPORT} WHERE n.language = ?1 AND n.container = ?2 AND n.kind = ?3 AND n.nativeKind = ?4 \
                  AND n.name IN (?5, ?6)"
             ))?,
+            // `+` keeps both on idx_nodes_qualifiedName, as above.
+            type_in_file: prepare(format!(
+                "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND +filePath = ?2 AND +kind = '{TYPE_KIND}' LIMIT 1"
+            ))?,
+            type_in_container: prepare(format!(
+                "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND +language = ?2 AND +container = ?3 \
+                 AND +kind = '{TYPE_KIND}' LIMIT 1"
+            ))?,
             declared: HashMap::new(),
             hops: HashMap::new(),
             visible_from: HashMap::new(),
+            type_members: HashMap::new(),
             untargeted_reexports: HashSet::new(),
         })
     }
@@ -1391,6 +1422,70 @@ impl<'c> Resolver<'c> {
         Ok(members)
     }
 
+    /// The one candidate of `several` that is not a type member, when a
+    /// `name` key found exactly one such candidate among type members.
+    ///
+    /// A name looked up in a module scope denotes a module-level declaration,
+    /// never an associated item: Rust's `use m::y` / `m::y()`, Go's `m.Y()`
+    /// and Python's `from a import y` cannot reach a field or method of a type
+    /// declared in `m`. Plugins store those members in the module's container
+    /// beside the free declarations, so they share the name lookup, and are
+    /// discarded here. Two or more non-members are still ambiguous, and so
+    /// are members alone (a field and a getter of one name). A `qualifiedName`
+    /// key names one declaration and gets no tie-break. Design:
+    /// docs/architecture/gm-470-member-free-fn-collision.md.
+    fn sole_non_member<'a>(&mut self, key: &Key, several: &[&'a Candidate]) -> Result<Option<&'a Candidate>> {
+        if !matches!(key, Key::Name(_)) {
+            return Ok(None);
+        }
+        let mut non_member = None;
+        for candidate in several {
+            if self.is_type_member(candidate)? {
+                continue;
+            }
+            if non_member.replace(*candidate).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(non_member)
+    }
+
+    /// Whether `candidate` is a member of a type: its `qualifiedPath` minus
+    /// the last segment is the qualifiedName of a `Type` declared in the same
+    /// container (the same language and container key), or in the same file
+    /// when it has no container. A candidate without a path of at least two
+    /// segments is not one. The container, not the file, is what a Go method
+    /// shares with its receiver type, which may be declared in another file
+    /// of the package.
+    fn is_type_member(&mut self, candidate: &Candidate) -> Result<bool> {
+        if let Some(known) = self.type_members.get(&candidate.id) {
+            return Ok(*known);
+        }
+        let parent = candidate
+            .qualified_path
+            .as_deref()
+            .and_then(qualified_path::decode)
+            .and_then(|path| path.head())
+            .map(|head| head.display());
+        let member = match (parent, candidate.container.as_deref()) {
+            (None, _) => false,
+            (Some(parent), Some(container)) => self
+                .type_in_container
+                .query_row(params![parent, candidate.language, container], |_| Ok(()))
+                .optional()
+                .context("failed to look up a candidate's enclosing type")?
+                .is_some(),
+            (Some(parent), None) => self
+                .type_in_file
+                .query_row(params![parent, candidate.file_path], |_| Ok(()))
+                .optional()
+                .context("failed to look up a candidate's enclosing type")?
+                .is_some(),
+        };
+        self.type_members.insert(candidate.id.clone(), member);
+        Ok(member)
+    }
+
     /// Every declaration in `scope` matching `key`, visible or not.
     fn declared(&mut self, scope: &Scope, key: &Key) -> Result<Vec<Candidate>> {
         let cache_key = (scope.clone(), key.clone());
@@ -1408,6 +1503,7 @@ impl<'c> Resolver<'c> {
                 visibility_container: row.get(5)?,
                 qualified_name: row.get(6)?,
                 container: row.get(7)?,
+                qualified_path: row.get(8)?,
             })
         };
         let rows = match (scope, key) {
