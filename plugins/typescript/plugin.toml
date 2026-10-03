@@ -83,8 +83,9 @@ entry_points = ["index"]
 # Query shapes that are never a TypeScript/JavaScript symbol: core sets aside this language's
 # semantic candidates for such a query, and no other language's
 # (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
-# `@` starts a scoped package or a decorator, and `/` is a path or
-# package separator; no TypeScript/JavaScript function, type or member
-# name contains either.
-starts_with = ["@"]
+# `@` starts a scoped package or a decorator, `/` is a path or package
+# separator, and `node:` starts a Node.js built-in module specifier
+# (`node:fs`, `node:path`); no TypeScript/JavaScript function, type or
+# member name contains `@`, `/` or `:`.
+starts_with = ["@", "node:"]
 contains = ["/"]

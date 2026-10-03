@@ -82,7 +82,8 @@ silence every other language.
   later.
 - `plugin.toml` is fingerprinted, so adding the table rebuilds each index
   once.
-- Follow-up: TypeScript's `node:` prefix.
+- Follow-up: TypeScript's `node:` prefix (done in GM-481,
+  `docs/architecture/gm-481-node-specifiers.md`).
 
 ## Alternatives considered
 
