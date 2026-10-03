@@ -69,6 +69,8 @@ pub(crate) struct FileModel {
     by_tail: HashMap<(String, String), DeclRef>,
     imports: HashMap<(String, String), Import>,
     child_modules: HashSet<(String, String)>,
+    /// Modules with at least one glob `use` (`use a::*;`, any visibility).
+    glob_modules: HashSet<String>,
 }
 
 impl FileModel {
@@ -134,6 +136,16 @@ impl FileModel {
     /// Records that `container` declares `mod name` - file-backed or inline.
     pub(crate) fn child_module(&mut self, container: &str, name: &str) {
         self.child_modules.insert((container.to_string(), name.to_string()));
+    }
+
+    /// Records that `container` has a glob `use`.
+    pub(crate) fn glob_module(&mut self, container: &str) {
+        self.glob_modules.insert(container.to_string());
+    }
+
+    /// Whether `container` has any glob `use`.
+    pub(crate) fn has_glob(&self, container: &str) -> bool {
+        self.glob_modules.contains(container)
     }
 
     /// Whether `container` declares any `mod` - file-backed or inline.

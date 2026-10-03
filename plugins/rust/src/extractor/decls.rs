@@ -299,15 +299,27 @@ pub(crate) struct Declarer<'a, 's> {
 
 impl Declarer<'_, '_> {
     /// Records every `mod` item in the file, at every nesting depth, before
-    /// anything else runs.
+    /// anything else runs - and which modules have a glob `use`.
     ///
     /// `use self::helpers::run;` may sit above `mod helpers;`, and Rust does
     /// not care - items in a module are mutually visible whatever their
     /// order. Resolving that `use` needs to know `helpers` is a child module,
-    /// so the child modules are learned first and everything else second.
+    /// so the child modules are learned first and everything else second. The
+    /// globs are learned here for the same reason: an external named `use`
+    /// above a glob needs to know the glob is there (see `use_leaf`).
     pub(crate) fn collect_modules(&mut self, list: Node, module: &ModuleCtx) {
         let mut cursor = list.walk();
         for item in list.named_children(&mut cursor) {
+            if item.kind() == "use_declaration" {
+                if let Some(argument) = item.child_by_field_name("argument") {
+                    let mut leaves = Vec::new();
+                    collect_use_leaves(argument, &[], &mut leaves, self.source);
+                    if leaves.iter().any(|leaf| matches!(leaf.kind, LeafKind::Glob)) {
+                        self.model.glob_module(&module.key);
+                    }
+                }
+                continue;
+            }
             if item.kind() != "mod_item" {
                 continue;
             }
@@ -540,6 +552,21 @@ impl Declarer<'_, '_> {
                 self.import_edge(target, &krate, range);
                 if let LeafKind::Named { name, alias } = leaf.kind {
                     self.model.import(&module.key, alias.unwrap_or(name), Import::External);
+                    // A private row, as for a project item, where a child
+                    // module's `use super::*` can follow it and this module
+                    // has a glob: an explicit import shadows the module's
+                    // globs (`Resolver::walk`), so without the row a glob's
+                    // same-named item would be linked instead. Without a glob
+                    // there is nothing to shadow and the row is dead weight.
+                    // The target is the crate path, which no project
+                    // container matches, so the walk ends there unresolved.
+                    if !republishes
+                        && self.model.has_child_modules(&module.key)
+                        && self.model.has_glob(&module.key)
+                    {
+                        let path = external_path(&leaf.prefix).unwrap_or(krate);
+                        self.reexport(alias.unwrap_or(name), &path, name, module, false, range);
+                    }
                 }
                 return;
             }
@@ -639,6 +666,19 @@ impl Declarer<'_, '_> {
         };
         self.emitter.placeholder_edge(EdgeKind::Imports, &file, &to);
     }
+}
+
+/// `std::io` for an external `use std::io::Error;`'s prefix: the path as
+/// written, when it is plain names throughout.
+fn external_path(prefix: &[Seg<'_>]) -> Option<String> {
+    let names = prefix
+        .iter()
+        .map(|seg| match seg {
+            Seg::Name(name) => Some(*name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(names.join("::"))
 }
 
 /// One leaf of a `use` tree, flattened out of however many nested groups

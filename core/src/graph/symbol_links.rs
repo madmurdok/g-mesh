@@ -116,7 +116,11 @@
 //! ([`REEXPORT_NATIVE_KIND`]), breadth-first until a declaration turns up or
 //! [`MAX_REEXPORT_DEPTH`] hops are spent. Shallowest wins: a scope that
 //! declares a name itself shadows what it re-exports under that name, as it
-//! does in the language. Only `name` keys walk; a `qualifiedName` names a
+//! does in the language, and within one scope a named re-export shadows its
+//! `*` ones (an explicit `use`/`export { x }` beats a glob), even when the
+//! named one leads nowhere - a Rust `use std::io::Error;` beside
+//! `use self::x::*;` is a row to the external crate, so the walk stops there
+//! rather than linking `x::Error`. Only `name` keys walk; a `qualifiedName` names a
 //! declaration, never a pass-through - except through its head, below.
 //!
 //! ## Members of a re-exported head
@@ -1252,6 +1256,11 @@ type Step = (Scope, Key);
 #[derive(Debug, Clone)]
 struct Hop {
     to: Step,
+    /// Whether the row forwards one name (`use a::T;`, `export { T }`) rather
+    /// than a whole scope (`*`). In one scope a named row shadows every `*`
+    /// row for that name - an explicit import beats a glob in Rust, as an
+    /// explicit export beats `export *` in ES modules.
+    named: bool,
     /// `Some((language, container))` for a row of `container` visibility: only
     /// a requester of that language in that container or below it may follow
     /// it. `None` for every other row, which anyone may follow.
@@ -1385,14 +1394,25 @@ impl<'c> Resolver<'c> {
                 let Key::Name(name) = key else {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
+                let mut followed = Vec::new();
                 for hop in self.hops(scope, name)? {
-                    // Checked before `visited`: a row this requester may not
-                    // follow must not hide another row reaching the same step.
+                    // Checked before `visited` and before shadowing: a row
+                    // this requester may not follow must neither hide another
+                    // row reaching the same step nor shadow a glob.
                     if let Some((language, container)) = &hop.restricted_to {
                         if !self.sees(requester, language, container.as_deref())? {
                             continue;
                         }
                     }
+                    followed.push(hop);
+                }
+                // A named row shadows the scope's `*` rows, even when it leads
+                // nowhere (an external crate's item): a missing edge beats the
+                // wrong one a glob would give.
+                if followed.iter().any(|hop| hop.named) {
+                    followed.retain(|hop| hop.named);
+                }
+                for hop in followed {
                     if visited.insert(hop.to.clone()) {
                         next.push(hop.to);
                     }
@@ -1653,7 +1673,7 @@ impl<'c> Resolver<'c> {
                 }
             };
             let restricted_to = (visibility == VISIBILITY_CONTAINER).then_some((language, visible_in));
-            hops.push(Hop { to: (target_scope, hop_key), restricted_to });
+            hops.push(Hop { to: (target_scope, hop_key), named: !whole_module, restricted_to });
         }
 
         self.hops.insert(cache_key, hops.clone());
