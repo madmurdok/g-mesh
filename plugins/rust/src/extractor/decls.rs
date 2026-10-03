@@ -85,11 +85,12 @@ use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
     is_public, resolve_module_path, visibility, visibility_modifier, ModuleCtx, PathTarget,
 };
-use crate::extractor::model::{DeclRef, FileModel, Import};
+use crate::extractor::model::{DeclRef, FileModel, Import, Returns};
 use crate::extractor::syntax::{
     collapse_whitespace, flatten_path, inner_doc_comment, item_name, outer_doc_comment, path_tail, signature,
     text, Seg,
 };
+use crate::extractor::typing::{generic_names, WrittenType};
 use crate::project::ProjectContext;
 
 /// Which block a declaration sits in, which is what decides its `nativeKind`
@@ -469,6 +470,9 @@ impl Declarer<'_, '_> {
         spec.doc_comment = outer_doc_comment(item, self.source);
         let id = self.emitter.declare(spec, is_public(&own));
         let decl = DeclRef { id: id.clone(), kind };
+        if let Some(returns) = self.returns(item, module, block) {
+            self.model.set_returns(&id, returns);
+        }
         if block.is_some() {
             // An associated item (`T::y`, `<T as Tr>::y`, `Tr::y`) is never
             // named by a bare path: it is recorded by its tail only, so it
@@ -478,6 +482,27 @@ impl Declarer<'_, '_> {
             self.model.declare(&module.key, &name, &tail, decl);
         }
         Some(id)
+    }
+
+    /// A function's written return type, when a typed receiver could use it:
+    /// a path type naming no generic parameter in scope, with `Self` replaced
+    /// by the impl's own type. A trait's own `Self` is not a type, so a
+    /// trait method returning it has none.
+    fn returns(&self, item: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<Returns> {
+        if !matches!(item.kind(), "function_item" | "function_signature_item") {
+            return None;
+        }
+        let written = WrittenType::parse(item.child_by_field_name("return_type")?, self.source)?;
+        let self_type = block
+            .filter(|block| block.family != Family::TraitDecl)
+            .map(|block| block.self_type.as_str())
+            .filter(|name| name.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        let ty = written.substitute_self(self_type)?;
+        let generics = generic_names(item, self.source);
+        if ty.mentions(&|name| generics.iter().any(|generic| generic == name)) {
+            return None;
+        }
+        Some(Returns { module: module.clone(), ty })
     }
 
     /// `mod child;` and `mod child { … }`: a member of the module that

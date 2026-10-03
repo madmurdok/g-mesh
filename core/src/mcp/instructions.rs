@@ -137,7 +137,7 @@ const P3: &str = "`resolved: false` marks the one thing the indexer could not se
 /// The receiver-call paragraph with no language list: used when nothing is
 /// known yet or exactly one language is present (see [`build`]).
 const P4_GENERIC: &str = "The one legitimate reason to grep afterward: a method call through a \
-     variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
+     variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
      lists for methods can under-report; bare function calls and this/super/qualified-type \
      calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
      project's first index, or a re-index after an upgrade, a tool call waits for the walk \
@@ -162,7 +162,7 @@ const P4_STATIC_RECEIVER: &str =
 fn p4_named(list: &str) -> String {
     format!(
         "The one legitimate reason to grep afterward: a method call through a \
-         variable receiver (`x.foo()`) produces no edge in {list}, so caller/reference \
+         variable receiver (`x.foo()`) may produce no edge in {list}, so caller/reference \
          lists for methods can under-report; bare function calls and this/super/qualified-type \
          calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
          project's first index, or a re-index after an upgrade, a tool call waits for the walk \
@@ -175,7 +175,7 @@ fn p4_named(list: &str) -> String {
 /// pointer to a response field (none carries this fact yet).
 fn p4_fallback() -> String {
     "The one legitimate reason to grep afterward: a method call through a variable \
-     receiver (`x.foo()`) produces no edge in some of this project's languages until \
+     receiver (`x.foo()`) may produce no edge in some of this project's languages until \
      their semantic layer finishes - check which before trusting a method's page as \
      exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
      call waits for the walk to finish before answering - slow, not wrong; do not \

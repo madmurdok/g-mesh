@@ -89,6 +89,7 @@ mod keys;
 mod model;
 mod scope;
 mod syntax;
+mod typing;
 
 use std::cell::RefCell;
 
@@ -101,6 +102,8 @@ use crate::extractor::keys::ModuleCtx;
 use crate::extractor::model::FileModel;
 use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::inner_doc_comment;
+#[cfg(test)]
+pub(crate) use crate::extractor::typing::Origin;
 use crate::project::ProjectContext;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's

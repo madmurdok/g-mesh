@@ -32,7 +32,8 @@ use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::wire::NodeKind;
 
-use crate::extractor::keys::ModuleNames;
+use crate::extractor::keys::{ModuleCtx, ModuleNames};
+use crate::extractor::typing::WrittenType;
 
 /// A declaration this file makes, as everything that needs to point at it
 /// sees it.
@@ -43,6 +44,14 @@ pub(crate) struct DeclRef {
     /// Its storage kind, for the same filter core's linker applies: a
     /// `CALLS` edge only ever lands on a `Function`.
     pub(crate) kind: NodeKind,
+}
+
+/// A function's written return type, with the module it was written in, which
+/// is where its names resolve. `Self` is already replaced by the impl's type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Returns {
+    pub(crate) module: ModuleCtx,
+    pub(crate) ty: WrittenType,
 }
 
 /// What one `use` item bound a name to.
@@ -71,6 +80,9 @@ pub(crate) struct FileModel {
     child_modules: HashSet<(String, String)>,
     /// Modules with at least one glob `use` (`use a::*;`, any visibility).
     glob_modules: HashSet<String>,
+    /// Keyed by declaration id. `None` marks an id declared twice (a `cfg`
+    /// pair) with two different return types: neither is the answer.
+    returns: HashMap<String, Option<Returns>>,
 }
 
 impl FileModel {
@@ -119,6 +131,24 @@ impl FileModel {
     /// The declaration whose full name within `container` is `tail`.
     pub(crate) fn lookup_tail(&self, container: &str, tail: &str) -> Option<&DeclRef> {
         self.by_tail.get(&(container.to_string(), tail.to_string()))
+    }
+
+    /// Records the written return type of the function `id`.
+    pub(crate) fn set_returns(&mut self, id: &str, returns: Returns) {
+        match self.returns.get(id) {
+            None => {
+                self.returns.insert(id.to_string(), Some(returns));
+            }
+            Some(Some(known)) if *known == returns => {}
+            Some(_) => {
+                self.returns.insert(id.to_string(), None);
+            }
+        }
+    }
+
+    /// The written return type of the function `id`, when it has exactly one.
+    pub(crate) fn returns(&self, id: &str) -> Option<&Returns> {
+        self.returns.get(id)?.as_ref()
     }
 
     /// Records what a `use` item bound. The first binding of a name in a

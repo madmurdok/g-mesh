@@ -704,22 +704,20 @@ fn self_and_self_dot_inside_an_impl_reach_the_impl_types_own_method() {
     assert!(graph.edges(EdgeKind::Calls).iter().all(|edge| edge.resolved));
 }
 
-/// Acceptance: a receiver call produces **no edge**. It is the shape nearly
-/// every Rust method call has, and guessing at it is what the semantic tier
-/// exists to avoid needing.
+/// A receiver call whose receiver's type this file writes out is addressed
+/// as `T::m`, and its open site stays, naming that edge in `replaces` so a
+/// semantic answer that lands elsewhere can retract it.
 #[test]
-fn a_receiver_call_produces_no_edge_and_one_open_site() {
+fn a_typed_receiver_call_produces_an_edge_and_an_open_site_that_replaces_it() {
     let krate = Crate::new(&[(
         "src/lib.rs",
         "pub struct P;\nimpl P { pub fn m(&self) {} }\npub fn run(p: P) { p.m(); }\n",
     )]);
     let graph = krate.extract("src/lib.rs");
     let run = graph.node("run").id.clone();
-    assert!(
-        graph.edges(EdgeKind::Calls).iter().all(|edge| edge.from_id != run),
-        "no edge may be emitted for `p.m()`: {:#?}",
-        graph.edges(EdgeKind::Calls)
-    );
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["P::m"]);
+    let edge = graph.edges(EdgeKind::Calls).into_iter().find(|edge| edge.from_id == run).unwrap().clone();
+    assert!(edge.resolved, "a same-file target is a resolved edge");
     let sites: Vec<_> =
         graph.0.open_sites.iter().filter(|site| site.kind == OpenSiteKind::ReceiverCall).collect();
     assert_eq!(sites.len(), 1, "{sites:#?}");
@@ -727,6 +725,195 @@ fn a_receiver_call_produces_no_edge_and_one_open_site() {
     assert_eq!(sites[0].from_id, run);
     assert_eq!(sites[0].edge_kind, EdgeKind::Calls);
     assert_eq!(sites[0].from_container.as_deref(), Some("krate"));
+    assert_eq!(sites[0].replaces.as_deref(), Some(edge.id.as_str()), "the site names the edge it replaces");
+}
+
+/// A receiver whose type this file does not say - a generic parameter, a
+/// trait object, `impl Trait`, a type from another crate, an untyped closure
+/// parameter - still produces no edge, and its open site replaces nothing.
+#[test]
+fn an_untyped_receiver_call_produces_no_edge_and_an_open_site_that_replaces_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr { fn m(&self); }
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub fn generic<T: Tr>(p: T) { p.m(); }
+pub fn object(p: &dyn Tr) { p.m(); }
+pub fn opaque(p: impl Tr) { p.m(); }
+pub fn foreign(p: String) { p.m(); }
+pub fn closure(ps: Vec<P>) { ps.iter().for_each(|p| p.m()); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["generic", "object", "opaque", "foreign", "closure"] {
+        assert_eq!(graph.targets(EdgeKind::Calls, function), Vec::<String>::new(), "{function}");
+    }
+    let sites: Vec<_> = graph.0.open_sites.iter().filter(|site| site.name == "m").collect();
+    assert_eq!(sites.len(), 5, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_none()), "{sites:#?}");
+}
+
+/// GM-485's own shape: a local typed by the return type of a method, which
+/// is typed by the parameter it is called on.
+#[test]
+fn a_local_typed_by_a_same_file_method_return_links_its_receiver_calls() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct Q;
+impl Q { pub fn refuses(&self) -> bool { true } }
+pub struct A;
+impl A { pub fn shapes(&self) -> &Q { &Q } }
+pub fn run(a: &A) { let s = a.shapes(); s.refuses(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["A::shapes", "Q::refuses"]);
+    let sites: Vec<_> =
+        graph.0.open_sites.iter().filter(|site| site.kind == OpenSiteKind::ReceiverCall).collect();
+    assert_eq!(sites.len(), 2, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_some()), "{sites:#?}");
+}
+
+/// The same caller in another file: the types are imported, so `a.shapes()`
+/// is a `qualifiedName` placeholder in `A`'s module, and `s` stays untyped
+/// because `A::shapes`'s return type is written in another file.
+#[test]
+fn a_return_type_written_in_another_file_types_nothing() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod m;\npub mod caller;\n"),
+        (
+            "src/m.rs",
+            "pub struct Q;\nimpl Q { pub fn refuses(&self) -> bool { true } }\n\
+             pub struct A;\nimpl A { pub fn shapes(&self) -> &Q { &Q } }\n",
+        ),
+        ("src/caller.rs", "use crate::m::{A, Q};\npub fn run(a: &A) { let s = a.shapes(); s.refuses(); }\n"),
+    ]);
+    let graph = krate.extract("src/caller.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::m::A::shapes"]);
+    let placeholder = graph.placeholder("pending_symbol", "shapes");
+    assert_eq!(
+        graph.target_of(placeholder),
+        (container("krate::m"), TargetKey::QualifiedName("m::A::shapes".into()))
+    );
+    let refuses = graph.0.open_sites.iter().find(|site| site.name == "refuses").unwrap();
+    assert_eq!(refuses.replaces, None);
+}
+
+/// Every way a local is typed from what this file writes: a `let` type, a
+/// struct literal, an alias, a free function's and an associated function's
+/// return type, through `?`, `unwrap()` and `expect()`, and `Box`.
+#[test]
+fn locals_are_typed_by_annotations_literals_aliases_and_same_file_returns() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P {
+    pub fn new() -> Self { P }
+    pub fn maybe() -> Option<Self> { None }
+    pub fn m(&self) {}
+}
+pub fn make() -> P { P }
+pub fn fallible() -> Result<Box<P>, ()> { Err(()) }
+pub fn annotated() { let p: P = Default::default(); p.m(); }
+pub fn literal() { let p = P {}; p.m(); }
+pub fn alias(q: &P) { let p = &q; p.m(); }
+pub fn free() { let p = make(); p.m(); }
+pub fn assoc() { let p = P::new(); p.m(); }
+pub fn tried() -> Option<()> { let p = P::maybe()?; p.m(); None }
+pub fn unwrapped() { let p = P::maybe().unwrap(); p.m(); }
+pub fn expected() { let p = fallible().expect("p"); p.m(); }
+pub fn boxed(p: Box<P>) { p.m(); }
+pub fn later() { let p = P::maybe(); let q = p.unwrap(); q.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in
+        ["annotated", "literal", "alias", "free", "assoc", "tried", "unwrapped", "expected", "boxed", "later"]
+    {
+        let targets = graph.targets(EdgeKind::Calls, function);
+        assert!(targets.contains(&"P::m".to_string()), "{function}: {targets:?}");
+    }
+}
+
+/// What does not type a local: an `Option` never unwrapped, `Rc`/`Arc`, a
+/// project type that happens to be called `Option`, a generic return, a
+/// rebinding without a type, and a fourth hop.
+#[test]
+fn wrappers_shadowing_generics_and_long_chains_leave_a_local_untyped() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        (
+            "src/a.rs",
+            r#"
+use std::rc::Rc;
+pub struct P;
+impl P {
+    pub fn maybe() -> Option<Self> { None }
+    pub fn next(&self) -> P { P }
+    pub fn m(&self) {}
+}
+pub fn any<P>() -> P { todo!() }
+pub fn wrapped() { let p = P::maybe(); p.m(); }
+pub fn counted(p: Rc<P>) { p.m(); }
+pub fn generic() { let p: P = any(); let q = any(); q.m(); let _ = p; }
+pub fn shadowed(p: P) { let p = 3; p.m(); }
+pub fn closure(p: P) { let f = |p| p.m(); let _ = f; }
+pub fn chained(p: P) { let a = p.next(); let b = a.next(); let c = b.next(); a.m(); b.m(); c.m(); }
+"#,
+        ),
+        (
+            "src/b.rs",
+            r#"
+pub struct Option<T>(pub T);
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub fn own() -> Option<P> { Option(P) }
+pub fn run() { let p = own().unwrap(); p.m(); }
+"#,
+        ),
+    ]);
+    let a = krate.extract("src/a.rs");
+    for function in ["a::wrapped", "a::counted", "a::generic", "a::shadowed", "a::closure"] {
+        let targets = a.targets(EdgeKind::Calls, function);
+        assert!(!targets.contains(&"a::P::m".to_string()), "{function}: {targets:?}");
+    }
+    let chained = a.targets(EdgeKind::Calls, "a::chained");
+    assert_eq!(chained, vec!["a::P::m", "a::P::next"], "two hops are typed, the third is not");
+    let chained_id = a.node("a::chained").id.clone();
+    let untyped: Vec<_> =
+        a.0.open_sites
+            .iter()
+            .filter(|site| site.from_id == chained_id && site.name == "m" && site.replaces.is_none())
+            .collect();
+    assert_eq!(untyped.len(), 1, "only `c.m()` is left untyped: {untyped:#?}");
+    let b = krate.extract("src/b.rs");
+    assert_eq!(b.targets(EdgeKind::Calls, "b::run"), vec!["b::own"], "a project `Option` is not unwrapped");
+}
+
+/// Rust's method lookup prefers an inherent method to a trait method of the
+/// same name, and `T::m` is the inherent one. A trait-impl method has no
+/// `T::m` declaration, so it is a placeholder at that address: a miss, never
+/// a link to the wrong method.
+#[test]
+fn a_typed_receiver_finds_the_inherent_method_and_misses_a_trait_impl_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr { fn m(&self); fn t(&self); }
+pub struct P;
+impl P { pub fn m(&self) {} }
+impl Tr for P { fn m(&self) {} fn t(&self) {} }
+pub fn inherent(p: &P) { p.m(); }
+pub fn traitish(p: &P) { p.t(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "inherent"), vec!["P::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::P::t"]);
 }
 
 /// Decision 1, the trap this plugin is most at risk of: a local must never

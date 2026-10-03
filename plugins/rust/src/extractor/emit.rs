@@ -277,19 +277,24 @@ impl<'s> Emitter<'s> {
     }
 
     /// An edge onto a declaration of this same file: `resolved: true`, since
-    /// within one file nothing is left for core to confirm.
-    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// within one file nothing is left for core to confirm. Returns the
+    /// edge's id, whether this call or an earlier one added it.
+    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.resolved_edge(kind, from, to);
         }
+        id
     }
 
     /// An edge onto a placeholder: `resolved: false`, since only core can
-    /// confirm it.
-    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// confirm it. Returns the edge's id, as [`Self::resolved_edge`] does.
+    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.placeholder_edge(kind, from, to);
         }
+        id
     }
 
     /// Records a use site the structural tier could not settle - see
