@@ -391,6 +391,169 @@ fn a_pub_use_is_a_reexport_carrying_its_published_name_and_its_container() {
     assert_eq!(graph.target_of(glob), (container("krate::a"), TargetKey::Name("*".into())));
 }
 
+/// Every `reexport` row of `graph`, as `(container, published name, target,
+/// visibility)`, sorted.
+fn reexport_rows(graph: &Graph) -> Vec<(String, String, (TargetScope, TargetKey), Visibility)> {
+    let mut rows: Vec<_> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("reexport"))
+        .map(|node| {
+            (
+                node.container.clone().unwrap_or_default(),
+                node.name.clone(),
+                graph.target_of(node),
+                node.visibility.clone(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows
+}
+
+/// A private `use` is a `reexport` row that only its own module and that
+/// module's descendants may follow: `container(<module>)`. A glob always is
+/// one; a named leaf only in a module that declares a child module, since
+/// only a descendant can follow it (docs/architecture/gm-479-use-super-private-imports.md).
+///
+/// Controls: emit no row for a private `use` in `Declarer::use_leaf`, and
+/// the `user` and `tests` rows are missing; drop the `has_child_modules`
+/// condition, and `leaf` gains a named row; emit private rows as
+/// `Visibility::File`, and the visibilities differ.
+#[test]
+fn a_private_use_is_a_reexport_row_visible_in_its_own_module_only() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod user;\npub mod leaf;\n"),
+        ("src/a.rs", "pub struct P;\n"),
+        (
+            "src/user.rs",
+            "use crate::a::P;\nuse crate::a::P as Q;\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        ),
+        ("src/leaf.rs", "use crate::a::P;\nuse crate::a::*;\n"),
+    ]);
+    let private = |module: &str| Visibility::Container(module.to_string());
+
+    let user = krate.extract("src/user.rs");
+    assert_eq!(
+        reexport_rows(&user),
+        vec![
+            (
+                "krate::user".into(),
+                "P".into(),
+                (container("krate::a"), TargetKey::Name("P".into())),
+                private("krate::user")
+            ),
+            (
+                "krate::user".into(),
+                "Q".into(),
+                (container("krate::a"), TargetKey::Name("P".into())),
+                private("krate::user")
+            ),
+            (
+                "krate::user::tests".into(),
+                "*".into(),
+                (container("krate::user"), TargetKey::Name("*".into())),
+                private("krate::user::tests")
+            ),
+        ]
+    );
+
+    let leaf = krate.extract("src/leaf.rs");
+    assert_eq!(
+        reexport_rows(&leaf),
+        vec![(
+            "krate::leaf".into(),
+            "*".into(),
+            (container("krate::a"), TargetKey::Name("*".into())),
+            private("krate::leaf")
+        )],
+        "a module with no child module gets its glob row and no named one"
+    );
+}
+
+/// The named `reexport` rows of `graph` - its globs left out - as
+/// `(container, published name, target container, target name)`.
+fn named_reexport_rows(graph: &Graph) -> Vec<(String, String, TargetScope, String)> {
+    reexport_rows(graph)
+        .into_iter()
+        .filter(|(_, published, ..)| published != "*")
+        .map(|(module, published, (scope, key), visibility)| {
+            assert_eq!(visibility, Visibility::Container(module.clone()), "{module} {published}");
+            let TargetKey::Name(name) = key else { panic!("{module} {published}: {key:?}") };
+            (module, published, scope, name)
+        })
+        .collect()
+}
+
+/// An external named `use` is a private row onto its crate path (`std::io`
+/// for `use std::io::Error;`) only in a module that has a child module *and*
+/// a glob - the one place an explicit import has a glob to shadow for a
+/// descendant. The glob may sit below the `use`, and an inline module's own
+/// `use` lines count for that module, not its parent.
+///
+/// Controls: emit no row for an external named `use` in
+/// `Declarer::use_leaf` - `both` and `inline::inner` lose theirs; drop the
+/// `has_glob` condition - `no_glob` gains one; drop the `has_child_modules`
+/// condition - `no_child` gains one; target `krate` instead of
+/// `external_path(&leaf.prefix)` - the targets read `std`; drop the
+/// `use_declaration` arm of `Declarer::collect_modules` - every row is gone.
+#[test]
+fn an_external_named_use_is_a_row_only_where_a_glob_and_a_child_module_are() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod x;\npub mod both;\npub mod no_glob;\npub mod no_child;\npub mod inline;\n"),
+        ("src/x.rs", "pub struct Error;\n"),
+        (
+            "src/both.rs",
+            "use std::io::Error;\nuse std::fmt::Result as FmtResult;\nuse crate::x::*;\n\n\
+             #[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        ),
+        ("src/no_glob.rs", "use std::io::Error;\n\nmod tests {}\n"),
+        ("src/no_child.rs", "use std::io::Error;\nuse crate::x::*;\n"),
+        (
+            "src/inline.rs",
+            "use crate::x::*;\n\nmod inner {\n    use std::io::Error;\n    use crate::x::*;\n\n    mod deep {}\n}\n",
+        ),
+    ]);
+
+    assert_eq!(
+        named_reexport_rows(&krate.extract("src/both.rs")),
+        vec![
+            ("krate::both".into(), "Error".into(), container("std::io"), "Error".into()),
+            ("krate::both".into(), "FmtResult".into(), container("std::fmt"), "Result".into()),
+        ]
+    );
+    assert_eq!(named_reexport_rows(&krate.extract("src/no_glob.rs")), vec![], "no glob to shadow");
+    assert_eq!(named_reexport_rows(&krate.extract("src/no_child.rs")), vec![], "no descendant to follow it");
+    assert_eq!(
+        named_reexport_rows(&krate.extract("src/inline.rs")),
+        vec![("krate::inline::inner".into(), "Error".into(), container("std::io"), "Error".into())]
+    );
+}
+
+/// Two inline modules of one file importing the same item are two rows, one
+/// per module: the row's id names its module.
+///
+/// Control: drop the `{container}: ` prefix from `Emitter::reexport`'s
+/// `qualifiedName` - the second module's row is lost.
+#[test]
+fn two_modules_of_one_file_importing_one_item_get_a_row_each() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod two;\n"),
+        ("src/a.rs", "pub struct P;\n"),
+        (
+            "src/two.rs",
+            "pub mod x {\n    pub use crate::a::P;\n}\npub mod y {\n    pub use crate::a::P;\n}\n",
+        ),
+    ]);
+    let two = krate.extract("src/two.rs");
+    let modules: Vec<_> = reexport_rows(&two).into_iter().map(|(module, name, ..)| (module, name)).collect();
+    assert_eq!(
+        modules,
+        vec![("krate::two::x".to_string(), "P".to_string()), ("krate::two::y".to_string(), "P".to_string())]
+    );
+}
+
 #[test]
 fn a_use_of_a_crate_this_project_does_not_model_is_an_external_module() {
     let krate = Crate::new(&[("src/lib.rs", "use serde::Serialize;\npub fn f() { Serialize::go(); }\n")]);

@@ -116,7 +116,11 @@
 //! ([`REEXPORT_NATIVE_KIND`]), breadth-first until a declaration turns up or
 //! [`MAX_REEXPORT_DEPTH`] hops are spent. Shallowest wins: a scope that
 //! declares a name itself shadows what it re-exports under that name, as it
-//! does in the language. Only `name` keys walk; a `qualifiedName` names a
+//! does in the language, and within one scope a named re-export shadows its
+//! `*` ones (an explicit `use`/`export { x }` beats a glob), even when the
+//! named one leads nowhere - a Rust `use std::io::Error;` beside
+//! `use self::x::*;` is a row to the external crate, so the walk stops there
+//! rather than linking `x::Error`. Only `name` keys walk; a `qualifiedName` names a
 //! declaration, never a pass-through - except through its head, below.
 //!
 //! ## Members of a re-exported head
@@ -155,11 +159,16 @@
 //! container - the shape a Rust `pub use` inside `mod prelude` takes. A
 //! re-export node carrying both a file and a container publishes under both,
 //! which [`republished_addresses`] mirrors. The re-export statement's *own*
-//! visibility is not checked (a Rust `pub(crate) use` restricting an otherwise
-//! public item is not modelled): the TS plugin sends every re-export as
-//! `exported: false`, so checking it would unlink every barrel, and the
-//! declaration at the end of the chain is still checked against the original
-//! requester. A re-export with no target row is skipped, never guessed at.
+//! visibility is checked only when the row says `container(..)`: such a hop
+//! is followed only by a requester in that container or below it, as the
+//! declaration rule below has it - the shape of a Rust private `use`, which a
+//! child module's `use super::*` reaches and a sibling's glob does not. `file`
+//! and `public` rows are walkable by anyone: the TS plugin sends every
+//! re-export as `exported: false`, so checking those would unlink every
+//! barrel, and a Rust `pub(crate) use` restricting an otherwise public item is
+//! not modelled. The declaration at the end of the chain is still checked
+//! against the original requester. A re-export with no target row is skipped,
+//! never guessed at. Design: docs/architecture/gm-479-use-super-private-imports.md.
 //!
 //! ## What stays unresolved
 //!
@@ -1240,8 +1249,23 @@ struct Candidate {
     qualified_path: Option<String>,
 }
 
-/// One re-export hop: the scope and key a re-export forwards to.
-type Hop = (Scope, Key);
+/// A scope and key the walk looks a declaration up at.
+type Step = (Scope, Key);
+
+/// One re-export hop: where a re-export forwards to, and who may follow it.
+#[derive(Debug, Clone)]
+struct Hop {
+    to: Step,
+    /// Whether the row forwards one name (`use a::T;`, `export { T }`) rather
+    /// than a whole scope (`*`). In one scope a named row shadows every `*`
+    /// row for that name - an explicit import beats a glob in Rust, as an
+    /// explicit export beats `export *` in ES modules.
+    named: bool,
+    /// `Some((language, container))` for a row of `container` visibility: only
+    /// a requester of that language in that container or below it may follow
+    /// it. `None` for every other row, which anyone may follow.
+    restricted_to: Option<(String, Option<String>)>,
+}
 
 /// The lookups one linking pass needs, prepared once and memoized per
 /// distinct question - see the module doc's "Cost" section. Everything cached
@@ -1271,8 +1295,8 @@ impl<'c> Resolver<'c> {
     fn new(conn: &'c Connection) -> Result<Self> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
              qualifiedName, container, qualifiedPath FROM nodes";
-        const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key \
-             FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
+        const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
+             n.visibility, n.visibilityContainer FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
         // Unaliased: `CANDIDATE` selects from `nodes` directly.
         let declarations = declaration_only("");
         let prepare = |sql: String| conn.prepare(&sql).context("failed to prepare a symbol-linking lookup");
@@ -1345,8 +1369,8 @@ impl<'c> Resolver<'c> {
     /// bounds an acyclic chain, and both are needed since one does not imply
     /// the other.
     fn walk(&mut self, scope: &Scope, key: &Key, requester: &Requester) -> Result<(Vec<Candidate>, usize)> {
-        let mut frontier: Vec<Hop> = vec![(scope.clone(), key.clone())];
-        let mut visited: HashSet<Hop> = frontier.iter().cloned().collect();
+        let mut frontier: Vec<Step> = vec![(scope.clone(), key.clone())];
+        let mut visited: HashSet<Step> = frontier.iter().cloned().collect();
 
         for depth in 0..=MAX_REEXPORT_DEPTH {
             let mut candidates: Vec<Candidate> = Vec::new();
@@ -1370,9 +1394,29 @@ impl<'c> Resolver<'c> {
                 let Key::Name(name) = key else {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
-                for hop in self.hops(scope, name)? {
-                    if visited.insert(hop.clone()) {
-                        next.push(hop);
+                let mut hops = self.hops(scope, name)?;
+                // A named row shadows the scope's `*` rows, even when it leads
+                // nowhere (an external crate's item) and even when this
+                // requester may not follow it: in rustc the shadowed glob item
+                // is not in the scope at all, so a missing edge beats the
+                // wrong one a glob would give.
+                if hops.iter().any(|hop| hop.named) {
+                    hops.retain(|hop| hop.named);
+                }
+                let mut followed = Vec::new();
+                for hop in hops {
+                    // Checked before `visited`: a row this requester may not
+                    // follow must not hide another row reaching the same step.
+                    if let Some((language, container)) = &hop.restricted_to {
+                        if !self.sees(requester, language, container.as_deref())? {
+                            continue;
+                        }
+                    }
+                    followed.push(hop);
+                }
+                for hop in followed {
+                    if visited.insert(hop.to.clone()) {
+                        next.push(hop.to);
                     }
                 }
             }
@@ -1569,10 +1613,29 @@ impl<'c> Resolver<'c> {
             return Ok(found.clone());
         }
 
-        type ReexportRow =
-            (String, String, String, Option<String>, Option<String>, Option<String>, Option<String>);
+        type ReexportRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        );
         let map = |row: &Row| -> rusqlite::Result<ReexportRow> {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
         };
         let rows: Vec<ReexportRow> = match scope {
             Scope::File(path) => self
@@ -1588,7 +1651,8 @@ impl<'c> Resolver<'c> {
         .context("failed to read a scope's re-exports")?;
 
         let mut hops = Vec::new();
-        for (id, published, language, scope_kind, target_scope, key_kind, key) in rows {
+        for (id, published, language, scope_kind, target_scope, key_kind, key, visibility, visible_in) in rows
+        {
             let (Some(scope_kind), Some(target_scope), Some(key_kind), Some(key)) =
                 (scope_kind, target_scope, key_kind, key)
             else {
@@ -1610,7 +1674,8 @@ impl<'c> Resolver<'c> {
                     continue;
                 }
             };
-            hops.push((target_scope, hop_key));
+            let restricted_to = (visibility == VISIBILITY_CONTAINER).then_some((language, visible_in));
+            hops.push(Hop { to: (target_scope, hop_key), named: !whole_module, restricted_to });
         }
 
         self.hops.insert(cache_key, hops.clone());
@@ -1626,26 +1691,34 @@ impl<'c> Resolver<'c> {
                 Ok(matches!(scope, Scope::Container { .. }) && candidate.file_path == requester.file)
             }
             VISIBILITY_CONTAINER => {
-                // A container-private node with no container named is a
-                // malformed row; refusing it is the missing-edge side.
-                let (Some(visible_in), Some(from)) = (&candidate.visibility_container, &requester.container)
-                else {
-                    return Ok(false);
-                };
-                if candidate.language != requester.language {
-                    return Ok(false);
-                }
-                let cache_key = (requester.language.clone(), from.clone());
-                if !self.visible_from.contains_key(&cache_key) {
-                    let mut chain: HashSet<String> =
-                        containers::parent_chain(self.conn, &requester.language, from)?.into_iter().collect();
-                    chain.insert(from.clone());
-                    self.visible_from.insert(cache_key.clone(), chain);
-                }
-                Ok(self.visible_from[&cache_key].contains(visible_in))
+                let (language, visible_in) =
+                    (candidate.language.clone(), candidate.visibility_container.clone());
+                self.sees(requester, &language, visible_in.as_deref())
             }
             _ => Ok(false),
         }
+    }
+
+    /// Whether `requester` sees a row of `language` that is visible in
+    /// `container` only: the requester's own container is `container` or has
+    /// it on its parent chain. A row of another language is never seen.
+    fn sees(&mut self, requester: &Requester, language: &str, container: Option<&str>) -> Result<bool> {
+        // A container-private row with no container named is malformed;
+        // refusing it is the missing-edge side.
+        let (Some(visible_in), Some(from)) = (container, &requester.container) else {
+            return Ok(false);
+        };
+        if language != requester.language {
+            return Ok(false);
+        }
+        let cache_key = (requester.language.clone(), from.clone());
+        if !self.visible_from.contains_key(&cache_key) {
+            let mut chain: HashSet<String> =
+                containers::parent_chain(self.conn, &requester.language, from)?.into_iter().collect();
+            chain.insert(from.clone());
+            self.visible_from.insert(cache_key.clone(), chain);
+        }
+        Ok(self.visible_from[&cache_key].contains(visible_in))
     }
 }
 
