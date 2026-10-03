@@ -37,7 +37,8 @@ the page otherwise looks complete (`hasMore: false`, plausible results), so \
 check this field, not just individual rows. Never set on an empty page.\n\n\
 The one legitimate reason to grep afterward: a method call through a \
 variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
-lists for methods can under-report; bare function calls and this/super/qualified-type \
+lists for methods can under-report (a method page that may miss such calls carries \
+`untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
 calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
 project's first index, or a re-index after an upgrade, a tool call waits for the walk \
 to finish - slow, not wrong; do not abandon it for grep.\n\n\
@@ -167,7 +168,7 @@ fn ts_only_is_byte_identical_to_the_original_string() {
         "a TypeScript-only project must read exactly what it did before GM-262"
     );
     // The measured length of the current rendering, not a re-derivation.
-    assert_eq!(rendered.len(), 1732, "this module's own current baseline, re-measured");
+    assert_eq!(rendered.len(), 1836, "this module's own current baseline, re-measured");
 }
 
 #[test]

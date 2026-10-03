@@ -38,39 +38,64 @@ const UNLINKED_USAGES_HINT: &str =
      type re-exported under two `#[cfg]` arms. They may be usages of this symbol missing from \
      `results`, so this page is not exact: check `files` before treating it as complete.";
 
-/// Usages that may belong to the anchor but sit on unlinked placeholders.
+/// A by-name candidate count disclosed on a caller/reference page: shared by
+/// `unlinkedUsages` (this module) and `untypedReceiverCalls`
+/// (`super::untyped`), which differ only in what they count and in `hint`.
 /// Absent from a response, not zero, when there is no candidate: most anchors
 /// have none, and they must not grow a byte to say so.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UnlinkedUsages {
-    /// Every candidate usage edge, uncapped.
-    count: usize,
+pub(crate) struct CandidateTally {
+    /// Every candidate, uncapped. Its unit is the field's: a usage edge for
+    /// `unlinkedUsages`, a calling function for `untypedReceiverCalls`.
+    pub(super) count: usize,
     /// Files holding the candidates, highest count first, capped at
     /// [`MAX_UNLINKED_FILE_TALLY`].
-    files: Vec<FileTally>,
+    pub(super) files: Vec<FileTally>,
     /// Present only when the cap cut `files`.
     #[serde(skip_serializing_if = "is_false")]
-    files_truncated: bool,
+    pub(super) files_truncated: bool,
     hint: &'static str,
 }
+
+/// Usages that may belong to the anchor but sit on unlinked placeholders.
+pub(crate) type UnlinkedUsages = CandidateTally;
 
 fn is_false(flag: &bool) -> bool {
     !*flag
 }
 
-impl UnlinkedUsages {
+impl CandidateTally {
+    /// `count` candidates over `by_file` (`(path, refs)` in any order), or
+    /// `None` when `count` is 0. Sorts by refs, then path, and caps the list
+    /// at [`MAX_UNLINKED_FILE_TALLY`].
+    pub(super) fn from_files(
+        count: usize,
+        mut by_file: Vec<(String, i64)>,
+        hint: &'static str,
+    ) -> Option<Self> {
+        if count == 0 {
+            return None;
+        }
+        by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let files_truncated = by_file.len() > MAX_UNLINKED_FILE_TALLY;
+        by_file.truncate(MAX_UNLINKED_FILE_TALLY);
+        let files = by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
+        Some(Self { count, files, files_truncated, hint })
+    }
+
     /// The files this disclosure names.
     pub(crate) fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(|tally| tally.path.as_str())
     }
 
-    /// Bytes this field adds to a response, so the page bound can hold them
-    /// back. Zero when there is nothing to disclose.
-    pub(crate) fn wire_len(disclosure: &Option<Self>) -> usize {
+    /// Bytes this field, serialized under the camelCase key `field`, adds to
+    /// a response, so the page bound can hold them back. Zero when there is
+    /// nothing to disclose.
+    pub(crate) fn wire_len(disclosure: &Option<Self>, field: &str) -> usize {
         disclosure.as_ref().map_or(0, |found| {
-            // `,"unlinkedUsages":` plus the value.
-            serde_json::to_vec(found).map_or(0, |bytes| bytes.len()) + 20
+            // `,"<field>":` plus the value, with two bytes of slack.
+            serde_json::to_vec(found).map_or(0, |bytes| bytes.len()) + field.len() + 6
         })
     }
 }
@@ -120,15 +145,7 @@ pub(crate) fn probe(
             None => by_file.push((file_path, 1)),
         }
     }
-    if count == 0 {
-        return None;
-    }
-
-    by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let files_truncated = by_file.len() > MAX_UNLINKED_FILE_TALLY;
-    by_file.truncate(MAX_UNLINKED_FILE_TALLY);
-    let files = by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
-    Some(UnlinkedUsages { count, files, files_truncated, hint: UNLINKED_USAGES_HINT })
+    CandidateTally::from_files(count, by_file, UNLINKED_USAGES_HINT)
 }
 
 /// `(usage's file, placeholder keyPath)` for every `edge_kinds` edge into a
@@ -182,7 +199,11 @@ fn candidate_sql(kinds: usize, paths: usize) -> String {
 
 /// Whether the anchor's parent path names a `Type` node of its language. An
 /// anchor with no recorded path, or a one-segment one, is not a member.
-fn is_type_member(conn: &Connection, anchor: &NodeRecord, segments: Option<&[PathSegment]>) -> bool {
+pub(super) fn is_type_member(
+    conn: &Connection,
+    anchor: &NodeRecord,
+    segments: Option<&[PathSegment]>,
+) -> bool {
     let Some(segments) = segments.filter(|segments| segments.len() >= 2) else {
         return false;
     };
