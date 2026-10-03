@@ -199,9 +199,10 @@ pub(crate) fn handle_in(
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
     let resolved_by = resolved.by;
+    let queried_as = resolved.queried_as;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by, queried_as);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();

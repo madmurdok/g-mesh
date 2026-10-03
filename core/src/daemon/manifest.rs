@@ -217,6 +217,33 @@ impl NonSymbolShapes {
     }
 }
 
+/// `[plugin.symbol_query_prefixes]`: literal prefixes that, stripped from a
+/// query nothing matched, can leave a name of this plugin's language (`@`
+/// before a decorator). Core retries the remainder at the structural rungs,
+/// among this language's declarations only (`mcp::find_definition`); an
+/// absent table rewrites nothing. Decision:
+/// `docs/adr/0019-symbol-query-prefixes.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolQueryPrefixes {
+    /// Each a prefix stripped once, never empty, and always also one of the
+    /// same manifest's `non_symbol_queries.starts_with`.
+    #[serde(default)]
+    pub strip: Vec<String>,
+}
+
+impl SymbolQueryPrefixes {
+    /// `strip=@`, or `none`, as `g-mesh plugins list` and `g-mesh plugins
+    /// check` print it.
+    pub fn render(&self) -> String {
+        if self.strip.is_empty() {
+            "none".to_string()
+        } else {
+            format!("strip={}", self.strip.join(","))
+        }
+    }
+}
+
 /// One plugin directory's fully resolved manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifest {
@@ -247,6 +274,8 @@ pub struct PluginManifest {
     pub workspace: WorkspaceConfig,
     /// Parsed `[plugin.non_symbol_queries]`, or empty if the table is absent.
     pub non_symbol_queries: NonSymbolShapes,
+    /// Parsed `[plugin.symbol_query_prefixes]`, or empty if the table is absent.
+    pub symbol_query_prefixes: SymbolQueryPrefixes,
 }
 
 impl PluginManifest {
@@ -262,8 +291,10 @@ impl PluginManifest {
 /// (including an unknown `receiver_calls` value or an unknown key in
 /// `[plugin.non_symbol_queries]`), a missing field, `language` not equal to
 /// `dir`'s name, an unknown `protocol_version`, an invalid `watch_files`
-/// glob, or an empty string in `[plugin.non_symbol_queries]` (which would
-/// match every query). Every error names the manifest path; the `language` and
+/// glob, an empty string in `[plugin.non_symbol_queries]` (which would
+/// match every query), or a `[plugin.symbol_query_prefixes]` entry that is
+/// empty, an unknown key, or not also in `non_symbol_queries.starts_with`.
+/// Every error names the manifest path; the `language` and
 /// `protocol_version` errors also name the declared and expected values.
 pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
@@ -321,6 +352,11 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         .collect::<Result<Vec<_>>>()?;
 
     validate_non_symbol_queries(&plugin.non_symbol_queries, &manifest_path)?;
+    validate_symbol_query_prefixes(
+        &plugin.symbol_query_prefixes,
+        &plugin.non_symbol_queries,
+        &manifest_path,
+    )?;
 
     Ok(PluginManifest {
         language: plugin.language,
@@ -338,6 +374,7 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
             entry_points: plugin.workspace.entry_points,
         },
         non_symbol_queries: plugin.non_symbol_queries,
+        symbol_query_prefixes: plugin.symbol_query_prefixes,
     })
 }
 
@@ -357,11 +394,40 @@ fn validate_non_symbol_queries(shapes: &NonSymbolShapes, manifest_path: &Path) -
     Ok(())
 }
 
-/// The `[plugin.non_symbol_queries]` table of a manifest's text, validated as
-/// [`read_manifest`] validates it. For callers that hold a manifest's text but
-/// not its directory, such as one embedded with `include_str!`.
+/// Invariant: every strip prefix is also refused as typed. A query is then
+/// never both "maybe a symbol as typed" and "a symbol once stripped", and it
+/// cannot reach the semantic rung with its prefix still on.
+fn validate_symbol_query_prefixes(
+    prefixes: &SymbolQueryPrefixes,
+    shapes: &NonSymbolShapes,
+    manifest_path: &Path,
+) -> Result<()> {
+    for prefix in &prefixes.strip {
+        if prefix.is_empty() {
+            bail!(
+                "plugin manifest at {} declares an empty string in [plugin.symbol_query_prefixes] strip - \
+                 it would rewrite every query to itself",
+                manifest_path.display(),
+            );
+        }
+        if !shapes.starts_with.contains(prefix) {
+            bail!(
+                "plugin manifest at {} declares \"{}\" in [plugin.symbol_query_prefixes] strip, but not in \
+                 [plugin.non_symbol_queries] starts_with - a strip prefix must also be refused as typed",
+                manifest_path.display(),
+                prefix,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `[plugin.non_symbol_queries]` and `[plugin.symbol_query_prefixes]`
+/// tables of a manifest's text, validated as [`read_manifest`] validates
+/// them. For callers that hold a manifest's text but not its directory, such
+/// as one embedded with `include_str!`.
 #[cfg(test)]
-pub(crate) fn non_symbol_queries_of(contents: &str) -> Result<NonSymbolShapes> {
+pub(crate) fn query_tables_of(contents: &str) -> Result<(NonSymbolShapes, SymbolQueryPrefixes)> {
     #[derive(Deserialize)]
     struct Outer {
         plugin: Inner,
@@ -370,10 +436,24 @@ pub(crate) fn non_symbol_queries_of(contents: &str) -> Result<NonSymbolShapes> {
     struct Inner {
         #[serde(default)]
         non_symbol_queries: NonSymbolShapes,
+        #[serde(default)]
+        symbol_query_prefixes: SymbolQueryPrefixes,
     }
     let outer: Outer = toml::from_str(contents).context("failed to parse plugin manifest")?;
-    validate_non_symbol_queries(&outer.plugin.non_symbol_queries, Path::new("<embedded>"))?;
-    Ok(outer.plugin.non_symbol_queries)
+    let embedded = Path::new("<embedded>");
+    validate_non_symbol_queries(&outer.plugin.non_symbol_queries, embedded)?;
+    validate_symbol_query_prefixes(
+        &outer.plugin.symbol_query_prefixes,
+        &outer.plugin.non_symbol_queries,
+        embedded,
+    )?;
+    Ok((outer.plugin.non_symbol_queries, outer.plugin.symbol_query_prefixes))
+}
+
+/// [`query_tables_of`]'s `[plugin.non_symbol_queries]` alone.
+#[cfg(test)]
+pub(crate) fn non_symbol_queries_of(contents: &str) -> Result<NonSymbolShapes> {
+    query_tables_of(contents).map(|(shapes, _)| shapes)
 }
 
 /// Discovery's output: every plugin found, keyed by language, plus the
@@ -646,6 +726,10 @@ struct RawPlugin {
     /// Optional; absent refuses nothing.
     #[serde(default)]
     non_symbol_queries: NonSymbolShapes,
+    /// Optional; absent rewrites nothing. A table of its own, not a key in
+    /// `non_symbol_queries`, so a core that predates it ignores it.
+    #[serde(default)]
+    symbol_query_prefixes: SymbolQueryPrefixes,
 }
 
 #[derive(Debug, Deserialize)]

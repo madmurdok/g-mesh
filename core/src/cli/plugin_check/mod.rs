@@ -235,6 +235,7 @@ pub fn check(
             timeouts.file_changed, timeouts.semantic_pass_file, whole_project_timeout
         ),
         format!("non_symbol_queries: {}", manifest.non_symbol_queries.render()),
+        format!("symbol_query_prefixes: {}", manifest.symbol_query_prefixes.render()),
     ];
     if let Some(target) = &target {
         notes.push(format!(

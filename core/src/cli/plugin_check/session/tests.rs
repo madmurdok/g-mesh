@@ -25,6 +25,7 @@ fn fake_workspace_plugin_manifest(command: PathBuf) -> PluginManifest {
         capabilities: Capabilities::default(),
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
+        symbol_query_prefixes: Default::default(),
     }
 }
 

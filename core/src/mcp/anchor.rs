@@ -82,14 +82,22 @@ pub(super) struct AnchorInfo {
     /// (a resumed walk, where the anchor is carried rather than resolved).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) resolved_by: Option<find_definition::ResolvedBy>,
+    /// The name looked up in place of `symbol_name` - see
+    /// [`find_definition::Resolved::queried_as`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) queried_as: Option<String>,
 }
 
 impl AnchorInfo {
     /// The anchor with the rung that reached it - what a freshly-resolved walk
     /// echoes, so a caller can tell an exact resolution from a suggestion it
     /// was handed.
-    pub(super) fn with_rung(node: &NodeRecord, by: find_definition::ResolvedBy) -> Self {
-        Self { resolved_by: Some(by), ..Self::from(node) }
+    pub(super) fn with_rung(
+        node: &NodeRecord,
+        by: find_definition::ResolvedBy,
+        queried_as: Option<String>,
+    ) -> Self {
+        Self { resolved_by: Some(by), queried_as, ..Self::from(node) }
     }
 }
 
@@ -102,6 +110,7 @@ impl From<&NodeRecord> for AnchorInfo {
             file_path: node.file_path.clone(),
             start_line: node.start_line,
             resolved_by: None,
+            queried_as: None,
         }
     }
 }
@@ -146,7 +155,9 @@ fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
     let anchor =
         queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
     match anchor {
-        Some(node) => Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id })),
+        Some(node) => {
+            Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id, queried_as: None }))
+        }
         None => error(format!("g-mesh: no symbol with id '{symbol_id}' found")).map(Err),
     }
 }
@@ -261,5 +272,31 @@ mod tests {
         let resolved = expect_resolved(resolve(&conn, &find_definition::SemanticRung::off(), &params));
         assert_eq!(resolved.node.id, "n1");
         assert_eq!(resolved.by, find_definition::ResolvedBy::QualifiedNameSuffix);
+    }
+
+    /// T14: the four anchored tools inherit the strip-prefix rung, so
+    /// `@Component` anchors on the same node `Component` does.
+    ///
+    /// Control: delete the `by_stripped_prefix` arm from
+    /// `find_definition::resolve_symbol_name` - `@Component` is refused and
+    /// this fails.
+    #[test]
+    fn a_decorator_query_anchors_on_the_decorator() {
+        let mut conn = setup();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("deco", "Function", "Component", "Component", "d.ts", "typescript"),
+        )
+        .unwrap();
+        let by = |name: &str| SymbolQueryParams { symbol_name: Some(name.to_string()), ..Default::default() };
+
+        let plain = expect_resolved(resolve(&conn, &find_definition::SemanticRung::off(), &by("Component")));
+        let decorated =
+            expect_resolved(resolve(&conn, &find_definition::SemanticRung::off(), &by("@Component")));
+
+        assert_eq!(decorated.node.id, plain.node.id);
+        assert_eq!(decorated.by, plain.by);
+        assert_eq!(decorated.queried_as.as_deref(), Some("Component"));
+        assert_eq!(plain.queried_as, None);
     }
 }

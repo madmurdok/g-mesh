@@ -1,6 +1,7 @@
 # GM-482: `find_definition("@Component")` finds the decorator `Component`
 
-Design note (slice S1). Nothing here is implemented yet.
+Design note (slice S1). Implemented in slice S2; the decision is recorded as
+[ADR 0019](../adr/0019-symbol-query-prefixes.md).
 
 ## 1. Problem, measured
 

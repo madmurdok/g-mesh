@@ -200,6 +200,7 @@ fn manifest_for(dir: &Path, ignore: &[&str]) -> PluginManifest {
         capabilities: Capabilities::default(),
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
+        symbol_query_prefixes: Default::default(),
     }
 }
 
