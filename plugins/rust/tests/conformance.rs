@@ -10,7 +10,7 @@
 //!
 //! - [`semantic`] - the manifest this plugin ships, read from
 //!   `plugins/rust/plugin.toml` rather than copied, so a run checks the
-//!   configuration a user actually gets. All seventeen expectations run and
+//!   configuration a user actually gets. All thirty-one expectations run and
 //!   pass.
 //! - [`structural_3_2_0`] - the manifest as 3.2.0 declared it:
 //!   `semantic_pass = false`, no `[plugin.semantic]` at all. Core never sends
@@ -119,7 +119,9 @@ const EXPECTATIONS: usize = 31;
 // comment has the measurement and what arm 2 gives up for it.
 // 7 with `[[references]] gaps::Ledger.all_unresolved`, whose
 // `internals::peek` row is a field read only rust-analyzer resolves.
-const SEMANTIC_EXPECTATIONS: usize = 7;
+// 6 once `[[callers]] shapes::Square::perimeter` became structural: its
+// receiver is a parameter of a written type.
+const SEMANTIC_EXPECTATIONS: usize = 6;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
@@ -423,12 +425,13 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
     // the task's own acceptance criteria, and each is exactly what the
     // semantic tier contributes to its entry:
     //
-    //   - the receiver call on a variable (`square.perimeter()` in
-    //     `total_perimeter`), the caller the structural tier cannot see;
+    //   - the receiver call on a variable whose method is a trait impl's
+    //     (`square.area()` in `total`), which the structural tier addresses
+    //     as `Square::area` and so cannot find;
     //   - the implementation in another crate of the workspace;
     //   - a struct field read through a variable receiver (`internals::peek`).
     for row in [
-        "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total_perimeter",
+        "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
         "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
         "missing (expected, not found): crates/alpha/src/internals.rs:internals::peek",
     ] {

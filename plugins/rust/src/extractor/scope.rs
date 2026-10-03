@@ -40,6 +40,11 @@
 //! Lifetimes are not tracked: they live in a namespace of their own that no
 //! edge this plugin emits ever addresses.
 //!
+//! A binding may also carry a [`LocalType`], set by the body pass when the
+//! file spells the type out (see [`super::typing`]). A binding without one
+//! hides every outer binding of the same name, typed or not, exactly as it
+//! hides it from name resolution.
+//!
 //! # What it does when it is unsure
 //!
 //! [`Scopes::binds`] answering `true` means "do not emit an edge for this
@@ -53,16 +58,17 @@
 //! from a binding needs name resolution, and guessing either way here would
 //! trade a missing edge for a wrong one.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use tree_sitter::Node;
 
 use crate::extractor::syntax::text;
+use crate::extractor::typing::LocalType;
 
 /// The bindings in scope at one point of a walk, innermost frame last.
 #[derive(Debug, Default)]
 pub(crate) struct Scopes {
-    frames: Vec<HashSet<String>>,
+    frames: Vec<HashMap<String, Option<LocalType>>>,
 }
 
 impl Scopes {
@@ -75,7 +81,7 @@ impl Scopes {
     /// are not a guard type because the walk is recursive and a guard would
     /// have to borrow the stack for the whole of each recursive call.
     pub(crate) fn push(&mut self) {
-        self.frames.push(HashSet::new());
+        self.frames.push(HashMap::new());
     }
 
     /// Leaves the innermost scope.
@@ -89,14 +95,27 @@ impl Scopes {
     /// still worth having.
     pub(crate) fn bind(&mut self, name: &str) {
         if let Some(frame) = self.frames.last_mut() {
-            frame.insert(name.to_string());
+            frame.insert(name.to_string(), None);
+        }
+    }
+
+    /// Binds one name with a known type, replacing whatever the innermost
+    /// scope bound under that name.
+    pub(crate) fn bind_typed(&mut self, name: &str, ty: LocalType) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.insert(name.to_string(), Some(ty));
         }
     }
 
     /// Whether `name` is bound by anything lexically enclosing this point -
     /// that is, whether an edge for it would be an edge for a local.
     pub(crate) fn binds(&self, name: &str) -> bool {
-        self.frames.iter().any(|frame| frame.contains(name))
+        self.frames.iter().any(|frame| frame.contains_key(name))
+    }
+
+    /// The type of the innermost binding of `name`, if that binding has one.
+    pub(crate) fn type_of(&self, name: &str) -> Option<&LocalType> {
+        self.frames.iter().rev().find_map(|frame| frame.get(name)).and_then(Option::as_ref)
     }
 
     /// Binds every name `pattern` introduces.
@@ -150,12 +169,21 @@ impl Scopes {
         }
     }
 
-    /// Binds every name a parameter list introduces, `self` included.
+    /// Binds every name a parameter list introduces, `self` included. A
+    /// closure's untyped parameter (`|x|`) is a bare pattern rather than a
+    /// `parameter` node, and binds the same way.
     pub(crate) fn bind_parameters(&mut self, parameters: Node, source: &str) {
+        let closure = parameters.kind() == "closure_parameters";
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
             match parameter.kind() {
                 "self_parameter" => self.bind("self"),
+                "parameter" => {
+                    if let Some(pattern) = parameter.child_by_field_name("pattern") {
+                        self.bind_pattern(pattern, source);
+                    }
+                }
+                _ if closure => self.bind_pattern(parameter, source),
                 _ => {
                     if let Some(pattern) = parameter.child_by_field_name("pattern") {
                         self.bind_pattern(pattern, source);
@@ -244,6 +272,42 @@ mod tests {
         for name in ["self", "a", "b", "c"] {
             assert!(scopes.binds(name), "{name} must be bound");
         }
+    }
+
+    #[test]
+    fn a_closures_untyped_parameters_are_bound() {
+        let scopes = bound(
+            "fn f() { let g = |a, (b, c), d: u8| a; }",
+            "closure_parameters",
+            |scopes, node, source| scopes.bind_parameters(node, source),
+        );
+        for name in ["a", "b", "c", "d"] {
+            assert!(scopes.binds(name), "{name} must be bound");
+        }
+    }
+
+    #[test]
+    fn an_untyped_binding_hides_an_outer_typed_one() {
+        use crate::extractor::typing::{Origin, Wrapper};
+        let ty = LocalType {
+            container: "k".to_string(),
+            name: "T".to_string(),
+            wrapper: Wrapper::Plain,
+            hops: 0,
+            origin: Origin::Parameter,
+            unwrapped: false,
+        };
+        let mut scopes = Scopes::new();
+        scopes.push();
+        scopes.bind_typed("x", ty.clone());
+        assert_eq!(scopes.type_of("x"), Some(&ty));
+        scopes.push();
+        scopes.bind("x");
+        assert_eq!(scopes.type_of("x"), None, "the inner binding has no type, and hides the outer one");
+        scopes.pop();
+        assert_eq!(scopes.type_of("x"), Some(&ty));
+        scopes.bind("x");
+        assert_eq!(scopes.type_of("x"), None, "a rebinding in the same scope replaces the type");
     }
 
     #[test]

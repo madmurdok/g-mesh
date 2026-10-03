@@ -610,13 +610,13 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
              response must render its receiver-call gap in the STATIC-RECEIVER form:\n{text}"
         );
         assert!(
-            !text.contains("produces no edge by design"),
+            !text.contains("may produce no edge by design"),
             "rust's semantic pass completed, so the gap must not still be rendered in its \
              OPEN form - that wording is for a tier that never ran:\n{text}"
         );
     } else {
         assert!(
-            text.contains("produces no edge by design"),
+            text.contains("may produce no edge by design"),
             "rust's semantic pass had not completed when suspension caught it, so the real MCP \
              `initialize` response must still list its receiver-call gap:\n{text}"
         );
