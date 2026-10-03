@@ -436,11 +436,45 @@ touches symbol names. Three related items, none of them about
 | item | where | language-specific? | proposal |
 |---|---|---|---|
 | `cli/embed_eval` (`owner_of`, `trait_impl_segment`, `symbol_name`) and `eval/embedding/*.py` | eval tooling, not shipped in the server's query path | parses `::`, `.`, `#` | read `nodes.qualifiedPath` instead once it exists; a follow-up inside GM-455's eval work, not this task |
-| `mcp/find_definition.rs::is_module_specifier` (`@` prefix or contains `/`) | gates the semantic-neighbour rung | yes: the shape of an npm or Go import specifier | out of scope for GM-474. A data-driven replacement is "the string equals a stored module key or file path" (a lookup, no syntax). Proposed as a separate task. |
+| `mcp/find_definition.rs::is_module_specifier` (`@` prefix or contains `/`) | gates the semantic-neighbour rung | yes: the shape of an npm or Go import specifier | kept as a spelling rule: a lookup cannot express it (GM-475, below) |
 | `embedding/text.rs` (Markdown headings, `<url>` links in doc comments) | embedding text | doc-comment Markdown, shared by all languages | none needed |
 
 The SDK's `render_target` (`<file>#<key>`, `<container>::<key>`) builds
 placeholder labels on the plugin side, so it is not core.
+
+**`is_module_specifier` stays a spelling rule (GM-475).** The proposed
+lookup, "the query equals a stored module key or file path", was built and
+measured, and it does not preserve answers. Every stored specifier is
+answered before the semantic rung: a file path is a `File` node's
+`qualifiedName` (rung 1), and an import placeholder's specifier is answered
+by `import_only_refusal`. Only a container key (`containers.key`) reaches the
+check. What the check actually catches are specifiers that no table holds: a
+TypeScript relative specifier (`./extract.js`), stored only as the file it
+resolves to, and a package the project never imports (`@types/node`). A
+lookup returns "not a specifier" for both, so they reach the semantic rung
+and get whatever clears the floor.
+
+Measured through the MCP shim, with embeddings, on copies of
+`plugins/typescript` (401 queries: every import specifier in the sources, 150
+sampled names, 40 truncated names, 50 qualified names, every file path, the
+placeholder specifiers, 16 synthetic) and `plugins/go` (335 queries, same
+classes plus the 4 container keys). The lookup turned 55 TypeScript
+refusals into `semanticNeighbours` pages: 47 import specifiers written in
+those sources, almost all relative (`./a`, `../src/extract`); 6 synthetic
+(`@types/node`, `github.com/nope/pkg`, `@`); and 2 regex captures of comment
+text. Go changed 1 answer, the synthetic `./extract`, because every real Go
+import is stored as a placeholder or a container key. Every other answer was
+byte-identical. The lookup query itself costs about 56 µs on g-mesh's own
+index (2,000 runs: 0.112 s real, 0.108 s CPU), using the `indexed_files` and
+`nodes.qualifiedName` indexes plus a covering scan of `containers`.
+
+A data-driven version needs the index to hold the specifier as written.
+That is a plugin change: for example, the TypeScript plugin storing each
+relative import's raw specifier the way it stores external ones, so that
+`import_only_refusal` answers it. Even then, packages the project never
+imports would still reach the semantic rung. The rule's cost runs the other
+way: a non-specifier name with `@` or `/` (`@Component`) is refused instead
+of being offered neighbours.
 
 ## 4. How GM-469 and GM-472 work on top of this
 
@@ -575,5 +609,5 @@ To confirm (recommendations, not yet confirmed by the owner):
 Decided by the owner: no separator-insensitive tier; no language-specific
 rule in core.
 
-Separate from this task: an index on `nodes(name)` for rung 3's full scan,
-and a data-driven replacement for `is_module_specifier` (§3.5).
+Separate from this task: an index on `nodes(name)` for rung 3's full scan.
+`is_module_specifier` stays a spelling rule (§3.5).

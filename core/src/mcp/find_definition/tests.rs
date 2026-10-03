@@ -885,23 +885,60 @@ fn a_specifier_shaped_query_is_declined_before_the_score_is_consulted() {
     // directly rather than through the tool.
     assert!(is_module_specifier("@excalidraw/math"), "a scoped package is a specifier");
     assert!(is_module_specifier("packages/element/src/index.ts"), "a path is a specifier");
+    assert!(is_module_specifier("./extract.js"), "a relative specifier is one");
     assert!(!is_module_specifier("DropdownMenuGroup"), "a plain identifier is not");
     assert!(!is_module_specifier("AppState"), "nor is a type name");
+}
+
+/// The second pass of the ladder with a query vector identical to `near`'s,
+/// so the semantic rung scores 1.0 and answers whenever it is consulted.
+fn with_a_matching_vector(conn: &Connection, name: &str) -> CallToolResult {
+    let query = [1.0_f32, 0.0];
+    by_name(conn, None, &SemanticRung::Embedded { name, query: Some(&query) }, name, None).unwrap()
 }
 
 /// The measured reason this guard exists: `@excalidraw/element` scores
 /// 0.699 - above the threshold - while being junk, because only doc
 /// comments and signatures are embedded and a specifier has nothing to
-/// match. Score alone cannot catch it, so shape has to.
+/// match. Score alone cannot catch it, so the guard has to. None of these
+/// spellings is stored anywhere in the index, which is why a lookup of
+/// stored module keys and file paths could not refuse them: a package the
+/// project never imports, a relative specifier, and a path.
 #[test]
 fn a_specifier_is_refused_tersely_even_though_it_would_out_score_the_threshold() {
     let conn = setup_with_vectors();
     insert_vector(&conn, "near", &[1.0, 0.0]);
 
-    // Reached through the ladder, so this exercises the real miss path.
-    let result = by_name(&conn, None, &SemanticRung::off(), "@excalidraw/element", None).unwrap();
+    for query in ["@excalidraw/element", "./extract.js", "packages/element/src/index.ts"] {
+        let result = with_a_matching_vector(&conn, query);
+        assert_eq!(error_text(&result), format!("g-mesh: no symbol named '{query}' found"));
+    }
+}
 
-    assert_eq!(error_text(&result), "g-mesh: no symbol named '@excalidraw/element' found");
+/// The fixture's own control: on the same index and vector, a name with no
+/// specifier's spelling reaches the rung and is answered by it, so the
+/// refusals around it are the guard's doing and not the fixture's.
+#[test]
+fn a_plain_unknown_name_reaches_the_semantic_rung_on_the_same_fixture() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+
+    let body = json_body(&with_a_matching_vector(&conn, "NoSuchThingAnywhere"));
+
+    assert_eq!(body["resolvedBy"], "semanticNeighbours");
+    assert_eq!(body["results"][0]["id"], "near");
+}
+
+/// What the spelling rule costs: a symbol-name query that starts with `@`
+/// but is no specifier is refused rather than offered neighbours.
+#[test]
+fn a_non_specifier_with_a_specifiers_spelling_is_refused_too() {
+    let conn = setup_with_vectors();
+    insert_vector(&conn, "near", &[1.0, 0.0]);
+
+    let result = with_a_matching_vector(&conn, "@Component");
+
+    assert_eq!(error_text(&result), "g-mesh: no symbol named '@Component' found");
 }
 
 #[test]

@@ -641,6 +641,28 @@ const SEMANTIC_CANDIDATES: usize = 3;
 /// Raising the threshold to 0.70 would exclude it too, and cost 42 points of
 /// recall to do so. This costs nothing, and specifiers already have a rung of
 /// their own - `get_dependencies`' path matching.
+///
+/// # Why this is a spelling rule and not a lookup
+///
+/// Every specifier the index stores is answered before this check is made:
+/// a file path is a `File` node's `qualifiedName` and resolves at the first
+/// rung, and an import placeholder's specifier is answered by
+/// [`import_only_refusal`]. Of the stored module keys, only a container key
+/// (`containers.key`) gets this far. So "the query equals a stored module key
+/// or file path" would decide almost nothing here, and the specifiers this
+/// check exists for are exactly the ones no table holds: a relative
+/// specifier such as `./extract.js`, which the index records only as the file
+/// it resolves to, and a package this project never imports. A lookup cannot
+/// recognise either; replaced by one, both go on to the semantic rung and are
+/// offered whatever clears the floor. Measured on the TypeScript plugin's own
+/// sources, that turned 55 of 401 queries' refusals into candidate pages, 47
+/// of them import specifiers written in those sources; on the Go plugin's
+/// sources, 1 of 335, a synthetic `./extract`
+/// (`docs/architecture/gm-474-qualified-name-segments.md`, section 3.5).
+///
+/// The cost of the rule is the other direction: a symbol-name query that
+/// starts with `@` or contains `/` but is not a specifier (`@Component`) is
+/// refused here instead of being offered neighbours.
 fn is_module_specifier(name: &str) -> bool {
     name.starts_with('@') || name.contains('/')
 }
