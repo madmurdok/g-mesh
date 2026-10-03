@@ -1025,6 +1025,7 @@ fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
         capabilities: Capabilities { semantic_pass: true, ..Capabilities::default() },
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
+        symbol_query_prefixes: Default::default(),
     };
     let not_capable =
         |language: &str| PluginManifest { capabilities: Capabilities::default(), ..capable(language) };
@@ -1103,4 +1104,72 @@ fn rejects_an_unknown_key_in_non_symbol_queries() {
 
     assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
     assert!(message.contains("start_with"), "{message}");
+}
+
+fn with_symbol_query_prefixes(starts_with: &str, table: &str) -> String {
+    format!(
+        "{}\n[plugin.non_symbol_queries]\nstarts_with = {starts_with}\n\n[plugin.symbol_query_prefixes]\n{table}\n",
+        well_formed_toml()
+    )
+}
+
+/// T1: the table parses, and a manifest without it strips nothing.
+///
+/// Control: build `read_manifest`'s result with
+/// `symbol_query_prefixes: Default::default()` - the first assertion fails.
+#[test]
+fn parses_symbol_query_prefixes_and_defaults_to_none() {
+    let (_root, dir) = plugin_dir("python", &with_symbol_query_prefixes("[\"@\", \".\"]", "strip = [\"@\"]"));
+    assert_eq!(read_manifest(&dir).unwrap().symbol_query_prefixes.strip, vec!["@".to_string()]);
+
+    let (_root, dir) = plugin_dir("python", &well_formed_toml());
+    assert_eq!(read_manifest(&dir).unwrap().symbol_query_prefixes, SymbolQueryPrefixes::default());
+}
+
+/// T2: an empty prefix would rewrite every query to itself.
+///
+/// Control: remove the `prefix.is_empty()` check from
+/// `validate_symbol_query_prefixes` - the error is then the `starts_with`
+/// one, which says nothing about an empty string, and this fails.
+#[test]
+fn rejects_an_empty_strip_prefix() {
+    let (_root, dir) = plugin_dir("python", &with_symbol_query_prefixes("[\"@\"]", "strip = [\"\"]"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+    assert!(
+        message.contains("[plugin.symbol_query_prefixes]") && message.contains("empty string"),
+        "{message}"
+    );
+}
+
+/// T3: a misspelt key would otherwise be silently ignored and strip nothing.
+///
+/// Control: remove `#[serde(deny_unknown_fields)]` from
+/// `SymbolQueryPrefixes` - the manifest loads and this fails.
+#[test]
+fn rejects_an_unknown_key_in_symbol_query_prefixes() {
+    let (_root, dir) = plugin_dir("python", &with_symbol_query_prefixes("[\"@\"]", "strips = [\"@\"]"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains("strips"), "{message}");
+}
+
+/// T4: a strip prefix the language does not also refuse as typed is
+/// rejected, naming the prefix and both tables.
+///
+/// Control: remove the `starts_with.contains(prefix)` check from
+/// `validate_symbol_query_prefixes` - the manifest loads and this fails.
+#[test]
+fn rejects_a_strip_prefix_missing_from_starts_with() {
+    let (_root, dir) = plugin_dir("python", &with_symbol_query_prefixes("[\".\"]", "strip = [\"@\"]"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+    assert!(message.contains("\"@\""), "{message}");
+    assert!(message.contains("[plugin.symbol_query_prefixes]"), "{message}");
+    assert!(message.contains("[plugin.non_symbol_queries] starts_with"), "{message}");
 }

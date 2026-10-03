@@ -261,6 +261,11 @@ ignore = ["node_modules"]    # optional; directory names skipped when
                               # that are never this language's symbols - see
                               # multi-language-plugins.md. Missing refuses
                               # nothing.
+
+[plugin.symbol_query_prefixes]  # optional; strip prefixes (`@`) retried at the
+                              # structural rungs for this language only - see
+                              # multi-language-plugins.md. Missing rewrites
+                              # nothing.
 ```
 
 `[plugin.capabilities]` and `[plugin.workspace]` shipped with the per-language
@@ -363,6 +368,7 @@ pub struct PluginManifest {
     pub capabilities: Capabilities, // [plugin.capabilities] - see multi-language-plugins.md
     pub workspace: WorkspaceConfig, // [plugin.workspace] - see multi-language-plugins.md
     pub non_symbol_queries: NonSymbolShapes, // [plugin.non_symbol_queries] - ditto
+    pub symbol_query_prefixes: SymbolQueryPrefixes, // [plugin.symbol_query_prefixes] - ditto
 }
 
 /// Reads and validates one `plugin.toml`. Hard error on: malformed TOML,

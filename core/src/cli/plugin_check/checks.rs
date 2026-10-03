@@ -860,6 +860,7 @@ mod tests {
             capabilities: Capabilities { semantic_pass, ..Capabilities::default() },
             workspace: WorkspaceConfig::default(),
             non_symbol_queries: Default::default(),
+            symbol_query_prefixes: Default::default(),
         }
     }
 

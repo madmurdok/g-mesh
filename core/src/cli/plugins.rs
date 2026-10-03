@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::manifest::{self, Capabilities, NonSymbolShapes};
+use crate::daemon::manifest::{self, Capabilities, NonSymbolShapes, SymbolQueryPrefixes};
 
 /// `<root>/<language-dir>/plugin.toml` - matches
 /// `daemon::manifest`'s own (private) constant of the same name.
@@ -104,6 +104,8 @@ pub enum PluginOutcome {
         capabilities: Capabilities,
         /// `[plugin.non_symbol_queries]`, shown for the same reason.
         non_symbol_queries: NonSymbolShapes,
+        /// `[plugin.symbol_query_prefixes]`, shown for the same reason.
+        symbol_query_prefixes: SymbolQueryPrefixes,
     },
     /// In place of a version/status/capabilities triple - see this module's
     /// doc comment.
@@ -242,6 +244,7 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
                         status,
                         capabilities: manifest.capabilities,
                         non_symbol_queries: manifest.non_symbol_queries,
+                        symbol_query_prefixes: manifest.symbol_query_prefixes,
                     },
                 });
                 continue;
@@ -262,15 +265,22 @@ pub fn render(plugins: &[PluginInfo]) -> String {
     let mut out = String::new();
     for plugin in plugins {
         match &plugin.outcome {
-            PluginOutcome::Loaded { version, status, capabilities, non_symbol_queries } => {
+            PluginOutcome::Loaded {
+                version,
+                status,
+                capabilities,
+                non_symbol_queries,
+                symbol_query_prefixes,
+            } => {
                 let _ = writeln!(
                     out,
-                    "{}  {}  {}  {}  non_symbol_queries: {}",
+                    "{}  {}  {}  {}  non_symbol_queries: {}  symbol_query_prefixes: {}",
                     plugin.language,
                     version,
                     status.label(),
                     render_capabilities(capabilities),
-                    non_symbol_queries.render()
+                    non_symbol_queries.render(),
+                    symbol_query_prefixes.render()
                 );
             }
             PluginOutcome::Error(message) => {
@@ -345,6 +355,13 @@ mod tests {
             .non_symbol_queries
     }
 
+    fn bundled_plugin_symbol_query_prefixes() -> SymbolQueryPrefixes {
+        let (_root, dir) = fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST)]);
+        manifest::read_manifest(&dir.join("typescript"))
+            .expect("the bundled plugin's manifest must parse")
+            .symbol_query_prefixes
+    }
+
     /// Builds a fresh tempdir root containing one `<dir_name>/plugin.toml`
     /// per entry in `plugins`.
     fn fixture_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
@@ -381,7 +398,8 @@ mod tests {
                 version: bundled_plugin_version(),
                 status: PluginStatus::Bundled,
                 capabilities: bundled_plugin_capabilities(),
-                non_symbol_queries: bundled_plugin_non_symbol_queries()
+                non_symbol_queries: bundled_plugin_non_symbol_queries(),
+                symbol_query_prefixes: bundled_plugin_symbol_query_prefixes(),
             }
         );
     }
@@ -407,7 +425,8 @@ mod tests {
                 version: bundled_plugin_version(),
                 status: PluginStatus::Installed,
                 capabilities: bundled_plugin_capabilities(),
-                non_symbol_queries: bundled_plugin_non_symbol_queries()
+                non_symbol_queries: bundled_plugin_non_symbol_queries(),
+                symbol_query_prefixes: bundled_plugin_symbol_query_prefixes(),
             }
         );
     }
@@ -433,7 +452,8 @@ mod tests {
                 version: bundled_plugin_version(),
                 status: PluginStatus::Bundled,
                 capabilities: bundled_plugin_capabilities(),
-                non_symbol_queries: bundled_plugin_non_symbol_queries()
+                non_symbol_queries: bundled_plugin_non_symbol_queries(),
+                symbol_query_prefixes: bundled_plugin_symbol_query_prefixes(),
             }
         );
 
@@ -528,6 +548,7 @@ extensions = [".{language}"]
                 status: PluginStatus::Installed,
                 capabilities: Capabilities::default(),
                 non_symbol_queries: NonSymbolShapes::default(),
+                symbol_query_prefixes: SymbolQueryPrefixes::default(),
             },
             "the earlier root (first_root, here tagged Installed) must win over the later \
              root's disagreeing version - the later root's 2.0.0 must not appear at all"
@@ -543,6 +564,7 @@ extensions = [".{language}"]
                 status: PluginStatus::Bundled,
                 capabilities: Capabilities::default(),
                 non_symbol_queries: NonSymbolShapes::default(),
+                symbol_query_prefixes: SymbolQueryPrefixes::default(),
             },
         }];
 
@@ -562,6 +584,7 @@ extensions = [".{language}"]
                 status: PluginStatus::Installed,
                 capabilities: Capabilities::default(),
                 non_symbol_queries: NonSymbolShapes::default(),
+                symbol_query_prefixes: SymbolQueryPrefixes::default(),
             },
         }];
 
@@ -591,6 +614,7 @@ extensions = [".{language}"]
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
                 },
                 non_symbol_queries: NonSymbolShapes::default(),
+                symbol_query_prefixes: SymbolQueryPrefixes::default(),
             },
         }];
 
@@ -604,23 +628,32 @@ extensions = [".{language}"]
     /// Non-default shapes, so a render that ignored the field would fail.
     #[test]
     fn render_shows_non_symbol_queries_for_a_loaded_plugin() {
-        let loaded = |non_symbol_queries| PluginInfo {
+        let loaded = |non_symbol_queries, symbol_query_prefixes| PluginInfo {
             language: "go".to_string(),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Bundled,
                 capabilities: Capabilities::default(),
                 non_symbol_queries,
+                symbol_query_prefixes,
             },
         };
         let declared =
             NonSymbolShapes { starts_with: vec!["@".into()], contains: vec!["/".into(), "::".into()] };
+        let strip = SymbolQueryPrefixes { strip: vec!["@".into()] };
 
-        let rendered = render(&[loaded(declared), loaded(NonSymbolShapes::default())]);
+        let rendered = render(&[
+            loaded(declared, strip),
+            loaded(NonSymbolShapes::default(), SymbolQueryPrefixes::default()),
+        ]);
 
         let lines: Vec<&str> = rendered.lines().collect();
-        assert!(lines[0].ends_with("non_symbol_queries: starts_with=@ contains=/,::"), "{rendered}");
-        assert!(lines[1].ends_with("non_symbol_queries: none"), "{rendered}");
+        assert!(
+            lines[0]
+                .ends_with("non_symbol_queries: starts_with=@ contains=/,::  symbol_query_prefixes: strip=@"),
+            "{rendered}"
+        );
+        assert!(lines[1].ends_with("non_symbol_queries: none  symbol_query_prefixes: none"), "{rendered}");
     }
 
     #[test]

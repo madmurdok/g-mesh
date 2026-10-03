@@ -208,3 +208,10 @@ exclude_dirs = [".venv", "venv", "__pycache__", ".tox", ".mypy_cache", "site-pac
 # `/`, or starts with `.`.
 starts_with = ["@", "."]
 contains = ["/"]
+
+[plugin.symbol_query_prefixes]
+# A query `@name` that matches nothing is looked up again as `name`, among
+# Python declarations only: `@` marks a decorator use, and the decorator is
+# indexed under its own name. Each prefix must also be in
+# `non_symbol_queries.starts_with` above (docs/adr/0019-symbol-query-prefixes.md).
+strip = ["@"]
