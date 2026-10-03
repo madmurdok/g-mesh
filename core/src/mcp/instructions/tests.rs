@@ -510,7 +510,7 @@ fn fallback_wording_fits_under_the_ceiling() {
     let rendered = assemble(&p4_fallback());
     println!("fallback bytes: {}", rendered.len());
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
-    assert!(rendered.contains("semantic layer finishes"));
+    assert!(rendered.contains("untypedReceiverCalls"));
 }
 
 /// [`build`]'s own fallback branch, proven rather than merely present:
