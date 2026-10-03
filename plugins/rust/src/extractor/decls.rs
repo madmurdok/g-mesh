@@ -450,7 +450,15 @@ impl Declarer<'_, '_> {
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         let id = self.emitter.declare(spec, is_public(&own));
-        self.model.declare(&module.key, &name, &tail, DeclRef { id: id.clone(), kind });
+        let decl = DeclRef { id: id.clone(), kind };
+        if block.is_some() {
+            // An associated item (`T::y`, `<T as Tr>::y`, `Tr::y`) is never
+            // named by a bare path: it is recorded by its tail only, so it
+            // cannot make a bare `y` ambiguous beside a free `fn y`.
+            self.model.declare_member(&module.key, &tail, decl);
+        } else {
+            self.model.declare(&module.key, &name, &tail, decl);
+        }
         Some(id)
     }
 

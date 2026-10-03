@@ -18,13 +18,15 @@
 //! - **by name, within a module** answers "what does the bare name `f` mean
 //!   here". It refuses an ambiguous answer: two declarations of one name in
 //!   one module is either a `cfg` pair this plugin merged already or genuinely
-//!   two things, and picking either would be a guess.
+//!   two things, and picking either would be a guess. Only module-level
+//!   items are in it: a field or an associated item is never named by a bare
+//!   path, so it can neither answer nor make ambiguous a bare `f`.
 //! - **by tail, within a module** answers "is `Point::new` declared here" -
 //!   the exact, unambiguous key a type-qualified path needs, and the reason
 //!   `T::f()` is addressed by `qualifiedName` rather than by name. A module
 //!   holding `impl A { fn new() }` and `impl B { fn new() }` - which is most
-//!   modules - offers two declarations *named* `new`, and only the tail tells
-//!   them apart.
+//!   modules - declares two items *named* `new`, and only the tail tells them
+//!   apart.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,10 +86,12 @@ impl FileModel {
         }
     }
 
-    /// Records a declaration under its full `tail` only (`T.f` for a struct
-    /// field). A field's bare name is never a path in Rust - it is reached
-    /// only through a value or a type - so a bare identifier written in the
-    /// module must not resolve to it.
+    /// Records a declaration under its full `tail` only: a struct field
+    /// (`T.f`) or an associated item (`T::m`, `<T as Tr>::m`, `Tr::m`).
+    /// Neither's bare name is ever a path in Rust - a field is reached only
+    /// through a value, an associated item only through a type, a trait or
+    /// `self` - so a bare identifier written in the module must not resolve
+    /// to it, nor be made ambiguous by it.
     pub(crate) fn declare_member(&mut self, container: &str, tail: &str, decl: DeclRef) {
         self.by_tail.entry((container.to_string(), tail.to_string())).or_insert(decl);
     }
