@@ -150,7 +150,7 @@ pub fn check(
     let whole_project_timeout = timeouts.semantic_pass_project_timeout(file_count);
 
     let mut failures = Vec::new();
-    let conn = session::open_index()?;
+    let conn = session::open_index(&manifest)?;
 
     let bulk1 = session::run_bulk(&manifest, &scratch, whole_project_timeout);
     match &bulk1.failure {
@@ -214,7 +214,7 @@ pub fn check(
         match &run.failure {
             Some(failure) => failures.push(format!("bulk run 3 (after the declaration edit): {failure}")),
             None => {
-                let fresh = session::open_index()?;
+                let fresh = session::open_index(&manifest)?;
                 match session::ingest_and_link(&fresh, &run.bytes)
                     .and_then(|()| session::file_node_ranges(&fresh, &target.file_path))
                 {

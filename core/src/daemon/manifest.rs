@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use globset::Glob;
 use serde::Deserialize;
 
+use crate::graph::symbol_links::LinkRules;
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
@@ -244,6 +245,33 @@ impl SymbolQueryPrefixes {
     }
 }
 
+/// `[plugin.reexports]`: how this plugin's language resolves a name that one
+/// scope both re-exports by name and through a glob. Core's linker applies it
+/// to that language's scopes only (`graph::symbol_links::LinkRules`); an
+/// absent table declares nothing, so neither kind of row wins. Decision:
+/// `docs/adr/0020-named-reexport-shadows-glob.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReexportRules {
+    /// In one scope, a named import or re-export of a name hides every glob
+    /// (`*`) one for it - Rust's explicit `use` over a glob, ES modules'
+    /// local or explicit export over `export *`. False where the later
+    /// import binds the name instead (Python).
+    #[serde(default)]
+    pub named_shadows_glob: bool,
+}
+
+/// The linker's rules for every manifest in `manifests`: the languages whose
+/// `[plugin.reexports]` declares `named_shadows_glob`.
+pub fn link_rules<'a>(manifests: impl IntoIterator<Item = &'a PluginManifest>) -> LinkRules {
+    LinkRules::with_named_shadows_glob(
+        manifests
+            .into_iter()
+            .filter(|manifest| manifest.reexports.named_shadows_glob)
+            .map(|manifest| manifest.language.clone()),
+    )
+}
+
 /// One plugin directory's fully resolved manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifest {
@@ -276,6 +304,8 @@ pub struct PluginManifest {
     pub non_symbol_queries: NonSymbolShapes,
     /// Parsed `[plugin.symbol_query_prefixes]`, or empty if the table is absent.
     pub symbol_query_prefixes: SymbolQueryPrefixes,
+    /// Parsed `[plugin.reexports]`, or all-false if the table is absent.
+    pub reexports: ReexportRules,
 }
 
 impl PluginManifest {
@@ -375,6 +405,7 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         },
         non_symbol_queries: plugin.non_symbol_queries,
         symbol_query_prefixes: plugin.symbol_query_prefixes,
+        reexports: plugin.reexports,
     })
 }
 
@@ -730,6 +761,10 @@ struct RawPlugin {
     /// `non_symbol_queries`, so a core that predates it ignores it.
     #[serde(default)]
     symbol_query_prefixes: SymbolQueryPrefixes,
+    /// Optional; absent declares no shadowing. Its own table, so a core that
+    /// predates it ignores it.
+    #[serde(default)]
+    reexports: ReexportRules,
 }
 
 #[derive(Debug, Deserialize)]

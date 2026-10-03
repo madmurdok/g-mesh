@@ -2,6 +2,24 @@ use super::*;
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
+/// The rules the bundled plugins declare (`plugins/rust/plugin.toml` and
+/// `plugins/typescript/plugin.toml` set `[plugin.reexports]
+/// named_shadows_glob`; Python and Go do not), so the tests below link as the
+/// daemon would.
+fn bundled_rules() -> LinkRules {
+    LinkRules::with_named_shadows_glob(["rust", "typescript"])
+}
+
+/// [`super::link_all`] under [`bundled_rules`]. Shadows the glob import.
+fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
+    super::link_all(conn, &bundled_rules())
+}
+
+/// [`super::link_diff`] under [`bundled_rules`]. Shadows the glob import.
+fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
+    super::link_diff(conn, diff, &bundled_rules())
+}
+
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     // On, so that an edge left pointing at a node that is not there - the

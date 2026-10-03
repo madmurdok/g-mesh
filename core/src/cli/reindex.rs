@@ -101,7 +101,8 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let canonical_root = project_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-    let conn = Arc::new(IndexStore::new(conn));
+    let conn =
+        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
     // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
     // for a cold start - a reindex is that same walk, run early.
     let project_config = crate::config::read_project_config(project_root)

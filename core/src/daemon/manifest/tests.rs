@@ -1026,6 +1026,7 @@ fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
         symbol_query_prefixes: Default::default(),
+        reexports: Default::default(),
     };
     let not_capable =
         |language: &str| PluginManifest { capabilities: Capabilities::default(), ..capable(language) };
