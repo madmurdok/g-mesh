@@ -181,9 +181,9 @@ fn p4_named(list: &str) -> String {
 /// pointer to a response field (none carries this fact yet).
 fn p4_fallback() -> String {
     "The one legitimate reason to grep afterward: a method call through a variable \
-     receiver (`x.foo()`) may produce no edge in some of this project's languages until \
-     their semantic layer finishes - check which before trusting a method's page as \
-     exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
+     receiver (`x.foo()`) may produce no edge in some of this project's languages - a \
+     method's page says so in `unlinkedUsages`/`untypedReceiverCalls`; check them before \
+     trusting it as exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
      call waits for the walk to finish before answering - slow, not wrong; do not \
      abandon it for grep."
         .to_string()
