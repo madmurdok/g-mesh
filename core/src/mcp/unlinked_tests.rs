@@ -33,12 +33,14 @@ const SHARED: &[(&str, &str)] = &[
     ("src/ipc/windows.rs", "pub struct Listener;\n\nimpl Listener {\n    pub fn bind() -> Self {\n        Listener\n    }\n}\n"),
 ];
 
-/// `P::load` called only from `mod tests { use super::*; }`, and
-/// `Listener::bind` through a type re-exported under two `#[cfg]` arms: the
-/// linker attaches neither call to its declaration.
-const UNLINKED_USER: &str = "use crate::ipc::Listener;\nuse crate::m::P;\n\n\
+/// `P::load` called only from a module whose glob reaches `P` through a
+/// *sibling's* private `use`, which Rust refuses, and `Listener::bind`
+/// through a type re-exported under two `#[cfg]` arms: the linker attaches
+/// neither call to its declaration.
+const UNLINKED_USER: &str = "use crate::ipc::Listener;\n\n\
      pub fn serve() {\n    Listener::bind();\n}\n\n\
-     #[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn loads() {\n        P::load(1);\n    }\n}\n";
+     mod imports {\n    use crate::m::P;\n\n    mod child {}\n}\n\n\
+     mod other {\n    use super::imports::*;\n\n    fn loads() {\n        P::load(1);\n    }\n}\n";
 
 /// The same `P::load` call behind a top-level `use`, which links.
 const LINKED_USER: &str = "use crate::m::P;\n\npub fn loads() {\n    P::load(1);\n}\n";
@@ -61,8 +63,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(user: &str) -> Self {
+        Self::with_files(user, &[])
+    }
+
+    /// The shared crate, `src/user.rs`, and `extra` files besides.
+    fn with_files(user: &str, extra: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("failed to create a temp project root");
-        for (path, contents) in SHARED.iter().copied().chain([("src/user.rs", user)]) {
+        for (path, contents) in
+            SHARED.iter().copied().chain([("src/user.rs", user)]).chain(extra.iter().copied())
+        {
             let full = dir.path().join(path);
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
             std::fs::write(&full, contents).unwrap();
@@ -133,16 +142,21 @@ fn caller_names(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// A call through `use super::*` in a `mod tests` and a call through a
-/// cfg-twin re-export both stay on placeholders. Each declaration's page has
-/// no row for them, so it must say it is not exact.
+/// A call through a sibling's private `use` and a call through a cfg-twin
+/// re-export both stay on placeholders. Each declaration's page has no row
+/// for them, so it must say it is not exact.
+///
+/// The first half is also the end-to-end sibling case of
+/// docs/architecture/gm-479-use-super-private-imports.md. Control: drop the
+/// `restricted_to` check from `Resolver::walk` - `user::other::loads` becomes
+/// a caller and the marker goes.
 #[test]
 fn calls_the_linker_left_on_placeholders_mark_the_callers_page_not_exact() {
     let fixture = Fixture::new(UNLINKED_USER);
 
     let load = fixture.callers("m::inner::P::load");
     assert_eq!(load["hasMore"], false, "{load}");
-    assert!(caller_names(&load).is_empty(), "the test-module call is not linked: {load}");
+    assert!(caller_names(&load).is_empty(), "a sibling's private import is not followed: {load}");
     assert!(load["unlinkedUsages"]["count"].as_u64().unwrap() >= 1, "{load}");
     assert_eq!(load["unlinkedUsages"]["files"], serde_json::json!([{ "path": "src/user.rs", "refs": 1 }]));
 
@@ -171,6 +185,56 @@ fn a_linked_call_is_a_row_and_carries_no_marker() {
 
     let references = fixture.references("m::inner::P::load");
     assert!(references.get("unlinkedUsages").is_none(), "{references}");
+}
+
+/// `mod tests { use super::*; }` calling `<head>::load`, with `prelude` above
+/// it in `src/user.rs`.
+fn tests_calling(prelude: &str, head: &str) -> String {
+    format!(
+        "{prelude}\n#[cfg(test)]\nmod tests {{\n    use super::*;\n\n    #[test]\n    fn loads() {{\n        \
+         {head}::load(1);\n    }}\n}}\n"
+    )
+}
+
+/// Asserts `symbol`'s callers are exactly `callers`, with no marker.
+fn assert_linked_callers(fixture: &Fixture, symbol: &str, callers: &[&str]) {
+    let page = fixture.callers(symbol);
+    assert_eq!(caller_names(&page), callers, "{page}");
+    assert!(page.get("unlinkedUsages").is_none(), "{page}");
+}
+
+/// A test module's `use super::*` reaches what its parent imported
+/// privately, inline or as a file-backed `tests.rs`, and through an `as`
+/// alias (docs/architecture/gm-479-use-super-private-imports.md).
+///
+/// Control: make `Declarer::use_leaf` emit no row for a private `use` (the
+/// plugin before GM-479) - no caller, and the marker is back.
+#[test]
+fn a_test_module_calls_through_its_parents_private_import() {
+    let inline = Fixture::new(&tests_calling("use crate::m::P;\n", "P"));
+    assert_linked_callers(&inline, "m::inner::P::load", &["user::tests::loads"]);
+
+    let aliased = Fixture::new(&tests_calling("use crate::m::P as Q;\n", "Q"));
+    assert_linked_callers(&aliased, "m::inner::P::load", &["user::tests::loads"]);
+
+    let file_backed = Fixture::with_files(
+        "use crate::m::P;\n\n#[cfg(test)]\nmod tests;\n",
+        &[("src/user/tests.rs", "use super::*;\n\n#[test]\nfn loads() {\n    P::load(1);\n}\n")],
+    );
+    assert_linked_callers(&file_backed, "m::inner::P::load", &["user::tests::loads"]);
+}
+
+/// A type the parent declares itself needs only the test module's glob.
+///
+/// Control: make `Declarer::use_leaf` emit no row for a private glob - no
+/// caller.
+#[test]
+fn a_test_module_calls_a_type_its_parent_declares() {
+    let fixture = Fixture::new(&tests_calling(
+        "pub struct D;\n\nimpl D {\n    pub fn load(c: u32) {\n        let _ = c;\n    }\n}\n",
+        "D",
+    ));
+    assert_linked_callers(&fixture, "user::D::load", &["user::tests::loads"]);
 }
 
 fn path(segments: &[&str]) -> QualifiedPath {

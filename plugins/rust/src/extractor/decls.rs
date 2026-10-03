@@ -53,9 +53,15 @@
 //! ```rust,ignore
 //! use a::b::C;          // a `pending_symbol` placeholder in container a::b
 //! use a::b::C as D;     // the same placeholder; `D` is what this module calls it
-//! use a::b::*;          // a container import, and nothing to name
+//! use a::b::*;          // a container import, plus a private `reexport` row
 //! pub use a::b::C;      // a `reexport`: this module publishes `C`
 //! ```
+//!
+//! A private `use` is a `reexport` row too, with `container(<this module>)`
+//! visibility, so that a child module's `use super::*` can reach what the
+//! parent imported and a sibling's glob cannot: a glob always, a named
+//! leaf only in a module that declares a child module (only a descendant
+//! follows it). Design: docs/architecture/gm-479-use-super-private-imports.md.
 //!
 //! Every one of them also emits an `IMPORTS` edge from the file onto the
 //! container `a::b` - not only the glob, which is all the design doc's
@@ -503,8 +509,7 @@ impl Declarer<'_, '_> {
 
     fn use_declaration(&mut self, item: Node, module: &ModuleCtx) {
         let Some(argument) = item.child_by_field_name("argument") else { return };
-        // Any restriction still re-exports: `graph::symbol_links` documents
-        // that a re-export's own visibility is not checked, and the
+        // Any restriction still republishes, as an unchecked `file` row: the
         // declaration at the end of the chain is checked against the original
         // requester anyway.
         let republishes = visibility_modifier(item).is_some();
@@ -572,36 +577,46 @@ impl Declarer<'_, '_> {
                 if self.project.has_container(&submodule) {
                     self.import_edge(PathTarget::Container(submodule), name, range);
                 }
-                if republishes {
-                    self.reexport(alias.unwrap_or(name), &container, name, module, range);
+                // A private named `use` is a row only where a descendant can
+                // follow it: this module's own uses of the name are already
+                // addressed at the import's target (`lookup_import`), so in a
+                // module without child modules the row would be dead weight.
+                if republishes || self.model.has_child_modules(&module.key) {
+                    self.reexport(alias.unwrap_or(name), &container, name, module, republishes, range);
                 }
             }
             LeafKind::Glob => {
                 #[cfg(test)]
                 crate::census::note_glob(&module.key);
-                if republishes {
-                    // `*` at both ends: core's own spelling for "this scope
-                    // republishes everything that one does".
-                    self.reexport("*", &container, "*", module, range);
-                }
+                // `*` at both ends: core's own spelling for "this scope
+                // republishes everything that one does". A private glob is a
+                // row too: the module itself is the one that follows it.
+                self.reexport("*", &container, "*", module, republishes, range);
             }
         }
     }
 
-    /// A `pub use`: a `reexport` node carrying what this module *publishes*
-    /// (its `name`) and what that really is (its target).
+    /// A `reexport` node carrying what this module *publishes* (its `name`)
+    /// and what that really is (its target). A `pub use` (any restriction)
+    /// is `file`, which the linker does not check; a private `use` is
+    /// `container(<this module>)`, which only this module and its
+    /// descendants may follow - Rust's own rule for private imports.
     fn reexport(
         &mut self,
         published: &str,
         container: &str,
         name: &str,
         module: &ModuleCtx,
+        republishes: bool,
         range: g_mesh_plugin_sdk::wire::Range,
     ) {
+        let visibility =
+            if republishes { Visibility::File } else { Visibility::Container(module.key.clone()) };
         self.emitter.reexport(
             published,
             container_target(container, TargetKey::Name(name.to_string()), &module.key),
             &module.key,
+            visibility,
             range,
         );
     }

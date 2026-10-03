@@ -135,6 +135,11 @@ impl FileModel {
     pub(crate) fn child_module(&mut self, container: &str, name: &str) {
         self.child_modules.insert((container.to_string(), name.to_string()));
     }
+
+    /// Whether `container` declares any `mod` - file-backed or inline.
+    pub(crate) fn has_child_modules(&self, container: &str) -> bool {
+        self.child_modules.iter().any(|(parent, _)| parent == container)
+    }
 }
 
 impl ModuleNames for FileModel {

@@ -2310,3 +2310,192 @@ fn a_qualified_name_key_matching_a_member_and_a_non_member_stays_unresolved() {
     assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
     assert!(!edge_target(&conn, &edge).1, "a qualifiedName key must refuse two declarations");
 }
+
+// --- GM-479: private imports reached through `use super::*` ----------------
+//
+// The rows the Rust plugin sends for
+// `mod user { use crate::m::P; mod tests { use super::*; … P::load(1) } }`
+// with `tests` file-backed (`src/user/tests.rs`), and a sibling
+// `mod other { use crate::user::*; … P::load(1); crate::user::P::load(1) }`.
+// A private `use` is a re-export row of `container(<its module>)`
+// visibility, which only that module and its descendants may follow. See
+// docs/architecture/gm-479-use-super-private-imports.md.
+
+const GM479_LOAD: &str = "Function:src/m.rs:m::P::load";
+
+fn gm479_m() -> At<'static> {
+    gm472_at("src/m.rs", "krate::m")
+}
+fn gm479_user() -> At<'static> {
+    gm472_at("src/user.rs", "krate::user")
+}
+fn gm479_tests() -> At<'static> {
+    At {
+        file: "src/user/tests.rs",
+        language: "rust",
+        container: "krate::user::tests",
+        parent: Some("krate::user"),
+    }
+}
+fn gm479_other() -> At<'static> {
+    gm472_at("src/other.rs", "krate::other")
+}
+
+/// A private `use` row: published in `at`, visible in `at.container` only.
+fn gm479_private(at: At, published: &str, scope: &str, key: &str) -> NodeRecord {
+    let mut node = container_reexport(at, published, scope, key);
+    node.visibility = VISIBILITY_CONTAINER.to_string();
+    node.visibility_container = Some(at.container.to_string());
+    node
+}
+
+/// A `qualifiedName` placeholder for `<head>::load` addressed at `scope`, with
+/// its `keyPath`.
+fn gm479_load_at(at: At, scope: &str, head: &str) -> NodeRecord {
+    let path = gm472_path(scope.trim_start_matches("krate::"), &[("::", head), ("::", "load")]);
+    let mut node = container_placeholder(at, scope, KEY_QUALIFIED_NAME, &path.display());
+    node.target.as_mut().unwrap().key_path = Some(path);
+    node
+}
+
+/// `src/m.rs`: `P` and `P::load`.
+fn gm479_m_diff() -> Diff {
+    let nodes = vec![
+        gm472_member(gm479_m(), "Type", "struct", &[("::", "P")]),
+        gm472_member(gm479_m(), "Function", "method", &[("::", "P"), ("::", "load")]),
+    ];
+    Diff { upsert_nodes: nodes, ..Default::default() }
+}
+
+/// `src/user.rs`: `mod tests;` and the private `use crate::m::P;`.
+fn gm479_user_diff(with_use: bool) -> Diff {
+    let mut nodes = vec![member(gm479_user(), "Module", "user::tests", Vis::Container("krate::user"))];
+    if with_use {
+        nodes.push(gm479_private(gm479_user(), "P", "krate::m", "P"));
+    }
+    Diff { upsert_nodes: nodes, ..Default::default() }
+}
+
+/// A file whose one function `<module>::<function>` calls each of `calls`
+/// (`(scope, head)`), with the module's private glob of `glob_of`. Returns
+/// the diff and one edge id per call.
+fn gm479_caller_diff(at: At, function: &str, glob_of: &str, calls: &[(&str, &str)]) -> (Diff, Vec<String>) {
+    let caller = member(at, "Function", function, Vis::Container(at.container));
+    let caller_id = caller.id.clone();
+    let mut nodes = vec![caller, gm479_private(at, REEXPORT_ALL_NAME, glob_of, REEXPORT_ALL_NAME)];
+    let mut edges = Vec::new();
+    for (scope, head) in calls {
+        let placeholder = gm479_load_at(at, scope, head);
+        edges.push(usage_edge(&caller_id, "CALLS", &placeholder));
+        nodes.push(placeholder);
+    }
+    let ids = edges.iter().map(|edge| edge.id.clone()).collect();
+    (Diff { upsert_nodes: nodes, upsert_edges: edges, ..Default::default() }, ids)
+}
+
+fn gm479_tests_diff() -> (Diff, Vec<String>) {
+    gm479_caller_diff(gm479_tests(), "user::tests::loads", "krate::user", &[("krate::user::tests", "P")])
+}
+
+fn gm479_other_diff() -> (Diff, Vec<String>) {
+    gm479_caller_diff(
+        gm479_other(),
+        "other::calls",
+        "krate::user",
+        &[("krate::other", "P"), ("krate::user", "P")],
+    )
+}
+
+/// `tests` → its glob → `user` → `user`'s private `use` → `m::P`, and the
+/// member beside it: the test module's call links.
+///
+/// Control: remove the parent's private row (`gm479_user_diff(false)`, the
+/// plugin before GM-479) - nothing links; see also the sibling test below.
+#[test]
+fn gm479_a_child_module_reaches_its_parents_private_import_through_its_glob() {
+    let mut conn = setup();
+    let (tests, edges) = gm479_tests_diff();
+    for diff in [gm479_m_diff(), gm479_user_diff(true), tests] {
+        apply_diff(&mut conn, &diff).unwrap();
+    }
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edges[0]), (GM479_LOAD.to_string(), true));
+}
+
+/// The same chain without the parent's row: the glob reaches `user`, which
+/// neither declares nor imports `P` as far as the index knows.
+#[test]
+fn gm479_without_the_parents_private_row_the_call_stays_unresolved() {
+    let mut conn = setup();
+    let (tests, edges) = gm479_tests_diff();
+    for diff in [gm479_m_diff(), gm479_user_diff(false), tests] {
+        apply_diff(&mut conn, &diff).unwrap();
+    }
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edges[0]).1);
+}
+
+/// A sibling cannot follow `user`'s private `use`, neither through its own
+/// glob of `user` nor by addressing `user` directly (`crate::user::P::load`):
+/// `krate::other`'s chain does not contain `krate::user`. The test module's
+/// call, in the same index, still links.
+///
+/// Control: drop the `restricted_to` check from `Resolver::walk` - both
+/// sibling calls link onto `m::P::load`.
+#[test]
+fn gm479_a_sibling_cannot_follow_a_private_import() {
+    let mut conn = setup();
+    let (tests, tests_edges) = gm479_tests_diff();
+    let (other, other_edges) = gm479_other_diff();
+    for diff in [gm479_m_diff(), gm479_user_diff(true), tests, other] {
+        apply_diff(&mut conn, &diff).unwrap();
+    }
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &tests_edges[0]), (GM479_LOAD.to_string(), true));
+    for edge in &other_edges {
+        assert!(!edge_target(&conn, edge).1, "a sibling followed a private import: {edge}");
+    }
+}
+
+/// Every order of the four files, linked incrementally, ends where one
+/// `link_all` does - including the parent's `use` arriving after the
+/// file-backed `tests.rs` that waits on it.
+///
+/// Control: drop the reexport branch of `seeds` (the `is_reexport` arm)
+/// - the orders where `user.rs` arrives last leave the test call unresolved.
+#[test]
+fn gm479_link_all_and_link_diff_agree_whatever_order_the_files_arrive_in() {
+    let diffs = || {
+        let (tests, _) = gm479_tests_diff();
+        let (other, _) = gm479_other_diff();
+        vec![gm479_m_diff(), gm479_user_diff(true), tests, other]
+    };
+    let mut bulk = setup();
+    for diff in diffs() {
+        apply_diff(&mut bulk, &diff).unwrap();
+    }
+    link_all(&mut bulk).unwrap();
+    let reference = usage_edges(&bulk);
+    let (_, tests_edges) = gm479_tests_diff();
+    assert!(reference.contains(&(tests_edges[0].clone(), GM479_LOAD.to_string(), true)), "{reference:?}");
+
+    let mut orders: Vec<[usize; 4]> = Vec::new();
+    for a in 0..4 {
+        for b in (0..4).filter(|&b| b != a) {
+            for c in (0..4).filter(|&c| c != a && c != b) {
+                orders.push([a, b, c, 6 - a - b - c]);
+            }
+        }
+    }
+    assert_eq!(orders.len(), 24);
+    for order in orders {
+        let mut pending: Vec<Option<Diff>> = diffs().into_iter().map(Some).collect();
+        let mut incremental = setup();
+        for index in order {
+            let diff = pending[index].take().unwrap();
+            apply_diff(&mut incremental, &diff).unwrap();
+            link_diff(&mut incremental, &diff).unwrap();
+        }
+        assert_eq!(usage_edges(&incremental), reference, "file order {order:?}");
+    }
+}

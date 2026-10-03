@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{
-    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope,
+    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope, Visibility,
 };
 use g_mesh_plugin_sdk::{
     render_target, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath,
@@ -228,20 +228,27 @@ impl<'s> Emitter<'s> {
     /// which is what keeps it out of `memberCount`), and a parent is only
     /// ever read from a member's record.
     ///
-    /// The `qualifiedName` names the published name as well as the address,
-    /// where the SDK's own rendering would name only the address. Two
-    /// `pub use` items forwarding one declaration under two names -
-    /// `pub use a::b::C as X;` and `… as Y;` - are two different facts about
-    /// what this module publishes, and an id derived from the address alone
-    /// would make them one node and lose the second name.
+    /// The `qualifiedName` names the publishing module and the published name
+    /// as well as the address, where the SDK's own rendering would name only
+    /// the address. Two `pub use` items forwarding one declaration under two
+    /// names - `pub use a::b::C as X;` and `… as Y;` - are two different facts
+    /// about what this module publishes, and so are two inline modules of one
+    /// file importing the same item: an id derived from the address alone
+    /// would make each pair one node, losing the second name or the second
+    /// module's row.
+    ///
+    /// `visibility` is who may follow the row: [`Visibility::File`] for a
+    /// `pub use` (unchecked by the linker), `container(<module>)` for a
+    /// private `use`, which only that module and its descendants may follow.
     pub(crate) fn reexport(
         &mut self,
         published: &str,
         target: PlaceholderTarget,
         container: &str,
+        visibility: Visibility,
         range: Range,
     ) -> String {
-        let qualified_name = format!("{} as {published}", render_target(&target));
+        let qualified_name = format!("{container}: {} as {published}", render_target(&target));
         let id = node_id(
             self.path.as_str(),
             NodeKind::Module,
@@ -253,6 +260,7 @@ impl<'s> Emitter<'s> {
                 .native_kind(PlaceholderKind::Reexport.native_kind());
             spec.container = Some(container.to_string());
             spec.target = Some(target);
+            spec.visibility = visibility;
             self.graph.add_node(spec);
         }
         id
