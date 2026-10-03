@@ -397,3 +397,54 @@ Approved by the owner, verbatim: "да, хорошо".
   any node with the row's name), so a partial pass keeps the marker honest.
 - **D4.** Two sibling fields, `unlinkedUsages` and `untypedReceiverCalls`.
 - **D5.** `count` is the number of calling functions, not call sites.
+
+## Measured noise
+
+GM-486 S13. Corpus: `git archive 7c73009` of g-mesh itself (273 `.rs` files),
+indexed by a release build of this branch into a scratch `G_MESH_HOME`, with
+only the Rust plugin discovered. Two fresh `reindex` runs: **A** with the
+manifest's `semantic_pass = false`, **B** with it `true` (rust-analyzer
+1.97.1). B's pass completed: `language_state.semanticPassAt` set, no
+`semanticPassError`, 273 files, 6,217 semantic edges. The structural walk is the
+same in both: `untyped_calls` holds the identical 16,029 rows (706 distinct
+names). Anchors are every Rust `Function` with `nativeKind` in
+`method`/`trait_method`/`trait_impl_method` (1,389). Counts come from SQL
+mirroring `untyped::candidate_sql` (edge kind `CALLS`, no scope) on every
+anchor. That SQL matched `find_callers` on 5/5 anchors per phase (top 2 by
+count, 2 seeded-random marked, 1 seeded-random unmarked): `count`, `files` and
+byte size. `count` percentiles are over marked anchors only.
+
+| | A: structural only | B: after semantic pass |
+|---|---|---|
+| method anchors | 1,389 | 1,389 |
+| pages with `untypedReceiverCalls` | 589 (42.4%) | 195 (14.0%) |
+| `count` p50 / p90 / max | 4 / 48 / 708 | 12 / 214 / 702 |
+| `untyped_calls` rows | 16,029 | 16,029 |
+| largest field (bytes) | 1,525 (`call_tool`, 28 files, truncated) | 1,525 (same) |
+| field bytes p50 / p90 | 505 / 1,369 | 736 / 1,418 |
+
+Top 15 names by `count`, with the number of marked anchors carrying the name:
+
+- **A:** expect 708 (2), collect 624 (3), path 431 (6), get 355 (3), push 277 (3),
+  as_str 241 (1), len 218 (3), is_empty 211 (6), filter 204 (1), lock 145 (2),
+  insert 133 (2), prepare 99 (5), contains 95 (1), extend 95 (1), kind 79 (1).
+- **B:** expect 702, collect 622, path 418, get 343, push 254, as_str 221,
+  len 214, is_empty 209, filter 204, insert 109, lock 99, contains 95,
+  extend 95, prepare 91, find 78.
+
+The semantic pass removes about two thirds of the marked pages. These are
+mostly the long tail of project-only names. What stays is a set of
+project methods that share a name with a std method (`expect`, `collect`,
+`get`, `push`, `len`, `is_empty`). rust-analyzer resolves those calls to std,
+which is not indexed. So the caller has no semantic edge to any node of that
+name, and the D3 filter keeps the row. Example: of the 708 callers of
+`.expect` in `untyped_calls`, 382 have semantic edges, yet only 6 drop
+out of the `expect` anchors' count (708 to 702). These markers are near-certain noise
+on a complete pass. The page cost is bounded: `files` is capped at 20, so
+the field never exceeded 1.5 KB.
+
+Run: `reindex` took A `real 860 s, user 2114 s, sys 18 s` and B
+`real 620 s, user 1555 s, sys 13 s`. The semantic pass itself took 206 s.
+Most of the rest was embedding backfill. Load averages at the start were
+174 / 208 / 170, from other work on the machine, and 8 / 27 / 86 at the end.
+So these wall times are not a performance figure.
