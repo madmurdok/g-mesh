@@ -10,7 +10,8 @@
 //! | `f()`, `CONST` | this module's own declaration, this module's `use` items, or nothing |
 //! | `a::b::f()` | a `name` key in the container `a::b` resolves to |
 //! | `T::f()`, `Self::f()`, `self.f()` | a `qualifiedName` key - `…::T::f` - in the container `T` lives in |
-//! | `x.m()` | nothing: an open site for the semantic tier |
+//! | `x.m()`, `x` typed in this file | `T::m`, as `T::f()` is - and an open site that replaces it |
+//! | `x.m()`, any other `x` | nothing: an open site for the semantic tier |
 //! | `self.f`, `T { f: .. }`, `T { f, .. }` | a `qualifiedName` key - `…::T.f` - in the container `T` lives in |
 //! | `x.f` | nothing: an open site for the semantic tier |
 //!
@@ -36,7 +37,14 @@
 //! An open site is a question this tier cannot answer and
 //! `rust-analyzer` (GM-290) can. It is recorded for:
 //!
-//!  - **`x.m()`** - a receiver call, the case open sites exist for.
+//!  - **`x.m()`** - a receiver call, the case open sites exist for. When
+//!    this file spells out the receiver's type `T` ([`super::typing`]), the
+//!    call also gets the edge `T::m(x)` would, and the open site carries that
+//!    edge's id in `replaces`: a semantic answer that lands elsewhere
+//!    retracts it, and one that lands on the same declaration retracts it
+//!    too, because the bridge's own edge onto a placeholder never shares the
+//!    structural edge's id - so the two tiers leave one edge per call, not
+//!    two.
 //!  - **`x.f`** - a field read through a receiver whose type this tier does
 //!    not know (anything but `self` inside an `impl`).
 //!  - **A call whose path does not resolve**: a bare name that is neither
@@ -72,6 +80,7 @@ use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::{
     flatten_path, item_name, looks_like_type, outer_doc_comment, path_tail, signature, text, Seg,
 };
+use crate::extractor::typing::{binding_name, LocalType, Origin, Wrapper, WrittenType, MAX_HOPS};
 use crate::project::ProjectContext;
 
 /// What a use site turned out to name.
@@ -376,6 +385,7 @@ impl Bodies<'_, '_> {
         }
         if let Some(parameters) = item.child_by_field_name("parameters") {
             self.scopes.bind_parameters(parameters, self.source);
+            self.type_parameters(parameters, module, block, Origin::Parameter);
         }
         // The name is an `identifier`, and walking it would ask what `f`
         // means at a point where `f` is the thing being declared.
@@ -403,9 +413,16 @@ impl Bodies<'_, '_> {
                 self.visit(child, module, block, from);
             }
         }
+        let typed = match node.child_by_field_name("type") {
+            Some(ty) => self.written_local(ty, module, block, Origin::LetAnnotation),
+            None => node.child_by_field_name("value").and_then(|value| self.value_type(value, module, block)),
+        };
         if let Some(pattern) = node.child_by_field_name("pattern") {
             self.pattern_fields(pattern, module, block, from);
             self.scopes.bind_pattern(pattern, self.source);
+            if let (Some(ty), Some(name)) = (typed, binding_name(pattern, self.source)) {
+                self.scopes.bind_typed(name, ty);
+            }
         }
     }
 
@@ -414,6 +431,7 @@ impl Bodies<'_, '_> {
         if let Some(parameters) = node.child_by_field_name("parameters") {
             self.pattern_fields(parameters, module, block, from);
             self.scopes.bind_parameters(parameters, self.source);
+            self.type_parameters(parameters, module, block, Origin::ClosureParameter);
         }
         self.visit_children_except(node, &[node.child_by_field_name("parameters")], module, block, from);
         self.scopes.pop();
@@ -532,9 +550,10 @@ impl Bodies<'_, '_> {
         }
     }
 
-    /// `x.m()` - and its one resolvable special case, `self.m()` inside an
-    /// `impl`, which is the impl type's own method (the design doc's "like TS
-    /// `this`").
+    /// `x.m()`. `self.m()` inside an `impl` is the impl type's own method.
+    /// Any other receiver is an open site; when this file also says what
+    /// type `T` the receiver has, the call is addressed as `T::m` too, and
+    /// the open site names that edge in `replaces`.
     fn receiver_call(&mut self, target: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         let Some(field) = target.child_by_field_name("field") else { return };
         let Some(value) = target.child_by_field_name("value") else { return };
@@ -547,7 +566,251 @@ impl Bodies<'_, '_> {
             }
         }
         self.visit(value, module, block, from);
-        self.open_site(from, field, name, module, OpenSiteKind::ReceiverCall, EdgeKind::Calls);
+        let replaces = match self.receiver_type(value).filter(|ty| ty.wrapper == Wrapper::Plain) {
+            Some(ty) => {
+                let bound = self.member_of(&ty.container, &ty.name, name, module);
+                #[cfg(test)]
+                crate::census::typed_receiver(ty.origin, ty.unwrapped, matches!(bound, Bound::Here(_)));
+                self.edge(bound, EdgeKind::Calls, from, field)
+            }
+            None => None,
+        };
+        self.open_site(from, field, name, module, OpenSiteKind::ReceiverCall, EdgeKind::Calls, replaces);
+    }
+
+    // --- receiver types -------------------------------------------------------
+
+    /// Types every `name: T` parameter of a function or closure whose `T`
+    /// this file can address. Runs after the list is bound, so a parameter
+    /// left untyped here is bound all the same.
+    fn type_parameters(
+        &mut self,
+        parameters: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+        origin: Origin,
+    ) {
+        let mut cursor = parameters.walk();
+        let typed: Vec<(&str, LocalType)> = parameters
+            .named_children(&mut cursor)
+            .filter(|parameter| parameter.kind() == "parameter")
+            .filter_map(|parameter| {
+                let name = binding_name(parameter.child_by_field_name("pattern")?, self.source)?;
+                let ty = self.written_local(parameter.child_by_field_name("type")?, module, block, origin)?;
+                Some((name, ty))
+            })
+            .collect();
+        for (name, ty) in typed {
+            self.scopes.bind_typed(name, ty);
+        }
+    }
+
+    /// The type a written type annotation gives a local.
+    fn written_local(
+        &self,
+        node: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+        origin: Origin,
+    ) -> Option<LocalType> {
+        let self_type =
+            block.filter(|block| block.family != Family::TraitDecl).map(|block| block.self_type.as_str());
+        let written = WrittenType::parse(node, self.source)?.substitute_self(self_type)?;
+        let (container, name, wrapper) =
+            self.resolve_written(&written, module, &|name| self.scopes.binds(name))?;
+        Some(LocalType { container, name, wrapper, hops: 0, origin, unwrapped: false })
+    }
+
+    /// `(container, type name, wrapper)` for a written type: `Box` is looked
+    /// through, `Option`/`Result` become the wrapper of their first argument.
+    fn resolve_written(
+        &self,
+        written: &WrittenType,
+        module: &ModuleCtx,
+        generic: &dyn Fn(&str) -> bool,
+    ) -> Option<(String, String, Wrapper)> {
+        if let Some(head) = written.single() {
+            let wrapper = match head {
+                "Box" => Some(Wrapper::Plain),
+                "Option" => Some(Wrapper::Option),
+                "Result" => Some(Wrapper::Result),
+                _ => None,
+            };
+            if let Some(wrapper) = wrapper.filter(|_| !self.is_project_type(&module.key, head)) {
+                let inner = written.args.first()?.as_ref()?;
+                let (container, name, inner_wrapper) = self.resolve_written(inner, module, generic)?;
+                return (inner_wrapper == Wrapper::Plain).then_some((container, name, wrapper));
+            }
+        }
+        let segments = written.segments();
+        let tail = path_tail(&segments)?;
+        if segments.len() == 1 {
+            if generic(tail) {
+                return None;
+            }
+            if self.model.lookup_name(&module.key, tail, Some(NodeKind::Type)).is_some() {
+                return Some((module.key.clone(), tail.to_string(), Wrapper::Plain));
+            }
+            return match self.model.lookup_import(&module.key, tail) {
+                Some(Import::Item { container, name }) => {
+                    Some((container.clone(), name.clone(), Wrapper::Plain))
+                }
+                _ => None,
+            };
+        }
+        let qualifier = segments[segments.len() - 2].name();
+        if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
+            return None;
+        }
+        match resolve_module_path(&segments[..segments.len() - 1], module, self.model, self.project) {
+            PathTarget::Container(container) => Some((container, tail.to_string(), Wrapper::Plain)),
+            PathTarget::ExternalCrate(_) | PathTarget::Unresolved => None,
+        }
+    }
+
+    /// Whether `name` in `container` is a type this file declares or a `use`
+    /// brings in from this project.
+    fn is_project_type(&self, container: &str, name: &str) -> bool {
+        self.model.lookup_name(container, name, Some(NodeKind::Type)).is_some()
+            || matches!(self.model.lookup_import(container, name), Some(Import::Item { .. }))
+    }
+
+    /// The type of a receiver expression: a typed local, through any number
+    /// of `&`/`&mut` and parentheses.
+    fn receiver_type(&self, value: Node) -> Option<LocalType> {
+        match value.kind() {
+            "identifier" => self.scopes.type_of(text(value, self.source)).cloned(),
+            "reference_expression" => self.receiver_type(value.child_by_field_name("value")?),
+            "parenthesized_expression" => self.receiver_type(value.named_child(0)?),
+            _ => None,
+        }
+    }
+
+    /// The type a `let` initializer gives its binding, through at most one
+    /// explicit `?`, `.unwrap()` or `.expect(..)`.
+    fn value_type(&self, value: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<LocalType> {
+        let (inner, unwrapped) = self.peel_unwrap(value);
+        let mut ty = self.expression_type(inner, module, block)?;
+        if unwrapped {
+            if ty.wrapper == Wrapper::Plain {
+                return None;
+            }
+            ty.wrapper = Wrapper::Plain;
+            ty.unwrapped = true;
+        }
+        Some(ty)
+    }
+
+    /// `e?`, `e.unwrap()` and `e.expect(..)` as `(e, true)`; anything else
+    /// as itself.
+    fn peel_unwrap<'t>(&self, value: Node<'t>) -> (Node<'t>, bool) {
+        if value.kind() == "try_expression" {
+            if let Some(inner) = value.named_child(0) {
+                return (inner, true);
+            }
+        }
+        if value.kind() == "call_expression" {
+            let callee =
+                value.child_by_field_name("function").filter(|callee| callee.kind() == "field_expression");
+            if let Some(callee) = callee {
+                let method = callee.child_by_field_name("field").map(|field| text(field, self.source));
+                if let (Some("unwrap" | "expect"), Some(inner)) =
+                    (method, callee.child_by_field_name("value"))
+                {
+                    return (inner, true);
+                }
+            }
+        }
+        (value, false)
+    }
+
+    fn expression_type(
+        &self,
+        value: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+    ) -> Option<LocalType> {
+        match value.kind() {
+            "identifier" | "reference_expression" | "parenthesized_expression" => self.receiver_type(value),
+            "struct_expression" => {
+                let (container, name) =
+                    self.struct_address(value.child_by_field_name("name")?, module, block)?;
+                Some(LocalType {
+                    container,
+                    name,
+                    wrapper: Wrapper::Plain,
+                    hops: 0,
+                    origin: Origin::StructLiteral,
+                    unwrapped: false,
+                })
+            }
+            "call_expression" => self.call_type(value, module, block),
+            _ => None,
+        }
+    }
+
+    /// The written return type of the same-file declaration a call lands on:
+    /// `f()`, `a::f()`, `T::f()`, `Self::f()`, `self.m()` or `x.m()` with `x`
+    /// typed.
+    fn call_type(&self, call: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<LocalType> {
+        let function = call.child_by_field_name("function")?;
+        let function = if function.kind() == "generic_function" {
+            function.child_by_field_name("function")?
+        } else {
+            function
+        };
+        match function.kind() {
+            "identifier" => {
+                let name = text(function, self.source);
+                if self.scopes.binds(name) {
+                    return None;
+                }
+                let decl = self.model.lookup_name(&module.key, name, Some(NodeKind::Function))?;
+                self.returned(&decl.id, Origin::FreeFnReturn, 1)
+            }
+            "scoped_identifier" => {
+                let segments = flatten_path(function, self.source)?;
+                let Bound::Here(id) = self.resolve_path(&segments, module, block, Some(NodeKind::Function))
+                else {
+                    return None;
+                };
+                let qualifier = segments.len().checked_sub(2).and_then(|at| segments[at].name());
+                let origin =
+                    if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
+                        Origin::AssocFnReturn
+                    } else {
+                        Origin::FreeFnReturn
+                    };
+                self.returned(&id, origin, 1)
+            }
+            "field_expression" => {
+                let name = text(function.child_by_field_name("field")?, self.source);
+                let value = function.child_by_field_name("value")?;
+                if value.kind() == "self" {
+                    let Bound::Here(id) = self.self_member(block?, name, module) else { return None };
+                    return self.returned(&id, Origin::MethodReturn, 1);
+                }
+                let receiver = self.receiver_type(value).filter(|ty| ty.wrapper == Wrapper::Plain)?;
+                let hops = receiver.hops + 1;
+                if hops > MAX_HOPS {
+                    return None;
+                }
+                let Bound::Here(id) = self.member_of(&receiver.container, &receiver.name, name, module)
+                else {
+                    return None;
+                };
+                self.returned(&id, Origin::MethodReturn, hops)
+            }
+            _ => None,
+        }
+    }
+
+    /// The type a call to the declaration `id` returns, from its written
+    /// return type.
+    fn returned(&self, id: &str, origin: Origin, hops: u8) -> Option<LocalType> {
+        let returns = self.model.returns(id)?;
+        let (container, name, wrapper) = self.resolve_written(&returns.ty, &returns.module, &|_| false)?;
+        Some(LocalType { container, name, wrapper, hops, origin, unwrapped: false })
     }
 
     /// `x.f` read as a value. `self.f` inside an `impl T` is the field `T.f`
@@ -570,7 +833,7 @@ impl Bodies<'_, '_> {
             }
         }
         self.visit(value, module, block, from);
-        self.open_site(from, field, name, module, OpenSiteKind::Reference, EdgeKind::References);
+        self.open_site(from, field, name, module, OpenSiteKind::Reference, EdgeKind::References, None);
     }
 
     /// Every field named in a struct literal or struct pattern (`list`), as
@@ -969,21 +1232,36 @@ impl Bodies<'_, '_> {
         open: OpenSiteKind,
     ) {
         match bound {
-            Bound::Here(to) => self.emitter.resolved_edge(kind, from, &to),
-            Bound::There { target, name } => {
-                let range = self.emitter.positions().range(at);
-                let placeholder =
-                    self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
-                self.emitter.placeholder_edge(kind, from, &placeholder);
+            Bound::Here(_) | Bound::There { .. } => {
+                self.edge(bound, kind, from, at);
             }
             Bound::Open => {
                 let name = text(at, self.source).to_string();
-                self.open_site(from, at, &name, module, open, kind);
+                self.open_site(from, at, &name, module, open, kind, None);
             }
             Bound::Nothing => {}
         }
     }
 
+    /// The edge a [`Bound::Here`] or [`Bound::There`] stands for, and its id.
+    /// `None`, emitting nothing, for the other two.
+    fn edge(&mut self, bound: Bound, kind: EdgeKind, from: &str, at: Node) -> Option<String> {
+        match bound {
+            Bound::Here(to) => Some(self.emitter.resolved_edge(kind, from, &to)),
+            Bound::There { target, name } => {
+                let range = self.emitter.positions().range(at);
+                let placeholder =
+                    self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
+                Some(self.emitter.placeholder_edge(kind, from, &placeholder))
+            }
+            Bound::Open | Bound::Nothing => None,
+        }
+    }
+
+    /// `replaces` is the id of the structural edge this tier wrote for the
+    /// same site, which a semantic answer landing elsewhere retracts; `None`
+    /// when it wrote none.
+    #[allow(clippy::too_many_arguments)]
     fn open_site(
         &mut self,
         from: &str,
@@ -992,6 +1270,7 @@ impl Bodies<'_, '_> {
         module: &ModuleCtx,
         kind: OpenSiteKind,
         edge_kind: EdgeKind,
+        replaces: Option<String>,
     ) {
         let position = self.emitter.positions().at(at.start_position());
         self.emitter.open_site(OpenSite {
@@ -1001,12 +1280,7 @@ impl Bodies<'_, '_> {
             kind,
             edge_kind,
             from_container: Some(module.key.clone()),
-            // Nothing this tier emitted is being replaced: every open site
-            // here is a site it wrote *no* edge for (see the module doc,
-            // Decision 7), so a semantic answer has nothing to contradict.
-            // The field exists for the other shape - a structural edge
-            // written on a guess - which this extractor does not produce.
-            replaces: None,
+            replaces,
         });
     }
 
@@ -1082,7 +1356,15 @@ impl Bodies<'_, '_> {
             .and_then(path_tail)
             .unwrap_or_else(|| text(self_type, self.source))
             .to_string();
-        self.open_site(from, self_type, &name, module, OpenSiteKind::Implementation, EdgeKind::SupertypeOf);
+        self.open_site(
+            from,
+            self_type,
+            &name,
+            module,
+            OpenSiteKind::Implementation,
+            EdgeKind::SupertypeOf,
+            None,
+        );
     }
 
     /// The node for an `impl Tr for T` block whose `T` names no declaration -

@@ -156,7 +156,8 @@ code that has them.
    twice.
 3. **Trait dispatch through generics.** `fn f<S: Shape>(s: &S) { s.area() }`
    reaches whichever `Shape::area` the type argument selects at each call
-   site. That is a receiver call, so it produces no edge at all - see below.
+   site. That is a receiver call on a generic, so it produces no structural
+   edge - see below.
    Once rust-analyzer has run it produces one, onto `Shape::area` itself:
    the bound is the only type there is to resolve against. That is not this
    gap closing, it is this gap narrowing, and
@@ -165,13 +166,18 @@ code that has them.
 
 Two smaller ones, for completeness:
 
-- **Receiver calls (`x.m()`) produce no *structural* edge.** They are what
-  open sites exist for, and the semantic tier answers them: `plugin.toml`
+- **Most receiver calls (`x.m()`) produce no *structural* edge.** They are
+  what open sites exist for, and the semantic tier answers them: `plugin.toml`
   declares `receiver_calls_structural = "unresolved"` with
   `receiver_calls = "resolved"`, which is what makes the MCP instructions
   list the gap until a semantic pass has landed for this language and stop
   afterwards. `self.m()` inside an `impl` *is* resolved structurally, to the
-  impl type's own method.
+  impl type's own method. So is a call through a local whose type the same
+  file spells out - a typed parameter, a `let x: T`, a struct literal, or the
+  written return type of a function or method declared in that file - which
+  is addressed as `T::m` and keeps its open site, naming the edge in
+  `replaces` (`src/extractor/typing.rs` lists the rules). A trait-impl
+  method is not found that way: its name is `<T as Tr>::m`, not `T::m`.
 - **An `impl Trait for T` whose trait arrives through a glob import** gets no
   structural edge and not even an open site - a bare type name that is
   neither declared nor imported by item resolves to nothing, deliberately, so
@@ -260,10 +266,13 @@ which it judges no expectations at all. That one failing check is the kit
 telling the truth about the environment, and the test pins it to exactly that
 one so nothing else can hide behind it.
 
-The receiver-call gap's own assertion moved with them. Through 3.2.0 it lived
-in this file as a caller set that deliberately *omitted* the non-resolving
-call site; it is now the same entry listing all three callers and requiring
-the semantic tier to produce the third. The structural half - that `x.m()`
-emits one open site and no edge - is pinned by
-`src/extractor/tests.rs::a_receiver_call_produces_no_edge_and_one_open_site`,
-which needs no toolchain at all.
+The receiver-call gap's own assertion moved with them. The perimeter entry
+lists all three of `Square::perimeter`'s callers, the third a call through a
+typed parameter that both tiers resolve, and its `files` tally requires one
+edge per call rather than one per tier. The structural half - that an
+untyped `x.m()` emits one open site and no edge, and a typed one an edge
+plus an open site that replaces it - is pinned by
+`src/extractor/tests.rs`'s
+`an_untyped_receiver_call_produces_no_edge_and_an_open_site_that_replaces_nothing`
+and `a_typed_receiver_call_produces_an_edge_and_an_open_site_that_replaces_it`,
+which need no toolchain at all.
