@@ -472,7 +472,8 @@ declares nothing refuses nothing. Validation, as hard errors naming the
 manifest path: an empty string (it would match every query) and an unknown key
 in the table (so a misspelt `start_with` fails loudly). The four shipped
 plugins declare `starts_with = ["@"]` and `contains = ["/"]`; Python also
-declares a leading `.` (`starts_with = ["@", "."]`), a relative import.
+declares a leading `.` (`starts_with = ["@", "."]`), a relative import, and
+TypeScript declares `node:` (`starts_with = ["@", "node:"]`), a Node built-in.
 `g-mesh plugins list` and `g-mesh plugins check` print the declaration.
 `search_code` reads the same table for its `noMatch` verdict: a first page is
 `queryIsAPathOrPackage` when every row's language refuses the query (an empty
