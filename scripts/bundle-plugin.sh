@@ -358,7 +358,8 @@ args = []
 [plugin.languages]
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 
-# Same capabilities/workspace/non_symbol_queries/symbol_query_prefixes declarations as the repo's own
+# Same capabilities/workspace/non_symbol_queries/symbol_query_prefixes/reexports declarations as the
+# repo's own
 # plugins/typescript/plugin.toml - see that file's comments for the full
 # rationale behind each value; this is the installed copy of the same facts
 # about the same plugin binary, not a second decision.
@@ -378,6 +379,9 @@ contains = ["/"]
 
 [plugin.symbol_query_prefixes]
 strip = ["@"]
+
+[plugin.reexports]
+named_shadows_glob = true
 EOF
 
 	# A bundle that cannot even introduce itself is not worth packaging. Run

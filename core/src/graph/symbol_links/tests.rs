@@ -2,6 +2,24 @@ use super::*;
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
+/// The rules the bundled plugins declare (`plugins/rust/plugin.toml` and
+/// `plugins/typescript/plugin.toml` set `[plugin.reexports]
+/// named_shadows_glob`; Python and Go do not), so the tests below link as the
+/// daemon would.
+fn bundled_rules() -> LinkRules {
+    LinkRules::with_named_shadows_glob(["rust", "typescript"])
+}
+
+/// [`super::link_all`] under [`bundled_rules`]. Shadows the glob import.
+fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
+    super::link_all(conn, &bundled_rules())
+}
+
+/// [`super::link_diff`] under [`bundled_rules`]. Shadows the glob import.
+fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
+    super::link_diff(conn, diff, &bundled_rules())
+}
+
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     // On, so that an edge left pointing at a node that is not there - the
@@ -2630,4 +2648,242 @@ fn gm479_a_named_row_shadows_globs_even_for_a_requester_that_cannot_follow_it() 
     link_all(&mut conn).unwrap();
     assert!(!edge_target(&conn, &other_edge).1, "{:?}", edge_target(&conn, &other_edge));
     assert_eq!(edge_target(&conn, &tests_edge), ("Function:src/y.rs:y::Error::new".to_string(), true));
+}
+
+// --- Only a language that declares it shadows a glob -----------------------
+//
+// ADR 0020: `[plugin.reexports] named_shadows_glob` decides, per language,
+// whether a named re-export row hides the same scope's `*` rows. Rust and
+// TypeScript declare it; Python (the later import binds) does not.
+
+const GM490_Y_NEW: &str = "Function:src/y.rs:y::Error::new";
+const GM490_PY_A: &str = "Function:pkg/a.py:pkg.a.f";
+const GM490_PY_B: &str = "Function:pkg/b.py:pkg.b.f";
+
+/// The Rust named-over-glob fixture above, unlinked: `mod user { use crate::y::Error; use
+/// crate::x::*; mod tests { use super::*; … Error::new() } }`, with
+/// `x::Error::new` and `y::Error::new` both declared. One diff per file;
+/// returns the diffs and the call's edge id.
+fn gm490_rust_diffs() -> (Vec<Diff>, String) {
+    let mut user = gm479_user_diff(false);
+    user.upsert_nodes
+        .extend([gm479_private(gm479_user(), "Error", "krate::y", "Error"), gm479_user_glob_of_x()]);
+    let (tests, edge) = gm479_error_caller(gm479_tests(), "user::tests::loads");
+    (
+        vec![gm479_error_diff("src/x.rs", "krate::x"), gm479_error_diff("src/y.rs", "krate::y"), user, tests],
+        edge,
+    )
+}
+
+fn gm490_py_at(file: &'static str, module: &'static str, parent: Option<&'static str>) -> At<'static> {
+    At { file, language: "python", container: module, parent }
+}
+
+/// The acceptance criterion's Python fixture, unlinked, as the Python plugin
+/// states it (container-scoped rows, `crate::extractor::emit::reexport`):
+/// `pkg/__init__.py` does `from .a import f` (only when `named`) and then
+/// `from .b import *`; `pkg.a` and `pkg.b` both declare `f`; `user.py` does
+/// `from pkg import f` and calls it. Python binds `f` to `pkg.b.f`, the star
+/// import's item. One diff per file; returns the diffs and the call's edge id.
+fn gm490_python_diffs(named: bool) -> (Vec<Diff>, String) {
+    let init = gm490_py_at("pkg/__init__.py", "pkg", None);
+    let mut rows = Vec::new();
+    if named {
+        rows.push(container_reexport(init, "f", "pkg.a", "f"));
+    }
+    rows.push(container_reexport(init, REEXPORT_ALL_NAME, "pkg.b", REEXPORT_ALL_NAME));
+    let a = member(gm490_py_at("pkg/a.py", "pkg.a", Some("pkg")), "Function", "pkg.a.f", Vis::Public);
+    let b = member(gm490_py_at("pkg/b.py", "pkg.b", Some("pkg")), "Function", "pkg.b.f", Vis::Public);
+    let user = gm490_py_at("user.py", "user", None);
+    let caller = member(user, "Function", "user.run", Vis::Public);
+    let placeholder = container_placeholder(user, "pkg", KEY_NAME, "f");
+    let edge = usage_edge(&caller.id, "CALLS", &placeholder);
+    let id = edge.id.clone();
+    let nodes = |nodes: Vec<NodeRecord>| Diff { upsert_nodes: nodes, ..Default::default() };
+    let user =
+        Diff { upsert_nodes: vec![caller, placeholder], upsert_edges: vec![edge], ..Default::default() };
+    (vec![nodes(vec![a]), nodes(vec![b]), nodes(rows), user], id)
+}
+
+fn gm490_apply(conn: &mut Connection, diffs: &[Diff]) {
+    for diff in diffs {
+        apply_diff(conn, diff).unwrap();
+    }
+}
+
+/// `export { mutate } from "<named_target>"; export * from "./b";` in
+/// `index.ts`, with `mutate` declared in `a.ts` and `b.ts`, and a call of
+/// `index.ts`'s `mutate`. Unlinked; returns the call's edge id.
+fn gm490_ts_barrel(conn: &mut Connection, named_target: &str) -> String {
+    upsert(
+        conn,
+        vec![
+            symbol("caller.ts", "run", "Function", true),
+            reexport_node("index.ts", "mutate", named_target, "mutate"),
+            reexport_all("index.ts", "b.ts"),
+            symbol("a.ts", "mutate", "Function", true),
+            symbol("b.ts", "mutate", "Function", true),
+        ],
+    );
+    seed_usage(conn, "Function:caller.ts:run", "CALLS", "index.ts", "mutate")
+}
+
+/// ES modules: an explicit `export { mutate } from "./a"` beats the same
+/// barrel's `export * from "./b"`, so the call links `a.ts`'s `mutate`. With
+/// no rules the two rows sit at one depth and the call stays unresolved,
+/// which is what makes the first assertion the rule's doing.
+///
+/// Control: drop `"typescript"` from `bundled_rules` (or the
+/// `hops.retain(..)` step of `Resolver::walk`) - the call stays unresolved.
+#[test]
+fn gm490_a_typescript_named_reexport_shadows_an_export_star_of_the_same_name() {
+    let mut conn = setup();
+    let edge = gm490_ts_barrel(&mut conn, "a.ts");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Function:a.ts:mutate".to_string(), true));
+
+    let mut unruled = setup();
+    let edge = gm490_ts_barrel(&mut unruled, "a.ts");
+    super::link_all(&mut unruled, &LinkRules::default()).unwrap();
+    assert!(!edge_target(&unruled, &edge).1, "{:?}", edge_target(&unruled, &edge));
+}
+
+/// The TypeScript named row still shadows the glob when it leads nowhere
+/// (`./gone` is not indexed): the call stays unresolved rather than linking
+/// `b.ts`'s `mutate`, as for Rust's external `use`.
+///
+/// Control: drop `"typescript"` from `bundled_rules` - the call links
+/// `b.ts`'s `mutate`.
+#[test]
+fn gm490_a_typescript_named_reexport_that_leads_nowhere_still_shadows_the_glob() {
+    let mut conn = setup();
+    let edge = gm490_ts_barrel(&mut conn, "gone.ts");
+    link_all(&mut conn).unwrap();
+    assert!(!edge_target(&conn, &edge).1, "{:?}", edge_target(&conn, &edge));
+}
+
+/// The acceptance criterion: in Python an explicit import followed by a star
+/// import of the same name never links to the explicit import's item. Under
+/// the bundled rules (Python declares nothing) both rows are followed at one
+/// depth, both reach an `f`, and the call stays unresolved - in a whole pass
+/// and in incremental passes whichever way round the files arrive. Without
+/// the explicit import the star import alone links `pkg.b.f`, so the walk
+/// does reach the star import's item. Incrementally, `pkg.b.f` is also an
+/// allowed end state (linked before `pkg.a` exists); `pkg.a.f` never is.
+/// Not covered: an order where `pkg.a` and the call are in while `pkg.b` is
+/// not (`__init__`, `a`, `user`, then `b`) links `pkg.a.f`, the only `f` in
+/// the index, and `link_diff` never moves it when `pkg.b` arrives - an answer
+/// that worsens, outside `link_diff`'s contract and independent of the rule.
+///
+/// Control: make `Resolver::hops` tag every row `named_shadows_glob: true`
+/// (or add `"python"` to `bundled_rules`) - the call links `pkg.a.f`.
+#[test]
+fn gm490_a_python_explicit_import_never_shadows_a_later_star_import() {
+    let (diffs, edge) = gm490_python_diffs(true);
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    let (target, resolved) = edge_target(&conn, &edge);
+    assert!(!resolved, "linked {target}");
+    assert_ne!(target, GM490_PY_A);
+
+    for order in [[0, 1, 2, 3], [0, 1, 3, 2], [3, 2, 1, 0]] {
+        let mut incremental = setup();
+        for index in order {
+            apply_diff(&mut incremental, &diffs[index]).unwrap();
+            link_diff(&mut incremental, &diffs[index]).unwrap();
+            let onto_a: i64 = incremental
+                .query_row(
+                    "SELECT COUNT(*) FROM edges WHERE id = ?1 AND toId = ?2",
+                    params![edge, GM490_PY_A],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(onto_a, 0, "file order {order:?}, after file {index}");
+        }
+        // `pkg.b` arriving before `pkg.a` links the star import's item, and a
+        // later file never moves an edge that is already linked (the
+        // module doc's `link_diff`): Python's own answer, so also allowed.
+        let (target, resolved) = edge_target(&incremental, &edge);
+        assert!(!resolved || target == GM490_PY_B, "file order {order:?} linked {target}");
+    }
+
+    let (diffs, edge) = gm490_python_diffs(false);
+    let mut glob_only = setup();
+    gm490_apply(&mut glob_only, &diffs);
+    link_all(&mut glob_only).unwrap();
+    assert_eq!(edge_target(&glob_only, &edge), (GM490_PY_B.to_string(), true));
+}
+
+/// Each row carries its own language's rule: one store, rules for Rust only,
+/// a Rust scope and a Python scope with the same named-plus-glob shape. The
+/// Rust call links the named `use`'s `y::Error::new`; the Python call stays
+/// unresolved.
+///
+/// Controls: in `Resolver::hops`, set `named_shadows_glob` from whether any
+/// language declares the rule rather than from the row's own language - the
+/// Python call links `pkg.a.f`; set it to `false` - the Rust call stays
+/// unresolved.
+#[test]
+fn gm490_each_row_follows_its_own_languages_rule() {
+    let (rust, rust_edge) = gm490_rust_diffs();
+    let (python, python_edge) = gm490_python_diffs(true);
+    let mut conn = setup();
+    gm490_apply(&mut conn, &rust);
+    gm490_apply(&mut conn, &python);
+
+    super::link_all(&mut conn, &LinkRules::with_named_shadows_glob(["rust"])).unwrap();
+
+    assert_eq!(edge_target(&conn, &rust_edge), (GM490_Y_NEW.to_string(), true));
+    let (target, resolved) = edge_target(&conn, &python_edge);
+    assert!(!resolved, "the Python call linked {target}");
+}
+
+/// No rules is no shadowing, for every language: the Rust fixture,
+/// whose named row wins under Rust's rule, leaves the call unresolved.
+///
+/// Control: make `LinkRules::named_shadows_glob` answer `true` for a language
+/// it does not hold - the call links `y::Error::new`.
+#[test]
+fn gm490_default_rules_shadow_nothing() {
+    let (rust, edge) = gm490_rust_diffs();
+    let mut conn = setup();
+    gm490_apply(&mut conn, &rust);
+    super::link_all(&mut conn, &LinkRules::default()).unwrap();
+    assert!(!edge_target(&conn, &edge).1, "{:?}", edge_target(&conn, &edge));
+}
+
+/// `IndexStore` links under the rules it was given and none by default, on
+/// both of its linking paths: the whole-project `link_all` and a watcher
+/// diff's `apply_diff_linked`.
+///
+/// Controls: make `IndexStore::new` start from the Rust rule - the first
+/// assertion fails; pass `&LinkRules::default()` in `IndexStore::link_all` -
+/// the second fails; pass it in `apply_and_link` - the third fails.
+#[test]
+fn gm490_an_index_store_links_under_its_own_rules() {
+    use crate::storage::index_store::{IndexStore, Unit};
+
+    let (rust, edge) = gm490_rust_diffs();
+    let unlinked = || {
+        let mut conn = setup();
+        gm490_apply(&mut conn, &rust);
+        conn
+    };
+    let rules = || LinkRules::with_named_shadows_glob(["rust"]);
+
+    let plain = IndexStore::new(unlinked());
+    assert_eq!(plain.link_rules(), &LinkRules::default());
+    plain.link_all().unwrap();
+    assert!(!plain.with(|conn| edge_target(conn, &edge)).1, "IndexStore::new shadowed a glob");
+
+    let ruled = IndexStore::new(unlinked()).with_link_rules(rules());
+    ruled.link_all().unwrap();
+    assert_eq!(ruled.with(|conn| edge_target(conn, &edge)), (GM490_Y_NEW.to_string(), true));
+
+    let watched = IndexStore::new(setup()).with_link_rules(rules());
+    for diff in &rust {
+        watched.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(diff, "test")).unwrap();
+    }
+    assert_eq!(watched.with(|conn| edge_target(conn, &edge)), (GM490_Y_NEW.to_string(), true));
 }

@@ -116,11 +116,15 @@
 //! ([`REEXPORT_NATIVE_KIND`]), breadth-first until a declaration turns up or
 //! [`MAX_REEXPORT_DEPTH`] hops are spent. Shallowest wins: a scope that
 //! declares a name itself shadows what it re-exports under that name, as it
-//! does in the language, and within one scope a named re-export shadows its
-//! `*` ones (an explicit `use`/`export { x }` beats a glob), even when the
+//! does in the language. Within one scope a named re-export shadows its `*`
+//! ones only where the scope's language says so ([`LinkRules`], declared by
+//! its plugin as `[plugin.reexports] named_shadows_glob`): an explicit
+//! `use`/`export { x }` beats a glob in Rust and ES modules, even when the
 //! named one leads nowhere - a Rust `use std::io::Error;` beside
 //! `use self::x::*;` is a row to the external crate, so the walk stops there
-//! rather than linking `x::Error`. Only `name` keys walk; a `qualifiedName` names a
+//! rather than linking `x::Error`. A language that does not declare it (Python,
+//! where the later import binds the name) keeps named and `*` rows side by
+//! side at one depth, with no winner. Only `name` keys walk; a `qualifiedName` names a
 //! declaration, never a pass-through - except through its head, below.
 //!
 //! ## Members of a re-exported head
@@ -563,11 +567,41 @@ impl Pending {
     }
 }
 
+/// Per-language linking rules, declared by each language's plugin manifest
+/// and handed in by whoever owns the index (`storage::index_store`). Core
+/// holds no language's rule itself: a language absent here gets the base
+/// behaviour, which is no shadowing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkRules {
+    /// Languages whose plugin declares `[plugin.reexports]
+    /// named_shadows_glob = true`: in one scope, a named re-export of a name
+    /// hides every `*` re-export for it.
+    named_shadows_glob: HashSet<String>,
+}
+
+impl LinkRules {
+    /// Rules under which exactly `languages` have a named re-export shadow
+    /// the same scope's globs.
+    pub fn with_named_shadows_glob<I, S>(languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self { named_shadows_glob: languages.into_iter().map(Into::into).collect() }
+    }
+
+    /// Whether, in a scope of `language`, a named re-export shadows the
+    /// scope's `*` re-exports for the same name.
+    pub fn named_shadows_glob(&self, language: &str) -> bool {
+        self.named_shadows_glob.contains(language)
+    }
+}
+
 /// Links every pending symbol in the index. The whole-project pass, run once
 /// a bulk index has committed its last batch - at which point every symbol
 /// the walk will ever produce is in, so a placeholder that finds no target
 /// here has none to find.
-pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
+pub fn link_all(conn: &mut Connection, rules: &LinkRules) -> Result<LinkSummary> {
     let mut pending = Pending::default();
     {
         let mut stmt = conn
@@ -578,7 +612,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
             .context("failed to scan for pending symbols")?;
         pending.collect(rows)?;
     }
-    link(conn, pending)
+    link(conn, pending, rules)
 }
 
 /// Links what one just-applied diff could have changed, without rescanning
@@ -638,7 +672,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 /// [`link_all`] can disagree: on a sequence of diffs in which an answer only
 /// ever *improves*, the two produce the same edges (asserted by
 /// `link_all_and_link_diff_agree_on_the_same_end_state`).
-pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
+pub fn link_diff(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Result<LinkSummary> {
     let mut ids: BTreeSet<String> = diff
         .upsert_nodes
         .iter()
@@ -676,7 +710,7 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
             pending.collect(rows)?;
         }
     }
-    link(conn, pending)
+    link(conn, pending, rules)
 }
 
 fn is_placeholder(kind: &str, native_kind: Option<&str>) -> bool {
@@ -1145,7 +1179,7 @@ fn requesters_below_new_containers(conn: &Connection, diff: &Diff) -> Result<Vec
 /// second pass finds nothing to move, and a reindex that resets one (a
 /// restarted plugin re-sends its full extraction, `resolved: false` and all)
 /// is simply linked again.
-fn link(conn: &mut Connection, pending: Pending) -> Result<LinkSummary> {
+fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<LinkSummary> {
     let Pending { placeholders, untargeted } = pending;
     let mut summary = LinkSummary::default();
     if placeholders.is_empty() {
@@ -1162,7 +1196,7 @@ fn link(conn: &mut Connection, pending: Pending) -> Result<LinkSummary> {
         let mut repoint = tx
             .prepare("UPDATE edges SET toId = ?1, resolved = 1 WHERE toId = ?2 AND kind = ?3")
             .context("failed to prepare the edge repoint")?;
-        let mut resolver = Resolver::new(&tx)?;
+        let mut resolver = Resolver::new(&tx, rules)?;
 
         for placeholder in placeholders {
             let edge_kinds: Vec<String> = pending_kinds
@@ -1257,10 +1291,13 @@ type Step = (Scope, Key);
 struct Hop {
     to: Step,
     /// Whether the row forwards one name (`use a::T;`, `export { T }`) rather
-    /// than a whole scope (`*`). In one scope a named row shadows every `*`
-    /// row for that name - an explicit import beats a glob in Rust, as an
-    /// explicit export beats `export *` in ES modules.
+    /// than a whole scope (`*`).
     named: bool,
+    /// Whether the row's language makes a named row shadow every `*` row for
+    /// that name in the same scope ([`LinkRules::named_shadows_glob`]) - an
+    /// explicit import beats a glob in Rust, as an explicit export beats
+    /// `export *` in ES modules, while in Python the later import binds.
+    named_shadows_glob: bool,
     /// `Some((language, container))` for a row of `container` visibility: only
     /// a requester of that language in that container or below it may follow
     /// it. `None` for every other row, which anyone may follow.
@@ -1273,6 +1310,7 @@ struct Hop {
 /// under it; only [`Resolver::resolve`]'s walk depends on who is asking.
 struct Resolver<'c> {
     conn: &'c Connection,
+    rules: &'c LinkRules,
     in_file_by_name: Statement<'c>,
     in_file_by_qualified_name: Statement<'c>,
     in_container_by_name: Statement<'c>,
@@ -1292,7 +1330,7 @@ struct Resolver<'c> {
 }
 
 impl<'c> Resolver<'c> {
-    fn new(conn: &'c Connection) -> Result<Self> {
+    fn new(conn: &'c Connection, rules: &'c LinkRules) -> Result<Self> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
              qualifiedName, container, qualifiedPath FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
@@ -1302,6 +1340,7 @@ impl<'c> Resolver<'c> {
         let prepare = |sql: String| conn.prepare(&sql).context("failed to prepare a symbol-linking lookup");
         Ok(Resolver {
             conn,
+            rules,
             in_file_by_name: prepare(format!("{CANDIDATE} WHERE filePath = ?1 AND name = ?2 AND {declarations}"))?,
             in_file_by_qualified_name: prepare(format!(
                 "{CANDIDATE} WHERE filePath = ?1 AND qualifiedName = ?2 AND {declarations}"
@@ -1395,13 +1434,15 @@ impl<'c> Resolver<'c> {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
                 let mut hops = self.hops(scope, name)?;
-                // A named row shadows the scope's `*` rows, even when it leads
-                // nowhere (an external crate's item) and even when this
-                // requester may not follow it: in rustc the shadowed glob item
-                // is not in the scope at all, so a missing edge beats the
-                // wrong one a glob would give.
-                if hops.iter().any(|hop| hop.named) {
-                    hops.retain(|hop| hop.named);
+                // Where the language says so, a named row shadows the scope's
+                // `*` rows, even when it leads nowhere (an external crate's
+                // item) and even when this requester may not follow it: in
+                // rustc the shadowed glob item is not in the scope at all, so
+                // a missing edge beats the wrong one a glob would give. A
+                // language that does not declare it (Python: the later import
+                // binds) keeps both kinds at this depth, with no winner.
+                if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
+                    hops.retain(|hop| hop.named || !hop.named_shadows_glob);
                 }
                 let mut followed = Vec::new();
                 for hop in hops {
@@ -1674,8 +1715,14 @@ impl<'c> Resolver<'c> {
                     continue;
                 }
             };
+            let named_shadows_glob = self.rules.named_shadows_glob(&language);
             let restricted_to = (visibility == VISIBILITY_CONTAINER).then_some((language, visible_in));
-            hops.push(Hop { to: (target_scope, hop_key), named: !whole_module, restricted_to });
+            hops.push(Hop {
+                to: (target_scope, hop_key),
+                named: !whole_module,
+                named_shadows_glob,
+                restricted_to,
+            });
         }
 
         self.hops.insert(cache_key, hops.clone());

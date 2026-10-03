@@ -525,12 +525,14 @@ pub(crate) fn parse_bulk_lines(bytes: &[u8]) -> Vec<BulkLine> {
 ///
 /// An `Arc<IndexStore>`: the expectations call the MCP tools' own handler
 /// functions, which take the same `&Arc<IndexStore>` `mcp::mod` holds, and
-/// every other caller here borrows it as `&IndexStore`.
-pub(crate) fn open_index() -> Result<Arc<IndexStore>> {
+/// every other caller here borrows it as `&IndexStore`. Linked under
+/// `manifest`'s own rules, as the daemon would link that language.
+pub(crate) fn open_index(manifest: &PluginManifest) -> Result<Arc<IndexStore>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    Ok(Arc::new(IndexStore::new(conn)))
+    let rules = crate::daemon::manifest::link_rules([manifest]);
+    Ok(Arc::new(IndexStore::new(conn).with_link_rules(rules)))
 }
 
 /// Commits one bulk stream through the daemon's own batching and links it

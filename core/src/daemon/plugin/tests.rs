@@ -201,6 +201,7 @@ fn manifest_for(dir: &Path, ignore: &[&str]) -> PluginManifest {
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
         symbol_query_prefixes: Default::default(),
+        reexports: Default::default(),
     }
 }
 

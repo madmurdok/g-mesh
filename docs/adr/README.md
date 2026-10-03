@@ -90,3 +90,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0017 | [The semantic rung embeds off the async workers; plain store reads stay on them](0017-semantic-rung-off-the-worker.md) | Accepted |
 | 0018 | [Plugins declare the query shapes that are never their symbols](0018-non-symbol-query-shapes.md) | Accepted |
 | 0019 | [Plugins declare the prefixes that, stripped, leave one of their symbols](0019-symbol-query-prefixes.md) | Accepted |
+| 0020 | [Plugins declare whether a named re-export shadows a glob](0020-named-reexport-shadows-glob.md) | Accepted |

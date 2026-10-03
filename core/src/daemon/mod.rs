@@ -289,7 +289,8 @@ pub fn run(root: &Path) -> Result<()> {
     let needs_semantic_pass_retry = !needs_bulk_index
         && !schema::semantic_pass_completed(&conn)
             .context("failed to check whether the project's semantic pass has completed")?;
-    let conn = Arc::new(IndexStore::new(conn));
+    let conn =
+        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
 
     // Canonicalized like `ProjectWatcher`'s paths, so `relative_wire_path` can strip it.
     let canonical_root = root

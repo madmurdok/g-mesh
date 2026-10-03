@@ -96,3 +96,9 @@ contains = ["/"]
 # decorator is indexed under its own name. Each prefix must also be in
 # `non_symbol_queries.starts_with` above (docs/adr/0019-symbol-query-prefixes.md).
 strip = ["@"]
+
+[plugin.reexports]
+# A local or explicit export (`export { T } from "./a"`) beats `export *`
+# for the same name in ES modules, so core's linker stops at the named row
+# (docs/adr/0020-named-reexport-shadows-glob.md).
+named_shadows_glob = true

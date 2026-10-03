@@ -277,7 +277,9 @@ fn rebuild(
     let live_path = store.file_path().context("a workspace reindex needs a file-backed index")?;
     let live_path = live_path.to_str().context("the index path is not valid UTF-8")?;
 
-    let staged = IndexStore::new(connection::open_staging(staging)?);
+    // Links as the live store does: the same discovered plugins' rules.
+    let staged =
+        IndexStore::new(connection::open_staging(staging)?).with_link_rules(store.link_rules().clone());
     // No `walked_files`, so no baselines (see the module doc on
     // `indexed_files`), and no embedding: only the texts the plan finds
     // changed are embedded.

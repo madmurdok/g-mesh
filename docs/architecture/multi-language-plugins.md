@@ -432,6 +432,12 @@ contains = ["/"]
 # be in `non_symbol_queries.starts_with`. Absent: nothing is rewritten.
 strip = ["@"]
 
+[plugin.reexports]
+# Whether, in one scope, a named import/re-export of a name hides every glob
+# (`*`) one for it when the linker walks re-export chains. Absent: false, and
+# named and glob rows stay side by side with no winner.
+named_shadows_glob = true  # rust, typescript; python and go declare nothing
+
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
 # Absent means the plugin has no language server behind its semantic tier.
@@ -503,6 +509,15 @@ empty prefix, an unknown key, and a prefix missing from the same manifest's
 `strip = ["@"]`; Rust and Go declare nothing. `g-mesh plugins list` and
 `g-mesh plugins check` print it. Decision:
 [ADR 0019](../adr/0019-symbol-query-prefixes.md).
+
+`[plugin.reexports]` is read by the symbol linker
+(`graph::symbol_links`), through the `LinkRules` the index store is built
+with (`daemon::manifest::link_rules`). With `named_shadows_glob = true`, a
+scope of that language that re-exports a name both by name and through a glob
+follows the named row only; without it, both rows are followed at the same
+depth. Rust and TypeScript declare it; Python (the later import binds) and Go
+do not. Decision:
+[ADR 0020](../adr/0020-named-reexport-shadows-glob.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest

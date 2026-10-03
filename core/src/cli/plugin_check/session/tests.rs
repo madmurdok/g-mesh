@@ -26,6 +26,7 @@ fn fake_workspace_plugin_manifest(command: PathBuf) -> PluginManifest {
         workspace: WorkspaceConfig::default(),
         non_symbol_queries: Default::default(),
         symbol_query_prefixes: Default::default(),
+        reexports: Default::default(),
     }
 }
 
@@ -65,7 +66,7 @@ fn run_session_names_a_missing_workspace_binary_instead_of_the_bare_os_error() {
     let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-fake");
     let manifest = fake_workspace_plugin_manifest(binary.clone());
     let scratch = Scratch::create().unwrap();
-    let conn = open_index().unwrap();
+    let conn = open_index(&manifest).unwrap();
     let target = EditTarget {
         file_path: "a.fake".to_string(),
         line: 1,

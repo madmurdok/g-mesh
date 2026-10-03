@@ -324,6 +324,7 @@ fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
         },
         non_symbol_queries: Default::default(),
         symbol_query_prefixes: Default::default(),
+        reexports: Default::default(),
     };
 
     let mut discovered = DiscoveredPlugins::default();

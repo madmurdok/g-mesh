@@ -78,8 +78,10 @@ impl Fixture {
         }
         let conn = open(dir.path()).expect("failed to open the project index");
         schema::ensure_current(&conn, "unlinked-usages-test").expect("failed to prepare the index");
-        let store = IndexStore::new(conn);
-        let summary = bulk_index::run(dir.path(), &store, None, &rust_only()).expect("the bulk walk failed");
+        let discovered = rust_only();
+        let rules = crate::daemon::manifest::link_rules(discovered.manifests.values());
+        let store = IndexStore::new(conn).with_link_rules(rules);
+        let summary = bulk_index::run(dir.path(), &store, None, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes");
         Self { dir, store: Arc::new(store) }
     }

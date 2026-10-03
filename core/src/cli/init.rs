@@ -204,7 +204,9 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             let canonical_root = project_root
                 .canonicalize()
                 .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-            let conn = Arc::new(IndexStore::new(conn));
+            let conn = Arc::new(
+                IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())),
+            );
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
             let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
@@ -229,7 +231,9 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let canonical_root = project_root
             .canonicalize()
             .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-        let conn = Arc::new(IndexStore::new(conn));
+        let conn = Arc::new(
+            IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())),
+        );
         // Read back rather than assumed from `ProjectConfig::default()`: a
         // pre-existing config.toml (the `!config_written` case) may name a
         // different model, and this walk has to honor whatever is actually
